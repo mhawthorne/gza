@@ -20,7 +20,6 @@ from ..git import Git
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..workers import WorkerRegistry
 from ._common import (
-    _create_improve_task,
     _create_rebase_task,
     _create_resume_task,
     _spawn_background_resume_worker,
@@ -28,14 +27,15 @@ from ._common import (
     get_review_verdict,
     get_store,
     resolve_id,
-    resolve_improve_action,
     set_task_urgency,
 )
+from .advance_executor import AdvanceActionExecutionContext, execute_advance_action
 from .execution import _spawn_background_iterate
 from .git_ops import (
     _collect_advance_completed_tasks,
     _determine_advance_action,
     _execute_merge_action,
+    _merge_single_task,  # noqa: F401  # kept for test patch compatibility
     _prepare_create_review_action,
     _require_default_branch,
     _unimplemented_implement_prompt,
@@ -300,6 +300,70 @@ def _run_cycle(
                 lambda: _require_default_branch(git, current_branch, "merge"),
             )
 
+        worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+
+        def _watch_spawn_worker(task_id: str, task_kind: str) -> int:
+            return _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=log,
+                failure_message=f"{task_id} {task_kind}: worker spawn failed",
+                dedupe_key=f"spawn-worker-failed:{task_id}",
+                spawn_fn=lambda: _spawn_background_worker(worker_args, config, task_id=task_id, quiet=quiet),
+            )
+
+        def _watch_spawn_resume_worker(task_id: str, task_kind: str) -> int:
+            return _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=log,
+                failure_message=f"{task_id} {task_kind}: resume worker spawn failed",
+                dedupe_key=f"spawn-resume-failed:{task_id}",
+                spawn_fn=lambda: _spawn_background_resume_worker(worker_args, config, new_task_id=task_id, quiet=quiet),
+            )
+
+        def _watch_spawn_iterate(task_obj: DbTask, task_kind: str) -> int:
+            iterate_args = argparse.Namespace(
+                max_iterations=max_iterations,
+                no_docker=False,
+                resume=False,
+                retry=False,
+            )
+            return _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=log,
+                failure_message=f"{task_obj.id} {task_kind}: iterate worker spawn failed",
+                dedupe_key=f"spawn-iterate-failed:{task_obj.id}",
+                spawn_fn=lambda: _spawn_background_iterate(iterate_args, config, task_obj),
+            )
+
+        def _create_rebase_from_task(parent_task: DbTask) -> DbTask:
+            assert parent_task.id is not None
+            assert parent_task.branch is not None
+            return _create_rebase_task(store, parent_task.id, parent_task.branch, target_branch)
+
+        def _create_implement_from_task(parent_task: DbTask) -> DbTask:
+            assert parent_task.id is not None
+            return store.add(
+                prompt=_unimplemented_implement_prompt(parent_task),
+                task_type="implement",
+                depends_on=parent_task.id,
+                group=parent_task.group,
+            )
+
+        executor_context = AdvanceActionExecutionContext(
+            store=store,
+            dry_run=dry_run,
+            max_resume_attempts=config.max_resume_attempts,
+            use_iterate_for_create_implement=True,
+            use_iterate_for_needs_rebase=False,
+            prepare_create_review=lambda t: _prepare_create_review_action(store, t),
+            create_resume_task=lambda t: _create_resume_task(store, t),
+            create_rebase_task=_create_rebase_from_task,
+            create_implement_task=_create_implement_from_task,
+            spawn_worker=_watch_spawn_worker,
+            spawn_resume_worker=_watch_spawn_resume_worker,
+            spawn_iterate_worker=_watch_spawn_iterate,
+        )
+
         for task, action in action_plan:
             action_type = action.get("type")
             if action_type in {
@@ -358,269 +422,78 @@ def _run_cycle(
             if slots <= 0:
                 continue
 
-            if action_type == "create_review":
-                if task.id is None:
-                    continue
-                if dry_run:
+            exec_result = execute_advance_action(task=task, action=action, context=executor_context)
+            child_id = exec_result.handled_task_id
+
+            if exec_result.status == "skip":
+                message = exec_result.message
+                if action_type == "improve" and task.id is not None:
+                    message = f"{task.id}: {message}"
+                log.emit(
+                    "SKIP",
+                    message,
+                    dedupe_key=f"advance-worker-skip:{action_type}:{task.id}:{message}",
+                )
+                continue
+
+            if exec_result.status == "error":
+                if not exec_result.attempted_spawn and task.id is not None:
+                    log.emit(
+                        "ERROR",
+                        f"{task.id}: {exec_result.message}",
+                        dedupe_key=f"advance-worker-error:{action_type}:{task.id}:{exec_result.message}",
+                    )
+                if child_id is not None and action_type in {
+                    "create_review",
+                    "improve",
+                    "create_implement",
+                    "needs_rebase",
+                    "run_review",
+                    "run_improve",
+                }:
+                    step1_handled_child_task_ids.add(str(child_id))
+                continue
+
+            if exec_result.status == "dry_run":
+                if action_type == "create_review" and task.id is not None:
                     log.emit("START", f"(new) review for {task.id} [dry-run]")
-                    slots -= 1
-                    work_done = True
-                    continue
-                create_result = _prepare_create_review_action(store, task)
-                if create_result.status == "skip":
-                    log.emit(
-                        "SKIP",
-                        create_result.message,
-                        dedupe_key=f"create-review-skip:{task.id}:{create_result.message}",
-                    )
-                    continue
-                review_task = create_result.review_task
-                assert review_task is not None
-                step1_handled_child_task_ids.add(str(review_task.id))
-
-                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_worker_with_failure_log(
-                    quiet=quiet,
-                    log=log,
-                    failure_message=f"{review_task.id} review: worker spawn failed",
-                    dedupe_key=f"spawn-worker-failed:{review_task.id}",
-                    spawn_fn=lambda: _spawn_background_worker(
-                        worker_args, config, task_id=review_task.id, quiet=quiet
-                    ),
-                )
-                if rc == 0:
-                    log.emit("START", f"{review_task.id} review")
-                    started_task_ids.add(str(review_task.id))
-                    slots -= 1
-                    work_done = True
-                continue
-
-            if action_type == "run_review":
-                review_task_obj = action.get("review_task")
-                if not isinstance(review_task_obj, DbTask) or review_task_obj.id is None:
-                    continue
-                review_task_id = str(review_task_obj.id)
-
-                if dry_run:
-                    log.emit("START", f"{review_task_id} review [dry-run]")
-                    started_task_ids.add(review_task_id)
-                    slots -= 1
-                    work_done = True
-                    continue
-
-                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_worker_with_failure_log(
-                    quiet=quiet,
-                    log=log,
-                    failure_message=f"{review_task_id} review: worker spawn failed",
-                    dedupe_key=f"spawn-worker-failed:{review_task_id}",
-                    spawn_fn=lambda: _spawn_background_worker(
-                        worker_args, config, task_id=review_task_id, quiet=quiet
-                    ),
-                )
-                if rc == 0:
-                    log.emit("START", f"{review_task_id} review")
-                    started_task_ids.add(review_task_id)
-                    slots -= 1
-                    work_done = True
-                else:
-                    log.emit("START_FAILED", f"{review_task_id} review")
-                    step1_handled_child_task_ids.add(review_task_id)
-                continue
-
-            if action_type == "improve":
-                review_task_obj = action.get("review_task")
-                if not isinstance(review_task_obj, DbTask) or review_task_obj.id is None or task.id is None:
-                    continue
-
-                improve_action, failed_improve = resolve_improve_action(
-                    store,
-                    task.id,
-                    review_task_obj.id,
-                    max_resume_attempts=config.max_resume_attempts,
-                )
-                if improve_action == "give_up" and failed_improve is not None:
-                    assert failed_improve.id is not None
-                    msg = (
-                        f"SKIP: max improve attempts ({config.max_resume_attempts}) reached for "
-                        f"{task.id} + {review_task_obj.id}; latest failed improve: {failed_improve.id}. "
-                        f"Run uv run gza fix {task.id}"
-                    )
-                    log.emit(
-                        "SKIP",
-                        f"{task.id}: {msg}",
-                        dedupe_key=f"max-improve-attempts:{task.id}:{review_task_obj.id}",
-                    )
-                    continue
-
-                if dry_run:
-                    if improve_action == "resume" and failed_improve is not None and failed_improve.id is not None:
-                        log.emit("START", f"(resume) improve for {failed_improve.id} [dry-run]")
-                    elif improve_action == "retry" and failed_improve is not None and failed_improve.id is not None:
-                        log.emit("START", f"(retry) improve for {failed_improve.id} [dry-run]")
-                    else:
+                elif action_type == "run_review" and child_id is not None:
+                    log.emit("START", f"{child_id} review [dry-run]")
+                    started_task_ids.add(str(child_id))
+                elif action_type == "improve":
+                    failed_id = exec_result.failed_improve.id if exec_result.failed_improve is not None else None
+                    if exec_result.improve_mode == "resume" and failed_id is not None:
+                        log.emit("START", f"(resume) improve for {failed_id} [dry-run]")
+                    elif exec_result.improve_mode == "retry" and failed_id is not None:
+                        log.emit("START", f"(retry) improve for {failed_id} [dry-run]")
+                    elif task.id is not None:
                         log.emit("START", f"(new) improve for {task.id} [dry-run]")
-                    slots -= 1
-                    work_done = True
-                    continue
-
-                if improve_action == "resume" and failed_improve is not None:
-                    assert failed_improve.id is not None
-                    improve_task = _create_resume_task(store, failed_improve)
-                elif improve_action == "retry" and failed_improve is not None:
-                    assert failed_improve.id is not None
-                    retry_same_branch = failed_improve.same_branch
-                    retry_base_branch: str | None = None
-                    if failed_improve.same_branch and failed_improve.branch:
-                        retry_same_branch = False
-                        retry_base_branch = failed_improve.branch
-                    improve_task = store.add(
-                        prompt=failed_improve.prompt,
-                        task_type="improve",
-                        depends_on=failed_improve.depends_on,
-                        based_on=failed_improve.id,
-                        same_branch=retry_same_branch,
-                        group=failed_improve.group,
-                        base_branch=retry_base_branch,
-                    )
-                else:
-                    try:
-                        improve_task = _create_improve_task(store, task, review_task_obj)
-                    except ValueError as exc:
-                        log.emit(
-                            "ERROR",
-                            f"{task.id}: unable to create improve task: {exc}",
-                            dedupe_key=f"improve-create-error:{task.id}:{review_task_obj.id}",
-                        )
-                        continue
-                assert improve_task.id is not None
-                improve_task_id = improve_task.id
-                step1_handled_child_task_ids.add(improve_task_id)
-
-                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                is_resume = improve_task.session_id is not None
-                if is_resume:
-                    rc = _spawn_worker_with_failure_log(
-                        quiet=quiet,
-                        log=log,
-                        failure_message=f"{improve_task_id} improve: resume worker spawn failed",
-                        dedupe_key=f"spawn-resume-failed:{improve_task_id}",
-                        spawn_fn=lambda: _spawn_background_resume_worker(
-                            worker_args, config, new_task_id=improve_task_id, quiet=quiet
-                        ),
-                    )
-                else:
-                    rc = _spawn_worker_with_failure_log(
-                        quiet=quiet,
-                        log=log,
-                        failure_message=f"{improve_task_id} improve: worker spawn failed",
-                        dedupe_key=f"spawn-worker-failed:{improve_task_id}",
-                        spawn_fn=lambda: _spawn_background_worker(
-                            worker_args, config, task_id=improve_task_id, quiet=quiet
-                        ),
-                    )
-                if rc == 0:
-                    log.emit("START", f"{improve_task_id} improve")
-                    started_task_ids.add(improve_task_id)
-                    slots -= 1
-                    work_done = True
-                continue
-
-            if action_type == "run_improve":
-                improve_task_obj = action.get("improve_task")
-                if not isinstance(improve_task_obj, DbTask) or improve_task_obj.id is None:
-                    continue
-
-                if dry_run:
-                    log.emit("START", f"{improve_task_obj.id} improve [dry-run]")
-                    started_task_ids.add(str(improve_task_obj.id))
-                    slots -= 1
-                    work_done = True
-                    continue
-
-                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_worker_with_failure_log(
-                    quiet=quiet,
-                    log=log,
-                    failure_message=f"{improve_task_obj.id} improve: worker spawn failed",
-                    dedupe_key=f"spawn-worker-failed:{improve_task_obj.id}",
-                    spawn_fn=lambda: _spawn_background_worker(
-                        worker_args, config, task_id=improve_task_obj.id, quiet=quiet
-                    ),
-                )
-                if rc == 0:
-                    log.emit("START", f"{improve_task_obj.id} improve")
-                    started_task_ids.add(str(improve_task_obj.id))
-                    slots -= 1
-                    work_done = True
-                else:
-                    log.emit("START_FAILED", f"{improve_task_obj.id} improve")
-                    step1_handled_child_task_ids.add(str(improve_task_obj.id))
-                continue
-
-            if action_type == "create_implement":
-                if task.id is None:
-                    continue
-                if dry_run:
+                elif action_type == "run_improve" and child_id is not None:
+                    log.emit("START", f"{child_id} improve [dry-run]")
+                    started_task_ids.add(str(child_id))
+                elif action_type == "create_implement" and task.id is not None:
                     log.emit("START", f"(new) implement for {task.id} [dry-run]")
-                    slots -= 1
-                    work_done = True
-                    continue
-                prompt_text = _unimplemented_implement_prompt(task)
-                impl_task = store.add(
-                    prompt=prompt_text,
-                    task_type="implement",
-                    based_on=task.id,
-                    group=task.group,
-                )
-                step1_handled_child_task_ids.add(str(impl_task.id))
-
-                iterate_args = argparse.Namespace(
-                    max_iterations=max_iterations,
-                    no_docker=False,
-                    resume=False,
-                    retry=False,
-                )
-                rc = _spawn_worker_with_failure_log(
-                    quiet=quiet,
-                    log=log,
-                    failure_message=f"{impl_task.id} implement: iterate worker spawn failed",
-                    dedupe_key=f"spawn-iterate-failed:{impl_task.id}",
-                    spawn_fn=lambda: _spawn_background_iterate(iterate_args, config, impl_task),
-                )
-                if rc == 0:
-                    log.emit("START", f"{impl_task.id} implement")
-                    started_task_ids.add(str(impl_task.id))
-                    slots -= 1
-                    work_done = True
+                elif action_type == "needs_rebase" and task.id is not None:
+                    log.emit("START", f"(new) rebase for {task.id} [dry-run]")
+                slots -= 1
+                work_done = True
                 continue
 
-            if action_type == "needs_rebase":
-                if task.id is None or not task.branch:
-                    continue
-                if dry_run:
-                    log.emit("START", f"(new) rebase for {task.id} [dry-run]")
-                    slots -= 1
-                    work_done = True
-                    continue
-                rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
-                step1_handled_child_task_ids.add(str(rebase_task.id))
+            if child_id is not None and action_type in {"create_review", "improve", "create_implement", "needs_rebase"}:
+                step1_handled_child_task_ids.add(str(child_id))
 
-                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                rc = _spawn_worker_with_failure_log(
-                    quiet=quiet,
-                    log=log,
-                    failure_message=f"{rebase_task.id} rebase: worker spawn failed",
-                    dedupe_key=f"spawn-worker-failed:{rebase_task.id}",
-                    spawn_fn=lambda: _spawn_background_worker(
-                        worker_args, config, task_id=rebase_task.id, quiet=quiet
-                    ),
-                )
-                if rc == 0:
-                    log.emit("START", f"{rebase_task.id} rebase")
-                    started_task_ids.add(str(rebase_task.id))
-                    slots -= 1
-                    work_done = True
+            if exec_result.status == "success" and child_id is not None:
+                if action_type in {"create_review", "run_review"}:
+                    log.emit("START", f"{child_id} review")
+                elif action_type in {"improve", "run_improve"}:
+                    log.emit("START", f"{child_id} improve")
+                elif action_type == "create_implement":
+                    log.emit("START", f"{child_id} implement")
+                elif action_type == "needs_rebase":
+                    log.emit("START", f"{child_id} rebase")
+                started_task_ids.add(str(child_id))
+                slots -= 1
+                work_done = True
 
     # 2) Resume failed resumable tasks (consumes slots)
     pending_resume_task_ids: set[str] = set()

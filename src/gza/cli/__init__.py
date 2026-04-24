@@ -15,6 +15,7 @@ import types as _types
 
 from . import (
     _common as _common_mod,  # noqa: F401
+    advance_executor as _advance_executor_mod,  # noqa: F401
     config_cmds as _config_cmds_mod,  # noqa: F401
     execution as _execution_mod,  # noqa: F401
     git_ops as _git_ops_mod,  # noqa: F401
@@ -25,7 +26,16 @@ from . import (
 from .main import main  # noqa: F401
 
 # Sub-modules list for attribute propagation
-_SUBMODULES = (_common_mod, _log_mod, _config_cmds_mod, _query_mod, _git_ops_mod, _execution_mod, _watch_mod)
+_SUBMODULES = (
+    _common_mod,
+    _advance_executor_mod,
+    _log_mod,
+    _config_cmds_mod,
+    _query_mod,
+    _git_ops_mod,
+    _execution_mod,
+    _watch_mod,
+)
 
 # Build mapping: attribute name -> list of sub-modules that have it.
 # When a test does patch("gza.cli.X", mock), we propagate the mock to every
