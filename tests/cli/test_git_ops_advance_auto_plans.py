@@ -107,11 +107,12 @@ class TestAdvanceAutoPlans:
         assert "Created implement task" in output
         assert "Started implement worker" in output
 
-        # Verify the implement task was created with correct based_on
+        # Verify the implement task was created with plan dependency.
         all_tasks = store.get_all()
         impl_tasks = [t for t in all_tasks if t.task_type == "implement"]
         assert len(impl_tasks) == 1
-        assert impl_tasks[0].based_on == plan.id
+        assert impl_tasks[0].depends_on == plan.id
+        assert impl_tasks[0].based_on is None
         assert impl_tasks[0].prompt == f"Implement plan from task {plan.id}: design-auth-system"
 
     def test_advance_skips_plan_with_existing_implement(self, tmp_path: Path):

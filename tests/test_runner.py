@@ -14,6 +14,7 @@ import pytest
 from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError
+from gza.lineage import get_plan_for_task
 from gza.providers import ClaudeProvider, RunResult
 from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.review_verdict import ReviewFinding, parse_review_report
@@ -33,7 +34,6 @@ from gza.runner import (
     _create_and_run_review_task,
     _ensure_work_pr_for_completed_code_task,
     _extract_review_verdict,
-    _find_task_of_type_in_chain,
     _get_task_output,
     _resolve_code_task_branch_name,
     _restore_wip_changes,
@@ -8226,13 +8226,13 @@ class TestDependencyMergePrecondition:
         assert git_error is None
 
 
-class TestFindTaskOfTypeInChain:
+class TestGetPlanForTask:
     def test_finds_plan_via_depends_on_only(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         plan = store.add("Plan feature", task_type="plan")
         impl = store.add("Implement feature", task_type="implement", depends_on=plan.id)
 
-        found = _find_task_of_type_in_chain(impl.id, "plan", store)
+        found = get_plan_for_task(store, impl)
         assert found is not None
         assert found.id == plan.id
 
@@ -8241,7 +8241,7 @@ class TestFindTaskOfTypeInChain:
         plan = store.add("Plan feature", task_type="plan")
         impl = store.add("Implement feature", task_type="implement", based_on=plan.id)
 
-        found = _find_task_of_type_in_chain(impl.id, "plan", store)
+        found = get_plan_for_task(store, impl)
         assert found is not None
         assert found.id == plan.id
 
@@ -8251,7 +8251,7 @@ class TestFindTaskOfTypeInChain:
         impl = store.add("Implement feature", task_type="implement", depends_on=plan.id)
         retry = store.add("Retry implementation", task_type="implement", based_on=impl.id)
 
-        found = _find_task_of_type_in_chain(retry.id, "plan", store)
+        found = get_plan_for_task(store, retry)
         assert found is not None
         assert found.id == plan.id
 

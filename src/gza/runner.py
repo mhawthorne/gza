@@ -35,6 +35,7 @@ from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason, task_i
 from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
+from .lineage import get_plan_for_task
 from .pr_ops import ensure_task_pr
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
@@ -1066,21 +1067,18 @@ def _build_context_from_chain(
                         f"(review task {review_task.id} exists but content unavailable on this machine - flag as blocker)"
                     )
 
-        # Get the original plan (via based_on chain)
-        if task.based_on:
-            impl_task = store.get(task.based_on)
-            if impl_task and impl_task.based_on:
-                plan_task = _find_task_of_type_in_chain(impl_task.based_on, "plan", store)
-                if plan_task:
-                    plan_content = _get_task_output(plan_task, project_dir)
-                    if plan_content:
-                        context_parts.append("\n## Original plan:\n")
-                        context_parts.append(plan_content)
-                    else:
-                        context_parts.append(
-                            "\n## Original plan:\n"
-                            f"(plan task {plan_task.id} exists but content unavailable on this machine - flag as blocker)"
-                        )
+        if impl_ancestor is not None:
+            plan_task = get_plan_for_task(store, impl_ancestor)
+            if plan_task:
+                plan_content = _get_task_output(plan_task, project_dir)
+                if plan_content:
+                    context_parts.append("\n## Original plan:\n")
+                    context_parts.append(plan_content)
+                else:
+                    context_parts.append(
+                        "\n## Original plan:\n"
+                        f"(plan task {plan_task.id} exists but content unavailable on this machine - flag as blocker)"
+                    )
 
     if task.task_type == "fix":
         root_impl = _resolve_root_implementation_for_fix(task, store)
@@ -1135,9 +1133,7 @@ def _build_context_from_chain(
                         f"Latest failed implementation retry/resume attempt: {latest_failed_impl.id}"
                     )
 
-            plan_task = None
-            if root_impl.based_on:
-                plan_task = _find_task_of_type_in_chain(root_impl.based_on, "plan", store)
+            plan_task = get_plan_for_task(store, root_impl)
 
             if plan_task:
                 plan_content = _get_task_output(plan_task, project_dir)
@@ -1153,14 +1149,14 @@ def _build_context_from_chain(
                 context_parts.append("\n## Original request:\n")
                 context_parts.append(root_impl.prompt)
 
-    # For implement tasks, include plan from based_on chain
-    if task.task_type == "implement" and task.based_on:
+    # For implement tasks, include plan from lineage chain.
+    if task.task_type == "implement":
         followup_parts = extract_followup_prompt_parts(task.prompt)
         if followup_parts is not None:
             marker = "## Follow-up finding to implement:"
             if marker in task.prompt:
                 context_parts.append(task.prompt[task.prompt.index(marker):].strip())
-        plan_task = _find_task_of_type_in_chain(task.based_on, "plan", store)
+        plan_task = get_plan_for_task(store, task)
         if plan_task:
             plan_content = _get_task_output(plan_task, project_dir)
             if plan_content:
@@ -1181,9 +1177,7 @@ def _build_context_from_chain(
                         context_parts.append(f"## Specification\n\nThe following specification file ({impl_task.spec}) provides context for this implementation:\n\n{spec_content}")
 
                 # Inject ask context: plan output for plan-driven work, else full original request.
-                plan_task = None
-                if impl_task.based_on:
-                    plan_task = _find_task_of_type_in_chain(impl_task.based_on, "plan", store)
+                plan_task = get_plan_for_task(store, impl_task)
 
                 if plan_task:
                     plan_content = _get_task_output(plan_task, project_dir)
@@ -1365,35 +1359,6 @@ def _extract_failure_context(task: Task, project_dir: Path) -> str:
     if not lines:
         return "(no failed-attempt context available)"
     return "\n".join(lines)
-
-
-def _find_task_of_type_in_chain(task_id: str, task_type: str, store: SqliteTaskStore, visited: set[str] | None = None) -> Task | None:
-    """Walk lineage links to find a task of the given type."""
-    if visited is None:
-        visited = set()
-    stack = [task_id]
-
-    while stack:
-        current_id = stack.pop()
-        if current_id in visited:
-            continue  # Avoid cycles
-        visited.add(current_id)
-
-        task = store.get(current_id)
-        if not task:
-            continue
-
-        if task.task_type == task_type:
-            return task
-
-        # Transitional behavior: support historical plan links on either edge
-        # until all plan discovery callers/records are normalized.
-        if task.based_on:
-            stack.append(task.based_on)
-        if task.depends_on:
-            stack.append(task.depends_on)
-
-    return None
 
 
 def _run_result_to_stats(result: RunResult) -> TaskStats:

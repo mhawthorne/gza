@@ -130,11 +130,12 @@ class TestAdvanceUnimplementedCommand:
         all_tasks = store.get_all()
         impl_tasks = [t for t in all_tasks if t.task_type == "implement"]
         assert len(impl_tasks) == 2
-        by_based_on = {t.based_on: t for t in impl_tasks}
-        assert plan.id in by_based_on
-        assert explore.id in by_based_on
-        assert by_based_on[plan.id].prompt.startswith(f"Implement plan from task {plan.id}")
-        assert by_based_on[explore.id].prompt.startswith(f"Implement findings from task {explore.id}")
+        by_depends_on = {t.depends_on: t for t in impl_tasks}
+        assert plan.id in by_depends_on
+        assert explore.id in by_depends_on
+        assert all(t.based_on is None for t in impl_tasks)
+        assert by_depends_on[plan.id].prompt.startswith(f"Implement plan from task {plan.id}")
+        assert by_depends_on[explore.id].prompt.startswith(f"Implement findings from task {explore.id}")
 
     def test_advance_unimplemented_dry_run_no_create(self, tmp_path: Path):
         """advance --unimplemented --create --dry-run shows preview but creates nothing."""
