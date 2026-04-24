@@ -3,6 +3,7 @@
 project_name: gza
 
 verify_command: 'uv run ruff check src/gza/ && uv run ty check src/gza/ && uv run mypy src/ && uv run python -m checks && uv run pytest tests/ -x -q'
+docker_setup_command: 'uv sync'
 
 branch_strategy: date_slug
 

@@ -358,7 +358,7 @@ class Config:
     providers: dict[str, ProviderConfig] = field(default_factory=dict)  # Provider-scoped config
     branch_strategy: BranchStrategy | None = None  # Branch naming strategy
     chat_text_display_length: int = DEFAULT_CHAT_TEXT_DISPLAY_LENGTH  # 0 = unlimited
-    docker_setup_command: str = ""  # Command to run inside container before CLI starts
+    docker_setup_command: str = ""  # Pre-warm command run synchronously before provider CLI starts
     verify_command: str = ""  # Command to run before finishing (e.g., mypy + pytest)
     advance_create_reviews: bool = DEFAULT_ADVANCE_CREATE_REVIEWS
     advance_requires_review: bool = DEFAULT_ADVANCE_REQUIRES_REVIEW

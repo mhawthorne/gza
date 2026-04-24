@@ -22,6 +22,7 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `log_dir` | String | `.gza/logs` | Directory for log files |
 | `use_docker` | Boolean | `true` | Whether to run Claude in Docker container |
 | `docker_image` | String | `{project_name}-gza` | Custom Docker image name |
+| `docker_setup_command` | String | `""` | Pre-warm hook run synchronously in Docker before provider CLI starts |
 | `docker_volumes` | List | `[]` | Custom Docker volume mounts (e.g., `["/host:/container:ro"]`) |
 | `timeout_minutes` | Integer | `10` | Maximum time per task in minutes |
 | `branch_mode` | String | `multi` | Branch strategy: `single` or `multi` |
@@ -221,6 +222,31 @@ docker_volumes:
 - Tilde (`~`) in source paths is automatically expanded to your home directory
 - The workspace is always mounted at `/workspace` automatically
 - Config validation warns about common syntax errors but doesn't block invalid formats
+
+### Docker Pre-Warm Hook (`docker_setup_command`)
+
+Use `docker_setup_command` in `gza.yaml` for one-time container environment preparation before the agent starts.
+
+```yaml
+docker_setup_command: "uv sync"
+```
+
+How it runs:
+- Runs synchronously inside the container before the provider CLI process starts.
+- Runs on a single process once per provider invocation, so setup does not race with parallel tool calls or subagents.
+- Is concatenated with the internal shim installer in the container entrypoint and evaluated before provider startup.
+
+What to put here:
+- Python (`uv`): `uv sync`
+- Python (`Poetry`): `poetry install --no-interaction`
+- Python (`pip`): `pip install -e .`
+- Node-side prep: `npm ci`
+- Mixed stacks: chained setup such as `uv sync && npm ci`
+
+Why this matters:
+- Without `docker_setup_command`, dependency installs are often lazy on the first CLI invocation.
+- If the agent parallelizes initial commands, those first lazy installs can race and fail (for example, shared wheel staging collisions).
+- Pre-warming in `docker_setup_command` makes later `uv run ...`/CLI invocations no-op for environment setup and avoids first-use install contention.
 
 ### Claude Configuration
 
@@ -1453,6 +1479,7 @@ project_name: my-app
 
 # Execution settings
 use_docker: true
+docker_setup_command: "uv sync"
 timeout_minutes: 15
 max_turns: 80
 work_count: 3

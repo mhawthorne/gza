@@ -37,3 +37,10 @@ def test_configuration_doc_mentions_all_registered_keys() -> None:
     missing = [spec.key for spec in CONFIG_KEY_REGISTRY if spec.key not in docs_text]
     assert not missing, f"Missing config keys in docs/configuration.md: {missing}"
 
+
+def test_docker_setup_command_registry_description_mentions_prewarm_execution() -> None:
+    """Discoverable key metadata should describe docker_setup_command pre-warm semantics."""
+    docker_setup_spec = next(spec for spec in CONFIG_KEY_REGISTRY if spec.key == "docker_setup_command")
+    assert "Pre-warm" in docker_setup_spec.description
+    assert "synchronously" in docker_setup_spec.description
+    assert "before provider CLI starts" in docker_setup_spec.description

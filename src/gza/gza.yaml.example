@@ -26,7 +26,8 @@ project_name: my-project
 # Additional Docker volume mounts
 # docker_volumes: []
 
-# Command to run inside container before CLI starts (e.g., dependency install)
+# Pre-warm hook: command run synchronously inside container before provider CLI starts
+# Use for environment prep to avoid first-invocation install races (e.g., uv/poetry/pip/npm)
 # docker_setup_command: ""
 
 # Maximum time per task in minutes

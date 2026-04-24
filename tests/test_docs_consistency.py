@@ -140,6 +140,35 @@ def test_configuration_docs_describe_comments_only_improve_path() -> None:
     assert "improve still runs using comments-only feedback" in config_content
 
 
+def test_docker_setup_command_docs_describe_prewarm_hook_and_race_avoidance() -> None:
+    """Docker config docs should explain pre-warm semantics and why first-use lazy installs race."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    config_content = (docs_root / "configuration.md").read_text()
+    docker_content = (docs_root / "docker.md").read_text()
+
+    required_config_snippets = [
+        "### Docker Pre-Warm Hook (`docker_setup_command`)",
+        "Runs synchronously inside the container before the provider CLI process starts.",
+        "so setup does not race with parallel tool calls or subagents.",
+        "dependency installs are often lazy on the first CLI invocation.",
+        'docker_setup_command: "uv sync"',
+        "poetry install --no-interaction",
+        "pip install -e .",
+        "npm ci",
+    ]
+    for snippet in required_config_snippets:
+        assert snippet in config_content
+
+    required_docker_snippets = [
+        "## Pre-Warm Dependencies with `docker_setup_command`",
+        "Runs inside the container before the provider CLI starts.",
+        "Runs synchronously in a single process.",
+        "Completes before the agent can issue tool calls.",
+    ]
+    for snippet in required_docker_snippets:
+        assert snippet in docker_content
+
+
 def test_improve_related_skills_describe_comments_as_feedback_source() -> None:
     """Bundled improve-related skills should mention unresolved task comments as a first-class
     feedback source and describe the comments-only fallback when no review exists.

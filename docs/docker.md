@@ -10,6 +10,34 @@ When you first run `gza work`, it automatically:
 2. Builds a Docker image named `{project_name}-gza`
 3. Runs the AI provider inside that container
 
+Before the provider CLI starts, Gza also runs the internal shim setup command. If you set `docker_setup_command` in `gza.yaml`, that command is appended and executed in the same synchronous pre-start step.
+
+## Pre-Warm Dependencies with `docker_setup_command`
+
+`docker_setup_command` is the pre-warm hook for project environment setup inside Docker.
+
+```yaml
+# gza.yaml
+docker_setup_command: "uv sync"
+```
+
+Execution model:
+- Runs inside the container before the provider CLI starts.
+- Runs synchronously in a single process.
+- Completes before the agent can issue tool calls.
+
+Use it for dependency/environment prep that should be done once up front:
+- `uv sync`
+- `poetry install --no-interaction`
+- `pip install -e .`
+- `npm ci`
+- Combined setup such as `uv sync && npm ci`
+
+Why this is important:
+- Without this hook, installs may happen lazily on the first provider/tool invocation.
+- Parallel first invocations can race on installer state.
+- Pre-warming eliminates those first-use install races and makes later `uv run ...` calls no-op for environment setup.
+
 The default Dockerfile only includes Node.js and the AI CLI tool:
 
 ```dockerfile

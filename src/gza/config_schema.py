@@ -47,7 +47,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("defaults.max_turns", "int", 50, "Deprecated legacy alias for defaults.max_steps."),
     ConfigKeySpec("defaults.model", "str", "", "Legacy global default model fallback."),
     ConfigKeySpec("docker_image", "str", "{project_name}-gza", "Docker image used for task execution."),
-    ConfigKeySpec("docker_setup_command", "str", "", "Command run inside Docker before provider starts."),
+    ConfigKeySpec(
+        "docker_setup_command",
+        "str",
+        "",
+        "Pre-warm command run synchronously inside Docker before provider CLI starts.",
+    ),
     ConfigKeySpec("docker_volumes", "list[str]", [], "Extra Docker volume mounts (`source:dest[:mode]`)."),
     ConfigKeySpec("interactive_worktree_dir", "str", "", "Base path for interactive worktree operations."),
     ConfigKeySpec("iterate_max_iterations", "int", 3, "Default iteration budget for `gza iterate`."),
@@ -92,4 +97,3 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("work_count", "int", 1, "Default task count for each `gza work` run."),
     ConfigKeySpec("worktree_dir", "str", "/tmp/gza-worktrees", "Base directory for git worktrees."),
 )
-
