@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import re
 import subprocess
 import time
 from datetime import UTC, datetime
@@ -277,6 +278,71 @@ class _LiveLogPrinter:
         self._total_input_tokens = 0
         self._total_output_tokens = 0
         self._start_time: float | None = None
+        self._configured_provider: str | None = None
+        self._configured_model: str | None = None
+        self._provider_reported_model: str | None = None
+        self._last_model_display_key: tuple[str | None, str | None, str | None] | None = None
+
+    _PROVIDER_MODEL_INFO_RE = re.compile(
+        r"^Provider:\s*(?P<provider>[^,]+),\s*Model:\s*(?P<model>.+?)\s*$"
+    )
+
+    @classmethod
+    def _parse_configured_provider_model(cls, message: str) -> tuple[str | None, str | None]:
+        """Parse configured provider/model from standard gza info line."""
+        match = cls._PROVIDER_MODEL_INFO_RE.match(message.strip())
+        if not match:
+            return None, None
+        provider = match.group("provider").strip() or None
+        model = match.group("model").strip() or None
+        return provider, model
+
+    @staticmethod
+    def _extract_provider_model(entry: dict) -> str | None:
+        """Extract provider-reported model from a provider event when present."""
+        candidate_keys = ("model", "model_name", "provider_model")
+        for key in candidate_keys:
+            value = entry.get(key)
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    return stripped
+        return None
+
+    def _render_model_parity_if_changed(self, *, include_missing_provider_note: bool = False) -> None:
+        """Render configured/provider model parity when state changes."""
+        key = (
+            self._configured_provider,
+            self._configured_model,
+            self._provider_reported_model,
+        )
+        if key == self._last_model_display_key:
+            return
+
+        if not self._configured_model and not self._provider_reported_model:
+            return
+
+        provider_label = self._configured_provider or "Provider"
+        configured = self._configured_model or "unknown"
+        provider_reported = self._provider_reported_model
+
+        if provider_reported:
+            self._last_model_display_key = key
+            self._fmt.print_agent_message(
+                f"{provider_label} model parity: configured={configured}, provider_reported={provider_reported}"
+            )
+            if configured != provider_reported:
+                self._console.print(
+                    f"[yellow]WARNING: Model mismatch ({configured} != {provider_reported})[/yellow]",
+                    soft_wrap=True,
+                )
+            return
+
+        if include_missing_provider_note and self._configured_model:
+            self._last_model_display_key = key
+            self._fmt.print_agent_message(
+                f"{provider_label} model parity: configured={configured}, provider_reported=(provider did not echo model)"
+            )
 
     def process(self, entry: dict) -> None:
         """Process a single JSON log entry and print it."""
@@ -285,8 +351,19 @@ class _LiveLogPrinter:
         if entry_type == "system":
             subtype = entry.get("subtype", "")
             if subtype == "init":
-                model = entry.get("model", "unknown")
-                self._fmt.print_agent_message(f"Session initialized (model: {model})")
+                self._fmt.print_agent_message("Session initialized")
+                provider_model = self._extract_provider_model(entry)
+                if provider_model:
+                    self._provider_reported_model = provider_model
+                self._render_model_parity_if_changed(include_missing_provider_note=True)
+
+        elif entry_type == "init":
+            # Gemini stream-json init event.
+            self._fmt.print_agent_message("Session initialized")
+            provider_model = self._extract_provider_model(entry)
+            if provider_model:
+                self._provider_reported_model = provider_model
+            self._render_model_parity_if_changed(include_missing_provider_note=True)
 
         elif entry_type == "assistant":
             message = entry.get("message", {})
@@ -357,6 +434,13 @@ class _LiveLogPrinter:
         elif entry_type == "gza":
             subtype = entry.get("subtype", "")
             message = entry.get("message", "")
+            if subtype == "info" and isinstance(message, str):
+                provider_name, configured_model = self._parse_configured_provider_model(message)
+                if provider_name:
+                    self._configured_provider = provider_name
+                if configured_model:
+                    self._configured_model = configured_model
+                self._render_model_parity_if_changed()
             if message:
                 if subtype:
                     self._console.print(f"[{_lc()}]\\[gza:{rich_escape(subtype)}][/{_lc()}] {rich_escape(message)}", soft_wrap=True)
@@ -365,8 +449,12 @@ class _LiveLogPrinter:
 
         elif entry_type == "thread.started":
             thread_id = entry.get("thread_id", "")
+            provider_model = self._extract_provider_model(entry)
+            if provider_model:
+                self._provider_reported_model = provider_model
             if thread_id:
                 self._fmt.print_agent_message(f"Session started (thread: {thread_id})")
+            self._render_model_parity_if_changed(include_missing_provider_note=True)
 
         elif entry_type == "turn.started":
             # Codex emits turn.started once per session (not per logical step).
@@ -416,6 +504,7 @@ class _LiveLogPrinter:
                         self._console.print(rich_escape(output), style=SHOW_COLORS_DICT["label"], soft_wrap=True)
 
         elif entry_type == "result":
+            self._render_model_parity_if_changed(include_missing_provider_note=True)
             is_error = entry.get("is_error", False)
             subtype = str(entry.get("subtype") or "")
             result_text = entry.get("result", "")

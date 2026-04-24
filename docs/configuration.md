@@ -510,6 +510,7 @@ gza log <identifier> [options]
 
 By default, the identifier is treated as a full task ID (for example `gza-1234`).
 If no main task log exists yet, `gza log` can fall back to worker startup logs in `.gza/workers/*-startup.log`.
+When stream metadata is present, `gza log` also shows model parity in-session: configured model (from `gza/info`) vs provider-reported model, including a warning on mismatch or an explicit note when the provider does not echo a model.
 
 ### stats
 

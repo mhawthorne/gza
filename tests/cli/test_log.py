@@ -1252,3 +1252,165 @@ def test_live_log_printer_uses_formatter_console_for_stream_output(monkeypatch: 
 
     assert formatter_kwargs == {}
     assert any("\\[result] warning:" in line for line in printed)
+
+
+def test_live_log_printer_renders_claude_model_parity_when_models_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gza.providers.output_formatter as output_formatter
+
+    agent_messages: list[str] = []
+    console_lines: list[str] = []
+
+    class _FakeConsole:
+        def print(self, *args: Any, **_kwargs: Any) -> None:
+            if args:
+                console_lines.append(str(args[0]))
+
+    class _FakeFormatter:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.console = _FakeConsole()
+
+        def print_agent_message(self, text: str, **_kwargs: Any) -> None:
+            agent_messages.append(text)
+
+        def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_error(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(output_formatter, "StreamOutputFormatter", _FakeFormatter)
+    monkeypatch.setattr(output_formatter, "truncate_text", lambda text, _max_length: text)
+
+    printer = _LiveLogPrinter()
+    printer.process({"type": "gza", "subtype": "info", "message": "Provider: Claude, Model: claude-opus-4-6"})
+    printer.process({"type": "system", "subtype": "init", "model": "claude-opus-4-6"})
+
+    assert "Claude model parity: configured=claude-opus-4-6, provider_reported=claude-opus-4-6" in agent_messages
+    assert not any("WARNING: Model mismatch" in line for line in console_lines)
+    assert not any("provider did not echo model" in line for line in agent_messages)
+
+
+def test_live_log_printer_warns_on_model_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gza.providers.output_formatter as output_formatter
+
+    agent_messages: list[str] = []
+    console_lines: list[str] = []
+
+    class _FakeConsole:
+        def print(self, *args: Any, **_kwargs: Any) -> None:
+            if args:
+                console_lines.append(str(args[0]))
+
+    class _FakeFormatter:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.console = _FakeConsole()
+
+        def print_agent_message(self, text: str, **_kwargs: Any) -> None:
+            agent_messages.append(text)
+
+        def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_error(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(output_formatter, "StreamOutputFormatter", _FakeFormatter)
+    monkeypatch.setattr(output_formatter, "truncate_text", lambda text, _max_length: text)
+
+    printer = _LiveLogPrinter()
+    printer.process({"type": "gza", "subtype": "info", "message": "Provider: Claude, Model: claude-opus-4-6"})
+    printer.process({"type": "system", "subtype": "init", "model": "claude-sonnet-4-5"})
+
+    assert "Claude model parity: configured=claude-opus-4-6, provider_reported=claude-sonnet-4-5" in agent_messages
+    assert any("WARNING: Model mismatch (claude-opus-4-6 != claude-sonnet-4-5)" in line for line in console_lines)
+
+
+def test_live_log_printer_notes_when_provider_does_not_echo_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gza.providers.output_formatter as output_formatter
+
+    agent_messages: list[str] = []
+
+    class _FakeConsole:
+        def print(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    class _FakeFormatter:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.console = _FakeConsole()
+
+        def print_agent_message(self, text: str, **_kwargs: Any) -> None:
+            agent_messages.append(text)
+
+        def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_error(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(output_formatter, "StreamOutputFormatter", _FakeFormatter)
+    monkeypatch.setattr(output_formatter, "truncate_text", lambda text, _max_length: text)
+
+    printer = _LiveLogPrinter()
+    printer.process({"type": "gza", "subtype": "info", "message": "Provider: Codex, Model: gpt-5.3-codex"})
+    printer.process({"type": "thread.started", "thread_id": "thread_abc"})
+
+    assert "Codex model parity: configured=gpt-5.3-codex, provider_reported=(provider did not echo model)" in agent_messages
+
+
+def test_live_log_printer_parses_gemini_init_model_for_parity(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gza.providers.output_formatter as output_formatter
+
+    agent_messages: list[str] = []
+    console_lines: list[str] = []
+
+    class _FakeConsole:
+        def print(self, *args: Any, **_kwargs: Any) -> None:
+            if args:
+                console_lines.append(str(args[0]))
+
+    class _FakeFormatter:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.console = _FakeConsole()
+
+        def print_agent_message(self, text: str, **_kwargs: Any) -> None:
+            agent_messages.append(text)
+
+        def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_error(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(output_formatter, "StreamOutputFormatter", _FakeFormatter)
+    monkeypatch.setattr(output_formatter, "truncate_text", lambda text, _max_length: text)
+
+    printer = _LiveLogPrinter()
+    printer.process({"type": "gza", "subtype": "info", "message": "Provider: Gemini, Model: gemini-2.5-pro"})
+    printer.process({"type": "init", "model": "gemini-2.5-flash"})
+
+    assert "Gemini model parity: configured=gemini-2.5-pro, provider_reported=gemini-2.5-flash" in agent_messages
+    assert any("WARNING: Model mismatch (gemini-2.5-pro != gemini-2.5-flash)" in line for line in console_lines)
