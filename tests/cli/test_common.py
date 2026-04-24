@@ -108,7 +108,7 @@ class TestRunWithResume:
         assert seen_resume_flags == [False, True]
         assert len(store.get_all()) == 2  # original + 1 resume child
 
-    def test_resumes_on_max_steps_and_max_turns(self, tmp_path):
+    def test_resumes_on_max_steps_max_turns_and_terminated(self, tmp_path):
         (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
         config = Config.load(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
@@ -117,7 +117,7 @@ class TestRunWithResume:
         task.session_id = "sess-123"
         store.update(task)
 
-        outcomes = ["MAX_STEPS", "MAX_TURNS", None]
+        outcomes = ["MAX_STEPS", "MAX_TURNS", "TERMINATED", None]
         seen_resume_flags: list[bool] = []
 
         def _run_task(run_task, resume: bool) -> int:
@@ -143,8 +143,8 @@ class TestRunWithResume:
 
         assert rc == 0
         assert final_task.status == "completed"
-        assert seen_resume_flags == [False, True, True]
-        assert len(store.get_all()) == 3  # original + 2 resume children
+        assert seen_resume_flags == [False, True, True, True]
+        assert len(store.get_all()) == 4  # original + 3 resume children
 
     def test_stops_after_max_resume_attempts(self, tmp_path):
         (tmp_path / "gza.yaml").write_text("project_name: test-project\n")

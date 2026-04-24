@@ -55,6 +55,7 @@ from .task_slug import (
 logger = logging.getLogger(__name__)
 
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
+TERMINATED_FAILURE_REASON = "TERMINATED"
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,13 @@ class RunInvocationContext:
     command: str
     execution_mode: str
     interaction_mode: str = "observe_only"
+
+
+def _interruption_failure_reason() -> str:
+    """Classify an interrupted run based on the triggering signal, when known."""
+    if os.environ.get("GZA_INTERRUPT_SIGNAL") == "SIGTERM":
+        return TERMINATED_FAILURE_REASON
+    return "INTERRUPTED"
 
 
 _TASK_EXECUTION_MODE_BY_INVOCATION_MODE: dict[str, str] = {
@@ -3028,9 +3036,10 @@ def _run_inner(
         store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), branch=branch_name, failure_reason="GIT_ERROR")
         return 1
     except KeyboardInterrupt:
+        failure_reason = _interruption_failure_reason()
         # Save WIP changes before returning
         _save_wip_changes(task, worktree_git, config, branch_name)
-        store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), branch=branch_name, failure_reason="INTERRUPTED")
+        store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), branch=branch_name, failure_reason=failure_reason)
         console.print("\nInterrupted")
         return 130
 
@@ -3192,7 +3201,8 @@ def _run_non_code_task(
                 provider_run_kwargs["interactive"] = True
             result = provider.run(config, prompt, log_file, worktree_path, **provider_run_kwargs)
         except KeyboardInterrupt:
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), failure_reason="INTERRUPTED")
+            failure_reason = _interruption_failure_reason()
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), failure_reason=failure_reason)
             console.print("\nInterrupted")
             return 130
         finally:

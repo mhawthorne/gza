@@ -2,7 +2,12 @@
 
 from collections.abc import Sequence
 
-RESUMABLE_FAILURE_REASONS: tuple[str, ...] = ("MAX_STEPS", "MAX_TURNS")
+from .resume_policy import RESUMABLE_FAILURE_REASONS as _RESUMABLE_FAILURE_REASONS
+
+RESUMABLE_FAILURE_REASONS: tuple[str, ...] = tuple(
+    reason for reason in ("MAX_STEPS", "MAX_TURNS", "TIMEOUT", "TERMINATED")
+    if reason in _RESUMABLE_FAILURE_REASONS
+)
 
 
 def is_resumable_failure_reason(reason: str | None) -> bool:

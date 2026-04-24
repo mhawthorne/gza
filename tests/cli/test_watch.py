@@ -590,13 +590,23 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
     git.count_commits_ahead.return_value = 3
+    captured: dict[str, object] = {}
+
+    def fake_execute_merge_action(config_arg, store_arg, git_arg, task_arg, action_arg, *, target_branch, current_branch):
+        del store_arg, action_arg, current_branch
+        from types import SimpleNamespace
+
+        from gza.cli.git_ops import _build_auto_merge_args
+
+        captured["merge_args"] = _build_auto_merge_args(config_arg, git_arg, task_arg, target_branch)
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
-        patch("gza.cli.watch._merge_single_task", return_value=0) as merge_single,
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
     ):
         _run_cycle(
             config=config,
@@ -606,7 +616,7 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
             dry_run=False,
             log=log,
         )
-        watch_merge_args = merge_single.call_args.args[4]
+        watch_merge_args = captured["merge_args"]
         from gza.cli.git_ops import _build_auto_merge_args
         advance_merge_args = _build_auto_merge_args(config, git, task, "main")
 
@@ -837,7 +847,7 @@ def test_watch_cycle_quiet_off_default_branch_suppresses_stdout_and_logs_skip(
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
-        patch("gza.cli.watch._merge_single_task", return_value=0) as merge_single,
+        patch("gza.cli.watch._execute_merge_action") as merge_exec,
     ):
         _run_cycle(
             config=config,
@@ -851,7 +861,7 @@ def test_watch_cycle_quiet_off_default_branch_suppresses_stdout_and_logs_skip(
 
     stdout = capsys.readouterr().out
     assert "`gza merge` must be run from the default branch" not in stdout
-    assert merge_single.call_count == 0
+    assert merge_exec.call_count == 0
     assert "SKIP   merge actions skipped: not on default branch" in log_path.read_text()
 
 

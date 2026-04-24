@@ -1532,6 +1532,49 @@ class TestBackgroundWorkerCommand:
         assert worker.log_file is None
         assert (tmp_path / worker.startup_log_file).exists()
 
+    def test_background_iterate_worker_passes_worker_id_to_child(self, tmp_path: Path):
+        """Background iterate workers must pass the generated worker_id to the child process."""
+        import argparse
+        from unittest.mock import MagicMock
+
+        from gza.cli._common import _spawn_background_iterate_worker
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl_task = store.add("Iterate in background", task_type="implement")
+        assert impl_task.id is not None
+
+        config = Config.load(tmp_path)
+        args = argparse.Namespace(
+            no_docker=True,
+            force=False,
+        )
+
+        captured_cmd: list[str] | None = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 42424
+
+        def fake_spawn(cmd: list[str], _config: Config, worker_id: str):
+            nonlocal captured_cmd
+            captured_cmd = list(cmd)
+            startup_log = f".gza/workers/{worker_id}-startup.log"
+            return mock_proc, startup_log
+
+        with patch("gza.cli._common._spawn_detached_worker_process", side_effect=fake_spawn):
+            rc = _spawn_background_iterate_worker(args, config, impl_task, max_iterations=3)
+
+        assert rc == 0
+        assert captured_cmd is not None
+        assert "--worker-id" in captured_cmd
+        worker_id = captured_cmd[captured_cmd.index("--worker-id") + 1]
+
+        registry = WorkerRegistry(config.workers_path)
+        worker = registry.get(worker_id)
+        assert worker is not None
+        assert worker.task_id == impl_task.id
+        assert worker.pid == 42424
+
     def test_background_worker_allows_failed_pr_required_task_with_pr_flag(self, tmp_path: Path):
         """Background explicit work should allow retrying failed PR_REQUIRED tasks with --pr."""
         import argparse
