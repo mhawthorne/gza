@@ -1160,7 +1160,6 @@ gza implement <plan_task_id> [prompt] [options]
 | `prompt` | Implementation prompt (defaults to plan-derived prompt) |
 | `--review` | Auto-create review task on completion |
 | `--group NAME` | Set task group |
-| `--depends-on ID` | Set dependency on another task by full prefixed task ID (e.g. `gza-1234`) |
 | `--same-branch` | Continue on depends_on task's branch instead of creating new |
 | `--branch-type TYPE` | Set branch type hint for branch naming |
 | `--model MODEL` | Override model for this task |

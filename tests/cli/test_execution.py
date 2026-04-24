@@ -2021,6 +2021,32 @@ class TestImplementCommand:
         assert impl_task.based_on is None
         assert impl_task.depends_on == plan_task.id
 
+    def test_implement_rejects_depends_on_flag(self, tmp_path: Path):
+        """Implement command should fail fast for removed --depends-on flag."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        dep_task = store.add("Independent dependency", task_type="implement")
+
+        result = run_gza(
+            "implement",
+            str(plan_task.id),
+            "--depends-on",
+            str(dep_task.id),
+            "--queue",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 2
+        assert "unrecognized arguments: --depends-on" in result.stderr
+
 
 class TestImproveCommand:
     """Tests for 'gza improve' command."""
