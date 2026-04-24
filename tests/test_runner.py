@@ -56,6 +56,7 @@ from gza.runner import (
     write_log_entry,
     write_worker_start_event,
 )
+from gza.providers.base import PreflightCheckResult
 
 
 class TestGetTaskOutputPaths:
@@ -5233,10 +5234,11 @@ class TestTaskClaimSafety:
         assert refreshed.execution_mode == "foreground_inline"
 
     @pytest.mark.parametrize(
-        ("failure_stage", "invocation"),
+        ("failure_stage", "invocation", "expected_reason", "expected_message"),
         [
-            ("check", None),
-            ("verify", None),
+            ("check", None, "PROVIDER_UNAVAILABLE", "Preflight failed: missing TestProvider credentials"),
+            ("verify", None, "PROVIDER_UNAVAILABLE", "Preflight failed: TestProvider credential verification failed"),
+            ("verify_infra", None, "INFRASTRUCTURE_ERROR", "Preflight failed: Docker daemon is not running"),
             (
                 "check",
                 RunInvocationContext(
@@ -5244,6 +5246,8 @@ class TestTaskClaimSafety:
                     execution_mode="foreground_inline",
                     interaction_mode="auto",
                 ),
+                "PROVIDER_UNAVAILABLE",
+                "Preflight failed: missing TestProvider credentials",
             ),
             (
                 "verify",
@@ -5252,6 +5256,8 @@ class TestTaskClaimSafety:
                     execution_mode="foreground_inline",
                     interaction_mode="auto",
                 ),
+                "PROVIDER_UNAVAILABLE",
+                "Preflight failed: TestProvider credential verification failed",
             ),
         ],
     )
@@ -5260,6 +5266,8 @@ class TestTaskClaimSafety:
         tmp_path: Path,
         failure_stage: str,
         invocation: RunInvocationContext | None,
+        expected_reason: str,
+        expected_message: str,
     ):
         """Credential preflight failures must persist failed state + provenance/outcome logs."""
         db_path = tmp_path / "test.db"
@@ -5276,7 +5284,18 @@ class TestTaskClaimSafety:
             mock_provider.name = "TestProvider"
             mock_provider.supports_interactive_foreground = True
             mock_provider.check_credentials.return_value = failure_stage != "check"
-            mock_provider.verify_credentials.return_value = failure_stage != "verify"
+            if failure_stage == "verify":
+                mock_provider.verify_credentials.return_value = PreflightCheckResult.failure(
+                    failure_reason="PROVIDER_UNAVAILABLE",
+                    message="Preflight failed: TestProvider credential verification failed",
+                )
+            elif failure_stage == "verify_infra":
+                mock_provider.verify_credentials.return_value = PreflightCheckResult.failure(
+                    failure_reason="INFRASTRUCTURE_ERROR",
+                    message="Preflight failed: Docker daemon is not running",
+                )
+            else:
+                mock_provider.verify_credentials.return_value = PreflightCheckResult.success()
             mock_provider.credential_setup_hint = "set creds"
             mock_get_provider.return_value = mock_provider
 
@@ -5286,12 +5305,12 @@ class TestTaskClaimSafety:
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.status == "failed"
-        assert refreshed.failure_reason == "PROVIDER_UNAVAILABLE"
+        assert refreshed.failure_reason == expected_reason
         assert refreshed.log_file is not None
         log_content = (tmp_path / refreshed.log_file).read_text()
-        assert "PROVIDER_UNAVAILABLE" in log_content
+        assert expected_reason in log_content
         assert '"subtype": "execution"' in log_content
-        assert "Preflight failed" in log_content
+        assert expected_message in log_content
 
         import json
 

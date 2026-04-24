@@ -40,6 +40,7 @@ from .lineage import get_plan_for_task
 from .pr_ops import ensure_task_pr
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
+from .providers.base import PreflightCheckResult
 from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
 from .review_verdict import (
     compute_review_score,
@@ -324,6 +325,77 @@ def _mark_preflight_provider_unavailable(
         task,
         log_file=task_log_storage_path(config, log_file),
         failure_reason="PROVIDER_UNAVAILABLE",
+    )
+
+
+def _normalize_preflight_result(result: bool | PreflightCheckResult) -> PreflightCheckResult:
+    """Normalize legacy bool provider preflight results to structured outcomes."""
+    if isinstance(result, PreflightCheckResult):
+        return result
+    if result:
+        return PreflightCheckResult.success()
+    return PreflightCheckResult.failure(
+        failure_reason="PROVIDER_UNAVAILABLE",
+        message="Preflight failed: provider credential verification failed",
+    )
+
+
+def _mark_preflight_failure(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    provider: Provider,
+    invocation: "RunInvocationContext",
+    interaction_mode: str,
+    resume: bool,
+    message: str,
+    failure_reason: str,
+) -> None:
+    """Persist structured preflight failures as task failures with provenance."""
+    log_file = (
+        config.project_dir / Path(task.log_file)
+        if task.log_file
+        else open_task_startup_log(config, task)
+    )
+    log_file_relative = str(log_file.relative_to(config.project_dir))
+    if task.log_file != log_file_relative:
+        task.log_file = log_file_relative
+        store.update(task)
+
+    write_worker_start_event(log_file, resumed=resume)
+    write_log_entry(
+        log_file,
+        {"type": "gza", "subtype": "info", "message": f"Task: {task.id} {task.slug or ''}".strip()},
+    )
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "info",
+            "message": f"Provider: {provider.name}, Model: {config.model or 'default'}",
+        },
+    )
+    write_execution_provenance_event(
+        log_file,
+        invocation=invocation,
+        provider=provider,
+        interaction_mode=interaction_mode,
+        resumed=resume,
+    )
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "outcome",
+            "message": message,
+            "failure_reason": failure_reason,
+        },
+    )
+    store.mark_failed(
+        task,
+        log_file=str(log_file.relative_to(config.project_dir)),
+        failure_reason=failure_reason,
     )
 
 
@@ -2071,8 +2143,11 @@ def run(
 
     # Verify credentials work before proceeding
     console.print(f"Verifying {provider.name} credentials...")
-    if not provider.verify_credentials(task_config, log_file=preflight_log):
-        _mark_preflight_provider_unavailable(
+    preflight_result = _normalize_preflight_result(
+        provider.verify_credentials(task_config, log_file=preflight_log)
+    )
+    if not preflight_result.ok:
+        _mark_preflight_failure(
             task=task,
             config=config,
             store=store,
@@ -2080,7 +2155,8 @@ def run(
             invocation=invocation_context,
             interaction_mode=resolved_interaction_mode,
             resume=resume,
-            message=f"Preflight failed: {provider.name} credential verification failed",
+            message=preflight_result.message or f"Preflight failed: {provider.name} verification failed",
+            failure_reason=preflight_result.failure_reason or "PROVIDER_UNAVAILABLE",
         )
         return 1
     rc = _colors.RUNNER_COLORS

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from .base import (
     DockerConfig,
+    PreflightCheckResult,
     Provider,
     RunResult,
     build_docker_cmd,
@@ -100,13 +101,13 @@ class GeminiProvider(Provider):
             return True
         return False
 
-    def verify_credentials(self, config: Config, log_file: Path | None = None) -> bool:
+    def verify_credentials(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify Gemini credentials by testing the gemini command."""
         if config.use_docker:
             return self._verify_docker(config, log_file=log_file)
         return self._verify_direct(log_file=log_file)
 
-    def _verify_docker(self, config: Config, log_file: Path | None = None) -> bool:
+    def _verify_docker(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify credentials work in Docker."""
         image_name = f"{config.docker_image}-gemini"
         docker_config = _get_docker_config(image_name)
@@ -121,8 +122,11 @@ class GeminiProvider(Provider):
                 message="Failed to build Gemini Docker image",
             )
             print("Error: Failed to build Docker image")
-            return False
-        return verify_docker_credentials(
+            return PreflightCheckResult.failure(
+                failure_reason="INFRASTRUCTURE_ERROR",
+                message="Preflight failed: failed to build Gemini Docker image",
+            )
+        result = verify_docker_credentials(
             docker_config=docker_config,
             version_cmd=["gemini", "--version"],
             error_patterns=["authentication", "api key", "unauthorized"],
@@ -132,8 +136,14 @@ class GeminiProvider(Provider):
             ),
             log_file=log_file,
         )
+        if not result.ok and result.failure_reason == "PROVIDER_UNAVAILABLE":
+            return PreflightCheckResult.failure(
+                failure_reason="PROVIDER_UNAVAILABLE",
+                message="Preflight failed: Gemini credential verification failed",
+            )
+        return result
 
-    def _verify_direct(self, log_file: Path | None = None) -> bool:
+    def _verify_direct(self, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify credentials work directly."""
         cmd = ["gemini", "--version"]
         try:
@@ -153,17 +163,23 @@ class GeminiProvider(Provider):
                 message=f"gemini --version exited {result.returncode}",
             )
             if result.returncode == 0:
-                return True
+                return PreflightCheckResult.success()
             output = result.stdout + result.stderr
             if "not found" in output.lower() or "command not found" in output.lower():
                 print("Error: 'gemini' command not found")
                 print("  Install with: npm install -g @google/gemini-cli")
-                return False
+                return PreflightCheckResult.failure(
+                    failure_reason="INFRASTRUCTURE_ERROR",
+                    message="Preflight failed: gemini CLI not found on PATH",
+                )
             # Check for auth errors
             if "authentication" in output.lower() or "api key" in output.lower():
                 print("Error: Invalid or missing Gemini credentials")
                 print("  Run 'gemini auth' or set GEMINI_API_KEY in .env")
-                return False
+                return PreflightCheckResult.failure(
+                    failure_reason="PROVIDER_UNAVAILABLE",
+                    message="Preflight failed: Gemini credential verification failed",
+                )
         except subprocess.TimeoutExpired:
             write_preflight_entry(
                 log_file,
@@ -175,7 +191,10 @@ class GeminiProvider(Provider):
                 message="gemini --version timed out after 5s",
             )
             print("Error: Gemini CLI timed out")
-            return False
+            return PreflightCheckResult.failure(
+                failure_reason="INFRASTRUCTURE_ERROR",
+                message="Preflight failed: gemini --version timed out",
+            )
         except FileNotFoundError:
             write_preflight_entry(
                 log_file,
@@ -188,8 +207,14 @@ class GeminiProvider(Provider):
             )
             print("Error: 'gemini' command not found")
             print("  Install with: npm install -g @google/gemini-cli")
-            return False
-        return False
+            return PreflightCheckResult.failure(
+                failure_reason="INFRASTRUCTURE_ERROR",
+                message="Preflight failed: gemini CLI not found on PATH",
+            )
+        return PreflightCheckResult.failure(
+            failure_reason="INFRASTRUCTURE_ERROR",
+            message=f"Preflight failed: gemini --version exited {result.returncode}",
+        )
 
     def run(
         self,

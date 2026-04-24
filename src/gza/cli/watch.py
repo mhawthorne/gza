@@ -205,9 +205,16 @@ def _emit_transition_events(
 def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
     registry = WorkerRegistry(config.workers_path)
     live_pids: set[int] = set()
+    active_task_statuses = {
+        str(task.id): task.status
+        for task in store.get_in_progress()
+        if task.id is not None
+    }
 
     for worker in registry.list_all(include_completed=False):
         if worker.status != "running":
+            continue
+        if worker.task_id is not None and active_task_statuses.get(str(worker.task_id)) not in {"pending", "in_progress"}:
             continue
         if not registry.is_running(worker.worker_id):
             continue

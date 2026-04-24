@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from .base import (
     DockerConfig,
+    PreflightCheckResult,
     Provider,
     RunResult,
     build_docker_cmd,
@@ -174,13 +175,13 @@ class ClaudeProvider(Provider):
             return True
         return False
 
-    def verify_credentials(self, config: Config, log_file: Path | None = None) -> bool:
+    def verify_credentials(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify Claude credentials by testing the claude command."""
         if config.use_docker:
             return self._verify_docker(config, log_file=log_file)
         return self._verify_direct(log_file=log_file)
 
-    def _verify_docker(self, config: Config, log_file: Path | None = None) -> bool:
+    def _verify_docker(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify credentials work in Docker."""
         if config.claude.fetch_auth_token_from_keychain:
             sync_keychain_credentials()
@@ -196,8 +197,11 @@ class ClaudeProvider(Provider):
                 message="Failed to build Claude Docker image",
             )
             print("Error: Failed to build Docker image")
-            return False
-        return verify_docker_credentials(
+            return PreflightCheckResult.failure(
+                failure_reason="INFRASTRUCTURE_ERROR",
+                message="Preflight failed: failed to build Claude Docker image",
+            )
+        result = verify_docker_credentials(
             docker_config=docker_config,
             version_cmd=["claude", "--version"],
             error_patterns=["Invalid API key", "Please run /login", "/login"],
@@ -207,8 +211,14 @@ class ClaudeProvider(Provider):
             ),
             log_file=log_file,
         )
+        if not result.ok and result.failure_reason == "PROVIDER_UNAVAILABLE":
+            return PreflightCheckResult.failure(
+                failure_reason="PROVIDER_UNAVAILABLE",
+                message="Preflight failed: Claude credential verification failed",
+            )
+        return result
 
-    def _verify_direct(self, log_file: Path | None = None) -> bool:
+    def _verify_direct(self, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify credentials work directly."""
         cmd = ["claude", "--version"]
         try:
@@ -231,9 +241,12 @@ class ClaudeProvider(Provider):
             if "Invalid API key" in output or "Please run /login" in output or "/login" in output:
                 print("Error: Invalid or missing Claude credentials")
                 print("  Run 'claude login' or set ANTHROPIC_API_KEY in .env")
-                return False
+                return PreflightCheckResult.failure(
+                    failure_reason="PROVIDER_UNAVAILABLE",
+                    message="Preflight failed: Claude credential verification failed",
+                )
             if result.returncode == 0:
-                return True
+                return PreflightCheckResult.success()
         except subprocess.TimeoutExpired:
             write_preflight_entry(
                 log_file,
@@ -245,7 +258,10 @@ class ClaudeProvider(Provider):
                 message="claude --version timed out after 5s",
             )
             print("Error: 'claude --version' timed out (CLI may be hanging)")
-            return False
+            return PreflightCheckResult.failure(
+                failure_reason="INFRASTRUCTURE_ERROR",
+                message="Preflight failed: claude --version timed out",
+            )
         except FileNotFoundError:
             write_preflight_entry(
                 log_file,
@@ -258,8 +274,14 @@ class ClaudeProvider(Provider):
             )
             print("Error: 'claude' command not found")
             print("  Install with: npm install -g @anthropic-ai/claude-code")
-            return False
-        return False
+            return PreflightCheckResult.failure(
+                failure_reason="INFRASTRUCTURE_ERROR",
+                message="Preflight failed: claude CLI not found on PATH",
+            )
+        return PreflightCheckResult.failure(
+            failure_reason="INFRASTRUCTURE_ERROR",
+            message=f"Preflight failed: claude --version exited {result.returncode}",
+        )
 
     def run(
         self,

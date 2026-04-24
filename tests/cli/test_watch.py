@@ -442,6 +442,31 @@ def test_count_live_workers_dedupes_registry_and_in_progress_rows_by_pid(tmp_pat
         assert _count_live_workers(config, store) == 1
 
 
+def test_count_live_workers_ignores_shutting_down_worker_for_terminal_task(tmp_path: Path) -> None:
+    """Terminal tasks should not keep a slot occupied just because the worker PID is still alive."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "INFRASTRUCTURE_ERROR"
+    task.running_pid = None
+    store.update(task)
+
+    config = Config.load(tmp_path)
+    registry = MagicMock()
+    registry.list_all.return_value = [
+        WorkerMetadata(worker_id="w-1", task_id=task.id, pid=4242, status="running"),
+    ]
+    registry.is_running.return_value = True
+
+    with (
+        patch("gza.cli.watch.WorkerRegistry", return_value=registry),
+        patch("gza.cli.watch._pid_alive", return_value=True),
+    ):
+        assert _count_live_workers(config, store) == 0
+
+
 def test_watch_cycle_keeps_free_slot_when_iterate_child_task_shares_pid(tmp_path: Path) -> None:
     """batch=2 should still schedule one task when one iterate process is active."""
     setup_config(tmp_path)
