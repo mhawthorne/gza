@@ -35,7 +35,7 @@ from .git_ops import (
     _collect_advance_completed_tasks,
     _determine_advance_action,
     _execute_merge_action,
-    _merge_single_task,  # noqa: F401  # kept for test patch compatibility
+    _merge_single_task as _git_ops_merge_single_task,
     _prepare_create_review_action,
     _require_default_branch,
     _unimplemented_implement_prompt,
@@ -43,6 +43,18 @@ from .git_ops import (
 
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 T = TypeVar("T")
+
+
+def _merge_single_task(
+    task_id: str,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    args: argparse.Namespace,
+    current_branch: str,
+) -> int:
+    """Compatibility shim for tests patching watch-local merge execution."""
+    return _git_ops_merge_single_task(task_id, config, store, git, args, current_branch)
 
 
 def _watch_skip_message(task: DbTask, action: dict) -> str:

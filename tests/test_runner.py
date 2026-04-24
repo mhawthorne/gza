@@ -3755,6 +3755,75 @@ class TestRunStepPersistenceIntegration:
         assert refreshed.session_id == "sess-interrupted-inline"
         assert refreshed.num_steps_computed == 3
 
+    def test_non_code_sigterm_interrupt_marks_terminated(self, tmp_path: Path):
+        """SIGTERM-driven interrupts should be classified separately from manual interrupts."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.slug = "20260422-plan-terminated"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+        config.model = ""
+        config.chat_text_display_length = 80
+        config.claude = Mock(args=[])
+        config.tmux = Mock(session_name=None)
+
+        def _interrupting_run(
+            _config,
+            _prompt,
+            _log_file,
+            _work_dir,
+            resume_session_id=None,
+            on_session_id=None,
+            on_step_count=None,
+            interactive=False,
+        ):
+            del resume_session_id, on_step_count, interactive
+            assert on_session_id is not None
+            on_session_id("sess-terminated-inline")
+            raise KeyboardInterrupt
+
+        mock_provider = Mock()
+        mock_provider.name = "Claude"
+        mock_provider.run.side_effect = _interrupting_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=1)
+
+        with (
+            patch.dict(os.environ, {"GZA_INTERRUPT_SIGNAL": "SIGTERM"}, clear=False),
+            patch("gza.runner.console"),
+            patch("gza.runner._snapshot_task_db_to_worktree"),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._create_local_dep_symlinks"),
+        ):
+            exit_code = _run_non_code_task(
+                task,
+                config,
+                store,
+                mock_provider,
+                mock_git,
+                resume=False,
+                interaction_mode="interactive",
+            )
+
+        assert exit_code == 130
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "TERMINATED"
+        assert refreshed.session_id == "sess-terminated-inline"
+
 
 class TestResumeVerificationPrompt:
     """Tests for resume verification prompt injection."""

@@ -312,11 +312,17 @@ def _run_foreground(
     # Save original signal handlers so we can restore them in the finally block
     original_sigint = signal.getsignal(signal.SIGINT)
     original_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_interrupt_signal = os.environ.get("GZA_INTERRUPT_SIGNAL")
 
     def _cleanup(signum, frame):
+        del frame
         # Restore original handlers and re-raise so the except block handles cleanup
         signal.signal(signal.SIGINT, original_sigint)
         signal.signal(signal.SIGTERM, original_sigterm)
+        try:
+            os.environ["GZA_INTERRUPT_SIGNAL"] = signal.Signals(signum).name
+        except ValueError:
+            os.environ["GZA_INTERRUPT_SIGNAL"] = str(signum)
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, _cleanup)
@@ -354,6 +360,10 @@ def _run_foreground(
     finally:
         signal.signal(signal.SIGINT, original_sigint)
         signal.signal(signal.SIGTERM, original_sigterm)
+        if previous_interrupt_signal is None:
+            os.environ.pop("GZA_INTERRUPT_SIGNAL", None)
+        else:
+            os.environ["GZA_INTERRUPT_SIGNAL"] = previous_interrupt_signal
 
 
 def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: str | None = None, quiet: bool = False) -> int:
@@ -819,6 +829,7 @@ def _spawn_background_iterate_worker(
         return 0
 
     worker_id = registry.generate_worker_id()
+    inner_cmd.extend(["--worker-id", worker_id])
 
     try:
         proc, startup_log_rel = _spawn_detached_worker_process(inner_cmd, config, worker_id)
@@ -1696,6 +1707,7 @@ def _failure_summary(reason: str) -> str:
     summaries = {
         "MAX_STEPS": "Stopped due to max steps limit.",
         "MAX_TURNS": "Stopped due to max steps limit.",
+        "TERMINATED": "Stopped by an external termination signal.",
         "PREREQUISITE_UNMERGED": "Dependency is not yet merged to main.",
         "TEST_FAILURE": "Stopped due to verification/test failure.",
         "UNKNOWN": "Task failed; inspect log output for details.",
