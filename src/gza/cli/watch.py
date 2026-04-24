@@ -575,7 +575,10 @@ def _run_cycle(
                 if task.id is None:
                     continue
                 if dry_run:
-                    log.emit("START", f"(new) implement for {task.id} [dry-run]")
+                    log.emit(
+                        "START",
+                        f"(new) implement child for completed {task.task_type} {task.id} [dry-run]",
+                    )
                     slots -= 1
                     work_done = True
                     continue
