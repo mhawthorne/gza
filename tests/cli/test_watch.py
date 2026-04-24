@@ -388,7 +388,7 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
         assert spawn_iterate.call_count == 1
         assert spawn_worker.call_count == 0
         created_children = [
-            task for task in store.get_based_on_children(root.id) if task.task_type == "implement"
+            task for task in store.get_all() if task.task_type == "implement" and task.depends_on == root.id
         ]
         assert len(created_children) == 1
         child_id = str(created_children[0].id)
@@ -596,7 +596,7 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
-        patch("gza.cli.watch._merge_single_task", return_value=0) as merge_single,
+        patch("gza.cli.git_ops._merge_single_task", return_value=0) as merge_single,
     ):
         _run_cycle(
             config=config,
@@ -837,7 +837,7 @@ def test_watch_cycle_quiet_off_default_branch_suppresses_stdout_and_logs_skip(
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
-        patch("gza.cli.watch._merge_single_task", return_value=0) as merge_single,
+        patch("gza.cli.git_ops._merge_single_task", return_value=0) as merge_single,
     ):
         _run_cycle(
             config=config,
@@ -976,7 +976,7 @@ def test_watch_cycle_creates_implement_from_completed_plan_with_iterate_mode(tmp
     created_impl = spawn_iterate.call_args.args[2]
     assert iterate_args.max_iterations == 7
     assert created_impl.task_type == "implement"
-    assert created_impl.based_on == plan.id
+    assert created_impl.depends_on == plan.id
 
 
 @pytest.mark.parametrize(

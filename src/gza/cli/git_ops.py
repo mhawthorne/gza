@@ -37,7 +37,6 @@ from ..prompts import PromptBuilder
 from ..runner import get_effective_config_for_task, load_dotenv
 from ._common import (
     DuplicateReviewError,
-    _create_improve_task,
     _create_or_reuse_followup_tasks,
     _create_rebase_task,
     _create_resume_task,
@@ -50,9 +49,9 @@ from ._common import (
     get_review_verdict,  # noqa: F401  # re-exported for test patching
     get_store,
     resolve_id,
-    resolve_improve_action,
 )
 from .advance_engine import determine_next_action, is_resumable_failed_task
+from .advance_executor import AdvanceActionExecutionContext, execute_advance_action
 
 logger = logging.getLogger(__name__)
 
@@ -1429,6 +1428,57 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # Use the currently checked-out branch as the target for conflict checks,
     # merge execution, and rebase task creation.
     target_branch = git.current_branch()
+    use_iterate_mode = _advance_uses_iterate(config)
+
+    def _worker_args() -> argparse.Namespace:
+        return argparse.Namespace(
+            no_docker=getattr(args, 'no_docker', False),
+            max_turns=None,
+            force=force,
+        )
+
+    def _build_action_context(*, dry_run_mode: bool) -> AdvanceActionExecutionContext:
+        def _create_rebase_from_task(parent_task: DbTask) -> DbTask:
+            assert parent_task.id is not None
+            assert parent_task.branch is not None
+            return _create_rebase_task(store, parent_task.id, parent_task.branch, target_branch)
+
+        def _create_implement_from_task(parent_task: DbTask) -> DbTask:
+            assert parent_task.id is not None
+            return store.add(
+                prompt=_unimplemented_implement_prompt(parent_task),
+                task_type="implement",
+                depends_on=parent_task.id,
+                group=parent_task.group,
+            )
+
+        return AdvanceActionExecutionContext(
+            store=store,
+            dry_run=dry_run_mode,
+            max_resume_attempts=max_resume_attempts,
+            use_iterate_for_create_implement=use_iterate_mode,
+            use_iterate_for_needs_rebase=use_iterate_mode,
+            prepare_create_review=lambda t: _prepare_create_review_action(store, t),
+            create_resume_task=lambda t: _create_resume_task(store, t),
+            create_rebase_task=_create_rebase_from_task,
+            create_implement_task=_create_implement_from_task,
+            spawn_worker=lambda task_id, _kind: _spawn_background_worker(
+                _worker_args(), config, task_id=task_id, quiet=True
+            ),
+            spawn_resume_worker=lambda task_id, _kind: _spawn_background_resume_worker(
+                _worker_args(), config, task_id, quiet=True
+            ),
+            spawn_iterate_worker=lambda task_obj, _kind: _spawn_background_iterate_worker(
+                argparse.Namespace(
+                    no_docker=getattr(args, 'no_docker', False),
+                    force=force,
+                ),
+                config,
+                task_obj,
+                max_iterations=config.iterate_max_iterations,
+                quiet=True,
+            ),
+        )
 
     # Analyze each task to determine the next action
     plan: list[tuple[DbTask, dict]] = []
@@ -1493,23 +1543,20 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print()
 
     if dry_run:
+        dry_run_context = _build_action_context(dry_run_mode=True)
         print(f"Would advance {len(plan)} task(s):\n")
         for task, action in plan:
             prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
             console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             description = action['description']
-            if action['type'] == 'improve':
-                review_task = action.get('review_task')
-                if review_task is not None and task.id is not None and review_task.id is not None:
-                    improve_action, failed_improve = resolve_improve_action(store, task.id, review_task.id)
-                    if improve_action == "resume" and failed_improve is not None:
-                        description = f"Resume improve {failed_improve.id} (failed: {failed_improve.failure_reason or 'UNKNOWN'})"
-                    elif improve_action == "retry" and failed_improve is not None:
-                        description = f"Retry improve {failed_improve.id} (failed: {failed_improve.failure_reason or 'UNKNOWN'})"
-            elif action['type'] in {'merge', 'merge_with_followups'}:
+            if action['type'] in {'merge', 'merge_with_followups'}:
                 commit_count = _auto_squash_commit_count(config, git, task, target_branch)
                 if commit_count is not None:
                     description = f"{description} (auto-squash, {commit_count} commits)"
+            elif is_worker_consuming_advance_action(action['type']):
+                dry_result = execute_advance_action(task=task, action=action, context=dry_run_context)
+                if dry_result.status == "dry_run" and dry_result.message:
+                    description = dry_result.message
             _color = _advance_action_color(action['type'])
             console.print(f"      [{_color}]→ {description}[/{_color}]")
             print()
@@ -1572,13 +1619,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # Track tasks skipped for actionable reasons (needs human attention)
     _ACTIONABLE_SKIP_TYPES = frozenset({'needs_discussion', 'max_cycles_reached', 'max_improve_attempts'})
     attention_tasks: list[tuple[DbTask, dict]] = []
-
-    def _worker_args() -> argparse.Namespace:
-        return argparse.Namespace(
-            no_docker=getattr(args, 'no_docker', False),
-            max_turns=None,
-            force=force,
-        )
+    action_context = _build_action_context(dry_run_mode=False)
 
     for task, action in plan:
         assert task.id is not None
@@ -1671,218 +1712,71 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     console.print(f"      [{_c_err}]✗ Merge failed[/{_c_err}]")
                     error_count += 1
 
-        elif action_type == 'create_review':
-            create_result = _prepare_create_review_action(store, task)
-            if create_result.status == "skip":
-                console.print(f"      [{_c_warn}]{create_result.message}[/{_c_warn}]")
+        else:
+            exec_result = execute_advance_action(task=task, action=action, context=action_context)
+            if exec_result.attempted_spawn:
+                workers_started += 1
+
+            if exec_result.status == "skip":
+                console.print(f"      [{_c_warn}]{exec_result.message}[/{_c_warn}]")
                 skip_count += 1
-                continue
-            review_task = create_result.review_task
-            assert review_task is not None
-            console.print(f"      [{_c_ok}]{create_result.message}[/{_c_ok}]")
-
-            # Spawn background worker to run the review
-            assert review_task.id is not None
-            worker_args = _worker_args()
-            rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=True)
-            workers_started += 1
-            if rc == 0:
-                console.print(f"      [{_c_ok}]✓ Started review worker[/{_c_ok}]")
-                success_count += 1
-            else:
-                console.print(f"      [{_c_err}]✗ Failed to start review worker[/{_c_err}]")
-                error_count += 1
-
-        elif action_type == 'run_review':
-            # Spawn worker for an existing pending review task
-            review_task = action['review_task']
-            assert review_task.id is not None
-            worker_args = _worker_args()
-            rc = _spawn_background_worker(worker_args, config, task_id=review_task.id, quiet=True)
-            workers_started += 1
-            if rc == 0:
-                console.print(f"      [{_c_ok}]✓ Started review worker for {review_task.id}[/{_c_ok}]")
-                success_count += 1
-            else:
-                console.print(f"      [{_c_err}]✗ Failed to start review worker for {review_task.id}[/{_c_err}]")
-                error_count += 1
-
-        elif action_type == 'improve':
-            review_task = action['review_task']
-            assert review_task.id is not None
-            assert task.id is not None
-
-            # Check for existing failed improve for this impl+review pair.
-            # Resume if possible, otherwise retry — never create a duplicate sibling.
-            improve_action, failed_improve = resolve_improve_action(
-                store,
-                task.id,
-                review_task.id,
-                max_resume_attempts=config.max_resume_attempts,
-            )
-            if improve_action == "give_up" and failed_improve is not None:
-                assert failed_improve.id is not None
-                msg = (
-                    f"SKIP: max improve attempts ({config.max_resume_attempts}) reached for "
-                    f"{task.id} + {review_task.id}; latest failed improve: {failed_improve.id}. "
-                    f"Run uv run gza fix {task.id}"
-                )
-                console.print(f"      [{_c_warn}]{msg}[/{_c_warn}]")
-                skip_count += 1
-                attention_tasks.append(
-                    (
-                        task,
-                        {
-                            "type": "max_improve_attempts",
-                            "description": msg,
-                        },
+                if exec_result.attention_type == "max_improve_attempts":
+                    attention_tasks.append(
+                        (
+                            task,
+                            {
+                                "type": "max_improve_attempts",
+                                "description": exec_result.message,
+                            },
+                        )
                     )
-                )
                 continue
-            if improve_action == "resume" and failed_improve is not None:
-                assert failed_improve.id is not None
-                improve_task = _create_resume_task(store, failed_improve)
-                console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id} (resume of {failed_improve.id})[/{_c_ok}]")
-            elif improve_action == "retry" and failed_improve is not None:
-                assert failed_improve.id is not None
-                retry_same_branch = failed_improve.same_branch
-                retry_base_branch: str | None = None
-                if failed_improve.same_branch and failed_improve.branch:
-                    retry_same_branch = False
-                    retry_base_branch = failed_improve.branch
-                improve_task = store.add(
-                    prompt=failed_improve.prompt,
-                    task_type='improve',
-                    depends_on=failed_improve.depends_on,
-                    based_on=failed_improve.id,
-                    same_branch=retry_same_branch,
-                    group=failed_improve.group,
-                    base_branch=retry_base_branch,
-                )
-                console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id} (retry of {failed_improve.id})[/{_c_ok}]")
-            else:
-                try:
-                    improve_task = _create_improve_task(store, task, review_task)
-                except ValueError as exc:
-                    console.print(f"      [{_c_err}]✗ Failed to create improve task: {exc}[/{_c_err}]")
-                    error_count += 1
-                    continue
-                console.print(f"      [{_c_ok}]✓ Created improve task {improve_task.id}[/{_c_ok}]")
 
-            # Spawn background worker — use resume worker if this is a resume task
-            assert improve_task.id is not None
-            worker_args = _worker_args()
-            is_resume = improve_task.session_id is not None
-            if is_resume:
-                rc = _spawn_background_resume_worker(worker_args, config, new_task_id=improve_task.id, quiet=True)
-            else:
-                rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
-            workers_started += 1
-            if rc == 0:
-                console.print(f"      [{_c_ok}]✓ Started improve worker[/{_c_ok}]")
-                success_count += 1
-            else:
-                console.print(f"      [{_c_err}]✗ Failed to start improve worker[/{_c_err}]")
-                error_count += 1
-
-        elif action_type == 'run_improve':
-            # Spawn worker for an existing pending improve task
-            improve_task = action['improve_task']
-            assert improve_task.id is not None
-            worker_args = _worker_args()
-            rc = _spawn_background_worker(worker_args, config, task_id=improve_task.id, quiet=True)
-            workers_started += 1
-            if rc == 0:
-                console.print(f"      [{_c_ok}]✓ Started improve worker for {improve_task.id}[/{_c_ok}]")
-                success_count += 1
-            else:
-                console.print(f"      [{_c_err}]✗ Failed to start improve worker for {improve_task.id}[/{_c_err}]")
-                error_count += 1
-
-        elif action_type == 'resume':
-            # Create a resume task and spawn a background worker for it
-            resume_task = _create_resume_task(store, task)
-            assert resume_task.id is not None
-            console.print(f"      [{_c_ok}]✓ Created resume task {resume_task.id}[/{_c_ok}]")
-            worker_args = _worker_args()
-            rc = _spawn_background_resume_worker(worker_args, config, resume_task.id, quiet=True)
-            workers_started += 1
-            if rc == 0:
-                console.print(f"      [{_c_ok}]✓ Started resume worker[/{_c_ok}]")
-                success_count += 1
-            else:
-                console.print(f"      [{_c_err}]✗ Failed to start resume worker[/{_c_err}]")
-                error_count += 1
-
-        elif action_type == 'create_implement':
-            # Create an implement task for a completed plan and spawn a worker
-            prompt_text = _unimplemented_implement_prompt(task)
-            impl_task = store.add(
-                prompt=prompt_text,
-                task_type="implement",
-                depends_on=task.id,
-                group=task.group,
-            )
-            console.print(f"      [{_c_ok}]✓ Created implement task {impl_task.id}[/{_c_ok}]")
-
-            assert impl_task.id is not None
-            if _advance_uses_iterate(config):
-                iterate_args = argparse.Namespace(
-                    no_docker=getattr(args, 'no_docker', False),
-                    force=force,
-                )
-                rc = _spawn_background_iterate_worker(
-                    iterate_args,
-                    config,
-                    impl_task,
-                    max_iterations=config.iterate_max_iterations,
-                    quiet=True,
-                )
-            else:
-                worker_args = _worker_args()
-                rc = _spawn_background_worker(worker_args, config, task_id=impl_task.id, quiet=True)
-            workers_started += 1
-            if rc == 0:
-                started_label = "iterate worker for implement task" if _advance_uses_iterate(config) else "implement worker"
-                console.print(f"      [{_c_ok}]✓ Started {started_label}[/{_c_ok}]")
-                success_count += 1
-            else:
-                failed_label = "iterate worker for implement task" if _advance_uses_iterate(config) else "implement worker"
-                console.print(f"      [{_c_err}]✗ Failed to start {failed_label}[/{_c_err}]")
-                error_count += 1
-
-        elif action_type == 'needs_rebase':
-            assert task.id is not None
-            if not task.branch:
-                console.print(f"      [{_c_err}]✗ Cannot rebase: task {task.id} has no branch[/{_c_err}]")
+            if exec_result.status == "error":
+                err_message = exec_result.message or f"Failed to execute {action_type}"
+                console.print(f"      [{_c_err}]✗ {err_message}[/{_c_err}]")
                 error_count += 1
                 continue
-            if _advance_uses_iterate(config):
-                iterate_args = argparse.Namespace(
-                    no_docker=getattr(args, 'no_docker', False),
-                    force=force,
-                )
-                rc = _spawn_background_iterate_worker(
-                    iterate_args,
-                    config,
-                    task,
-                    max_iterations=config.iterate_max_iterations,
-                    quiet=True,
-                )
-            else:
-                rebase_task = _create_rebase_task(store, task.id, task.branch, target_branch)
-                assert rebase_task.id is not None
-                console.print(f"      [{_c_ok}]✓ Created rebase task {rebase_task.id}[/{_c_ok}]")
-                worker_args = _worker_args()
-                rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
-            workers_started += 1
-            if rc == 0:
-                started_label = "iterate worker for rebase cycle" if _advance_uses_iterate(config) else "rebase worker"
-                console.print(f"      [{_c_ok}]✓ Started {started_label}[/{_c_ok}]")
+
+            if exec_result.message:
+                console.print(f"      [{_c_ok}]✓ {exec_result.message}[/{_c_ok}]")
+
+            started_id = exec_result.handled_task_id
+            if exec_result.worker_started:
+                if action_type == "create_review":
+                    console.print(f"      [{_c_ok}]✓ Started review worker[/{_c_ok}]")
+                elif action_type == "run_review" and started_id is not None:
+                    console.print(f"      [{_c_ok}]✓ Started review worker for {started_id}[/{_c_ok}]")
+                elif action_type == "improve":
+                    console.print(f"      [{_c_ok}]✓ Started improve worker[/{_c_ok}]")
+                elif action_type == "run_improve" and started_id is not None:
+                    console.print(f"      [{_c_ok}]✓ Started improve worker for {started_id}[/{_c_ok}]")
+                elif action_type == "resume":
+                    console.print(f"      [{_c_ok}]✓ Started resume worker[/{_c_ok}]")
+                elif action_type == "create_implement":
+                    started_label = "iterate worker for implement task" if use_iterate_mode else "implement worker"
+                    console.print(f"      [{_c_ok}]✓ Started {started_label}[/{_c_ok}]")
+                elif action_type == "needs_rebase":
+                    started_label = "iterate worker for rebase cycle" if use_iterate_mode else "rebase worker"
+                    console.print(f"      [{_c_ok}]✓ Started {started_label}[/{_c_ok}]")
                 success_count += 1
-            else:
-                failed_label = "iterate worker for rebase cycle" if _advance_uses_iterate(config) else "rebase worker"
-                console.print(f"      [{_c_err}]✗ Failed to start {failed_label}[/{_c_err}]")
+            elif exec_result.worker_consuming:
+                if action_type == "run_review" and started_id is not None:
+                    console.print(f"      [{_c_err}]✗ Failed to start review worker for {started_id}[/{_c_err}]")
+                elif action_type == "run_improve" and started_id is not None:
+                    console.print(f"      [{_c_err}]✗ Failed to start improve worker for {started_id}[/{_c_err}]")
+                elif action_type == "create_review":
+                    console.print(f"      [{_c_err}]✗ Failed to start review worker[/{_c_err}]")
+                elif action_type == "improve":
+                    console.print(f"      [{_c_err}]✗ Failed to start improve worker[/{_c_err}]")
+                elif action_type == "resume":
+                    console.print(f"      [{_c_err}]✗ Failed to start resume worker[/{_c_err}]")
+                elif action_type == "create_implement":
+                    failed_label = "iterate worker for implement task" if use_iterate_mode else "implement worker"
+                    console.print(f"      [{_c_err}]✗ Failed to start {failed_label}[/{_c_err}]")
+                elif action_type == "needs_rebase":
+                    failed_label = "iterate worker for rebase cycle" if use_iterate_mode else "rebase worker"
+                    console.print(f"      [{_c_err}]✗ Failed to start {failed_label}[/{_c_err}]")
                 error_count += 1
 
         print()
