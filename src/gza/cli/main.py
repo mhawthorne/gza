@@ -1036,6 +1036,11 @@ def main() -> int:
         help="Show raw JSON lines instead of formatted output",
     )
     log_parser.add_argument(
+        "--failure", "-F",
+        action="store_true",
+        help="Show failure-focused diagnostics (failed tasks only): reason, summary, agent explanation, and last verify/result context",
+    )
+    log_parser.add_argument(
         "--page",
         action="store_true",
         help="Pipe output through $PAGER (default: less -R); skipped for --follow and --raw modes",

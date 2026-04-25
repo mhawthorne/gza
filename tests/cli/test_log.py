@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from gza.cli import _LiveLogPrinter, _build_step_timeline, _format_log_entry, _load_log_file_entries
+from gza.cli import _build_step_timeline, _format_log_entry, _LiveLogPrinter, _load_log_file_entries
 from gza.db import SqliteTaskStore
 
 from .conftest import LOG_FIXTURES_DIR, make_store, run_gza, setup_config
@@ -29,6 +29,7 @@ class TestLogCommand:
         assert result.returncode == 0
         assert "resolved task run" not in help_output
         assert "requested task or worker is actively running" in help_output
+        assert "--failure" in result.stdout
 
     def test_log_by_task_id_single_json_format(self, tmp_path: Path):
         """Log command by task ID parses single JSON format with successful result."""
@@ -134,6 +135,190 @@ class TestLogCommand:
         assert "Steps: 60" in result.stdout
         assert "Legacy turns: 60" in result.stdout
         assert "Cost: $1.5000" in result.stdout
+
+    def test_log_failure_view_surfaces_agent_explanation(self, tmp_path: Path):
+        """--failure should show concise failed-task diagnostics including final agent explanation."""
+        import json
+
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nverify_command: uv run pytest tests/ -q\n")
+
+        store = make_store(tmp_path)
+        task = store.add("Failed task for failure view")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "MAX_STEPS"
+        task.log_file = ".gza/logs/failed.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "failed.log").write_text(
+            "\n".join(
+                json.dumps(line) for line in [
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "[GZA_FAILURE:MAX_STEPS]\nBlocked by ordering prerequisite.",
+                        },
+                    },
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "tool_use", "id": "tool_1", "name": "Bash", "input": {"command": "uv run pytest tests/ -q"}},
+                            ],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tool_1",
+                                    "is_error": True,
+                                    "content": "FAILED tests/test_cli.py::test_case - AssertionError",
+                                }
+                            ],
+                        },
+                    },
+                    {"type": "result", "subtype": "error_max_turns", "result": "Stopped at limit"},
+                ]
+            )
+        )
+
+        result = run_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Failure Reason: MAX_STEPS" in result.stdout
+        assert "Failure Summary: Stopped due to max steps limit." in result.stdout
+        assert "Agent Explanation:" in result.stdout
+        assert "Blocked by ordering prerequisite." in result.stdout
+        assert "[GZA_FAILURE:MAX_STEPS]" in result.stdout
+        assert result.stdout.count("[GZA_FAILURE:MAX_STEPS]") == 1
+        assert "Last Verify Failure:" in result.stdout
+        assert "uv run pytest tests/ -q" in result.stdout
+        assert "Last Result Context: error_max_turns" in result.stdout
+
+    def test_failure_diagnostics_parity_between_show_and_log_failure(self, tmp_path: Path):
+        """Show and log --failure should render the same core failure diagnostics."""
+        import json
+
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nverify_command: uv run pytest tests/ -q\n")
+
+        store = make_store(tmp_path)
+        task = store.add("Parity failure diagnostics task")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "MAX_STEPS"
+        task.log_file = ".gza/logs/parity-failure.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "parity-failure.log").write_text(
+            "\n".join(
+                json.dumps(line) for line in [
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "[GZA_FAILURE:MAX_STEPS]\nBlocked by ordering prerequisite.",
+                        },
+                    },
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "tool_use", "id": "tool_1", "name": "Bash", "input": {"command": "uv run pytest tests/ -q"}},
+                            ],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tool_1",
+                                    "is_error": True,
+                                    "content": "FAILED tests/test_cli.py::test_case - AssertionError",
+                                }
+                            ],
+                        },
+                    },
+                    {"type": "result", "subtype": "error_max_turns", "result": "Stopped at limit"},
+                ]
+            )
+        )
+
+        show_result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        log_result = run_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
+
+        assert show_result.returncode == 0
+        assert log_result.returncode == 0
+
+        expected_fragments = [
+            "Failure Reason: MAX_STEPS",
+            "Failure Summary: Stopped due to max steps limit.",
+            "[GZA_FAILURE:MAX_STEPS]",
+            "Agent Explanation:",
+            "Blocked by ordering prerequisite.",
+            "Last Verify Failure:",
+            "uv run pytest tests/ -q",
+            "Last Result Context: error_max_turns",
+        ]
+        for fragment in expected_fragments:
+            assert fragment in show_result.stdout
+            assert fragment in log_result.stdout
+
+    def test_failure_marker_stripping_is_identical_for_show_and_log_failure(self, tmp_path: Path):
+        """Marker lines should be stripped from explanation text in both show and log --failure."""
+        import json
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Marker stripping parity task")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "MAX_STEPS"
+        task.log_file = ".gza/logs/marker-strip.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "marker-strip.log").write_text(
+            "\n".join(
+                json.dumps(line) for line in [
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "[GZA_FAILURE:MAX_STEPS]\nOnly body text remains",
+                        },
+                    },
+                    {"type": "result", "subtype": "error_max_turns", "result": "Stopped at limit"},
+                ]
+            )
+        )
+
+        show_result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        log_result = run_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
+
+        assert show_result.returncode == 0
+        assert log_result.returncode == 0
+
+        assert show_result.stdout.count("[GZA_FAILURE:MAX_STEPS]") == 1
+        assert log_result.stdout.count("[GZA_FAILURE:MAX_STEPS]") == 1
+        assert "Only body text remains" in show_result.stdout
+        assert "Only body text remains" in log_result.stdout
 
     def test_log_by_task_id_missing_log_file(self, tmp_path: Path):
         """Log command by task ID handles missing log file."""

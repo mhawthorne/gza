@@ -14,15 +14,19 @@ import sys
 import tempfile
 from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
+from rich.markup import escape as rich_escape
 from rich.pager import Pager
+from rich.panel import Panel
 
 from ..config import Config
 from ..console import (
     MAX_PROMPT_DISPLAY,
+    console,
     truncate,
 )
 from ..db import ManualMigrationRequired, SqliteTaskStore, Task as DbTask, resolve_task_id, task_id_numeric_key
@@ -78,6 +82,7 @@ def set_task_urgency(store: SqliteTaskStore, task_id: str, *, urgent: bool) -> b
 # Matches "{prefix}-{suffix}" where prefix is 1-12 lowercase alphanumeric chars.
 # This is tighter than `"-" in arg` (which also matches branch names like "feature-foo").
 _TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
+_FAILURE_MARKER_LINE_RE = re.compile(r"^\s*\[GZA_FAILURE:(?P<reason>[A-Z0-9_]+)\]\s*$")
 
 
 def _looks_like_task_id(arg: str) -> bool:
@@ -1669,6 +1674,147 @@ def _failure_summary(reason: str) -> str:
         "UNKNOWN": "Task failed; inspect log output for details.",
     }
     return summaries.get(reason, f"Task failed: {reason}")
+
+
+def _extract_last_agent_message_text(log_path: Path) -> str | None:
+    """Extract the most recent ``item.completed`` agent_message text from a log file."""
+    from .log import _load_log_file_entries
+
+    try:
+        _log_data, entries, _content = _load_log_file_entries(log_path)
+    except OSError:
+        return None
+
+    last_message: str | None = None
+    for entry in entries:
+        if entry.get("type") != "item.completed":
+            continue
+        item = entry.get("item", {})
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "agent_message":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            last_message = text
+    return last_message
+
+
+def _extract_agent_failure_marker_reason(log_path: Path) -> str | None:
+    """Return the last ``[GZA_FAILURE:REASON]`` marker from the final agent message."""
+    text = _extract_last_agent_message_text(log_path)
+    if not text:
+        return None
+    marker_reason: str | None = None
+    for line in text.splitlines():
+        match = _FAILURE_MARKER_LINE_RE.match(line)
+        if match:
+            marker_reason = match.group("reason")
+    return marker_reason
+
+
+def _extract_last_agent_message_for_failure(log_path: Path) -> str | None:
+    """Return final agent message text with failure marker lines removed."""
+    text = _extract_last_agent_message_text(log_path)
+    if not text:
+        return None
+
+    cleaned_lines = [
+        line for line in text.splitlines()
+        if _FAILURE_MARKER_LINE_RE.match(line) is None
+    ]
+    cleaned = "\n".join(cleaned_lines).strip()
+    return cleaned or None
+
+
+@dataclass(frozen=True)
+class FailureDiagnostics:
+    """Canonical failed-task diagnostics extracted from task/log context."""
+
+    reason: str
+    marker_reason: str | None
+    summary: str
+    explanation: str | None
+    verify_context: str | None
+    result_context: str | None
+
+
+def _build_failure_diagnostics(task: DbTask, log_path: Path | None, verify_command: str | None) -> FailureDiagnostics:
+    """Build canonical failure diagnostics for CLI rendering."""
+    reason = task.failure_reason or "UNKNOWN"
+    marker_reason: str | None = None
+    explanation: str | None = None
+    verify_context: str | None = None
+    result_context: str | None = None
+
+    if log_path and log_path.exists():
+        marker_reason = _extract_agent_failure_marker_reason(log_path)
+        explanation = _extract_last_agent_message_for_failure(log_path)
+        verify_context, result_context = _extract_failure_log_context(log_path, verify_command)
+
+    return FailureDiagnostics(
+        reason=reason,
+        marker_reason=marker_reason,
+        summary=_failure_summary(reason),
+        explanation=explanation,
+        verify_context=verify_context,
+        result_context=result_context,
+    )
+
+
+def _render_failure_diagnostics(
+    diagnostics: FailureDiagnostics,
+    *,
+    label_color: str,
+    value_color: str,
+    status_failed_color: str,
+    soft_wrap: bool = False,
+    include_explanation: bool = True,
+) -> None:
+    """Render canonical failed-task diagnostics for CLI output."""
+    marker_text = ""
+    if diagnostics.marker_reason:
+        marker_label = rich_escape(f"[GZA_FAILURE:{diagnostics.marker_reason}]")
+        marker_text = f" [{status_failed_color}]{marker_label}[/{status_failed_color}]"
+
+    console.print(
+        f"[{label_color}]Failure Reason:[/{label_color}] "
+        f"[{status_failed_color}]{diagnostics.reason}[/{status_failed_color}]"
+        f"{marker_text}",
+        soft_wrap=soft_wrap,
+    )
+    console.print(
+        f"[{label_color}]Failure Summary:[/{label_color}] "
+        f"[{value_color}]{diagnostics.summary}[/{value_color}]",
+        soft_wrap=soft_wrap,
+    )
+
+    if include_explanation:
+        console.print(f"[{label_color}]Agent Explanation:[/{label_color}]", soft_wrap=soft_wrap)
+        if diagnostics.explanation:
+            console.print(
+                Panel(
+                    rich_escape(diagnostics.explanation),
+                    border_style=status_failed_color,
+                    padding=(0, 1),
+                    expand=False,
+                )
+            )
+        else:
+            console.print(f"[{value_color}]  (not found in log)[/{value_color}]", soft_wrap=soft_wrap)
+
+    if diagnostics.verify_context:
+        console.print(
+            f"[{label_color}]Last Verify Failure:[/{label_color}] "
+            f"[{value_color}]{rich_escape(diagnostics.verify_context)}[/{value_color}]",
+            soft_wrap=soft_wrap,
+        )
+    if diagnostics.result_context:
+        console.print(
+            f"[{label_color}]Last Result Context:[/{label_color}] "
+            f"[{value_color}]{rich_escape(diagnostics.result_context)}[/{value_color}]",
+            soft_wrap=soft_wrap,
+        )
 
 
 def _precondition_blocking_dependency_id(task: DbTask, config: Config | None) -> str | None:
