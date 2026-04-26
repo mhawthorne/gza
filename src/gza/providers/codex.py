@@ -313,6 +313,7 @@ class CodexProvider(Provider):
             # Add model if specified
             if config.model:
                 cmd.extend(["-m", config.model])
+            self._append_reasoning_effort_override(cmd, config.reasoning_effort)
         else:
             cmd.extend([
                 "codex",
@@ -327,6 +328,7 @@ class CodexProvider(Provider):
             # Add model if specified
             if config.model:
                 cmd.extend(["-m", config.model])
+            self._append_reasoning_effort_override(cmd, config.reasoning_effort)
 
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, stdin_input=prompt,
@@ -364,6 +366,7 @@ class CodexProvider(Provider):
             # Add model if specified
             if config.model:
                 cmd.extend(["-m", config.model])
+            self._append_reasoning_effort_override(cmd, config.reasoning_effort)
         else:
             cmd.extend([
                 "codex",
@@ -378,6 +381,7 @@ class CodexProvider(Provider):
             # Add model if specified
             if config.model:
                 cmd.extend(["-m", config.model])
+            self._append_reasoning_effort_override(cmd, config.reasoning_effort)
 
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, cwd=work_dir,
@@ -387,6 +391,12 @@ class CodexProvider(Provider):
             on_session_id=on_session_id,
             on_step_count=on_step_count,
         )
+
+    @staticmethod
+    def _append_reasoning_effort_override(cmd: list[str], reasoning_effort: str) -> None:
+        """Append Codex model reasoning-effort override when configured."""
+        if reasoning_effort:
+            cmd.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
 
     def _run_with_output_parsing(
         self,

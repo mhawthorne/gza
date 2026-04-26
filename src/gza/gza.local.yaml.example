@@ -8,6 +8,7 @@
 # task_providers:
 #   review: claude
 # model: o4-mini
+# reasoning_effort: medium
 # docker_volumes:
 #   - ~/datasets:/datasets:ro
 
@@ -17,3 +18,4 @@
 #     task_types:
 #       review:
 #         model: claude-haiku-4-5
+#         reasoning_effort: low

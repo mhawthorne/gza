@@ -1271,6 +1271,7 @@ def _config_to_effective_dict(config: Config) -> dict:
         "provider": config.provider,
         "task_providers": config.task_providers,
         "model": config.model,
+        "reasoning_effort": config.reasoning_effort,
         "chat_text_display_length": config.chat_text_display_length,
         "verify_command": config.verify_command,
         "claude": {
@@ -1280,6 +1281,7 @@ def _config_to_effective_dict(config: Config) -> dict:
         "task_types": {
             task_type: {
                 "model": task_cfg.model,
+                "reasoning_effort": task_cfg.reasoning_effort,
                 "max_steps": task_cfg.max_steps,
                 "max_turns": task_cfg.max_turns,
             }
@@ -1288,9 +1290,11 @@ def _config_to_effective_dict(config: Config) -> dict:
         "providers": {
             provider_name: {
                 "model": provider_cfg.model,
+                "reasoning_effort": provider_cfg.reasoning_effort,
                 "task_types": {
                     task_type: {
                         "model": task_cfg.model,
+                        "reasoning_effort": task_cfg.reasoning_effort,
                         "max_steps": task_cfg.max_steps,
                         "max_turns": task_cfg.max_turns,
                     }
@@ -1357,7 +1361,12 @@ def cmd_config(args: argparse.Namespace) -> int:
         for task_type in task_types:
             provider = config.get_provider_for_task(task_type)
             model = config.get_model_for_task(task_type, provider)
-            model_resolution[task_type] = {"provider": provider, "model": model}
+            reasoning_effort = config.get_reasoning_effort_for_task(task_type, provider)
+            model_resolution[task_type] = {
+                "provider": provider,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+            }
         payload = {
             "effective": effective,
             "sources": effective_sources,
@@ -1400,20 +1409,28 @@ def cmd_config(args: argparse.Namespace) -> int:
         source = effective_sources.get(path, "default")
         print(f"{path:<{key_width}}  {json.dumps(value):<{val_width}}  [{source}]")
 
-    # Model resolution summary
+    # Model/reasoning resolution summary
     print()
-    print("Model Resolution by Task Type")
+    print("Model/Reasoning Resolution by Task Type")
     print("=" * 50)
     task_types = ["explore", "plan", "implement", "review", "improve", "internal"]
     model_rows = []
     for task_type in task_types:
         provider = config.get_provider_for_task(task_type)
         model = config.get_model_for_task(task_type, provider)
-        model_rows.append((task_type, provider, model or "(provider default)"))
+        reasoning_effort = config.get_reasoning_effort_for_task(task_type, provider)
+        model_rows.append(
+            (
+                task_type,
+                provider,
+                model or "(provider default)",
+                reasoning_effort or "(provider default)",
+            )
+        )
     type_width = max(len(r[0]) for r in model_rows)
     prov_width = max(len(r[1]) for r in model_rows)
-    for task_type, provider, model_display in model_rows:
-        print(f"{task_type:<{type_width}}  {provider:<{prov_width}}  {model_display}")
+    for task_type, provider, model_display, reasoning_effort_display in model_rows:
+        print(f"{task_type:<{type_width}}  {provider:<{prov_width}}  {model_display}  {reasoning_effort_display}")
 
     return 0
 

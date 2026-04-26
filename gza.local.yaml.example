@@ -9,6 +9,7 @@
 # task_providers:
 #   review: claude
 # model: o4-mini
+# reasoning_effort: medium
 # docker_volumes:
 #   - ~/datasets:/datasets:ro
 # cleanup_days: 30

@@ -3706,6 +3706,61 @@ class TestCodexProvider:
         ]
         assert mock_run.call_args.kwargs["stdin_input"] == "resume prompt"
 
+    def test_direct_exec_includes_reasoning_effort_override(self, tmp_path):
+        """Direct codex exec should pass model_reasoning_effort via config override."""
+        provider = CodexProvider()
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="codex",
+            use_docker=False,
+            timeout_minutes=10,
+            model="gpt-5.3-codex",
+            reasoning_effort="high",
+        )
+        log_file = tmp_path / "log.txt"
+
+        with patch.object(provider, "_run_with_output_parsing") as mock_run:
+            mock_run.return_value = MagicMock(exit_code=0)
+            provider._run_direct(
+                config=config,
+                prompt="do work",
+                log_file=log_file,
+                work_dir=tmp_path,
+            )
+
+        cmd = mock_run.call_args.args[0]
+        assert "-c" in cmd
+        assert "model_reasoning_effort=high" in cmd
+
+    def test_resume_exec_includes_reasoning_effort_override(self, tmp_path):
+        """Codex resume exec should pass model_reasoning_effort via config override."""
+        provider = CodexProvider()
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="codex",
+            use_docker=False,
+            timeout_minutes=10,
+            model="gpt-5.3-codex",
+            reasoning_effort="medium",
+        )
+        log_file = tmp_path / "log.txt"
+
+        with patch.object(provider, "_run_with_output_parsing") as mock_run:
+            mock_run.return_value = MagicMock(exit_code=0)
+            provider._run_direct(
+                config=config,
+                prompt="resume prompt",
+                log_file=log_file,
+                work_dir=tmp_path,
+                resume_session_id="thread_123",
+            )
+
+        cmd = mock_run.call_args.args[0]
+        assert "-c" in cmd
+        assert "model_reasoning_effort=medium" in cmd
+
 
 class TestCodexCostCalculation:
     """Tests for Codex cost calculation."""
@@ -4674,9 +4729,11 @@ class TestProviderScopedConfig:
             "providers:\n"
             "  claude:\n"
             "    model: claude-sonnet-4-5\n"
+            "    reasoning_effort: medium\n"
             "    task_types:\n"
             "      review:\n"
             "        model: claude-haiku-4-5\n"
+            "        reasoning_effort: high\n"
             "        max_steps: 25\n"
             "        max_turns: 20\n"
             "  codex:\n"
@@ -4684,8 +4741,11 @@ class TestProviderScopedConfig:
         )
         config = Config.load(tmp_path)
 
+        assert config.reasoning_effort == ""
         assert config.providers["claude"].model == "claude-sonnet-4-5"
+        assert config.providers["claude"].reasoning_effort == "medium"
         assert config.providers["claude"].task_types["review"].model == "claude-haiku-4-5"
+        assert config.providers["claude"].task_types["review"].reasoning_effort == "high"
         assert config.providers["claude"].task_types["review"].max_steps == 25
         assert config.providers["claude"].task_types["review"].max_turns == 20
         assert config.providers["codex"].model == "o4-mini"
@@ -4772,20 +4832,24 @@ class TestProviderScopedConfig:
         assert any("'providers.claude' must be a dictionary" in e for e in errors)
 
     def test_validate_rejects_invalid_provider_task_type_values(self, tmp_path):
-        """Validate should reject non-string model and non-positive max_turns in providers.task_types."""
+        """Validate should reject non-string scoped fields and non-positive max_turns in providers.task_types."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
             "providers:\n"
             "  claude:\n"
+            "    reasoning_effort: 123\n"
             "    task_types:\n"
             "      review:\n"
             "        model: 123\n"
+            "        reasoning_effort: 456\n"
             "        max_turns: 0\n"
         )
         is_valid, errors, warns = Config.validate(tmp_path)
         assert not is_valid
+        assert any("providers.claude.reasoning_effort" in e for e in errors)
         assert any("providers.claude.task_types.review.model" in e for e in errors)
+        assert any("providers.claude.task_types.review.reasoning_effort" in e for e in errors)
         assert any("providers.claude.task_types.review.max_turns" in e for e in errors)
 
     def test_validate_rejects_incompatible_provider_scoped_model(self, tmp_path):
@@ -4852,17 +4916,21 @@ class TestProviderScopedConfig:
             "max_steps: 60\n"
             "max_turns: 50\n"
             "model: legacy-model\n"
+            "reasoning_effort: low\n"
             "task_types:\n"
             "  review:\n"
             "    model: legacy-review\n"
+            "    reasoning_effort: medium\n"
             "    max_steps: 35\n"
             "    max_turns: 30\n"
             "providers:\n"
             "  claude:\n"
             "    model: scoped-model\n"
+            "    reasoning_effort: high\n"
             "    task_types:\n"
             "      review:\n"
             "        model: scoped-review\n"
+            "        reasoning_effort: minimal\n"
             "        max_steps: 22\n"
             "        max_turns: 20\n"
         )
@@ -4871,12 +4939,34 @@ class TestProviderScopedConfig:
         assert config.get_model_for_task("review", "claude") == "scoped-review"
         assert config.get_model_for_task("task", "claude") == "scoped-model"
         assert config.get_model_for_task("review", "codex") == "legacy-review"
+        assert config.get_reasoning_effort_for_task("review", "claude") == "minimal"
+        assert config.get_reasoning_effort_for_task("task", "claude") == "high"
+        assert config.get_reasoning_effort_for_task("review", "codex") == "medium"
+        assert config.get_reasoning_effort_for_task("task", "codex") == "low"
         assert config.get_max_steps_for_task("review", "claude") == 22
         assert config.get_max_steps_for_task("review", "codex") == 35
         assert config.get_max_steps_for_task("task", "codex") == 60
         assert config.get_max_turns_for_task("review", "claude") == 22
         assert config.get_max_turns_for_task("review", "codex") == 35
         assert config.get_max_turns_for_task("task", "codex") == 60
+
+    def test_validate_rejects_non_string_reasoning_effort_fields(self, tmp_path):
+        """Validate should reject non-string reasoning_effort values across config scopes."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "reasoning_effort: 1\n"
+            "defaults:\n"
+            "  reasoning_effort: 2\n"
+            "task_types:\n"
+            "  review:\n"
+            "    reasoning_effort: 3\n"
+        )
+        is_valid, errors, _warns = Config.validate(tmp_path)
+        assert not is_valid
+        assert any("'reasoning_effort' must be a string" in e for e in errors)
+        assert any("'defaults.reasoning_effort' must be a string" in e for e in errors)
+        assert any("'task_types.review.reasoning_effort' must be a string" in e for e in errors)
 
     def test_max_steps_falls_back_to_max_turns_with_warning(self, tmp_path):
         """Legacy max_turns should still resolve max steps and emit a deprecation warning."""

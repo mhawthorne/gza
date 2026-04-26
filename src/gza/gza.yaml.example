@@ -71,6 +71,9 @@ project_name: my-project
 # Provider-specific model name (optional)
 # model: ""
 
+# Codex reasoning effort override (optional: low, medium, high)
+# reasoning_effort: ""
+
 # Maximum characters of chat text to display (0 = unlimited)
 # chat_text_display_length: 0
 
@@ -78,11 +81,14 @@ project_name: my-project
 # task_types:
 #   plan:
 #     model: claude-sonnet-4-20250514
+#     reasoning_effort: medium
 #     max_steps: 30
 #   review:
 #     model: claude-sonnet-4-20250514
+#     reasoning_effort: low
 #   fix:
 #     model: claude-sonnet-4-20250514
+#     reasoning_effort: high
 
 # --- Learnings ---
 

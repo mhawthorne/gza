@@ -34,6 +34,7 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `task_providers` | Dict | `{}` | Route task types to providers (e.g., `review: claude`) |
 | `providers` | Dict | `{}` | Provider-scoped model/task-type config (preferred) |
 | `model` | String | *(empty)* | Legacy global model fallback (compatible) |
+| `reasoning_effort` | String | *(empty)* | Legacy global reasoning effort fallback (Codex) |
 | `task_types` | Dict | `{}` | Legacy global per-task fallback (compatible) |
 | `claude` | Dict | *(see below)* | Claude-specific configuration (see [Claude Configuration](#claude-configuration)) |
 | `claude_args` | List | *(deprecated)* | Use `claude.args` instead |
@@ -69,6 +70,7 @@ providers:
     task_types:
       review:
         model: claude-haiku-4-5
+        reasoning_effort: low
 ```
 
 Inspect effective values and source attribution:
@@ -299,9 +301,11 @@ providers:
     task_types:
       review:
         model: claude-haiku-4-5
+        reasoning_effort: low
         max_turns: 20
   codex:
     model: o4-mini
+    reasoning_effort: medium
 ```
 
 ### Task Types Configuration (Legacy-Compatible)
@@ -312,11 +316,14 @@ Override settings per task type:
 task_types:
   explore:
     model: claude-sonnet-4-5
+    reasoning_effort: low
     max_turns: 20
   plan:
     model: claude-opus-4
+    reasoning_effort: medium
     max_turns: 30
   review:
+    reasoning_effort: high
     max_turns: 15
 ```
 
@@ -338,6 +345,13 @@ Model selection:
 4. `task_types.<task_type>.model` (legacy fallback)
 5. `model` / `defaults.model` (legacy fallback)
 6. Provider runtime default (if no model resolved)
+
+Reasoning effort selection:
+1. `providers.<effective_provider>.task_types.<task_type>.reasoning_effort`
+2. `providers.<effective_provider>.reasoning_effort`
+3. `task_types.<task_type>.reasoning_effort` (legacy fallback)
+4. `reasoning_effort` / `defaults.reasoning_effort` (legacy fallback)
+5. Provider runtime default (if no reasoning effort resolved)
 
 Max steps selection:
 1. `providers.<effective_provider>.task_types.<task_type>.max_steps`
@@ -364,6 +378,7 @@ Set your provider in `gza.yaml`:
 ```yaml
 provider: claude
 model: claude-sonnet-4-5  # optional: override the default model
+reasoning_effort: medium  # optional: Codex reasoning effort override
 ```
 
 ### Provider Credentials
@@ -734,6 +749,7 @@ colors.*
 defaults.max_steps
 defaults.max_turns
 defaults.model
+defaults.reasoning_effort
 docker_image
 docker_setup_command
 docker_volumes
@@ -749,13 +765,16 @@ max_steps
 max_turns
 merge_squash_threshold
 model
+reasoning_effort
 project_name
 project_prefix
 provider
 providers.*.model
+providers.*.reasoning_effort
 providers.*.task_types.*.max_steps
 providers.*.task_types.*.max_turns
 providers.*.task_types.*.model
+providers.*.task_types.*.reasoning_effort
 review_context_file_limit
 review_diff_medium_threshold
 review_diff_small_threshold
@@ -763,6 +782,7 @@ task_providers.*
 task_types.*.max_steps
 task_types.*.max_turns
 task_types.*.model
+task_types.*.reasoning_effort
 tasks_file
 theme
 timeout_minutes
