@@ -1961,7 +1961,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         ancestors_last: tuple[bool, ...] = (),
     ) -> None:
         if ancestors_last:
-            prefix = "".join("  " if flag else "│ " for flag in ancestors_last[:-1])
+            prefix = "".join(" " if flag else "│" for flag in ancestors_last[:-1])
             prefix += "└── " if ancestors_last[-1] else "├── "
         else:
             prefix = ""

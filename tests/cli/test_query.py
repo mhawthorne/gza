@@ -6356,6 +6356,53 @@ class TestLineageCommand:
         assert len(status_positions) == 1
         assert len(prompt_positions) == 1
 
+    def test_lineage_prefix_depth_increments_one_column_per_level(self, tmp_path: Path):
+        """Ancestor indentation grows by exactly one column per depth level."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        now = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+
+        root = store.add("Root implement", task_type="implement")
+        root.status = "completed"
+        root.completed_at = now
+        store.update(root)
+
+        child = store.add("Child improve", task_type="improve", based_on=root.id)
+        child.status = "completed"
+        child.completed_at = now
+        store.update(child)
+
+        grandchild = store.add("Grandchild improve", task_type="improve", based_on=child.id)
+        grandchild.status = "completed"
+        grandchild.completed_at = now
+        store.update(grandchild)
+
+        great_grandchild = store.add("Great grandchild improve", task_type="improve", based_on=grandchild.id)
+        great_grandchild.status = "completed"
+        great_grandchild.completed_at = now
+        store.update(great_grandchild)
+
+        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        by_id = {
+            match.group(1): line
+            for line in result.stdout.splitlines()
+            for match in [re.search(r"(testproject-\d+)", line)]
+            if match
+        }
+        child_line = by_id[child.id]
+        grandchild_line = by_id[grandchild.id]
+        great_grandchild_line = by_id[great_grandchild.id]
+
+        child_connector_col = child_line.index("└── ")
+        grandchild_connector_col = grandchild_line.index("└── ")
+        great_grandchild_connector_col = great_grandchild_line.index("└── ")
+
+        assert grandchild_connector_col - child_connector_col == 1
+        assert great_grandchild_connector_col - grandchild_connector_col == 1
+
 
 class TestPsSortKey:
     """Tests for _ps_sort_key sort-key function."""
