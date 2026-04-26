@@ -1197,6 +1197,7 @@ Use `gza queue next <task_id>` to make a task the next ordered item, or `gza que
 `gza queue` shows tasks that default worker pickup can run (internal and dependency-blocked pending tasks are excluded).
 By default, `gza queue` shows the first 10 runnable tasks. Use `-n 0`, `-n -1`, or `--all` to show everything.
 To treat a group as a release queue, assign tasks with `gza add --group release-1.2 ...` and inspect them with `gza queue --group release-1.2`. That command is the canonical preview for what `gza watch --group release-1.2` will consider and in what order.
+Internally, queue-style task listing is routed through the unified task query layer so queue, next, and API consumers can share the same filter/order semantics.
 
 ### implement
 

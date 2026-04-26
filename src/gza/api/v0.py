@@ -38,7 +38,7 @@ from pathlib import Path
 from gza import query as _query
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task
-from gza.pickup import get_runnable_pending_tasks
+from gza.task_query import SortSpec, TaskQuery, TaskQueryPresets, TaskQueryService, TaskRow
 
 __all__ = ["GzaClient", "Task", "IncompleteSnapshot"]
 
@@ -154,10 +154,32 @@ class GzaClient:
         dependency-blocked tasks). Use :meth:`get_pending` for runnable pickup
         order semantics.
         """
-        return IncompleteSnapshot(
-            pending=self._store.get_pending(),
-            in_progress=self._store.get_in_progress(),
-        )
+        service = TaskQueryService(self._store)
+        pending = [
+            row.task
+            for row in service.run(
+                TaskQuery(
+                    scope="tasks",
+                    limit=None,
+                    statuses=("pending",),
+                    sort=SortSpec(field="pickup_order", descending=False),
+                )
+            ).rows
+            if isinstance(row, TaskRow)
+        ]
+        in_progress = [
+            row.task
+            for row in service.run(
+                TaskQuery(
+                    scope="tasks",
+                    limit=None,
+                    statuses=("in_progress",),
+                    sort=SortSpec(field="created_at", descending=False),
+                )
+            ).rows
+            if isinstance(row, TaskRow)
+        ]
+        return IncompleteSnapshot(pending=pending, in_progress=in_progress)
 
     def get_pending(self, limit: int | None = None) -> list[Task]:
         """Return pending tasks in pickup order.
@@ -173,11 +195,28 @@ class GzaClient:
         dependency-blocked tasks are excluded. Ordering is urgent-first, with
         recently bumped urgent tasks first, then FIFO by creation time.
         """
-        return get_runnable_pending_tasks(self._store, limit=limit)
+        service = TaskQueryService(self._store)
+        return [
+            row.task
+            for row in service.run(TaskQueryPresets.queue(limit=limit)).rows
+            if isinstance(row, TaskRow)
+        ]
 
     def get_in_progress(self) -> list[Task]:
         """Return in-progress tasks, oldest-started first."""
-        return self._store.get_in_progress()
+        service = TaskQueryService(self._store)
+        return [
+            row.task
+            for row in service.run(
+                TaskQuery(
+                    scope="tasks",
+                    limit=None,
+                    statuses=("in_progress",),
+                    sort=SortSpec(field="created_at", descending=False),
+                )
+            ).rows
+            if isinstance(row, TaskRow)
+        ]
 
     # ------------------------------------------------------------------ #
     # Lookback / history queries                                           #
@@ -210,7 +249,10 @@ class GzaClient:
         list[Task]
             Tasks ordered by completed_at DESC.
         """
-        return self._store.get_history(limit=limit, status=status, task_type=task_type)
+        return _query.query_history(
+            self._store,
+            _query.HistoryFilter(limit=limit, status=status, task_type=task_type),
+        )
 
     def get_recent_completed(self, limit: int = 15) -> list[Task]:
         """Return the N most recently completed tasks.
@@ -220,4 +262,7 @@ class GzaClient:
         limit:
             Number of tasks to return (default 15).
         """
-        return self._store.get_recent_completed(limit=limit)
+        return _query.query_history(
+            self._store,
+            _query.HistoryFilter(limit=limit, status="completed"),
+        )
