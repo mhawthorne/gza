@@ -1864,6 +1864,13 @@ def main() -> int:
             metavar="SECS",
             help="Refresh output every SECS seconds (default: 5 if flag given without value)",
         )
+        ps_parser.add_argument(
+            "--recent-minutes",
+            type=int,
+            default=1,
+            metavar="MINUTES",
+            help="In --poll mode, include terminal rows that ended within the last MINUTES (default: 1)",
+        )
         add_common_args(ps_parser)
 
     # kill command

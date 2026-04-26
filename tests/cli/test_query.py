@@ -3185,6 +3185,160 @@ class TestPsCommand:
 
         registry.remove("w-test-startup-poll")
 
+    def test_print_ps_output_poll_adopts_recently_ended_terminal_row(self, tmp_path: Path, capsys):
+        """Poll path adopts first-seen terminal rows ended within the recent window."""
+        import argparse
+
+        from gza.cli import _print_ps_output
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        now = datetime.now(UTC)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-recent-terminal",
+                pid=99998,
+                task_id=None,
+                task_slug="recent-terminal-worker",
+                started_at=(now - timedelta(minutes=2)).isoformat(),
+                status="completed",
+                log_file=None,
+                worktree=None,
+                completed_at=(now - timedelta(seconds=30)).isoformat(),
+            )
+        )
+
+        args = argparse.Namespace(quiet=False, json=True)
+        seen_tasks: dict[str, dict] = {}
+        _print_ps_output(args, registry, store, seen_tasks=seen_tasks, recent_minutes=1)
+
+        captured = capsys.readouterr()
+        assert '"worker_id": "w-test-recent-terminal"' in captured.out
+        assert '"status": "completed"' in captured.out
+        assert "w-test-recent-terminal" in seen_tasks
+
+        registry.remove("w-test-recent-terminal")
+
+    def test_print_ps_output_poll_does_not_adopt_old_terminal_row(self, tmp_path: Path, capsys):
+        """Poll path does not adopt terminal rows outside the recent window."""
+        import argparse
+
+        from gza.cli import _print_ps_output
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        now = datetime.now(UTC)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-old-terminal",
+                pid=99997,
+                task_id=None,
+                task_slug="old-terminal-worker",
+                started_at=(now - timedelta(minutes=10)).isoformat(),
+                status="completed",
+                log_file=None,
+                worktree=None,
+                completed_at=(now - timedelta(minutes=5)).isoformat(),
+            )
+        )
+
+        args = argparse.Namespace(quiet=False, json=True)
+        seen_tasks: dict[str, dict] = {}
+        _print_ps_output(args, registry, store, seen_tasks=seen_tasks, recent_minutes=1)
+
+        captured = capsys.readouterr()
+        assert "No in-progress tasks (use --poll to monitor)" in captured.out
+        assert "w-test-old-terminal" not in seen_tasks
+
+        registry.remove("w-test-old-terminal")
+
+    def test_print_ps_output_poll_recent_minutes_zero_disables_recent_terminal_adoption(self, tmp_path: Path, capsys):
+        """A 0-minute recent window preserves old behavior for first-seen terminal rows."""
+        import argparse
+
+        from gza.cli import _print_ps_output
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        now = datetime.now(UTC)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-zero-window",
+                pid=99996,
+                task_id=None,
+                task_slug="zero-window-worker",
+                started_at=(now - timedelta(minutes=2)).isoformat(),
+                status="completed",
+                log_file=None,
+                worktree=None,
+                completed_at=(now - timedelta(seconds=15)).isoformat(),
+            )
+        )
+
+        args = argparse.Namespace(quiet=False, json=True)
+        seen_tasks: dict[str, dict] = {}
+        _print_ps_output(args, registry, store, seen_tasks=seen_tasks, recent_minutes=0)
+
+        captured = capsys.readouterr()
+        assert "No in-progress tasks (use --poll to monitor)" in captured.out
+        assert "w-test-zero-window" not in seen_tasks
+
+        registry.remove("w-test-zero-window")
+
+    def test_print_ps_output_poll_respects_custom_recent_minutes_window(self, tmp_path: Path, capsys):
+        """Custom recent window widens first-seen terminal adoption in poll mode."""
+        import argparse
+
+        from gza.cli import _print_ps_output
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        now = datetime.now(UTC)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-wide-window",
+                pid=99995,
+                task_id=None,
+                task_slug="wide-window-worker",
+                started_at=(now - timedelta(minutes=7)).isoformat(),
+                status="failed",
+                log_file=None,
+                worktree=None,
+                completed_at=(now - timedelta(minutes=5)).isoformat(),
+            )
+        )
+
+        args = argparse.Namespace(quiet=False, json=True)
+        seen_tasks: dict[str, dict] = {}
+        _print_ps_output(args, registry, store, seen_tasks=seen_tasks, recent_minutes=10)
+
+        captured = capsys.readouterr()
+        assert '"worker_id": "w-test-wide-window"' in captured.out
+        assert '"status": "failed"' in captured.out
+        assert "w-test-wide-window" in seen_tasks
+
+        registry.remove("w-test-wide-window")
+
     def test_ps_handles_missing_started_timestamp(self, tmp_path: Path):
         """PS should gracefully handle invalid/missing start timestamps."""
         import json
@@ -3409,6 +3563,61 @@ class TestPsCommand:
         assert result == 1
         captured = capsys.readouterr()
         assert "error" in captured.err
+
+    def test_ps_recent_minutes_negative_value_returns_error(self, tmp_path: Path, capsys):
+        """Negative --recent-minutes value returns exit code 1 with an error message."""
+        import argparse
+
+        from gza.cli import cmd_ps
+
+        setup_config(tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            quiet=False,
+            json=False,
+            poll=None,
+            recent_minutes=-1,
+        )
+
+        result = cmd_ps(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "error" in captured.err
+        assert "--recent-minutes" in captured.err
+        assert "-1" in captured.err
+
+    def test_ps_recent_minutes_non_poll_has_no_effect(self, tmp_path: Path):
+        """Without --poll, recent terminal adoption is still not applied."""
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        now = datetime.now(UTC)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-non-poll-recent",
+                pid=99993,
+                task_id=None,
+                task_slug="non-poll-recent-worker",
+                started_at=(now - timedelta(minutes=2)).isoformat(),
+                status="completed",
+                log_file=None,
+                worktree=None,
+                completed_at=(now - timedelta(seconds=20)).isoformat(),
+            )
+        )
+
+        result = run_gza("ps", "--json", "--recent-minutes", "10", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "No in-progress tasks (use --poll to monitor)" in result.stdout
+        assert "w-test-non-poll-recent" not in result.stdout
+
+        registry.remove("w-test-non-poll-recent")
 
     def test_ps_poll_no_ansi_codes_when_not_tty(self, tmp_path: Path, capsys):
         """ANSI escape codes are not emitted when stdout is not a TTY."""
