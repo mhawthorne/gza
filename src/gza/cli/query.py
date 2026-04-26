@@ -1896,8 +1896,6 @@ def cmd_delete(args: argparse.Namespace) -> int:
 
 def cmd_lineage(args: argparse.Namespace) -> int:
     """Show the full lineage tree for a given task."""
-    from rich.tree import Tree as RichTree
-
     config = Config.load(args.project_dir)
     store = get_store(config)
     service = _TaskQueryService(store)
@@ -1930,49 +1928,130 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         ts = value.astimezone(UTC) if value.tzinfo is not None else value
         return f"{ts.strftime('%Y-%m-%d %H:%M:%S')} UTC"
 
-    def _node_label(node: TaskLineageNode) -> str:
-        t = node.task
-        is_target = t.id == task_id
+    def _strip_slug_date_prefix(slug: str) -> str:
+        if len(slug) > 9 and slug[8] == "-" and slug[:8].isdigit():
+            return slug[9:]
+        return slug
 
-        status = _status_text(t)
+    def _prompt_text(t: DbTask) -> str:
+        type_str = t.task_type or "implement"
+        if type_str not in {"plan", "implement"}:
+            return ""
+        if t.slug:
+            value = _strip_slug_date_prefix(t.slug)
+        else:
+            value = t.prompt.split("\n")[0].strip()
+        return value[:60] + "…" if len(value) > 60 else value
+
+    def _merge_label_text(t: DbTask) -> str:
+        type_str = t.task_type or "implement"
+        if type_str not in {"implement", "improve"}:
+            return ""
+        if t.merge_status == "merged":
+            return "[merged]"
+        if t.merge_status == "unmerged":
+            return "[unmerged]"
+        return ""
+
+    rows: list[tuple[TaskLineageNode, str]] = []
+
+    def _collect_rows(
+        node: TaskLineageNode,
+        *,
+        ancestors_last: tuple[bool, ...] = (),
+    ) -> None:
+        if ancestors_last:
+            prefix = "".join("  " if flag else "│ " for flag in ancestors_last[:-1])
+            prefix += "└── " if ancestors_last[-1] else "├── "
+        else:
+            prefix = ""
+        rows.append((node, prefix))
+
+        for idx, child in enumerate(node.children):
+            _collect_rows(
+                child,
+                ancestors_last=(*ancestors_last, idx == len(node.children) - 1),
+            )
+
+    _collect_rows(lineage_tree)
+
+    id_width = 1
+    when_width = 1
+    type_width = 1
+    status_width = 1
+    merge_width = 0
+    prefix_width = 0
+
+    for node, prefix in rows:
+        t = node.task
         when = t.completed_at or t.started_at or t.created_at
         type_str = t.task_type or "implement"
-        first_line = t.prompt.split("\n")[0].strip()
-        prompt_short = first_line[:60] + "…" if len(first_line) > 60 else first_line
-
-        lc = _colors.LINEAGE_COLORS
         rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
-        rel_part = f" [{lc.relationship}]{rich_escape(f'[{rel}]')}[/{lc.relationship}]" if rel and rel != type_str else ""
+        type_display = f"{type_str} [{rel}]" if rel and rel != type_str else type_str
+        status_text = _status_text(t)
+        merge_text = _merge_label_text(t)
 
-        stats = format_stats(t)
-        stats_part = f" [{lc.stats}]({stats})[/{lc.stats}]" if stats else ""
-        when_part = f" [{lc.stats}]({_format_utc_timestamp(when)})[/{lc.stats}]" if when else ""
+        id_width = max(id_width, len(t.id or "-"))
+        when_width = max(when_width, len(_format_utc_timestamp(when)) if when else 1)
+        type_width = max(type_width, len(type_display))
+        status_width = max(status_width, len(status_text))
+        merge_width = max(merge_width, len(merge_text))
+        prefix_width = max(prefix_width, len(prefix))
 
-        status_color = _LINEAGE_STATUS_COLORS.get(t.status or "", "white")
+    lc = _colors.LINEAGE_COLORS
+    unknown_status_color = _colors.STATUS_COLORS.unknown
+    merged_color = _colors.STATUS_COLORS.completed
+    unmerged_color = _colors.STATUS_COLORS.unmerged
 
-        label = (
-            f"[{lc.task_id}]{t.id}[/{lc.task_id}]"
-            f" [{lc.type_label}]{rich_escape(type_str)}[/{lc.type_label}]"
-            f" [{status_color}]{rich_escape(status)}[/{status_color}]"
-            f"{when_part}"
-            f"{rel_part}"
-            f"  [{lc.prompt}]'{rich_escape(prompt_short)}'[/{lc.prompt}]"
-            f"{stats_part}"
-        )
+    for node, prefix in rows:
+        t = node.task
+        is_target = t.id == task_id
+        when = t.completed_at or t.started_at or t.created_at
 
-        if is_target:
-            label = f"[{lc.target_highlight}]→ {label}[/{lc.target_highlight}]"
+        task_id_text = t.id or "-"
+        timestamp_text = _format_utc_timestamp(when) if when else "-"
+        type_str = t.task_type or "implement"
+        rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
+        type_display = f"{type_str} [{rel}]" if rel and rel != type_str else type_str
+        status_text = _status_text(t)
+        merge_text = _merge_label_text(t)
+        prompt_text = _prompt_text(t)
 
-        return label
+        status_color = _LINEAGE_STATUS_COLORS.get(t.status or "", unknown_status_color)
+        if merge_text == "[merged]":
+            merge_color = merged_color
+        elif merge_text == "[unmerged]":
+            merge_color = unmerged_color
+        else:
+            merge_color = lc.annotation
 
-    def _populate(node: TaskLineageNode, rich_parent: RichTree) -> None:
-        for child in node.children:
-            child_branch = rich_parent.add(_node_label(child))
-            _populate(child, child_branch)
+        prefix_part = f"[{lc.connector}]{rich_escape(prefix.ljust(prefix_width))}[/{lc.connector}]"
+        arrow_char = "→" if is_target else " "
+        arrow_part = f"[{lc.target_highlight}]{arrow_char}[/{lc.target_highlight}]"
+        task_id_part = f"[{lc.task_id}]{rich_escape(task_id_text.ljust(id_width))}[/{lc.task_id}]"
+        timestamp_part = f"[{lc.stats}]{rich_escape(timestamp_text.ljust(when_width))}[/{lc.stats}]"
+        type_part = f"[{lc.type_label}]{rich_escape(type_display.ljust(type_width))}[/{lc.type_label}]"
+        status_part = f"[{status_color}]{rich_escape(status_text.ljust(status_width))}[/{status_color}]"
+        if merge_width > 0:
+            merge_cell = merge_text.ljust(merge_width)
+            merge_part = f"[{merge_color}]{rich_escape(merge_cell)}[/{merge_color}]"
+        else:
+            merge_part = ""
+        prompt_part = f"[{lc.prompt}]{rich_escape(prompt_text)}[/{lc.prompt}]"
 
-    rich_tree = RichTree(_node_label(lineage_tree))
-    _populate(lineage_tree, rich_tree)
-    console.print(rich_tree)
+        pieces = [
+            prefix_part,
+            arrow_part,
+            task_id_part,
+            timestamp_part,
+            type_part,
+            status_part,
+        ]
+        if merge_width > 0:
+            pieces.append(merge_part)
+        pieces.append(prompt_part)
+        console.print(" ".join(pieces).rstrip())
+
     return 0
 
 
