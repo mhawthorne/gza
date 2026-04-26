@@ -7,6 +7,7 @@ import pytest
 
 from gza.db import SqliteTaskStore, Task
 from gza.query import (
+    _classify_child_relationship,
     _resolve_effective_shared_branch_retry_head,
     HistoryFilter,
     get_task_lineage,
@@ -29,6 +30,16 @@ def _make_task(**kwargs) -> Task:
     }
     defaults.update(kwargs)
     return Task(**defaults)
+
+
+class TestClassifyChildRelationship:
+    """Unit tests for lineage child relationship classification."""
+
+    def test_rebase_child_of_rebase_parent_is_labeled_rebase(self):
+        parent = _make_task(id="gza-1", task_type="rebase")
+        child = _make_task(id="gza-2", task_type="rebase", based_on="gza-1")
+
+        assert _classify_child_relationship(parent, child) == "rebase"
 
 
 class TestIsLineageComplete:

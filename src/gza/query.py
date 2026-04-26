@@ -525,6 +525,11 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
     if parent_id is None:
         return "child"
 
+    # Rebase children should always be classified as rebase, even when they
+    # share task_type with the parent (which would otherwise look like retry).
+    if child.task_type == "rebase" and child.based_on == parent_id:
+        return "rebase"
+
     # Detect resume/retry first: same task_type + based_on pointing to parent
     # indicates a re-execution of the same work, not a lifecycle transition.
     # An explicit depends_on edge to the same parent means the child is a
@@ -538,8 +543,6 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
             return "resume"
         return "retry"
 
-    if child.task_type == "rebase" and child.based_on == parent_id:
-        return "rebase"
     if child.task_type == "review" and child.depends_on == parent_id:
         return "review"
     if child.task_type == "improve" and child.depends_on == parent_id:
