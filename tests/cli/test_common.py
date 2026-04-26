@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import pytest
 
 from gza.cli._common import (
@@ -47,6 +49,22 @@ class TestLooksLikeTaskId:
 
 class TestFormatStats:
     """Unit tests for compact task stats formatting."""
+
+    def test_format_stats_includes_started_date_and_omits_steps_and_cost(self, tmp_path):
+        """Stats include started date while excluding step and cost fields."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Task with stats")
+        task.started_at = datetime(2026, 4, 25, 8, 30, tzinfo=UTC)
+        task.duration_seconds = 120.0
+        task.num_steps_reported = 7
+        task.cost_usd = 0.4321
+        store.update(task)
+
+        stats = format_stats(task)
+        assert "2m0s" in stats
+        assert "2026-04-25" in stats
+        assert "steps" not in stats
+        assert "$" not in stats
 
     def test_format_stats_includes_attach_counts_and_seconds(self, tmp_path):
         """Attach count and sub-minute attach duration are rendered in seconds."""

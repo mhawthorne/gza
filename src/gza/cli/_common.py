@@ -972,9 +972,8 @@ def format_stats(task: DbTask) -> str:
             mins = int(task.duration_seconds // 60)
             secs = int(task.duration_seconds % 60)
             parts.append(f"{mins}m{secs}s")
-    resolved_steps = get_task_step_count(task)
-    if resolved_steps is not None:
-        parts.append(f"{resolved_steps} steps")
+    if task.started_at is not None:
+        parts.append(task.started_at.strftime("%Y-%m-%d"))
     if task.attach_count:
         attach_part = f"{task.attach_count} attach"
         if task.attach_count != 1:
@@ -988,8 +987,6 @@ def format_stats(task: DbTask) -> str:
                 secs = int(attach_secs % 60)
                 attach_part += f" ({mins}m{secs}s)"
         parts.append(attach_part)
-    if task.cost_usd is not None:
-        parts.append(f"${task.cost_usd:.4f}")
     return " | ".join(parts) if parts else ""
 
 
