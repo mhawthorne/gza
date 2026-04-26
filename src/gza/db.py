@@ -2488,6 +2488,48 @@ class SqliteTaskStore:
             )
             return [self._row_to_task(row) for row in cur.fetchall()]
 
+    def rename_group(self, old_group: str, new_group: str) -> int:
+        """Rename a task group across all tasks.
+
+        Returns the number of updated tasks.
+
+        Raises:
+            ValueError: If either name is empty, the source group does not exist,
+                or the destination group already exists.
+        """
+        old_name = old_group.strip()
+        new_name = new_group.strip()
+        if not old_name:
+            raise ValueError("source group name must not be empty")
+        if not new_name:
+            raise ValueError("destination group name must not be empty")
+
+        with self._connect() as conn:
+            existing_old = conn.execute(
+                'SELECT COUNT(*) AS count FROM tasks WHERE "group" = ?',
+                (old_name,),
+            ).fetchone()
+            assert existing_old is not None
+            old_count = int(existing_old["count"])
+            if old_count == 0:
+                raise ValueError(f"group '{old_name}' not found")
+
+            if old_name == new_name:
+                return old_count
+
+            existing_new = conn.execute(
+                'SELECT 1 FROM tasks WHERE "group" = ? LIMIT 1',
+                (new_name,),
+            ).fetchone()
+            if existing_new is not None:
+                raise ValueError(f"group '{new_name}' already exists")
+
+            cur = conn.execute(
+                'UPDATE tasks SET "group" = ? WHERE "group" = ?',
+                (new_name, old_name),
+            )
+            return cur.rowcount
+
     def _find_successful_retry_task(self, task_id: str) -> Task | None:
         """Return the first completed task in the retry chain rooted at task_id.
 

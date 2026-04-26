@@ -2450,7 +2450,7 @@ class TestGroupsCommand:
     """Tests for 'gza groups' command."""
 
     def test_groups_with_tasks(self, tmp_path: Path):
-        """Groups command shows all groups with task counts."""
+        """groups list shows all groups with task counts."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2463,22 +2463,49 @@ class TestGroupsCommand:
         task3.completed_at = datetime.now(UTC)
         store.update(task3)
 
-        result = run_gza("groups", "--project", str(tmp_path))
+        result = run_gza("groups", "list", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "group-a" in result.stdout
+        assert "group-b" in result.stdout
+
+    def test_groups_list_with_tasks(self, tmp_path: Path):
+        """groups list should show all groups with task counts."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("Task 1", group="group-a")
+        store.add("Task 2", group="group-b")
+
+        result = run_gza("groups", "list", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "group-a" in result.stdout
         assert "group-b" in result.stdout
 
     def test_groups_with_no_groups(self, tmp_path: Path):
-        """Groups command handles no groups."""
+        """groups list handles no groups."""
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         make_store(tmp_path)
 
+        result = run_gza("groups", "list", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+    def test_groups_without_subcommand_shows_help(self, tmp_path: Path):
+        """Bare groups should show help instead of implicitly listing."""
+        setup_config(tmp_path)
+        make_store(tmp_path)
+
         result = run_gza("groups", "--project", str(tmp_path))
 
         assert result.returncode == 0
+        assert "usage:" in result.stdout
+        assert "list" in result.stdout
+        assert "rename" in result.stdout
 
 
 class TestStatusCommand:
@@ -2544,6 +2571,38 @@ class TestStatusCommand:
         assert result.returncode == 0
         assert "orphaned" not in result.stdout
         assert "Task in group B" in result.stdout
+
+
+class TestRenameGroupCommand:
+    """Tests for 'gza groups rename' command."""
+
+    def test_rename_group_updates_all_tasks_in_group(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        first = store.add("First task", group="release")
+        second = store.add("Second task", group="release")
+        other = store.add("Backlog task", group="backlog")
+
+        result = run_gza("groups", "rename", "release", "launch", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Renamed group 'release' to 'launch'" in result.stdout
+        assert store.get(first.id).group == "launch"
+        assert store.get(second.id).group == "launch"
+        assert store.get(other.id).group == "backlog"
+
+    def test_rename_group_rejects_existing_destination(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("Release task", group="release")
+        store.add("Backlog task", group="backlog")
+
+        result = run_gza("groups", "rename", "release", "backlog", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "already exists" in result.stdout
 
 
 class TestPsCommand:

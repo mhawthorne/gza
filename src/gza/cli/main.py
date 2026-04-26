@@ -69,6 +69,7 @@ from .log import cmd_log
 from .query import (
     cmd_attach,
     cmd_delete,
+    cmd_group_rename,
     cmd_groups,
     cmd_history,
     cmd_incomplete,
@@ -1826,6 +1827,19 @@ def main() -> int:
     # groups command
     groups_parser = subparsers.add_parser("groups", help="List all groups with task counts")
     add_common_args(groups_parser)
+    groups_subparsers = groups_parser.add_subparsers(dest="groups_action")
+    groups_list_parser = groups_subparsers.add_parser("list", help="List all groups with task counts")
+    add_common_args(groups_list_parser)
+    groups_rename_parser = groups_subparsers.add_parser("rename", help="Rename a group across all attached tasks")
+    groups_rename_parser.add_argument(
+        "old_group",
+        help="Current group name",
+    )
+    groups_rename_parser.add_argument(
+        "new_group",
+        help="New group name",
+    )
+    add_common_args(groups_rename_parser)
 
     # group command
     group_parser = subparsers.add_parser("group", help="Show tasks in a group")
@@ -2087,6 +2101,11 @@ def main() -> int:
         elif args.command == "import":
             return cmd_import(args)
         elif args.command == "groups":
+            if getattr(args, "groups_action", None) is None:
+                groups_parser.print_help()
+                return 0
+            if getattr(args, "groups_action", None) == "rename":
+                return cmd_group_rename(args)
             return cmd_groups(args)
         elif args.command == "group":
             return cmd_status(args)
