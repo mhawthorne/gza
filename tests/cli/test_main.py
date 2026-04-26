@@ -185,6 +185,53 @@ class TestHelpOutput:
         assert "--pr" in docs_text
         assert "Create/reuse a GitHub PR for completed code tasks before auto-created review runs" in docs_text
 
+    def test_watch_and_queue_group_help_point_to_same_scoped_pickup_preview(self, tmp_path):
+        """Help/docs should make `queue --group` the preview for `watch --group`."""
+        setup_config(tmp_path)
+
+        watch_help = run_gza("watch", "--help", "--project", str(tmp_path))
+        queue_help = run_gza("queue", "--help", "--project", str(tmp_path))
+        assert watch_help.returncode == 0
+        assert queue_help.returncode == 0
+
+        watch_text = " ".join(watch_help.stdout.split())
+        queue_text = " ".join(queue_help.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "use 'gza queue --group NAME' to preview scoped pickup order" in watch_text
+        assert "same scoped pickup order used by 'gza watch --group NAME'" in queue_text
+        assert "use `gza queue --group NAME` to preview the same scoped pickup order" in docs_text
+        assert "canonical preview for what `gza watch --group release-1.2` will consider and in what order" in docs_text
+
+    def test_queue_help_and_docs_describe_default_limit_and_all_overrides(self, tmp_path):
+        """`queue --help` and docs should describe capped default output and all-task overrides."""
+        setup_config(tmp_path)
+
+        queue_help = run_gza("queue", "--help", "--project", str(tmp_path))
+        assert queue_help.returncode == 0
+
+        help_text = " ".join(queue_help.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "Show first N runnable tasks (default: 10; use 0, -1, or --all for all)" in help_text
+        assert "Show all runnable tasks" in help_text
+        assert "Show first N runnable tasks (default: 10; use `0`, `-1`, or `--all` for all)" in docs_text
+        assert "By default, `gza queue` shows the first 10 runnable tasks." in docs_text
+
+    def test_show_help_and_docs_describe_prompt_as_plain_text(self, tmp_path):
+        """`show --prompt` should be documented as plain prompt-text output, not JSON."""
+        setup_config(tmp_path)
+
+        show_help = run_gza("show", "--help", "--project", str(tmp_path))
+        assert show_help.returncode == 0
+
+        help_text = " ".join(show_help.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "Print only the fully built prompt text for this task and exit" in help_text
+        assert "as JSON" not in help_text
+        assert "| `--prompt` | Print only the fully built prompt text for this task and exit |" in docs_text
+
     def test_search_command_help_mentions_prompt_substring_scope(self, tmp_path):
         """`search --help` should describe prompt-only substring matching."""
         setup_config(tmp_path)
@@ -282,9 +329,18 @@ class TestCommandAliases:
         assert args.command == "watch"
         assert args.batch == 2
 
-    @pytest.mark.parametrize("queue_action", ["bump", "unbump"])
-    def test_queue_subcommands_dispatch_to_cmd_queue(self, tmp_path, queue_action):
-        """`queue bump|unbump` should parse subcommand shape and route to cmd_queue."""
+    @pytest.mark.parametrize(
+        ("queue_action", "argv_tail"),
+        [
+            ("bump", ["test-project-1"]),
+            ("unbump", ["test-project-1"]),
+            ("next", ["test-project-1"]),
+            ("clear", ["test-project-1"]),
+            ("move", ["test-project-1", "2"]),
+        ],
+    )
+    def test_queue_subcommands_dispatch_to_cmd_queue(self, tmp_path, queue_action, argv_tail):
+        """`queue` subcommands should parse subcommand shape and route to cmd_queue."""
         from gza.cli.main import main
 
         setup_config(tmp_path)
@@ -293,7 +349,7 @@ class TestCommandAliases:
             patch.object(
                 sys,
                 "argv",
-                ["gza", "queue", queue_action, "test-project-1", "--project", str(tmp_path)],
+                ["gza", "queue", queue_action, *argv_tail, "--project", str(tmp_path)],
             ),
             patch("gza.cli.main.cmd_queue", return_value=0) as cmd_queue,
         ):
@@ -305,6 +361,8 @@ class TestCommandAliases:
         assert args.command == "queue"
         assert args.queue_action == queue_action
         assert args.task_id == "test-project-1"
+        if queue_action == "move":
+            assert args.position == 2
 
 
 class TestWorkForceBackgroundDispatch:

@@ -1334,6 +1334,22 @@ class TestNextCommand:
 class TestQueueCommand:
     """Tests for `gza queue` ordering and urgent-lane controls."""
 
+    def test_queue_defaults_to_first_ten_runnable_tasks(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        for i in range(12):
+            store.add(f"Task {i + 1}")
+
+        result = run_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Task 1" in result.stdout
+        assert "Task 10" in result.stdout
+        assert "Task 11" not in result.stdout
+        assert "Task 12" not in result.stdout
+        assert "2 more runnable tasks" in result.stdout
+
     def test_queue_lists_pending_in_urgent_then_fifo_order(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1357,6 +1373,48 @@ class TestQueueCommand:
         assert urgent_line < normal_1_line < normal_2_line
         assert str(normal_1.id) in lines[normal_1_line]
         assert str(normal_2.id) in lines[normal_2_line]
+
+    @pytest.mark.parametrize("all_value", ["0", "-1"])
+    def test_queue_limit_zero_or_minus_one_shows_all(self, tmp_path: Path, all_value: str):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        for i in range(12):
+            store.add(f"Task {i + 1}")
+
+        result = run_gza("queue", "-n", all_value, "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Task 12" in result.stdout
+        assert "more runnable tasks" not in result.stdout
+
+    def test_queue_all_shows_all(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        for i in range(12):
+            store.add(f"Task {i + 1}")
+
+        result = run_gza("queue", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Task 12" in result.stdout
+        assert "more runnable tasks" not in result.stdout
+
+    def test_queue_limit_restricts_output(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        for i in range(5):
+            store.add(f"Task {i + 1}")
+
+        result = run_gza("queue", "-n", "2", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Task 1" in result.stdout
+        assert "Task 2" in result.stdout
+        assert "Task 3" not in result.stdout
+        assert "3 more runnable tasks" in result.stdout
 
     def test_queue_bump_and_unbump(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -1427,6 +1485,57 @@ class TestQueueCommand:
         newer_line = next(i for i, line in enumerate(lines) if "Newer urgent" in line)
         assert bumped_line < older_line < newer_line
 
+    def test_queue_move_assigns_explicit_positions(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        first = store.add("First")
+        second = store.add("Second")
+        third = store.add("Third")
+        assert first.id is not None
+        assert second.id is not None
+        assert third.id is not None
+
+        move = run_gza("queue", "move", third.id, "1", "--project", str(tmp_path))
+        assert move.returncode == 0
+        assert "queue position 1" in move.stdout
+
+        queue = run_gza("queue", "--project", str(tmp_path))
+        assert queue.returncode == 0
+        lines = [line for line in queue.stdout.splitlines() if line.strip()]
+        third_line = next(i for i, line in enumerate(lines) if "Third" in line)
+        first_line = next(i for i, line in enumerate(lines) if "First" in line)
+        second_line = next(i for i, line in enumerate(lines) if "Second" in line)
+        assert third_line < first_line < second_line
+        assert "[#1]" in lines[third_line]
+
+    def test_queue_next_and_clear_manage_explicit_order(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        first = store.add("First", group="release")
+        second = store.add("Second", group="release")
+        assert first.id is not None
+        assert second.id is not None
+
+        move_next = run_gza("queue", "next", second.id, "--project", str(tmp_path))
+        assert move_next.returncode == 0
+        assert "queue position 1" in move_next.stdout
+
+        queue = run_gza("queue", "--group", "release", "--project", str(tmp_path))
+        assert queue.returncode == 0
+        lines = [line for line in queue.stdout.splitlines() if line.strip()]
+        assert "Second" in lines[0]
+        assert "[#1]" in lines[0]
+
+        clear = run_gza("queue", "clear", second.id, "--project", str(tmp_path))
+        assert clear.returncode == 0
+        assert "Cleared explicit queue order" in clear.stdout
+
+        refreshed = store.get(second.id)
+        assert refreshed is not None
+        assert refreshed.queue_position is None
+
     def test_next_shows_bumped_task_first(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1444,6 +1553,22 @@ class TestQueueCommand:
         older_line = next(i for i, line in enumerate(lines) if "Older urgent" in line)
         newer_line = next(i for i, line in enumerate(lines) if "Newer urgent" in line)
         assert bumped_line < older_line < newer_line
+
+    def test_next_shows_explicitly_ordered_task_first(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("Older urgent", urgent=True)
+        ordered = store.add("Ordered")
+        assert ordered.id is not None
+        run_gza("queue", "move", ordered.id, "1", "--project", str(tmp_path))
+
+        result = run_gza("next", "--project", str(tmp_path))
+        assert result.returncode == 0
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        ordered_line = next(i for i, line in enumerate(lines) if "Ordered" in line)
+        urgent_line = next(i for i, line in enumerate(lines) if "Older urgent" in line)
+        assert ordered_line < urgent_line
 
     def test_queue_excludes_non_pickable_internal_and_blocked_pending_tasks(self, tmp_path: Path):
         """Queue pickup order output should only include runnable pending tasks."""
@@ -1547,6 +1672,21 @@ class TestShowCommand:
 
         assert result.returncode == 0
         assert "- Restored legacy fix output" in result.stdout
+
+    def test_show_prompt_prints_only_built_prompt_text(self, tmp_path: Path):
+        """--prompt should emit only prompt text, not a JSON metadata envelope."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Prompt only task")
+        assert task.id is not None
+
+        result = run_gza("show", str(task.id), "--prompt", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Prompt only task" in result.stdout
+        assert '"task_id"' not in result.stdout
+        assert '"prompt"' not in result.stdout
+        assert '"verify_command"' not in result.stdout
 
     def test_show_displays_execution_mode_when_set(self, tmp_path: Path):
         """Show command includes execution provenance mode when present."""

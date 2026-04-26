@@ -24,9 +24,11 @@ from ._common import (
     _create_resume_task,
     _spawn_background_resume_worker,
     _spawn_background_worker,
+    clear_task_queue_position,
     format_review_outcome,
     get_store,
     resolve_id,
+    set_task_queue_position,
     set_task_urgency,
 )
 from .advance_executor import AdvanceActionExecutionContext, execute_advance_action
@@ -986,7 +988,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     action = getattr(args, "queue_action", None)
     group = getattr(args, "group", None)
 
-    if action in {"bump", "unbump"}:
+    if action in {"bump", "unbump", "move", "next", "clear"}:
         task_id = resolve_id(config, args.task_id)
         task = store.get(task_id)
         if task is None:
@@ -1006,18 +1008,42 @@ def cmd_queue(args: argparse.Namespace) -> int:
         }
         is_currently_runnable = str(task_id) in runnable_pending_ids
 
-        new_urgent = action == "bump"
-        set_task_urgency(store, task_id, urgent=new_urgent)
-        if new_urgent:
-            if is_currently_runnable:
-                print(f"✓ Bumped task {task_id} to urgent queue")
+        if action in {"bump", "unbump"}:
+            new_urgent = action == "bump"
+            set_task_urgency(store, task_id, urgent=new_urgent)
+            if new_urgent:
+                if is_currently_runnable:
+                    print(f"✓ Bumped task {task_id} to urgent queue")
+                else:
+                    print(f"✓ Bumped task {task_id} (not currently runnable; urgency will apply once runnable)")
             else:
-                print(f"✓ Bumped task {task_id} (not currently runnable; urgency will apply once runnable)")
+                if is_currently_runnable:
+                    print(f"✓ Removed task {task_id} from urgent queue")
+                else:
+                    print(f"✓ Removed urgent flag from task {task_id} (task is not currently runnable)")
+            return 0
+
+        if action == "clear":
+            clear_task_queue_position(store, task_id)
+            if is_currently_runnable:
+                print(f"✓ Cleared explicit queue order for task {task_id}")
+            else:
+                print(f"✓ Cleared explicit queue order for task {task_id} (task is not currently runnable)")
+            return 0
+
+        position = 1 if action == "next" else int(args.position)
+        if position < 1:
+            print("Error: queue position must be >= 1")
+            return 1
+        set_task_queue_position(store, task_id, position=position)
+        if position == 1:
+            message = f"✓ Moved task {task_id} to queue position 1"
         else:
-            if is_currently_runnable:
-                print(f"✓ Removed task {task_id} from urgent queue")
-            else:
-                print(f"✓ Removed urgent flag from task {task_id} (task is not currently runnable)")
+            message = f"✓ Moved task {task_id} to queue position {position}"
+        if is_currently_runnable:
+            print(message)
+        else:
+            print(f"{message} (task is not currently runnable; ordering will apply once runnable)")
         return 0
 
     pending = store.get_pending_pickup(group=group)
@@ -1028,8 +1054,19 @@ def cmd_queue(args: argparse.Namespace) -> int:
             print("No runnable tasks")
         return 0
 
-    for index, task in enumerate(pending, start=1):
+    limit_arg = getattr(args, "limit", 10)
+    show_all = bool(getattr(args, "all", False)) or limit_arg in {0, -1}
+    display_limit = None if show_all else max(1, int(limit_arg))
+    visible_pending = pending if display_limit is None else pending[:display_limit]
+
+    for index, task in enumerate(visible_pending, start=1):
         lane = "urgent" if task.urgent else "normal"
-        print(f"{index:>3}  {task.id}  [{lane}] [{task.task_type}] {_short_prompt(task.prompt)}")
+        position_label = f"[#{task.queue_position}] " if task.queue_position is not None else ""
+        print(f"{index:>3}  {task.id}  {position_label}[{lane}] [{task.task_type}] {_short_prompt(task.prompt)}")
+
+    if display_limit is not None and len(pending) > display_limit:
+        remaining = len(pending) - display_limit
+        plural = "tasks" if remaining != 1 else "task"
+        print(f"({remaining} more runnable {plural}; use -n 0, -n -1, or --all to show everything)")
 
     return 0

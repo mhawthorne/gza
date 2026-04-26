@@ -118,6 +118,17 @@ def _parse_non_negative_int(value: str) -> int:
     return parsed
 
 
+def _parse_queue_limit(value: str) -> int:
+    """Parse `queue -n/--limit` where 0 and -1 both mean unlimited."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--limit must be an integer") from exc
+    if parsed < -1:
+        raise argparse.ArgumentTypeError("--limit must be >= -1 (use 0, -1, or --all for all tasks)")
+    return parsed
+
+
 def main() -> int:
     parser = GzaArgumentParser(
         description="Gza - AI agent task runner",
@@ -628,7 +639,7 @@ def main() -> int:
     watch_parser.add_argument(
         "--group",
         metavar="NAME",
-        help="Only advance, resume, and start tasks from this group",
+        help="Only advance, resume, and start tasks from this group; use 'gza queue --group NAME' to preview scoped pickup order",
     )
 
     # queue command
@@ -637,10 +648,23 @@ def main() -> int:
         help="List runnable pending tasks in pickup order and manage urgent bump flags",
     )
     add_common_args(queue_parser)
+    queue_parser.set_defaults(limit=10, all=False)
     queue_parser.add_argument(
         "--group",
         metavar="NAME",
-        help="Only list runnable tasks from this group",
+        help="Only list runnable tasks from this group (same scoped pickup order used by 'gza watch --group NAME')",
+    )
+    queue_parser.add_argument(
+        "-n",
+        "--limit",
+        type=_parse_queue_limit,
+        metavar="N",
+        help="Show first N runnable tasks (default: 10; use 0, -1, or --all for all)",
+    )
+    queue_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Show all runnable tasks",
     )
     queue_subparsers = queue_parser.add_subparsers(dest="queue_action")
     queue_bump = queue_subparsers.add_parser("bump", help="Move a pending task to the front of the urgent queue lane")
@@ -658,6 +682,40 @@ def main() -> int:
         "--group",
         metavar="NAME",
         help="Check runnable status within this group while unbumping",
+    )
+    queue_move = queue_subparsers.add_parser(
+        "move",
+        help="Assign an explicit queue position within the task's current group bucket",
+    )
+    queue_move.add_argument("task_id", type=str, help="Full prefixed task ID to reorder")
+    queue_move.add_argument("position", type=_parse_non_negative_int, help="1-based queue position")
+    add_common_args(queue_move)
+    queue_move.add_argument(
+        "--group",
+        metavar="NAME",
+        help="Check runnable status within this group while reordering",
+    )
+    queue_next = queue_subparsers.add_parser(
+        "next",
+        help="Move a pending task to explicit queue position 1 within its current group bucket",
+    )
+    queue_next.add_argument("task_id", type=str, help="Full prefixed task ID to move next")
+    add_common_args(queue_next)
+    queue_next.add_argument(
+        "--group",
+        metavar="NAME",
+        help="Check runnable status within this group while moving next",
+    )
+    queue_clear = queue_subparsers.add_parser(
+        "clear",
+        help="Remove a task's explicit queue position and return it to lane-based ordering",
+    )
+    queue_clear.add_argument("task_id", type=str, help="Full prefixed task ID to clear")
+    add_common_args(queue_clear)
+    queue_clear.add_argument(
+        "--group",
+        metavar="NAME",
+        help="Check runnable status within this group while clearing queue order",
     )
 
     # refresh command
@@ -1701,7 +1759,7 @@ def main() -> int:
         "--prompt",
         action="store_true",
         default=False,
-        help="Output the fully built prompt (with templates, context, verify_command) as JSON",
+        help="Print only the fully built prompt text for this task and exit",
     )
     show_parser.add_argument(
         "--output",

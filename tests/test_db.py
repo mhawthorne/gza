@@ -158,6 +158,56 @@ class TestTaskChaining:
         assert next_task.id == urgent.id
         assert next_task.id != normal.id
 
+    def test_explicit_queue_positions_sort_before_lane_order(self, tmp_path: Path):
+        """Explicit queue positions should override urgent/FIFO fallback ordering."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        urgent = store.add("Urgent fallback", urgent=True)
+        ordered_two = store.add("Ordered two")
+        ordered_one = store.add("Ordered one")
+
+        assert urgent.id is not None
+        assert ordered_two.id is not None
+        assert ordered_one.id is not None
+
+        store.set_queue_position(ordered_two.id, 2)
+        store.set_queue_position(ordered_one.id, 1)
+
+        pending = store.get_pending_pickup()
+        assert [task.id for task in pending[:3]] == [
+            ordered_one.id,
+            ordered_two.id,
+            urgent.id,
+        ]
+
+    def test_clear_queue_position_closes_gap(self, tmp_path: Path):
+        """Clearing explicit order should compact remaining positions."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        first = store.add("First ordered", group="release")
+        second = store.add("Second ordered", group="release")
+        third = store.add("Third ordered", group="release")
+        assert first.id is not None
+        assert second.id is not None
+        assert third.id is not None
+
+        store.set_queue_position(first.id, 1)
+        store.set_queue_position(second.id, 2)
+        store.set_queue_position(third.id, 3)
+        store.clear_queue_position(second.id)
+
+        refreshed_first = store.get(first.id)
+        refreshed_second = store.get(second.id)
+        refreshed_third = store.get(third.id)
+        assert refreshed_first is not None
+        assert refreshed_second is not None
+        assert refreshed_third is not None
+        assert refreshed_first.queue_position == 1
+        assert refreshed_second.queue_position is None
+        assert refreshed_third.queue_position == 2
+
     def test_get_pending_pickup_excludes_non_pickable_pending_tasks(self, tmp_path: Path):
         """Pickup listing excludes internal and dependency-blocked pending tasks."""
         db_path = tmp_path / "test.db"
@@ -4162,7 +4212,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -4174,7 +4224,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -4648,6 +4698,28 @@ class TestMigrationUtilityFunctions:
         assert version == SCHEMA_VERSION
         assert "review_score" in columns
 
+    def test_auto_migration_v33_to_v34_adds_queue_position_column(self, tmp_path: Path) -> None:
+        """Opening a v33 DB should migrate to v34 and create tasks.queue_position."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE schema_version SET version = 33")
+        conn.commit()
+        conn.close()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert version == SCHEMA_VERSION
+        assert "queue_position" in columns
+
     def test_open_current_v32_db_repairs_missing_task_comments_table(self, tmp_path: Path) -> None:
         """Opening an already-v32 DB should repair missing comment artifacts."""
         import sqlite3
@@ -4954,7 +5026,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34]
 
         # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")

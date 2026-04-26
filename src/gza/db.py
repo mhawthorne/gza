@@ -242,6 +242,7 @@ class Task:
     provider: str | None = None  # Per-task provider override
     provider_is_explicit: bool = False  # True when provider was explicitly set by user input
     urgent: bool = False  # Queue lane flag: urgent tasks are picked before normal pending tasks
+    queue_position: int | None = None  # Optional explicit queue order within a group bucket
     merge_status: str | None = None  # None, 'unmerged', or 'merged'
     merged_at: datetime | None = None  # When merge_status was set to 'merged'
     failure_reason: str | None = None
@@ -354,8 +355,13 @@ MIGRATION_V32_TO_V33 = """
 ALTER TABLE tasks ADD COLUMN review_score INTEGER;
 """
 
+# Migration from v33 to v34: explicit queue positions for ordered pickup
+MIGRATION_V33_TO_V34 = """
+ALTER TABLE tasks ADD COLUMN queue_position INTEGER;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -470,6 +476,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         30: ("tasks", "urgent_bumped_at"),
         31: ("tasks", "execution_mode"),
         33: ("tasks", "review_score"),
+        34: ("tasks", "queue_position"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is None:
@@ -481,14 +488,18 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         )
 
 
-def _ensure_required_auto_migration_artifacts(conn: sqlite3.Connection) -> None:
+def _ensure_required_auto_migration_artifacts(
+    conn: sqlite3.Connection,
+    *,
+    target_version: int = SCHEMA_VERSION,
+) -> None:
     """Repair required current-schema artifacts removed by external damage.
 
     For writable databases, missing artifacts are recreated in place.
     For read-only/damaged databases where repair cannot be applied, raise
     SchemaIntegrityError with deterministic remediation guidance.
     """
-    if not _table_exists(conn, "task_comments"):
+    if target_version >= 32 and not _table_exists(conn, "task_comments"):
         try:
             conn.executescript(MIGRATION_V31_TO_V32)
         except sqlite3.OperationalError as exc:
@@ -497,8 +508,12 @@ def _ensure_required_auto_migration_artifacts(conn: sqlite3.Connection) -> None:
                 "missing task_comments table; use a writable database."
             ) from exc
 
-    missing_comment_columns = _missing_required_columns(conn, "task_comments", _TASK_COMMENTS_REQUIRED_COLUMNS)
-    if missing_comment_columns:
+    missing_comment_columns = (
+        _missing_required_columns(conn, "task_comments", _TASK_COMMENTS_REQUIRED_COLUMNS)
+        if target_version >= 32
+        else []
+    )
+    if target_version >= 32 and missing_comment_columns:
         missing_column = missing_comment_columns[0]
         try:
             _rebuild_task_comments_table(conn)
@@ -514,13 +529,16 @@ def _ensure_required_auto_migration_artifacts(conn: sqlite3.Connection) -> None:
                 f"task_comments.{remaining_missing[0]}: use a writable database."
             )
 
-    required_columns: tuple[tuple[str, str, str], ...] = (
-        ("tasks", "urgent_bumped_at", "ALTER TABLE tasks ADD COLUMN urgent_bumped_at TEXT"),
-        ("tasks", "execution_mode", "ALTER TABLE tasks ADD COLUMN execution_mode TEXT"),
-        ("tasks", "base_branch", "ALTER TABLE tasks ADD COLUMN base_branch TEXT"),
-        ("tasks", "review_score", "ALTER TABLE tasks ADD COLUMN review_score INTEGER"),
+    required_columns: tuple[tuple[int, str, str, str], ...] = (
+        (30, "tasks", "urgent_bumped_at", "ALTER TABLE tasks ADD COLUMN urgent_bumped_at TEXT"),
+        (31, "tasks", "execution_mode", "ALTER TABLE tasks ADD COLUMN execution_mode TEXT"),
+        (31, "tasks", "base_branch", "ALTER TABLE tasks ADD COLUMN base_branch TEXT"),
+        (33, "tasks", "review_score", "ALTER TABLE tasks ADD COLUMN review_score INTEGER"),
+        (34, "tasks", "queue_position", "ALTER TABLE tasks ADD COLUMN queue_position INTEGER"),
     )
-    for table, column, alter_sql in required_columns:
+    for min_version, table, column, alter_sql in required_columns:
+        if target_version < min_version:
+            continue
         if _table_has_column(conn, table, column):
             continue
         try:
@@ -580,6 +598,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     provider_is_explicit INTEGER DEFAULT 0,
     urgent INTEGER DEFAULT 0,
     urgent_bumped_at TEXT,
+    queue_position INTEGER,
     input_tokens INTEGER,
     output_tokens INTEGER,
     merge_status TEXT,
@@ -935,6 +954,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (31, MIGRATION_V30_TO_V31),
     (32, MIGRATION_V31_TO_V32),
     (33, MIGRATION_V32_TO_V33),
+    (34, MIGRATION_V33_TO_V34),
 ]
 
 
@@ -980,6 +1000,7 @@ class SqliteTaskStore:
                 cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
                 row = cur.fetchone()
                 current_version = row["version"] if row else 0
+                _ensure_required_auto_migration_artifacts(conn, target_version=current_version)
 
                 pending_manual: list[int] = []
                 for target_version, migration_sql in _MIGRATIONS:
@@ -1011,7 +1032,7 @@ class SqliteTaskStore:
 
             # Repair required artifacts for current schemas when external damage
             # or partial migrations removed them.
-            _ensure_required_auto_migration_artifacts(conn)
+            _ensure_required_auto_migration_artifacts(conn, target_version=SCHEMA_VERSION)
 
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection with auto-commit."""
@@ -1073,6 +1094,7 @@ class SqliteTaskStore:
             provider=row["provider"] if "provider" in keys else None,
             provider_is_explicit=bool(row["provider_is_explicit"]) if "provider_is_explicit" in keys and row["provider_is_explicit"] is not None else False,
             urgent=bool(row["urgent"]) if "urgent" in keys and row["urgent"] is not None else False,
+            queue_position=row["queue_position"] if "queue_position" in keys else None,
             merge_status=row["merge_status"] if "merge_status" in keys else None,
             merged_at=datetime.fromisoformat(row["merged_at"]) if "merged_at" in keys and row["merged_at"] else None,
             failure_reason=row["failure_reason"] if "failure_reason" in keys else None,
@@ -1315,6 +1337,7 @@ class SqliteTaskStore:
                     provider = ?,
                     provider_is_explicit = ?,
                     urgent = ?,
+                    queue_position = ?,
                     merge_status = ?,
                     merged_at = ?,
                     failure_reason = ?,
@@ -1365,6 +1388,7 @@ class SqliteTaskStore:
                     task.provider,
                     1 if task.provider_is_explicit else 0,
                     1 if task.urgent else 0,
+                    task.queue_position,
                     task.merge_status,
                     task.merged_at.isoformat() if task.merged_at else None,
                     task.failure_reason,
@@ -1403,7 +1427,8 @@ class SqliteTaskStore:
 
         Pickup semantics match default worker selection: excludes internal and
         dependency-blocked tasks. Ordering is urgent-first, with recently bumped
-        urgent tasks at the front, then FIFO by creation time.
+        urgent tasks at the front, then FIFO by creation time. Explicit
+        queue_position values sort ahead of the lane-based fallback ordering.
         """
         with self._connect() as conn:
             query = """
@@ -1423,6 +1448,8 @@ class SqliteTaskStore:
                     OR t.depends_on IN (SELECT id FROM successful_ancestors)
                 )
                 ORDER BY
+                    CASE WHEN t.queue_position IS NULL THEN 1 ELSE 0 END,
+                    COALESCE(t.queue_position, 0) ASC,
                     t.urgent DESC,
                     COALESCE(t.urgent_bumped_at, '') DESC,
                     t.created_at ASC
@@ -1471,7 +1498,12 @@ class SqliteTaskStore:
             query = (
                 'SELECT * FROM tasks WHERE status = \'pending\' '
                 'AND (? IS NULL OR "group" = ?) '
-                "ORDER BY urgent DESC, created_at ASC"
+                "ORDER BY "
+                "CASE WHEN queue_position IS NULL THEN 1 ELSE 0 END, "
+                "COALESCE(queue_position, 0) ASC, "
+                "urgent DESC, "
+                "COALESCE(urgent_bumped_at, '') DESC, "
+                "created_at ASC"
             )
             params: tuple[str | int | None, ...] = (group, group)
             if limit is not None:
@@ -1493,6 +1525,122 @@ class SqliteTaskStore:
                 (1 if urgent else 0, bumped_at, task_id),
             )
             return cur.rowcount > 0
+
+    def set_queue_position(self, task_id: str, position: int) -> bool:
+        """Assign an explicit queue position within the task's current group bucket.
+
+        Ordered tasks stay contiguous starting from 1 within their bucket.
+        Unordered tasks keep queue_position=NULL and sort after ordered tasks.
+        """
+        if position < 1:
+            raise ValueError("position must be >= 1")
+
+        with self._connect() as conn:
+            row = conn.execute(
+                'SELECT id, "group", queue_position FROM tasks WHERE id = ?',
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            group = row["group"]
+            current_position = row["queue_position"]
+            bucket_predicate = '("group" = ? OR ("group" IS NULL AND ? IS NULL))'
+            desired_position = position
+
+            if current_position is None:
+                max_position_row = conn.execute(
+                    f"""
+                    SELECT MAX(queue_position) AS max_position
+                    FROM tasks
+                    WHERE {bucket_predicate}
+                    """,
+                    (group, group),
+                ).fetchone()
+                max_position = int(max_position_row["max_position"] or 0)
+                desired_position = min(position, max_position + 1)
+                conn.execute(
+                    f"""
+                    UPDATE tasks
+                    SET queue_position = queue_position + 1
+                    WHERE {bucket_predicate}
+                      AND queue_position IS NOT NULL
+                      AND queue_position >= ?
+                    """,
+                    (group, group, desired_position),
+                )
+            else:
+                max_position_row = conn.execute(
+                    f"""
+                    SELECT MAX(queue_position) AS max_position
+                    FROM tasks
+                    WHERE {bucket_predicate}
+                    """,
+                    (group, group),
+                ).fetchone()
+                max_position = int(max_position_row["max_position"] or current_position)
+                desired_position = min(position, max_position)
+                if desired_position < current_position:
+                    conn.execute(
+                        f"""
+                        UPDATE tasks
+                        SET queue_position = queue_position + 1
+                        WHERE {bucket_predicate}
+                          AND queue_position IS NOT NULL
+                          AND queue_position >= ?
+                          AND queue_position < ?
+                          AND id != ?
+                        """,
+                        (group, group, desired_position, current_position, task_id),
+                    )
+                elif desired_position > current_position:
+                    conn.execute(
+                        f"""
+                        UPDATE tasks
+                        SET queue_position = queue_position - 1
+                        WHERE {bucket_predicate}
+                          AND queue_position IS NOT NULL
+                          AND queue_position > ?
+                          AND queue_position <= ?
+                          AND id != ?
+                        """,
+                        (group, group, current_position, desired_position, task_id),
+                    )
+
+            cur = conn.execute(
+                "UPDATE tasks SET queue_position = ? WHERE id = ?",
+                (desired_position, task_id),
+            )
+            return cur.rowcount > 0
+
+    def clear_queue_position(self, task_id: str) -> bool:
+        """Clear explicit queue ordering and close the bucket gap if needed."""
+        with self._connect() as conn:
+            row = conn.execute(
+                'SELECT id, "group", queue_position FROM tasks WHERE id = ?',
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            current_position = row["queue_position"]
+            if current_position is None:
+                return True
+            group = row["group"]
+            bucket_predicate = '("group" = ? OR ("group" IS NULL AND ? IS NULL))'
+            conn.execute(
+                "UPDATE tasks SET queue_position = NULL WHERE id = ?",
+                (task_id,),
+            )
+            conn.execute(
+                f"""
+                UPDATE tasks
+                SET queue_position = queue_position - 1
+                WHERE {bucket_predicate}
+                  AND queue_position IS NOT NULL
+                  AND queue_position > ?
+                """,
+                (group, group, current_position),
+            )
+            return True
 
     def get_in_progress(self) -> list[Task]:
         """Get all in-progress tasks, oldest first."""
@@ -2899,6 +3047,7 @@ def _task_to_dict(task: "Task") -> dict:
         "model": task.model,
         "provider": task.provider,
         "provider_is_explicit": task.provider_is_explicit,
+        "queue_position": task.queue_position,
         "merge_status": task.merge_status,
         "failure_reason": task.failure_reason,
         "skip_learnings": task.skip_learnings,
