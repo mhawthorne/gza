@@ -2881,6 +2881,20 @@ class TestRetryChainDependencyResolution:
         assert resolved is not None
         assert resolved.id == retry.id
 
+    def test_dropped_dep_with_successful_retry_unblocks(self, tmp_path: Path):
+        """Dropped dependency remains blocking unless a retry descendant completes."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dependency")
+        dep.status = "dropped"
+        dep.completed_at = datetime.now(UTC)
+        store.update(dep)
+        retry = store.add("Retry of dropped dep", based_on=dep.id)
+        self._complete(store, retry)
+
+        downstream = store.add("Downstream", depends_on=dep.id)
+        is_blocked, _, _ = store.is_task_blocked(downstream)
+        assert is_blocked is False
+
     # --- get_next_pending ---
 
     def test_get_next_pending_skips_task_blocked_by_failed_dep(self, tmp_path: Path):

@@ -743,27 +743,43 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     store = get_store(config)
     service = _TaskQueryService(store)
     limit = None if args.last == 0 else args.last
+    blocked_by_dropped_only = bool(getattr(args, "blocked_by_dropped", False))
     mode = cast(_PresentationMode, "tree" if getattr(args, "tree", False) else "one_line")
     task_type_filter: str | None = getattr(args, "type", None)
     date_filter = _TaskDateFilter(
         field=cast(_QueryDateField, getattr(args, "date_field", "effective")),
         days=getattr(args, "days", None),
     )
-    query = _TaskQueryPresets.incomplete(
-        limit=limit,
-        task_types=(task_type_filter,) if task_type_filter else None,
-        date_filter=date_filter,
-        mode=mode,
-    )
+    if blocked_by_dropped_only:
+        query = _TaskQuery(
+            scope="tasks",
+            limit=limit,
+            statuses=("pending",),
+            task_types=(task_type_filter,) if task_type_filter else None,
+            dependency_state=("blocked_by_dropped_dep",),
+            date_filter=date_filter,
+            projection=_TaskProjectionSpec(
+                fields=("id", "prompt", "status", "task_type", "blocking_id")
+            ),
+            presentation=_TaskPresentationSpec(mode="flat"),
+        )
+    else:
+        query = _TaskQueryPresets.incomplete(
+            limit=limit,
+            task_types=(task_type_filter,) if task_type_filter else None,
+            date_filter=date_filter,
+            mode=mode,
+        )
 
     target_branch: str | None = None
     git: Git | None = None
-    try:
-        git = Git(config.project_dir)
-        target_branch = git.default_branch()
-    except GitError:
-        git = None
-        target_branch = None
+    if not blocked_by_dropped_only:
+        try:
+            git = Git(config.project_dir)
+            target_branch = git.default_branch()
+        except GitError:
+            git = None
+            target_branch = None
 
     result = service.run(query, config=config, git=git, target_branch=target_branch)
     if getattr(args, "json", False):
@@ -773,7 +789,24 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
         return 0
 
     if not result.rows:
-        console.print("No unresolved task lineages")
+        if blocked_by_dropped_only:
+            console.print("No pending tasks blocked by dropped dependencies")
+        else:
+            console.print("No unresolved task lineages")
+        return 0
+
+    if blocked_by_dropped_only:
+        for row in result.rows:
+            if not isinstance(row, _TaskRow):
+                continue
+            task = row.task
+            blocking_id = row.values.get("blocking_id")
+            marker = (
+                f" [blocked-by-dropped {blocking_id}]"
+                if isinstance(blocking_id, str) and blocking_id
+                else " [blocked-by-dropped]"
+            )
+            console.print(rich_escape(f"{task.id}: {task.prompt}{marker}"))
         return 0
 
     rendered = result.render(mode)

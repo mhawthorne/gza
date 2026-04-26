@@ -88,6 +88,7 @@ class TestHelpOutput:
         assert result.returncode == 0
         normalized_output = " ".join(result.stdout.split())
         assert "filter tasks by task_type before lineage rollup" in normalized_output.lower()
+        assert "--blocked-by-dropped" in result.stdout
         assert "--status" not in result.stdout
         assert "--incomplete" not in result.stdout
         assert "--lineage-depth" not in result.stdout

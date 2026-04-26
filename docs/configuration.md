@@ -1020,6 +1020,7 @@ gza incomplete [options]
 | `--days N` | Show only unresolved lineages with activity in the last N days |
 | `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `effective`) |
 | `--tree` | Show tree output instead of one-line summaries |
+| `--blocked-by-dropped` | Show pending tasks blocked by dropped dependencies (tagged as `[blocked-by-dropped <task_id>]`) |
 | `--verbose` | Include owner metadata under one-line output |
 | `--json` | Output JSON rows from the unified query API |
 
