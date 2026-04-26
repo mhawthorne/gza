@@ -82,7 +82,7 @@ def is_resumable_failure_reason(failure_reason: str | None) -> bool:
     return _is_resumable_failure_reason(failure_reason)
 
 
-def _count_completed_review_cycles(store: SqliteTaskStore, impl_task_id: str) -> int:
+def count_completed_review_cycles(store: SqliteTaskStore, impl_task_id: str) -> int:
     improve_tasks = store.get_improve_tasks_by_root(impl_task_id)
     return sum(1 for t in improve_tasks if t.status == "completed")
 
@@ -180,7 +180,7 @@ def _resolve_review_state(
 
         if review_verdict == "CHANGES_REQUESTED":
             assert task.id is not None
-            completed_review_cycles = _count_completed_review_cycles(store, task.id)
+            completed_review_cycles = count_completed_review_cycles(store, task.id)
             assert latest_completed_review.id is not None
             improve_tasks = store.get_improve_tasks_for(task.id, latest_completed_review.id)
             active_improve_running = next((t for t in improve_tasks if t.status == "in_progress"), None)

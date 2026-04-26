@@ -1287,6 +1287,11 @@ gza iterate <impl_task_id> [options]
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--force` | Skip dependency merge precondition checks when iterate starts workers |
 
+When iterate stops with `max_cycles_reached`, it now prints review-cycle accounting with:
+- task `completed` review-cycle count
+- configured `max_review_cycles`
+- `consumed_this_invocation` cycles
+
 ### watch
 
 Continuously maintain a target number of concurrent workers.

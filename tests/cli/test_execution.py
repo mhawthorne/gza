@@ -5623,6 +5623,98 @@ class TestIterateCommand:
         assert "Iterate waiting: improve_in_progress. Existing task is already in progress." in output
         assert "Manual review required" not in output
 
+    def test_iterate_max_cycles_reached_reports_cycle_accounting(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        trigger_review = store.add("Trigger review", task_type="review", depends_on=impl.id)
+        trigger_review.status = "completed"
+        trigger_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        trigger_review.completed_at = datetime.now(UTC)
+        store.update(trigger_review)
+
+        for idx in range(5):
+            done_improve = store.add(
+                f"Prior improve {idx + 1}",
+                task_type="improve",
+                based_on=impl.id,
+                depends_on=trigger_review.id,
+            )
+            done_improve.status = "completed"
+            done_improve.completed_at = datetime.now(UTC)
+            store.update(done_improve)
+
+        improve_6 = store.add("Improve 6", task_type="improve", based_on=impl.id, depends_on=trigger_review.id)
+        improve_7 = store.add("Improve 7", task_type="improve", based_on=impl.id, depends_on=trigger_review.id)
+        review_6 = store.add("Review 6", task_type="review", depends_on=impl.id)
+        review_7 = store.add("Review 7", task_type="review", depends_on=impl.id)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=7,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_review_cycles=7,
+            max_resume_attempts=1,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        def fake_run_foreground(_config, task_id, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            if task.task_type == "review":
+                task.output_content = "**Verdict: CHANGES_REQUESTED**"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+            patch(
+                "gza.cli.determine_next_action",
+                side_effect=[
+                    {"type": "run_improve", "description": "Run improve 6", "improve_task": improve_6},
+                    {"type": "run_improve", "description": "Run improve 6", "improve_task": improve_6},
+                    {"type": "run_review", "description": "Run review 6", "review_task": review_6},
+                    {"type": "run_improve", "description": "Run improve 7", "improve_task": improve_7},
+                    {"type": "run_review", "description": "Run review 7", "review_task": review_7},
+                    {"type": "max_cycles_reached", "description": "Reached max review cycles"},
+                ],
+            ),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        assert "Iterate blocked: max_cycles_reached." in output
+        assert "Review-cycle accounting: completed=7, max_review_cycles=7, consumed_this_invocation=2" in output
+        assert f"Recommended next step: uv run gza fix {impl.id}" in output
+
     def test_in_progress_improve_is_prioritized_over_newer_pending_improve(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):

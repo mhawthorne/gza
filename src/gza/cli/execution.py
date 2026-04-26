@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ..advance_engine import count_completed_review_cycles
 from ..config import DEFAULT_MAX_RESUME_ATTEMPTS, Config
 from ..console import format_duration
 from ..db import (
@@ -1665,6 +1666,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     final_status = "maxed_out"
     final_stop_reason = "max_iterations"
     iteration = 0
+    starting_completed_review_cycles = count_completed_review_cycles(store, impl_task_key)
     max_resume_attempts = _int_config(
         getattr(config, "max_resume_attempts", None),
         DEFAULT_MAX_RESUME_ATTEMPTS,
@@ -2047,7 +2049,19 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     if final_stop_reason in {"review_in_progress", "improve_in_progress"}:
         print(f"Iterate waiting: {final_stop_reason}. Existing task is already in progress.")
         return 3
-    if final_stop_reason in {"max_cycles_reached", "max_improve_attempts"}:
+    if final_stop_reason == "max_cycles_reached":
+        completed_review_cycles = count_completed_review_cycles(store, impl_task_key)
+        consumed_this_invocation = max(0, completed_review_cycles - starting_completed_review_cycles)
+        print(f"Iterate blocked: {final_stop_reason}.")
+        print(
+            "Review-cycle accounting: "
+            f"completed={completed_review_cycles}, "
+            f"max_review_cycles={engine_config.max_review_cycles}, "
+            f"consumed_this_invocation={consumed_this_invocation}"
+        )
+        print(f"Recommended next step: uv run gza fix {impl_task_key}")
+        return 3
+    if final_stop_reason == "max_improve_attempts":
         print(f"Iterate blocked: {final_stop_reason}.")
         print(f"Recommended next step: uv run gza fix {impl_task_key}")
         return 3
