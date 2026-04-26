@@ -2118,6 +2118,7 @@ def run(
     task_config = copy(config)
     task_config.model = effective_model or ""
     task_config.provider = effective_provider
+    task_config.reasoning_effort = config.get_reasoning_effort_for_task(task.task_type, effective_provider) or ""
     task_config.max_steps = effective_max_steps
     task_config.max_turns = effective_max_steps
 

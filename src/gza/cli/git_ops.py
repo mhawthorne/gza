@@ -594,6 +594,7 @@ def invoke_provider_resolve(
         config,
         provider=effective_provider,
         model=effective_model or "",
+        reasoning_effort=config.get_reasoning_effort_for_task(task.task_type, effective_provider) or "",
         max_steps=effective_max_steps,
         max_turns=effective_max_steps,
     )

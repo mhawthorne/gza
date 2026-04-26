@@ -92,14 +92,17 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
         "*": None,
     },
     "model": None,
+    "reasoning_effort": None,
     "defaults": {
         "model": None,
+        "reasoning_effort": None,
         "max_steps": None,
         "max_turns": None,
     },
     "task_types": {
         "*": {
             "model": None,
+            "reasoning_effort": None,
             "max_steps": None,
             "max_turns": None,
         },
@@ -107,9 +110,11 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "providers": {
         "*": {
             "model": None,
+            "reasoning_effort": None,
             "task_types": {
                 "*": {
                     "model": None,
+                    "reasoning_effort": None,
                     "max_steps": None,
                     "max_turns": None,
                 },
@@ -269,6 +274,7 @@ def _validate_local_override_data(data: dict, schema: dict, path_prefix: str = "
 class TaskTypeConfig:
     """Configuration for a specific task type."""
     model: str | None = None
+    reasoning_effort: str | None = None
     max_steps: int | None = None
     max_turns: int | None = None
 
@@ -277,6 +283,7 @@ class TaskTypeConfig:
 class ProviderConfig:
     """Configuration scoped to a specific provider."""
     model: str | None = None
+    reasoning_effort: str | None = None
     task_types: dict[str, TaskTypeConfig] = field(default_factory=dict)
 
 
@@ -363,6 +370,7 @@ class Config:
     provider: str = DEFAULT_PROVIDER  # "claude", "codex", or "gemini"
     task_providers: dict[str, str] = field(default_factory=dict)  # Per-task-type provider routing
     model: str = ""  # Provider-specific model name (optional)
+    reasoning_effort: str = ""  # Provider-specific reasoning effort override (optional; Codex only)
     task_types: dict[str, TaskTypeConfig] = field(default_factory=dict)  # Per-task-type config
     providers: dict[str, ProviderConfig] = field(default_factory=dict)  # Provider-scoped config
     branch_strategy: BranchStrategy | None = None  # Branch naming strategy
@@ -459,6 +467,34 @@ class Config:
             The model name to use for this task type
         """
         return self.get_model_for_task(task_type, self.provider)
+
+    def get_reasoning_effort_for_task(self, task_type: str, provider: str) -> str | None:
+        """Get reasoning effort for task type within provider scope.
+
+        Precedence:
+        1. providers.<provider>.task_types.<task_type>.reasoning_effort
+        2. providers.<provider>.reasoning_effort
+        3. task_types.<task_type>.reasoning_effort (legacy)
+        4. reasoning_effort / defaults.reasoning_effort (legacy)
+        5. None (provider runtime default)
+        """
+        provider_config = self.providers.get(provider)
+        if provider_config:
+            provider_task_type = provider_config.task_types.get(task_type)
+            if provider_task_type and provider_task_type.reasoning_effort:
+                return provider_task_type.reasoning_effort
+            if provider_config.reasoning_effort:
+                return provider_config.reasoning_effort
+
+        legacy_task_type = self.task_types.get(task_type)
+        if legacy_task_type and legacy_task_type.reasoning_effort:
+            return legacy_task_type.reasoning_effort
+
+        return self.reasoning_effort or None
+
+    def get_reasoning_effort_for_task_type(self, task_type: str) -> str | None:
+        """Get reasoning effort for a task type using configured default provider."""
+        return self.get_reasoning_effort_for_task(task_type, self.provider)
 
     def get_max_steps_for_task(self, task_type: str, provider: str) -> int:
         """Get max_steps for task type within provider scope.
@@ -590,7 +626,7 @@ class Config:
         valid_fields = {
             "project_name", "project_prefix", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
-            "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
+            "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model", "reasoning_effort",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
             "advance_create_reviews", "advance_requires_review", "advance_mode",
             "max_resume_attempts", "max_review_cycles", "iterate_max_iterations",
@@ -682,6 +718,8 @@ class Config:
 
         # model: check defaults section first, then top-level
         model = defaults.get("model") or data.get("model", "")
+        # reasoning_effort: check defaults section first, then top-level
+        reasoning_effort = defaults.get("reasoning_effort") or data.get("reasoning_effort", "")
 
         docker_volumes = data.get("docker_volumes", [])
 
@@ -705,6 +743,7 @@ class Config:
                 if isinstance(config_data, dict):
                     task_types[task_type] = TaskTypeConfig(
                         model=config_data.get("model"),
+                        reasoning_effort=config_data.get("reasoning_effort"),
                         max_steps=config_data.get("max_steps"),
                         max_turns=config_data.get("max_turns")
                     )
@@ -729,6 +768,9 @@ class Config:
                 provider_model = provider_config_data.get("model")
                 if provider_model is not None and not isinstance(provider_model, str):
                     raise ConfigError(f"'providers.{provider_name}.model' must be a string")
+                provider_reasoning_effort = provider_config_data.get("reasoning_effort")
+                if provider_reasoning_effort is not None and not isinstance(provider_reasoning_effort, str):
+                    raise ConfigError(f"'providers.{provider_name}.reasoning_effort' must be a string")
 
                 provider_task_types: dict[str, TaskTypeConfig] = {}
                 provider_task_types_data = provider_config_data.get("task_types")
@@ -744,6 +786,14 @@ class Config:
                         if provider_task_model is not None and not isinstance(provider_task_model, str):
                             raise ConfigError(
                                 f"'providers.{provider_name}.task_types.{task_type}.model' must be a string"
+                            )
+                        provider_task_reasoning_effort = task_type_config_data.get("reasoning_effort")
+                        if (
+                            provider_task_reasoning_effort is not None
+                            and not isinstance(provider_task_reasoning_effort, str)
+                        ):
+                            raise ConfigError(
+                                f"'providers.{provider_name}.task_types.{task_type}.reasoning_effort' must be a string"
                             )
                         provider_task_max_turns = task_type_config_data.get("max_turns")
                         provider_task_max_steps = task_type_config_data.get("max_steps")
@@ -767,12 +817,14 @@ class Config:
                                 )
                         provider_task_types[task_type] = TaskTypeConfig(
                             model=provider_task_model,
+                            reasoning_effort=provider_task_reasoning_effort,
                             max_steps=provider_task_max_steps,
                             max_turns=provider_task_max_turns,
                         )
 
                 providers[provider_name] = ProviderConfig(
                     model=provider_model,
+                    reasoning_effort=provider_reasoning_effort,
                     task_types=provider_task_types,
                 )
 
@@ -784,6 +836,18 @@ class Config:
                     warnings.warn(
                         f"Both provider-scoped model ('providers.{provider_name}.model') and legacy global model "
                         f"('model'/'defaults.model') are set. Using provider-scoped value for provider '{provider_name}'.",
+                        stacklevel=2,
+                    )
+        legacy_reasoning_effort_set = "reasoning_effort" in data or (
+            "defaults" in data and isinstance(defaults, dict) and "reasoning_effort" in defaults
+        )
+        if legacy_reasoning_effort_set:
+            for provider_name, provider_config in providers.items():
+                if provider_config.reasoning_effort:
+                    warnings.warn(
+                        f"Both provider-scoped reasoning_effort ('providers.{provider_name}.reasoning_effort') and "
+                        f"legacy global reasoning_effort ('reasoning_effort'/'defaults.reasoning_effort') are set. "
+                        f"Using provider-scoped value for provider '{provider_name}'.",
                         stacklevel=2,
                     )
 
@@ -798,6 +862,14 @@ class Config:
                         warnings.warn(
                             f"Both provider-scoped and legacy model are set for task type '{task_type}' "
                             f"(providers.{provider_name}.task_types.{task_type}.model and task_types.{task_type}.model). "
+                            f"Using provider-scoped value for provider '{provider_name}'.",
+                            stacklevel=2,
+                        )
+                    if provider_task_type.reasoning_effort is not None and "reasoning_effort" in legacy_task_type:
+                        warnings.warn(
+                            f"Both provider-scoped and legacy reasoning_effort are set for task type '{task_type}' "
+                            f"(providers.{provider_name}.task_types.{task_type}.reasoning_effort and "
+                            f"task_types.{task_type}.reasoning_effort). "
                             f"Using provider-scoped value for provider '{provider_name}'.",
                             stacklevel=2,
                         )
@@ -976,6 +1048,11 @@ class Config:
                 source_map["model"] = source_map.get("defaults.model", "base")
             elif data.get("model"):
                 source_map["model"] = source_map.get("model", "base")
+        if "reasoning_effort" not in source_map and reasoning_effort:
+            if defaults.get("reasoning_effort"):
+                source_map["reasoning_effort"] = source_map.get("defaults.reasoning_effort", "base")
+            elif data.get("reasoning_effort"):
+                source_map["reasoning_effort"] = source_map.get("reasoning_effort", "base")
 
         advance_create_reviews = bool(data.get("advance_create_reviews", DEFAULT_ADVANCE_CREATE_REVIEWS))
         advance_requires_review = bool(data.get("advance_requires_review", DEFAULT_ADVANCE_REQUIRES_REVIEW))
@@ -1229,6 +1306,7 @@ class Config:
             provider=provider,
             task_providers=task_providers,
             model=model,
+            reasoning_effort=reasoning_effort,
             task_types=task_types,
             providers=providers,
             branch_strategy=branch_strategy,
@@ -1299,7 +1377,7 @@ class Config:
         valid_fields = {
             "project_name", "project_prefix", "tasks_file", "log_dir", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
-            "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
+            "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model", "reasoning_effort",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
             "advance_create_reviews", "advance_requires_review", "advance_mode",
             "max_resume_attempts", "max_review_cycles", "iterate_max_iterations",
@@ -1509,6 +1587,8 @@ class Config:
 
         if "model" in data and not isinstance(data["model"], str):
             errors.append("'model' must be a string")
+        if "reasoning_effort" in data and not isinstance(data["reasoning_effort"], str):
+            errors.append("'reasoning_effort' must be a string")
 
         if "verify_command" in data and not isinstance(data["verify_command"], str):
             errors.append("'verify_command' must be a string")
@@ -1572,6 +1652,8 @@ class Config:
                 defaults = data["defaults"]
                 if "model" in defaults and not isinstance(defaults["model"], str):
                     errors.append("'defaults.model' must be a string")
+                if "reasoning_effort" in defaults and not isinstance(defaults["reasoning_effort"], str):
+                    errors.append("'defaults.reasoning_effort' must be a string")
                 if "max_turns" in defaults:
                     if not isinstance(defaults["max_turns"], int):
                         errors.append("'defaults.max_turns' must be an integer")
@@ -1583,7 +1665,7 @@ class Config:
                     elif defaults["max_steps"] <= 0:
                         errors.append("'defaults.max_steps' must be positive")
                 # Warn about unknown keys in defaults
-                valid_defaults_keys = {"model", "max_steps", "max_turns"}
+                valid_defaults_keys = {"model", "reasoning_effort", "max_steps", "max_turns"}
                 for key in defaults.keys():
                     if key not in valid_defaults_keys:
                         warnings.append(f"Unknown field in 'defaults': '{key}'")
@@ -1599,6 +1681,8 @@ class Config:
                     else:
                         if "model" in config and not isinstance(config["model"], str):
                             errors.append(f"'task_types.{task_type}.model' must be a string")
+                        if "reasoning_effort" in config and not isinstance(config["reasoning_effort"], str):
+                            errors.append(f"'task_types.{task_type}.reasoning_effort' must be a string")
                         if "max_turns" in config:
                             if not isinstance(config["max_turns"], int):
                                 errors.append(f"'task_types.{task_type}.max_turns' must be an integer")
@@ -1610,7 +1694,7 @@ class Config:
                             elif config["max_steps"] <= 0:
                                 errors.append(f"'task_types.{task_type}.max_steps' must be positive")
                         # Warn about unknown keys
-                        valid_task_type_keys = {"model", "max_steps", "max_turns"}
+                        valid_task_type_keys = {"model", "reasoning_effort", "max_steps", "max_turns"}
                         for key in config.keys():
                             if key not in valid_task_type_keys:
                                 warnings.append(f"Unknown field in 'task_types.{task_type}': '{key}'")
@@ -1688,6 +1772,8 @@ class Config:
                                 provider_data["model"],
                             )
                         )
+                    if "reasoning_effort" in provider_data and not isinstance(provider_data["reasoning_effort"], str):
+                        errors.append(f"'providers.{provider_name}.reasoning_effort' must be a string")
 
                     if "task_types" in provider_data and provider_data["task_types"] is not None:
                         if not isinstance(provider_data["task_types"], dict):
@@ -1717,6 +1803,12 @@ class Config:
                                             task_type_config["model"],
                                         )
                                     )
+                                if "reasoning_effort" in task_type_config and not isinstance(
+                                    task_type_config["reasoning_effort"], str
+                                ):
+                                    errors.append(
+                                        f"'providers.{provider_name}.task_types.{task_type}.reasoning_effort' must be a string"
+                                    )
                                 if "max_turns" in task_type_config:
                                     if not isinstance(task_type_config["max_turns"], int):
                                         errors.append(
@@ -1735,14 +1827,14 @@ class Config:
                                         errors.append(
                                             f"'providers.{provider_name}.task_types.{task_type}.max_steps' must be positive"
                                         )
-                                valid_provider_task_type_keys = {"model", "max_steps", "max_turns"}
+                                valid_provider_task_type_keys = {"model", "reasoning_effort", "max_steps", "max_turns"}
                                 for key in task_type_config.keys():
                                     if key not in valid_provider_task_type_keys:
                                         warnings.append(
                                             f"Unknown field in 'providers.{provider_name}.task_types.{task_type}': '{key}'"
                                         )
 
-                    valid_provider_keys = {"model", "task_types"}
+                    valid_provider_keys = {"model", "reasoning_effort", "task_types"}
                     for key in provider_data.keys():
                         if key not in valid_provider_keys:
                             warnings.append(f"Unknown field in 'providers.{provider_name}': '{key}'")
@@ -1757,6 +1849,17 @@ class Config:
                     warnings.append(
                         f"Both provider-scoped model ('providers.{provider_name}.model') and legacy global model "
                         f"('model'/'defaults.model') are set. Provider-scoped value takes precedence."
+                    )
+        legacy_reasoning_effort_set = "reasoning_effort" in data or (
+            "defaults" in data and isinstance(data.get("defaults"), dict) and "reasoning_effort" in data["defaults"]
+        )
+        if legacy_reasoning_effort_set and isinstance(data.get("providers"), dict):
+            for provider_name, provider_data in data["providers"].items():
+                if isinstance(provider_data, dict) and provider_data.get("reasoning_effort") is not None:
+                    warnings.append(
+                        "Both provider-scoped reasoning_effort "
+                        f"('providers.{provider_name}.reasoning_effort') and legacy global reasoning_effort "
+                        "('reasoning_effort'/'defaults.reasoning_effort') are set. Provider-scoped value takes precedence."
                     )
 
         if isinstance(data.get("task_types"), dict) and isinstance(data.get("providers"), dict):
@@ -1774,6 +1877,13 @@ class Config:
                         warnings.append(
                             f"Both provider-scoped and legacy model are set for task type '{task_type}' "
                             f"(providers.{provider_name}.task_types.{task_type}.model and task_types.{task_type}.model). "
+                            f"Provider-scoped value takes precedence."
+                        )
+                    if "reasoning_effort" in provider_task_type and "reasoning_effort" in legacy_task_type:
+                        warnings.append(
+                            f"Both provider-scoped and legacy reasoning_effort are set for task type '{task_type}' "
+                            f"(providers.{provider_name}.task_types.{task_type}.reasoning_effort and "
+                            f"task_types.{task_type}.reasoning_effort). "
                             f"Provider-scoped value takes precedence."
                         )
                     if "max_turns" in provider_task_type and "max_turns" in legacy_task_type:

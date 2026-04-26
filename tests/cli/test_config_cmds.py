@@ -435,6 +435,41 @@ class TestLocalConfigOverrides:
         assert payload["effective"]["task_providers"]["review"] == "claude"
         assert payload["sources"]["task_providers.review"] == "base"
 
+    def test_config_command_includes_reasoning_effort_resolution(self, tmp_path: Path):
+        """gza config --json should expose reasoning_effort at all config scopes."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "defaults:\n"
+            "  reasoning_effort: low\n"
+            "task_types:\n"
+            "  review:\n"
+            "    reasoning_effort: medium\n"
+            "providers:\n"
+            "  codex:\n"
+            "    reasoning_effort: high\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        reasoning_effort: medium\n"
+        )
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "config", "--json", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        effective = payload["effective"]
+        assert effective["reasoning_effort"] == "low"
+        assert effective["task_types"]["review"]["reasoning_effort"] == "medium"
+        assert effective["providers"]["codex"]["reasoning_effort"] == "high"
+        assert effective["providers"]["codex"]["task_types"]["review"]["reasoning_effort"] == "medium"
+        assert payload["sources"]["reasoning_effort"] == "base"
+        assert payload["model_resolution"]["review"]["reasoning_effort"] == "medium"
+
     def test_config_keys_table_lists_all_registered_keys_and_columns(self, tmp_path: Path):
         """`gza config keys` should render a tabular registry with stable columns."""
         from gza.config_schema import CONFIG_KEY_REGISTRY
