@@ -5697,6 +5697,34 @@ class TestLineageCommand:
         assert "[review]" not in normalized
         assert "[depends]" in normalized
 
+    def test_lineage_rebase_child_does_not_render_retry_relationship_label(self, tmp_path: Path):
+        """Rebase children should classify as rebase, not retry."""
+        from datetime import datetime
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        now = datetime.now(UTC)
+
+        root = store.add("Initial rebase", task_type="rebase")
+        root.status = "completed"
+        root.completed_at = now
+        store.update(root)
+        assert root.id is not None
+
+        child = store.add("Follow-up rebase", task_type="rebase", based_on=root.id)
+        child.status = "completed"
+        child.completed_at = now
+        store.update(child)
+
+        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Initial rebase" in normalized
+        assert "Follow-up rebase" in normalized
+        assert "[retry]" not in normalized
+
     def test_lineage_rel_label_brackets_are_rendered_literally(self, tmp_path: Path):
         """Relationship labels render as [rel] text, not as Rich markup tags."""
         from datetime import datetime
