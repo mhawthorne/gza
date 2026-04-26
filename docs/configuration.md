@@ -659,6 +659,8 @@ gza ps [options]
 | `--all`, `-a` | Include all completed/failed workers (not just startup failures) |
 | `--quiet`, `-q` | Only show worker IDs |
 | `--json` | Output as JSON |
+| `--poll [SECS]` | Refresh output every `SECS` seconds (default: `5` when flag is present without a value) |
+| `--recent-minutes MINUTES` | In poll mode, keep first-seen terminal rows visible when they ended within the last `MINUTES` (default: `1`, `0` disables) |
 
 Runtime reconciliation notes:
 - Task lifecycle state is derived from the DB `tasks` table (`status`, `started_at`, `running_pid`), while worker metadata is a process index.

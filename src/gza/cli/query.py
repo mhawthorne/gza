@@ -1224,6 +1224,7 @@ def _print_ps_output(
     poll_interval: int | None = None,
     seen_tasks: "dict | None" = None,
     show_all: bool = False,
+    recent_minutes: int = 1,
     poll_started_at: "_dt.datetime | None" = None,
     last_poll_at: "_dt.datetime | None" = None,
 ) -> None:
@@ -1237,6 +1238,8 @@ def _print_ps_output(
 
     # In poll mode: update seen_tasks with new live data, preserving vanished tasks.
     if seen_tasks is not None:
+        poll_now = _dt.datetime.now(_dt.UTC)
+        recent_cutoff = poll_now - _dt.timedelta(minutes=recent_minutes) if recent_minutes > 0 else None
         live_keys = set()
         for row in live_rows:
             key = row["task_id"] if row["task_id"] is not None else row["worker_id"]
@@ -1246,17 +1249,28 @@ def _print_ps_output(
             # while still avoiding unrelated completed history.
             ended_at_iso = row.get("ended_at")
             ended_after_last_poll = False
-            if last_poll_at is not None and ended_at_iso:
+            ended_recently = False
+            if ended_at_iso:
                 try:
                     ended_dt = _dt.datetime.fromisoformat(ended_at_iso)
-                    ended_after_last_poll = ended_dt >= last_poll_at
-                except ValueError:
+                    if ended_dt.tzinfo is None:
+                        ended_dt = ended_dt.replace(tzinfo=_dt.UTC)
+                    if last_poll_at is not None:
+                        ended_after_last_poll = ended_dt >= last_poll_at
+                    if (
+                        recent_cutoff is not None
+                        and row["status"] in ("completed", "failed")
+                        and recent_cutoff <= ended_dt <= poll_now
+                    ):
+                        ended_recently = True
+                except (TypeError, ValueError):
                     pass
             if (
                 key in seen_tasks
                 or row["status"] in ("in_progress", "stale")
                 or row.get("startup_failure", False)
                 or ended_after_last_poll
+                or ended_recently
             ):
                 seen_tasks[key] = row
             live_keys.add(key)
@@ -1350,6 +1364,13 @@ def cmd_ps(args: argparse.Namespace) -> int:
     # Worker registry is now a thin process index; no ps-specific cleanup.
     poll_interval: int | None = getattr(args, "poll", None)
     show_all: bool = getattr(args, "all", False)
+    recent_minutes = getattr(args, "recent_minutes", 1)
+    if recent_minutes < 0:
+        print(
+            f"error: --recent-minutes must be >= 0 (got {recent_minutes})",
+            file=sys.stderr,
+        )
+        return 1
 
     if poll_interval is not None:
         if poll_interval < 1:
@@ -1370,6 +1391,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
                     poll_interval=poll_interval,
                     seen_tasks=seen_tasks,
                     show_all=show_all,
+                    recent_minutes=recent_minutes,
                     poll_started_at=poll_started_at,
                     last_poll_at=last_poll_at,
                 )
@@ -1378,7 +1400,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
         except KeyboardInterrupt:
             return 0
     else:
-        _print_ps_output(args, registry, store, show_all=show_all)
+        _print_ps_output(args, registry, store, show_all=show_all, recent_minutes=recent_minutes)
 
     return 0
 
