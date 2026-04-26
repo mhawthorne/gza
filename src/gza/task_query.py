@@ -599,6 +599,7 @@ class TaskQueryService:
     def _project_task_row(self, task: DbTask, query: TaskQuery) -> TaskRow:
         root = _resolve_lineage_root(self._store, task)
         branch_owner = self._resolve_branch_owner(task)
+        blocked, blocking_id, blocking_status = self._store.is_task_blocked(task)
         review_verdict = None
         comments_count = 0
         if task.id is not None:
@@ -626,8 +627,9 @@ class TaskQueryService:
             "next_action": None,
             "next_action_reason": None,
             "next_action_owner_id": None,
-            "blocked": self._store.is_task_blocked(task)[0],
-            "blocking_id": self._store.is_task_blocked(task)[1],
+            "blocked": blocked,
+            "blocking_id": blocking_id,
+            "blocking_status": blocking_status,
         }
         return TaskRow(
             task=task,

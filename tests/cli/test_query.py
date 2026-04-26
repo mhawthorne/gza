@@ -6652,6 +6652,86 @@ class TestIncompleteCommand:
         assert "Dropped lineage" in result.stdout
         assert "dropped" in result.stdout
 
+    def test_incomplete_blocked_by_dropped_surfaces_pending_with_indicator(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dep = store.add("Dropped dependency", task_type="implement")
+        dep.status = "dropped"
+        dep.completed_at = datetime.now(UTC)
+        store.update(dep)
+        assert dep.id is not None
+
+        blocked = store.add("Blocked dependent", task_type="implement", depends_on=dep.id)
+        assert blocked.id is not None
+
+        result = run_gza(
+            "incomplete",
+            "--blocked-by-dropped",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "Blocked dependent" in result.stdout
+        assert f"[blocked-by-dropped {dep.id}]" in result.stdout
+
+    def test_incomplete_blocked_by_dropped_hides_dep_with_completed_retry(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dep = store.add("Dropped dependency", task_type="implement")
+        dep.status = "dropped"
+        dep.completed_at = datetime.now(UTC) - timedelta(hours=2)
+        store.update(dep)
+        assert dep.id is not None
+
+        retry = store.add("Completed retry", task_type="implement", based_on=dep.id)
+        retry.status = "completed"
+        retry.completed_at = datetime.now(UTC) - timedelta(hours=1)
+        retry.has_commits = True
+        retry.merge_status = "unmerged"
+        store.update(retry)
+
+        blocked = store.add("Blocked dependent", task_type="implement", depends_on=dep.id)
+
+        result = run_gza(
+            "incomplete",
+            "--blocked-by-dropped",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "No pending tasks blocked by dropped dependencies" in result.stdout
+        assert blocked.prompt not in result.stdout
+
+    def test_incomplete_blocked_by_dropped_hides_dropped_dependent(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dep = store.add("Dropped dependency", task_type="implement")
+        dep.status = "dropped"
+        dep.completed_at = datetime.now(UTC)
+        store.update(dep)
+        assert dep.id is not None
+
+        blocked = store.add("Dropped dependent", task_type="implement", depends_on=dep.id)
+        blocked.status = "dropped"
+        blocked.completed_at = datetime.now(UTC)
+        store.update(blocked)
+
+        result = run_gza(
+            "incomplete",
+            "--blocked-by-dropped",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "No pending tasks blocked by dropped dependencies" in result.stdout
+        assert "Dropped dependent" not in result.stdout
+
     def test_incomplete_branching_retry_shows_all_unresolved_siblings_under_one_root(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)

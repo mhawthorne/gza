@@ -433,6 +433,11 @@ def main() -> int:
         help="Show unresolved lineages as trees instead of one-line summaries",
     )
     incomplete_parser.add_argument(
+        "--blocked-by-dropped",
+        action="store_true",
+        help="Show pending tasks blocked by dropped dependencies",
+    )
+    incomplete_parser.add_argument(
         "--verbose",
         action="store_true",
         help="Include owner metadata under one-line summaries",

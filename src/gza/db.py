@@ -2566,7 +2566,7 @@ class SqliteTaskStore:
 
         Mirrors dependency-unblock semantics used by ``is_task_blocked()``:
         - direct dependency completed => resolved to direct dependency
-        - direct dependency failed but has completed retry descendant => resolved
+        - direct dependency failed/dropped but has completed retry descendant => resolved
           to the completed retry task
         - otherwise unresolved
         """
@@ -2580,7 +2580,7 @@ class SqliteTaskStore:
         if dep.status == "completed":
             return dep
 
-        if dep.status == "failed" and dep.id is not None:
+        if dep.status in {"failed", "dropped"} and dep.id is not None:
             return self._find_successful_retry_task(dep.id)
 
         return None
@@ -2588,9 +2588,9 @@ class SqliteTaskStore:
     def is_task_blocked(self, task: Task) -> tuple[bool, str | None, str | None]:
         """Check if a task is blocked by an incomplete dependency.
 
-        When the direct dependency has failed, follows the retry chain (via
-        based_on) to see if a subsequent retry succeeded.  If so, the task is
-        treated as unblocked.
+        When the direct dependency has failed or dropped, follows the retry
+        chain (via based_on) to see if a subsequent retry succeeded. If so, the
+        task is treated as unblocked.
 
         Returns:
             Tuple of (is_blocked, blocking_task_id, blocking_task_status)
@@ -2611,15 +2611,13 @@ class SqliteTaskStore:
         """Count pending tasks that are blocked by dependencies.
 
         A task is unblocked (and therefore not counted) if its dependency is
-        completed OR if the dependency is failed but a completed retry exists
-        anywhere in the based_on chain.
+        completed OR if the dependency is failed/dropped but a completed retry
+        exists anywhere in the based_on chain.
 
         NOTE: This SQL intentionally mirrors the Python logic in is_task_blocked():
-        both treat only 'completed' (or 'failed' with a successful retry) as
-        unblocking. A 'dropped' dependency is therefore counted as blocking here,
-        consistent with is_task_blocked() returning (True, ...) for dropped deps.
-        If the semantics of dropped-unblocks-dependents ever change, both sites
-        must be updated together.
+        both treat only 'completed' (or failed/dropped with a successful retry)
+        as unblocking. If these semantics change, both sites must be updated
+        together.
         """
         with self._connect() as conn:
             cur = conn.execute(
