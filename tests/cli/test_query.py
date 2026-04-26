@@ -6043,10 +6043,10 @@ class TestLineageCommand:
         normalized = " ".join(result.stdout.split())
         assert "Design auth system" in normalized
         assert "Implement auth per plan" in normalized
-        assert "Review implementation" in normalized
+        assert "review" in normalized
 
-    def test_lineage_shows_stats_when_available(self, tmp_path: Path):
-        """Lineage command shows duration and started date when available."""
+    def test_lineage_omits_runtime_steps_cost_trailer(self, tmp_path: Path):
+        """Lineage command omits runtime/steps/cost stats trailers."""
         from datetime import datetime
 
         setup_config(tmp_path)
@@ -6066,8 +6066,8 @@ class TestLineageCommand:
         result = run_gza("lineage", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "2m0s" in result.stdout
-        assert "2026-02-12" in result.stdout
+        assert "UTC" in result.stdout
+        assert "2m0s" not in result.stdout
         assert "steps" not in result.stdout
         assert "$0.1234" not in result.stdout
 
@@ -6105,7 +6105,6 @@ class TestLineageCommand:
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
-        assert re.search(r"Review feature\s+[|│]?\s*impl", normalized)
         assert "[review]" not in normalized
         assert "[depends]" in normalized
 
@@ -6133,8 +6132,7 @@ class TestLineageCommand:
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
-        assert "Initial rebase" in normalized
-        assert "Follow-up rebase" in normalized
+        assert "rebase" in normalized
         assert "[retry]" not in normalized
 
     def test_lineage_rel_label_brackets_are_rendered_literally(self, tmp_path: Path):
@@ -6172,6 +6170,238 @@ class TestLineageCommand:
 
         assert cli_query._LINEAGE_REL_LABELS is query_module._LINEAGE_REL_LABELS
         assert "_LINEAGE_REL_LABELS:" not in cli_query_path.read_text()
+
+    def test_lineage_merge_labels_render_for_implement_and_improve_only(self, tmp_path: Path):
+        """Implement/improve rows render merge labels; other types do not."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        now = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+
+        plan = store.add("Plan migration", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = now
+        store.update(plan)
+
+        impl_merged = store.add("Implement merged", task_type="implement", based_on=plan.id)
+        impl_merged.status = "completed"
+        impl_merged.merge_status = "merged"
+        impl_merged.completed_at = now
+        store.update(impl_merged)
+
+        impl_none = store.add("Implement no merge status", task_type="implement", based_on=plan.id)
+        impl_none.status = "completed"
+        impl_none.merge_status = None
+        impl_none.completed_at = now
+        store.update(impl_none)
+
+        improve_unmerged = store.add("Improve unmerged", task_type="improve", based_on=impl_none.id)
+        improve_unmerged.status = "completed"
+        improve_unmerged.merge_status = "unmerged"
+        improve_unmerged.completed_at = now
+        store.update(improve_unmerged)
+
+        review = store.add("Review row", task_type="review", depends_on=impl_none.id)
+        review.status = "completed"
+        review.completed_at = now
+        store.update(review)
+
+        result = run_gza("lineage", str(plan.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        output = result.stdout
+
+        assert "[merged]" in output
+        assert "[unmerged]" in output
+        assert "Implement no merge status [merged]" not in output
+        assert "Implement no merge status [unmerged]" not in output
+        assert "review completed [merged]" not in output
+        assert "review completed [unmerged]" not in output
+
+    def test_lineage_omits_prompt_for_non_plan_non_implement_rows(self, tmp_path: Path):
+        """Prompt/slug text is shown only on plan and implement rows."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        now = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+
+        plan = store.add("Plan visible prompt", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = now
+        store.update(plan)
+
+        impl = store.add("Implement visible prompt", task_type="implement", based_on=plan.id)
+        impl.status = "completed"
+        impl.completed_at = now
+        store.update(impl)
+
+        review = store.add("Review hidden prompt", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.completed_at = now
+        store.update(review)
+
+        improve = store.add("Improve hidden prompt", task_type="improve", based_on=impl.id)
+        improve.status = "completed"
+        improve.completed_at = now
+        store.update(improve)
+
+        fix = store.add("Fix hidden prompt", task_type="fix", depends_on=review.id)
+        fix.status = "completed"
+        fix.completed_at = now
+        store.update(fix)
+
+        rebase = store.add("Rebase hidden prompt", task_type="rebase", based_on=impl.id)
+        rebase.status = "completed"
+        rebase.completed_at = now
+        store.update(rebase)
+
+        result = run_gza("lineage", str(plan.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+
+        assert "Plan visible prompt" in normalized
+        assert "Implement visible prompt" in normalized
+        assert "Review hidden prompt" not in normalized
+        assert "Improve hidden prompt" not in normalized
+        assert "Fix hidden prompt" not in normalized
+        assert "Rebase hidden prompt" not in normalized
+
+    def test_lineage_strips_yyyymmdd_prefix_from_slug(self, tmp_path: Path):
+        """Lineage prompt column strips YYYYMMDD- prefix from slugs."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        now = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        impl = store.add("Prompt fallback", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = now
+        impl.slug = "20260212-feature-improve-lineage"
+        store.update(impl)
+
+        result = run_gza("lineage", str(impl.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "feature-improve-lineage" in result.stdout
+        assert "20260212-feature-improve-lineage" not in result.stdout
+
+    def test_lineage_columns_align_after_tree_prefix(self, tmp_path: Path):
+        """Task id/timestamp/type/status/prompt columns align across varying depths."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        now = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+
+        plan = store.add("Plan aligned prompt", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = now
+        store.update(plan)
+
+        impl_merged = store.add("Implement merged prompt", task_type="implement", based_on=plan.id)
+        impl_merged.status = "completed"
+        impl_merged.merge_status = "merged"
+        impl_merged.completed_at = now
+        store.update(impl_merged)
+
+        impl_unmerged = store.add("Implement unmerged prompt", task_type="implement", based_on=plan.id)
+        impl_unmerged.status = "completed"
+        impl_unmerged.merge_status = "unmerged"
+        impl_unmerged.completed_at = now
+        store.update(impl_unmerged)
+
+        review = store.add("Review hidden", task_type="review", depends_on=impl_unmerged.id)
+        review.status = "pending"
+        review.completed_at = now
+        store.update(review)
+
+        result = run_gza("lineage", str(plan.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        assert len(lines) >= 4
+
+        def _first_index(text: str, options: tuple[str, ...]) -> int:
+            for option in options:
+                idx = text.find(option)
+                if idx != -1:
+                    return idx
+            raise AssertionError(f"None of {options} found in line: {text}")
+
+        id_positions = {re.search(r"testproject-\d+", line).start() for line in lines if re.search(r"testproject-\d+", line)}
+        ts_positions = {line.index("2026-02-12 10:00:00 UTC") for line in lines if "2026-02-12 10:00:00 UTC" in line}
+        type_positions = {
+            _first_index(line, ("plan", "implement", "review"))
+            for line in lines
+            if any(token in line for token in ("plan", "implement", "review"))
+        }
+        status_positions = {
+            _first_index(line, ("completed", "pending"))
+            for line in lines
+            if "completed" in line or "pending" in line
+        }
+        prompt_positions = {
+            line.index("Plan aligned prompt")
+            for line in lines
+            if "Plan aligned prompt" in line
+        } | {
+            line.index("Implement merged prompt")
+            for line in lines
+            if "Implement merged prompt" in line
+        } | {
+            line.index("Implement unmerged prompt")
+            for line in lines
+            if "Implement unmerged prompt" in line
+        }
+
+        assert len(id_positions) == 1
+        assert len(ts_positions) == 1
+        assert len(type_positions) == 1
+        assert len(status_positions) == 1
+        assert len(prompt_positions) == 1
+
+    def test_lineage_prefix_depth_increments_one_column_per_level(self, tmp_path: Path):
+        """Ancestor indentation grows by exactly one column per depth level."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        now = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+
+        root = store.add("Root implement", task_type="implement")
+        root.status = "completed"
+        root.completed_at = now
+        store.update(root)
+
+        child = store.add("Child improve", task_type="improve", based_on=root.id)
+        child.status = "completed"
+        child.completed_at = now
+        store.update(child)
+
+        grandchild = store.add("Grandchild improve", task_type="improve", based_on=child.id)
+        grandchild.status = "completed"
+        grandchild.completed_at = now
+        store.update(grandchild)
+
+        great_grandchild = store.add("Great grandchild improve", task_type="improve", based_on=grandchild.id)
+        great_grandchild.status = "completed"
+        great_grandchild.completed_at = now
+        store.update(great_grandchild)
+
+        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        by_id = {
+            match.group(1): line
+            for line in result.stdout.splitlines()
+            for match in [re.search(r"(testproject-\d+)", line)]
+            if match
+        }
+        child_line = by_id[child.id]
+        grandchild_line = by_id[grandchild.id]
+        great_grandchild_line = by_id[great_grandchild.id]
+
+        child_connector_col = child_line.index("└── ")
+        grandchild_connector_col = grandchild_line.index("└── ")
+        great_grandchild_connector_col = great_grandchild_line.index("└── ")
+
+        assert grandchild_connector_col - child_connector_col == 1
+        assert great_grandchild_connector_col - grandchild_connector_col == 1
 
 
 class TestPsSortKey:
