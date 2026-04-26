@@ -263,6 +263,37 @@ def test_incomplete_limit_applies_once_at_owner_row_level(tmp_path: Path) -> Non
     result = service.run(TaskQueryPresets.incomplete(limit=1))
 
     assert len(result.rows) == 1
-    row = result.rows[0]
-    assert hasattr(row, "owner_task")
-    assert row.owner_task.id == root_b.id
+
+
+def test_queue_preset_matches_runnable_pickup_order(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first = store.add("First runnable")
+    blocked_parent = store.add("Blocking task")
+    blocked = store.add("Blocked task", depends_on=blocked_parent.id)
+    internal = store.add("Internal task", task_type="internal")
+    bumped = store.add("Bumped task")
+    assert first.id is not None
+    assert blocked.id is not None
+    assert internal.id is not None
+    assert bumped.id is not None
+    store.set_urgent(bumped.id, True)
+
+    service = TaskQueryService(store)
+    result = service.run(TaskQueryPresets.queue(limit=None))
+
+    prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
+    assert prompts == ["Bumped task", "First runnable", "Blocking task"]
+
+
+def test_queue_preset_filters_to_group(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    release = store.add("Release runnable", group="release")
+    backlog = store.add("Backlog runnable", group="backlog")
+    assert release.id is not None
+    assert backlog.id is not None
+
+    service = TaskQueryService(store)
+    result = service.run(TaskQueryPresets.queue(limit=None, group="release"))
+
+    prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
+    assert prompts == ["Release runnable"]

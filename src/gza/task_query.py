@@ -67,6 +67,7 @@ class TaskQuery:
     text: TextFilter | None = None
     statuses: tuple[str, ...] | None = None
     task_types: tuple[str, ...] | None = None
+    exclude_task_types: tuple[str, ...] | None = None
     lifecycle_state: tuple[str, ...] | None = None
     merge_chain_state: tuple[str, ...] | None = None
     dependency_state: tuple[str, ...] | None = None
@@ -74,6 +75,8 @@ class TaskQuery:
     lineage_of: str | None = None
     root_ids: tuple[str, ...] | None = None
     branch_owner_ids: tuple[str, ...] | None = None
+    groups: tuple[str | None, ...] | None = None
+    pickup_only: bool = False
     date_filter: DateFilter | None = None
     sort: SortSpec = DEFAULT_SORT
     projection: ProjectionSpec = ProjectionSpec()
@@ -127,6 +130,7 @@ class TaskProjectionPreset:
     LINEAGE_FULL = "lineage_full"
     SHOW_DETAIL = "show_detail"
     JSON_MINIMAL = "json_minimal"
+    QUEUE_DEFAULT = "queue_default"
 
 
 _TASK_DEFAULT_FIELDS: tuple[str, ...] = (
@@ -161,6 +165,18 @@ _PROJECTION_PRESET_FIELDS: dict[str, tuple[str, ...]] = {
     TaskProjectionPreset.LINEAGE_FULL: _LINEAGE_DEFAULT_FIELDS,
     TaskProjectionPreset.SHOW_DETAIL: _TASK_DEFAULT_FIELDS,
     TaskProjectionPreset.JSON_MINIMAL: ("id", "status", "task_type", "prompt"),
+    TaskProjectionPreset.QUEUE_DEFAULT: (
+        "id",
+        "prompt",
+        "status",
+        "task_type",
+        "created_at",
+        "group",
+        "urgent",
+        "queue_position",
+        "blocked",
+        "blocking_id",
+    ),
 }
 
 
@@ -241,6 +257,25 @@ class TaskQueryPresets:
             presentation=PresentationSpec(mode="tree"),
         )
 
+    @staticmethod
+    def queue(
+        *,
+        limit: int | None = 10,
+        group: str | None = None,
+    ) -> TaskQuery:
+        return TaskQuery(
+            scope="tasks",
+            limit=limit,
+            statuses=("pending",),
+            exclude_task_types=("internal",),
+            dependency_state=("unblocked",),
+            groups=None if group is None else (group,),
+            pickup_only=True,
+            sort=SortSpec(field="pickup_order", descending=False),
+            projection=ProjectionSpec(preset=TaskProjectionPreset.QUEUE_DEFAULT),
+            presentation=PresentationSpec(mode="flat"),
+        )
+
 
 class TaskQueryService:
     """Filter/projection/presentation query service over SqliteTaskStore."""
@@ -276,12 +311,24 @@ class TaskQueryService:
         return TaskQueryResult(query=query, rows=task_rows)
 
     def _collect_tasks(self, query: TaskQuery) -> list[DbTask]:
-        tasks = list(self._store.get_all())
+        tasks = self._base_task_candidates(query)
         tasks = self._apply_task_filters(tasks, query)
-        tasks.sort(key=lambda task: self._sort_key(task, query.sort), reverse=query.sort.descending)
+        if query.sort.field != "pickup_order":
+            tasks.sort(key=lambda task: self._sort_key(task, query.sort), reverse=query.sort.descending)
         if query.limit is not None:
             tasks = tasks[: query.limit]
         return tasks
+
+    def _base_task_candidates(self, query: TaskQuery) -> list[DbTask]:
+        if query.scope != "tasks":
+            return list(self._store.get_all())
+
+        single_group = query.groups[0] if query.groups and len(query.groups) == 1 else None
+        if query.pickup_only:
+            return list(self._store.get_pending_pickup(limit=None, group=single_group))
+        if query.sort.field == "pickup_order":
+            return list(self._store.get_pending(limit=None, group=single_group))
+        return list(self._store.get_all())
 
     def _collect_lineages(self, query: TaskQuery) -> list[LineageRow]:
         use_incomplete_rollup = bool(
@@ -374,6 +421,7 @@ class TaskQueryService:
                     text=query.text,
                     statuses=query.statuses,
                     task_types=query.task_types,
+                    exclude_task_types=query.exclude_task_types,
                     lifecycle_state=query.lifecycle_state,
                     merge_chain_state=query.merge_chain_state,
                     dependency_state=query.dependency_state,
@@ -381,6 +429,8 @@ class TaskQueryService:
                     lineage_of=query.lineage_of,
                     root_ids=query.root_ids,
                     branch_owner_ids=query.branch_owner_ids,
+                    groups=query.groups,
+                    pickup_only=query.pickup_only,
                     date_filter=query.date_filter,
                     sort=query.sort,
                     projection=query.projection,
@@ -439,6 +489,10 @@ class TaskQueryService:
             allowed_types = set(query.task_types)
             filtered = [task for task in filtered if task.task_type in allowed_types]
 
+        if query.exclude_task_types is not None:
+            disallowed_types = set(query.exclude_task_types)
+            filtered = [task for task in filtered if task.task_type not in disallowed_types]
+
         if query.lifecycle_state is not None:
             lifecycle = set(query.lifecycle_state)
             filtered = [task for task in filtered if self._matches_lifecycle(task, lifecycle)]
@@ -487,6 +541,10 @@ class TaskQueryService:
                 for task in filtered
                 if self._resolve_branch_owner(task).id in allowed_owners
             ]
+
+        if query.groups is not None:
+            allowed_groups = set(query.groups)
+            filtered = [task for task in filtered if task.group in allowed_groups]
 
         if query.merge_chain_state is not None:
             merge_states = set(query.merge_chain_state)
@@ -556,6 +614,9 @@ class TaskQueryService:
             "created_at": task.created_at,
             "completed_at": task.completed_at,
             "effective_at": _effective_at(task),
+            "group": task.group,
+            "urgent": task.urgent,
+            "queue_position": task.queue_position,
             "lineage_root_id": root.id,
             "branch_owner_id": branch_owner.id,
             "branch_merge_state": self._branch_merge_state(branch_owner),
@@ -565,6 +626,8 @@ class TaskQueryService:
             "next_action": None,
             "next_action_reason": None,
             "next_action_owner_id": None,
+            "blocked": self._store.is_task_blocked(task)[0],
+            "blocking_id": self._store.is_task_blocked(task)[1],
         }
         return TaskRow(
             task=task,
@@ -606,6 +669,9 @@ class TaskQueryService:
             "created_at": owner.created_at,
             "completed_at": owner.completed_at,
             "effective_at": _effective_at(owner),
+            "group": owner.group,
+            "urgent": owner.urgent,
+            "queue_position": owner.queue_position,
             "lineage_root_id": root.id,
             "branch_owner_id": owner.id,
             "branch_merge_state": self._branch_merge_state(owner),
@@ -615,6 +681,8 @@ class TaskQueryService:
             "next_action": next_action_type,
             "next_action_reason": next_action_reason,
             "next_action_owner_id": next_action_owner_id,
+            "blocked": self._store.is_task_blocked(owner)[0],
+            "blocking_id": self._store.is_task_blocked(owner)[1],
             "member_ids": [member.id for member in row.members if member.id is not None],
             "unresolved_ids": [task.id for task in row.unresolved_tasks if task.id is not None],
         }

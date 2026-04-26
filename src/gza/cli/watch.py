@@ -18,6 +18,7 @@ from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..failure_policy import is_resumable_failure_reason
 from ..git import Git
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
+from ..task_query import TaskQueryPresets, TaskQueryService, TaskRow
 from ..workers import WorkerRegistry
 from ._common import (
     _create_rebase_task,
@@ -985,6 +986,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     """Inspect and adjust pending queue urgency."""
     config = Config.load(args.project_dir)
     store = get_store(config)
+    service = TaskQueryService(store)
     action = getattr(args, "queue_action", None)
     group = getattr(args, "group", None)
 
@@ -1002,9 +1004,9 @@ def cmd_queue(args: argparse.Namespace) -> int:
             return 1
 
         runnable_pending_ids = {
-            str(pending_task.id)
-            for pending_task in store.get_pending_pickup(group=group)
-            if pending_task.id is not None
+            str(row.task.id)
+            for row in service.run(TaskQueryPresets.queue(limit=None, group=group)).rows
+            if isinstance(row, TaskRow) and row.task.id is not None
         }
         is_currently_runnable = str(task_id) in runnable_pending_ids
 
@@ -1046,7 +1048,11 @@ def cmd_queue(args: argparse.Namespace) -> int:
             print(f"{message} (task is not currently runnable; ordering will apply once runnable)")
         return 0
 
-    pending = store.get_pending_pickup(group=group)
+    pending = [
+        row.task
+        for row in service.run(TaskQueryPresets.queue(limit=None, group=group)).rows
+        if isinstance(row, TaskRow)
+    ]
     if not pending:
         if group:
             print(f"No runnable tasks in group '{group}'")

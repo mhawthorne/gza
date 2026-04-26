@@ -39,7 +39,6 @@ from ..console import (
 )
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key as _task_id_numeric_key
 from ..git import Git, GitError, active_worktree_path_for_branch
-from ..pickup import get_runnable_pending_tasks
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
     TaskLineageNode,
@@ -55,6 +54,7 @@ from ..task_query import (
     LineageRow as _LineageRow,
     PresentationSpec as _TaskPresentationSpec,
     ProjectionSpec as _TaskProjectionSpec,
+    SortSpec as _TaskSortSpec,
     TaskQuery as _TaskQuery,
     TaskQueryPresets as _TaskQueryPresets,
     TaskQueryResult as _TaskQueryResult,
@@ -151,11 +151,38 @@ def cmd_next(args: argparse.Namespace) -> int:
     """List upcoming pending tasks in order."""
     config = Config.load(args.project_dir)
     store = get_store(config)
+    service = _TaskQueryService(store)
     group = getattr(args, "group", None)
 
-    pending = store.get_pending(group=group)
-    runnable = get_runnable_pending_tasks(store, group=group)
-    blocked: list[tuple[DbTask, str | None]] = []
+    pending_query = _TaskQuery(
+        scope="tasks",
+        limit=None,
+        statuses=("pending",),
+        groups=None if group is None else (group,),
+        sort=_TaskSortSpec(field="pickup_order", descending=False),
+    )
+    pending = [row.task for row in service.run(pending_query).rows if isinstance(row, _TaskRow)]
+    runnable = [
+        row.task
+        for row in service.run(_TaskQueryPresets.queue(limit=None, group=group)).rows
+        if isinstance(row, _TaskRow)
+    ]
+    blocked_query = _TaskQuery(
+        scope="tasks",
+        limit=None,
+        statuses=("pending",),
+        exclude_task_types=("internal",),
+        dependency_state=("blocked",),
+        groups=None if group is None else (group,),
+        sort=_TaskSortSpec(field="pickup_order", descending=False),
+        projection=_TaskProjectionSpec(fields=("blocking_id",)),
+    )
+    blocked_rows = service.run(blocked_query).rows
+    blocked: list[tuple[DbTask, str | None]] = [
+        (row.task, cast(str | None, row.values.get("blocking_id")))
+        for row in blocked_rows
+        if isinstance(row, _TaskRow)
+    ]
 
     # Check for orphaned/stale tasks once, regardless of whether pending tasks exist
     registry = WorkerRegistry(config.workers_path)
@@ -169,14 +196,6 @@ def cmd_next(args: argparse.Namespace) -> int:
         if orphaned:
             _print_orphaned_warning(orphaned)
         return 0
-
-    # Compute dependency-blocked non-internal pending tasks for blocked display/count.
-    for task in pending:
-        if task.task_type == "internal":
-            continue
-        is_blocked, blocking_id, _blocking_status = store.is_task_blocked(task)
-        if is_blocked:
-            blocked.append((task, blocking_id))
 
     # Filter blocked tasks unless --all is specified
     show_all = args.all if hasattr(args, 'all') else False
