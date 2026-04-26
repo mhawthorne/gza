@@ -5638,7 +5638,7 @@ class TestLineageCommand:
         assert "Review implementation" in normalized
 
     def test_lineage_shows_stats_when_available(self, tmp_path: Path):
-        """Lineage command shows duration and cost when available."""
+        """Lineage command shows duration and started date when available."""
         from datetime import datetime
 
         setup_config(tmp_path)
@@ -5649,15 +5649,19 @@ class TestLineageCommand:
         task = store.add("Implement feature", task_type="implement")
         task.status = "completed"
         task.completed_at = now
+        task.started_at = datetime(2026, 2, 12, 9, 0, tzinfo=UTC)
         task.duration_seconds = 120.0  # 2 minutes
         task.cost_usd = 0.1234
+        task.num_steps_reported = 5
         store.update(task)
 
         result = run_gza("lineage", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "2m" in result.stdout
-        assert "0.1234" in result.stdout
+        assert "2m0s" in result.stdout
+        assert "2026-02-12" in result.stdout
+        assert "steps" not in result.stdout
+        assert "$0.1234" not in result.stdout
 
     def test_lineage_child_shows_relationship_label(self, tmp_path: Path):
         """Relationship label is shown only when it differs from the task type.
