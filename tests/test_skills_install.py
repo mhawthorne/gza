@@ -1,6 +1,5 @@
 """Tests for the skills-install command."""
 
-import json
 import os
 import subprocess
 from datetime import UTC, datetime
@@ -423,6 +422,8 @@ class TestSkillContentValidation:
 
     def test_manual_review_persistence_flow_works_for_fresh_task(self, tmp_path: Path):
         """Fresh manual review persistence should produce a slug-backed prompt path and store update cleanly."""
+        from gza.runner import get_task_output_paths
+
         setup_config(tmp_path)
         config, store = _create_store_for_project(tmp_path)
 
@@ -443,15 +444,18 @@ class TestSkillContentValidation:
 
         prompt_before = run_gza("show", "--prompt", created.id, "--project", str(tmp_path))
         assert prompt_before.returncode == 0
-        prompt_before_data = json.loads(prompt_before.stdout)
-        assert prompt_before_data["report_path"] is None
+        assert "Manual review via /gza-task-review" in prompt_before.stdout
+        report_path_before, _summary_path_before = get_task_output_paths(created, config.project_dir)
+        assert report_path_before is None
 
         _assign_slug_like_runner(created, store, config)
+        refreshed = store.get(created.id)
+        assert refreshed is not None
 
         prompt_after = run_gza("show", "--prompt", created.id, "--project", str(tmp_path))
         assert prompt_after.returncode == 0
-        prompt_after_data = json.loads(prompt_after.stdout)
-        report_path_value = prompt_after_data["report_path"]
+        assert "Manual review via /gza-task-review" in prompt_after.stdout
+        report_path_value, _summary_path_after = get_task_output_paths(refreshed, config.project_dir)
         assert report_path_value is not None
 
         report_path = Path(report_path_value)
@@ -473,6 +477,8 @@ class TestSkillContentValidation:
 
     def test_manual_improve_persistence_flow_works_for_fresh_task(self, tmp_path: Path):
         """Fresh manual improve persistence should produce a slug-backed prompt path and clear review state."""
+        from gza.runner import get_task_output_paths
+
         setup_config(tmp_path)
         config, store = _create_store_for_project(tmp_path)
 
@@ -501,15 +507,18 @@ class TestSkillContentValidation:
 
         prompt_before = run_gza("show", "--prompt", created.id, "--project", str(tmp_path))
         assert prompt_before.returncode == 0
-        prompt_before_data = json.loads(prompt_before.stdout)
-        assert prompt_before_data["summary_path"] is None
+        assert "Manual improve via /gza-task-improve" in prompt_before.stdout
+        _report_path_before, summary_path_before = get_task_output_paths(created, config.project_dir)
+        assert summary_path_before is None
 
         _assign_slug_like_runner(created, store, config)
+        refreshed = store.get(created.id)
+        assert refreshed is not None
 
         prompt_after = run_gza("show", "--prompt", created.id, "--project", str(tmp_path))
         assert prompt_after.returncode == 0
-        prompt_after_data = json.loads(prompt_after.stdout)
-        summary_path_value = prompt_after_data["summary_path"]
+        assert "Manual improve via /gza-task-improve" in prompt_after.stdout
+        _report_path_after, summary_path_value = get_task_output_paths(refreshed, config.project_dir)
         assert summary_path_value is not None
 
         summary_path = Path(summary_path_value)

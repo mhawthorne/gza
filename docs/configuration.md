@@ -794,6 +794,9 @@ gza show <task_id> [options]
 |--------|-------------|
 | `task_id` | Full prefixed task ID to show (e.g. `gza-1234`) |
 | `--full` | Show full output without truncation |
+| `--prompt` | Print only the fully built prompt text for this task and exit |
+| `--output` | Print only the raw output/report content and exit |
+| `--path` | Print only the report file path and exit |
 | `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--prompt`, `--output`, and `--path` modes |
 
 When a task has a branch, `gza show` also reports active worktree information:
@@ -1170,16 +1173,28 @@ Inspect and manage runnable pending queue ordering.
 gza queue
 gza queue bump <task_id>
 gza queue unbump <task_id>
+gza queue move <task_id> <position>
+gza queue next <task_id>
+gza queue clear <task_id>
 ```
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Full prefixed task ID to bump/unbump (e.g. `gza-1234`) |
-| `--group NAME` | Only list runnable tasks from this group; for `bump`/`unbump`, only affects the runnable-status message |
+| `task_id` | Full prefixed task ID to reorder (for example `gza-1234`) |
+| `position` | 1-based explicit queue position for `queue move` |
+| `--group NAME` | Only list runnable tasks from this group (the same scoped pickup order used by `gza watch --group NAME`); for `bump`/`unbump`/`move`/`next`/`clear`, only affects the runnable-status message |
+| `-n, --limit N` | Show first N runnable tasks (default: 10; use `0`, `-1`, or `--all` for all) |
+| `--all` | Show all runnable tasks |
 
-Queue pickup ordering is urgent-first. `queue bump` moves a task to the front of the urgent lane (next pickup), then remaining tasks stay FIFO by creation time within each lane.
+Queue pickup ordering is:
+1. Explicit `queue_position` values in ascending order within the selected group bucket (or within ungrouped tasks when no group is set on the task)
+2. Urgent lane, with `queue bump` moving a task to the front of that lane
+3. FIFO by creation time for the remaining runnable tasks
+
+Use `gza queue next <task_id>` to make a task the next ordered item, or `gza queue move <task_id> <position>` to assign positions like 1, 2, and 3 without having to order every task. Use `gza queue clear <task_id>` to remove explicit ordering and fall back to lane/FIFO behavior.
 `gza queue` shows tasks that default worker pickup can run (internal and dependency-blocked pending tasks are excluded).
-To treat a group as a release queue, assign tasks with `gza add --group release-1.2 ...` and inspect them with `gza queue --group release-1.2`.
+By default, `gza queue` shows the first 10 runnable tasks. Use `-n 0`, `-n -1`, or `--all` to show everything.
+To treat a group as a release queue, assign tasks with `gza add --group release-1.2 ...` and inspect them with `gza queue --group release-1.2`. That command is the canonical preview for what `gza watch --group release-1.2` will consider and in what order.
 
 ### implement
 
@@ -1265,7 +1280,7 @@ gza watch [options]
 | `--max-iterations N` | Iterate loop cap for implement tasks (default: `watch.max_iterations` or `10`) |
 | `--dry-run` | Show what each cycle would do without executing |
 | `--quiet` | Write events to `.gza/watch.log` only |
-| `--group NAME` | Only advance, resume, and start tasks from this group |
+| `--group NAME` | Only advance, resume, and start tasks from this group; use `gza queue --group NAME` to preview the same scoped pickup order |
 
 ### learnings
 

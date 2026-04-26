@@ -1917,13 +1917,11 @@ def cmd_lineage(args: argparse.Namespace) -> int:
 
 
 def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore") -> int:
-    """Build and print the full prompt for a task as JSON.
+    """Build and print only the full prompt text for a task.
 
     Uses the same build_prompt() path as background execution, so the output
-    is identical to what a background worker would receive.
+    text is identical to what a background worker would receive.
     """
-    import json
-
     from ..git import Git
     from ..runner import build_prompt, get_task_output_paths
 
@@ -1931,18 +1929,7 @@ def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore")
 
     git = Git(config.project_dir)
     prompt = build_prompt(task, config, store, report_path=report_path, summary_path=summary_path, git=git)
-
-    output = {
-        "task_id": task.id,
-        "task_type": task.task_type,
-        "task_slug": task.slug,
-        "branch": task.branch,
-        "prompt": prompt,
-        "report_path": str(report_path) if report_path else None,
-        "summary_path": str(summary_path) if summary_path else None,
-        "verify_command": config.verify_command,
-    }
-    print(json.dumps(output, indent=2))
+    print(prompt)
     return 0
 
 
@@ -1957,7 +1944,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         console.print(f"[red]Error: Task {task_id} not found[/red]")
         return 1
 
-    # --prompt: emit the fully built prompt as JSON and exit
+    # --prompt: emit only the fully built prompt text and exit
     if getattr(args, "prompt", False):
         return _show_built_prompt(task, config, store)
 

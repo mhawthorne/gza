@@ -79,6 +79,16 @@ def set_task_urgency(store: SqliteTaskStore, task_id: str, *, urgent: bool) -> b
     return store.set_urgent(task_id, urgent)
 
 
+def set_task_queue_position(store: SqliteTaskStore, task_id: str, *, position: int) -> bool:
+    """Shared explicit queue ordering path for queue move/next."""
+    return store.set_queue_position(task_id, position)
+
+
+def clear_task_queue_position(store: SqliteTaskStore, task_id: str) -> bool:
+    """Shared explicit queue ordering clear path."""
+    return store.clear_queue_position(task_id)
+
+
 # Matches "{prefix}-{suffix}" where prefix is 1-12 lowercase alphanumeric chars.
 # This is tighter than `"-" in arg` (which also matches branch names like "feature-foo").
 _TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
