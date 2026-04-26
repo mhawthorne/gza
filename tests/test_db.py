@@ -374,6 +374,39 @@ class TestConnectionLifecycle:
         assert tasks[0].id == task1.id
         assert tasks[1].id == task2.id
 
+    def test_rename_group_updates_all_attached_tasks(self, tmp_path: Path):
+        """Renaming a group should update every task in that group."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        first = store.add("First", group="release")
+        second = store.add("Second", group="release")
+        other = store.add("Other", group="backlog")
+
+        updated = store.rename_group("release", "launch")
+
+        assert updated == 2
+        refreshed_first = store.get(first.id)
+        refreshed_second = store.get(second.id)
+        refreshed_other = store.get(other.id)
+        assert refreshed_first is not None
+        assert refreshed_second is not None
+        assert refreshed_other is not None
+        assert refreshed_first.group == "launch"
+        assert refreshed_second.group == "launch"
+        assert refreshed_other.group == "backlog"
+
+    def test_rename_group_rejects_existing_destination_group(self, tmp_path: Path):
+        """Renaming into an existing group should fail instead of merging."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        store.add("Release task", group="release")
+        store.add("Backlog task", group="backlog")
+
+        with pytest.raises(ValueError, match="already exists"):
+            store.rename_group("release", "backlog")
+
     def test_next_task_after_follows_sequence_and_skips_gaps(self, tmp_path: Path):
         """next_task_after finds the next existing sequence ID, not +1 arithmetic."""
         db_path = tmp_path / "test.db"

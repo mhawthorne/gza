@@ -1236,6 +1236,25 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_group_rename(args: argparse.Namespace) -> int:
+    """Rename a task group across all attached tasks."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    try:
+        updated = store.rename_group(args.old_group, args.new_group)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    if args.old_group.strip() == args.new_group.strip():
+        print(f"✓ Group '{args.old_group.strip()}' already has that name ({updated} tasks unchanged)")
+        return 0
+
+    print(f"✓ Renamed group '{args.old_group.strip()}' to '{args.new_group.strip()}' ({updated} tasks updated)")
+    return 0
+
+
 def _print_ps_output(
     args: argparse.Namespace,
     registry: "WorkerRegistry",
