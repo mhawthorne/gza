@@ -130,19 +130,31 @@ def format_no_runnable_message_for_tags(
     """Render precise tag-filtered empty-pickup messaging.
 
     Distinguishes between "no matching pending tasks" and
-    "matching pending tasks exist but are dependency-blocked".
+    "matching pending tasks exist but are not runnable", including
+    dependency-blocked and internal-only pending matches.
     """
     tag_text = ", ".join(tags)
-    has_matching_pending = bool(store.get_pending(limit=1, tags=tags, any_tag=any_tag))
-    if has_matching_pending:
+    matching_pending = store.get_pending(limit=None, tags=tags, any_tag=any_tag)
+    if matching_pending:
+        matching_non_internal = [task for task in matching_pending if task.task_type != "internal"]
+        if matching_non_internal and all(store.is_task_blocked(task)[0] for task in matching_non_internal):
+            if exhausted:
+                return (
+                    f"No more runnable tasks matching tags: {tag_text}. "
+                    "Remaining matching pending tasks are blocked by dependencies."
+                )
+            return (
+                f"No runnable tasks found matching tags: {tag_text}. "
+                "Matching pending tasks are blocked by dependencies."
+            )
         if exhausted:
             return (
                 f"No more runnable tasks matching tags: {tag_text}. "
-                "Remaining matching pending tasks are blocked by dependencies."
+                "Remaining matching pending tasks are not runnable via work (for example internal tasks)."
             )
         return (
             f"No runnable tasks found matching tags: {tag_text}. "
-            "Matching pending tasks are blocked by dependencies."
+            "Matching pending tasks are not runnable via work (for example internal tasks)."
         )
     if exhausted:
         return f"No more pending tasks matching tags: {tag_text}."
