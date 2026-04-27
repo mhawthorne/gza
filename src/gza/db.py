@@ -1617,6 +1617,16 @@ def _write_shared_import_marker(project_dir: Path, local_db_path: Path, active_d
     marker_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _project_identity_from_config(config: "Config") -> tuple[str, str]:
+    project_id = getattr(config, "project_id", None)
+    if not isinstance(project_id, str) or not project_id:
+        project_id = "default"
+    project_prefix = getattr(config, "project_prefix", "gza")
+    if not isinstance(project_prefix, str) or not project_prefix:
+        project_prefix = "gza"
+    return project_id, project_prefix
+
+
 class SqliteTaskStore:
     """SQLite-based task storage."""
 
@@ -1654,12 +1664,7 @@ class SqliteTaskStore:
     @classmethod
     def from_config(cls, config: "Config", *, allow_legacy_local_db: bool = False) -> "SqliteTaskStore":
         """Create a store from a loaded Config instance."""
-        project_id = getattr(config, "project_id", None)
-        if not isinstance(project_id, str) or not project_id:
-            project_id = "default"
-        project_prefix = getattr(config, "project_prefix", "gza")
-        if not isinstance(project_prefix, str) or not project_prefix:
-            project_prefix = "gza"
+        project_id, project_prefix = _project_identity_from_config(config)
         project_dir = getattr(config, "project_dir", None)
         if isinstance(project_dir, Path) and not allow_legacy_local_db:
             local_db = _legacy_local_db_path(project_dir)
@@ -4134,36 +4139,72 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "diff_lines_removed", "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
     )
     task_import_columns_sql = ", ".join(f'"{c}"' if c == "group" else c for c in task_import_columns)
+    project_id, project_prefix = _project_identity_from_config(config)
+
+    def _find_conflicts(conn: sqlite3.Connection, local_rows: list[sqlite3.Row]) -> list[str]:
+        local_ids = [str(row["id"]) for row in local_rows]
+        if not local_ids:
+            return []
+        placeholders = ",".join(["?"] * len(local_ids))
+        existing_rows = conn.execute(
+            f"""
+            SELECT {task_import_columns_sql}
+            FROM tasks
+            WHERE project_id = ? AND id IN ({placeholders})
+            """,
+            (project_id, *local_ids),
+        ).fetchall()
+        existing_by_id = {str(row["id"]): row for row in existing_rows}
+        conflicts: list[str] = []
+        for row in local_rows:
+            existing = existing_by_id.get(str(row["id"]))
+            if existing is None:
+                continue
+            if any(existing[column] != row[column] for column in task_import_columns):
+                conflicts.append(str(row["id"]))
+        return conflicts
 
     local_conn = sqlite3.connect(f"file:{local_db}?mode=ro", uri=True)
     local_conn.row_factory = sqlite3.Row
     try:
+        local_task_rows = local_conn.execute(
+            f"SELECT {task_import_columns_sql} FROM tasks ORDER BY id"
+        ).fetchall()
+
+        if dry_run:
+            existing_count = 0
+            if shared_db.exists():
+                shared_ro = sqlite3.connect(f"file:{shared_db}?mode=ro", uri=True)
+                shared_ro.row_factory = sqlite3.Row
+                try:
+                    conflicts = _find_conflicts(shared_ro, local_task_rows)
+                    if conflicts:
+                        sample = ", ".join(conflicts[:5])
+                        raise ValueError(
+                            "Conflicting task IDs already exist in shared DB for this project_id: "
+                            f"{sample}. Resolve conflicts before importing."
+                        )
+                    existing_count = int(
+                        shared_ro.execute(
+                            "SELECT COUNT(*) FROM tasks WHERE project_id = ?",
+                            (project_id,),
+                        ).fetchone()[0]
+                    )
+                finally:
+                    shared_ro.close()
+            return {
+                "status": "dry_run",
+                "local_db_path": str(local_db),
+                "shared_db_path": str(shared_db),
+                "project_id": project_id,
+                "local_task_count": len(local_task_rows),
+                "shared_existing_task_count": existing_count,
+            }
+
         store = SqliteTaskStore.from_config(config, allow_legacy_local_db=True)
         with store._connect() as shared_conn:
             shared_conn.execute("ATTACH DATABASE ? AS legacy_local", (str(local_db),))
-            local_task_rows = local_conn.execute(
-                f"SELECT {task_import_columns_sql} FROM tasks ORDER BY id"
-            ).fetchall()
-            local_ids = [str(row["id"]) for row in local_task_rows]
-
-            conflicts: list[str] = []
-            if local_ids:
-                placeholders = ",".join(["?"] * len(local_ids))
-                existing_rows = shared_conn.execute(
-                    f"""
-                    SELECT {task_import_columns_sql}
-                    FROM tasks
-                    WHERE project_id = ? AND id IN ({placeholders})
-                    """,
-                    (store._project_id, *local_ids),
-                ).fetchall()
-                existing_by_id = {str(row["id"]): row for row in existing_rows}
-                for row in local_task_rows:
-                    existing = existing_by_id.get(str(row["id"]))
-                    if existing is None:
-                        continue
-                    if any(existing[column] != row[column] for column in task_import_columns):
-                        conflicts.append(str(row["id"]))
+            conflicts = _find_conflicts(shared_conn, local_task_rows)
             if conflicts:
                 sample = ", ".join(conflicts[:5])
                 raise ValueError(
@@ -4171,26 +4212,12 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                     f"{sample}. Resolve conflicts before importing."
                 )
 
-            if dry_run:
-                existing_count = shared_conn.execute(
-                    "SELECT COUNT(*) FROM tasks WHERE project_id = ?",
-                    (store._project_id,),
-                ).fetchone()[0]
-                return {
-                    "status": "dry_run",
-                    "local_db_path": str(local_db),
-                    "shared_db_path": str(shared_db),
-                    "project_id": store._project_id,
-                    "local_task_count": len(local_task_rows),
-                    "shared_existing_task_count": existing_count,
-                }
-
             before_count = shared_conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE project_id = ?",
                 (store._project_id,),
             ).fetchone()[0]
             max_imported_suffix = 0
-            prefix_token = f"{store._prefix}-"
+            prefix_token = f"{project_prefix}-"
             for row in local_task_rows:
                 task_id = str(row["id"])
                 if not task_id.startswith(prefix_token):

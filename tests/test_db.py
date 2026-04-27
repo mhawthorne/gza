@@ -4756,6 +4756,92 @@ class TestSharedDbIsolationAndImportGating:
         assert conflict.returncode == 1
         assert "Conflicting task IDs already exist" in conflict.stderr
 
+    def test_import_local_db_dry_run_does_not_create_missing_shared_db(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared-missing" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportdryrun01\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        assert not shared_db.exists()
+        assert not shared_db.parent.exists()
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--dry-run", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "Dry-run: legacy local DB import preview" in result.stdout
+        assert not shared_db.exists()
+        assert not shared_db.parent.exists()
+
+    def test_import_local_db_dry_run_does_not_mutate_existing_projects_rows(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportdryrun02\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        seeded = SqliteTaskStore(shared_db, prefix="other", project_id="otherproject01")
+        seeded.add("seed task")
+
+        with sqlite3.connect(shared_db) as conn:
+            conn.row_factory = sqlite3.Row
+            before_count = int(conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0])
+            before_other_last_seen = conn.execute(
+                "SELECT last_seen_at FROM projects WHERE id = ?",
+                ("otherproject01",),
+            ).fetchone()["last_seen_at"]
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--dry-run", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "Dry-run: legacy local DB import preview" in result.stdout
+
+        with sqlite3.connect(shared_db) as conn:
+            conn.row_factory = sqlite3.Row
+            after_count = int(conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0])
+            after_other_last_seen = conn.execute(
+                "SELECT last_seen_at FROM projects WHERE id = ?",
+                ("otherproject01",),
+            ).fetchone()["last_seen_at"]
+            target_project_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM projects WHERE id = ?",
+                    ("demoimportdryrun02",),
+                ).fetchone()[0]
+            )
+
+        assert after_count == before_count
+        assert after_other_last_seen == before_other_last_seen
+        assert target_project_count == 0
+
     def test_import_local_db_then_add_task_continues_sequence(self, tmp_path: Path) -> None:
         from gza.config import Config
 
