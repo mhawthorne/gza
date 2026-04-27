@@ -1334,6 +1334,17 @@ class TestNextCommand:
         assert result.returncode == 0
         assert "No pending tasks" in result.stdout
 
+    def test_next_rejects_empty_tag_without_traceback(self, tmp_path: Path):
+        """next --tag '' should fail with user-facing validation, not traceback."""
+        setup_config(tmp_path)
+
+        result = run_gza("next", "--tag", "", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: tag must not be empty" in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
+
     def test_next_warns_about_orphaned_tasks(self, tmp_path: Path):
         """Next command warns about orphaned in-progress tasks."""
 

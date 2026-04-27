@@ -47,6 +47,7 @@ from ._common import (
     get_review_verdict,
     get_store,
     get_task_step_count,
+    parse_cli_tag_filters,
     resolve_comments_improve_action,
     resolve_id,
     resolve_improve_action,
@@ -67,21 +68,12 @@ def _foreground_command_invocation(command: str) -> RunInvocationContext:
 
 
 def _selected_tag_filters(args: argparse.Namespace) -> tuple[tuple[str, ...] | None, bool]:
-    tags = list(getattr(args, "tags", None) or [])
-    legacy_group = getattr(args, "group", None)
-    if legacy_group:
-        print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
-        tags.append(legacy_group)
-    return (tuple(tags) if tags else None, bool(getattr(args, "any_tag", False)))
+    return parse_cli_tag_filters(args)
 
 
 def _selected_tags_for_new_task(args: argparse.Namespace) -> tuple[str, ...]:
-    tags = list(getattr(args, "tags", None) or [])
-    legacy_group = getattr(args, "group", None)
-    if legacy_group:
-        print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
-        tags.append(legacy_group)
-    return tuple(tags)
+    tags, _any_tag = parse_cli_tag_filters(args)
+    return tags or ()
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -94,6 +86,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     if hasattr(args, 'max_turns') and args.max_turns is not None:
         config.max_steps = args.max_turns
         config.max_turns = args.max_turns
+    try:
+        selected_tags, any_tag = _selected_tag_filters(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     # Handle background mode
     if args.background:
@@ -118,8 +115,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             _print_orphaned_warning(orphaned)
             print()
     task_id_for_registration = None
-    selected_tags, any_tag = _selected_tag_filters(args)
-
     # Check if specific task IDs were provided
     if hasattr(args, 'task_ids') and args.task_ids:
         # Resolve and validate all task IDs first
@@ -337,7 +332,11 @@ def cmd_implement(args: argparse.Namespace) -> int:
         else:
             prompt = f"Implement plan from task {plan_task.id}"
 
-    tags = _selected_tags_for_new_task(args)
+    try:
+        tags = _selected_tags_for_new_task(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
     create_review = args.review if hasattr(args, 'review') and args.review else False
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
     branch_type = args.branch_type if hasattr(args, 'branch_type') and args.branch_type else None
@@ -405,7 +404,11 @@ def cmd_add(args: argparse.Namespace) -> int:
         return 1
 
     # Get optional parameters
-    tags = _selected_tags_for_new_task(args)
+    try:
+        tags = _selected_tags_for_new_task(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
     depends_on = resolve_id(config, args.depends_on) if hasattr(args, 'depends_on') and args.depends_on else None
     based_on = resolve_id(config, args.based_on) if hasattr(args, 'based_on') and args.based_on else None
     create_review = args.review if hasattr(args, 'review') and args.review else False
@@ -572,7 +575,11 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
     if getattr(args, "set_tags", None) is not None:
         set_tags = tuple(part.strip() for part in str(args.set_tags).split(",") if part.strip())
-        store.replace_task_tags(task_row_id, set_tags)
+        try:
+            store.replace_task_tags(task_row_id, set_tags)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
         refreshed = store.get(task_row_id)
         if refreshed is not None:
             task = refreshed
@@ -580,7 +587,11 @@ def cmd_edit(args: argparse.Namespace) -> int:
         return 0
 
     if getattr(args, "add_tags", None):
-        store.add_task_tags(task_row_id, tuple(args.add_tags))
+        try:
+            store.add_task_tags(task_row_id, tuple(args.add_tags))
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
         refreshed = store.get(task_row_id)
         if refreshed is not None:
             task = refreshed
@@ -588,7 +599,11 @@ def cmd_edit(args: argparse.Namespace) -> int:
         return 0
 
     if getattr(args, "remove_tags", None):
-        store.remove_task_tags(task_row_id, tuple(args.remove_tags))
+        try:
+            store.remove_task_tags(task_row_id, tuple(args.remove_tags))
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
         refreshed = store.get(task_row_id)
         if refreshed is not None:
             task = refreshed
@@ -612,7 +627,11 @@ def cmd_edit(args: argparse.Namespace) -> int:
             )
             return 1
         else:
-            store.replace_task_tags(task_row_id, (args.group_flag,))
+            try:
+                store.replace_task_tags(task_row_id, (args.group_flag,))
+            except ValueError as exc:
+                print(f"Error: {exc}")
+                return 1
             refreshed = store.get(task_row_id)
             if refreshed is not None:
                 task = refreshed

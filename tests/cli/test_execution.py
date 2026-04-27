@@ -130,6 +130,17 @@ class TestAddCommand:
         assert task.task_type == "implement"
         assert task.group == "features"
 
+    def test_add_rejects_empty_tag_without_traceback(self, tmp_path: Path):
+        """add --tag '' should fail with user-facing validation, not traceback."""
+        setup_config(tmp_path)
+
+        result = run_gza("add", "Tag validation", "--tag", "", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: tag must not be empty" in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
+
 
 class TestEditCommand:
     """Tests for 'gza edit' command."""
@@ -244,6 +255,19 @@ class TestEditCommand:
         updated = store.get(task.id)
         assert updated is not None
         assert updated.tags == ("backend", "release-1.2")
+
+    def test_edit_add_tag_rejects_empty_value_without_traceback(self, tmp_path: Path):
+        """edit --add-tag '' should fail with user-facing validation, not traceback."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Test task")
+
+        result = run_gza("edit", str(task.id), "--add-tag", "", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: tag must not be empty" in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
 
     def test_edit_review_flag(self, tmp_path: Path):
         """Edit command can enable automatic review task creation."""
@@ -1308,6 +1332,17 @@ class TestWorkCommandMultiTask:
 
         assert rc == 0
         assert seen_task_ids == [release_task.id]
+
+    def test_work_group_rejects_empty_value_without_traceback(self, tmp_path: Path):
+        """Deprecated --group alias should reject empty values cleanly."""
+        setup_config(tmp_path)
+
+        result = run_gza("work", "--group", "", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: tag must not be empty" in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
 
     def test_work_allows_failed_pr_required_task_with_pr_flag(self, tmp_path: Path):
         """work <task> --pr should allow retrying failed PR_REQUIRED tasks."""

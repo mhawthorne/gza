@@ -5,7 +5,6 @@ import contextlib
 import io
 import os
 import signal
-import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -35,6 +34,7 @@ from ._common import (
     clear_task_queue_position,
     format_review_outcome,
     get_store,
+    parse_cli_tag_filters,
     resolve_id,
     set_task_queue_position,
     set_task_urgency,
@@ -848,13 +848,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
     )
     dry_run = bool(getattr(args, "dry_run", False))
     quiet = bool(getattr(args, "quiet", False))
-    tags = list(getattr(args, "tags", None) or [])
-    group = getattr(args, "group", None)
-    if group:
-        print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
-        tags.append(group)
-    tag_filters = tuple(tags) if tags else None
-    any_tag = bool(getattr(args, "any_tag", False))
+    try:
+        tag_filters, any_tag = parse_cli_tag_filters(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     if batch < 1:
         print("Error: --batch must be a positive integer")
@@ -1036,13 +1034,11 @@ def cmd_queue(args: argparse.Namespace) -> int:
     store = get_store(config)
     service = TaskQueryService(store)
     action = getattr(args, "queue_action", None)
-    tags = list(getattr(args, "tags", None) or [])
-    group = getattr(args, "group", None)
-    if group:
-        print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
-        tags.append(group)
-    tag_filters = tuple(tags) if tags else None
-    any_tag = bool(getattr(args, "any_tag", False))
+    try:
+        tag_filters, any_tag = parse_cli_tag_filters(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     if action in {"bump", "unbump", "move", "next", "clear"}:
         task_id = resolve_id(config, args.task_id)

@@ -77,7 +77,9 @@ from ._common import (
     get_review_verdict,
     get_store,
     pager_context,
+    parse_cli_tag_filters,
     resolve_id,
+    validate_cli_tag_values,
 )
 
 _LINEAGE_REL_LABELS = _QUERY_LINEAGE_REL_LABELS
@@ -152,13 +154,11 @@ def cmd_next(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
     service = _TaskQueryService(store)
-    tags = list(getattr(args, "tags", None) or [])
-    group = getattr(args, "group", None)
-    if group:
-        print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
-        tags.append(group)
-    tag_filters = tuple(tags) if tags else None
-    any_tag = bool(getattr(args, "any_tag", False))
+    try:
+        tag_filters, any_tag = parse_cli_tag_filters(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     pending_query = _TaskQuery(
         scope="tasks",
@@ -293,7 +293,11 @@ def cmd_history(args: argparse.Namespace) -> int:
     projection_fields = _parse_csv(getattr(args, "fields", None))
     projection_preset = getattr(args, "preset", None)
     use_json = bool(getattr(args, "json", False))
-    tags = tuple(getattr(args, "tags", None) or ())
+    try:
+        tags = validate_cli_tag_values(tuple(getattr(args, "tags", None) or ()))
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
     any_tag = bool(getattr(args, "any_tag", False))
 
     if not use_json and (projection_fields is not None or projection_preset):
@@ -641,7 +645,11 @@ def cmd_search(args: argparse.Namespace) -> int:
     projection_fields = _parse_csv(getattr(args, "fields", None))
     projection_preset = getattr(args, "preset", None)
     use_json = bool(getattr(args, "json", False))
-    tags = tuple(getattr(args, "tags", None) or ())
+    try:
+        tags = validate_cli_tag_values(tuple(getattr(args, "tags", None) or ()))
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
     any_tag = bool(getattr(args, "any_tag", False))
 
     if not use_json and (projection_fields is not None or projection_preset):

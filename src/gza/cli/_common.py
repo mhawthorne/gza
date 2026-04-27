@@ -89,6 +89,37 @@ def clear_task_queue_position(store: SqliteTaskStore, task_id: str) -> bool:
     return store.clear_queue_position(task_id)
 
 
+def _validate_tag_value(raw: object) -> str:
+    """Return raw tag text when non-empty after trim, otherwise raise ValueError."""
+    tag = str(raw)
+    if not tag.strip():
+        raise ValueError("tag must not be empty")
+    return tag
+
+
+def parse_cli_tag_filters(
+    args: argparse.Namespace,
+    *,
+    tags_attr: str = "tags",
+    group_attr: str = "group",
+    any_tag_attr: str = "any_tag",
+    warn_on_group_alias: bool = True,
+) -> tuple[tuple[str, ...] | None, bool]:
+    """Parse and validate tag/group filter flags from argparse args."""
+    selected_tags = [_validate_tag_value(raw) for raw in (getattr(args, tags_attr, None) or [])]
+    legacy_group = getattr(args, group_attr, None) if hasattr(args, group_attr) else None
+    if legacy_group is not None:
+        selected_tags.append(_validate_tag_value(legacy_group))
+        if warn_on_group_alias:
+            print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
+    return (tuple(selected_tags) if selected_tags else None, bool(getattr(args, any_tag_attr, False)))
+
+
+def validate_cli_tag_values(values: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    """Validate CLI-provided tag values and return them as a tuple."""
+    return tuple(_validate_tag_value(raw) for raw in (values or ()))
+
+
 # Matches "{prefix}-{suffix}" where prefix is 1-12 lowercase alphanumeric chars.
 # This is tighter than `"-" in arg` (which also matches branch names like "feature-foo").
 _TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
@@ -400,12 +431,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     explicit_task_id = task_id
     selected_task: DbTask | None = None
     resume_mode = bool(getattr(args, "resume", False))
-    selected_tags = list(getattr(args, "tags", None) or [])
-    selected_group = getattr(args, "group", None)
-    if selected_group:
-        print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
-        selected_tags.append(selected_group)
-    any_tag = bool(getattr(args, "any_tag", False))
+    selected_tags, any_tag = parse_cli_tag_filters(args)
 
     if explicit_task_id is not None:
         task = store.get(explicit_task_id)
@@ -440,7 +466,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
             print("Error: Cannot resume without specifying a task ID")
             return 1
         # Select a candidate for UX; actual claim happens in the child runner.
-        selected_task = store.get_next_pending(tags=tuple(selected_tags) or None, any_tag=any_tag)
+        selected_task = store.get_next_pending(tags=selected_tags, any_tag=any_tag)
         if not selected_task:
             if selected_tags:
                 print(f"No pending tasks found matching tags: {', '.join(selected_tags)}")
@@ -914,12 +940,7 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
     """
     # Determine how many workers to spawn
     count = args.count if args.count is not None else 1
-    selected_tags = list(getattr(args, "tags", None) or [])
-    selected_group = getattr(args, "group", None)
-    if selected_group:
-        print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
-        selected_tags.append(selected_group)
-    any_tag = bool(getattr(args, "any_tag", False))
+    selected_tags, any_tag = parse_cli_tag_filters(args)
     store = get_store(config)
 
     # If specific task_ids are provided, spawn one worker per task ID
@@ -940,7 +961,7 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
         return 0
 
     if selected_tags:
-        pending_tasks = store.get_pending_pickup(limit=count, tags=tuple(selected_tags), any_tag=any_tag)
+        pending_tasks = store.get_pending_pickup(limit=count, tags=selected_tags, any_tag=any_tag)
         spawned_count = 0
         for task in pending_tasks:
             if task.id is None:
