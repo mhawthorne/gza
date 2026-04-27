@@ -526,7 +526,7 @@ def _has_fk_columns(conn: sqlite3.Connection, table: str, to_table: str, from_co
     return False
 
 
-def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str) -> None:
+def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project_prefix: str) -> None:
     """Perform full structural v35→v36 migration to match fresh SCHEMA semantics."""
     conn.execute("PRAGMA foreign_keys=OFF")
     try:
@@ -546,6 +546,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str) -> None
         )
 
         # Rebuild project_sequences from prefix-keyed legacy shape to project-keyed shape.
+        legacy_active_prefix_next_seq: int | None = None
         if _table_exists(conn, "project_sequences"):
             sequence_cols = _table_columns(conn, "project_sequences")
             if "project_id" not in sequence_cols:
@@ -559,13 +560,28 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str) -> None
                     )
                     """
                 )
-                conn.execute(
+                row = conn.execute(
                     """
-                    INSERT OR IGNORE INTO project_sequences(project_id, prefix, next_seq)
-                    SELECT ?, prefix, next_seq FROM project_sequences_legacy
+                    SELECT next_seq
+                    FROM project_sequences_legacy
+                    WHERE prefix = ?
+                    ORDER BY next_seq DESC
+                    LIMIT 1
                     """,
-                    (project_id,),
-                )
+                    (project_prefix,),
+                ).fetchone()
+                if row is not None:
+                    legacy_active_prefix_next_seq = int(row["next_seq"])
+                    conn.execute(
+                        """
+                        INSERT INTO project_sequences(project_id, prefix, next_seq)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(project_id) DO UPDATE SET
+                            prefix = excluded.prefix,
+                            next_seq = MAX(project_sequences.next_seq, excluded.next_seq)
+                        """,
+                        (project_id, project_prefix, legacy_active_prefix_next_seq),
+                    )
                 conn.execute("DROP TABLE project_sequences_legacy")
         else:
             conn.execute(
@@ -788,6 +804,32 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str) -> None
             """,
             (project_id,),
         )
+
+        max_task_suffix_row = conn.execute(
+            """
+            SELECT COALESCE(MAX(CAST(substr(id, length(?) + 2) AS INTEGER)), 0) AS max_suffix
+            FROM tasks
+            WHERE project_id = ?
+              AND id LIKE (? || '-%')
+              AND substr(id, length(?) + 2) GLOB '[0-9]*'
+            """,
+            (project_prefix, project_id, project_prefix, project_prefix),
+        ).fetchone()
+        max_task_suffix = int(max_task_suffix_row["max_suffix"]) if max_task_suffix_row is not None else 0
+        sequence_seed = max_task_suffix
+        if legacy_active_prefix_next_seq is not None:
+            sequence_seed = max(sequence_seed, legacy_active_prefix_next_seq)
+        if sequence_seed > 0:
+            conn.execute(
+                """
+                INSERT INTO project_sequences(project_id, prefix, next_seq)
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    prefix = excluded.prefix,
+                    next_seq = MAX(project_sequences.next_seq, excluded.next_seq)
+                """,
+                (project_id, project_prefix, sequence_seed),
+            )
 
         if task_tags_exists:
             task_tags_cols = _table_columns(conn, "task_tags_v35_legacy")
@@ -1729,7 +1771,7 @@ class SqliteTaskStore:
                             # Don't advance current_version; stop processing further
                             break
                         if target_version == 36:
-                            _run_v35_to_v36_migration(conn, self._project_id)
+                            _run_v35_to_v36_migration(conn, self._project_id, self._prefix)
                         elif migration_sql is not None:
                             for stmt in migration_sql.strip().split(";"):
                                 stmt = stmt.strip()
@@ -4174,24 +4216,30 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         if dry_run:
             existing_count = 0
             if shared_db.exists():
-                shared_ro = sqlite3.connect(f"file:{shared_db}?mode=ro", uri=True)
-                shared_ro.row_factory = sqlite3.Row
                 try:
-                    conflicts = _find_conflicts(shared_ro, local_task_rows)
-                    if conflicts:
-                        sample = ", ".join(conflicts[:5])
-                        raise ValueError(
-                            "Conflicting task IDs already exist in shared DB for this project_id: "
-                            f"{sample}. Resolve conflicts before importing."
+                    shared_ro = sqlite3.connect(f"file:{shared_db}?mode=ro", uri=True)
+                    shared_ro.row_factory = sqlite3.Row
+                    try:
+                        conflicts = _find_conflicts(shared_ro, local_task_rows)
+                        if conflicts:
+                            sample = ", ".join(conflicts[:5])
+                            raise ValueError(
+                                "Conflicting task IDs already exist in shared DB for this project_id: "
+                                f"{sample}. Resolve conflicts before importing."
+                            )
+                        existing_count = int(
+                            shared_ro.execute(
+                                "SELECT COUNT(*) FROM tasks WHERE project_id = ?",
+                                (project_id,),
+                            ).fetchone()[0]
                         )
-                    existing_count = int(
-                        shared_ro.execute(
-                            "SELECT COUNT(*) FROM tasks WHERE project_id = ?",
-                            (project_id,),
-                        ).fetchone()[0]
-                    )
-                finally:
-                    shared_ro.close()
+                    finally:
+                        shared_ro.close()
+                except sqlite3.DatabaseError as exc:
+                    raise ValueError(
+                        f"Shared DB at {shared_db} is not initialized or readable: {exc}. "
+                        "Run 'uv run gza migrate' first."
+                    ) from exc
             return {
                 "status": "dry_run",
                 "local_db_path": str(local_db),

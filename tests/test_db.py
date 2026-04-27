@@ -4842,6 +4842,36 @@ class TestSharedDbIsolationAndImportGating:
         assert after_other_last_seen == before_other_last_seen
         assert target_project_count == 0
 
+    def test_import_local_db_dry_run_errors_cleanly_when_shared_db_uninitialized(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        shared_db.parent.mkdir(parents=True, exist_ok=True)
+        shared_db.touch()
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportdryrun03\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--dry-run", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert result.returncode == 1
+        assert "Error: Shared DB at" in result.stderr
+        assert "not initialized or readable" in result.stderr
+        assert "Traceback" not in result.stderr
+
     def test_import_local_db_then_add_task_continues_sequence(self, tmp_path: Path) -> None:
         from gza.config import Config
 
@@ -5219,6 +5249,37 @@ class TestSharedDbIsolationAndImportGating:
         assert ("project_id", "run_id", "step_id") in run_steps_unique_indexes
         assert ("project_id", "step_id", "substep_index") in run_substeps_unique_indexes
         assert ("project_id", "step_id", "substep_id") in run_substeps_unique_indexes
+
+    def test_v35_to_v36_migration_keeps_active_prefix_sequence_continuity(self, tmp_path: Path) -> None:
+        """v35→v36 migration must keep next ID above existing active-prefix task suffixes."""
+        db_path = tmp_path / "test.db"
+        _make_v35_db_with_legacy_key_shapes(db_path)
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DELETE FROM project_sequences")
+            conn.execute("INSERT INTO project_sequences(prefix, next_seq) VALUES ('old', 1)")
+            conn.execute("INSERT INTO project_sequences(prefix, next_seq) VALUES ('gza', 5)")
+            conn.execute(
+                """
+                INSERT INTO tasks (id, prompt, status, task_type, task_id, created_at)
+                VALUES ('gza-5', 'legacy task 5', 'pending', 'implement', '20260427-gza-legacy-task-5', '2024-01-01T00:00:00+00:00')
+                """
+            )
+            conn.commit()
+
+        store = SqliteTaskStore(db_path, prefix="gza", project_id="alpha")
+        created = store.add("post-migration task")
+        assert created.id == "gza-6"
+
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            seq = conn.execute(
+                "SELECT next_seq FROM project_sequences WHERE project_id = ?",
+                ("alpha",),
+            ).fetchone()
+
+        assert seq is not None
+        assert int(seq["next_seq"]) == 6
 
     def test_preview_v25_migration_shows_samples(self, tmp_path: Path) -> None:
         """preview_v25_migration returns correct task_count and sample ID conversions."""
