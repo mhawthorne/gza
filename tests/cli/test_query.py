@@ -2725,17 +2725,20 @@ class TestGroupsCommand:
 
         assert result.returncode == 0
 
-    def test_groups_without_subcommand_shows_help(self, tmp_path: Path):
-        """Bare groups should show help instead of implicitly listing."""
+    def test_groups_without_subcommand_runs_deprecated_list_alias(self, tmp_path: Path):
+        """Bare groups should run deprecated list-alias behavior."""
         setup_config(tmp_path)
-        make_store(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Task 1", tags=("group-a",))
+        store.add("Task 2", tags=("group-b",))
 
         result = run_gza("groups", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "usage:" in result.stdout
-        assert "list" in result.stdout
-        assert "rename" in result.stdout
+        assert "Warning: 'gza groups' is deprecated; use 'gza groups list'." in result.stdout
+        assert "group-a" in result.stdout
+        assert "group-b" in result.stdout
+        assert "usage:" not in result.stdout
 
     def test_groups_warning_references_existing_command(self, tmp_path: Path):
         """Deprecation warning should not point to non-existent commands."""

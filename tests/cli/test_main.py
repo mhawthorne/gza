@@ -247,6 +247,23 @@ class TestHelpOutput:
         assert "as JSON" not in help_text
         assert "| `--prompt` | Print only the fully built prompt text for this task and exit |" in docs_text
 
+    def test_groups_alias_docs_and_dispatch_remain_aligned(self, tmp_path):
+        """`gza groups` docs invocation should match runtime deprecation-alias behavior."""
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        store.add("Grouped task", tags=("release",))
+
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        assert "### groups" in docs_text
+        assert "gza groups" in docs_text
+
+        result = run_gza("groups", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Warning: 'gza groups' is deprecated; use 'gza groups list'." in result.stdout
+        assert "release" in result.stdout
+        assert "usage:" not in result.stdout
+
     def test_search_command_help_mentions_prompt_substring_scope(self, tmp_path):
         """`search --help` should describe prompt-only substring matching."""
         setup_config(tmp_path)

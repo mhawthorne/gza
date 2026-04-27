@@ -2213,9 +2213,6 @@ def main() -> int:
         elif args.command == "import":
             return cmd_import(args)
         elif args.command == "groups":
-            if getattr(args, "groups_action", None) is None:
-                groups_parser.print_help()
-                return 0
             if getattr(args, "groups_action", None) == "rename":
                 return cmd_group_rename(args)
             return cmd_groups(args)
