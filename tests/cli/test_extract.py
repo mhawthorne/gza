@@ -240,6 +240,54 @@ def test_extract_files_from_decode_error_reports_error_without_traceback(tmp_pat
     assert "Traceback" not in result.stderr
 
 
+def test_extract_files_from_directory_reports_error_without_traceback(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    git = _init_repo(tmp_path)
+    source_task = _create_completed_source_task(tmp_path, git)
+
+    paths_dir = tmp_path / "selected-paths"
+    paths_dir.mkdir()
+
+    result = run_gza(
+        "extract",
+        str(source_task.id),
+        "--files-from",
+        str(paths_dir),
+        "--queue",
+        "--project",
+        str(tmp_path),
+    )
+
+    assert result.returncode == 1
+    assert "Error: Unable to read --files-from path" in result.stdout
+    assert "Traceback" not in result.stdout
+    assert "Traceback" not in result.stderr
+
+
+def test_extract_files_from_decode_error_reports_error_without_traceback(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    git = _init_repo(tmp_path)
+    source_task = _create_completed_source_task(tmp_path, git)
+
+    paths_file = tmp_path / "paths.txt"
+    paths_file.write_bytes(b"\xff\xfe")
+
+    result = run_gza(
+        "extract",
+        str(source_task.id),
+        "--files-from",
+        str(paths_file),
+        "--queue",
+        "--project",
+        str(tmp_path),
+    )
+
+    assert result.returncode == 1
+    assert "Error: Unable to read --files-from path" in result.stdout
+    assert "Traceback" not in result.stdout
+    assert "Traceback" not in result.stderr
+
+
 def test_extract_rejects_non_code_source_task(tmp_path: Path) -> None:
     setup_config(tmp_path)
     git = _init_repo(tmp_path)
