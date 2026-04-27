@@ -17,7 +17,9 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
+| `project_id` | String | `default` | Stable project identity used to scope rows inside shared DB mode. |
 | `project_prefix` | String | *(project_name)* | Short prefix for task IDs (1–12 chars, lowercase alphanumeric only — no hyphens, since hyphen is the separator in task IDs like `gza-1234`). Defaults to `project_name`. |
+| `db_path` | String | `~/.gza/gza.db` | Task DB path. If omitted and legacy `.gza/gza.db` exists, Gza keeps using the local DB for compatibility. |
 | `tasks_file` | String | `tasks.yaml` | Path to legacy tasks file |
 | `log_dir` | String | `.gza/logs` | Directory for log files |
 | `use_docker` | Boolean | `true` | Whether to run Claude in Docker container |
@@ -1515,7 +1517,8 @@ Provider credentials (API keys) have their own precedence — see [Dotenv Files]
 | `.env` | Project-specific environment variables |
 | `.gza/.env` | Worktree-level credentials (highest priority; shared via symlink) |
 | `.gza/` | Local state directory (add to `.gitignore`) |
-| `.gza/gza.db` | SQLite task database |
+| `~/.gza/gza.db` | Default shared SQLite task database |
+| `.gza/gza.db` | Legacy project-local DB (still honored when present or when `db_path` points here) |
 | `.gza/logs/` | Task execution logs |
 | `.gza/workers/` | Worker metadata and startup logs |
 | `etc/Dockerfile.claude` | Generated Docker image for Claude |

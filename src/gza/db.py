@@ -11,11 +11,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from gza.resume_policy import RESUMABLE_FAILURE_REASONS, is_resumable_failure_reason
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from gza.config import Config
 
 
 def _launch_editor(cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
@@ -157,8 +160,8 @@ def _backfill_task_tags_from_group(conn: sqlite3.Connection) -> None:
     """Backfill legacy tasks.group values into task_tags."""
     if not _table_exists(conn, "task_tags"):
         return
-    rows = conn.execute('SELECT id, "group" FROM tasks WHERE "group" IS NOT NULL').fetchall()
-    pairs: list[tuple[str, str]] = []
+    rows = conn.execute('SELECT project_id, id, "group" FROM tasks WHERE "group" IS NOT NULL').fetchall()
+    pairs: list[tuple[str, str, str]] = []
     for row in rows:
         group_value = row["group"]
         if group_value is None:
@@ -167,10 +170,11 @@ def _backfill_task_tags_from_group(conn: sqlite3.Connection) -> None:
             normalized = _normalize_tag(str(group_value))
         except ValueError:
             continue
-        pairs.append((str(row["id"]), normalized))
+        project_id = str(row["project_id"]) if "project_id" in row.keys() and row["project_id"] else "default"
+        pairs.append((project_id, str(row["id"]), normalized))
     if pairs:
         conn.executemany(
-            "INSERT OR IGNORE INTO task_tags(task_id, tag) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO task_tags(project_id, task_id, tag) VALUES (?, ?, ?)",
             pairs,
         )
 
@@ -414,8 +418,36 @@ CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_task_tags_task_id ON task_tags(task_id);
 """
 
+# Migration from v35 to v36: shared DB project scoping primitives
+MIGRATION_V35_TO_V36 = """
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    root_path TEXT NOT NULL DEFAULT '',
+    config_path TEXT NOT NULL DEFAULT '',
+    project_name TEXT NOT NULL DEFAULT '',
+    project_prefix TEXT NOT NULL DEFAULT '',
+    db_layout_version INTEGER NOT NULL DEFAULT 36,
+    created_at TEXT NOT NULL DEFAULT '',
+    last_seen_at TEXT NOT NULL DEFAULT ''
+);
+ALTER TABLE tasks ADD COLUMN project_id TEXT;
+CREATE TABLE IF NOT EXISTS project_sequences (
+    prefix TEXT PRIMARY KEY,
+    next_seq INTEGER NOT NULL DEFAULT 1
+);
+ALTER TABLE project_sequences RENAME TO project_sequences_legacy;
+CREATE TABLE IF NOT EXISTS project_sequences (
+    project_id TEXT PRIMARY KEY,
+    prefix TEXT NOT NULL,
+    next_seq INTEGER NOT NULL DEFAULT 1
+);
+INSERT OR IGNORE INTO project_sequences(project_id, prefix, next_seq)
+SELECT 'default', prefix, next_seq FROM project_sequences_legacy;
+DROP TABLE IF EXISTS project_sequences_legacy;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 35
+SCHEMA_VERSION = 36
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -589,9 +621,18 @@ def _ensure_required_auto_migration_artifacts(
         (31, "tasks", "base_branch", "ALTER TABLE tasks ADD COLUMN base_branch TEXT"),
         (33, "tasks", "review_score", "ALTER TABLE tasks ADD COLUMN review_score INTEGER"),
         (34, "tasks", "queue_position", "ALTER TABLE tasks ADD COLUMN queue_position INTEGER"),
+        (36, "tasks", "project_id", "ALTER TABLE tasks ADD COLUMN project_id TEXT"),
+        (36, "run_steps", "project_id", "ALTER TABLE run_steps ADD COLUMN project_id TEXT"),
+        (36, "run_substeps", "project_id", "ALTER TABLE run_substeps ADD COLUMN project_id TEXT"),
+        (36, "task_comments", "project_id", "ALTER TABLE task_comments ADD COLUMN project_id TEXT"),
+        (36, "task_tags", "project_id", "ALTER TABLE task_tags ADD COLUMN project_id TEXT"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
+            continue
+        if min_version >= 36 and not _table_exists(conn, table):
+            # Older synthetic schemas used in tests may not have all optional
+            # child tables; do not fail v36 repair for those shapes.
             continue
         if _table_has_column(conn, table, column):
             continue
@@ -611,19 +652,53 @@ def _ensure_required_auto_migration_artifacts(
                 "Schema integrity check failed while repairing required table task_tags: "
                 "use a writable database."
             ) from exc
+    if target_version >= 36 and not _table_exists(conn, "projects"):
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY,
+                    root_path TEXT NOT NULL DEFAULT '',
+                    config_path TEXT NOT NULL DEFAULT '',
+                    project_name TEXT NOT NULL DEFAULT '',
+                    project_prefix TEXT NOT NULL DEFAULT '',
+                    db_layout_version INTEGER NOT NULL DEFAULT 36,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    last_seen_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+        except sqlite3.OperationalError as exc:
+            raise SchemaIntegrityError(
+                "Schema integrity check failed while repairing required table projects: "
+                "use a writable database."
+            ) from exc
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
 );
 
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    root_path TEXT NOT NULL,
+    config_path TEXT NOT NULL,
+    project_name TEXT NOT NULL,
+    project_prefix TEXT NOT NULL,
+    db_layout_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS project_sequences (
-    prefix TEXT PRIMARY KEY,
+    project_id TEXT PRIMARY KEY,
+    prefix TEXT NOT NULL,
     next_seq INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
-    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    id TEXT NOT NULL,
     prompt TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     task_type TEXT NOT NULL DEFAULT 'implement',
@@ -631,7 +706,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     branch TEXT,
     log_file TEXT,
     report_file TEXT,
-    based_on TEXT REFERENCES tasks(id),
+    based_on TEXT,
     has_commits INTEGER,
     duration_seconds REAL,
     num_steps_reported INTEGER,
@@ -648,7 +723,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed_at TEXT,
     -- Task import/chaining (v2+)
     "group" TEXT,
-    depends_on TEXT REFERENCES tasks(id),
+    depends_on TEXT,
     spec TEXT,
     create_review INTEGER DEFAULT 0,
     same_branch INTEGER DEFAULT 0,
@@ -675,27 +750,31 @@ CREATE TABLE IF NOT EXISTS tasks (
     review_score INTEGER,
     log_schema_version INTEGER DEFAULT 1,
     execution_mode TEXT,
-    base_branch TEXT
+    base_branch TEXT,
+    PRIMARY KEY(project_id, id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-CREATE INDEX IF NOT EXISTS idx_tasks_slug ON tasks(slug);
-CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
-CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks("group");
-CREATE INDEX IF NOT EXISTS idx_tasks_depends_on ON tasks(depends_on);
-CREATE INDEX IF NOT EXISTS idx_tasks_merge_status ON tasks(merge_status);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_slug ON tasks(project_id, slug);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_created ON tasks(project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_group ON tasks(project_id, "group");
+CREATE INDEX IF NOT EXISTS idx_tasks_project_depends_on ON tasks(project_id, depends_on);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_merge_status ON tasks(project_id, merge_status);
 
 CREATE TABLE IF NOT EXISTS task_tags (
-    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
     tag TEXT NOT NULL,
-    PRIMARY KEY(task_id, tag)
+    PRIMARY KEY(project_id, task_id, tag),
+    FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tag);
-CREATE INDEX IF NOT EXISTS idx_task_tags_task_id ON task_tags(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_tags_project_tag ON task_tags(project_id, tag);
+CREATE INDEX IF NOT EXISTS idx_task_tags_project_task_id ON task_tags(project_id, task_id);
 
 CREATE TABLE IF NOT EXISTS run_steps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL REFERENCES tasks(id),
+    project_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
     step_index INTEGER NOT NULL,
     step_id TEXT NOT NULL,
     provider TEXT NOT NULL,
@@ -707,14 +786,16 @@ CREATE TABLE IF NOT EXISTS run_steps (
     summary TEXT,
     legacy_turn_id TEXT,
     legacy_event_id TEXT,
-    UNIQUE(run_id, step_index),
-    UNIQUE(run_id, step_id)
+    UNIQUE(project_id, run_id, step_index),
+    UNIQUE(project_id, run_id, step_id),
+    FOREIGN KEY(project_id, run_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS run_substeps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL REFERENCES tasks(id),
-    step_id INTEGER NOT NULL REFERENCES run_steps(id),
+    project_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    step_id INTEGER NOT NULL REFERENCES run_steps(id) ON DELETE CASCADE,
     substep_index INTEGER NOT NULL,
     substep_id TEXT NOT NULL,
     type TEXT NOT NULL,
@@ -724,27 +805,30 @@ CREATE TABLE IF NOT EXISTS run_substeps (
     timestamp TEXT NOT NULL,
     legacy_turn_id TEXT,
     legacy_event_id TEXT,
-    UNIQUE(step_id, substep_index),
-    UNIQUE(step_id, substep_id)
+    UNIQUE(project_id, step_id, substep_index),
+    UNIQUE(project_id, step_id, substep_id),
+    FOREIGN KEY(project_id, run_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_run_steps_run_id ON run_steps(run_id);
-CREATE INDEX IF NOT EXISTS idx_run_steps_step_index ON run_steps(run_id, step_index);
-CREATE INDEX IF NOT EXISTS idx_run_substeps_run_id ON run_substeps(run_id);
-CREATE INDEX IF NOT EXISTS idx_run_substeps_step_id ON run_substeps(step_id);
+CREATE INDEX IF NOT EXISTS idx_run_steps_project_run_id ON run_steps(project_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_run_steps_project_step_index ON run_steps(project_id, run_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_run_substeps_project_run_id ON run_substeps(project_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_run_substeps_project_step_id ON run_substeps(project_id, step_id);
 
-CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_type_based_on ON tasks(project_id, task_type, based_on);
 CREATE TABLE IF NOT EXISTS task_comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
     content TEXT NOT NULL,
     source TEXT NOT NULL,
     author TEXT,
     created_at TEXT NOT NULL,
-    resolved_at TEXT
+    resolved_at TEXT,
+    FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_task_comments_task_created ON task_comments(task_id, created_at ASC);
-CREATE INDEX IF NOT EXISTS idx_task_comments_task_unresolved ON task_comments(task_id, resolved_at);
+CREATE INDEX IF NOT EXISTS idx_task_comments_project_task_created ON task_comments(project_id, task_id, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_task_comments_project_task_unresolved ON task_comments(project_id, task_id, resolved_at);
 """
 
 # Migration from v1 to v2
@@ -1027,16 +1111,31 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (33, MIGRATION_V32_TO_V33),
     (34, MIGRATION_V33_TO_V34),
     (35, MIGRATION_V34_TO_V35),
+    (36, MIGRATION_V35_TO_V36),
 ]
 
 
 class SqliteTaskStore:
     """SQLite-based task storage."""
 
-    def __init__(self, db_path: Path, prefix: str = "gza"):
+    def __init__(
+        self,
+        db_path: Path,
+        prefix: str = "gza",
+        project_id: str | None = None,
+        *,
+        project_root: Path | None = None,
+        config_path: Path | None = None,
+        project_name: str | None = None,
+    ):
         self.db_path = db_path
         self._prefix = prefix
+        self._project_id = project_id or "default"
+        self._project_root = project_root
+        self._config_path = config_path
+        self._project_name = project_name
         self._ensure_db()
+        self._ensure_project_row()
 
     @classmethod
     def default(cls, project_dir: Path | None = None) -> "SqliteTaskStore":
@@ -1047,8 +1146,36 @@ class SqliteTaskStore:
         """
         from .config import Config
 
-        config = Config.load(project_dir or Path.cwd())
-        return cls(config.db_path, prefix=config.project_prefix)
+        config = Config.load(project_dir or Path.cwd(), discover=True)
+        return cls.from_config(config)
+
+    @classmethod
+    def from_config(cls, config: "Config") -> "SqliteTaskStore":
+        """Create a store from a loaded Config instance."""
+        project_id = getattr(config, "project_id", None)
+        if not isinstance(project_id, str) or not project_id:
+            project_id = "default"
+        project_prefix = getattr(config, "project_prefix", "gza")
+        if not isinstance(project_prefix, str) or not project_prefix:
+            project_prefix = "gza"
+        project_dir = getattr(config, "project_dir", None)
+        config_path = getattr(config, "config_path", None)
+        resolved_config_path = (
+            config_path(project_dir)
+            if callable(config_path) and isinstance(project_dir, Path)
+            else None
+        )
+        project_name = getattr(config, "project_name", None)
+        if not isinstance(project_name, str):
+            project_name = None
+        return cls(
+            config.db_path,
+            prefix=project_prefix,
+            project_id=project_id,
+            project_root=project_dir if isinstance(project_dir, Path) else None,
+            config_path=resolved_config_path,
+            project_name=project_name,
+        )
 
     def _ensure_db(self) -> None:
         """Ensure database exists and schema is current.
@@ -1103,20 +1230,83 @@ class SqliteTaskStore:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
 
             _backfill_task_tags_from_group(conn)
+            def _safe_project_backfill(sql: str) -> None:
+                try:
+                    conn.execute(sql, (self._project_id,))
+                except sqlite3.OperationalError as exc:
+                    if "readonly" not in str(exc).lower():
+                        raise
+
+            if _table_has_column(conn, "tasks", "project_id"):
+                _safe_project_backfill(
+                    "UPDATE tasks SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+                )
+            if _table_has_column(conn, "run_steps", "project_id"):
+                _safe_project_backfill(
+                    "UPDATE run_steps SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+                )
+            if _table_has_column(conn, "run_substeps", "project_id"):
+                _safe_project_backfill(
+                    "UPDATE run_substeps SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+                )
+            if _table_has_column(conn, "task_comments", "project_id"):
+                _safe_project_backfill(
+                    "UPDATE task_comments SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+                )
+            if _table_has_column(conn, "task_tags", "project_id"):
+                _safe_project_backfill(
+                    "UPDATE task_tags SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+                )
 
             # Repair required artifacts for current schemas when external damage
             # or partial migrations removed them.
             _ensure_required_auto_migration_artifacts(conn, target_version=SCHEMA_VERSION)
+
+    def _ensure_project_row(self) -> None:
+        """Ensure the current project is registered in the shared DB."""
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO projects (
+                        id, root_path, config_path, project_name, project_prefix, db_layout_version, created_at, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        root_path = excluded.root_path,
+                        config_path = excluded.config_path,
+                        project_name = excluded.project_name,
+                        project_prefix = excluded.project_prefix,
+                        db_layout_version = excluded.db_layout_version,
+                        last_seen_at = excluded.last_seen_at
+                    """,
+                    (
+                        self._project_id,
+                        str(self._project_root.resolve()) if self._project_root else "",
+                        str(self._config_path.resolve()) if self._config_path else "",
+                        self._project_name or self._prefix,
+                        self._prefix,
+                        SCHEMA_VERSION,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.OperationalError as exc:
+                if "readonly" not in str(exc).lower():
+                    raise
 
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection with auto-commit."""
         conn = sqlite3.connect(
             self.db_path,
             isolation_level=None,
-            timeout=5,
+            timeout=15,
             factory=_ClosingSqliteConnection,
         )
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def _row_to_task(self, row: sqlite3.Row, *, tags: tuple[str, ...] = ()) -> Task:
@@ -1197,10 +1387,11 @@ class SqliteTaskStore:
             f"""
             SELECT task_id, tag
             FROM task_tags
-            WHERE task_id IN ({placeholders})
+            WHERE project_id = ?
+              AND task_id IN ({placeholders})
             ORDER BY task_id ASC, tag ASC
             """,
-            tuple(ids),
+            (self._project_id, *ids),
         )
         by_task: dict[str, list[str]] = {}
         for row in cur.fetchall():
@@ -1223,11 +1414,14 @@ class SqliteTaskStore:
 
     def _replace_task_tags_conn(self, conn: sqlite3.Connection, task_id: str, tags: tuple[str, ...]) -> None:
         """Replace all tags for a task inside an open transaction."""
-        conn.execute("DELETE FROM task_tags WHERE task_id = ?", (task_id,))
+        conn.execute(
+            "DELETE FROM task_tags WHERE project_id = ? AND task_id = ?",
+            (self._project_id, task_id),
+        )
         if tags:
             conn.executemany(
-                "INSERT INTO task_tags(task_id, tag) VALUES (?, ?)",
-                [(task_id, tag) for tag in tags],
+                "INSERT INTO task_tags(project_id, task_id, tag) VALUES (?, ?, ?)",
+                [(self._project_id, task_id, tag) for tag in tags],
             )
 
     def _row_to_run_step(self, row: sqlite3.Row) -> RunStep:
@@ -1298,10 +1492,10 @@ class SqliteTaskStore:
         # value. After v25/v26 migrations the row is seeded to preserve continuity, so
         # the first post-migration task gets max_old_int_id + 1.
         cur = conn.execute(
-            "INSERT INTO project_sequences (prefix, next_seq) VALUES (?, 1) "
-            "ON CONFLICT(prefix) DO UPDATE SET next_seq = next_seq + 1 "
+            "INSERT INTO project_sequences (project_id, prefix, next_seq) VALUES (?, ?, 1) "
+            "ON CONFLICT(project_id) DO UPDATE SET next_seq = next_seq + 1, prefix = excluded.prefix "
             "RETURNING next_seq",
-            (self._prefix,),
+            (self._project_id, self._prefix),
         )
         seq = int(cur.fetchone()["next_seq"])
         return f"{self._prefix}-{seq}"
@@ -1337,10 +1531,11 @@ class SqliteTaskStore:
             new_id = self._next_id(conn)
             conn.execute(
                 """
-                INSERT INTO tasks (id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, urgent, skip_learnings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, urgent, skip_learnings)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    self._project_id,
                     new_id,
                     prompt,
                     task_type,
@@ -1361,14 +1556,20 @@ class SqliteTaskStore:
                 ),
             )
             self._replace_task_tags_conn(conn, new_id, normalized_tags)
-            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (new_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, new_id),
+            ).fetchone()
             assert row is not None
             return self._rows_to_tasks(conn, [row])[0]
 
     def get(self, task_id: str) -> Task | None:
         """Get a task by its string ID (e.g. 'gza-1234')."""
         with self._connect() as conn:
-            cur = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+            cur = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
+            )
             row = cur.fetchone()
             if row is None:
                 return None
@@ -1403,13 +1604,14 @@ class SqliteTaskStore:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE id LIKE (? || '-%')
+                WHERE project_id = ?
+                  AND id LIKE (? || '-%')
                   AND substr(id, length(?) + 2) GLOB '[0-9]*'
                   AND CAST(substr(id, length(?) + 2) AS INTEGER) > ?
                 ORDER BY CAST(substr(id, length(?) + 2) AS INTEGER) ASC
                 LIMIT 1
                 """,
-                (prefix, prefix, prefix, seq, prefix),
+                (self._project_id, prefix, prefix, prefix, seq, prefix),
             )
             row = cur.fetchone()
             if row is None:
@@ -1419,7 +1621,10 @@ class SqliteTaskStore:
     def get_by_slug(self, slug: str) -> Task | None:
         """Get a task by slug (YYYYMMDD-... format, stored in the 'slug' DB column)."""
         with self._connect() as conn:
-            cur = conn.execute("SELECT * FROM tasks WHERE slug = ?", (slug,))
+            cur = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND slug = ?",
+                (self._project_id, slug),
+            )
             row = cur.fetchone()
             if row is None:
                 return None
@@ -1483,7 +1688,7 @@ class SqliteTaskStore:
                     review_score = ?,
                     log_schema_version = ?,
                     execution_mode = ?
-                WHERE id = ?
+                WHERE project_id = ? AND id = ?
                 """,
                 (
                     task.prompt,
@@ -1534,6 +1739,7 @@ class SqliteTaskStore:
                     task.review_score,
                     task.log_schema_version,
                     task.execution_mode,
+                    self._project_id,
                     task.id,
                 ),
             )
@@ -1543,7 +1749,10 @@ class SqliteTaskStore:
     def delete(self, task_id: str) -> bool:
         """Delete a task by ID. Returns True if deleted."""
         with self._connect() as conn:
-            cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            cur = conn.execute(
+                "DELETE FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
+            )
             return cur.rowcount > 0
 
     # === Query methods ===
@@ -1585,14 +1794,15 @@ class SqliteTaskStore:
         with self._connect() as conn:
             query = """
                 WITH RECURSIVE successful_ancestors(id) AS (
-                    SELECT id FROM tasks WHERE status = 'completed'
+                    SELECT id FROM tasks WHERE project_id = ? AND status = 'completed'
                     UNION ALL
                     SELECT t2.based_on FROM tasks t2
                     JOIN successful_ancestors sa ON t2.id = sa.id
-                    WHERE t2.based_on IS NOT NULL
+                    WHERE t2.project_id = ? AND t2.based_on IS NOT NULL
                 )
                 SELECT t.* FROM tasks t
-                WHERE t.status = 'pending'
+                WHERE t.project_id = ?
+                AND t.status = 'pending'
                 AND t.task_type != 'internal'
                 AND (
                     t.depends_on IS NULL
@@ -1605,20 +1815,20 @@ class SqliteTaskStore:
                     COALESCE(t.urgent_bumped_at, '') DESC,
                     t.created_at ASC
                 """
-            params: list[str | int | None] = []
+            params: list[str | int | None] = [self._project_id, self._project_id, self._project_id]
             if normalized_tags:
                 placeholders = ",".join("?" for _ in normalized_tags)
                 if any_tag:
                     query = query.replace(
                         "AND (",
-                        f"AND EXISTS (SELECT 1 FROM task_tags tt WHERE tt.task_id = t.id AND tt.tag IN ({placeholders}))\nAND (",
+                        f"AND EXISTS (SELECT 1 FROM task_tags tt WHERE tt.project_id = t.project_id AND tt.task_id = t.id AND tt.tag IN ({placeholders}))\nAND (",
                         1,
                     )
                     params.extend(normalized_tags)
                 else:
                     query = query.replace(
                         "AND (",
-                        f"AND (SELECT COUNT(DISTINCT tt.tag) FROM task_tags tt WHERE tt.task_id = t.id AND tt.tag IN ({placeholders})) = ?\nAND (",
+                        f"AND (SELECT COUNT(DISTINCT tt.tag) FROM task_tags tt WHERE tt.project_id = t.project_id AND tt.task_id = t.id AND tt.tag IN ({placeholders})) = ?\nAND (",
                         1,
                     )
                     params.extend(normalized_tags)
@@ -1646,9 +1856,9 @@ class SqliteTaskStore:
                         completed_at = NULL,
                         failure_reason = NULL,
                         running_pid = ?
-                    WHERE id = ? AND status = 'pending'
+                    WHERE project_id = ? AND id = ? AND status = 'pending'
                     """,
-                    (started_at.isoformat(), pid, task_id),
+                    (started_at.isoformat(), pid, self._project_id, task_id),
                 )
                 if cur.rowcount == 0:
                     return None
@@ -1674,7 +1884,7 @@ class SqliteTaskStore:
             normalized_tags = _normalize_tags((group,))
         with self._connect() as conn:
             query = (
-                "SELECT t.* FROM tasks t WHERE t.status = 'pending' "
+                "SELECT t.* FROM tasks t WHERE t.project_id = ? AND t.status = 'pending' "
                 "ORDER BY "
                 "CASE WHEN queue_position IS NULL THEN 1 ELSE 0 END, "
                 "COALESCE(queue_position, 0) ASC, "
@@ -1682,20 +1892,20 @@ class SqliteTaskStore:
                 "COALESCE(urgent_bumped_at, '') DESC, "
                 "created_at ASC"
             )
-            params: list[str | int | None] = []
+            params: list[str | int | None] = [self._project_id]
             if normalized_tags:
                 placeholders = ",".join("?" for _ in normalized_tags)
                 if any_tag:
                     query = query.replace(
                         "ORDER BY",
-                        f"AND EXISTS (SELECT 1 FROM task_tags tt WHERE tt.task_id = t.id AND tt.tag IN ({placeholders})) ORDER BY",
+                        f"AND EXISTS (SELECT 1 FROM task_tags tt WHERE tt.project_id = t.project_id AND tt.task_id = t.id AND tt.tag IN ({placeholders})) ORDER BY",
                         1,
                     )
                     params.extend(normalized_tags)
                 else:
                     query = query.replace(
                         "ORDER BY",
-                        f"AND (SELECT COUNT(DISTINCT tt.tag) FROM task_tags tt WHERE tt.task_id = t.id AND tt.tag IN ({placeholders})) = ? ORDER BY",
+                        f"AND (SELECT COUNT(DISTINCT tt.tag) FROM task_tags tt WHERE tt.project_id = t.project_id AND tt.task_id = t.id AND tt.tag IN ({placeholders})) = ? ORDER BY",
                         1,
                     )
                     params.extend(normalized_tags)
@@ -1715,8 +1925,8 @@ class SqliteTaskStore:
         bumped_at = datetime.now(UTC).isoformat() if urgent else None
         with self._connect() as conn:
             cur = conn.execute(
-                "UPDATE tasks SET urgent = ?, urgent_bumped_at = ? WHERE id = ?",
-                (1 if urgent else 0, bumped_at, task_id),
+                "UPDATE tasks SET urgent = ?, urgent_bumped_at = ? WHERE project_id = ? AND id = ?",
+                (1 if urgent else 0, bumped_at, self._project_id, task_id),
             )
             return cur.rowcount > 0
 
@@ -1731,8 +1941,8 @@ class SqliteTaskStore:
 
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT id, queue_position FROM tasks WHERE id = ?",
-                (task_id,),
+                "SELECT id, queue_position FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
             ).fetchone()
             if row is None:
                 return False
@@ -1800,8 +2010,8 @@ class SqliteTaskStore:
                     )
 
             cur = conn.execute(
-                "UPDATE tasks SET queue_position = ? WHERE id = ?",
-                (desired_position, task_id),
+                "UPDATE tasks SET queue_position = ? WHERE project_id = ? AND id = ?",
+                (desired_position, self._project_id, task_id),
             )
             return cur.rowcount > 0
 
@@ -1809,8 +2019,8 @@ class SqliteTaskStore:
         """Clear explicit queue ordering and close the bucket gap if needed."""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT id, queue_position FROM tasks WHERE id = ?",
-                (task_id,),
+                "SELECT id, queue_position FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
             ).fetchone()
             if row is None:
                 return False
@@ -1819,8 +2029,8 @@ class SqliteTaskStore:
                 return True
             bucket_predicate, bucket_params = self._queue_bucket_predicate_and_params_conn(conn, task_id)
             conn.execute(
-                "UPDATE tasks SET queue_position = NULL WHERE id = ?",
-                (task_id,),
+                "UPDATE tasks SET queue_position = NULL WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
             )
             conn.execute(
                 f"""
@@ -1847,14 +2057,14 @@ class SqliteTaskStore:
         tags = self._fetch_tags_for_task_ids(conn, (task_id,)).get(task_id, ())
         if not tags:
             return (
-                "NOT EXISTS (SELECT 1 FROM task_tags qbt WHERE qbt.task_id = tasks.id)",
+                "NOT EXISTS (SELECT 1 FROM task_tags qbt WHERE qbt.project_id = tasks.project_id AND qbt.task_id = tasks.id)",
                 (),
             )
 
         placeholders = ",".join("?" for _ in tags)
         predicate = (
-            "(SELECT COUNT(*) FROM task_tags qbt WHERE qbt.task_id = tasks.id) = ? "
-            f"AND (SELECT COUNT(*) FROM task_tags qbt WHERE qbt.task_id = tasks.id AND qbt.tag IN ({placeholders})) = ?"
+            "(SELECT COUNT(*) FROM task_tags qbt WHERE qbt.project_id = tasks.project_id AND qbt.task_id = tasks.id) = ? "
+            f"AND (SELECT COUNT(*) FROM task_tags qbt WHERE qbt.project_id = tasks.project_id AND qbt.task_id = tasks.id AND qbt.tag IN ({placeholders})) = ?"
         )
         params: tuple[str | int, ...] = (len(tags), *tags, len(tags))
         return predicate, params
@@ -1863,7 +2073,8 @@ class SqliteTaskStore:
         """Get all in-progress tasks, oldest first."""
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT * FROM tasks WHERE status = 'in_progress' ORDER BY started_at ASC, created_at ASC"
+                "SELECT * FROM tasks WHERE project_id = ? AND status = 'in_progress' ORDER BY started_at ASC, created_at ASC",
+                (self._project_id,),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -1891,8 +2102,8 @@ class SqliteTaskStore:
         """
         with self._connect() as conn:
             # Build WHERE clause based on status and task_type filters
-            where_clauses = []
-            params = []
+            where_clauses = ["project_id = ?"]
+            params = [self._project_id]
 
             if status == "unmerged":
                 # Unmerged tasks: either merge_status='unmerged' (current) or
@@ -1952,8 +2163,8 @@ class SqliteTaskStore:
         """Return tasks where based_on = task_id (direct lineage descendants)."""
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT * FROM tasks WHERE based_on = ? ORDER BY created_at ASC",
-                (task_id,),
+                "SELECT * FROM tasks WHERE project_id = ? AND based_on = ? ORDER BY created_at ASC",
+                (self._project_id, task_id),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -1963,10 +2174,10 @@ class SqliteTaskStore:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE based_on = ? AND task_type = ?
+                WHERE project_id = ? AND based_on = ? AND task_type = ?
                 ORDER BY created_at ASC
                 """,
-                (task_id, task_type),
+                (self._project_id, task_id, task_type),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -1979,10 +2190,10 @@ class SqliteTaskStore:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE based_on = ? OR depends_on = ?
+                WHERE project_id = ? AND (based_on = ? OR depends_on = ?)
                 ORDER BY created_at ASC
                 """,
-                (task_id, task_id),
+                (self._project_id, task_id, task_id),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -2000,12 +2211,12 @@ class SqliteTaskStore:
             cur = conn.execute(
                 f"""
                 SELECT * FROM tasks
-                WHERE status = 'failed'
+                WHERE project_id = ? AND status = 'failed'
                 AND failure_reason IN ({placeholders})
                 AND session_id IS NOT NULL
                 ORDER BY completed_at DESC, created_at DESC
                 """,
-                resumable_reasons,
+                (self._project_id, *resumable_reasons),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -2026,8 +2237,8 @@ class SqliteTaskStore:
         # Start from the parent (based_on of task_id)
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT based_on FROM tasks WHERE id = ?",
-                (task_id,),
+                "SELECT based_on FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
             )
             row = cur.fetchone()
             if row is None:
@@ -2040,8 +2251,8 @@ class SqliteTaskStore:
                     break  # Cycle detected
                 seen_ids.add(current_id)
                 cur = conn.execute(
-                    "SELECT based_on, status, failure_reason FROM tasks WHERE id = ?",
-                    (current_id,),
+                    "SELECT based_on, status, failure_reason FROM tasks WHERE project_id = ? AND id = ?",
+                    (self._project_id, current_id),
                 )
                 row = cur.fetchone()
                 if row is None:
@@ -2060,12 +2271,13 @@ class SqliteTaskStore:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE status = 'completed'
+                WHERE project_id = ?
+                  AND status = 'completed'
                   AND task_type != 'internal'
                 ORDER BY completed_at DESC, created_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (self._project_id, limit),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -2080,13 +2292,15 @@ class SqliteTaskStore:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE merge_status = 'unmerged'
+                WHERE project_id = ?
+                AND merge_status = 'unmerged'
                 AND (
                     task_type NOT IN ('improve', 'rebase', 'fix')
                     OR based_on IS NULL
                 )
                 ORDER BY completed_at DESC
-                """
+                """,
+                (self._project_id,),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -2095,8 +2309,8 @@ class SqliteTaskStore:
         merged_at = datetime.now(UTC).isoformat() if merge_status == "merged" else None
         with self._connect() as conn:
             conn.execute(
-                "UPDATE tasks SET merge_status = ?, merged_at = ? WHERE id = ?",
-                (merge_status, merged_at, task_id),
+                "UPDATE tasks SET merge_status = ?, merged_at = ? WHERE project_id = ? AND id = ?",
+                (merge_status, merged_at, self._project_id, task_id),
             )
 
     def clear_review_state(self, task_id: str) -> None:
@@ -2114,8 +2328,8 @@ class SqliteTaskStore:
         now = datetime.now(UTC).isoformat()
         with self._connect() as conn:
             conn.execute(
-                "UPDATE tasks SET review_cleared_at = ? WHERE id = ?",
-                (now, task_id),
+                "UPDATE tasks SET review_cleared_at = ? WHERE project_id = ? AND id = ?",
+                (now, self._project_id, task_id),
             )
 
     def invalidate_review_state(self, task_id: str) -> None:
@@ -2129,16 +2343,16 @@ class SqliteTaskStore:
         """
         with self._connect() as conn:
             conn.execute(
-                "UPDATE tasks SET review_cleared_at = NULL WHERE id = ?",
-                (task_id,),
+                "UPDATE tasks SET review_cleared_at = NULL WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
             )
 
     def set_log_schema_version(self, task_id: str, version: int) -> None:
         """Set the persisted log schema marker for a task/run."""
         with self._connect() as conn:
             conn.execute(
-                "UPDATE tasks SET log_schema_version = ? WHERE id = ?",
-                (version, task_id),
+                "UPDATE tasks SET log_schema_version = ? WHERE project_id = ? AND id = ?",
+                (version, self._project_id, task_id),
             )
 
     def set_execution_mode(self, task_id: str, mode: str | None) -> None:
@@ -2147,8 +2361,8 @@ class SqliteTaskStore:
             raise ValueError(f"Unknown execution mode: {mode}")
         with self._connect() as conn:
             conn.execute(
-                "UPDATE tasks SET execution_mode = ? WHERE id = ?",
-                (mode, task_id),
+                "UPDATE tasks SET execution_mode = ? WHERE project_id = ? AND id = ?",
+                (mode, self._project_id, task_id),
             )
 
     # === Run step/substep persistence ===
@@ -2168,20 +2382,21 @@ class SqliteTaskStore:
         timestamp = (started_at or datetime.now(UTC)).isoformat()
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT COALESCE(MAX(step_index), 0) + 1 AS next_step FROM run_steps WHERE run_id = ?",
-                (run_id,),
+                "SELECT COALESCE(MAX(step_index), 0) + 1 AS next_step FROM run_steps WHERE project_id = ? AND run_id = ?",
+                (self._project_id, run_id),
             )
             next_step = int(cur.fetchone()["next_step"])
             step_label = f"S{next_step}"
             cur = conn.execute(
                 """
                 INSERT INTO run_steps (
-                    run_id, step_index, step_id, provider, message_role,
+                    project_id, run_id, step_index, step_id, provider, message_role,
                     message_text, started_at, legacy_turn_id, legacy_event_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    self._project_id,
                     run_id,
                     next_step,
                     step_label,
@@ -2214,8 +2429,8 @@ class SqliteTaskStore:
         payload_json = json.dumps(payload)
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT run_id, step_index, step_id FROM run_steps WHERE id = ?",
-                (step_ref.id,),
+                "SELECT run_id, step_index, step_id FROM run_steps WHERE project_id = ? AND id = ?",
+                (self._project_id, step_ref.id),
             )
             row = cur.fetchone()
             if row is None:
@@ -2234,20 +2449,21 @@ class SqliteTaskStore:
                 )
 
             cur = conn.execute(
-                "SELECT COALESCE(MAX(substep_index), 0) + 1 AS next_substep FROM run_substeps WHERE step_id = ?",
-                (step_ref.id,),
+                "SELECT COALESCE(MAX(substep_index), 0) + 1 AS next_substep FROM run_substeps WHERE project_id = ? AND step_id = ?",
+                (self._project_id, step_ref.id),
             )
             next_substep = int(cur.fetchone()["next_substep"])
             substep_label = f"{step_ref.step_id}.{next_substep}"
             cur = conn.execute(
                 """
                 INSERT INTO run_substeps (
-                    run_id, step_id, substep_index, substep_id, type, source, call_id,
+                    project_id, run_id, step_id, substep_index, substep_id, type, source, call_id,
                     payload_json, timestamp, legacy_turn_id, legacy_event_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    self._project_id,
                     step_ref.run_id,
                     step_ref.id,
                     next_substep,
@@ -2263,7 +2479,10 @@ class SqliteTaskStore:
             )
             substep_row_id = cur.lastrowid
             assert substep_row_id is not None
-            row = conn.execute("SELECT * FROM run_substeps WHERE id = ?", (substep_row_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM run_substeps WHERE project_id = ? AND id = ?",
+                (self._project_id, substep_row_id),
+            ).fetchone()
             assert row is not None
             return self._row_to_run_substep(row)
 
@@ -2279,8 +2498,8 @@ class SqliteTaskStore:
         ts = (completed_at or datetime.now(UTC)).isoformat()
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT run_id, step_index, step_id FROM run_steps WHERE id = ?",
-                (step_ref.id,),
+                "SELECT run_id, step_index, step_id FROM run_steps WHERE project_id = ? AND id = ?",
+                (self._project_id, step_ref.id),
             )
             row = cur.fetchone()
             if row is None:
@@ -2302,9 +2521,9 @@ class SqliteTaskStore:
                 """
                 UPDATE run_steps
                 SET completed_at = ?, outcome = ?, summary = ?
-                WHERE id = ?
+                WHERE project_id = ? AND id = ?
                 """,
-                (ts, outcome, summary, step_ref.id),
+                (ts, outcome, summary, self._project_id, step_ref.id),
             )
             if cur.rowcount == 0:
                 raise ValueError(f"Unknown step reference: {step_ref.id}")
@@ -2313,8 +2532,8 @@ class SqliteTaskStore:
         """Count the number of run_steps rows for a given run_id."""
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT COUNT(*) AS cnt FROM run_steps WHERE run_id = ?",
-                (run_id,),
+                "SELECT COUNT(*) AS cnt FROM run_steps WHERE project_id = ? AND run_id = ?",
+                (self._project_id, run_id),
             )
             row = cur.fetchone()
             return int(row["cnt"]) if row else 0
@@ -2323,8 +2542,8 @@ class SqliteTaskStore:
         """Get all stored run steps for a run, ordered by step index."""
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT * FROM run_steps WHERE run_id = ? ORDER BY step_index ASC",
-                (run_id,),
+                "SELECT * FROM run_steps WHERE project_id = ? AND run_id = ? ORDER BY step_index ASC",
+                (self._project_id, run_id),
             )
             return [self._row_to_run_step(row) for row in cur.fetchall()]
 
@@ -2332,8 +2551,8 @@ class SqliteTaskStore:
         """Get all stored substeps for a step, ordered by substep index."""
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT run_id, step_index, step_id FROM run_steps WHERE id = ?",
-                (step_ref.id,),
+                "SELECT run_id, step_index, step_id FROM run_steps WHERE project_id = ? AND id = ?",
+                (self._project_id, step_ref.id),
             )
             row = cur.fetchone()
             if row is None:
@@ -2354,17 +2573,20 @@ class SqliteTaskStore:
             cur = conn.execute(
                 """
                 SELECT * FROM run_substeps
-                WHERE run_id = ? AND step_id = ?
+                WHERE project_id = ? AND run_id = ? AND step_id = ?
                 ORDER BY substep_index ASC
                 """,
-                (step_ref.run_id, step_ref.id),
+                (self._project_id, step_ref.run_id, step_ref.id),
             )
             return [self._row_to_run_substep(row) for row in cur.fetchall()]
 
     def get_all(self) -> list[Task]:
         """Get all tasks."""
         with self._connect() as conn:
-            cur = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC")
+            cur = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC",
+                (self._project_id,),
+            )
             return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_impl_based_on_ids(self) -> set[str]:
@@ -2376,10 +2598,11 @@ class SqliteTaskStore:
         with self._connect() as conn:
             cur = conn.execute(
                 "SELECT DISTINCT based_on FROM tasks"
-                " WHERE task_type = 'implement' AND based_on IS NOT NULL"
+                " WHERE project_id = ? AND task_type = 'implement' AND based_on IS NOT NULL"
                 " UNION"
                 " SELECT DISTINCT depends_on FROM tasks"
-                " WHERE task_type = 'implement' AND depends_on IS NOT NULL"
+                " WHERE project_id = ? AND task_type = 'implement' AND depends_on IS NOT NULL",
+                (self._project_id, self._project_id),
             )
             return {row[0] for row in cur.fetchall()}
 
@@ -2395,10 +2618,10 @@ class SqliteTaskStore:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE task_type = 'review' AND depends_on = ?
+                WHERE project_id = ? AND task_type = 'review' AND depends_on = ?
                 ORDER BY completed_at DESC NULLS LAST
                 """,
-                (task_id,),
+                (self._project_id, task_id),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -2412,7 +2635,8 @@ class SqliteTaskStore:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE task_type = 'review'
+                WHERE project_id = ?
+                  AND task_type = 'review'
                   AND status = 'completed'
                   AND depends_on IS NULL
                   AND (
@@ -2421,7 +2645,7 @@ class SqliteTaskStore:
                   )
                 ORDER BY completed_at DESC NULLS LAST
                 """,
-                (f"%review-{slug}%", f"review {slug}%"),
+                (self._project_id, f"%review-{slug}%", f"review {slug}%"),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -2433,22 +2657,32 @@ class SqliteTaskStore:
                 WITH RECURSIVE improve_chain(id) AS (
                     SELECT id
                     FROM tasks
-                    WHERE task_type = 'improve'
+                    WHERE project_id = ?
+                      AND task_type = 'improve'
                       AND based_on = ?
                       AND depends_on = ?
                     UNION ALL
                     SELECT child.id
                     FROM tasks child
                     JOIN improve_chain parent ON child.based_on = parent.id
-                    WHERE child.task_type = 'improve'
+                    WHERE child.project_id = ?
+                      AND child.task_type = 'improve'
                       AND child.depends_on = ?
                 )
                 SELECT t.*
                 FROM tasks t
                 JOIN improve_chain c ON c.id = t.id
+                WHERE t.project_id = ?
                 ORDER BY created_at DESC
                 """,
-                (impl_task_id, review_task_id, review_task_id),
+                (
+                    self._project_id,
+                    impl_task_id,
+                    review_task_id,
+                    self._project_id,
+                    review_task_id,
+                    self._project_id,
+                ),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -2464,19 +2698,20 @@ class SqliteTaskStore:
                 WITH RECURSIVE improve_chain(id) AS (
                     SELECT id
                     FROM tasks
-                    WHERE task_type = 'improve' AND based_on = ?
+                    WHERE project_id = ? AND task_type = 'improve' AND based_on = ?
                     UNION ALL
                     SELECT child.id
                     FROM tasks child
                     JOIN improve_chain parent ON child.based_on = parent.id
-                    WHERE child.task_type = 'improve'
+                    WHERE child.project_id = ? AND child.task_type = 'improve'
                 )
                 SELECT t.*
                 FROM tasks t
                 JOIN improve_chain c ON c.id = t.id
+                WHERE t.project_id = ?
                 ORDER BY created_at DESC
                 """,
-                (root_task_id,),
+                (self._project_id, root_task_id, self._project_id, self._project_id),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -2488,21 +2723,24 @@ class SqliteTaskStore:
                 WITH RECURSIVE code_chain(id, task_type) AS (
                     SELECT id, task_type
                     FROM tasks
-                    WHERE based_on = ?
+                    WHERE project_id = ?
+                      AND based_on = ?
                       AND task_type IN ('improve', 'fix')
                     UNION ALL
                     SELECT child.id, child.task_type
                     FROM tasks child
                     JOIN code_chain parent ON child.based_on = parent.id
-                    WHERE child.task_type IN ('improve', 'fix')
+                    WHERE child.project_id = ?
+                      AND child.task_type IN ('improve', 'fix')
                 )
                 SELECT t.*
                 FROM tasks t
                 JOIN code_chain c ON c.id = t.id
-                WHERE t.task_type = 'fix'
+                WHERE t.project_id = ?
+                  AND t.task_type = 'fix'
                 ORDER BY t.created_at DESC
                 """,
-                (root_task_id,),
+                (self._project_id, root_task_id, self._project_id, self._project_id),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -2522,8 +2760,8 @@ class SqliteTaskStore:
             raise ValueError("Comment content cannot be empty")
         with self._connect() as conn:
             existing = conn.execute(
-                "SELECT 1 FROM tasks WHERE id = ?",
-                (task_id,),
+                "SELECT 1 FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
             ).fetchone()
             if existing is None:
                 raise KeyError(f"Task {task_id} not found")
@@ -2531,11 +2769,11 @@ class SqliteTaskStore:
                 """
                 SELECT created_at
                 FROM task_comments
-                WHERE task_id = ?
+                WHERE project_id = ? AND task_id = ?
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
                 """,
-                (task_id,),
+                (self._project_id, task_id),
             ).fetchone()
             previous_created_at = (
                 str(previous_row["created_at"])
@@ -2545,14 +2783,14 @@ class SqliteTaskStore:
             created_at = _next_monotonic_iso_timestamp(datetime.now(UTC), previous_created_at)
             cur = conn.execute(
                 """
-                INSERT INTO task_comments (task_id, content, source, author, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO task_comments (project_id, task_id, content, source, author, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (task_id, normalized, source, author, created_at),
+                (self._project_id, task_id, normalized, source, author, created_at),
             )
             row = conn.execute(
-                "SELECT * FROM task_comments WHERE id = ?",
-                (cur.lastrowid,),
+                "SELECT * FROM task_comments WHERE project_id = ? AND id = ?",
+                (self._project_id, cur.lastrowid),
             ).fetchone()
             assert row is not None
             return self._row_to_task_comment(row)
@@ -2565,8 +2803,8 @@ class SqliteTaskStore:
         created_on_or_before: datetime | None = None,
     ) -> list[TaskComment]:
         """Return comments for a task in creation order."""
-        query = "SELECT * FROM task_comments WHERE task_id = ?"
-        params: list[Any] = [task_id]
+        query = "SELECT * FROM task_comments WHERE project_id = ? AND task_id = ?"
+        params: list[Any] = [self._project_id, task_id]
         if unresolved_only:
             query += " AND resolved_at IS NULL"
         if created_on_or_before is not None:
@@ -2591,9 +2829,9 @@ class SqliteTaskStore:
         query = (
             "UPDATE task_comments "
             "SET resolved_at = ? "
-            "WHERE task_id = ? AND resolved_at IS NULL"
+            "WHERE project_id = ? AND task_id = ? AND resolved_at IS NULL"
         )
-        params: list[Any] = [resolved_at, task_id]
+        params: list[Any] = [resolved_at, self._project_id, task_id]
         if created_on_or_before is not None:
             cutoff = created_on_or_before
             if cutoff.tzinfo is not None:
@@ -2613,10 +2851,10 @@ class SqliteTaskStore:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE task_type = 'implement' AND (based_on = ? OR depends_on = ?)
+                WHERE project_id = ? AND task_type = 'implement' AND (based_on = ? OR depends_on = ?)
                 ORDER BY created_at ASC
                 """,
-                (task_id, task_id),
+                (self._project_id, task_id, task_id),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -2637,7 +2875,9 @@ class SqliteTaskStore:
                     SUM(input_tokens) as total_input_tokens,
                     SUM(output_tokens) as total_output_tokens
                 FROM tasks
-                """
+                WHERE project_id = ?
+                """,
+                (self._project_id,),
             )
             row = cur.fetchone()
             return {
@@ -2659,10 +2899,10 @@ class SqliteTaskStore:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE prompt LIKE ?
+                WHERE project_id = ? AND prompt LIKE ?
                 ORDER BY created_at DESC
                 """,
-                (f"%{query}%",),
+                (self._project_id, f"%{query}%"),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -2670,8 +2910,8 @@ class SqliteTaskStore:
         """Return canonical tags for a task."""
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT tag FROM task_tags WHERE task_id = ? ORDER BY tag ASC",
-                (task_id,),
+                "SELECT tag FROM task_tags WHERE project_id = ? AND task_id = ? ORDER BY tag ASC",
+                (self._project_id, task_id),
             )
             return tuple(str(row["tag"]) for row in cur.fetchall())
 
@@ -2681,8 +2921,8 @@ class SqliteTaskStore:
         with self._connect() as conn:
             self._replace_task_tags_conn(conn, task_id, normalized)
             conn.execute(
-                'UPDATE tasks SET "group" = ? WHERE id = ?',
-                (normalized[0] if len(normalized) == 1 else None, task_id),
+                'UPDATE tasks SET "group" = ? WHERE project_id = ? AND id = ?',
+                (normalized[0] if len(normalized) == 1 else None, self._project_id, task_id),
             )
         return normalized
 
@@ -2705,9 +2945,11 @@ class SqliteTaskStore:
                 """
                 SELECT tag, COUNT(*) AS count
                 FROM task_tags
+                WHERE project_id = ?
                 GROUP BY tag
                 ORDER BY tag ASC
-                """
+                """,
+                (self._project_id,),
             )
             return {str(row["tag"]): int(row["count"]) for row in cur.fetchall()}
 
@@ -2726,9 +2968,11 @@ class SqliteTaskStore:
                 """
                 SELECT tt.tag AS tag, t.status AS status, COUNT(*) AS count
                 FROM task_tags tt
-                JOIN tasks t ON t.id = tt.task_id
+                JOIN tasks t ON t.project_id = tt.project_id AND t.id = tt.task_id
+                WHERE tt.project_id = ?
                 GROUP BY tt.tag, t.status
-                """
+                """,
+                (self._project_id,),
             )
             groups: dict[str, dict[str, int]] = {}
             for row in cur.fetchall():
@@ -2748,11 +2992,11 @@ class SqliteTaskStore:
                 """
                 SELECT t.*
                 FROM tasks t
-                JOIN task_tags tt ON tt.task_id = t.id
-                WHERE tt.tag = ?
+                JOIN task_tags tt ON tt.project_id = t.project_id AND tt.task_id = t.id
+                WHERE tt.project_id = ? AND tt.tag = ?
                 ORDER BY t.created_at ASC
                 """,
-                (normalized,),
+                (self._project_id, normalized),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -2770,8 +3014,8 @@ class SqliteTaskStore:
 
         with self._connect() as conn:
             existing_old = conn.execute(
-                "SELECT COUNT(*) AS count FROM task_tags WHERE tag = ?",
-                (old_name,),
+                "SELECT COUNT(*) AS count FROM task_tags WHERE project_id = ? AND tag = ?",
+                (self._project_id, old_name),
             ).fetchone()
             assert existing_old is not None
             old_count = int(existing_old["count"])
@@ -2782,29 +3026,31 @@ class SqliteTaskStore:
                 return old_count
 
             existing_new = conn.execute(
-                "SELECT 1 FROM task_tags WHERE tag = ? LIMIT 1",
-                (new_name,),
+                "SELECT 1 FROM task_tags WHERE project_id = ? AND tag = ? LIMIT 1",
+                (self._project_id, new_name),
             ).fetchone()
             if existing_new is not None:
                 raise ValueError(f"group '{new_name}' already exists")
 
             cur = conn.execute(
-                "UPDATE task_tags SET tag = ? WHERE tag = ?",
-                (new_name, old_name),
+                "UPDATE task_tags SET tag = ? WHERE project_id = ? AND tag = ?",
+                (new_name, self._project_id, old_name),
             )
             # Keep compatibility column aligned for single-tag tasks.
-            conn.execute('UPDATE tasks SET "group" = NULL')
+            conn.execute('UPDATE tasks SET "group" = NULL WHERE project_id = ?', (self._project_id,))
             conn.execute(
                 """
                 UPDATE tasks
                 SET "group" = (
                     SELECT tt.tag
                     FROM task_tags tt
-                    WHERE tt.task_id = tasks.id
+                    WHERE tt.project_id = tasks.project_id AND tt.task_id = tasks.id
                     GROUP BY tt.task_id
                     HAVING COUNT(*) = 1
                 )
-                """
+                WHERE project_id = ?
+                """,
+                (self._project_id,),
             )
             return cur.rowcount
 
@@ -2828,8 +3074,8 @@ class SqliteTaskStore:
             visited.add(current_id)
             with self._connect() as conn:
                 cur = conn.execute(
-                    "SELECT id, status FROM tasks WHERE based_on = ? ORDER BY created_at ASC",
-                    (current_id,),
+                    "SELECT id, status FROM tasks WHERE project_id = ? AND based_on = ? ORDER BY created_at ASC",
+                    (self._project_id, current_id),
                 )
                 for row in cur.fetchall():
                     if row["status"] == "completed":
@@ -2901,17 +3147,19 @@ class SqliteTaskStore:
             cur = conn.execute(
                 """
                 WITH RECURSIVE successful_ancestors(id) AS (
-                    SELECT id FROM tasks WHERE status = 'completed'
+                    SELECT id FROM tasks WHERE project_id = ? AND status = 'completed'
                     UNION ALL
                     SELECT t2.based_on FROM tasks t2
                     JOIN successful_ancestors sa ON t2.id = sa.id
-                    WHERE t2.based_on IS NOT NULL
+                    WHERE t2.project_id = ? AND t2.based_on IS NOT NULL
                 )
                 SELECT COUNT(*) as count FROM tasks t
-                WHERE t.status = 'pending'
+                WHERE t.project_id = ?
+                AND t.status = 'pending'
                 AND t.depends_on IS NOT NULL
                 AND t.depends_on NOT IN (SELECT id FROM successful_ancestors)
-                """
+                """,
+                (self._project_id, self._project_id, self._project_id),
             )
             row = cur.fetchone()
             return row["count"] if row else 0
@@ -2990,9 +3238,9 @@ class SqliteTaskStore:
                     diff_files_changed = ?,
                     diff_lines_added = ?,
                     diff_lines_removed = ?
-                WHERE id = ?
+                WHERE project_id = ? AND id = ?
                 """,
-                (files_changed, lines_added, lines_removed, task_id),
+                (files_changed, lines_added, lines_removed, self._project_id, task_id),
             )
 
     def mark_failed(
@@ -3059,7 +3307,8 @@ def needs_merge_status_migration(store: "SqliteTaskStore") -> bool:
     """Check if any tasks need merge_status backfilled."""
     with store._connect() as conn:
         cur = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE merge_status IS NULL AND has_commits = 1"
+            "SELECT COUNT(*) FROM tasks WHERE project_id = ? AND merge_status IS NULL AND has_commits = 1",
+            (store._project_id,),
         )
         return cur.fetchone()[0] > 0
 
@@ -3079,7 +3328,8 @@ def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
 
     with store._connect() as conn:
         cur = conn.execute(
-            "SELECT id, has_commits, branch FROM tasks WHERE merge_status IS NULL"
+            "SELECT id, has_commits, branch FROM tasks WHERE project_id = ? AND merge_status IS NULL",
+            (store._project_id,),
         )
         rows = cur.fetchall()
 
@@ -3391,7 +3641,7 @@ def _task_to_dict(task: "Task") -> dict:
 def get_task(task_id: str) -> dict:
     """Get a task by ID as a JSON-serializable dict.
 
-    Auto-discovers the DB at .gza/gza.db relative to cwd.
+    Uses config-derived DB resolution for the active project (shared or local).
 
     Raises:
         KeyError: If task_id is not found.
@@ -3406,7 +3656,7 @@ def get_task(task_id: str) -> dict:
 def get_task_log_path(task_id: str) -> str | None:
     """Get the log_file path for a task.
 
-    Auto-discovers the DB at .gza/gza.db relative to cwd.
+    Uses config-derived DB resolution for the active project.
     Returns None if task not found or log_file is not set.
     """
     store = _default_store()
@@ -3419,7 +3669,7 @@ def get_task_log_path(task_id: str) -> str | None:
 def get_task_report_path(task_id: str) -> str | None:
     """Get the report_file path for a task.
 
-    Auto-discovers the DB at .gza/gza.db relative to cwd.
+    Uses config-derived DB resolution for the active project.
     Returns None if task not found or report_file is not set.
     """
     store = _default_store()
@@ -3432,7 +3682,7 @@ def get_task_report_path(task_id: str) -> str | None:
 def get_baseline_stats(limit: int = 20) -> dict:
     """Get average stats from the last N completed tasks.
 
-    Auto-discovers the DB at .gza/gza.db relative to cwd.
+    Uses config-derived DB resolution for the active project.
 
     Returns:
         Dict with keys: avg_steps, avg_turns, avg_duration, avg_cost
@@ -3448,12 +3698,12 @@ def get_baseline_stats(limit: int = 20) -> dict:
                 round(avg(cost_usd), 4) as avg_cost
             FROM (
                 SELECT * FROM tasks
-                WHERE status = 'completed'
+                WHERE project_id = ? AND status = 'completed'
                 ORDER BY completed_at DESC
                 LIMIT ?
             )
             """,
-            (limit,),
+            (store._project_id, limit),
         )
         row = cur.fetchone()
         return {

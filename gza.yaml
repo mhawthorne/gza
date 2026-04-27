@@ -25,3 +25,4 @@ model: gpt-5.3-codex
 #    model: claude-opus-4-6
 #  review:
 #    model: claude-haiku-4-5-20251001
+project_id: default

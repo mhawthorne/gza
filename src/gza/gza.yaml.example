@@ -3,6 +3,9 @@
 # Project name (required) - used for branch prefixes and Docker image naming
 project_name: my-project
 
+# Stable project identity used to scope rows in shared task DBs.
+# project_id: default
+
 # Optional local override file: gza.local.yaml (gitignored)
 # Keep shared defaults here and put machine-specific settings in gza.local.yaml.
 
@@ -53,6 +56,10 @@ project_name: my-project
 # worktree_dir: /tmp/gza-worktrees
 
 # --- Storage ---
+
+# Task database path. Default is ~/.gza/gza.db (shared across projects).
+# Legacy project-local .gza/gza.db is still auto-used when it already exists.
+# db_path: ~/.gza/gza.db
 
 # Directory for log files (relative to project directory)
 # log_dir: .gza/logs

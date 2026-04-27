@@ -4282,19 +4282,25 @@ def _drop_tasks_column(db_path: Path, column_name: str) -> None:
     _quote = lambda c: f'"{c}"' if c in ("group",) else c
     cols_str = ", ".join(_quote(c) for c in kept_cols)
     col_defs = []
-    for row in conn.execute("PRAGMA table_info(tasks_old)"):
+    pragma_rows = list(conn.execute("PRAGMA table_info(tasks_old)"))
+    pk_cols = [(row[5], row[1]) for row in pragma_rows if row[1] != column_name and row[5]]
+    has_composite_pk = len(pk_cols) > 1
+    for row in pragma_rows:
         if row[1] == column_name:
             continue
         name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
         quoted_name = f'"{name}"' if name in ("group",) else name
         parts = [quoted_name, typ]
-        if pk:
+        if pk and not has_composite_pk:
             parts.append("PRIMARY KEY")
         if notnull and not pk:
             parts.append("NOT NULL")
         if dflt is not None:
             parts.append(f"DEFAULT {dflt}")
         col_defs.append(" ".join(parts))
+    if has_composite_pk:
+        ordered_pk = ", ".join(_quote(name) for _, name in sorted(pk_cols, key=lambda item: item[0]))
+        col_defs.append(f"PRIMARY KEY({ordered_pk})")
     conn.execute(f"CREATE TABLE tasks ({', '.join(col_defs)})")
     conn.execute(f"INSERT INTO tasks ({cols_str}) SELECT {cols_str} FROM tasks_old")
     conn.execute("DROP TABLE tasks_old")
@@ -4345,7 +4351,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -4357,7 +4363,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -5159,7 +5165,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36]
 
         # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")

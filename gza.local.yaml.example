@@ -13,3 +13,4 @@
 # docker_volumes:
 #   - ~/datasets:/datasets:ro
 # cleanup_days: 30
+# db_path: .gza/gza.db

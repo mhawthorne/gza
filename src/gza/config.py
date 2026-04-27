@@ -8,6 +8,7 @@ import sys
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import uuid4
 
 import yaml
 
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 # Only lowercase alphanumeric — no hyphens, since the hyphen is the separator
 # between prefix and numeric suffix in task IDs (e.g., "gza-42").
 _PREFIX_RE = re.compile(r'^[a-z0-9]+$')
+_PROJECT_ID_RE = re.compile(r"^[a-z0-9]{1,64}$")
 
 __all__ = [
     "APP_NAME",
@@ -29,6 +31,7 @@ __all__ = [
     "Config",
     "TaskTypeConfig",
     "BranchStrategy",
+    "discover_project_dir",
 ]
 
 
@@ -78,6 +81,7 @@ DEFAULT_LEARNINGS_WINDOW = 25
 DEFAULT_LEARNINGS_INTERVAL = 5
 DEFAULT_LEARNINGS_MAX_ITEMS = 50
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
+    "db_path": None,
     "use_docker": None,
     "docker_image": None,
     "docker_volumes": None,
@@ -159,6 +163,34 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
 }
 
 _LOCAL_OVERRIDE_NOTICE_SHOWN: set[str] = set()
+
+
+def discover_project_dir(start: Path) -> Path:
+    """Find the nearest ancestor directory that contains gza.yaml."""
+    current = start.resolve()
+    if current.is_file():
+        current = current.parent
+    while True:
+        if (current / CONFIG_FILENAME).exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            raise ConfigError(
+                f"Configuration file not found from: {start}\n"
+                f"Run 'gza init' to create one."
+            )
+        current = parent
+
+
+def _generate_project_id(prefix_hint: str | None = None) -> str:
+    """Generate a stable opaque project ID suitable for gza.yaml."""
+    if prefix_hint:
+        hint = re.sub(r"[^a-z0-9]", "", prefix_hint.lower())
+        if hint and 12 <= len(hint) <= 64:
+            return hint
+        if hint:
+            return (hint * ((12 // len(hint)) + 1))[:12]
+    return f"p{uuid4().hex}"
 
 
 def _detect_model_provider_family(model: str) -> str | None:
@@ -354,7 +386,9 @@ class BranchStrategy:
 class Config:
     project_dir: Path
     project_name: str  # Required - no default
+    project_id: str = ""
     project_prefix: str = ""  # Short prefix for task slugs; defaults to project_name if empty
+    db_path_value: str = ""
     tasks_file: str = DEFAULT_TASKS_FILE
     log_dir: str = DEFAULT_LOG_DIR
     use_docker: bool = DEFAULT_USE_DOCKER
@@ -401,6 +435,13 @@ class Config:
     local_overrides_active: bool = False
 
     def __post_init__(self):
+        if not self.project_id:
+            self.project_id = _generate_project_id()
+        if not _PROJECT_ID_RE.match(self.project_id):
+            raise ConfigError(
+                "'project_id' must be 1-64 lowercase alphanumeric characters"
+            )
+
         if not self.docker_image:
             self.docker_image = f"{self.project_name}-gza"
 
@@ -557,7 +598,17 @@ class Config:
 
     @property
     def db_path(self) -> Path:
-        return self.project_dir / DEFAULT_DB_FILE
+        if self.db_path_value:
+            resolved = Path(os.path.expanduser(self.db_path_value))
+            if not resolved.is_absolute():
+                resolved = self.project_dir / resolved
+            return resolved
+        if self.project_id == "default":
+            return self.project_dir / DEFAULT_DB_FILE
+        legacy_local = self.project_dir / DEFAULT_DB_FILE
+        if legacy_local.exists():
+            return legacy_local
+        return Path(os.path.expanduser("~/.gza/gza.db"))
 
     @property
     def log_path(self) -> Path:
@@ -605,7 +656,7 @@ class Config:
         return merged_data, source_map, (local_path if local_path.exists() else None), local_active
 
     @classmethod
-    def load(cls, project_dir: Path) -> "Config":
+    def load(cls, project_dir: Path, *, discover: bool = False) -> "Config":
         """Load config from gza.yaml in project root.
 
         Raises ConfigError if config file is missing or project_name is not set.
@@ -624,7 +675,7 @@ class Config:
 
         # Validate and warn about unknown keys
         valid_fields = {
-            "project_name", "project_prefix", "tasks_file", "log_dir", "use_docker",
+            "project_name", "project_id", "project_prefix", "tasks_file", "log_dir", "db_path", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model", "reasoning_effort",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
@@ -649,6 +700,28 @@ class Config:
                 f"'project_name' is required in {config_path}\n"
                 f"Add 'project_name: your-project-name' to the config file."
             )
+
+        project_id_raw = data.get("project_id", "")
+        if project_id_raw:
+            if not isinstance(project_id_raw, str):
+                raise ConfigError("'project_id' must be a string")
+            if not _PROJECT_ID_RE.match(project_id_raw):
+                raise ConfigError("'project_id' must be 1-64 lowercase alphanumeric characters")
+        else:
+            project_id_raw = "default"
+            existing = config_path.read_text(encoding="utf-8")
+            with open(config_path, "a", encoding="utf-8") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write(f"project_id: {project_id_raw}\n")
+
+        db_path_raw = os.environ.get("GZA_DB_PATH")
+        if db_path_raw:
+            source_map["db_path"] = "env"
+        else:
+            db_path_raw = data.get("db_path", "")
+            if db_path_raw and not isinstance(db_path_raw, str):
+                raise ConfigError("'db_path' must be a string")
 
         # Parse and validate project_prefix
         project_prefix_raw = data.get("project_prefix", "")
@@ -1289,9 +1362,11 @@ class Config:
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
+            project_id=project_id_raw,
             project_prefix=project_prefix_raw,
             tasks_file=data.get("tasks_file", DEFAULT_TASKS_FILE),
             log_dir=data.get("log_dir", DEFAULT_LOG_DIR),
+            db_path_value=db_path_raw or "",
             use_docker=use_docker,
             docker_image=data.get("docker_image", ""),
             docker_volumes=docker_volumes,
@@ -1375,7 +1450,7 @@ class Config:
 
         # Validate known fields - unknown keys are warnings, not errors
         valid_fields = {
-            "project_name", "project_prefix", "tasks_file", "log_dir", "use_docker",
+            "project_name", "project_id", "project_prefix", "tasks_file", "log_dir", "db_path", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model", "reasoning_effort",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
@@ -1400,6 +1475,16 @@ class Config:
             errors.append("'project_name' is required")
         elif not isinstance(data["project_name"], str):
             errors.append("'project_name' must be a string")
+
+        if "project_id" in data and data["project_id"]:
+            project_id = data["project_id"]
+            if not isinstance(project_id, str):
+                errors.append("'project_id' must be a string")
+            elif not _PROJECT_ID_RE.match(project_id):
+                errors.append("'project_id' must be 1-64 lowercase alphanumeric characters")
+
+        if "db_path" in data and data["db_path"] is not None and not isinstance(data["db_path"], str):
+            errors.append("'db_path' must be a string")
 
         if "project_prefix" in data and data["project_prefix"]:
             prefix_val = data["project_prefix"]

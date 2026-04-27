@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..config import Config, ConfigError
+from ..config import Config, ConfigError, discover_project_dir
 from ..db import (
     KNOWN_EXECUTION_MODES,
     InvalidTaskIdError,
@@ -2104,11 +2104,21 @@ def main() -> int:
     args = parser.parse_args()
 
     # Validate and resolve project_dir
-    if hasattr(args, 'project_dir'):
-        args.project_dir = Path(args.project_dir).resolve()
+    project_explicit = False
+    if hasattr(args, "project_dir"):
+        raw_project = getattr(args, "project_dir", None)
+        project_explicit = raw_project is not None
+        args.project_dir = Path(raw_project or ".").resolve()
+        setattr(args, "project_explicit", project_explicit)
         if not args.project_dir.is_dir():
             print(f"Error: {args.project_dir} is not a directory")
             return 1
+        if not project_explicit:
+            try:
+                args.project_dir = discover_project_dir(args.project_dir)
+            except ConfigError:
+                # Let the command-specific config load surface the normal error path.
+                pass
 
     # Commands where reconciling orphaned in-progress tasks is useful.
     _RECONCILE_COMMANDS = {
@@ -2119,7 +2129,7 @@ def main() -> int:
     try:
         if args.command in _RECONCILE_COMMANDS:
             try:
-                cfg = Config.load(args.project_dir)
+                cfg = Config.load(args.project_dir, discover=not project_explicit)
             except Exception as exc:
                 print(f"Warning: Skipping in-progress reconciliation: {exc}", file=sys.stderr)
             else:
@@ -2256,7 +2266,7 @@ def main() -> int:
 def _cmd_migrate(args: "argparse.Namespace") -> int:
     """Handle the 'migrate' subcommand."""
     try:
-        config = Config.load(args.project_dir)
+        config = Config.load(args.project_dir, discover=not bool(getattr(args, "project_explicit", False)))
     except ConfigError as e:
         print(f"Error loading config: {e}", file=sys.stderr)
         return 1
@@ -2369,7 +2379,7 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
     # will run the auto-migrations and then raise ManualMigrationRequired.
     # We swallow that exception here since we are about to run the manual migration.
     try:
-        SqliteTaskStore(config.db_path, prefix=config.project_prefix)
+        SqliteTaskStore.from_config(config)
     except ManualMigrationRequired:
         pass  # Expected — auto-migrations ran, now proceed with the manual migration
 
