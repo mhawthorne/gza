@@ -21,7 +21,9 @@ from gza.db import SqliteTaskStore, Task
 
 
 ITEM_HEADER_RE = re.compile(r"^###\s+([BF])(\d+)\s*$")
-SECTION_RE = re.compile(r"^(Evidence|Impact|Required fix|Recommended follow-up|Required tests|Recommended tests):\s*(.*)$")
+SECTION_RE = re.compile(
+    r"^-?\s*(Evidence|Impact|Required fix|Recommended follow-up|Required tests|Recommended tests):\s*(.*)$"
+)
 VERDICT_RE = re.compile(r"^Verdict:\s*(\S.*)$", re.MULTILINE)
 # Matches the Codex aggregate usage payload in log files. Claude emits
 # cache_read_input_tokens / cache_creation_input_tokens under similar objects;
@@ -119,9 +121,9 @@ def _parse_items(body: str) -> tuple[list[ReviewItem], list[ReviewItem]]:
                 inline = sec.group(2).strip()
                 bucket = sections.setdefault(current, [])
                 if inline:
-                    bucket.append(inline)
+                    bucket.append(re.sub(r"^-\s+", "", inline))
             elif current is not None and stripped:
-                sections[current].append(stripped)
+                sections[current].append(re.sub(r"^-\s+", "", stripped))
             i += 1
         item = ReviewItem(
             kind=kind,
@@ -165,8 +167,9 @@ def _fmt_duration(seconds: float | None) -> str:
     return f"{m}m{s}s" if m else f"{s}s"
 
 
-def _fmt_cost(cost: float | None) -> str:
-    return f"${cost:.2f}" if cost else "-"
+def _sum_durations(tasks: list[Task]) -> float | None:
+    values = [t.duration_seconds for t in tasks if t.duration_seconds is not None]
+    return sum(values) if values else None
 
 
 def _read_cache_usage(task: Task) -> tuple[int, int] | None:
@@ -190,6 +193,14 @@ def _read_cache_usage(task: Task) -> tuple[int, int] | None:
     return int(m.group(1)), int(m.group(2))
 
 
+def _combine_usage(tasks: list[Task]) -> tuple[int, int] | None:
+    usages = [_read_cache_usage(task) for task in tasks]
+    present = [usage for usage in usages if usage is not None]
+    if not present:
+        return None
+    return sum(total for total, _ in present), sum(cached for _, cached in present)
+
+
 def _fmt_cache(usage: tuple[int, int] | None) -> str:
     if usage is None:
         return "-"
@@ -197,6 +208,17 @@ def _fmt_cache(usage: tuple[int, int] | None) -> str:
     if total <= 0:
         return "-"
     return f"{100 * cached / total:4.1f}%"
+
+
+def _fmt_tokens(usage: tuple[int, int] | None) -> str:
+    if usage is None:
+        return "-"
+    total, _ = usage
+    if total >= 1_000_000:
+        return f"{total / 1_000_000:.1f}M"
+    if total >= 1_000:
+        return f"{total / 1_000:.1f}k"
+    return str(total)
 
 
 def _fmt_improve(improves: list[Task]) -> str:
@@ -312,19 +334,23 @@ def main() -> int:
         print("No completed review cycles yet.")
         return 0
 
-    header = f"{'Cycle':<6}{'Review':<12}{'Verdict':<20}{'B':>3}{'F':>3}  {'Improve':<48}{'Dur':>8}  {'Cost':>7}  {'Cache':>6}"
+    header = (
+        f"{'Cycle':<6}{'Review':<12}{'Verdict':<20}{'B':>3}{'F':>3}  "
+        f"{'Improve':<48}{'Runtime':>8}  {'Tokens':>8}  {'Cache':>6}"
+    )
     print(header)
     print("-" * len(header))
     for idx, c in enumerate(cycles, start=1):
         improve_str = _fmt_improve(c.improves)
-        last_improve = c.improves[-1] if c.improves else None
-        dur = _fmt_duration(last_improve.duration_seconds) if last_improve else "-"
-        cost = _fmt_cost(last_improve.cost_usd) if last_improve else "-"
-        cache = _fmt_cache(_read_cache_usage(last_improve)) if last_improve else "-"
+        metric_tasks = [c.review, *c.improves]
+        dur = _fmt_duration(_sum_durations(metric_tasks))
+        usage = _combine_usage(metric_tasks)
+        tokens = _fmt_tokens(usage)
+        cache = _fmt_cache(usage)
         print(
             f"{idx:<6}{c.review.id or '-':<12}{(c.verdict or '-'):<20}"
             f"{len(c.blockers):>3}{len(c.followups):>3}  "
-            f"{improve_str:<48}{dur:>8}  {cost:>7}  {cache:>6}"
+            f"{improve_str:<48}{dur:>8}  {tokens:>8}  {cache:>6}"
         )
     print()
 
