@@ -33,6 +33,17 @@ from .console import (
     task_header,
 )
 from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason, task_id_numeric_key
+from .extractions import (
+    MANIFEST_FILENAME,
+    PATCH_FILENAME,
+    ExtractionError,
+    copy_bundle_to_worktree,
+    extraction_bundle_path,
+    load_manifest,
+    load_patch_text,
+    parse_patch_touched_paths,
+    resolve_manifest_patch_path,
+)
 from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
@@ -55,6 +66,8 @@ from .task_slug import (
 )
 
 logger = logging.getLogger(__name__)
+
+EXTRACTION_PRECHECK_FAILURE_REASON = "EXTRACTION_PRECHECK_FAILED"
 
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
 TERMINATED_FAILURE_REASON = "TERMINATED"
@@ -672,6 +685,8 @@ def generate_slug(
     existing_id: str | None = None,
     log_path: Path | None = None,
     git: Git | None = None,
+    store: SqliteTaskStore | None = None,
+    exclude_task_id: str | None = None,
     project_name: str | None = None,
     project_prefix: str | None = None,
     slug_override: str | None = None,
@@ -698,13 +713,35 @@ def generate_slug(
                 base_id = f"{date_prefix}-{slug}"
 
     # Check if base ID is available
-    if not _slug_exists(base_id, log_path, git, project_name, prompt, branch_strategy, explicit_type, project_prefix):
+    if not _slug_exists(
+        base_id,
+        log_path=log_path,
+        git=git,
+        project_name=project_name,
+        prompt=prompt,
+        branch_strategy=branch_strategy,
+        explicit_type=explicit_type,
+        project_prefix=project_prefix,
+        store=store,
+        exclude_task_id=exclude_task_id,
+    ):
         return base_id
 
     # Find next available suffix
     suffix = 2
     new_id = f"{base_id}-{suffix}"
-    while _slug_exists(new_id, log_path, git, project_name, prompt, branch_strategy, explicit_type, project_prefix):
+    while _slug_exists(
+        new_id,
+        log_path=log_path,
+        git=git,
+        project_name=project_name,
+        prompt=prompt,
+        branch_strategy=branch_strategy,
+        explicit_type=explicit_type,
+        project_prefix=project_prefix,
+        store=store,
+        exclude_task_id=exclude_task_id,
+    ):
         suffix += 1
         new_id = f"{base_id}-{suffix}"
     return new_id
@@ -810,8 +847,14 @@ def _slug_exists(
     branch_strategy: "BranchStrategy | None" = None,
     explicit_type: str | None = None,
     project_prefix: str | None = None,
+    store: SqliteTaskStore | None = None,
+    exclude_task_id: str | None = None,
 ) -> bool:
-    """Check if a slug is already in use (log file or branch exists)."""
+    """Check if a slug is already in use (task row, log file, or branch exists)."""
+    if store is not None:
+        existing = store.get_by_slug(task_id)
+        if existing is not None and existing.id != exclude_task_id:
+            return True
     # Check log file
     if log_path and (log_path / f"{task_id}.log").exists():
         return True
@@ -1861,6 +1904,87 @@ def _copy_learnings_to_worktree(config: Config, worktree_path: Path) -> None:
     shutil.copy2(src, dst_dir / "learnings.md")
 
 
+def _seed_extraction_bundle_if_present(
+    task: Task,
+    config: Config,
+    worktree_path: Path,
+    worktree_git: Git,
+    log_file: Path,
+    *,
+    resume: bool,
+) -> set[str]:
+    """Copy/apply extraction bundle before provider execution when configured for the task."""
+    if resume or not task.slug:
+        return set()
+
+    project_bundle_dir = extraction_bundle_path(config.project_dir, task.slug)
+    if not project_bundle_dir.exists():
+        return set()
+
+    worktree_bundle_dir = copy_bundle_to_worktree(project_bundle_dir, worktree_path)
+    manifest = load_manifest(worktree_bundle_dir / MANIFEST_FILENAME)
+    manifest_target_slug = manifest.get("target_slug")
+    manifest_target_task_id = manifest.get("target_task_id")
+    if not isinstance(manifest_target_slug, str) or not manifest_target_slug:
+        raise ExtractionError("Extraction manifest missing required target identity field: target_slug")
+    if not isinstance(manifest_target_task_id, str) or not manifest_target_task_id:
+        raise ExtractionError("Extraction manifest missing required target identity field: target_task_id")
+    if manifest_target_slug != task.slug or manifest_target_task_id != task.id:
+        raise ExtractionError(
+            "Extraction bundle target identity mismatch "
+            f"(manifest task={manifest_target_task_id} slug={manifest_target_slug}, "
+            f"current task={task.id} slug={task.slug})"
+        )
+
+    patch_path = resolve_manifest_patch_path(
+        worktree_bundle_dir,
+        manifest.get("patch_path", PATCH_FILENAME),
+    )
+
+    patch_text = load_patch_text(patch_path)
+    touched_paths = parse_patch_touched_paths(patch_text)
+    if not touched_paths:
+        raise ExtractionError("Extraction patch has no touched file paths")
+
+    declared_raw = manifest.get("touched_paths")
+    if declared_raw is None and "touched_paths" not in manifest:
+        declared_raw = manifest.get("selected_paths", [])
+
+    if not isinstance(declared_raw, (list, tuple)):
+        raise ExtractionError("Extraction manifest selected/touched path declarations must be a list")
+
+    declared_paths: set[str] = set()
+    for path_value in declared_raw:
+        if not isinstance(path_value, str) or not path_value:
+            raise ExtractionError("Extraction manifest selected/touched paths must be non-empty strings")
+        declared_paths.add(path_value)
+
+    if not declared_paths:
+        raise ExtractionError("Extraction manifest is missing selected/touched path declarations")
+
+    unexpected = sorted(set(touched_paths) - declared_paths)
+    if unexpected:
+        raise ExtractionError(
+            "Extraction patch touches undeclared paths: " + ", ".join(unexpected),
+        )
+
+    worktree_git.apply_patch_check(patch_path)
+    worktree_git.apply_patch_file(patch_path)
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "info",
+            "message": (
+                f"Applied extraction seed bundle from {project_bundle_dir.relative_to(config.project_dir)} "
+                f"({len(touched_paths)} files)"
+            ),
+            "seeded_paths": sorted(touched_paths),
+        },
+    )
+    return set(touched_paths)
+
+
 def _resolve_task_db_path(config: Config) -> Path:
     """Resolve the live task DB path for worktree snapshotting."""
     db_path = getattr(config, "db_path", None)
@@ -2184,6 +2308,8 @@ def run(
             existing_id=None,
             log_path=config.log_path,
             git=git,
+            store=store,
+            exclude_task_id=task.id,
             project_name=config.project_name,
             project_prefix=config.project_prefix,
             slug_override=slug_override,
@@ -2442,6 +2568,14 @@ def _setup_code_task_worktree(
         return False
 
 
+def _filter_stageable_paths(
+    candidate_paths: set[str],
+    status_paths: set[str],
+) -> set[str]:
+    """Keep only paths that can be staged without pathspec failures."""
+    return {path for path in candidate_paths if path in status_paths}
+
+
 def _complete_code_task(
     task: Task,
     config: Config,
@@ -2460,6 +2594,7 @@ def _complete_code_task(
     create_pr: bool = False,
     fix_commits_ahead_before_run: int | None = None,
     fix_default_branch: str | None = None,
+    seeded_paths: set[str] | None = None,
 ) -> int:
     """Handle successful code-task completion (staging, commit, completion state, output).
 
@@ -2471,10 +2606,17 @@ def _complete_code_task(
     if skip_commit:
         has_uncommitted = False
     else:
+        seeded_paths = seeded_paths or set()
         # Compute which files changed during the provider run (selective staging)
         post_run_status = worktree_git.status_porcelain()
         new_changes = post_run_status - pre_run_status
-        has_uncommitted = bool(new_changes)
+        status_paths = {filepath for _, filepath in post_run_status}
+        candidate_stage_paths = {filepath for _, filepath in new_changes} | seeded_paths
+        files_to_stage = _filter_stageable_paths(
+            candidate_stage_paths,
+            status_paths,
+        )
+        has_uncommitted = bool(files_to_stage)
 
         if not has_uncommitted:
             # Check if branch already has commits from a previous run
@@ -2526,9 +2668,8 @@ def _complete_code_task(
             # Squash any WIP commits before creating final commit
             _squash_wip_commits(worktree_git, task)
 
-            # Stage only files that changed during the provider run
-            files_to_stage = [filepath for _, filepath in new_changes]
-            for f in files_to_stage:
+            # Stage only files changed in this run plus extraction-seeded files.
+            for f in sorted(files_to_stage):
                 worktree_git.add(f)
 
             review_task_id = None
@@ -3024,12 +3165,6 @@ def _run_inner(
     else:
         prompt_summary_path = worktree_summary_path
 
-    # Run provider in the worktree
-    if resume:
-        prompt = PromptBuilder().resume_prompt()
-    else:
-        prompt = build_prompt(task, config, store, report_path=None, summary_path=prompt_summary_path, git=git)
-
     def _on_session_id(session_id: str) -> None:
         """Persist session_id to the task record as soon as it is first seen.
 
@@ -3059,6 +3194,42 @@ def _run_inner(
 
     if not config.use_docker:
         _create_local_dep_symlinks(config, worktree_path)
+
+    seeded_paths: set[str] = set()
+    try:
+        seeded_paths = _seed_extraction_bundle_if_present(
+            task,
+            config,
+            worktree_path,
+            worktree_git,
+            log_file,
+            resume=resume,
+        )
+    except (ExtractionError, GitError) as exc:
+        failure_message = f"Extraction preflight/apply failed: {exc}"
+        error_message(f"Error: {failure_message}")
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "outcome",
+                "message": failure_message,
+                "failure_reason": EXTRACTION_PRECHECK_FAILURE_REASON,
+            },
+        )
+        store.mark_failed(
+            task,
+            log_file=str(log_file.relative_to(config.project_dir)),
+            branch=branch_name,
+            failure_reason=EXTRACTION_PRECHECK_FAILURE_REASON,
+        )
+        return 1
+
+    # Run provider in the worktree
+    if resume:
+        prompt = PromptBuilder().resume_prompt()
+    else:
+        prompt = build_prompt(task, config, store, report_path=None, summary_path=prompt_summary_path, git=git)
 
     # Snapshot worktree state before provider runs so we can selectively stage only new changes
     pre_run_status = worktree_git.status_porcelain()
@@ -3160,6 +3331,7 @@ def _run_inner(
             create_pr=create_pr,
             fix_commits_ahead_before_run=fix_commits_ahead_before_run,
             fix_default_branch=fix_default_branch,
+            seeded_paths=seeded_paths,
         )
 
     except GitError as e:

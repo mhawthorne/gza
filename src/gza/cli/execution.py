@@ -15,6 +15,7 @@ from ..advance_engine import count_completed_review_cycles
 from ..config import DEFAULT_MAX_RESUME_ATTEMPTS, Config
 from ..console import format_duration
 from ..db import (
+    InvalidTaskIdError,
     SqliteTaskStore,
     Task as DbTask,
     add_task_interactive,
@@ -22,12 +23,20 @@ from ..db import (
     task_id_numeric_key,
     validate_prompt,
 )
+from ..extractions import (
+    ExtractionError,
+    normalize_selected_paths,
+    plan_extraction,
+    read_paths_file,
+    resolve_source_selection,
+    write_extraction_bundle,
+)
 from ..git import Git
 from ..lineage import resolve_impl_task
 from ..prompts import PromptBuilder
 from ..query import get_base_task_slug as _get_base_task_slug
 from ..review_verdict import get_review_report
-from ..runner import RunInvocationContext, run
+from ..runner import RunInvocationContext, generate_slug, run
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
     DuplicateReviewError,
@@ -395,6 +404,175 @@ def cmd_implement(args: argparse.Namespace) -> int:
         task_id=impl_task.id,
         force=getattr(args, "force", False),
         invocation=_foreground_command_invocation("implement"),
+    )
+
+
+def cmd_extract(args: argparse.Namespace) -> int:
+    """Create an implementation task from selected source-branch file changes."""
+    config = Config.load(args.project_dir)
+    if hasattr(args, "no_docker") and args.no_docker:
+        config.use_docker = False
+
+    if hasattr(args, "max_turns") and args.max_turns is not None:
+        config.max_steps = args.max_turns
+        config.max_turns = args.max_turns
+
+    source_task_id_raw = args.source if hasattr(args, "source") else None
+    source_branch = args.branch if hasattr(args, "branch") else None
+    selected_raw: list[str] = list(getattr(args, "paths", ()) or ())
+    store: SqliteTaskStore | None = None
+
+    # argparse uses "source?" then "paths*"; in `--branch` mode the first path
+    # can land in `source`. Reassign to selected paths unless it is a real task ID.
+    if source_branch and source_task_id_raw:
+        try:
+            source_id_candidate = resolve_id(config, source_task_id_raw)
+        except InvalidTaskIdError:
+            selected_raw.insert(0, source_task_id_raw)
+            source_task_id_raw = None
+        else:
+            store = get_store(config)
+            if store.get(source_id_candidate) is None:
+                selected_raw.insert(0, source_task_id_raw)
+                source_task_id_raw = None
+
+    if bool(source_task_id_raw) == bool(source_branch):
+        print("Error: Specify exactly one source selector: SOURCE task ID or --branch")
+        return 1
+
+    files_from = getattr(args, "files_from", None)
+    if files_from:
+        try:
+            files_from_path = Path(files_from)
+            if not files_from_path.is_absolute():
+                files_from_path = config.project_dir / files_from_path
+            selected_raw.extend(read_paths_file(files_from_path))
+        except ExtractionError as exc:
+            print(f"Error: {exc}")
+            return 1
+
+    if not selected_raw:
+        print("Error: Select at least one file via PATH arguments or --files-from")
+        return 1
+
+    try:
+        selected_paths = normalize_selected_paths(selected_raw)
+    except ExtractionError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    try:
+        tags = _selected_tags_for_new_task(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    source_task_id: str | None = None
+    if source_task_id_raw:
+        try:
+            source_task_id = resolve_id(config, source_task_id_raw)
+        except InvalidTaskIdError as exc:
+            print(f"Error: {exc}")
+            return 1
+
+    if store is None:
+        store = get_store(config)
+    git = Git(config.project_dir)
+    try:
+        source = resolve_source_selection(
+            store,
+            git,
+            source_task_id=source_task_id,
+            source_branch=source_branch,
+            base_branch_override=getattr(args, "base_branch", None),
+        )
+        draft = plan_extraction(
+            git,
+            source,
+            selected_paths,
+            operator_prompt=getattr(args, "prompt", None),
+        )
+    except ExtractionError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    create_review = bool(getattr(args, "review", False))
+    branch_type = args.branch_type if hasattr(args, "branch_type") and args.branch_type else None
+    model = args.model if hasattr(args, "model") and args.model else None
+    provider = args.provider if hasattr(args, "provider") and args.provider else None
+    skip_learnings = bool(getattr(args, "skip_learnings", False))
+    base_branch = args.base_branch if hasattr(args, "base_branch") and args.base_branch else None
+
+    impl_task = store.add(
+        draft.prompt,
+        task_type="implement",
+        tags=tags,
+        create_review=create_review,
+        same_branch=False,
+        base_branch=base_branch,
+        task_type_hint=branch_type,
+        model=model,
+        provider=provider,
+        skip_learnings=skip_learnings,
+    )
+
+    # Assign slug at creation time so extraction artifacts can be persisted at the slug path.
+    if impl_task.slug is None:
+        impl_task.slug = generate_slug(
+            impl_task.prompt,
+            existing_id=None,
+            log_path=config.log_path,
+            git=git,
+            store=store,
+            exclude_task_id=impl_task.id,
+            project_name=config.project_name,
+            project_prefix=config.project_prefix,
+            branch_strategy=config.branch_strategy,
+            explicit_type=impl_task.task_type_hint,
+        )
+        store.update(impl_task)
+
+    try:
+        bundle_dir = write_extraction_bundle(
+            project_dir=config.project_dir,
+            task=impl_task,
+            draft=draft,
+        )
+    except (ExtractionError, OSError) as exc:
+        # Fail closed: avoid leaving a runnable pending task when bundle persistence fails.
+        if impl_task.id and not store.delete(impl_task.id):
+            created_task = store.get(impl_task.id)
+            if created_task is not None:
+                store.mark_failed(
+                    created_task,
+                    failure_reason="EXTRACTION_BUNDLE_WRITE_FAILED",
+                )
+        print(f"Error: {exc}")
+        return 1
+
+    source_label = (
+        f"task {source.source_task_id}" if source.source_task_id else f"branch {source.source_branch}"
+    )
+    print(f"✓ Created extract implement task {impl_task.id}")
+    print(f"  Source: {source_label}")
+    print(f"  Selected files: {len(selected_paths)}")
+    print(f"  Bundle: {bundle_dir.relative_to(config.project_dir)}")
+
+    if hasattr(args, "background") and args.background:
+        assert impl_task.id is not None
+        worker_args = argparse.Namespace(**vars(args))
+        worker_args.task_ids = [impl_task.id]
+        return _spawn_background_worker(worker_args, config, task_id=impl_task.id)
+
+    if hasattr(args, "queue") and args.queue:
+        return 0
+
+    print(f"\nRunning implement task {impl_task.id}...")
+    return _run_foreground(
+        config,
+        task_id=impl_task.id,
+        force=getattr(args, "force", False),
+        invocation=_foreground_command_invocation("extract"),
     )
 
 

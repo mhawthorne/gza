@@ -1255,6 +1255,37 @@ gza implement <plan_task_id> [prompt] [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when running the implement task |
 
+### extract
+
+Create a new implementation task from a selected subset of file changes on a source task branch or explicit branch.
+
+```bash
+gza extract SOURCE [PATH ...] [options]
+gza extract --branch BRANCH [PATH ...] [options]
+gza extract SOURCE --files-from FILE [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `SOURCE` | Full prefixed completed/failed code task ID to extract from (alternative to `--branch`) |
+| `PATH ...` | Repo-relative selected files to extract |
+| `--branch BRANCH` | Source branch to extract from (alternative to `SOURCE`) |
+| `--files-from FILE` | Read newline-delimited selected files from file |
+| `--prompt TEXT` | Additional operator intent appended to the drafted prompt |
+| `--review` | Auto-create review task on completion |
+| `--tag TAG` | Add task tag (repeatable) |
+| `--group NAME` | Deprecated alias for `--tag NAME` |
+| `--branch-type TYPE` | Set branch type hint for branch naming |
+| `--base-branch BRANCH` | Override base branch used for source diff and new task branch creation |
+| `--model MODEL` | Override model for this task |
+| `--provider PROVIDER` | Override provider for this task |
+| `--no-learnings` | Skip injecting learnings context |
+| `--queue`, `-q` | Add task to queue without executing immediately |
+| `--background`, `-b` | Run worker in background |
+| `--no-docker` | Run Claude directly instead of in Docker |
+| `--max-turns N` | Override max_turns setting for this run |
+| `--force` | Skip dependency merge precondition checks when running the extracted implement task |
+
 ### advance
 
 Intelligently progress unmerged tasks through their lifecycle. Handles review creation, improve tasks, merging, and resuming failed tasks.

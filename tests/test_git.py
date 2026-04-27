@@ -1339,3 +1339,56 @@ class TestStatusPorcelain:
             result = git.status_porcelain()
 
         assert result == {("R", "new -> name.txt")}
+
+
+class TestExtractionGitHelpers:
+    """Tests for git helpers used by extraction orchestration."""
+
+    def test_ref_exists_uses_rev_parse_verify(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            assert git.ref_exists("main") is True
+            mock_run.assert_called_once_with(
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "main^{commit}",
+                check=False,
+            )
+
+    def test_get_diff_name_status_scoped_to_paths(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="M\tsrc/file.py\n", stderr="")
+            output = git.get_diff_name_status("main...feature", ("src/file.py",))
+            assert output == "M\tsrc/file.py"
+            mock_run.assert_called_once_with(
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "main...feature",
+                "--",
+                "src/file.py",
+                check=False,
+            )
+
+    def test_apply_patch_check_and_apply_patch_file(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+        patch_file = tmp_path / "selected.patch"
+        patch_file.write_text("diff --git a/a b/a\n")
+
+        with patch.object(git, "_run") as mock_run:
+            git.apply_patch_check(patch_file)
+            git.apply_patch_file(patch_file)
+
+            assert mock_run.call_args_list[0].args == ("apply", "--check", str(patch_file))
+            assert mock_run.call_args_list[1].args == ("apply", str(patch_file))

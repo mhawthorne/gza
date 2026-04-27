@@ -455,6 +455,10 @@ class TestDirectExecutionForceDispatch:
                 "gza.cli.main.cmd_implement",
             ),
             (
+                ["gza", "extract", "--branch", "feature/source", "src/file.py", "--force"],
+                "gza.cli.main.cmd_extract",
+            ),
+            (
                 ["gza", "retry", "testproject-1", "--force"],
                 "gza.cli.main.cmd_retry",
             ),

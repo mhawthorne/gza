@@ -477,6 +477,46 @@ class Git:
         result = self._run("diff", revision_range, check=False)
         return result.stdout.strip()
 
+    def ref_exists(self, ref: str) -> bool:
+        """Return whether a ref resolves to a commit."""
+        result = self._run("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+        return result.returncode == 0
+
+    def get_diff_name_status(self, revision_range: str, paths: tuple[str, ...] | list[str] = ()) -> str:
+        """Get machine-readable name/status output for a revision range and optional paths."""
+        args = ["diff", "--name-status", "--find-renames", revision_range]
+        if paths:
+            args.append("--")
+            args.extend(paths)
+        result = self._run(*args, check=False)
+        return result.stdout.strip()
+
+    def get_diff_patch_for_paths(
+        self,
+        revision_range: str,
+        paths: tuple[str, ...] | list[str],
+        *,
+        binary: bool = False,
+    ) -> str:
+        """Get patch text for a revision range scoped to specific paths."""
+        args = ["diff", "--find-renames"]
+        if binary:
+            args.append("--binary")
+        args.append(revision_range)
+        if paths:
+            args.append("--")
+            args.extend(paths)
+        result = self._run(*args, check=False)
+        return result.stdout
+
+    def apply_patch_check(self, patch_file: Path) -> None:
+        """Validate patch application with ``git apply --check``."""
+        self._run("apply", "--check", str(patch_file))
+
+    def apply_patch_file(self, patch_file: Path) -> None:
+        """Apply a patch file with ``git apply``."""
+        self._run("apply", str(patch_file))
+
     def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
         """Check if a branch has been merged into another branch.
 

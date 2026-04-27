@@ -44,6 +44,7 @@ from .execution import (
     cmd_add,
     cmd_comment,
     cmd_edit,
+    cmd_extract,
     cmd_fix,
     cmd_implement,
     cmd_improve,
@@ -1792,6 +1793,108 @@ def main() -> int:
     )
     add_common_args(implement_parser)
 
+    # extract command
+    extract_parser = subparsers.add_parser(
+        "extract",
+        help="Create an implementation task from selected file changes on a source task/branch",
+    )
+    extract_parser.add_argument(
+        "source",
+        nargs="?",
+        help="Source full prefixed task ID to extract from (alternative to --branch)",
+    )
+    extract_parser.add_argument(
+        "paths",
+        nargs="*",
+        help="Repo-relative files to extract from the source diff",
+    )
+    extract_parser.add_argument(
+        "--branch",
+        metavar="BRANCH",
+        help="Source branch to extract from (alternative to SOURCE task ID)",
+    )
+    extract_parser.add_argument(
+        "--files-from",
+        metavar="FILE",
+        help="Read newline-delimited selected files from FILE",
+    )
+    extract_parser.add_argument(
+        "--prompt",
+        metavar="TEXT",
+        help="Additional operator intent appended to the drafted extraction prompt",
+    )
+    extract_parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Auto-create review task on completion",
+    )
+    extract_parser.add_argument(
+        "--group",
+        metavar="NAME",
+        help="Deprecated alias for --tag",
+    )
+    extract_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Attach one or more tags to the new implementation task (repeatable)",
+    )
+    extract_parser.add_argument(
+        "--branch-type",
+        metavar="TYPE",
+        help="Set branch type hint for branch naming (e.g., fix, feature, chore)",
+    )
+    extract_parser.add_argument(
+        "--base-branch",
+        metavar="BRANCH",
+        help="Override base branch for source diff calculation and target task branch creation",
+    )
+    extract_parser.add_argument(
+        "--model",
+        metavar="MODEL",
+        help="Override model for this task (e.g., claude-3-5-haiku-latest)",
+    )
+    extract_parser.add_argument(
+        "--provider",
+        metavar="PROVIDER",
+        choices=["claude", "codex", "gemini"],
+        help="Override provider for this task (claude, codex, or gemini)",
+    )
+    extract_parser.add_argument(
+        "--no-learnings",
+        action="store_true",
+        dest="skip_learnings",
+        help="Skip injecting .gza/learnings.md context into this task's prompt",
+    )
+    extract_parser.add_argument(
+        "--queue", "-q",
+        action="store_true",
+        help="Add task to queue without executing immediately",
+    )
+    extract_parser.add_argument(
+        "--background", "-b",
+        action="store_true",
+        help="Run worker in background (detached mode)",
+    )
+    extract_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run Claude directly instead of in Docker (only with --background or when running immediately)",
+    )
+    extract_parser.add_argument(
+        "--max-turns",
+        type=int,
+        metavar="N",
+        help="Override max_turns setting from gza.yaml for this run",
+    )
+    extract_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip dependency precondition checks when running the extracted implement task",
+    )
+    add_common_args(extract_parser)
+
     # review command
     review_parser = subparsers.add_parser(
         "review",
@@ -2200,6 +2303,8 @@ def main() -> int:
             return cmd_iterate(args)
         elif args.command == "implement":
             return cmd_implement(args)
+        elif args.command == "extract":
+            return cmd_extract(args)
         elif args.command == "review":
             return cmd_review(args)
         elif args.command == "resume":
