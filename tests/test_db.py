@@ -4716,6 +4716,46 @@ class TestSharedDbIsolationAndImportGating:
         assert conflict.returncode == 1
         assert "Conflicting task IDs already exist" in conflict.stderr
 
+    def test_import_local_db_conflicts_on_non_key_field_drift(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: gated\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="gated")
+        legacy_task = legacy_store.add("legacy pending")
+        assert legacy_task.id is not None
+
+        first = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert first.returncode == 0, first.stderr
+
+        conn = sqlite3.connect(local_db)
+        conn.execute("UPDATE tasks SET merge_status = ? WHERE id = ?", ("merged", legacy_task.id))
+        conn.commit()
+        conn.close()
+
+        conflict = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert conflict.returncode == 1
+        assert "Conflicting task IDs already exist" in conflict.stderr
+
     def test_import_local_db_then_add_task_continues_sequence(self, tmp_path: Path) -> None:
         from gza.config import Config
 
@@ -5006,6 +5046,45 @@ class TestSharedDbIsolationAndImportGating:
 
         config = Config.load(project_dir)
         assert config.project_id != "default"
+
+    def test_shared_mode_rejects_project_id_default(self, tmp_path: Path) -> None:
+        from gza.config import Config, ConfigError
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: default\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ConfigError, match="only valid with local DB mode"):
+            Config.load(project_dir)
+
+        is_valid, errors, _warnings = Config.validate(project_dir)
+        assert is_valid is False
+        assert any("only valid with local DB mode" in err for err in errors)
+
+    def test_local_db_mode_allows_project_id_default(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n",
+            encoding="utf-8",
+        )
+
+        config = Config.load(project_dir)
+        assert config.project_id == "default"
+
+        is_valid, errors, _warnings = Config.validate(project_dir)
+        assert is_valid is True
+        assert errors == []
 
     def test_v35_to_v36_migration_rebuilds_project_scoped_keys(self, tmp_path: Path) -> None:
         """Auto-migrating v35 must rebuild keys/fks/uniques to isolate projects."""

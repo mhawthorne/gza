@@ -773,6 +773,7 @@ class TestCleanCommand:
         config_path.write_text(
             f"project_name: test-project\n"
             "project_id: default\n"
+            "db_path: .gza/gza.db\n"
             f"worktree_dir: {wt_base}\n"
         )
         config = Config.load(tmp_path)
@@ -817,6 +818,7 @@ class TestCleanCommand:
         config_path.write_text(
             f"project_name: test-project\n"
             "project_id: default\n"
+            "db_path: .gza/gza.db\n"
             f"worktree_dir: {wt_base}\n"
         )
         config = Config.load(tmp_path)

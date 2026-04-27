@@ -759,6 +759,11 @@ class Config:
                     "Run 'uv run gza migrate --import-local-db --yes' to persist it.",
                     file=sys.stderr,
                 )
+        if resolved_db != local_db_path and project_id_raw == "default":
+            raise ConfigError(
+                "'project_id: default' is only valid with local DB mode (db_path: .gza/gza.db). "
+                "Set a unique project_id for shared DB mode or omit project_id to derive one."
+            )
 
         # Parse and validate project_prefix
         project_prefix_raw = data.get("project_prefix", "")
@@ -1522,6 +1527,31 @@ class Config:
 
         if "db_path" in data and data["db_path"] is not None and not isinstance(data["db_path"], str):
             errors.append("'db_path' must be a string")
+
+        project_name_raw = data.get("project_name")
+        project_name_for_id = str(project_name_raw) if isinstance(project_name_raw, str) else ""
+        db_path_raw = data.get("db_path")
+        local_db_path = (project_dir / DEFAULT_DB_FILE).resolve()
+        if isinstance(db_path_raw, str) and db_path_raw:
+            resolved_db = Path(os.path.expanduser(db_path_raw))
+            if not resolved_db.is_absolute():
+                resolved_db = project_dir / resolved_db
+            resolved_db = resolved_db.resolve()
+        else:
+            resolved_db = Path(os.path.expanduser("~/.gza/gza.db")).resolve()
+        project_id_effective = data.get("project_id")
+        if not isinstance(project_id_effective, str) or not project_id_effective:
+            if resolved_db == local_db_path:
+                project_id_effective = "default"
+            elif project_name_for_id:
+                project_id_effective = _generate_project_id(project_dir, project_name_for_id)
+            else:
+                project_id_effective = ""
+        if resolved_db != local_db_path and project_id_effective == "default":
+            errors.append(
+                "'project_id: default' is only valid with local DB mode (db_path: .gza/gza.db). "
+                "Set a unique project_id for shared DB mode or omit project_id to derive one."
+            )
 
         if "project_prefix" in data and data["project_prefix"]:
             prefix_val = data["project_prefix"]

@@ -4123,6 +4123,18 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
             "tasks_imported": 0,
         }
 
+    task_import_columns = (
+        "id", "prompt", "status", "task_type", "slug", "branch", "log_file", "report_file", "based_on",
+        "has_commits", "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns",
+        "num_turns_reported", "num_turns_computed", "attach_count", "attach_duration_seconds", "cost_usd",
+        "created_at", "started_at", "running_pid", "completed_at", "group", "depends_on", "spec", "create_review",
+        "same_branch", "task_type_hint", "output_content", "session_id", "pr_number", "model", "provider",
+        "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
+        "merge_status", "merged_at", "failure_reason", "skip_learnings", "diff_files_changed", "diff_lines_added",
+        "diff_lines_removed", "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
+    )
+    task_import_columns_sql = ", ".join(f'"{c}"' if c == "group" else c for c in task_import_columns)
+
     local_conn = sqlite3.connect(f"file:{local_db}?mode=ro", uri=True)
     local_conn.row_factory = sqlite3.Row
     try:
@@ -4130,7 +4142,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         with store._connect() as shared_conn:
             shared_conn.execute("ATTACH DATABASE ? AS legacy_local", (str(local_db),))
             local_task_rows = local_conn.execute(
-                "SELECT id, prompt, status, task_type, created_at FROM tasks ORDER BY id"
+                f"SELECT {task_import_columns_sql} FROM tasks ORDER BY id"
             ).fetchall()
             local_ids = [str(row["id"]) for row in local_task_rows]
 
@@ -4139,7 +4151,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                 placeholders = ",".join(["?"] * len(local_ids))
                 existing_rows = shared_conn.execute(
                     f"""
-                    SELECT id, prompt, status, task_type, created_at
+                    SELECT {task_import_columns_sql}
                     FROM tasks
                     WHERE project_id = ? AND id IN ({placeholders})
                     """,
@@ -4150,12 +4162,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                     existing = existing_by_id.get(str(row["id"]))
                     if existing is None:
                         continue
-                    if (
-                        existing["prompt"] != row["prompt"]
-                        or existing["status"] != row["status"]
-                        or existing["task_type"] != row["task_type"]
-                        or existing["created_at"] != row["created_at"]
-                    ):
+                    if any(existing[column] != row[column] for column in task_import_columns):
                         conflicts.append(str(row["id"]))
             if conflicts:
                 sample = ", ".join(conflicts[:5])
@@ -4196,26 +4203,12 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
             shared_conn.execute("BEGIN")
             try:
                 shared_conn.execute(
-                    """
+                    f"""
                     INSERT OR IGNORE INTO tasks (
-                        project_id, id, prompt, status, task_type, slug, branch, log_file, report_file, based_on,
-                        has_commits, duration_seconds, num_steps_reported, num_steps_computed, num_turns,
-                        num_turns_reported, num_turns_computed, attach_count, attach_duration_seconds, cost_usd,
-                        created_at, started_at, running_pid, completed_at, "group", depends_on, spec, create_review,
-                        same_branch, task_type_hint, output_content, session_id, pr_number, model, provider,
-                        provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
-                        merge_status, merged_at, failure_reason, skip_learnings, diff_files_changed, diff_lines_added,
-                        diff_lines_removed, review_cleared_at, review_score, log_schema_version, execution_mode, base_branch
+                        project_id, {task_import_columns_sql}
                     )
                     SELECT
-                        ?, id, prompt, status, task_type, slug, branch, log_file, report_file, based_on,
-                        has_commits, duration_seconds, num_steps_reported, num_steps_computed, num_turns,
-                        num_turns_reported, num_turns_computed, attach_count, attach_duration_seconds, cost_usd,
-                        created_at, started_at, running_pid, completed_at, "group", depends_on, spec, create_review,
-                        same_branch, task_type_hint, output_content, session_id, pr_number, model, provider,
-                        provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
-                        merge_status, merged_at, failure_reason, skip_learnings, diff_files_changed, diff_lines_added,
-                        diff_lines_removed, review_cleared_at, review_score, log_schema_version, execution_mode, base_branch
+                        ?, {task_import_columns_sql}
                     FROM legacy_local.tasks
                     """,
                     (store._project_id,),

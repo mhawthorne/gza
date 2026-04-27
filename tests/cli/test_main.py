@@ -594,6 +594,7 @@ class TestIterateBackgroundForceDispatch:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
             "project_id: default\n"
+            "db_path: .gza/gza.db\n"
             "iterate_max_iterations: 6\n"
         )
         config = Config.load(tmp_path)
