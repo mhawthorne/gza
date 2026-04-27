@@ -682,14 +682,12 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         registry.register(worker_metadata)
 
         if not quiet:
-            print(f"Started worker {worker_id} (PID {pid})")
-            print(f"  Task: {selected_task.id}")
+            print(f"Started task {selected_task.id} in background (PID {pid})")
             if selected_task.prompt:
                 prompt_display = truncate(selected_task.prompt, MAX_PROMPT_DISPLAY)
                 print(f"  Prompt: {prompt_display}")
             print()
-            print("Use 'gza ps' to view running workers")
-            print(f"Use 'gza log -w {worker_id} -f' to follow output")
+            print(f"Use 'gza log {selected_task.id} -f' to follow progress")
 
         return 0
 
@@ -891,14 +889,12 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         registry.register(worker)
 
         if not quiet:
-            print(f"Started worker {worker_id} (PID {proc.pid})")
-            print(f"  Task: {task.id} (resuming)")
+            print(f"Started task {task.id} in background (resuming, PID {proc.pid})")
             if task.prompt:
                 prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
                 print(f"  Prompt: {prompt_display}")
             print()
-            print("Use 'gza ps' to view running workers")
-            print(f"Use 'gza log -w {worker_id} -f' to follow output")
+            print(f"Use 'gza log {task.id} -f' to follow progress")
 
         return 0
 
@@ -956,13 +952,11 @@ def _spawn_background_iterate_worker(
         )
         registry.register(worker)
         if quiet:
-            print(f"Started iterate worker {worker_id} (PID {proc.pid}) for task {impl_task.id}")
+            print(f"Started task {impl_task.id} in background (PID {proc.pid})")
         else:
-            print(f"Started iterate worker {worker_id} (PID {proc.pid})")
-            print(f"  Task: {impl_task.id}")
+            print(f"Started task {impl_task.id} in background (PID {proc.pid})")
             print()
-            print("Use 'gza ps' to view running workers")
-            print(f"Use 'gza log -w {worker_id} -f' to follow output")
+            print(f"Use 'gza log {impl_task.id} -f' to follow progress")
         return 0
     except Exception as e:
         print(f"Error spawning background iterate worker: {e}")
