@@ -43,6 +43,7 @@ from ._common import (
     _spawn_background_resume_worker,
     _spawn_background_worker,
     _spawn_background_workers,
+    format_no_runnable_message_for_tags,
     format_review_outcome,
     get_review_verdict,
     get_store,
@@ -215,12 +216,23 @@ def cmd_run(args: argparse.Namespace) -> int:
                 next_task = store.get_next_pending(tags=selected_tags, any_tag=any_tag)
                 if not next_task:
                     if tasks_completed == 0:
-                        print(f"No pending tasks found matching tags: {', '.join(selected_tags)}")
+                        print(
+                            format_no_runnable_message_for_tags(
+                                store,
+                                selected_tags,
+                                any_tag=any_tag,
+                            )
+                        )
                     else:
                         elapsed = format_duration(time.time() - start_time)
                         print(
                             f"\nCompleted {tasks_completed} task(s) in {elapsed}. "
-                            f"No more pending tasks matching tags: {', '.join(selected_tags)}."
+                            + format_no_runnable_message_for_tags(
+                                store,
+                                selected_tags,
+                                any_tag=any_tag,
+                                exhausted=True,
+                            )
                         )
                     break
                 worker.task_id = next_task.id
@@ -251,7 +263,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                     if selected_tags:
                         print(
                             f"\nCompleted {tasks_completed} task(s) in {elapsed}. "
-                            f"No more pending tasks matching tags: {', '.join(selected_tags)}."
+                            + format_no_runnable_message_for_tags(
+                                store,
+                                selected_tags,
+                                any_tag=any_tag,
+                                exhausted=True,
+                            )
                         )
                     else:
                         print(f"\nCompleted {tasks_completed} task(s) in {elapsed}. No more pending tasks.")

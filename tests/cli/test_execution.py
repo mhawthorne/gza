@@ -1344,6 +1344,48 @@ class TestWorkCommandMultiTask:
         assert "Traceback" not in result.stdout
         assert "Traceback" not in result.stderr
 
+    def test_work_tag_reports_blocked_when_matching_pending_tasks_are_not_runnable(self, tmp_path: Path):
+        """work --tag should distinguish blocked matching tasks from an empty pending set."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        prereq = store.add("Prerequisite task")
+        blocked = store.add("Blocked release task", tags=("release-1",), depends_on=prereq.id)
+        assert prereq.id is not None
+        assert blocked.id is not None
+
+        result = run_gza("work", "--tag", "release-1", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No runnable tasks found matching tags: release-1." in result.stdout
+        assert "blocked by dependencies" in result.stdout
+        assert "No pending tasks found matching tags: release-1" not in result.stdout
+
+    def test_work_background_tag_reports_blocked_when_matching_pending_tasks_are_not_runnable(self, tmp_path: Path):
+        """work --background --tag should report blocked matching tasks, not missing pending tasks."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        prereq = store.add("Prerequisite task")
+        blocked = store.add("Blocked release task", tags=("release-1",), depends_on=prereq.id)
+        assert prereq.id is not None
+        assert blocked.id is not None
+
+        result = run_gza(
+            "work",
+            "--background",
+            "--no-docker",
+            "--tag",
+            "release-1",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "No runnable tasks found matching tags: release-1." in result.stdout
+        assert "blocked by dependencies" in result.stdout
+        assert "No pending tasks found matching tags: release-1" not in result.stdout
+
     def test_work_allows_failed_pr_required_task_with_pr_flag(self, tmp_path: Path):
         """work <task> --pr should allow retrying failed PR_REQUIRED tasks."""
         from gza.cli.execution import cmd_run

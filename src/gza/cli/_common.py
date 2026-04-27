@@ -120,6 +120,35 @@ def validate_cli_tag_values(values: tuple[str, ...] | list[str] | None) -> tuple
     return tuple(_validate_tag_value(raw) for raw in (values or ()))
 
 
+def format_no_runnable_message_for_tags(
+    store: SqliteTaskStore,
+    tags: tuple[str, ...],
+    *,
+    any_tag: bool = False,
+    exhausted: bool = False,
+) -> str:
+    """Render precise tag-filtered empty-pickup messaging.
+
+    Distinguishes between "no matching pending tasks" and
+    "matching pending tasks exist but are dependency-blocked".
+    """
+    tag_text = ", ".join(tags)
+    has_matching_pending = bool(store.get_pending(limit=1, tags=tags, any_tag=any_tag))
+    if has_matching_pending:
+        if exhausted:
+            return (
+                f"No more runnable tasks matching tags: {tag_text}. "
+                "Remaining matching pending tasks are blocked by dependencies."
+            )
+        return (
+            f"No runnable tasks found matching tags: {tag_text}. "
+            "Matching pending tasks are blocked by dependencies."
+        )
+    if exhausted:
+        return f"No more pending tasks matching tags: {tag_text}."
+    return f"No pending tasks found matching tags: {tag_text}"
+
+
 # Matches "{prefix}-{suffix}" where prefix is 1-12 lowercase alphanumeric chars.
 # This is tighter than `"-" in arg` (which also matches branch names like "feature-foo").
 _TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
@@ -469,7 +498,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         selected_task = store.get_next_pending(tags=selected_tags, any_tag=any_tag)
         if not selected_task:
             if selected_tags:
-                print(f"No pending tasks found matching tags: {', '.join(selected_tags)}")
+                print(format_no_runnable_message_for_tags(store, selected_tags, any_tag=any_tag))
             else:
                 print("No pending tasks found")
             return 0
@@ -962,6 +991,9 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
 
     if selected_tags:
         pending_tasks = store.get_pending_pickup(limit=count, tags=selected_tags, any_tag=any_tag)
+        if not pending_tasks:
+            print(format_no_runnable_message_for_tags(store, selected_tags, any_tag=any_tag))
+            return 0
         spawned_count = 0
         for task in pending_tasks:
             if task.id is None:
