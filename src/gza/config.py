@@ -243,6 +243,32 @@ def _read_yaml_dict(path: Path) -> dict:
     return data
 
 
+def persist_project_id_if_missing(project_dir: Path, project_id: str) -> bool:
+    """Persist project_id into gza.yaml if it is currently absent.
+
+    Returns True when the file was updated, False when project_id already exists.
+    """
+    config_path = Config.config_path(project_dir)
+    data = _read_yaml_dict(config_path)
+    existing = data.get("project_id")
+    if isinstance(existing, str) and existing.strip():
+        return False
+
+    lines = config_path.read_text(encoding="utf-8").splitlines()
+    insertion = f"project_id: {project_id}"
+    insert_at = None
+    for idx, line in enumerate(lines):
+        if re.match(r"^\s*project_name\s*:", line):
+            insert_at = idx + 1
+            break
+    if insert_at is None:
+        lines.append(insertion)
+    else:
+        lines.insert(insert_at, insertion)
+    config_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return True
+
+
 def _remove_source_subtree(source_map: dict[str, str], prefix: str) -> None:
     keys_to_delete = [key for key in source_map if key == prefix or key.startswith(f"{prefix}.")]
     for key in keys_to_delete:
@@ -706,6 +732,15 @@ class Config:
                 raise ConfigError("'db_path' must be a string")
 
         project_name_raw = data["project_name"]
+        local_db_path = (project_dir / DEFAULT_DB_FILE).resolve()
+        if db_path_raw:
+            resolved_db = Path(os.path.expanduser(str(db_path_raw)))
+            if not resolved_db.is_absolute():
+                resolved_db = project_dir / resolved_db
+            resolved_db = resolved_db.resolve()
+        else:
+            resolved_db = Path(os.path.expanduser("~/.gza/gza.db")).resolve()
+
         project_id_raw = data.get("project_id", "")
         if project_id_raw:
             if not isinstance(project_id_raw, str):
@@ -713,14 +748,6 @@ class Config:
             if not _PROJECT_ID_RE.match(project_id_raw):
                 raise ConfigError("'project_id' must be 1-64 lowercase alphanumeric characters")
         else:
-            local_db_path = (project_dir / DEFAULT_DB_FILE).resolve()
-            if db_path_raw:
-                resolved_db = Path(os.path.expanduser(str(db_path_raw)))
-                if not resolved_db.is_absolute():
-                    resolved_db = project_dir / resolved_db
-                resolved_db = resolved_db.resolve()
-            else:
-                resolved_db = Path(os.path.expanduser("~/.gza/gza.db")).resolve()
             if resolved_db == local_db_path:
                 project_id_raw = "default"
             else:
@@ -729,7 +756,7 @@ class Config:
                 print(
                     "Warning: 'project_id' is missing in gza.yaml; "
                     f"using derived project_id '{project_id_raw}'. "
-                    "To persist identity across path moves/clones, set project_id explicitly in gza.yaml.",
+                    "Run 'uv run gza migrate --import-local-db --yes' to persist it.",
                     file=sys.stderr,
                 )
 

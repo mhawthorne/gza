@@ -3,8 +3,9 @@
 # Project name (required) - used for branch prefixes and Docker image naming
 project_name: my-project
 
-# Stable project identity used to scope rows in shared task DBs.
-# If omitted, gza derives one from project path/name and warns.
+# Project identity used to scope rows in shared task DBs.
+# If omitted, gza derives one from project path/name and warns; run
+# "uv run gza migrate --import-local-db --yes" once to persist it.
 # project_id: myproject01
 
 # Optional local override file: gza.local.yaml (gitignored)

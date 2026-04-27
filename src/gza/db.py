@@ -1654,8 +1654,6 @@ class SqliteTaskStore:
     @classmethod
     def from_config(cls, config: "Config", *, allow_legacy_local_db: bool = False) -> "SqliteTaskStore":
         """Create a store from a loaded Config instance."""
-        from .config import ConfigError
-
         project_id = getattr(config, "project_id", None)
         if not isinstance(project_id, str) or not project_id:
             project_id = "default"
@@ -1668,6 +1666,8 @@ class SqliteTaskStore:
             active_db = config.db_path
             if local_db.exists() and local_db.resolve() != active_db.resolve():
                 if not _marker_matches_shared_db(project_dir, local_db, active_db):
+                    from .config import ConfigError
+
                     raise ConfigError(
                         "Legacy local DB detected at "
                         f"{local_db} while active db_path is {active_db}. "
@@ -4182,6 +4182,16 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                 "SELECT COUNT(*) FROM tasks WHERE project_id = ?",
                 (store._project_id,),
             ).fetchone()[0]
+            max_imported_suffix = 0
+            prefix_token = f"{store._prefix}-"
+            for row in local_task_rows:
+                task_id = str(row["id"])
+                if not task_id.startswith(prefix_token):
+                    continue
+                suffix = task_id[len(prefix_token):]
+                if not suffix.isdigit():
+                    continue
+                max_imported_suffix = max(max_imported_suffix, int(suffix))
 
             shared_conn.execute("BEGIN")
             try:
@@ -4220,33 +4230,115 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                         (store._project_id,),
                     )
                 if _table_exists(local_conn, "run_steps"):
-                    shared_conn.execute(
+                    run_step_rows = shared_conn.execute(
                         """
-                        INSERT OR IGNORE INTO run_steps(
-                            project_id, run_id, step_index, step_id, provider, message_role, message_text,
-                            started_at, completed_at, outcome, summary, legacy_turn_id, legacy_event_id
-                        )
-                        SELECT
-                            ?, run_id, step_index, step_id, provider, message_role, message_text,
-                            started_at, completed_at, outcome, summary, legacy_turn_id, legacy_event_id
+                        SELECT id, run_id, step_index, step_id, provider, message_role, message_text,
+                               started_at, completed_at, outcome, summary, legacy_turn_id, legacy_event_id
                         FROM legacy_local.run_steps
-                        """,
-                        (store._project_id,),
-                    )
-                if _table_exists(local_conn, "run_substeps"):
-                    shared_conn.execute(
+                        ORDER BY id
                         """
-                        INSERT OR IGNORE INTO run_substeps(
-                            project_id, run_id, step_id, substep_index, substep_id, type, source, call_id,
-                            payload_json, timestamp, legacy_turn_id, legacy_event_id
+                    ).fetchall()
+                    run_step_id_map: dict[int, int] = {}
+                    for row in run_step_rows:
+                        old_step_id = int(row["id"])
+                        insert_cur = shared_conn.execute(
+                            """
+                            INSERT OR IGNORE INTO run_steps(
+                                project_id, run_id, step_index, step_id, provider, message_role, message_text,
+                                started_at, completed_at, outcome, summary, legacy_turn_id, legacy_event_id
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                store._project_id,
+                                row["run_id"],
+                                row["step_index"],
+                                row["step_id"],
+                                row["provider"],
+                                row["message_role"],
+                                row["message_text"],
+                                row["started_at"],
+                                row["completed_at"],
+                                row["outcome"],
+                                row["summary"],
+                                row["legacy_turn_id"],
+                                row["legacy_event_id"],
+                            ),
                         )
-                        SELECT
-                            ?, run_id, step_id, substep_index, substep_id, type, source, call_id,
-                            payload_json, timestamp, legacy_turn_id, legacy_event_id
+                        if insert_cur.rowcount > 0 and insert_cur.lastrowid is not None:
+                            run_step_id_map[old_step_id] = int(insert_cur.lastrowid)
+                            continue
+
+                        existing = shared_conn.execute(
+                            """
+                            SELECT id
+                            FROM run_steps
+                            WHERE project_id = ? AND run_id = ? AND step_index = ? AND step_id = ?
+                            """,
+                            (store._project_id, row["run_id"], row["step_index"], row["step_id"]),
+                        ).fetchone()
+                        if existing is None:
+                            raise ValueError(
+                                "Failed to resolve imported run_steps row for "
+                                f"run_id={row['run_id']} step_id={row['step_id']}"
+                            )
+                        run_step_id_map[old_step_id] = int(existing["id"])
+                else:
+                    run_step_id_map = {}
+                if _table_exists(local_conn, "run_substeps"):
+                    run_substep_rows = shared_conn.execute(
+                        """
+                        SELECT id, run_id, step_id, substep_index, substep_id, type, source, call_id,
+                               payload_json, timestamp, legacy_turn_id, legacy_event_id
                         FROM legacy_local.run_substeps
-                        """,
-                        (store._project_id,),
-                    )
+                        ORDER BY id
+                        """
+                    ).fetchall()
+                    for row in run_substep_rows:
+                        legacy_step_id = int(row["step_id"])
+                        mapped_step_id = run_step_id_map.get(legacy_step_id)
+                        if mapped_step_id is None:
+                            raise ValueError(
+                                "Legacy run_substeps row references unknown run_steps.id "
+                                f"{legacy_step_id} in local DB import."
+                            )
+                        step_row = shared_conn.execute(
+                            "SELECT project_id, run_id FROM run_steps WHERE id = ?",
+                            (mapped_step_id,),
+                        ).fetchone()
+                        if step_row is None or str(step_row["project_id"]) != store._project_id:
+                            raise ValueError(
+                                "Imported run_substeps row could not be linked to a project-scoped run_steps row "
+                                f"(legacy step_id={legacy_step_id}, mapped step_id={mapped_step_id})."
+                            )
+                        if str(step_row["run_id"]) != str(row["run_id"]):
+                            raise ValueError(
+                                "Imported run_substeps row run_id mismatch after step remap: "
+                                f"substep run_id={row['run_id']} step run_id={step_row['run_id']}"
+                            )
+                        shared_conn.execute(
+                            """
+                            INSERT OR IGNORE INTO run_substeps(
+                                project_id, run_id, step_id, substep_index, substep_id, type, source, call_id,
+                                payload_json, timestamp, legacy_turn_id, legacy_event_id
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                store._project_id,
+                                row["run_id"],
+                                mapped_step_id,
+                                row["substep_index"],
+                                row["substep_id"],
+                                row["type"],
+                                row["source"],
+                                row["call_id"],
+                                row["payload_json"],
+                                row["timestamp"],
+                                row["legacy_turn_id"],
+                                row["legacy_event_id"],
+                            ),
+                        )
                 if _table_exists(local_conn, "task_comments"):
                     shared_conn.execute(
                         """
@@ -4265,6 +4357,17 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                         )
                         """,
                         (store._project_id, store._project_id),
+                    )
+                if max_imported_suffix > 0:
+                    shared_conn.execute(
+                        """
+                        INSERT INTO project_sequences(project_id, prefix, next_seq)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(project_id) DO UPDATE SET
+                            prefix = excluded.prefix,
+                            next_seq = MAX(project_sequences.next_seq, excluded.next_seq)
+                        """,
+                        (store._project_id, store._prefix, max_imported_suffix),
                     )
 
                 shared_conn.execute("COMMIT")

@@ -17,7 +17,7 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `project_id` | String | *(derived from project path/name)* | Stable project identity used to scope rows inside shared DB mode. |
+| `project_id` | String | *(local DB: `default`; shared DB: derived from project path/name when omitted)* | Project identity used to scope rows in shared DB mode. Derived values are not stable across path moves/clones until persisted in `gza.yaml`. |
 | `project_prefix` | String | *(project_name)* | Short prefix for task IDs (1–12 chars, lowercase alphanumeric only — no hyphens, since hyphen is the separator in task IDs like `gza-1234`). Defaults to `project_name`. |
 | `db_path` | String | `~/.gza/gza.db` | Task DB path. If a legacy local `.gza/gza.db` exists, import it explicitly with `gza migrate --import-local-db`. |
 | `tasks_file` | String | `tasks.yaml` | Path to legacy tasks file |
@@ -1383,7 +1383,7 @@ gza migrate [--status] [--dry-run] [--yes/-y] [--import-local-db]
 | `--status` | Show current schema version and list pending migrations without running anything |
 | `--dry-run` | Preview what the migration would change without writing any data |
 | `--yes`, `-y` | Skip the confirmation prompt and run migrations immediately |
-| `--import-local-db` | Import legacy project-local `.gza/gza.db` rows into active shared `db_path` and record an idempotent marker |
+| `--import-local-db` | Import legacy project-local `.gza/gza.db` rows into active shared `db_path`, persist missing `project_id` once, and record an idempotent marker |
 
 When run without flags, `gza migrate` prompts for confirmation before applying migrations. Each migration is atomic (wrapped in BEGIN/COMMIT/ROLLBACK) and creates a pre-migration backup (for example, `<db_path>.backup.pre-v25.db` and `<db_path>.backup.pre-v26.db`). It is safe to re-run: calling it on an already-migrated database is a no-op.
 
