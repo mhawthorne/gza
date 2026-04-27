@@ -199,6 +199,51 @@ tasks:
         assert len(errors) == 1
         assert "invalid task type" in errors[0].message.lower()
 
+    def test_parse_rejects_task_level_scalar_tags(self, tmp_path: Path):
+        """Task-level tags must be a list of strings."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+tasks:
+  - prompt: "Task with scalar tags"
+    tags: release-1.2
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 1
+        assert errors[0].task_index == 1
+        assert errors[0].message == "'tags' must be a list of strings"
+
+    def test_parse_rejects_file_level_scalar_tags(self, tmp_path: Path):
+        """File-level tags must be a list of strings."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+tags: release-1.2
+tasks:
+  - prompt: "Task"
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 1
+        assert errors[0].task_index is None
+        assert errors[0].message == "'tags' must be a list of strings"
+
+    def test_parse_rejects_non_string_tag_entries(self, tmp_path: Path):
+        """Tags entries must all be strings."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+tasks:
+  - prompt: "Task with invalid tags"
+    tags: ["release-1.2", 123]
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 1
+        assert errors[0].task_index == 1
+        assert errors[0].message == "'tags' must contain only strings"
+
 
 class TestValidateImport:
     """Tests for validate_import."""

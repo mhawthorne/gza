@@ -13,6 +13,8 @@ _TAG_WS_RE = re.compile(r"\s+")
 
 
 def _normalize_tag(tag: str) -> str:
+    if not isinstance(tag, str):
+        raise ValueError("tag must be a string")
     normalized = _TAG_WS_RE.sub(" ", tag.strip()).lower()
     if not normalized:
         raise ValueError("tag must not be empty")
@@ -22,7 +24,7 @@ def _normalize_tag(tag: str) -> str:
 def _normalize_tags(tags: tuple[str, ...]) -> tuple[str, ...]:
     normalized: set[str] = set()
     for tag in tags:
-        normalized.add(_normalize_tag(str(tag)))
+        normalized.add(_normalize_tag(tag))
     return tuple(sorted(normalized))
 
 
@@ -54,6 +56,20 @@ class ValidationError:
     task_index: int | None = None  # None for file-level errors
 
 
+def _parse_tags_field(raw_tags: Any, *, task_index: int | None = None) -> tuple[tuple[str, ...], list[ValidationError]]:
+    """Validate and parse a tags field value."""
+    if raw_tags is None:
+        return (), []
+
+    if not isinstance(raw_tags, list):
+        return (), [ValidationError("'tags' must be a list of strings", task_index=task_index)]
+
+    if any(not isinstance(tag, str) for tag in raw_tags):
+        return (), [ValidationError("'tags' must contain only strings", task_index=task_index)]
+
+    return tuple(raw_tags), []
+
+
 def parse_import_file(
     file_path: Path,
 ) -> tuple[list[ImportTask], str | None, str | None, list[ValidationError]]:
@@ -81,7 +97,10 @@ def parse_import_file(
 
     # Extract file-level defaults
     default_group = data.get("group")
-    default_tags = tuple(data.get("tags", []) or ())
+    default_tags: tuple[str, ...] = ()
+    if "tags" in data:
+        default_tags, tag_errors = _parse_tags_field(data["tags"])
+        errors.extend(tag_errors)
     if default_group is not None:
         default_tags = (*default_tags, default_group)
     default_spec = data.get("spec")
@@ -149,7 +168,9 @@ def _parse_task(
     if "group" in data:
         group = data["group"]  # Can be None to clear default
     if "tags" in data:
-        tags = list(data["tags"] or [])
+        parsed_tags, tag_errors = _parse_tags_field(data["tags"], task_index=index)
+        errors.extend(tag_errors)
+        tags = list(parsed_tags)
     if group is not None:
         tags.append(group)
 
