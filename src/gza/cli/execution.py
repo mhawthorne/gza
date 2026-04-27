@@ -43,10 +43,12 @@ from ._common import (
     _spawn_background_resume_worker,
     _spawn_background_worker,
     _spawn_background_workers,
+    format_no_runnable_message_for_tags,
     format_review_outcome,
     get_review_verdict,
     get_store,
     get_task_step_count,
+    parse_cli_tag_filters,
     resolve_comments_improve_action,
     resolve_id,
     resolve_improve_action,
@@ -66,6 +68,15 @@ def _foreground_command_invocation(command: str) -> RunInvocationContext:
     )
 
 
+def _selected_tag_filters(args: argparse.Namespace) -> tuple[tuple[str, ...] | None, bool]:
+    return parse_cli_tag_filters(args)
+
+
+def _selected_tags_for_new_task(args: argparse.Namespace) -> tuple[str, ...]:
+    tags, _any_tag = parse_cli_tag_filters(args)
+    return tags or ()
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run the next pending task(s) or specific tasks."""
     config = Config.load(args.project_dir)
@@ -76,6 +87,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     if hasattr(args, 'max_turns') and args.max_turns is not None:
         config.max_steps = args.max_turns
         config.max_turns = args.max_turns
+    try:
+        selected_tags, any_tag = _selected_tag_filters(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     # Handle background mode
     if args.background:
@@ -100,8 +116,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             _print_orphaned_warning(orphaned)
             print()
     task_id_for_registration = None
-    selected_group = getattr(args, "group", None)
-
     # Check if specific task IDs were provided
     if hasattr(args, 'task_ids') and args.task_ids:
         # Resolve and validate all task IDs first
@@ -126,7 +140,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         task_id_for_registration = args.task_ids[0]
     else:
         # For loop mode, we'll register with the first task we're about to run
-        next_task = store.get_next_pending(group=selected_group)
+        next_task = store.get_next_pending(tags=selected_tags, any_tag=any_tag)
         if next_task:
             task_id_for_registration = next_task.id
 
@@ -198,16 +212,27 @@ def cmd_run(args: argparse.Namespace) -> int:
         for i in range(count):
             if tasks_completed > 0:
                 print(task_separator)
-            if selected_group:
-                next_task = store.get_next_pending(group=selected_group)
+            if selected_tags:
+                next_task = store.get_next_pending(tags=selected_tags, any_tag=any_tag)
                 if not next_task:
                     if tasks_completed == 0:
-                        print(f"No pending tasks found in group '{selected_group}'")
+                        print(
+                            format_no_runnable_message_for_tags(
+                                store,
+                                selected_tags,
+                                any_tag=any_tag,
+                            )
+                        )
                     else:
                         elapsed = format_duration(time.time() - start_time)
                         print(
                             f"\nCompleted {tasks_completed} task(s) in {elapsed}. "
-                            f"No more pending tasks in group '{selected_group}'."
+                            + format_no_runnable_message_for_tags(
+                                store,
+                                selected_tags,
+                                any_tag=any_tag,
+                                exhausted=True,
+                            )
                         )
                     break
                 worker.task_id = next_task.id
@@ -232,13 +257,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             if i < count - 1:  # Not the last iteration
                 from ..db import SqliteTaskStore
                 store = SqliteTaskStore(config.db_path)
-                next_task = store.get_next_pending(group=selected_group)
+                next_task = store.get_next_pending(tags=selected_tags, any_tag=any_tag)
                 if not next_task:
                     elapsed = format_duration(time.time() - start_time)
-                    if selected_group:
+                    if selected_tags:
                         print(
                             f"\nCompleted {tasks_completed} task(s) in {elapsed}. "
-                            f"No more pending tasks in group '{selected_group}'."
+                            + format_no_runnable_message_for_tags(
+                                store,
+                                selected_tags,
+                                any_tag=any_tag,
+                                exhausted=True,
+                            )
                         )
                     else:
                         print(f"\nCompleted {tasks_completed} task(s) in {elapsed}. No more pending tasks.")
@@ -319,7 +349,11 @@ def cmd_implement(args: argparse.Namespace) -> int:
         else:
             prompt = f"Implement plan from task {plan_task.id}"
 
-    group = args.group if hasattr(args, 'group') and args.group else None
+    try:
+        tags = _selected_tags_for_new_task(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
     create_review = args.review if hasattr(args, 'review') and args.review else False
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
     branch_type = args.branch_type if hasattr(args, 'branch_type') and args.branch_type else None
@@ -331,7 +365,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
         prompt,
         task_type="implement",
         depends_on=plan_task.id,
-        group=group,
+        tags=tags,
         create_review=create_review,
         same_branch=same_branch,
         task_type_hint=branch_type,
@@ -387,7 +421,11 @@ def cmd_add(args: argparse.Namespace) -> int:
         return 1
 
     # Get optional parameters
-    group = args.group if hasattr(args, 'group') and args.group else None
+    try:
+        tags = _selected_tags_for_new_task(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
     depends_on = resolve_id(config, args.depends_on) if hasattr(args, 'depends_on') and args.depends_on else None
     based_on = resolve_id(config, args.based_on) if hasattr(args, 'based_on') and args.based_on else None
     create_review = args.review if hasattr(args, 'review') and args.review else False
@@ -448,7 +486,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             prompt_text,
             task_type=task_type,
             based_on=based_on,
-            group=group,
+            tags=tags,
             depends_on=depends_on,
             create_review=create_review,
             same_branch=same_branch,
@@ -471,7 +509,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type=task_type,
             based_on=based_on,
             spec=spec,
-            group=group,
+            tags=tags,
             depends_on=depends_on,
             create_review=create_review,
             same_branch=same_branch,
@@ -493,7 +531,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             args.prompt,
             task_type=task_type,
             based_on=based_on,
-            group=group,
+            tags=tags,
             depends_on=depends_on,
             create_review=create_review,
             same_branch=same_branch,
@@ -524,19 +562,97 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if task.status != "pending":
         print(f"Error: Can only edit pending tasks (task is {task.status})")
         return 1
+    assert task.id is not None
+    task_row_id = task.id
 
-    # Handle --group flag
+    tag_mutation_flags: list[str] = []
+    if getattr(args, "clear_tags", False):
+        tag_mutation_flags.append("--clear-tags")
+    if getattr(args, "set_tags", None) is not None:
+        tag_mutation_flags.append("--set-tags")
+    if getattr(args, "add_tags", None):
+        tag_mutation_flags.append("--add-tag")
+    if getattr(args, "remove_tags", None):
+        tag_mutation_flags.append("--remove-tag")
+    if hasattr(args, "group_flag") and args.group_flag is not None:
+        tag_mutation_flags.append("--group")
+
+    if len(tag_mutation_flags) > 1:
+        print(
+            "Error: Tag mutation flags are mutually exclusive; "
+            "choose exactly one of --clear-tags, --set-tags, --add-tag, --remove-tag, or --group.",
+        )
+        return 1
+
+    # Handle explicit tag mutation flags
+    if getattr(args, "clear_tags", False):
+        store.replace_task_tags(task_row_id, ())
+        print(f"✓ Cleared tags for task {task_row_id}")
+        return 0
+
+    if getattr(args, "set_tags", None) is not None:
+        set_tags = tuple(part.strip() for part in str(args.set_tags).split(",") if part.strip())
+        try:
+            store.replace_task_tags(task_row_id, set_tags)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
+        refreshed = store.get(task_row_id)
+        if refreshed is not None:
+            task = refreshed
+        print(f"✓ Set tags for task {task_row_id}: {', '.join(task.tags) if task.tags else '(none)'}")
+        return 0
+
+    if getattr(args, "add_tags", None):
+        try:
+            store.add_task_tags(task_row_id, tuple(args.add_tags))
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
+        refreshed = store.get(task_row_id)
+        if refreshed is not None:
+            task = refreshed
+        print(f"✓ Added tags for task {task_row_id}: {', '.join(task.tags)}")
+        return 0
+
+    if getattr(args, "remove_tags", None):
+        try:
+            store.remove_task_tags(task_row_id, tuple(args.remove_tags))
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
+        refreshed = store.get(task_row_id)
+        if refreshed is not None:
+            task = refreshed
+        print(f"✓ Updated tags for task {task_row_id}: {', '.join(task.tags) if task.tags else '(none)'}")
+        return 0
+
+    # Handle legacy --group flag
     if hasattr(args, 'group_flag') and args.group_flag is not None:
-        # Empty string removes from group
+        print(
+            "Warning: --group is deprecated; use --add-tag/--remove-tag/--clear-tags/--set-tags.",
+            file=sys.stderr,
+        )
         if args.group_flag == "":
-            task.group = None
-            store.update(task)
-            print(f"✓ Removed task {task.id} from group")
-            return 0
+            if len(task.tags) <= 1:
+                store.replace_task_tags(task_row_id, ())
+                print(f"✓ Cleared tags for task {task_row_id}")
+                return 0
+            print(
+                "Error: --group \"\" is ambiguous for tasks with multiple tags; "
+                "use --remove-tag TAG or --clear-tags instead.",
+            )
+            return 1
         else:
-            task.group = args.group_flag
-            store.update(task)
-            print(f"✓ Moved task {task.id} to group '{args.group_flag}'")
+            try:
+                store.replace_task_tags(task_row_id, (args.group_flag,))
+            except ValueError as exc:
+                print(f"Error: {exc}")
+                return 1
+            refreshed = store.get(task_row_id)
+            if refreshed is not None:
+                task = refreshed
+            print(f"✓ Set tags for task {task_row_id}: {', '.join(task.tags)}")
             return 0
 
     # Handle --based-on flag (lineage/parent relationship)
@@ -637,7 +753,6 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if hasattr(args, 'prompt') and args.prompt is not None:
         # Handle stdin (-) or direct prompt text
         if args.prompt == '-':
-            import sys
             new_prompt = sys.stdin.read().strip()
         else:
             new_prompt = args.prompt
@@ -706,7 +821,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
     new_task = store.add(
         prompt=task.prompt,
         task_type=task.task_type,
-        group=task.group,
+        tags=task.tags,
         spec=task.spec,
         depends_on=task.depends_on,
         create_review=task.create_review,
@@ -1073,7 +1188,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
                 depends_on=None,
                 based_on=existing_comments_improve.id,
                 same_branch=retry_same_branch,
-                group=existing_comments_improve.group,
+                tags=existing_comments_improve.tags,
                 base_branch=retry_base_branch,
                 create_review=create_review,
                 model=model,
@@ -1174,7 +1289,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
         based_on=impl_task.id,
         depends_on=review_id,
         same_branch=True,
-        group=impl_task.group,
+        tags=impl_task.tags,
         model=args.model if hasattr(args, "model") and args.model else None,
         provider=args.provider if hasattr(args, "provider") and args.provider else None,
     )
@@ -1264,8 +1379,10 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     print(f"✓ Created review task {review_task.id}")
     print(f"  Implementation: {impl_task.id}")
-    if impl_task.group:
-        print(f"  Group: {impl_task.group}")
+    if len(impl_task.tags) == 1:
+        print(f"  Group: {impl_task.tags[0]}")
+    if impl_task.tags:
+        print(f"  Tags: {', '.join(impl_task.tags)}")
 
     # Handle background mode - spawn worker to run the review task
     if hasattr(args, 'background') and args.background:
@@ -1473,7 +1590,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             run_start_task = store.add(
                 prompt=impl_task.prompt,
                 task_type=impl_task.task_type,
-                group=impl_task.group,
+                tags=impl_task.tags,
                 spec=impl_task.spec,
                 depends_on=impl_task.depends_on,
                 create_review=impl_task.create_review,
@@ -1900,7 +2017,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                     depends_on=failed_improve.depends_on,
                     based_on=failed_improve.id,
                     same_branch=retry_same_branch,
-                    group=failed_improve.group,
+                    tags=failed_improve.tags,
                     base_branch=retry_base_branch,
                 )
                 print(f"  Created improve task {action_task.id} (retry of {failed_improve.id})")

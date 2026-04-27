@@ -1066,6 +1066,35 @@ class TestHistoryCommand:
         assert "failed" in result.stdout
         assert "WORKER_DIED" in result.stdout
 
+    def test_history_tag_filter_is_case_insensitive_with_json_text_parity(self, tmp_path: Path):
+        """history --tag should match canonical lowercase tags regardless of filter case."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        tagged = store.add("Tagged completed history", tags=("release-1.2",))
+        assert tagged.id is not None
+        tagged.status = "completed"
+        tagged.completed_at = datetime.now(UTC)
+        store.update(tagged)
+
+        other = store.add("Other completed history", tags=("backlog",))
+        assert other.id is not None
+        other.status = "completed"
+        other.completed_at = datetime.now(UTC)
+        store.update(other)
+
+        text_result = run_gza("history", "--tag", "Release-1.2", "--project", str(tmp_path))
+        json_result = run_gza("history", "--tag", "Release-1.2", "--json", "--project", str(tmp_path))
+
+        assert text_result.returncode == 0
+        assert "Tagged completed history" in text_result.stdout
+        assert "Other completed history" not in text_result.stdout
+
+        assert json_result.returncode == 0
+        rows = json.loads(json_result.stdout)
+        prompts = [row["prompt"] for row in rows]
+        assert prompts == ["Tagged completed history"]
+
 
 class TestSearchCommand:
     """Tests for 'gza search' command."""
@@ -1247,6 +1276,34 @@ class TestSearchCommand:
         assert result.returncode == 2
         assert "--fields and --preset require --json for gza search" in result.stderr
 
+    def test_search_tag_filter_is_case_insensitive_with_json_text_parity(self, tmp_path: Path):
+        """search --tag should match regardless of filter case in text and JSON outputs."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("Tagged search task", tags=("release-1.2",))
+        store.add("Backlog search task", tags=("backlog",))
+
+        text_result = run_gza("search", "search task", "--tag", "Release-1.2", "--project", str(tmp_path))
+        json_result = run_gza(
+            "search",
+            "search task",
+            "--tag",
+            "Release-1.2",
+            "--json",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert text_result.returncode == 0
+        assert "Tagged search task" in text_result.stdout
+        assert "Backlog search task" not in text_result.stdout
+
+        assert json_result.returncode == 0
+        rows = json.loads(json_result.stdout)
+        prompts = [row["prompt"] for row in rows]
+        assert prompts == ["Tagged search task"]
+
 
 class TestNextCommand:
     """Tests for 'gza next' command."""
@@ -1276,6 +1333,17 @@ class TestNextCommand:
 
         assert result.returncode == 0
         assert "No pending tasks" in result.stdout
+
+    def test_next_rejects_empty_tag_without_traceback(self, tmp_path: Path):
+        """next --tag '' should fail with user-facing validation, not traceback."""
+        setup_config(tmp_path)
+
+        result = run_gza("next", "--tag", "", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: tag must not be empty" in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
 
     def test_next_warns_about_orphaned_tasks(self, tmp_path: Path):
         """Next command warns about orphaned in-progress tasks."""
@@ -1485,6 +1553,89 @@ class TestQueueCommand:
         newer_line = next(i for i, line in enumerate(lines) if "Newer urgent" in line)
         assert bumped_line < older_line < newer_line
 
+    @pytest.mark.parametrize(
+        ("action", "extra_args"),
+        [
+            ("bump", []),
+            ("unbump", []),
+            ("move", ["1"]),
+            ("next", []),
+            ("clear", []),
+        ],
+    )
+    def test_queue_management_subcommands_accept_tag_after_subcommand(
+        self,
+        tmp_path: Path,
+        action: str,
+        extra_args: list[str],
+    ):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Release task", tags=("release-1.2",))
+        assert task.id is not None
+
+        result = run_gza(
+            "queue",
+            action,
+            task.id,
+            *extra_args,
+            "--tag",
+            "release-1.2",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "unrecognized arguments" not in result.stderr
+
+    @pytest.mark.parametrize(
+        ("action", "extra_args"),
+        [
+            ("bump", []),
+            ("unbump", []),
+            ("move", ["1"]),
+            ("next", []),
+            ("clear", []),
+        ],
+    )
+    def test_queue_management_group_and_tag_filters_have_equivalent_runnable_status(
+        self,
+        tmp_path: Path,
+        action: str,
+        extra_args: list[str],
+    ):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Release task", tags=("release-1.2",))
+        assert task.id is not None
+
+        with_group = run_gza(
+            "queue",
+            action,
+            task.id,
+            *extra_args,
+            "--group",
+            "release-1.2",
+            "--project",
+            str(tmp_path),
+        )
+        with_tag = run_gza(
+            "queue",
+            action,
+            task.id,
+            *extra_args,
+            "--tag",
+            "release-1.2",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert with_group.returncode == 0
+        assert with_tag.returncode == 0
+        assert ("not currently runnable" in with_group.stdout) == ("not currently runnable" in with_tag.stdout)
+
     def test_queue_move_assigns_explicit_positions(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -1535,6 +1686,66 @@ class TestQueueCommand:
         refreshed = store.get(second.id)
         assert refreshed is not None
         assert refreshed.queue_position is None
+
+    @pytest.mark.parametrize(
+        ("action", "extra_args"),
+        [
+            ("move", ["1"]),
+            ("next", []),
+        ],
+    )
+    def test_queue_tag_scoped_move_does_not_mutate_disjoint_multi_tag_bucket(
+        self,
+        tmp_path: Path,
+        action: str,
+        extra_args: list[str],
+    ):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        release_first = store.add("Release first", tags=("release", "backend"))
+        release_second = store.add("Release second", tags=("release", "backend"))
+        ops_first = store.add("Ops first", tags=("ops", "infra"))
+        ops_second = store.add("Ops second", tags=("ops", "infra"))
+        assert release_first.id is not None
+        assert release_second.id is not None
+        assert ops_first.id is not None
+        assert ops_second.id is not None
+
+        init_release_first = run_gza("queue", "move", release_first.id, "1", "--project", str(tmp_path))
+        init_release_second = run_gza("queue", "move", release_second.id, "2", "--project", str(tmp_path))
+        init_ops_first = run_gza("queue", "move", ops_first.id, "1", "--project", str(tmp_path))
+        init_ops_second = run_gza("queue", "move", ops_second.id, "2", "--project", str(tmp_path))
+        assert init_release_first.returncode == 0
+        assert init_release_second.returncode == 0
+        assert init_ops_first.returncode == 0
+        assert init_ops_second.returncode == 0
+
+        result = run_gza(
+            "queue",
+            action,
+            release_second.id,
+            *extra_args,
+            "--tag",
+            "release",
+            "--project",
+            str(tmp_path),
+        )
+        assert result.returncode == 0
+
+        refreshed_release_first = store.get(release_first.id)
+        refreshed_release_second = store.get(release_second.id)
+        refreshed_ops_first = store.get(ops_first.id)
+        refreshed_ops_second = store.get(ops_second.id)
+        assert refreshed_release_first is not None
+        assert refreshed_release_second is not None
+        assert refreshed_ops_first is not None
+        assert refreshed_ops_second is not None
+
+        assert refreshed_release_second.queue_position == 1
+        assert refreshed_release_first.queue_position == 2
+        assert refreshed_ops_first.queue_position == 1
+        assert refreshed_ops_second.queue_position == 2
 
     def test_next_shows_bumped_task_first(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -1634,6 +1845,25 @@ class TestQueueCommand:
         assert "Release blocked" not in result.stdout
         assert "Backlog runnable" not in result.stdout
         assert "1 task blocked by dependencies" in result.stdout
+
+    def test_queue_and_next_tag_filters_are_case_insensitive(self, tmp_path: Path):
+        """queue/next should match lowercase-stored tags for mixed-case --tag values."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("Release runnable", tags=("release-1.2",))
+        store.add("Backlog runnable", tags=("backlog",))
+
+        queue_result = run_gza("queue", "--tag", "Release-1.2", "--project", str(tmp_path))
+        next_result = run_gza("next", "--tag", "Release-1.2", "--project", str(tmp_path))
+
+        assert queue_result.returncode == 0
+        assert "Release runnable" in queue_result.stdout
+        assert "Backlog runnable" not in queue_result.stdout
+
+        assert next_result.returncode == 0
+        assert "Release runnable" in next_result.stdout
+        assert "Backlog runnable" not in next_result.stdout
 
 
 class TestShowCommand:
@@ -2495,17 +2725,32 @@ class TestGroupsCommand:
 
         assert result.returncode == 0
 
-    def test_groups_without_subcommand_shows_help(self, tmp_path: Path):
-        """Bare groups should show help instead of implicitly listing."""
+    def test_groups_without_subcommand_runs_deprecated_list_alias(self, tmp_path: Path):
+        """Bare groups should run deprecated list-alias behavior."""
         setup_config(tmp_path)
-        make_store(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Task 1", tags=("group-a",))
+        store.add("Task 2", tags=("group-b",))
 
         result = run_gza("groups", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "usage:" in result.stdout
-        assert "list" in result.stdout
-        assert "rename" in result.stdout
+        assert "Warning: 'gza groups' is deprecated; use 'gza groups list'." in result.stdout
+        assert "group-a" in result.stdout
+        assert "group-b" in result.stdout
+        assert "usage:" not in result.stdout
+
+    def test_groups_warning_references_existing_command(self, tmp_path: Path):
+        """Deprecation warning should not point to non-existent commands."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Task 1", tags=("group-a",))
+
+        result = run_gza("groups", "list", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Warning: 'gza groups' is deprecated; use 'gza groups list'." in result.stdout
+        assert "use tags" not in result.stdout
 
 
 class TestStatusCommand:
@@ -2530,6 +2775,17 @@ class TestStatusCommand:
         assert "test-group" in result.stdout
         assert "First task" in result.stdout
         assert "Second task" in result.stdout
+
+    def test_status_rejects_empty_group_without_traceback(self, tmp_path: Path):
+        """group '' should fail with user-facing validation, not traceback."""
+        setup_config(tmp_path)
+
+        result = run_gza("group", "", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: tag must not be empty" in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
 
     def test_status_warns_about_orphaned_tasks_in_group(self, tmp_path: Path):
         """Group command warns about orphaned tasks belonging to the viewed group."""
@@ -2603,6 +2859,18 @@ class TestRenameGroupCommand:
 
         assert result.returncode == 1
         assert "already exists" in result.stdout
+
+    def test_rename_group_warning_avoids_nonexistent_tags_command(self, tmp_path: Path):
+        """Deprecation warning should avoid suggesting missing tags rename command."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Release task", tags=("release",))
+
+        result = run_gza("groups", "rename", "release", "launch", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Warning: 'gza groups rename' is deprecated and will be removed in a future release." in result.stdout
+        assert "tags rename" not in result.stdout
 
 
 class TestPsCommand:

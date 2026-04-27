@@ -89,6 +89,78 @@ def clear_task_queue_position(store: SqliteTaskStore, task_id: str) -> bool:
     return store.clear_queue_position(task_id)
 
 
+def _validate_tag_value(raw: object) -> str:
+    """Return raw tag text when non-empty after trim, otherwise raise ValueError."""
+    tag = str(raw)
+    if not tag.strip():
+        raise ValueError("tag must not be empty")
+    return tag
+
+
+def parse_cli_tag_filters(
+    args: argparse.Namespace,
+    *,
+    tags_attr: str = "tags",
+    group_attr: str = "group",
+    any_tag_attr: str = "any_tag",
+    warn_on_group_alias: bool = True,
+) -> tuple[tuple[str, ...] | None, bool]:
+    """Parse and validate tag/group filter flags from argparse args."""
+    selected_tags = [_validate_tag_value(raw) for raw in (getattr(args, tags_attr, None) or [])]
+    legacy_group = getattr(args, group_attr, None) if hasattr(args, group_attr) else None
+    if legacy_group is not None:
+        selected_tags.append(_validate_tag_value(legacy_group))
+        if warn_on_group_alias:
+            print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
+    return (tuple(selected_tags) if selected_tags else None, bool(getattr(args, any_tag_attr, False)))
+
+
+def validate_cli_tag_values(values: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    """Validate CLI-provided tag values and return them as a tuple."""
+    return tuple(_validate_tag_value(raw) for raw in (values or ()))
+
+
+def format_no_runnable_message_for_tags(
+    store: SqliteTaskStore,
+    tags: tuple[str, ...],
+    *,
+    any_tag: bool = False,
+    exhausted: bool = False,
+) -> str:
+    """Render precise tag-filtered empty-pickup messaging.
+
+    Distinguishes between "no matching pending tasks" and
+    "matching pending tasks exist but are not runnable", including
+    dependency-blocked and internal-only pending matches.
+    """
+    tag_text = ", ".join(tags)
+    matching_pending = store.get_pending(limit=None, tags=tags, any_tag=any_tag)
+    if matching_pending:
+        matching_non_internal = [task for task in matching_pending if task.task_type != "internal"]
+        if matching_non_internal and all(store.is_task_blocked(task)[0] for task in matching_non_internal):
+            if exhausted:
+                return (
+                    f"No more runnable tasks matching tags: {tag_text}. "
+                    "Remaining matching pending tasks are blocked by dependencies."
+                )
+            return (
+                f"No runnable tasks found matching tags: {tag_text}. "
+                "Matching pending tasks are blocked by dependencies."
+            )
+        if exhausted:
+            return (
+                f"No more runnable tasks matching tags: {tag_text}. "
+                "Remaining matching pending tasks are not runnable via work (for example internal tasks)."
+            )
+        return (
+            f"No runnable tasks found matching tags: {tag_text}. "
+            "Matching pending tasks are not runnable via work (for example internal tasks)."
+        )
+    if exhausted:
+        return f"No more pending tasks matching tags: {tag_text}."
+    return f"No pending tasks found matching tags: {tag_text}"
+
+
 # Matches "{prefix}-{suffix}" where prefix is 1-12 lowercase alphanumeric chars.
 # This is tighter than `"-" in arg` (which also matches branch names like "feature-foo").
 _TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
@@ -400,7 +472,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     explicit_task_id = task_id
     selected_task: DbTask | None = None
     resume_mode = bool(getattr(args, "resume", False))
-    selected_group = getattr(args, "group", None)
+    selected_tags, any_tag = parse_cli_tag_filters(args)
 
     if explicit_task_id is not None:
         task = store.get(explicit_task_id)
@@ -435,10 +507,10 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
             print("Error: Cannot resume without specifying a task ID")
             return 1
         # Select a candidate for UX; actual claim happens in the child runner.
-        selected_task = store.get_next_pending(group=selected_group)
+        selected_task = store.get_next_pending(tags=selected_tags, any_tag=any_tag)
         if not selected_task:
-            if selected_group:
-                print(f"No pending tasks found in group '{selected_group}'")
+            if selected_tags:
+                print(format_no_runnable_message_for_tags(store, selected_tags, any_tag=any_tag))
             else:
                 print("No pending tasks found")
             return 0
@@ -456,8 +528,11 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
 
     if explicit_task_id is not None:
         inner_cmd.append(str(explicit_task_id))
-    elif selected_group:
-        inner_cmd.extend(["--group", selected_group])
+    elif selected_tags:
+        for tag in selected_tags:
+            inner_cmd.extend(["--tag", tag])
+        if any_tag:
+            inner_cmd.append("--any-tag")
 
     if args.no_docker:
         inner_cmd.append("--no-docker")
@@ -906,7 +981,7 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
     """
     # Determine how many workers to spawn
     count = args.count if args.count is not None else 1
-    selected_group = getattr(args, "group", None)
+    selected_tags, any_tag = parse_cli_tag_filters(args)
     store = get_store(config)
 
     # If specific task_ids are provided, spawn one worker per task ID
@@ -926,8 +1001,11 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
 
         return 0
 
-    if selected_group:
-        pending_tasks = store.get_pending_pickup(limit=count, group=selected_group)
+    if selected_tags:
+        pending_tasks = store.get_pending_pickup(limit=count, tags=selected_tags, any_tag=any_tag)
+        if not pending_tasks:
+            print(format_no_runnable_message_for_tags(store, selected_tags, any_tag=any_tag))
+            return 0
         spawned_count = 0
         for task in pending_tasks:
             if task.id is None:
@@ -938,7 +1016,7 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
         if count > 1:
             print(
                 f"\n=== Attempted to spawn {count} background worker(s) "
-                f"for group '{selected_group}' ==="
+                f"for tags '{', '.join(selected_tags)}' ==="
             )
         return 0
 
@@ -1242,7 +1320,7 @@ def _create_improve_task(
         depends_on=review_task.id if review_task is not None else None,
         based_on=impl_task.id,
         same_branch=True,
-        group=impl_task.group,
+        tags=impl_task.tags,
         create_review=create_review,
         model=model,
         provider=provider,
@@ -1354,7 +1432,7 @@ def _format_lineage(
 def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask:
     """Create a new resume task pointing to the original failed task.
 
-    Copies prompt, task_type, group, session_id, branch, model, etc.
+    Copies prompt, task_type, tags, session_id, branch, model, etc.
     Preserves provider across resumes:
       - When the original task had an explicit provider override, it carries over.
       - When the resume will reuse a backend session_id, the originally resolved
@@ -1371,7 +1449,7 @@ def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask
     new_task = store.add(
         prompt=original_task.prompt,
         task_type=original_task.task_type,
-        group=original_task.group,
+        tags=original_task.tags,
         spec=original_task.spec,
         depends_on=original_task.depends_on,
         create_review=original_task.create_review,
@@ -2022,6 +2100,19 @@ def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
         dest="end_date",
         metavar="YYYY-MM-DD",
         help="Show only tasks on or before this date",
+    )
+    parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Filter by tag (repeatable, AND semantics by default)",
+    )
+    parser.add_argument(
+        "--any-tag",
+        action="store_true",
+        dest="any_tag",
+        help="With repeated --tag values, match any tag instead of all tags",
     )
 
 

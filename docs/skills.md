@@ -22,13 +22,13 @@ Skills are installed to `.claude/skills/` in your project directory and become a
 
 ## gza-task-add
 
-**Create a well-formed gza task with appropriate type, group, and prompt.**
+**Create a well-formed gza task with appropriate type, tags, and prompt.**
 
 Use `/gza-task-add` when you want to add a task to the gza queue during a Claude Code session. The skill reads your project's AGENTS.md conventions, asks clarifying questions, constructs a well-scoped prompt, and runs `uv run gza add` with the right flags.
 
 **Key behaviors:**
 - Asks about task type (`explore`, `plan`, `implement`, `review`, `improve`)
-- Prompts for optional flags: `--group`, `--depends-on`, `--based-on`, `--review`
+- Prompts for optional flags: `--tag`, `--depends-on`, `--based-on`, `--review`
 - Generates a specific prompt (not vague) and shows the task ID on success
 - Always uses `uv run gza add` — never edits task files manually
 

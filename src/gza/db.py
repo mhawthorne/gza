@@ -7,6 +7,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -74,6 +75,7 @@ _B36_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
 # Legacy fixed width used only for v25 migration helper encoding.
 _TASK_ID_SEQ_WIDTH = 6
 _FULL_TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
+_TAG_WS_RE = re.compile(r"\s+")
 
 
 class InvalidTaskIdError(ValueError):
@@ -131,6 +133,46 @@ def task_id_numeric_key(task_id: str | None) -> int:
         return int(suffix)
     except ValueError:
         return 0
+
+
+def _normalize_tag(tag: str) -> str:
+    """Normalize user-provided tag text into canonical storage format."""
+    normalized = _TAG_WS_RE.sub(" ", tag.strip()).lower()
+    if not normalized:
+        raise ValueError("tag must not be empty")
+    return normalized
+
+
+def _normalize_tags(tags: Iterable[str] | None) -> tuple[str, ...]:
+    """Normalize and deduplicate tags with deterministic ordering."""
+    if tags is None:
+        return ()
+    normalized: set[str] = set()
+    for raw in tags:
+        normalized.add(_normalize_tag(str(raw)))
+    return tuple(sorted(normalized))
+
+
+def _backfill_task_tags_from_group(conn: sqlite3.Connection) -> None:
+    """Backfill legacy tasks.group values into task_tags."""
+    if not _table_exists(conn, "task_tags"):
+        return
+    rows = conn.execute('SELECT id, "group" FROM tasks WHERE "group" IS NOT NULL').fetchall()
+    pairs: list[tuple[str, str]] = []
+    for row in rows:
+        group_value = row["group"]
+        if group_value is None:
+            continue
+        try:
+            normalized = _normalize_tag(str(group_value))
+        except ValueError:
+            continue
+        pairs.append((str(row["id"]), normalized))
+    if pairs:
+        conn.executemany(
+            "INSERT OR IGNORE INTO task_tags(task_id, tag) VALUES (?, ?)",
+            pairs,
+        )
 
 
 def _next_monotonic_iso_timestamp(now: datetime, floor_iso: str | None) -> str:
@@ -229,6 +271,7 @@ class Task:
     completed_at: datetime | None = None
     # New fields for task import/chaining
     group: str | None = None  # Group name for related tasks
+    tags: tuple[str, ...] = ()  # Canonical multi-valued task labels
     depends_on: str | None = None  # Task ID this task depends on (string)
     spec: str | None = None  # Path to spec file for context
     create_review: bool = False  # Auto-create review task on completion
@@ -242,7 +285,7 @@ class Task:
     provider: str | None = None  # Per-task provider override
     provider_is_explicit: bool = False  # True when provider was explicitly set by user input
     urgent: bool = False  # Queue lane flag: urgent tasks are picked before normal pending tasks
-    queue_position: int | None = None  # Optional explicit queue order within a group bucket
+    queue_position: int | None = None  # Optional explicit queue order within the task's tag-set bucket
     merge_status: str | None = None  # None, 'unmerged', or 'merged'
     merged_at: datetime | None = None  # When merge_status was set to 'merged'
     failure_reason: str | None = None
@@ -360,8 +403,19 @@ MIGRATION_V33_TO_V34 = """
 ALTER TABLE tasks ADD COLUMN queue_position INTEGER;
 """
 
+# Migration from v34 to v35: first-class multi-valued tags
+MIGRATION_V34_TO_V35 = """
+CREATE TABLE IF NOT EXISTS task_tags (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    PRIMARY KEY(task_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_task_tags_task_id ON task_tags(task_id);
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 35
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -549,6 +603,15 @@ def _ensure_required_auto_migration_artifacts(
                 f"{table}.{column}: use a writable database."
             ) from exc
 
+    if target_version >= 35 and not _table_exists(conn, "task_tags"):
+        try:
+            conn.executescript(MIGRATION_V34_TO_V35)
+        except sqlite3.OperationalError as exc:
+            raise SchemaIntegrityError(
+                "Schema integrity check failed while repairing required table task_tags: "
+                "use a writable database."
+            ) from exc
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
@@ -621,6 +684,14 @@ CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks("group");
 CREATE INDEX IF NOT EXISTS idx_tasks_depends_on ON tasks(depends_on);
 CREATE INDEX IF NOT EXISTS idx_tasks_merge_status ON tasks(merge_status);
+
+CREATE TABLE IF NOT EXISTS task_tags (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    PRIMARY KEY(task_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_task_tags_task_id ON task_tags(task_id);
 
 CREATE TABLE IF NOT EXISTS run_steps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -955,6 +1026,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (32, MIGRATION_V31_TO_V32),
     (33, MIGRATION_V32_TO_V33),
     (34, MIGRATION_V33_TO_V34),
+    (35, MIGRATION_V34_TO_V35),
 ]
 
 
@@ -1030,6 +1102,8 @@ class SqliteTaskStore:
                 if row is None:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
 
+            _backfill_task_tags_from_group(conn)
+
             # Repair required artifacts for current schemas when external damage
             # or partial migrations removed them.
             _ensure_required_auto_migration_artifacts(conn, target_version=SCHEMA_VERSION)
@@ -1045,7 +1119,7 @@ class SqliteTaskStore:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _row_to_task(self, row: sqlite3.Row) -> Task:
+    def _row_to_task(self, row: sqlite3.Row, *, tags: tuple[str, ...] = ()) -> Task:
         """Convert a database row to a Task."""
         keys = row.keys()
         # Support both old column name ('task_id') and new ('slug') for migration compat
@@ -1081,6 +1155,7 @@ class SqliteTaskStore:
             running_pid=row["running_pid"] if "running_pid" in keys else None,
             completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
             group=row["group"],
+            tags=tags,
             depends_on=row["depends_on"],
             spec=row["spec"],
             create_review=bool(row["create_review"]) if row["create_review"] is not None else False,
@@ -1111,6 +1186,49 @@ class SqliteTaskStore:
             ),
             execution_mode=row["execution_mode"] if "execution_mode" in keys else None,
         )
+
+    def _fetch_tags_for_task_ids(self, conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, tuple[str, ...]]:
+        """Fetch tags for many tasks in one query."""
+        ids = sorted({task_id for task_id in task_ids if task_id})
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        cur = conn.execute(
+            f"""
+            SELECT task_id, tag
+            FROM task_tags
+            WHERE task_id IN ({placeholders})
+            ORDER BY task_id ASC, tag ASC
+            """,
+            tuple(ids),
+        )
+        by_task: dict[str, list[str]] = {}
+        for row in cur.fetchall():
+            by_task.setdefault(str(row["task_id"]), []).append(str(row["tag"]))
+        return {task_id: tuple(tags) for task_id, tags in by_task.items()}
+
+    def _rows_to_tasks(self, conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[Task]:
+        """Hydrate rows into tasks and attach tags in batch."""
+        if not rows:
+            return []
+        tag_map = self._fetch_tags_for_task_ids(conn, (str(row["id"]) for row in rows))
+        tasks: list[Task] = []
+        for row in rows:
+            task_id = str(row["id"])
+            tags = tag_map.get(task_id, ())
+            task = self._row_to_task(row, tags=tags)
+            task.group = tags[0] if len(tags) == 1 else task.group
+            tasks.append(task)
+        return tasks
+
+    def _replace_task_tags_conn(self, conn: sqlite3.Connection, task_id: str, tags: tuple[str, ...]) -> None:
+        """Replace all tags for a task inside an open transaction."""
+        conn.execute("DELETE FROM task_tags WHERE task_id = ?", (task_id,))
+        if tags:
+            conn.executemany(
+                "INSERT INTO task_tags(task_id, tag) VALUES (?, ?)",
+                [(task_id, tag) for tag in tags],
+            )
 
     def _row_to_run_step(self, row: sqlite3.Row) -> RunStep:
         """Convert a database row to a RunStep."""
@@ -1194,6 +1312,7 @@ class SqliteTaskStore:
         task_type: str = "implement",
         based_on: str | None = None,
         group: str | None = None,
+        tags: Iterable[str] | None = None,
         depends_on: str | None = None,
         spec: str | None = None,
         create_review: bool = False,
@@ -1208,6 +1327,10 @@ class SqliteTaskStore:
     ) -> Task:
         """Add a new task. Returns the created Task with its generated string ID."""
         now = datetime.now(UTC).isoformat()
+        normalized_tags = _normalize_tags(tags)
+        if group is not None:
+            normalized_tags = _normalize_tags((*normalized_tags, group))
+        persisted_group = normalized_tags[0] if len(normalized_tags) == 1 else None
         if provider_is_explicit is None:
             provider_is_explicit = provider is not None
         with self._connect() as conn:
@@ -1223,7 +1346,7 @@ class SqliteTaskStore:
                     task_type,
                     based_on,
                     now,
-                    group,
+                    persisted_group,
                     depends_on,
                     spec,
                     1 if create_review else 0,
@@ -1237,16 +1360,19 @@ class SqliteTaskStore:
                     1 if skip_learnings else 0,
                 ),
             )
-            result = self.get(new_id)
-            assert result is not None
-            return result
+            self._replace_task_tags_conn(conn, new_id, normalized_tags)
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (new_id,)).fetchone()
+            assert row is not None
+            return self._rows_to_tasks(conn, [row])[0]
 
     def get(self, task_id: str) -> Task | None:
         """Get a task by its string ID (e.g. 'gza-1234')."""
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
             row = cur.fetchone()
-            return self._row_to_task(row) if row else None
+            if row is None:
+                return None
+            return self._rows_to_tasks(conn, [row])[0]
 
     def get_by_seq(self, seq_number: int, prefix: str | None = None) -> Task | None:
         """Get task by ordinal sequence number within a project prefix.
@@ -1286,17 +1412,25 @@ class SqliteTaskStore:
                 (prefix, prefix, prefix, seq, prefix),
             )
             row = cur.fetchone()
-            return self._row_to_task(row) if row else None
+            if row is None:
+                return None
+            return self._rows_to_tasks(conn, [row])[0]
 
     def get_by_slug(self, slug: str) -> Task | None:
         """Get a task by slug (YYYYMMDD-... format, stored in the 'slug' DB column)."""
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM tasks WHERE slug = ?", (slug,))
             row = cur.fetchone()
-            return self._row_to_task(row) if row else None
+            if row is None:
+                return None
+            return self._rows_to_tasks(conn, [row])[0]
 
     def update(self, task: Task) -> None:
         """Update a task."""
+        normalized_tags = _normalize_tags(task.tags or (() if task.group is None else (task.group,)))
+        persisted_group = normalized_tags[0] if len(normalized_tags) == 1 else None
+        task.tags = normalized_tags
+        task.group = persisted_group
         with self._connect() as conn:
             conn.execute(
                 """
@@ -1374,7 +1508,7 @@ class SqliteTaskStore:
                     task.started_at.isoformat() if task.started_at else None,
                     task.running_pid,
                     task.completed_at.isoformat() if task.completed_at else None,
-                    task.group,
+                    persisted_group,
                     task.depends_on,
                     task.spec,
                     1 if task.create_review else 0,
@@ -1403,6 +1537,8 @@ class SqliteTaskStore:
                     task.id,
                 ),
             )
+            if task.id is not None:
+                self._replace_task_tags_conn(conn, task.id, normalized_tags)
 
     def delete(self, task_id: str) -> bool:
         """Delete a task by ID. Returns True if deleted."""
@@ -1412,17 +1548,30 @@ class SqliteTaskStore:
 
     # === Query methods ===
 
-    def get_next_pending(self, group: str | None = None) -> Task | None:
+    def get_next_pending(
+        self,
+        group: str | None = None,
+        *,
+        tags: Iterable[str] | None = None,
+        any_tag: bool = False,
+    ) -> Task | None:
         """Get the next pending task (oldest first), skipping blocked tasks.
 
         A task is unblocked when its dependency is completed OR when its
         dependency is failed but a completed retry exists anywhere in the
         based_on chain.
         """
-        pending = self.get_pending_pickup(limit=1, group=group)
+        pending = self.get_pending_pickup(limit=1, group=group, tags=tags, any_tag=any_tag)
         return pending[0] if pending else None
 
-    def get_pending_pickup(self, limit: int | None = None, group: str | None = None) -> list[Task]:
+    def get_pending_pickup(
+        self,
+        limit: int | None = None,
+        group: str | None = None,
+        *,
+        tags: Iterable[str] | None = None,
+        any_tag: bool = False,
+    ) -> list[Task]:
         """Get runnable pending tasks in pickup order.
 
         Pickup semantics match default worker selection: excludes internal and
@@ -1430,6 +1579,9 @@ class SqliteTaskStore:
         urgent tasks at the front, then FIFO by creation time. Explicit
         queue_position values sort ahead of the lane-based fallback ordering.
         """
+        normalized_tags = _normalize_tags(tags)
+        if not normalized_tags and group is not None:
+            normalized_tags = _normalize_tags((group,))
         with self._connect() as conn:
             query = """
                 WITH RECURSIVE successful_ancestors(id) AS (
@@ -1442,7 +1594,6 @@ class SqliteTaskStore:
                 SELECT t.* FROM tasks t
                 WHERE t.status = 'pending'
                 AND t.task_type != 'internal'
-                AND (? IS NULL OR t."group" = ?)
                 AND (
                     t.depends_on IS NULL
                     OR t.depends_on IN (SELECT id FROM successful_ancestors)
@@ -1454,12 +1605,29 @@ class SqliteTaskStore:
                     COALESCE(t.urgent_bumped_at, '') DESC,
                     t.created_at ASC
                 """
-            params: tuple[str | int | None, ...] = (group, group)
+            params: list[str | int | None] = []
+            if normalized_tags:
+                placeholders = ",".join("?" for _ in normalized_tags)
+                if any_tag:
+                    query = query.replace(
+                        "AND (",
+                        f"AND EXISTS (SELECT 1 FROM task_tags tt WHERE tt.task_id = t.id AND tt.tag IN ({placeholders}))\nAND (",
+                        1,
+                    )
+                    params.extend(normalized_tags)
+                else:
+                    query = query.replace(
+                        "AND (",
+                        f"AND (SELECT COUNT(DISTINCT tt.tag) FROM task_tags tt WHERE tt.task_id = t.id AND tt.tag IN ({placeholders})) = ?\nAND (",
+                        1,
+                    )
+                    params.extend(normalized_tags)
+                    params.append(len(normalized_tags))
             if limit is not None:
                 query += " LIMIT ?"
-                params += (limit,)
-            cur = conn.execute(query, params)
-            return [self._row_to_task(row) for row in cur.fetchall()]
+                params.append(limit)
+            cur = conn.execute(query, tuple(params))
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def try_mark_in_progress(self, task_id: str, pid: int) -> Task | None:
         """Compare-and-swap pending -> in_progress for a specific task.
@@ -1492,12 +1660,21 @@ class SqliteTaskStore:
             # Database busy after timeout — treat as CAS loss.
             return None
 
-    def get_pending(self, limit: int | None = None, group: str | None = None) -> list[Task]:
+    def get_pending(
+        self,
+        limit: int | None = None,
+        group: str | None = None,
+        *,
+        tags: Iterable[str] | None = None,
+        any_tag: bool = False,
+    ) -> list[Task]:
         """Get all pending tasks."""
+        normalized_tags = _normalize_tags(tags)
+        if not normalized_tags and group is not None:
+            normalized_tags = _normalize_tags((group,))
         with self._connect() as conn:
             query = (
-                'SELECT * FROM tasks WHERE status = \'pending\' '
-                'AND (? IS NULL OR "group" = ?) '
+                "SELECT t.* FROM tasks t WHERE t.status = 'pending' "
                 "ORDER BY "
                 "CASE WHEN queue_position IS NULL THEN 1 ELSE 0 END, "
                 "COALESCE(queue_position, 0) ASC, "
@@ -1505,12 +1682,29 @@ class SqliteTaskStore:
                 "COALESCE(urgent_bumped_at, '') DESC, "
                 "created_at ASC"
             )
-            params: tuple[str | int | None, ...] = (group, group)
+            params: list[str | int | None] = []
+            if normalized_tags:
+                placeholders = ",".join("?" for _ in normalized_tags)
+                if any_tag:
+                    query = query.replace(
+                        "ORDER BY",
+                        f"AND EXISTS (SELECT 1 FROM task_tags tt WHERE tt.task_id = t.id AND tt.tag IN ({placeholders})) ORDER BY",
+                        1,
+                    )
+                    params.extend(normalized_tags)
+                else:
+                    query = query.replace(
+                        "ORDER BY",
+                        f"AND (SELECT COUNT(DISTINCT tt.tag) FROM task_tags tt WHERE tt.task_id = t.id AND tt.tag IN ({placeholders})) = ? ORDER BY",
+                        1,
+                    )
+                    params.extend(normalized_tags)
+                    params.append(len(normalized_tags))
             if limit is not None:
                 query += " LIMIT ?"
-                params += (limit,)
-            cur = conn.execute(query, params)
-            return [self._row_to_task(row) for row in cur.fetchall()]
+                params.append(limit)
+            cur = conn.execute(query, tuple(params))
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def set_urgent(self, task_id: str, urgent: bool) -> bool:
         """Set or clear a task's urgent queue flag.
@@ -1527,7 +1721,7 @@ class SqliteTaskStore:
             return cur.rowcount > 0
 
     def set_queue_position(self, task_id: str, position: int) -> bool:
-        """Assign an explicit queue position within the task's current group bucket.
+        """Assign an explicit queue position within the task's current tag-set bucket.
 
         Ordered tasks stay contiguous starting from 1 within their bucket.
         Unordered tasks keep queue_position=NULL and sort after ordered tasks.
@@ -1537,14 +1731,13 @@ class SqliteTaskStore:
 
         with self._connect() as conn:
             row = conn.execute(
-                'SELECT id, "group", queue_position FROM tasks WHERE id = ?',
+                "SELECT id, queue_position FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             if row is None:
                 return False
-            group = row["group"]
             current_position = row["queue_position"]
-            bucket_predicate = '("group" = ? OR ("group" IS NULL AND ? IS NULL))'
+            bucket_predicate, bucket_params = self._queue_bucket_predicate_and_params_conn(conn, task_id)
             desired_position = position
 
             if current_position is None:
@@ -1554,7 +1747,7 @@ class SqliteTaskStore:
                     FROM tasks
                     WHERE {bucket_predicate}
                     """,
-                    (group, group),
+                    bucket_params,
                 ).fetchone()
                 max_position = int(max_position_row["max_position"] or 0)
                 desired_position = min(position, max_position + 1)
@@ -1566,7 +1759,7 @@ class SqliteTaskStore:
                       AND queue_position IS NOT NULL
                       AND queue_position >= ?
                     """,
-                    (group, group, desired_position),
+                    (*bucket_params, desired_position),
                 )
             else:
                 max_position_row = conn.execute(
@@ -1575,7 +1768,7 @@ class SqliteTaskStore:
                     FROM tasks
                     WHERE {bucket_predicate}
                     """,
-                    (group, group),
+                    bucket_params,
                 ).fetchone()
                 max_position = int(max_position_row["max_position"] or current_position)
                 desired_position = min(position, max_position)
@@ -1590,7 +1783,7 @@ class SqliteTaskStore:
                           AND queue_position < ?
                           AND id != ?
                         """,
-                        (group, group, desired_position, current_position, task_id),
+                        (*bucket_params, desired_position, current_position, task_id),
                     )
                 elif desired_position > current_position:
                     conn.execute(
@@ -1603,7 +1796,7 @@ class SqliteTaskStore:
                           AND queue_position <= ?
                           AND id != ?
                         """,
-                        (group, group, current_position, desired_position, task_id),
+                        (*bucket_params, current_position, desired_position, task_id),
                     )
 
             cur = conn.execute(
@@ -1616,7 +1809,7 @@ class SqliteTaskStore:
         """Clear explicit queue ordering and close the bucket gap if needed."""
         with self._connect() as conn:
             row = conn.execute(
-                'SELECT id, "group", queue_position FROM tasks WHERE id = ?',
+                "SELECT id, queue_position FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             if row is None:
@@ -1624,8 +1817,7 @@ class SqliteTaskStore:
             current_position = row["queue_position"]
             if current_position is None:
                 return True
-            group = row["group"]
-            bucket_predicate = '("group" = ? OR ("group" IS NULL AND ? IS NULL))'
+            bucket_predicate, bucket_params = self._queue_bucket_predicate_and_params_conn(conn, task_id)
             conn.execute(
                 "UPDATE tasks SET queue_position = NULL WHERE id = ?",
                 (task_id,),
@@ -1638,9 +1830,34 @@ class SqliteTaskStore:
                   AND queue_position IS NOT NULL
                   AND queue_position > ?
                 """,
-                (group, group, current_position),
+                (*bucket_params, current_position),
             )
             return True
+
+    def _queue_bucket_predicate_and_params_conn(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+    ) -> tuple[str, tuple[str | int, ...]]:
+        """Return SQL predicate/params for the task's canonical queue bucket.
+
+        Queue bucket identity is defined as exact normalized tag-set equality.
+        Tasks with disjoint multi-tag sets must never share a queue-position bucket.
+        """
+        tags = self._fetch_tags_for_task_ids(conn, (task_id,)).get(task_id, ())
+        if not tags:
+            return (
+                "NOT EXISTS (SELECT 1 FROM task_tags qbt WHERE qbt.task_id = tasks.id)",
+                (),
+            )
+
+        placeholders = ",".join("?" for _ in tags)
+        predicate = (
+            "(SELECT COUNT(*) FROM task_tags qbt WHERE qbt.task_id = tasks.id) = ? "
+            f"AND (SELECT COUNT(*) FROM task_tags qbt WHERE qbt.task_id = tasks.id AND qbt.tag IN ({placeholders})) = ?"
+        )
+        params: tuple[str | int, ...] = (len(tags), *tags, len(tags))
+        return predicate, params
 
     def get_in_progress(self) -> list[Task]:
         """Get all in-progress tasks, oldest first."""
@@ -1648,7 +1865,7 @@ class SqliteTaskStore:
             cur = conn.execute(
                 "SELECT * FROM tasks WHERE status = 'in_progress' ORDER BY started_at ASC, created_at ASC"
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_history(
         self,
@@ -1729,7 +1946,7 @@ class SqliteTaskStore:
                 params.append(str(limit))
                 cur = conn.execute(query, params)
 
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_based_on_children(self, task_id: str) -> list[Task]:
         """Return tasks where based_on = task_id (direct lineage descendants)."""
@@ -1738,7 +1955,7 @@ class SqliteTaskStore:
                 "SELECT * FROM tasks WHERE based_on = ? ORDER BY created_at ASC",
                 (task_id,),
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_based_on_children_by_type(self, task_id: str, task_type: str) -> list[Task]:
         """Return tasks where based_on = task_id and task_type matches."""
@@ -1751,7 +1968,7 @@ class SqliteTaskStore:
                 """,
                 (task_id, task_type),
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_lineage_children(self, task_id: str) -> list[Task]:
         """Return direct lineage children linked by based_on or depends_on.
@@ -1767,7 +1984,7 @@ class SqliteTaskStore:
                 """,
                 (task_id, task_id),
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_resumable_failed_tasks(self) -> list[Task]:
         """Return failed tasks that can be auto-resumed.
@@ -1790,7 +2007,7 @@ class SqliteTaskStore:
                 """,
                 resumable_reasons,
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def count_resume_chain_depth(self, task_id: str) -> int:
         """Count consecutive failed ancestors with resumable failure reasons.
@@ -1850,7 +2067,7 @@ class SqliteTaskStore:
                 """,
                 (limit,),
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_unmerged(self) -> list[Task]:
         """Get tasks with unmerged code (merge_status = 'unmerged').
@@ -1871,7 +2088,7 @@ class SqliteTaskStore:
                 ORDER BY completed_at DESC
                 """
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def set_merge_status(self, task_id: str, merge_status: str | None) -> None:
         """Set the merge_status for a task. Records merged_at when setting to 'merged'."""
@@ -2148,7 +2365,7 @@ class SqliteTaskStore:
         """Get all tasks."""
         with self._connect() as conn:
             cur = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC")
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_impl_based_on_ids(self) -> set[str]:
         """Return the set of plan IDs that already have an implement task.
@@ -2183,7 +2400,7 @@ class SqliteTaskStore:
                 """,
                 (task_id,),
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_unlinked_reviews_for_slug(self, slug: str) -> list[Task]:
         """Get completed review tasks not linked via depends_on, matched by slug.
@@ -2206,7 +2423,7 @@ class SqliteTaskStore:
                 """,
                 (f"%review-{slug}%", f"review {slug}%"),
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_improve_tasks_for(self, impl_task_id: str, review_task_id: str) -> list[Task]:
         """Get improve tasks that match the given implementation and review task IDs."""
@@ -2233,7 +2450,7 @@ class SqliteTaskStore:
                 """,
                 (impl_task_id, review_task_id, review_task_id),
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_improve_tasks_by_root(self, root_task_id: str) -> list[Task]:
         """Get all improve tasks transitively rooted at the given implementation.
@@ -2261,7 +2478,7 @@ class SqliteTaskStore:
                 """,
                 (root_task_id,),
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_fix_tasks_by_root(self, root_task_id: str) -> list[Task]:
         """Get fix tasks transitively rooted at the given implementation."""
@@ -2287,7 +2504,7 @@ class SqliteTaskStore:
                 """,
                 (root_task_id,),
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def add_comment(
         self,
@@ -2401,7 +2618,7 @@ class SqliteTaskStore:
                 """,
                 (task_id, task_id),
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_stats(self) -> dict:
         """Get aggregate statistics."""
@@ -2447,27 +2664,75 @@ class SqliteTaskStore:
                 """,
                 (f"%{query}%",),
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
+
+    def get_task_tags(self, task_id: str) -> tuple[str, ...]:
+        """Return canonical tags for a task."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT tag FROM task_tags WHERE task_id = ? ORDER BY tag ASC",
+                (task_id,),
+            )
+            return tuple(str(row["tag"]) for row in cur.fetchall())
+
+    def replace_task_tags(self, task_id: str, tags: Iterable[str]) -> tuple[str, ...]:
+        """Replace all tags on a task."""
+        normalized = _normalize_tags(tags)
+        with self._connect() as conn:
+            self._replace_task_tags_conn(conn, task_id, normalized)
+            conn.execute(
+                'UPDATE tasks SET "group" = ? WHERE id = ?',
+                (normalized[0] if len(normalized) == 1 else None, task_id),
+            )
+        return normalized
+
+    def add_task_tags(self, task_id: str, tags: Iterable[str]) -> tuple[str, ...]:
+        """Add one or more tags to a task."""
+        current = set(self.get_task_tags(task_id))
+        current.update(_normalize_tags(tags))
+        return self.replace_task_tags(task_id, current)
+
+    def remove_task_tags(self, task_id: str, tags: Iterable[str]) -> tuple[str, ...]:
+        """Remove one or more tags from a task."""
+        removed = set(_normalize_tags(tags))
+        current = [tag for tag in self.get_task_tags(task_id) if tag not in removed]
+        return self.replace_task_tags(task_id, current)
+
+    def get_tag_counts(self) -> dict[str, int]:
+        """Return counts for every known tag."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT tag, COUNT(*) AS count
+                FROM task_tags
+                GROUP BY tag
+                ORDER BY tag ASC
+                """
+            )
+            return {str(row["tag"]): int(row["count"]) for row in cur.fetchall()}
+
+    def list_tags(self) -> tuple[str, ...]:
+        """Return all known tags sorted alphabetically."""
+        return tuple(self.get_tag_counts().keys())
 
     def get_groups(self) -> dict[str, dict[str, int]]:
-        """Get all groups with task counts by status.
+        """Compatibility alias: return tag counts by status.
 
         Returns:
-            Dict mapping group name to dict of status counts.
-            Example: {"tarantino-v2": {"pending": 1, "completed": 2}, ...}
+            Dict mapping tag to dict of status counts.
         """
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                SELECT "group", status, COUNT(*) as count
-                FROM tasks
-                WHERE "group" IS NOT NULL
-                GROUP BY "group", status
+                SELECT tt.tag AS tag, t.status AS status, COUNT(*) AS count
+                FROM task_tags tt
+                JOIN tasks t ON t.id = tt.task_id
+                GROUP BY tt.tag, t.status
                 """
             )
             groups: dict[str, dict[str, int]] = {}
             for row in cur.fetchall():
-                group_name = row["group"]
+                group_name = row["tag"]
                 status = row["status"]
                 count = row["count"]
                 if group_name not in groups:
@@ -2476,20 +2741,23 @@ class SqliteTaskStore:
             return groups
 
     def get_by_group(self, group: str) -> list[Task]:
-        """Get all tasks in a group, ordered by creation time."""
+        """Compatibility alias: get all tasks carrying a tag."""
+        normalized = _normalize_tag(group)
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                SELECT * FROM tasks
-                WHERE "group" = ?
-                ORDER BY created_at ASC
+                SELECT t.*
+                FROM tasks t
+                JOIN task_tags tt ON tt.task_id = t.id
+                WHERE tt.tag = ?
+                ORDER BY t.created_at ASC
                 """,
-                (group,)
+                (normalized,),
             )
-            return [self._row_to_task(row) for row in cur.fetchall()]
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def rename_group(self, old_group: str, new_group: str) -> int:
-        """Rename a task group across all tasks.
+        """Compatibility alias: rename a tag across all tasks.
 
         Returns the number of updated tasks.
 
@@ -2497,16 +2765,12 @@ class SqliteTaskStore:
             ValueError: If either name is empty, the source group does not exist,
                 or the destination group already exists.
         """
-        old_name = old_group.strip()
-        new_name = new_group.strip()
-        if not old_name:
-            raise ValueError("source group name must not be empty")
-        if not new_name:
-            raise ValueError("destination group name must not be empty")
+        old_name = _normalize_tag(old_group)
+        new_name = _normalize_tag(new_group)
 
         with self._connect() as conn:
             existing_old = conn.execute(
-                'SELECT COUNT(*) AS count FROM tasks WHERE "group" = ?',
+                "SELECT COUNT(*) AS count FROM task_tags WHERE tag = ?",
                 (old_name,),
             ).fetchone()
             assert existing_old is not None
@@ -2518,15 +2782,29 @@ class SqliteTaskStore:
                 return old_count
 
             existing_new = conn.execute(
-                'SELECT 1 FROM tasks WHERE "group" = ? LIMIT 1',
+                "SELECT 1 FROM task_tags WHERE tag = ? LIMIT 1",
                 (new_name,),
             ).fetchone()
             if existing_new is not None:
                 raise ValueError(f"group '{new_name}' already exists")
 
             cur = conn.execute(
-                'UPDATE tasks SET "group" = ? WHERE "group" = ?',
+                "UPDATE task_tags SET tag = ? WHERE tag = ?",
                 (new_name, old_name),
+            )
+            # Keep compatibility column aligned for single-tag tasks.
+            conn.execute('UPDATE tasks SET "group" = NULL')
+            conn.execute(
+                """
+                UPDATE tasks
+                SET "group" = (
+                    SELECT tt.tag
+                    FROM task_tags tt
+                    WHERE tt.task_id = tasks.id
+                    GROUP BY tt.task_id
+                    HAVING COUNT(*) = 1
+                )
+                """
             )
             return cur.rowcount
 
@@ -2861,6 +3139,7 @@ def edit_prompt(
     based_on_slug: str | None = None,
     spec: str | None = None,
     group: str | None = None,
+    tags: Iterable[str] | None = None,
     depends_on: str | None = None,
     create_review: bool = False,
     same_branch: bool = False,
@@ -2881,6 +3160,9 @@ def edit_prompt(
         options.append(f"# Depends on: {depends_on}")
     if group:
         options.append(f"# Group: {group}")
+    normalized_tags = _normalize_tags(tags)
+    if normalized_tags:
+        options.append(f"# Tags: {', '.join(normalized_tags)}")
     if spec:
         options.append(f"# Spec: {spec}")
     if create_review:
@@ -2931,6 +3213,7 @@ def add_task_interactive(
     based_on: str | None = None,
     spec: str | None = None,
     group: str | None = None,
+    tags: Iterable[str] | None = None,
     depends_on: str | None = None,
     create_review: bool = False,
     same_branch: bool = False,
@@ -2957,6 +3240,7 @@ def add_task_interactive(
             based_on_slug=based_on_slug,
             spec=spec,
             group=group,
+            tags=tags,
             depends_on=depends_on,
             create_review=create_review,
             same_branch=same_branch,
@@ -2977,6 +3261,7 @@ def add_task_interactive(
                 task_type=task_type,
                 based_on=based_on,
                 group=group,
+                tags=tags,
                 depends_on=depends_on,
                 spec=spec,
                 create_review=create_review,
@@ -3011,6 +3296,7 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
             based_on=task.based_on,
             spec=task.spec,
             group=task.group,
+            tags=task.tags,
             depends_on=task.depends_on,
             create_review=task.create_review,
             same_branch=task.same_branch,
@@ -3076,6 +3362,7 @@ def _task_to_dict(task: "Task") -> dict:
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "completed_at": task.completed_at.isoformat() if task.completed_at else None,
         "group": task.group,
+        "tags": list(task.tags),
         "depends_on": task.depends_on,
         "spec": task.spec,
         "create_review": task.create_review,

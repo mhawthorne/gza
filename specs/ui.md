@@ -67,7 +67,7 @@ CREATE INDEX idx_task_tags_tag ON task_tags(tag);
 
 - **Queues** stay as they are: execution buckets (what `gza work` pulls from).
 - **Tags** are orthogonal labels for slicing/filtering (e.g. `v0.5`, `frontend`, `bug`).
-- Commands that take a queue-like filter (e.g. `gza watch`) MAY accept tags interchangeably in a later iteration — out of scope for v1 UI, tracked as follow-up.
+- Queue-like command filters (`gza work`, `gza watch`, `gza next`, `gza queue`, `gza history`, `gza search`) now accept repeatable tag filters and share the same tag-filter semantics.
 
 ## Pages
 
@@ -144,7 +144,6 @@ v1 (one week target):
 Post-v1 (follow-ups):
 - Specs / plans browsing and viewing
 - Suggested next actions on dashboard
-- Tag/queue interop in `gza watch` and similar
 - In-browser editing of specs/plans
 - Driving gza from the UI (create, resume, merge)
 

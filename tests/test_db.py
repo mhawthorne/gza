@@ -208,6 +208,92 @@ class TestTaskChaining:
         assert refreshed_second.queue_position is None
         assert refreshed_third.queue_position == 2
 
+    def test_queue_position_mutation_is_scoped_to_group_bucket(self, tmp_path: Path):
+        """Setting/clearing explicit order only mutates positions within the task's group bucket."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        release_first = store.add("Release first", group="release")
+        release_second = store.add("Release second", group="release")
+        backlog_first = store.add("Backlog first", group="backlog")
+        backlog_second = store.add("Backlog second", group="backlog")
+        assert release_first.id is not None
+        assert release_second.id is not None
+        assert backlog_first.id is not None
+        assert backlog_second.id is not None
+
+        store.set_queue_position(release_first.id, 1)
+        store.set_queue_position(release_second.id, 2)
+        store.set_queue_position(backlog_first.id, 1)
+        store.set_queue_position(backlog_second.id, 2)
+
+        store.clear_queue_position(release_first.id)
+
+        refreshed_release_first = store.get(release_first.id)
+        refreshed_release_second = store.get(release_second.id)
+        refreshed_backlog_first = store.get(backlog_first.id)
+        refreshed_backlog_second = store.get(backlog_second.id)
+        assert refreshed_release_first is not None
+        assert refreshed_release_second is not None
+        assert refreshed_backlog_first is not None
+        assert refreshed_backlog_second is not None
+
+        assert refreshed_release_first.queue_position is None
+        assert refreshed_release_second.queue_position == 1
+        assert refreshed_backlog_first.queue_position == 1
+        assert refreshed_backlog_second.queue_position == 2
+
+    def test_queue_position_mutation_does_not_cross_disjoint_multi_tag_buckets(self, tmp_path: Path):
+        """Multi-tag queue mutations should stay isolated to the task's exact tag-set bucket."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        release_first = store.add("Release first", tags=("release", "backend"))
+        release_second = store.add("Release second", tags=("release", "backend"))
+        ops_first = store.add("Ops first", tags=("ops", "infra"))
+        ops_second = store.add("Ops second", tags=("ops", "infra"))
+        assert release_first.id is not None
+        assert release_second.id is not None
+        assert ops_first.id is not None
+        assert ops_second.id is not None
+
+        store.set_queue_position(release_first.id, 1)
+        store.set_queue_position(release_second.id, 2)
+        store.set_queue_position(ops_first.id, 1)
+        store.set_queue_position(ops_second.id, 2)
+
+        store.set_queue_position(release_second.id, 1)
+
+        refreshed_release_first = store.get(release_first.id)
+        refreshed_release_second = store.get(release_second.id)
+        refreshed_ops_first = store.get(ops_first.id)
+        refreshed_ops_second = store.get(ops_second.id)
+        assert refreshed_release_first is not None
+        assert refreshed_release_second is not None
+        assert refreshed_ops_first is not None
+        assert refreshed_ops_second is not None
+
+        assert refreshed_release_second.queue_position == 1
+        assert refreshed_release_first.queue_position == 2
+        assert refreshed_ops_first.queue_position == 1
+        assert refreshed_ops_second.queue_position == 2
+
+        store.clear_queue_position(release_second.id)
+
+        refreshed_release_first = store.get(release_first.id)
+        refreshed_release_second = store.get(release_second.id)
+        refreshed_ops_first = store.get(ops_first.id)
+        refreshed_ops_second = store.get(ops_second.id)
+        assert refreshed_release_first is not None
+        assert refreshed_release_second is not None
+        assert refreshed_ops_first is not None
+        assert refreshed_ops_second is not None
+
+        assert refreshed_release_second.queue_position is None
+        assert refreshed_release_first.queue_position == 1
+        assert refreshed_ops_first.queue_position == 1
+        assert refreshed_ops_second.queue_position == 2
+
     def test_get_pending_pickup_excludes_non_pickable_pending_tasks(self, tmp_path: Path):
         """Pickup listing excludes internal and dependency-blocked pending tasks."""
         db_path = tmp_path / "test.db"
@@ -4259,7 +4345,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -4271,7 +4357,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -5073,7 +5159,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35]
 
         # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")

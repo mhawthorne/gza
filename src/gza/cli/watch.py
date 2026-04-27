@@ -18,7 +18,13 @@ from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..failure_policy import is_resumable_failure_reason
 from ..git import Git
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
-from ..task_query import TaskQueryPresets, TaskQueryService, TaskRow
+from ..task_query import (
+    TaskQueryPresets,
+    TaskQueryService,
+    TaskRow,
+    normalize_tag_filters,
+    task_matches_tag_filters,
+)
 from ..workers import WorkerRegistry
 from ._common import (
     _create_rebase_task,
@@ -28,6 +34,7 @@ from ._common import (
     clear_task_queue_position,
     format_review_outcome,
     get_store,
+    parse_cli_tag_filters,
     resolve_id,
     set_task_queue_position,
     set_task_urgency,
@@ -77,6 +84,14 @@ def _short_prompt(prompt: str) -> str:
 
 def _format_hms() -> str:
     return datetime.now(UTC).strftime("%H:%M:%S")
+
+
+def _format_scope_message(tags: tuple[str, ...] | None, *, any_tag: bool) -> str | None:
+    """Return a stable watch-scope message when tag filtering is active."""
+    if not tags:
+        return None
+    mode = "any" if any_tag else "all"
+    return f"scope: tags={','.join(tags)} mode={mode}"
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -258,8 +273,13 @@ def _format_wake_message(*, running: int, pending: int, slots: int, running_task
     return message
 
 
-def _pending_runnable_tasks(store: SqliteTaskStore, group: str | None = None) -> list[DbTask]:
-    return get_runnable_pending_tasks(store, group=group)
+def _pending_runnable_tasks(
+    store: SqliteTaskStore,
+    *,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = False,
+) -> list[DbTask]:
+    return get_runnable_pending_tasks(store, tags=tags, any_tag=any_tag)
 
 
 def _run_with_optional_stdout_suppressed(quiet: bool, fn: Callable[[], T]) -> T:
@@ -312,11 +332,19 @@ def _iter_status_transitions(
     return transitions
 
 
-def _task_matches_group(store: SqliteTaskStore, task_id: str, group: str | None) -> bool:
-    if group is None:
+def _task_matches_tags(
+    store: SqliteTaskStore,
+    task_id: str,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+) -> bool:
+    normalized_tags = normalize_tag_filters(tags)
+    if not normalized_tags:
         return True
     task = store.get(task_id)
-    return task is not None and task.group == group
+    if task is None:
+        return False
+    return task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized_tags, any_tag=any_tag)
 
 
 def _failure_is_auto_resumable_by_watch(
@@ -341,13 +369,14 @@ def _collect_completed_transition_ids(
     new: dict[str, dict[str, str | None]],
     *,
     store: SqliteTaskStore,
-    group: str | None = None,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = False,
 ) -> list[str]:
     completed_ids: list[str] = []
     for task_id, _old_status, new_row in _iter_status_transitions(old, new):
         if new_row.get("status") != "completed":
             continue
-        if not _task_matches_group(store, task_id, group):
+        if not _task_matches_tags(store, task_id, tags, any_tag):
             continue
         completed_ids.append(task_id)
     return completed_ids
@@ -359,13 +388,14 @@ def _collect_unhandled_failures(
     *,
     store: SqliteTaskStore,
     config: Config,
-    group: str | None = None,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = False,
 ) -> list[_ObservedFailure]:
     failures: list[_ObservedFailure] = []
     for task_id, _old_status, new_row in _iter_status_transitions(old, new):
         if new_row.get("status") != "failed":
             continue
-        if not _task_matches_group(store, task_id, group):
+        if not _task_matches_tags(store, task_id, tags, any_tag):
             continue
         reason = new_row.get("failure_reason") or "UNKNOWN"
         if _failure_is_auto_resumable_by_watch(task_id=task_id, store=store, config=config, reason=reason):
@@ -396,10 +426,18 @@ def _run_cycle(
     max_iterations: int,
     dry_run: bool,
     log: _WatchLog,
+    tags: tuple[str, ...] | None = None,
     group: str | None = None,
+    any_tag: bool = False,
     quiet: bool = False,
 ) -> _CycleResult:
     from ._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
+
+    if group:
+        merged_tags = list(tags or ())
+        merged_tags.append(group)
+        tags = tuple(merged_tags)
+    tags = normalize_tag_filters(tags)
 
     log.begin_cycle()
     if not dry_run:
@@ -407,7 +445,7 @@ def _run_cycle(
         prune_terminal_dead_workers(config)
 
     live_pids, running_task_ids = _collect_live_running_state(config, store)
-    pending_count = len(_pending_runnable_tasks(store, group=group))
+    pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
     running = len(live_pids)
     slots = max(0, batch - running)
     work_done = False
@@ -423,13 +461,20 @@ def _run_cycle(
             running_task_ids=running_task_ids,
         ),
     )
+    scope_message = _format_scope_message(tags, any_tag=any_tag)
+    if scope_message is not None:
+        log.emit("INFO", scope_message)
 
     # 1) Execute advance actions for completed tasks (includes completed plans
     # with no implement child, aligned with gza advance).
     # Merges run first; worker-spawning actions consume available slots.
     merge_candidates, impl_based_on_ids = _collect_advance_completed_tasks(store)
-    if group is not None:
-        merge_candidates = [task for task in merge_candidates if task.group == group]
+    if tags:
+        merge_candidates = [
+            task
+            for task in merge_candidates
+            if task_matches_tag_filters(task_tags=task.tags, tag_filters=tags, any_tag=any_tag)
+        ]
     if merge_candidates:
         git = Git(config.project_dir)
         current_branch = git.current_branch()
@@ -504,7 +549,7 @@ def _run_cycle(
                 prompt=_unimplemented_implement_prompt(parent_task),
                 task_type="implement",
                 depends_on=parent_task.id,
-                group=parent_task.group,
+                tags=parent_task.tags,
             )
 
         executor_context = AdvanceActionExecutionContext(
@@ -661,8 +706,12 @@ def _run_cycle(
     pending_resume_task_ids: set[str] = set()
     if slots > 0:
         failed_tasks = store.get_resumable_failed_tasks()
-        if group is not None:
-            failed_tasks = [task for task in failed_tasks if task.group == group]
+        if tags:
+            failed_tasks = [
+                task
+                for task in failed_tasks
+                if task_matches_tag_filters(task_tags=task.tags, tag_filters=tags, any_tag=any_tag)
+            ]
         for failed in failed_tasks:
             if slots <= 0:
                 break
@@ -726,7 +775,7 @@ def _run_cycle(
             )
 
     # 3) Start new queued tasks (consumes slots)
-    pending_tasks = _pending_runnable_tasks(store, group=group)
+    pending_tasks = _pending_runnable_tasks(store, tags=tags, any_tag=any_tag)
     if slots > 0:
         for task in pending_tasks:
             if slots <= 0:
@@ -788,7 +837,7 @@ def _run_cycle(
             started_task_ids.add(str(task.id))
             log.emit("START", f"{task.id} {task_type} \"{_short_prompt(task.prompt)}\"")
 
-    pending_count = len(_pending_runnable_tasks(store, group=group))
+    pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
     log.end_cycle()
     return _CycleResult(
         work_done=work_done,
@@ -810,7 +859,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
     )
     dry_run = bool(getattr(args, "dry_run", False))
     quiet = bool(getattr(args, "quiet", False))
-    group = getattr(args, "group", None)
+    try:
+        tag_filters, any_tag = parse_cli_tag_filters(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     if batch < 1:
         print("Error: --batch must be a positive integer")
@@ -860,7 +913,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
             dry_run=True,
             quiet=False,
             log=log,
-            group=group,
+            tags=tag_filters,
+            any_tag=any_tag,
         )
         if preview_result.work_done:
             try:
@@ -894,7 +948,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 dry_run=dry_run,
                 quiet=quiet,
                 log=log,
-                group=group,
+                tags=tag_filters,
+                any_tag=any_tag,
             )
 
             current_snapshot = _task_snapshot(store)
@@ -909,7 +964,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 previous_snapshot,
                 current_snapshot,
                 store=store,
-                group=group,
+                tags=tag_filters,
+                any_tag=any_tag,
             )
             if completed_ids and failure_streak > 0:
                 failure_streak = 0
@@ -922,7 +978,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 current_snapshot,
                 store=store,
                 config=config,
-                group=group,
+                tags=tag_filters,
+                any_tag=any_tag,
             )
             previous_snapshot = current_snapshot
 
@@ -988,7 +1045,11 @@ def cmd_queue(args: argparse.Namespace) -> int:
     store = get_store(config)
     service = TaskQueryService(store)
     action = getattr(args, "queue_action", None)
-    group = getattr(args, "group", None)
+    try:
+        tag_filters, any_tag = parse_cli_tag_filters(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     if action in {"bump", "unbump", "move", "next", "clear"}:
         task_id = resolve_id(config, args.task_id)
@@ -1005,7 +1066,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
         runnable_pending_ids = {
             str(row.task.id)
-            for row in service.run(TaskQueryPresets.queue(limit=None, group=group)).rows
+            for row in service.run(TaskQueryPresets.queue(limit=None, tags=tag_filters, any_tag=any_tag)).rows
             if isinstance(row, TaskRow) and row.task.id is not None
         }
         is_currently_runnable = str(task_id) in runnable_pending_ids
@@ -1050,12 +1111,12 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
     pending = [
         row.task
-        for row in service.run(TaskQueryPresets.queue(limit=None, group=group)).rows
+        for row in service.run(TaskQueryPresets.queue(limit=None, tags=tag_filters, any_tag=any_tag)).rows
         if isinstance(row, TaskRow)
     ]
     if not pending:
-        if group:
-            print(f"No runnable tasks in group '{group}'")
+        if tag_filters:
+            print(f"No runnable tasks matching tags: {', '.join(tag_filters)}")
         else:
             print("No runnable tasks")
         return 0

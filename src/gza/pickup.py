@@ -33,6 +33,9 @@ def get_runnable_pending_tasks(
     store: SqliteTaskStore,
     limit: int | None = None,
     group: str | None = None,
+    *,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = False,
 ) -> list[Task]:
     """Return pending tasks that default worker pickup can run, in pickup order."""
-    return store.get_pending_pickup(limit=limit, group=group)
+    return store.get_pending_pickup(limit=limit, group=group, tags=tags, any_tag=any_tag)

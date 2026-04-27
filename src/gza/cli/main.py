@@ -201,7 +201,20 @@ def main() -> int:
     work_parser.add_argument(
         "--group",
         metavar="NAME",
-        help="Only pick pending tasks from this group when no task IDs are specified",
+        help="Deprecated alias for --tag (single value)",
+    )
+    work_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only pick pending tasks matching tag filters when no task IDs are specified (repeatable)",
+    )
+    work_parser.add_argument(
+        "--any-tag",
+        action="store_true",
+        dest="any_tag",
+        help="With repeated --tag values, match any tag instead of all tags",
     )
 
     # run-inline command
@@ -256,7 +269,20 @@ def main() -> int:
     next_parser.add_argument(
         "--group",
         metavar="NAME",
-        help="Only show pending tasks from this group",
+        help="Deprecated alias for --tag (single value)",
+    )
+    next_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only show pending tasks matching tag filters (repeatable)",
+    )
+    next_parser.add_argument(
+        "--any-tag",
+        action="store_true",
+        dest="any_tag",
+        help="With repeated --tag values, match any tag instead of all tags",
     )
 
     # history command
@@ -393,6 +419,19 @@ def main() -> int:
         "--json",
         action="store_true",
         help="Output JSON rows from the unified query API",
+    )
+    search_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Filter matches by tag (repeatable)",
+    )
+    search_parser.add_argument(
+        "--any-tag",
+        action="store_true",
+        dest="any_tag",
+        help="With repeated --tag values, match any tag instead of all tags",
     )
 
     # incomplete command
@@ -645,7 +684,20 @@ def main() -> int:
     watch_parser.add_argument(
         "--group",
         metavar="NAME",
-        help="Only advance, resume, and start tasks from this group; use 'gza queue --group NAME' to preview scoped pickup order",
+        help="Deprecated alias for --tag (single value)",
+    )
+    watch_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'gza queue --tag TAG' to preview scoped pickup order",
+    )
+    watch_parser.add_argument(
+        "--any-tag",
+        action="store_true",
+        dest="any_tag",
+        help="With repeated --tag values, match any tag instead of all tags",
     )
 
     # queue command
@@ -658,7 +710,20 @@ def main() -> int:
     queue_parser.add_argument(
         "--group",
         metavar="NAME",
-        help="Only list runnable tasks from this group (same scoped pickup order used by 'gza watch --group NAME')",
+        help="Deprecated alias for --tag (single value)",
+    )
+    queue_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only list runnable tasks matching tag filters (repeatable); same scoped pickup order used by 'gza watch --tag TAG'",
+    )
+    queue_parser.add_argument(
+        "--any-tag",
+        action="store_true",
+        dest="any_tag",
+        help="With repeated --tag values, match any tag instead of all tags",
     )
     queue_parser.add_argument(
         "-n",
@@ -672,57 +737,59 @@ def main() -> int:
         action="store_true",
         help="Show all runnable tasks",
     )
+
+    def _add_queue_tag_scope_args(subparser: argparse.ArgumentParser, *, action: str) -> None:
+        """Add queue management tag-scope filters for runnable status messages."""
+        subparser.add_argument(
+            "--group",
+            metavar="NAME",
+            help=f"Deprecated alias for --tag; check runnable status within this tag scope while {action}",
+        )
+        subparser.add_argument(
+            "--tag",
+            action="append",
+            dest="tags",
+            metavar="TAG",
+            help=f"Check runnable status only within matching tag filters while {action} (repeatable)",
+        )
+        subparser.add_argument(
+            "--any-tag",
+            action="store_true",
+            dest="any_tag",
+            help="With repeated --tag values, match any tag instead of all tags",
+        )
+
     queue_subparsers = queue_parser.add_subparsers(dest="queue_action")
     queue_bump = queue_subparsers.add_parser("bump", help="Move a pending task to the front of the urgent queue lane")
     queue_bump.add_argument("task_id", type=str, help="Full prefixed task ID to bump")
     add_common_args(queue_bump)
-    queue_bump.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Check runnable status within this group while bumping",
-    )
+    _add_queue_tag_scope_args(queue_bump, action="bumping")
     queue_unbump = queue_subparsers.add_parser("unbump", help="Move a pending task back to the normal queue lane")
     queue_unbump.add_argument("task_id", type=str, help="Full prefixed task ID to unbump")
     add_common_args(queue_unbump)
-    queue_unbump.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Check runnable status within this group while unbumping",
-    )
+    _add_queue_tag_scope_args(queue_unbump, action="unbumping")
     queue_move = queue_subparsers.add_parser(
         "move",
-        help="Assign an explicit queue position within the task's current group bucket",
+        help="Assign an explicit queue position within the task's current tag-set bucket",
     )
     queue_move.add_argument("task_id", type=str, help="Full prefixed task ID to reorder")
     queue_move.add_argument("position", type=_parse_non_negative_int, help="1-based queue position")
     add_common_args(queue_move)
-    queue_move.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Check runnable status within this group while reordering",
-    )
+    _add_queue_tag_scope_args(queue_move, action="reordering")
     queue_next = queue_subparsers.add_parser(
         "next",
-        help="Move a pending task to explicit queue position 1 within its current group bucket",
+        help="Move a pending task to explicit queue position 1 within its current tag-set bucket",
     )
     queue_next.add_argument("task_id", type=str, help="Full prefixed task ID to move next")
     add_common_args(queue_next)
-    queue_next.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Check runnable status within this group while moving next",
-    )
+    _add_queue_tag_scope_args(queue_next, action="moving next")
     queue_clear = queue_subparsers.add_parser(
         "clear",
         help="Remove a task's explicit queue position and return it to lane-based ordering",
     )
     queue_clear.add_argument("task_id", type=str, help="Full prefixed task ID to clear")
     add_common_args(queue_clear)
-    queue_clear.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Check runnable status within this group while clearing queue order",
-    )
+    _add_queue_tag_scope_args(queue_clear, action="clearing queue order")
 
     # refresh command
     refresh_parser = subparsers.add_parser("refresh", help="Refresh cached diff stats for unmerged tasks")
@@ -1170,7 +1237,14 @@ def main() -> int:
     add_parser.add_argument(
         "--group",
         metavar="NAME",
-        help="Set task group",
+        help="Deprecated alias for --tag",
+    )
+    add_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Attach one or more tags to the task (repeatable)",
     )
     add_parser.add_argument(
         "--based-on",
@@ -1239,7 +1313,33 @@ def main() -> int:
         "--group",
         dest="group_flag",
         metavar="NAME",
-        help="Move task to group (use empty string \"\" to remove from group)",
+        help="Deprecated alias for tag edits (empty string clears all tags); mutually exclusive with other tag mutation flags",
+    )
+    edit_parser.add_argument(
+        "--add-tag",
+        action="append",
+        dest="add_tags",
+        metavar="TAG",
+        help="Add a tag (repeatable; mutually exclusive with other tag mutation flags)",
+    )
+    edit_parser.add_argument(
+        "--remove-tag",
+        action="append",
+        dest="remove_tags",
+        metavar="TAG",
+        help="Remove a tag (repeatable; mutually exclusive with other tag mutation flags)",
+    )
+    edit_parser.add_argument(
+        "--clear-tags",
+        action="store_true",
+        dest="clear_tags",
+        help="Clear all task tags (mutually exclusive with other tag mutation flags)",
+    )
+    edit_parser.add_argument(
+        "--set-tags",
+        metavar="CSV",
+        dest="set_tags",
+        help="Replace task tags with a comma-separated list (mutually exclusive with other tag mutation flags)",
     )
     edit_parser.add_argument(
         "--based-on",
@@ -1628,7 +1728,14 @@ def main() -> int:
     implement_parser.add_argument(
         "--group",
         metavar="NAME",
-        help="Set task group",
+        help="Deprecated alias for --tag",
+    )
+    implement_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Attach one or more tags to the new implementation task (repeatable)",
     )
     implement_parser.add_argument(
         "--same-branch",
@@ -1830,12 +1937,12 @@ def main() -> int:
     add_common_args(import_parser)
 
     # groups command
-    groups_parser = subparsers.add_parser("groups", help="List all groups with task counts")
+    groups_parser = subparsers.add_parser("groups", help="Deprecated tag-management commands")
     add_common_args(groups_parser)
     groups_subparsers = groups_parser.add_subparsers(dest="groups_action")
-    groups_list_parser = groups_subparsers.add_parser("list", help="List all groups with task counts")
+    groups_list_parser = groups_subparsers.add_parser("list", help="List tags with task counts")
     add_common_args(groups_list_parser)
-    groups_rename_parser = groups_subparsers.add_parser("rename", help="Rename a group across all attached tasks")
+    groups_rename_parser = groups_subparsers.add_parser("rename", help="Rename a tag across all attached tasks")
     groups_rename_parser.add_argument(
         "old_group",
         help="Current group name",
@@ -1847,7 +1954,7 @@ def main() -> int:
     add_common_args(groups_rename_parser)
 
     # group command
-    group_parser = subparsers.add_parser("group", help="Show tasks in a group")
+    group_parser = subparsers.add_parser("group", help="Deprecated alias for tasks filtered by one tag")
     group_parser.add_argument(
         "group",
         help="Group name to show tasks for",
@@ -2106,9 +2213,6 @@ def main() -> int:
         elif args.command == "import":
             return cmd_import(args)
         elif args.command == "groups":
-            if getattr(args, "groups_action", None) is None:
-                groups_parser.print_help()
-                return 0
             if getattr(args, "groups_action", None) == "rename":
                 return cmd_group_rename(args)
             return cmd_groups(args)

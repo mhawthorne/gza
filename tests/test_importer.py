@@ -90,6 +90,24 @@ tasks:
         assert tasks[0].group == "default-group"
         assert tasks[1].group is None
 
+    def test_parse_group_null_clears_inherited_group_tag(self, tmp_path: Path):
+        """Task-level `group: null` clears inherited file-level group tag."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+group: rel-1
+tags:
+  - core
+tasks:
+  - prompt: "inherits defaults"
+  - prompt: "clears group default"
+    group: null
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(errors) == 0
+        assert tasks[0].tags == ("core", "rel-1")
+        assert tasks[1].tags == ("core",)
+
     def test_parse_with_dependencies(self, tmp_path: Path):
         """Parse tasks with depends_on."""
         import_file = tmp_path / "tasks.yaml"
@@ -198,6 +216,115 @@ tasks:
 
         assert len(errors) == 1
         assert "invalid task type" in errors[0].message.lower()
+
+    def test_parse_rejects_task_level_scalar_tags(self, tmp_path: Path):
+        """Task-level tags must be a list of strings."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+tasks:
+  - prompt: "Task with scalar tags"
+    tags: release-1.2
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 1
+        assert errors[0].task_index == 1
+        assert errors[0].message == "'tags' must be a list of strings"
+
+    def test_parse_rejects_file_level_scalar_tags(self, tmp_path: Path):
+        """File-level tags must be a list of strings."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+tags: release-1.2
+tasks:
+  - prompt: "Task"
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 1
+        assert errors[0].task_index is None
+        assert errors[0].message == "'tags' must be a list of strings"
+
+    def test_parse_rejects_non_string_tag_entries(self, tmp_path: Path):
+        """Tags entries must all be strings."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+tasks:
+  - prompt: "Task with invalid tags"
+    tags: ["release-1.2", 123]
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 1
+        assert errors[0].task_index == 1
+        assert errors[0].message == "'tags' must contain only strings"
+
+    def test_parse_rejects_task_level_non_string_group_alias(self, tmp_path: Path):
+        """Task-level group alias must be string-or-null with precise error text."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+tasks:
+  - prompt: "Task with invalid group type"
+    group: 123
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 1
+        assert errors[0].task_index == 1
+        assert errors[0].message == "'group' must be a string or null"
+
+    def test_parse_rejects_file_level_non_string_group_alias(self, tmp_path: Path):
+        """File-level group alias must be string-or-null and reported as file-level."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+group: 123
+tasks:
+  - prompt: "Task"
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 1
+        assert errors[0].task_index is None
+        assert errors[0].message == "'group' must be a string or null"
+
+    def test_parse_reports_mixed_group_alias_and_tag_type_errors(self, tmp_path: Path):
+        """Invalid group alias and tags shape should both surface with task attribution."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+tasks:
+  - prompt: "Task with mixed invalid labels"
+    group: 123
+    tags: ["release-1.2", 456]
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 2
+        assert all(error.task_index == 1 for error in errors)
+        assert {error.message for error in errors} == {
+            "'group' must be a string or null",
+            "'tags' must contain only strings",
+        }
+
+    def test_parse_preserves_specific_empty_tag_validation_message(self, tmp_path: Path):
+        """Normalization errors should preserve precise tag failure messages."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+tasks:
+  - prompt: "Task with empty normalized tag"
+    group: "   "
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 1
+        assert errors[0].task_index == 1
+        assert errors[0].message == "tag must not be empty"
 
 
 class TestValidateImport:
@@ -390,6 +517,28 @@ class TestImportTasks:
         # Only one new task created
         all_tasks = store.get_pending()
         assert len(all_tasks) == 2  # 1 existing + 1 new
+
+    def test_import_group_null_duplicate_uses_cleared_effective_tags(
+        self, store: SqliteTaskStore, project_dir: Path
+    ):
+        """Imported `group: null` tasks should duplicate-match against untagged tasks."""
+        store.add("Legacy prompt")
+        import_file = project_dir / "tasks.yaml"
+        import_file.write_text("""
+group: rel-1
+tasks:
+  - prompt: "Legacy prompt"
+    group: null
+""")
+        tasks, _, _, parse_errors = parse_import_file(import_file)
+        assert parse_errors == []
+
+        results, _ = import_tasks(store, tasks, project_dir)
+
+        assert len(results) == 1
+        assert results[0].skipped is True
+        assert results[0].skip_reason is not None
+        assert "duplicate of" in results[0].skip_reason
 
     def test_import_force_duplicates(self, store: SqliteTaskStore, project_dir: Path):
         """Force flag creates duplicates."""

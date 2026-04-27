@@ -479,7 +479,9 @@ gza work [task_id...] [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks (run even if depends_on output is not yet merged) |
 | `--pr` | Create/reuse a GitHub PR for completed code tasks before auto-created review runs (when the branch has commits) |
-| `--group NAME` | Only pick pending tasks from this group when no task IDs are specified |
+| `--tag TAG` | Only pick pending tasks matching tag filters when no task IDs are specified (repeatable) |
+| `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
+| `--group NAME` | Deprecated alias for `--tag NAME` |
 
 ### add
 
@@ -496,7 +498,8 @@ gza add [prompt] [options]
 | `--type TYPE` | Set task type: `explore`\|`plan`\|`implement`\|`review`\|`improve` (default: `implement`) |
 | `--branch-type TYPE` | Set branch type hint for naming |
 | `--explore` | Create explore task (shorthand) |
-| `--group NAME` | Set task group |
+| `--tag TAG` | Add task tag (repeatable) |
+| `--group NAME` | Deprecated alias for `--tag NAME` |
 | `--based-on ID` | Base on previous task by full prefixed task ID (e.g. `gza-1234`) |
 | `--depends-on ID` | Set dependency on another task by full prefixed task ID (e.g. `gza-1234`) |
 | `--review` | Auto-create review task on completion |
@@ -519,7 +522,11 @@ gza edit <task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `task_id` | Full prefixed task ID to edit (e.g. `gza-1234`) |
-| `--group NAME` | Move task to group (empty `""` removes) |
+| `--add-tag TAG` | Add one or more tags (repeatable, mutually exclusive with other tag mutation flags) |
+| `--remove-tag TAG` | Remove one or more tags (repeatable, mutually exclusive with other tag mutation flags) |
+| `--clear-tags` | Remove all tags from task (mutually exclusive with other tag mutation flags) |
+| `--set-tags CSV` | Replace all tags with comma-separated tags (mutually exclusive with other tag mutation flags) |
+| `--group NAME` | Deprecated alias; maps to tag mutation compatibility behavior and is mutually exclusive with other tag mutation flags |
 | `--based-on ID` | Set lineage/parent relationship using a full prefixed task ID (branch inheritance and context; e.g. `gza-1234`) |
 | `--depends-on ID` | Set execution dependency using a full prefixed task ID (blocks task until dependency completes; e.g. `gza-1234`) |
 | `--explore` | Convert to explore task |
@@ -635,7 +642,7 @@ gza import [file] [options]
 
 ### group
 
-Show tasks in a specific group.
+Deprecated alias for tag-scoped listing.
 
 ```bash
 gza group <group>
@@ -949,7 +956,7 @@ For each unmerged implementation, output includes:
 
 ### groups
 
-List all task groups with their task counts.
+Deprecated alias for tag listing commands.
 
 ```bash
 gza groups
@@ -1186,7 +1193,7 @@ gza next [options]
 ```
 
 Shows pending tasks that are ready to run (dependencies satisfied). Tasks blocked by dependencies are listed separately.
-Use `--group NAME` to scope the list to one task group, such as a release queue.
+Use `--tag TAG` (repeatable) to scope the list to matching tags. `--group NAME` remains as a deprecated alias for one tag.
 
 ### queue
 
@@ -1205,19 +1212,21 @@ gza queue clear <task_id>
 |--------|-------------|
 | `task_id` | Full prefixed task ID to reorder (for example `gza-1234`) |
 | `position` | 1-based explicit queue position for `queue move` |
-| `--group NAME` | Only list runnable tasks from this group (the same scoped pickup order used by `gza watch --group NAME`); for `bump`/`unbump`/`move`/`next`/`clear`, only affects the runnable-status message |
+| `--tag TAG` | Only list runnable tasks matching tag filters (repeatable; same scoped pickup order used by `gza watch --tag TAG`) |
+| `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
+| `--group NAME` | Deprecated alias for `--tag NAME` |
 | `-n, --limit N` | Show first N runnable tasks (default: 10; use `0`, `-1`, or `--all` for all) |
 | `--all` | Show all runnable tasks |
 
 Queue pickup ordering is:
-1. Explicit `queue_position` values in ascending order within the selected group bucket (or within ungrouped tasks when no group is set on the task)
+1. Explicit `queue_position` values in ascending order within each task's current tag-set bucket (exact tag match)
 2. Urgent lane, with `queue bump` moving a task to the front of that lane
 3. FIFO by creation time for the remaining runnable tasks
 
-Use `gza queue next <task_id>` to make a task the next ordered item, or `gza queue move <task_id> <position>` to assign positions like 1, 2, and 3 without having to order every task. Use `gza queue clear <task_id>` to remove explicit ordering and fall back to lane/FIFO behavior.
+Use `gza queue next <task_id>` to make a task the next ordered item in its current tag-set bucket, or `gza queue move <task_id> <position>` to assign positions like 1, 2, and 3 within that bucket without having to order every task. Use `gza queue clear <task_id>` to remove explicit ordering and fall back to lane/FIFO behavior.
 `gza queue` shows tasks that default worker pickup can run (internal and dependency-blocked pending tasks are excluded).
 By default, `gza queue` shows the first 10 runnable tasks. Use `-n 0`, `-n -1`, or `--all` to show everything.
-To treat a group as a release queue, assign tasks with `gza add --group release-1.2 ...` and inspect them with `gza queue --group release-1.2`. That command is the canonical preview for what `gza watch --group release-1.2` will consider and in what order.
+To treat a tag as a release slice, assign tasks with `gza add --tag release-1.2 ...` and inspect them with `gza queue --tag release-1.2`. That command is the canonical preview for what `gza watch --tag release-1.2` will consider and in what order.
 Internally, queue-style task listing is routed through the unified task query layer so queue, next, and API consumers can share the same filter/order semantics.
 
 ### implement
@@ -1233,7 +1242,8 @@ gza implement <plan_task_id> [prompt] [options]
 | `plan_task_id` | Full prefixed completed plan task ID to implement (e.g. `gza-1234`) |
 | `prompt` | Implementation prompt (defaults to plan-derived prompt) |
 | `--review` | Auto-create review task on completion |
-| `--group NAME` | Set task group |
+| `--tag TAG` | Add task tag (repeatable) |
+| `--group NAME` | Deprecated alias for `--tag NAME` |
 | `--same-branch` | Continue on depends_on task's branch instead of creating new |
 | `--branch-type TYPE` | Set branch type hint for branch naming |
 | `--model MODEL` | Override model for this task |
@@ -1309,7 +1319,12 @@ gza watch [options]
 | `--max-iterations N` | Iterate loop cap for implement tasks (default: `watch.max_iterations` or `10`) |
 | `--dry-run` | Show what each cycle would do without executing |
 | `--quiet` | Write events to `.gza/watch.log` only |
-| `--group NAME` | Only advance, resume, and start tasks from this group; use `gza queue --group NAME` to preview the same scoped pickup order |
+| `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `gza queue --tag TAG` to preview the same scoped pickup order |
+| `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
+| `--group NAME` | Deprecated alias for `--tag NAME` |
+
+When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
+`INFO   scope: tags=<comma-separated-tags> mode=all|any`.
 
 ### learnings
 
@@ -1472,7 +1487,7 @@ Any state can be manually set to `dropped` via `gza set-status`.
 
 **Dependencies:**
 
-Tasks with `depends_on` set will remain pending until their dependency completes. Use `gza group <group>` to see dependency chains.
+Tasks with `depends_on` set will remain pending until their dependency completes. Use tag-scoped views such as `gza search --tag <tag>` or `gza queue --tag <tag>` to inspect related chains.
 
 ---
 
@@ -1579,7 +1594,7 @@ Tasks with unmet dependencies won't be picked up. Check:
 
 ```bash
 gza next          # Shows pending tasks and their dependencies
-gza group <group>  # Shows tasks in a group
+gza search --tag <tag>  # Shows tasks with a tag slice
 ```
 
 ### Claude Code not found

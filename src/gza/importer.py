@@ -1,5 +1,6 @@
 """Task import from YAML files."""
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,24 @@ import yaml
 
 from .db import SqliteTaskStore, Task
 
+_TAG_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_tag(tag: str) -> str:
+    if not isinstance(tag, str):
+        raise ValueError("tag must be a string")
+    normalized = _TAG_WS_RE.sub(" ", tag.strip()).lower()
+    if not normalized:
+        raise ValueError("tag must not be empty")
+    return normalized
+
+
+def _normalize_tags(tags: tuple[str, ...]) -> tuple[str, ...]:
+    normalized: set[str] = set()
+    for tag in tags:
+        normalized.add(_normalize_tag(tag))
+    return tuple(sorted(normalized))
+
 
 @dataclass
 class ImportTask:
@@ -15,6 +34,7 @@ class ImportTask:
     prompt: str
     task_type: str = "implement"
     group: str | None = None
+    tags: tuple[str, ...] = ()
     depends_on: int | None = None  # Local index (1-based)
     review: bool = False
     spec: str | None = None
@@ -36,7 +56,32 @@ class ValidationError:
     task_index: int | None = None  # None for file-level errors
 
 
-def parse_import_file(file_path: Path) -> tuple[list[ImportTask], str | None, str | None, list[ValidationError]]:
+def _parse_tags_field(raw_tags: Any, *, task_index: int | None = None) -> tuple[tuple[str, ...], list[ValidationError]]:
+    """Validate and parse a tags field value."""
+    if raw_tags is None:
+        return (), []
+
+    if not isinstance(raw_tags, list):
+        return (), [ValidationError("'tags' must be a list of strings", task_index=task_index)]
+
+    if any(not isinstance(tag, str) for tag in raw_tags):
+        return (), [ValidationError("'tags' must contain only strings", task_index=task_index)]
+
+    return tuple(raw_tags), []
+
+
+def _parse_group_field(raw_group: Any, *, task_index: int | None = None) -> tuple[str | None, list[ValidationError]]:
+    """Validate and parse deprecated group alias field value."""
+    if raw_group is None:
+        return None, []
+    if not isinstance(raw_group, str):
+        return None, [ValidationError("'group' must be a string or null", task_index=task_index)]
+    return raw_group, []
+
+
+def parse_import_file(
+    file_path: Path,
+) -> tuple[list[ImportTask], str | None, str | None, list[ValidationError]]:
     """Parse an import YAML file.
 
     Returns:
@@ -60,7 +105,14 @@ def parse_import_file(file_path: Path) -> tuple[list[ImportTask], str | None, st
         return [], None, None, errors
 
     # Extract file-level defaults
-    default_group = data.get("group")
+    default_group: str | None = None
+    if "group" in data:
+        default_group, group_errors = _parse_group_field(data["group"])
+        errors.extend(group_errors)
+    default_tags: tuple[str, ...] = ()
+    if "tags" in data:
+        default_tags, tag_errors = _parse_tags_field(data["tags"])
+        errors.extend(tag_errors)
     default_spec = data.get("spec")
 
     # Get tasks list
@@ -75,7 +127,7 @@ def parse_import_file(file_path: Path) -> tuple[list[ImportTask], str | None, st
 
     tasks: list[ImportTask] = []
     for i, task_data in enumerate(tasks_data, 1):
-        task, task_errors = _parse_task(task_data, i, default_group, default_spec)
+        task, task_errors = _parse_task(task_data, i, default_group, default_tags, default_spec)
         errors.extend(task_errors)
         if task:
             tasks.append(task)
@@ -87,6 +139,7 @@ def _parse_task(
     data: Any,
     index: int,
     default_group: str | None,
+    default_tags: tuple[str, ...],
     default_spec: str | None,
 ) -> tuple[ImportTask | None, list[ValidationError]]:
     """Parse a single task from the import file."""
@@ -119,10 +172,18 @@ def _parse_task(
             task_index=index
         ))
 
-    # Group: use task-level if present, else default, handle null override
+    # Group/tag compatibility: tags are canonical, group is a deprecated alias.
     group = default_group
+    tags: list[str] = list(default_tags)
     if "group" in data:
-        group = data["group"]  # Can be None to clear default
+        group, group_errors = _parse_group_field(data["group"], task_index=index)
+        errors.extend(group_errors)
+    if "tags" in data:
+        parsed_tags, tag_errors = _parse_tags_field(data["tags"], task_index=index)
+        errors.extend(tag_errors)
+        tags = list(parsed_tags)
+    if group is not None:
+        tags.append(group)
 
     # Spec: same logic as group
     spec = default_spec
@@ -145,10 +206,18 @@ def _parse_task(
         errors.append(ValidationError("'review' must be a boolean", task_index=index))
         review = False
 
+    normalized_tags: tuple[str, ...]
+    try:
+        normalized_tags = _normalize_tags(tuple(tags))
+    except ValueError as exc:
+        errors.append(ValidationError(str(exc), task_index=index))
+        normalized_tags = ()
+
     return ImportTask(
         prompt=prompt.strip(),
         task_type=task_type,
         group=group,
+        tags=normalized_tags,
         depends_on=depends_on,
         review=review,
         spec=spec,
@@ -212,16 +281,22 @@ def validate_import(
 def find_duplicate(
     store: SqliteTaskStore,
     prompt: str,
-    group: str | None,
+    tags: tuple[str, ...] | str | None,
 ) -> Task | None:
-    """Find a duplicate pending task by prompt and group."""
+    """Find a duplicate pending task by prompt and normalized tag set."""
+    if tags is None:
+        normalized_tags: tuple[str, ...] = ()
+    elif isinstance(tags, str):
+        normalized_tags = _normalize_tags((tags,))
+    else:
+        normalized_tags = _normalize_tags(tags)
     # Normalize prompt for comparison
     prompt_normalized = prompt.strip()
 
     # Search for pending tasks with same prompt
     pending = store.get_pending()
     for task in pending:
-        if task.prompt.strip() == prompt_normalized and task.group == group:
+        if task.prompt.strip() == prompt_normalized and tuple(sorted(task.tags)) == normalized_tags:
             return task
 
     return None
@@ -253,9 +328,10 @@ def import_tasks(
     index_to_id: dict[int, str] = {}
 
     for i, import_task in enumerate(tasks, 1):
+        effective_tags = import_task.tags or (() if import_task.group is None else _normalize_tags((import_task.group,)))
         # Check for duplicates
         if not force:
-            duplicate = find_duplicate(store, import_task.prompt, import_task.group)
+            duplicate = find_duplicate(store, import_task.prompt, effective_tags)
             if duplicate:
                 results.append(ImportResult(
                     task=None,
@@ -279,17 +355,17 @@ def import_tasks(
             # Don't create, just report what would happen
             prompt_preview = import_task.prompt[:40] + "..." if len(import_task.prompt) > 40 else import_task.prompt
             type_label = f"[{import_task.task_type}] " if import_task.task_type != "implement" else ""
-            group_label = f" (group: {import_task.group})" if import_task.group else ""
+            tag_label = f" (tags: {', '.join(sorted(effective_tags))})" if effective_tags else ""
             dep_label = f" (depends on {import_task.depends_on})" if import_task.depends_on else ""
             review_label = " (review: true)" if import_task.review else ""
-            messages.append(f"  {i}. {type_label}{prompt_preview}{group_label}{dep_label}{review_label}")
+            messages.append(f"  {i}. {type_label}{prompt_preview}{tag_label}{dep_label}{review_label}")
             results.append(ImportResult(task=None, local_index=i))
         else:
             # Create the task
             task = store.add(
                 prompt=import_task.prompt,
                 task_type=import_task.task_type,
-                group=import_task.group,
+                tags=effective_tags,
                 depends_on=depends_on_id,
                 spec=import_task.spec,
                 create_review=import_task.review,

@@ -186,8 +186,8 @@ class TestHelpOutput:
         assert "--pr" in docs_text
         assert "Create/reuse a GitHub PR for completed code tasks before auto-created review runs" in docs_text
 
-    def test_watch_and_queue_group_help_point_to_same_scoped_pickup_preview(self, tmp_path):
-        """Help/docs should make `queue --group` the preview for `watch --group`."""
+    def test_watch_and_queue_tag_help_point_to_same_scoped_pickup_preview(self, tmp_path):
+        """Help/docs should make `queue --tag` the preview for `watch --tag`."""
         setup_config(tmp_path)
 
         watch_help = run_gza("watch", "--help", "--project", str(tmp_path))
@@ -199,10 +199,10 @@ class TestHelpOutput:
         queue_text = " ".join(queue_help.stdout.split())
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
-        assert "use 'gza queue --group NAME' to preview scoped pickup order" in watch_text
-        assert "same scoped pickup order used by 'gza watch --group NAME'" in queue_text
-        assert "use `gza queue --group NAME` to preview the same scoped pickup order" in docs_text
-        assert "canonical preview for what `gza watch --group release-1.2` will consider and in what order" in docs_text
+        assert "use 'gza queue --tag TAG' to preview scoped pickup order" in watch_text
+        assert "same scoped pickup order used by 'gza watch --tag TAG'" in queue_text
+        assert "use `gza queue --tag TAG` to preview the same scoped pickup order" in docs_text
+        assert "canonical preview for what `gza watch --tag release-1.2` will consider and in what order" in docs_text
 
     def test_queue_help_and_docs_describe_default_limit_and_all_overrides(self, tmp_path):
         """`queue --help` and docs should describe capped default output and all-task overrides."""
@@ -219,6 +219,20 @@ class TestHelpOutput:
         assert "Show first N runnable tasks (default: 10; use `0`, `-1`, or `--all` for all)" in docs_text
         assert "By default, `gza queue` shows the first 10 runnable tasks." in docs_text
 
+    def test_queue_ordering_language_is_consistent_between_help_docs_and_bucket_behavior(self, tmp_path):
+        """Queue docs/help should consistently describe per-tag-set-bucket explicit ordering semantics."""
+        setup_config(tmp_path)
+
+        queue_help = run_gza("queue", "--help", "--project", str(tmp_path))
+        assert queue_help.returncode == 0
+
+        queue_help_text = " ".join(queue_help.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        assert "Assign an explicit queue position within the task's current tag-set bucket" in queue_help_text
+        assert "Move a pending task to explicit queue position 1 within its current tag-set bucket" in queue_help_text
+        assert "within each task's current tag-set bucket" in docs_text
+        assert "Explicit `queue_position` values in ascending order 2. Urgent lane" not in docs_text
+
     def test_show_help_and_docs_describe_prompt_as_plain_text(self, tmp_path):
         """`show --prompt` should be documented as plain prompt-text output, not JSON."""
         setup_config(tmp_path)
@@ -232,6 +246,23 @@ class TestHelpOutput:
         assert "Print only the fully built prompt text for this task and exit" in help_text
         assert "as JSON" not in help_text
         assert "| `--prompt` | Print only the fully built prompt text for this task and exit |" in docs_text
+
+    def test_groups_alias_docs_and_dispatch_remain_aligned(self, tmp_path):
+        """`gza groups` docs invocation should match runtime deprecation-alias behavior."""
+        setup_config(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+        store.add("Grouped task", tags=("release",))
+
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        assert "### groups" in docs_text
+        assert "gza groups" in docs_text
+
+        result = run_gza("groups", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Warning: 'gza groups' is deprecated; use 'gza groups list'." in result.stdout
+        assert "release" in result.stdout
+        assert "usage:" not in result.stdout
 
     def test_search_command_help_mentions_prompt_substring_scope(self, tmp_path):
         """`search --help` should describe prompt-only substring matching."""

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gza.cli.watch import (
+    _collect_completed_transition_ids,
     _collect_live_running_state,
     _collect_unhandled_failures,
     _compute_failure_backoff_seconds,
@@ -588,6 +589,65 @@ def test_watch_cycle_logs_group_scoped_pending_count_in_wake_line(tmp_path: Path
         )
 
     assert "WAKE   checking... (0 running, 2 pending, 1 slots)" in log_path.read_text()
+
+
+def test_watch_cycle_logs_tag_scope_with_all_mode(tmp_path: Path) -> None:
+    """Tag-scoped watch should log normalized filter scope with all-tag semantics."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    store.add("Release task", task_type="plan", tags=("release-1.2",))
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("Release-1.2", "backend"),
+        )
+
+    assert "INFO   scope: tags=backend,release-1.2 mode=all" in log_path.read_text()
+
+
+def test_watch_cycle_logs_tag_scope_with_any_mode(tmp_path: Path) -> None:
+    """Tag-scoped watch should log when any-tag matching is enabled."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    store.add("Release task", task_type="plan", tags=("release-1.2",))
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("release-1.2", "backend"),
+            any_tag=True,
+        )
+
+    assert "INFO   scope: tags=backend,release-1.2 mode=any" in log_path.read_text()
 
 
 def test_watch_cycle_keeps_free_slot_when_iterate_child_task_shares_pid(tmp_path: Path) -> None:
@@ -2262,6 +2322,68 @@ def test_collect_unhandled_failures_includes_unknown_failures(tmp_path: Path) ->
 
     failures = _collect_unhandled_failures(old, new, store=store, config=config)
     assert [(failure.task_id, failure.reason) for failure in failures] == [(str(failed.id), "UNKNOWN")]
+
+
+def test_watch_transition_collectors_apply_case_insensitive_tag_filters(tmp_path: Path) -> None:
+    """Transition collectors should use canonical case-insensitive tag filtering."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    completed_tagged = store.add("Completed tagged", task_type="plan", tags=("release-1.2",))
+    completed_other = store.add("Completed other", task_type="plan", tags=("backlog",))
+    failed_tagged = store.add("Failed tagged", task_type="plan", tags=("release-1.2",))
+    failed_other = store.add("Failed other", task_type="plan", tags=("backlog",))
+    assert completed_tagged.id is not None
+    assert completed_other.id is not None
+    assert failed_tagged.id is not None
+    assert failed_other.id is not None
+
+    config = Config.load(tmp_path)
+    old = {
+        str(completed_tagged.id): {"status": "in_progress"},
+        str(completed_other.id): {"status": "in_progress"},
+        str(failed_tagged.id): {"status": "in_progress"},
+        str(failed_other.id): {"status": "in_progress"},
+    }
+    new = {
+        str(completed_tagged.id): {
+            "status": "completed",
+            "task_type": "plan",
+            "failure_reason": None,
+        },
+        str(completed_other.id): {
+            "status": "completed",
+            "task_type": "plan",
+            "failure_reason": None,
+        },
+        str(failed_tagged.id): {
+            "status": "failed",
+            "task_type": "plan",
+            "failure_reason": "UNKNOWN",
+        },
+        str(failed_other.id): {
+            "status": "failed",
+            "task_type": "plan",
+            "failure_reason": "UNKNOWN",
+        },
+    }
+
+    completed_ids = _collect_completed_transition_ids(
+        old,
+        new,
+        store=store,
+        tags=("Release-1.2",),
+    )
+    failures = _collect_unhandled_failures(
+        old,
+        new,
+        store=store,
+        config=config,
+        tags=("Release-1.2",),
+    )
+
+    assert completed_ids == [str(completed_tagged.id)]
+    assert [(failure.task_id, failure.reason) for failure in failures] == [(str(failed_tagged.id), "UNKNOWN")]
 
 
 def test_compute_failure_backoff_seconds_caps_at_max(tmp_path: Path) -> None:
