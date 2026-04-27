@@ -591,6 +591,65 @@ def test_watch_cycle_logs_group_scoped_pending_count_in_wake_line(tmp_path: Path
     assert "WAKE   checking... (0 running, 2 pending, 1 slots)" in log_path.read_text()
 
 
+def test_watch_cycle_logs_tag_scope_with_all_mode(tmp_path: Path) -> None:
+    """Tag-scoped watch should log normalized filter scope with all-tag semantics."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    store.add("Release task", task_type="plan", tags=("release-1.2",))
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("Release-1.2", "backend"),
+        )
+
+    assert "INFO   scope: tags=backend,release-1.2 mode=all" in log_path.read_text()
+
+
+def test_watch_cycle_logs_tag_scope_with_any_mode(tmp_path: Path) -> None:
+    """Tag-scoped watch should log when any-tag matching is enabled."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    store.add("Release task", task_type="plan", tags=("release-1.2",))
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("release-1.2", "backend"),
+            any_tag=True,
+        )
+
+    assert "INFO   scope: tags=backend,release-1.2 mode=any" in log_path.read_text()
+
+
 def test_watch_cycle_keeps_free_slot_when_iterate_child_task_shares_pid(tmp_path: Path) -> None:
     """batch=2 should still schedule one task when one iterate process is active."""
     setup_config(tmp_path)

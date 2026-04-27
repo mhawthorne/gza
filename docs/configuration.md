@@ -1323,6 +1323,9 @@ gza watch [options]
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
 | `--group NAME` | Deprecated alias for `--tag NAME` |
 
+When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
+`INFO   scope: tags=<comma-separated-tags> mode=all|any`.
+
 ### learnings
 
 Manage project learnings accumulated from completed tasks.

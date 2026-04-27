@@ -86,6 +86,14 @@ def _format_hms() -> str:
     return datetime.now(UTC).strftime("%H:%M:%S")
 
 
+def _format_scope_message(tags: tuple[str, ...] | None, *, any_tag: bool) -> str | None:
+    """Return a stable watch-scope message when tag filtering is active."""
+    if not tags:
+        return None
+    mode = "any" if any_tag else "all"
+    return f"scope: tags={','.join(tags)} mode={mode}"
+
+
 def _parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -453,6 +461,9 @@ def _run_cycle(
             running_task_ids=running_task_ids,
         ),
     )
+    scope_message = _format_scope_message(tags, any_tag=any_tag)
+    if scope_message is not None:
+        log.emit("INFO", scope_message)
 
     # 1) Execute advance actions for completed tasks (includes completed plans
     # with no implement child, aligned with gza advance).
