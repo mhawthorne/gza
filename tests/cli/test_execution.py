@@ -655,7 +655,8 @@ class TestRetryCommand:
         # Verify the command completes successfully
         assert result.returncode == 0
         assert "Created task " in result.stdout
-        assert "Started worker" in result.stdout
+        assert "Started task " in result.stdout
+        assert "in background" in result.stdout
 
         # Verify new task was created
         new_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
@@ -795,8 +796,9 @@ class TestResumeCommand:
         assert result.returncode == 0
         # Verify new task was created
         assert "resume of " in result.stdout
-        assert "Started worker" in result.stdout
-        assert "(resuming)" in result.stdout
+        assert "Started task " in result.stdout
+        assert "in background" in result.stdout
+        assert "(resuming," in result.stdout
 
         # Verify original task still failed and new task was created
         original = store.get(task.id)
