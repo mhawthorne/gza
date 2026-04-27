@@ -84,9 +84,32 @@ def set_task_queue_position(store: SqliteTaskStore, task_id: str, *, position: i
     return store.set_queue_position(task_id, position)
 
 
+def set_task_queue_position_scoped(
+    store: SqliteTaskStore,
+    task_id: str,
+    *,
+    position: int,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = False,
+) -> bool:
+    """Shared explicit queue ordering path for queue move/next with optional tag scope."""
+    return store.set_queue_position(task_id, position, tags=tags, any_tag=any_tag)
+
+
 def clear_task_queue_position(store: SqliteTaskStore, task_id: str) -> bool:
     """Shared explicit queue ordering clear path."""
     return store.clear_queue_position(task_id)
+
+
+def clear_task_queue_position_scoped(
+    store: SqliteTaskStore,
+    task_id: str,
+    *,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = False,
+) -> bool:
+    """Shared explicit queue ordering clear path with optional tag scope."""
+    return store.clear_queue_position(task_id, tags=tags, any_tag=any_tag)
 
 
 def _validate_tag_value(raw: object) -> str:

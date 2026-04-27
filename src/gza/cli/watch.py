@@ -31,12 +31,12 @@ from ._common import (
     _create_resume_task,
     _spawn_background_resume_worker,
     _spawn_background_worker,
-    clear_task_queue_position,
+    clear_task_queue_position_scoped,
     format_review_outcome,
     get_store,
     parse_cli_tag_filters,
     resolve_id,
-    set_task_queue_position,
+    set_task_queue_position_scoped,
     set_task_urgency,
 )
 from .advance_executor import AdvanceActionExecutionContext, execute_advance_action
@@ -92,6 +92,15 @@ def _format_scope_message(tags: tuple[str, ...] | None, *, any_tag: bool) -> str
         return None
     mode = "any" if any_tag else "all"
     return f"scope: tags={','.join(tags)} mode={mode}"
+
+
+def _format_queue_scope_error(task_id: str, tags: tuple[str, ...], *, any_tag: bool) -> str:
+    """Return consistent fail-closed messaging for queue ordering scope mismatch."""
+    mode = "any" if any_tag else "all"
+    return (
+        f"Error: Task {task_id} does not match tag scope ({mode}: {', '.join(tags)}); "
+        "queue ordering was not changed"
+    )
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -1051,6 +1060,8 @@ def cmd_queue(args: argparse.Namespace) -> int:
         print(f"Error: {exc}")
         return 1
 
+    normalized_tag_filters = normalize_tag_filters(tag_filters)
+
     if action in {"bump", "unbump", "move", "next", "clear"}:
         task_id = resolve_id(config, args.task_id)
         task = store.get(task_id)
@@ -1066,10 +1077,21 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
         runnable_pending_ids = {
             str(row.task.id)
-            for row in service.run(TaskQueryPresets.queue(limit=None, tags=tag_filters, any_tag=any_tag)).rows
+            for row in service.run(
+                TaskQueryPresets.queue(limit=None, tags=normalized_tag_filters, any_tag=any_tag)
+            ).rows
             if isinstance(row, TaskRow) and row.task.id is not None
         }
         is_currently_runnable = str(task_id) in runnable_pending_ids
+
+        if action in {"move", "next", "clear"} and normalized_tag_filters is not None:
+            if not task_matches_tag_filters(
+                task_tags=task.tags or (),
+                tag_filters=normalized_tag_filters,
+                any_tag=any_tag,
+            ):
+                print(_format_queue_scope_error(task_id, normalized_tag_filters, any_tag=any_tag))
+                return 1
 
         if action in {"bump", "unbump"}:
             new_urgent = action == "bump"
@@ -1087,7 +1109,12 @@ def cmd_queue(args: argparse.Namespace) -> int:
             return 0
 
         if action == "clear":
-            clear_task_queue_position(store, task_id)
+            clear_task_queue_position_scoped(
+                store,
+                task_id,
+                tags=normalized_tag_filters,
+                any_tag=any_tag,
+            )
             if is_currently_runnable:
                 print(f"✓ Cleared explicit queue order for task {task_id}")
             else:
@@ -1098,7 +1125,13 @@ def cmd_queue(args: argparse.Namespace) -> int:
         if position < 1:
             print("Error: queue position must be >= 1")
             return 1
-        set_task_queue_position(store, task_id, position=position)
+        set_task_queue_position_scoped(
+            store,
+            task_id,
+            position=position,
+            tags=normalized_tag_filters,
+            any_tag=any_tag,
+        )
         if position == 1:
             message = f"✓ Moved task {task_id} to queue position 1"
         else:
@@ -1111,7 +1144,9 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
     pending = [
         row.task
-        for row in service.run(TaskQueryPresets.queue(limit=None, tags=tag_filters, any_tag=any_tag)).rows
+        for row in service.run(
+            TaskQueryPresets.queue(limit=None, tags=normalized_tag_filters, any_tag=any_tag)
+        ).rows
         if isinstance(row, TaskRow)
     ]
     if not pending:

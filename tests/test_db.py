@@ -294,6 +294,47 @@ class TestTaskChaining:
         assert refreshed_ops_first.queue_position == 1
         assert refreshed_ops_second.queue_position == 2
 
+    def test_queue_position_mutation_with_tag_scope_ignores_unrelated_extra_tags(self, tmp_path: Path):
+        """Tag-scoped queue mutations should share one ordering across tasks with extra tags."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        release_plain = store.add("Release plain", tags=("release",))
+        release_backend = store.add("Release backend", tags=("release", "backend"))
+        release_docs = store.add("Release docs", tags=("release", "docs"))
+        ops_first = store.add("Ops first", tags=("ops", "infra"))
+        ops_second = store.add("Ops second", tags=("ops", "infra"))
+        assert release_plain.id is not None
+        assert release_backend.id is not None
+        assert release_docs.id is not None
+        assert ops_first.id is not None
+        assert ops_second.id is not None
+
+        store.set_queue_position(release_plain.id, 1, tags=("release",))
+        store.set_queue_position(release_backend.id, 2, tags=("release",))
+        store.set_queue_position(release_docs.id, 3, tags=("release",))
+        store.set_queue_position(ops_first.id, 1)
+        store.set_queue_position(ops_second.id, 2)
+
+        store.set_queue_position(release_backend.id, 1, tags=("release",))
+
+        refreshed_release_plain = store.get(release_plain.id)
+        refreshed_release_backend = store.get(release_backend.id)
+        refreshed_release_docs = store.get(release_docs.id)
+        refreshed_ops_first = store.get(ops_first.id)
+        refreshed_ops_second = store.get(ops_second.id)
+        assert refreshed_release_plain is not None
+        assert refreshed_release_backend is not None
+        assert refreshed_release_docs is not None
+        assert refreshed_ops_first is not None
+        assert refreshed_ops_second is not None
+
+        assert refreshed_release_backend.queue_position == 1
+        assert refreshed_release_plain.queue_position == 2
+        assert refreshed_release_docs.queue_position == 3
+        assert refreshed_ops_first.queue_position == 1
+        assert refreshed_ops_second.queue_position == 2
+
     def test_get_pending_pickup_excludes_non_pickable_pending_tasks(self, tmp_path: Path):
         """Pickup listing excludes internal and dependency-blocked pending tasks."""
         db_path = tmp_path / "test.db"

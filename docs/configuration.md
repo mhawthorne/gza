@@ -1219,11 +1219,14 @@ gza queue clear <task_id>
 | `--all` | Show all runnable tasks |
 
 Queue pickup ordering is:
-1. Explicit `queue_position` values in ascending order within each task's current tag-set bucket (exact tag match)
+1. Explicit `queue_position` values in ascending order
 2. Urgent lane, with `queue bump` moving a task to the front of that lane
 3. FIFO by creation time for the remaining runnable tasks
 
-Use `gza queue next <task_id>` to make a task the next ordered item in its current tag-set bucket, or `gza queue move <task_id> <position>` to assign positions like 1, 2, and 3 within that bucket without having to order every task. Use `gza queue clear <task_id>` to remove explicit ordering and fall back to lane/FIFO behavior.
+Use `gza queue next <task_id>` to make a task the next ordered item, or `gza queue move <task_id> <position>` to assign positions like 1, 2, and 3 without having to order every task. Use `gza queue clear <task_id>` to remove explicit ordering and fall back to lane/FIFO behavior.
+When `queue move`, `queue next`, or `queue clear` include `--tag` filters, explicit ordering is shared across all tasks matching that tag scope, even when some tasks have additional unrelated tags.
+Those commands fail closed when the target task does not match the provided tag scope (`all` semantics by default, `any` with `--any-tag`) and do not mutate queue ordering in that case.
+When no tag scope is provided, queue-position edits keep existing exact tag-set bucket behavior.
 `gza queue` shows tasks that default worker pickup can run (internal and dependency-blocked pending tasks are excluded).
 By default, `gza queue` shows the first 10 runnable tasks. Use `-n 0`, `-n -1`, or `--all` to show everything.
 To treat a tag as a release slice, assign tasks with `gza add --tag release-1.2 ...` and inspect them with `gza queue --tag release-1.2`. That command is the canonical preview for what `gza watch --tag release-1.2` will consider and in what order.

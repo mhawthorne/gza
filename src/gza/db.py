@@ -285,7 +285,7 @@ class Task:
     provider: str | None = None  # Per-task provider override
     provider_is_explicit: bool = False  # True when provider was explicitly set by user input
     urgent: bool = False  # Queue lane flag: urgent tasks are picked before normal pending tasks
-    queue_position: int | None = None  # Optional explicit queue order within the task's tag-set bucket
+    queue_position: int | None = None  # Optional explicit queue order within the selected queue bucket
     merge_status: str | None = None  # None, 'unmerged', or 'merged'
     merged_at: datetime | None = None  # When merge_status was set to 'merged'
     failure_reason: str | None = None
@@ -1720,8 +1720,19 @@ class SqliteTaskStore:
             )
             return cur.rowcount > 0
 
-    def set_queue_position(self, task_id: str, position: int) -> bool:
-        """Assign an explicit queue position within the task's current tag-set bucket.
+    def set_queue_position(
+        self,
+        task_id: str,
+        position: int,
+        *,
+        tags: Iterable[str] | None = None,
+        any_tag: bool = False,
+    ) -> bool:
+        """Assign an explicit queue position within the task's queue bucket.
+
+        When tag filters are provided and the target task matches them, bucket
+        membership uses those filters so tag-scoped queue workflows share one
+        ordering across tasks with extra unrelated tags.
 
         Ordered tasks stay contiguous starting from 1 within their bucket.
         Unordered tasks keep queue_position=NULL and sort after ordered tasks.
@@ -1737,7 +1748,12 @@ class SqliteTaskStore:
             if row is None:
                 return False
             current_position = row["queue_position"]
-            bucket_predicate, bucket_params = self._queue_bucket_predicate_and_params_conn(conn, task_id)
+            bucket_predicate, bucket_params = self._queue_bucket_predicate_and_params_conn(
+                conn,
+                task_id,
+                tags=tags,
+                any_tag=any_tag,
+            )
             desired_position = position
 
             if current_position is None:
@@ -1805,7 +1821,13 @@ class SqliteTaskStore:
             )
             return cur.rowcount > 0
 
-    def clear_queue_position(self, task_id: str) -> bool:
+    def clear_queue_position(
+        self,
+        task_id: str,
+        *,
+        tags: Iterable[str] | None = None,
+        any_tag: bool = False,
+    ) -> bool:
         """Clear explicit queue ordering and close the bucket gap if needed."""
         with self._connect() as conn:
             row = conn.execute(
@@ -1817,7 +1839,12 @@ class SqliteTaskStore:
             current_position = row["queue_position"]
             if current_position is None:
                 return True
-            bucket_predicate, bucket_params = self._queue_bucket_predicate_and_params_conn(conn, task_id)
+            bucket_predicate, bucket_params = self._queue_bucket_predicate_and_params_conn(
+                conn,
+                task_id,
+                tags=tags,
+                any_tag=any_tag,
+            )
             conn.execute(
                 "UPDATE tasks SET queue_position = NULL WHERE id = ?",
                 (task_id,),
@@ -1838,25 +1865,52 @@ class SqliteTaskStore:
         self,
         conn: sqlite3.Connection,
         task_id: str,
+        *,
+        tags: Iterable[str] | None = None,
+        any_tag: bool = False,
     ) -> tuple[str, tuple[str | int, ...]]:
         """Return SQL predicate/params for the task's canonical queue bucket.
 
-        Queue bucket identity is defined as exact normalized tag-set equality.
-        Tasks with disjoint multi-tag sets must never share a queue-position bucket.
+        Default bucket identity is exact normalized tag-set equality.
+        For tag-scoped queue operations, when requested tags are provided and
+        the target task matches the scope, bucket identity is the same
+        tag-filter match (all tags or any tag) so extra task tags do not split
+        the ordering.
         """
-        tags = self._fetch_tags_for_task_ids(conn, (task_id,)).get(task_id, ())
-        if not tags:
+        task_tags = self._fetch_tags_for_task_ids(conn, (task_id,)).get(task_id, ())
+        normalized_scope_tags = _normalize_tags(tags)
+
+        if normalized_scope_tags:
+            task_tag_set = set(task_tags)
+            scope_matches_target = (
+                any(tag in task_tag_set for tag in normalized_scope_tags)
+                if any_tag
+                else all(tag in task_tag_set for tag in normalized_scope_tags)
+            )
+            if scope_matches_target:
+                placeholders = ",".join("?" for _ in normalized_scope_tags)
+                if any_tag:
+                    return (
+                        f"EXISTS (SELECT 1 FROM task_tags qbt WHERE qbt.task_id = tasks.id AND qbt.tag IN ({placeholders}))",
+                        normalized_scope_tags,
+                    )
+                return (
+                    f"(SELECT COUNT(DISTINCT qbt.tag) FROM task_tags qbt WHERE qbt.task_id = tasks.id AND qbt.tag IN ({placeholders})) = ?",
+                    (*normalized_scope_tags, len(normalized_scope_tags)),
+                )
+
+        if not task_tags:
             return (
                 "NOT EXISTS (SELECT 1 FROM task_tags qbt WHERE qbt.task_id = tasks.id)",
                 (),
             )
 
-        placeholders = ",".join("?" for _ in tags)
+        placeholders = ",".join("?" for _ in task_tags)
         predicate = (
             "(SELECT COUNT(*) FROM task_tags qbt WHERE qbt.task_id = tasks.id) = ? "
             f"AND (SELECT COUNT(*) FROM task_tags qbt WHERE qbt.task_id = tasks.id AND qbt.tag IN ({placeholders})) = ?"
         )
-        params: tuple[str | int, ...] = (len(tags), *tags, len(tags))
+        params: tuple[str | int, ...] = (len(task_tags), *task_tags, len(task_tags))
         return predicate, params
 
     def get_in_progress(self) -> list[Task]:

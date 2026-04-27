@@ -1703,28 +1703,59 @@ class TestQueueCommand:
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        release_first = store.add("Release first", tags=("release", "backend"))
-        release_second = store.add("Release second", tags=("release", "backend"))
+        release_plain = store.add("Release plain", tags=("release",))
+        release_backend = store.add("Release backend", tags=("release", "backend"))
+        release_docs = store.add("Release docs", tags=("release", "docs"))
         ops_first = store.add("Ops first", tags=("ops", "infra"))
         ops_second = store.add("Ops second", tags=("ops", "infra"))
-        assert release_first.id is not None
-        assert release_second.id is not None
+        assert release_plain.id is not None
+        assert release_backend.id is not None
+        assert release_docs.id is not None
         assert ops_first.id is not None
         assert ops_second.id is not None
 
-        init_release_first = run_gza("queue", "move", release_first.id, "1", "--project", str(tmp_path))
-        init_release_second = run_gza("queue", "move", release_second.id, "2", "--project", str(tmp_path))
+        init_release_plain = run_gza(
+            "queue",
+            "move",
+            release_plain.id,
+            "1",
+            "--tag",
+            "release",
+            "--project",
+            str(tmp_path),
+        )
+        init_release_backend = run_gza(
+            "queue",
+            "move",
+            release_backend.id,
+            "2",
+            "--tag",
+            "release",
+            "--project",
+            str(tmp_path),
+        )
+        init_release_docs = run_gza(
+            "queue",
+            "move",
+            release_docs.id,
+            "3",
+            "--tag",
+            "release",
+            "--project",
+            str(tmp_path),
+        )
         init_ops_first = run_gza("queue", "move", ops_first.id, "1", "--project", str(tmp_path))
         init_ops_second = run_gza("queue", "move", ops_second.id, "2", "--project", str(tmp_path))
-        assert init_release_first.returncode == 0
-        assert init_release_second.returncode == 0
+        assert init_release_plain.returncode == 0
+        assert init_release_backend.returncode == 0
+        assert init_release_docs.returncode == 0
         assert init_ops_first.returncode == 0
         assert init_ops_second.returncode == 0
 
         result = run_gza(
             "queue",
             action,
-            release_second.id,
+            release_backend.id,
             *extra_args,
             "--tag",
             "release",
@@ -1732,6 +1763,68 @@ class TestQueueCommand:
             str(tmp_path),
         )
         assert result.returncode == 0
+
+        refreshed_release_plain = store.get(release_plain.id)
+        refreshed_release_backend = store.get(release_backend.id)
+        refreshed_release_docs = store.get(release_docs.id)
+        refreshed_ops_first = store.get(ops_first.id)
+        refreshed_ops_second = store.get(ops_second.id)
+        assert refreshed_release_plain is not None
+        assert refreshed_release_backend is not None
+        assert refreshed_release_docs is not None
+        assert refreshed_ops_first is not None
+        assert refreshed_ops_second is not None
+
+        assert refreshed_release_backend.queue_position == 1
+        assert refreshed_release_plain.queue_position == 2
+        assert refreshed_release_docs.queue_position == 3
+        assert refreshed_ops_first.queue_position == 1
+        assert refreshed_ops_second.queue_position == 2
+
+    @pytest.mark.parametrize(
+        ("action", "extra_args"),
+        [
+            ("move", ["1"]),
+            ("next", []),
+            ("clear", []),
+        ],
+    )
+    def test_queue_tag_scoped_ordering_fails_closed_when_target_misses_scope(
+        self,
+        tmp_path: Path,
+        action: str,
+        extra_args: list[str],
+    ):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        release_first = store.add("Release first", tags=("release",))
+        release_second = store.add("Release second", tags=("release",))
+        ops_first = store.add("Ops first", tags=("ops",))
+        ops_second = store.add("Ops second", tags=("ops",))
+        assert release_first.id is not None
+        assert release_second.id is not None
+        assert ops_first.id is not None
+        assert ops_second.id is not None
+
+        assert run_gza("queue", "move", release_first.id, "1", "--project", str(tmp_path)).returncode == 0
+        assert run_gza("queue", "move", release_second.id, "2", "--project", str(tmp_path)).returncode == 0
+        assert run_gza("queue", "move", ops_first.id, "1", "--project", str(tmp_path)).returncode == 0
+        assert run_gza("queue", "move", ops_second.id, "2", "--project", str(tmp_path)).returncode == 0
+
+        result = run_gza(
+            "queue",
+            action,
+            ops_second.id,
+            *extra_args,
+            "--tag",
+            "release",
+            "--project",
+            str(tmp_path),
+        )
+        assert result.returncode == 1
+        assert "does not match tag scope" in result.stdout
+        assert "queue ordering was not changed" in result.stdout
 
         refreshed_release_first = store.get(release_first.id)
         refreshed_release_second = store.get(release_second.id)
@@ -1742,8 +1835,60 @@ class TestQueueCommand:
         assert refreshed_ops_first is not None
         assert refreshed_ops_second is not None
 
-        assert refreshed_release_second.queue_position == 1
-        assert refreshed_release_first.queue_position == 2
+        assert refreshed_release_first.queue_position == 1
+        assert refreshed_release_second.queue_position == 2
+        assert refreshed_ops_first.queue_position == 1
+        assert refreshed_ops_second.queue_position == 2
+
+    def test_queue_tag_scoped_ordering_fails_closed_for_repeated_tags_with_any_tag_mismatch(
+        self,
+        tmp_path: Path,
+    ):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        release_first = store.add("Release first", tags=("release",))
+        release_second = store.add("Release second", tags=("release",))
+        ops_first = store.add("Ops first", tags=("ops",))
+        ops_second = store.add("Ops second", tags=("ops",))
+        assert release_first.id is not None
+        assert release_second.id is not None
+        assert ops_first.id is not None
+        assert ops_second.id is not None
+
+        assert run_gza("queue", "move", release_first.id, "1", "--project", str(tmp_path)).returncode == 0
+        assert run_gza("queue", "move", release_second.id, "2", "--project", str(tmp_path)).returncode == 0
+        assert run_gza("queue", "move", ops_first.id, "1", "--project", str(tmp_path)).returncode == 0
+        assert run_gza("queue", "move", ops_second.id, "2", "--project", str(tmp_path)).returncode == 0
+
+        result = run_gza(
+            "queue",
+            "move",
+            ops_second.id,
+            "1",
+            "--tag",
+            "release",
+            "--tag",
+            "release",
+            "--any-tag",
+            "--project",
+            str(tmp_path),
+        )
+        assert result.returncode == 1
+        assert "does not match tag scope" in result.stdout
+        assert "queue ordering was not changed" in result.stdout
+
+        refreshed_release_first = store.get(release_first.id)
+        refreshed_release_second = store.get(release_second.id)
+        refreshed_ops_first = store.get(ops_first.id)
+        refreshed_ops_second = store.get(ops_second.id)
+        assert refreshed_release_first is not None
+        assert refreshed_release_second is not None
+        assert refreshed_ops_first is not None
+        assert refreshed_ops_second is not None
+
+        assert refreshed_release_first.queue_position == 1
+        assert refreshed_release_second.queue_position == 2
         assert refreshed_ops_first.queue_position == 1
         assert refreshed_ops_second.queue_position == 2
 
@@ -1764,6 +1909,32 @@ class TestQueueCommand:
         older_line = next(i for i, line in enumerate(lines) if "Older urgent" in line)
         newer_line = next(i for i, line in enumerate(lines) if "Newer urgent" in line)
         assert bumped_line < older_line < newer_line
+
+    def test_queue_tag_view_shares_one_order_across_tasks_with_extra_tags(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        release_plain = store.add("Release plain", tags=("release",))
+        release_backend = store.add("Release backend", tags=("release", "backend"))
+        release_docs = store.add("Release docs", tags=("release", "docs"))
+        assert release_plain.id is not None
+        assert release_backend.id is not None
+        assert release_docs.id is not None
+
+        assert run_gza("queue", "move", release_plain.id, "1", "--tag", "release", "--project", str(tmp_path)).returncode == 0
+        assert run_gza("queue", "move", release_backend.id, "2", "--tag", "release", "--project", str(tmp_path)).returncode == 0
+        assert run_gza("queue", "move", release_docs.id, "3", "--tag", "release", "--project", str(tmp_path)).returncode == 0
+
+        queue = run_gza("queue", "--tag", "release", "--project", str(tmp_path))
+        assert queue.returncode == 0
+
+        lines = [line for line in queue.stdout.splitlines() if line.strip()]
+        assert "Release plain" in lines[0]
+        assert "Release backend" in lines[1]
+        assert "Release docs" in lines[2]
+        assert "[#1]" in lines[0]
+        assert "[#2]" in lines[1]
+        assert "[#3]" in lines[2]
 
     def test_next_shows_explicitly_ordered_task_first(self, tmp_path: Path):
         setup_config(tmp_path)
