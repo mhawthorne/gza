@@ -4926,6 +4926,72 @@ class TestSharedDbIsolationAndImportGating:
         moved_config = Config.load(moved_dir)
         assert moved_config.project_id == persisted_project_id
 
+    def test_import_local_db_cancel_does_not_persist_project_id(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        config_path = project_dir / "gza.yaml"
+        original_config = (
+            "project_name: demo\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n"
+        )
+        config_path.write_text(original_config, encoding="utf-8")
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--project", str(project_dir)],
+            input="n\n",
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert result.returncode == 1
+        assert "Import cancelled." in result.stdout
+        assert config_path.read_text(encoding="utf-8") == original_config
+
+    def test_import_local_db_confirmed_yes_persists_project_id_once(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        config_path = project_dir / "gza.yaml"
+        config_path.write_text(
+            "project_name: demo\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        first = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--project", str(project_dir)],
+            input="y\n",
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert first.returncode == 0, first.stderr
+        assert "Persisted project_id" in first.stdout
+        assert "Imported legacy local DB into shared DB." in first.stdout
+
+        second = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert second.returncode == 0, second.stderr
+        lines = [line for line in config_path.read_text(encoding="utf-8").splitlines() if line.startswith("project_id:")]
+        assert len(lines) == 1
+
     def test_shared_mode_missing_project_id_derives_non_default_identity(self, tmp_path: Path) -> None:
         from gza.config import Config
 

@@ -2280,6 +2280,14 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
     status = check_migration_status(config.db_path)
 
     if args.import_local_db:
+        if not args.yes and not args.dry_run:
+            answer = input(
+                "Import legacy local DB into active shared DB now? [y/N]: "
+            ).strip().lower()
+            if answer not in {"y", "yes"}:
+                print("Import cancelled.")
+                return 1
+
         project_id_source = config.source_map.get("project_id", "")
         if project_id_source == "derived":
             if args.dry_run:
@@ -2303,14 +2311,6 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
                     except ConfigError as e:
                         print(f"Error loading config after persisting project_id: {e}", file=sys.stderr)
                         return 1
-
-        if not args.yes and not args.dry_run:
-            answer = input(
-                "Import legacy local DB into active shared DB now? [y/N]: "
-            ).strip().lower()
-            if answer not in {"y", "yes"}:
-                print("Import cancelled.")
-                return 1
         try:
             result = import_legacy_local_db(config, dry_run=args.dry_run)
         except ValueError as exc:
