@@ -101,8 +101,6 @@ def parse_import_file(
     if "tags" in data:
         default_tags, tag_errors = _parse_tags_field(data["tags"])
         errors.extend(tag_errors)
-    if default_group is not None:
-        default_tags = (*default_tags, default_group)
     default_spec = data.get("spec")
 
     # Get tasks list

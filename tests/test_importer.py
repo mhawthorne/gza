@@ -90,6 +90,24 @@ tasks:
         assert tasks[0].group == "default-group"
         assert tasks[1].group is None
 
+    def test_parse_group_null_clears_inherited_group_tag(self, tmp_path: Path):
+        """Task-level `group: null` clears inherited file-level group tag."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+group: rel-1
+tags:
+  - core
+tasks:
+  - prompt: "inherits defaults"
+  - prompt: "clears group default"
+    group: null
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(errors) == 0
+        assert tasks[0].tags == ("core", "rel-1")
+        assert tasks[1].tags == ("core",)
+
     def test_parse_with_dependencies(self, tmp_path: Path):
         """Parse tasks with depends_on."""
         import_file = tmp_path / "tasks.yaml"
@@ -435,6 +453,28 @@ class TestImportTasks:
         # Only one new task created
         all_tasks = store.get_pending()
         assert len(all_tasks) == 2  # 1 existing + 1 new
+
+    def test_import_group_null_duplicate_uses_cleared_effective_tags(
+        self, store: SqliteTaskStore, project_dir: Path
+    ):
+        """Imported `group: null` tasks should duplicate-match against untagged tasks."""
+        store.add("Legacy prompt")
+        import_file = project_dir / "tasks.yaml"
+        import_file.write_text("""
+group: rel-1
+tasks:
+  - prompt: "Legacy prompt"
+    group: null
+""")
+        tasks, _, _, parse_errors = parse_import_file(import_file)
+        assert parse_errors == []
+
+        results, _ = import_tasks(store, tasks, project_dir)
+
+        assert len(results) == 1
+        assert results[0].skipped is True
+        assert results[0].skip_reason is not None
+        assert "duplicate of" in results[0].skip_reason
 
     def test_import_force_duplicates(self, store: SqliteTaskStore, project_dir: Path):
         """Force flag creates duplicates."""

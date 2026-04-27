@@ -219,6 +219,20 @@ class TestHelpOutput:
         assert "Show first N runnable tasks (default: 10; use `0`, `-1`, or `--all` for all)" in docs_text
         assert "By default, `gza queue` shows the first 10 runnable tasks." in docs_text
 
+    def test_queue_ordering_language_is_consistent_between_help_docs_and_bucket_behavior(self, tmp_path):
+        """Queue docs/help should consistently describe per-group-bucket explicit ordering semantics."""
+        setup_config(tmp_path)
+
+        queue_help = run_gza("queue", "--help", "--project", str(tmp_path))
+        assert queue_help.returncode == 0
+
+        queue_help_text = " ".join(queue_help.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        assert "Assign an explicit queue position within the task's current group bucket" in queue_help_text
+        assert "Move a pending task to explicit queue position 1 within its current group bucket" in queue_help_text
+        assert "within each task's current group bucket" in docs_text
+        assert "Explicit `queue_position` values in ascending order 2. Urgent lane" not in docs_text
+
     def test_show_help_and_docs_describe_prompt_as_plain_text(self, tmp_path):
         """`show --prompt` should be documented as plain prompt-text output, not JSON."""
         setup_config(tmp_path)

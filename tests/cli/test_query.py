@@ -1542,6 +1542,89 @@ class TestQueueCommand:
         newer_line = next(i for i, line in enumerate(lines) if "Newer urgent" in line)
         assert bumped_line < older_line < newer_line
 
+    @pytest.mark.parametrize(
+        ("action", "extra_args"),
+        [
+            ("bump", []),
+            ("unbump", []),
+            ("move", ["1"]),
+            ("next", []),
+            ("clear", []),
+        ],
+    )
+    def test_queue_management_subcommands_accept_tag_after_subcommand(
+        self,
+        tmp_path: Path,
+        action: str,
+        extra_args: list[str],
+    ):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Release task", tags=("release-1.2",))
+        assert task.id is not None
+
+        result = run_gza(
+            "queue",
+            action,
+            task.id,
+            *extra_args,
+            "--tag",
+            "release-1.2",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "unrecognized arguments" not in result.stderr
+
+    @pytest.mark.parametrize(
+        ("action", "extra_args"),
+        [
+            ("bump", []),
+            ("unbump", []),
+            ("move", ["1"]),
+            ("next", []),
+            ("clear", []),
+        ],
+    )
+    def test_queue_management_group_and_tag_filters_have_equivalent_runnable_status(
+        self,
+        tmp_path: Path,
+        action: str,
+        extra_args: list[str],
+    ):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Release task", tags=("release-1.2",))
+        assert task.id is not None
+
+        with_group = run_gza(
+            "queue",
+            action,
+            task.id,
+            *extra_args,
+            "--group",
+            "release-1.2",
+            "--project",
+            str(tmp_path),
+        )
+        with_tag = run_gza(
+            "queue",
+            action,
+            task.id,
+            *extra_args,
+            "--tag",
+            "release-1.2",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert with_group.returncode == 0
+        assert with_tag.returncode == 0
+        assert ("not currently runnable" in with_group.stdout) == ("not currently runnable" in with_tag.stdout)
+
     def test_queue_move_assigns_explicit_positions(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)

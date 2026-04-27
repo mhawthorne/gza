@@ -208,6 +208,41 @@ class TestTaskChaining:
         assert refreshed_second.queue_position is None
         assert refreshed_third.queue_position == 2
 
+    def test_queue_position_mutation_is_scoped_to_group_bucket(self, tmp_path: Path):
+        """Setting/clearing explicit order only mutates positions within the task's group bucket."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        release_first = store.add("Release first", group="release")
+        release_second = store.add("Release second", group="release")
+        backlog_first = store.add("Backlog first", group="backlog")
+        backlog_second = store.add("Backlog second", group="backlog")
+        assert release_first.id is not None
+        assert release_second.id is not None
+        assert backlog_first.id is not None
+        assert backlog_second.id is not None
+
+        store.set_queue_position(release_first.id, 1)
+        store.set_queue_position(release_second.id, 2)
+        store.set_queue_position(backlog_first.id, 1)
+        store.set_queue_position(backlog_second.id, 2)
+
+        store.clear_queue_position(release_first.id)
+
+        refreshed_release_first = store.get(release_first.id)
+        refreshed_release_second = store.get(release_second.id)
+        refreshed_backlog_first = store.get(backlog_first.id)
+        refreshed_backlog_second = store.get(backlog_second.id)
+        assert refreshed_release_first is not None
+        assert refreshed_release_second is not None
+        assert refreshed_backlog_first is not None
+        assert refreshed_backlog_second is not None
+
+        assert refreshed_release_first.queue_position is None
+        assert refreshed_release_second.queue_position == 1
+        assert refreshed_backlog_first.queue_position == 1
+        assert refreshed_backlog_second.queue_position == 2
+
     def test_get_pending_pickup_excludes_non_pickable_pending_tasks(self, tmp_path: Path):
         """Pickup listing excludes internal and dependency-blocked pending tasks."""
         db_path = tmp_path / "test.db"

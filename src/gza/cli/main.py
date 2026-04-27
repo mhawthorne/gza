@@ -737,23 +737,37 @@ def main() -> int:
         action="store_true",
         help="Show all runnable tasks",
     )
+
+    def _add_queue_tag_scope_args(subparser: argparse.ArgumentParser, *, action: str) -> None:
+        """Add queue management tag-scope filters for runnable status messages."""
+        subparser.add_argument(
+            "--group",
+            metavar="NAME",
+            help=f"Deprecated alias for --tag; check runnable status within this tag scope while {action}",
+        )
+        subparser.add_argument(
+            "--tag",
+            action="append",
+            dest="tags",
+            metavar="TAG",
+            help=f"Check runnable status only within matching tag filters while {action} (repeatable)",
+        )
+        subparser.add_argument(
+            "--any-tag",
+            action="store_true",
+            dest="any_tag",
+            help="With repeated --tag values, match any tag instead of all tags",
+        )
+
     queue_subparsers = queue_parser.add_subparsers(dest="queue_action")
     queue_bump = queue_subparsers.add_parser("bump", help="Move a pending task to the front of the urgent queue lane")
     queue_bump.add_argument("task_id", type=str, help="Full prefixed task ID to bump")
     add_common_args(queue_bump)
-    queue_bump.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Check runnable status within this group while bumping",
-    )
+    _add_queue_tag_scope_args(queue_bump, action="bumping")
     queue_unbump = queue_subparsers.add_parser("unbump", help="Move a pending task back to the normal queue lane")
     queue_unbump.add_argument("task_id", type=str, help="Full prefixed task ID to unbump")
     add_common_args(queue_unbump)
-    queue_unbump.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Check runnable status within this group while unbumping",
-    )
+    _add_queue_tag_scope_args(queue_unbump, action="unbumping")
     queue_move = queue_subparsers.add_parser(
         "move",
         help="Assign an explicit queue position within the task's current group bucket",
@@ -761,33 +775,21 @@ def main() -> int:
     queue_move.add_argument("task_id", type=str, help="Full prefixed task ID to reorder")
     queue_move.add_argument("position", type=_parse_non_negative_int, help="1-based queue position")
     add_common_args(queue_move)
-    queue_move.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Check runnable status within this group while reordering",
-    )
+    _add_queue_tag_scope_args(queue_move, action="reordering")
     queue_next = queue_subparsers.add_parser(
         "next",
         help="Move a pending task to explicit queue position 1 within its current group bucket",
     )
     queue_next.add_argument("task_id", type=str, help="Full prefixed task ID to move next")
     add_common_args(queue_next)
-    queue_next.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Check runnable status within this group while moving next",
-    )
+    _add_queue_tag_scope_args(queue_next, action="moving next")
     queue_clear = queue_subparsers.add_parser(
         "clear",
         help="Remove a task's explicit queue position and return it to lane-based ordering",
     )
     queue_clear.add_argument("task_id", type=str, help="Full prefixed task ID to clear")
     add_common_args(queue_clear)
-    queue_clear.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Check runnable status within this group while clearing queue order",
-    )
+    _add_queue_tag_scope_args(queue_clear, action="clearing queue order")
 
     # refresh command
     refresh_parser = subparsers.add_parser("refresh", help="Refresh cached diff stats for unmerged tasks")
