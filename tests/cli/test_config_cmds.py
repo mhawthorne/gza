@@ -4,6 +4,8 @@
 import json
 import os
 import re
+import shutil
+import sqlite3
 import subprocess
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -538,7 +540,48 @@ class TestInitCommand:
         content = config_path.read_text()
         assert "project_name:" in content
         assert tmp_path.name in content
+        project_id_match = re.search(r"^project_id:\s*([a-z0-9]{1,64})\s*$", content, re.MULTILINE)
+        assert project_id_match is not None
+        assert project_id_match.group(1) != "default"
         assert "# iterate_max_iterations: 3" in content
+
+    def test_init_project_id_remains_stable_after_move_and_clone(self, tmp_path: Path):
+        """Init writes project_id once and moved/cloned projects keep that identity."""
+        shared_db = tmp_path / "shared" / "gza.db"
+        env = {"GZA_DB_PATH": str(shared_db)}
+
+        result = run_gza("init", "--project", str(tmp_path), env=env)
+        assert result.returncode == 0
+
+        config_path = tmp_path / "gza.yaml"
+        content = config_path.read_text(encoding="utf-8")
+        project_id_match = re.search(r"^project_id:\s*([a-z0-9]{1,64})\s*$", content, re.MULTILINE)
+        assert project_id_match is not None
+        project_id = project_id_match.group(1)
+
+        add_original = run_gza("add", "task in original", "--project", str(tmp_path), env=env)
+        assert add_original.returncode == 0
+
+        moved_dir = tmp_path.parent / f"{tmp_path.name}-moved"
+        tmp_path.rename(moved_dir)
+        add_moved = run_gza("add", "task in moved", "--project", str(moved_dir), env=env)
+        assert add_moved.returncode == 0
+
+        clone_dir = moved_dir.parent / f"{moved_dir.name}-clone"
+        shutil.copytree(moved_dir, clone_dir)
+        add_clone = run_gza("add", "task in clone", "--project", str(clone_dir), env=env)
+        assert add_clone.returncode == 0
+
+        moved_content = (moved_dir / "gza.yaml").read_text(encoding="utf-8")
+        clone_content = (clone_dir / "gza.yaml").read_text(encoding="utf-8")
+        assert f"project_id: {project_id}" in moved_content
+        assert f"project_id: {project_id}" in clone_content
+
+        with sqlite3.connect(shared_db) as conn:
+            ids = conn.execute(
+                "SELECT DISTINCT project_id FROM tasks WHERE prompt LIKE 'task in %' ORDER BY project_id"
+            ).fetchall()
+        assert ids == [(project_id,)]
 
     def test_init_does_not_overwrite(self, tmp_path: Path):
         """Init command does not overwrite existing config without --force."""
