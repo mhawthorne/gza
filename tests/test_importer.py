@@ -262,6 +262,70 @@ tasks:
         assert errors[0].task_index == 1
         assert errors[0].message == "'tags' must contain only strings"
 
+    def test_parse_rejects_task_level_non_string_group_alias(self, tmp_path: Path):
+        """Task-level group alias must be string-or-null with precise error text."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+tasks:
+  - prompt: "Task with invalid group type"
+    group: 123
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 1
+        assert errors[0].task_index == 1
+        assert errors[0].message == "'group' must be a string or null"
+
+    def test_parse_rejects_file_level_non_string_group_alias(self, tmp_path: Path):
+        """File-level group alias must be string-or-null and reported as file-level."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+group: 123
+tasks:
+  - prompt: "Task"
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 1
+        assert errors[0].task_index is None
+        assert errors[0].message == "'group' must be a string or null"
+
+    def test_parse_reports_mixed_group_alias_and_tag_type_errors(self, tmp_path: Path):
+        """Invalid group alias and tags shape should both surface with task attribution."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+tasks:
+  - prompt: "Task with mixed invalid labels"
+    group: 123
+    tags: ["release-1.2", 456]
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 2
+        assert all(error.task_index == 1 for error in errors)
+        assert {error.message for error in errors} == {
+            "'group' must be a string or null",
+            "'tags' must contain only strings",
+        }
+
+    def test_parse_preserves_specific_empty_tag_validation_message(self, tmp_path: Path):
+        """Normalization errors should preserve precise tag failure messages."""
+        import_file = tmp_path / "tasks.yaml"
+        import_file.write_text("""
+tasks:
+  - prompt: "Task with empty normalized tag"
+    group: "   "
+""")
+        tasks, _, _, errors = parse_import_file(import_file)
+
+        assert len(tasks) == 1
+        assert len(errors) == 1
+        assert errors[0].task_index == 1
+        assert errors[0].message == "tag must not be empty"
+
 
 class TestValidateImport:
     """Tests for validate_import."""

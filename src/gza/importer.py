@@ -70,6 +70,15 @@ def _parse_tags_field(raw_tags: Any, *, task_index: int | None = None) -> tuple[
     return tuple(raw_tags), []
 
 
+def _parse_group_field(raw_group: Any, *, task_index: int | None = None) -> tuple[str | None, list[ValidationError]]:
+    """Validate and parse deprecated group alias field value."""
+    if raw_group is None:
+        return None, []
+    if not isinstance(raw_group, str):
+        return None, [ValidationError("'group' must be a string or null", task_index=task_index)]
+    return raw_group, []
+
+
 def parse_import_file(
     file_path: Path,
 ) -> tuple[list[ImportTask], str | None, str | None, list[ValidationError]]:
@@ -96,7 +105,10 @@ def parse_import_file(
         return [], None, None, errors
 
     # Extract file-level defaults
-    default_group = data.get("group")
+    default_group: str | None = None
+    if "group" in data:
+        default_group, group_errors = _parse_group_field(data["group"])
+        errors.extend(group_errors)
     default_tags: tuple[str, ...] = ()
     if "tags" in data:
         default_tags, tag_errors = _parse_tags_field(data["tags"])
@@ -164,7 +176,8 @@ def _parse_task(
     group = default_group
     tags: list[str] = list(default_tags)
     if "group" in data:
-        group = data["group"]  # Can be None to clear default
+        group, group_errors = _parse_group_field(data["group"], task_index=index)
+        errors.extend(group_errors)
     if "tags" in data:
         parsed_tags, tag_errors = _parse_tags_field(data["tags"], task_index=index)
         errors.extend(tag_errors)
@@ -196,8 +209,8 @@ def _parse_task(
     normalized_tags: tuple[str, ...]
     try:
         normalized_tags = _normalize_tags(tuple(tags))
-    except ValueError:
-        errors.append(ValidationError("Tags must not be empty strings", task_index=index))
+    except ValueError as exc:
+        errors.append(ValidationError(str(exc), task_index=index))
         normalized_tags = ()
 
     return ImportTask(
