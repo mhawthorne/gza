@@ -545,13 +545,32 @@ def cmd_edit(args: argparse.Namespace) -> int:
     assert task.id is not None
     task_row_id = task.id
 
+    tag_mutation_flags: list[str] = []
+    if getattr(args, "clear_tags", False):
+        tag_mutation_flags.append("--clear-tags")
+    if getattr(args, "set_tags", None) is not None:
+        tag_mutation_flags.append("--set-tags")
+    if getattr(args, "add_tags", None):
+        tag_mutation_flags.append("--add-tag")
+    if getattr(args, "remove_tags", None):
+        tag_mutation_flags.append("--remove-tag")
+    if hasattr(args, "group_flag") and args.group_flag is not None:
+        tag_mutation_flags.append("--group")
+
+    if len(tag_mutation_flags) > 1:
+        print(
+            "Error: Tag mutation flags are mutually exclusive; "
+            "choose exactly one of --clear-tags, --set-tags, --add-tag, --remove-tag, or --group.",
+        )
+        return 1
+
     # Handle explicit tag mutation flags
     if getattr(args, "clear_tags", False):
         store.replace_task_tags(task_row_id, ())
         print(f"✓ Cleared tags for task {task_row_id}")
         return 0
 
-    if getattr(args, "set_tags", None):
+    if getattr(args, "set_tags", None) is not None:
         set_tags = tuple(part.strip() for part in str(args.set_tags).split(",") if part.strip())
         store.replace_task_tags(task_row_id, set_tags)
         refreshed = store.get(task_row_id)

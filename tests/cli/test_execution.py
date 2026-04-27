@@ -202,6 +202,49 @@ class TestEditCommand:
         assert updated is not None
         assert updated.tags == ()
 
+    def test_edit_rejects_combined_tag_mutation_flags(self, tmp_path: Path):
+        """Tag mutation flags are mutually exclusive to prevent silent partial updates."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task", tags=("backend",))
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            "--add-tag",
+            "release-1.2",
+            "--remove-tag",
+            "backend",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "Tag mutation flags are mutually exclusive" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.tags == ("backend",)
+
+    def test_edit_add_tag_single_mutation_succeeds(self, tmp_path: Path):
+        """Single tag mutation flag invocation remains supported."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task", tags=("backend",))
+
+        result = run_gza("edit", str(task.id), "--add-tag", "release-1.2", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Added tags for task" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.tags == ("backend", "release-1.2")
+
     def test_edit_review_flag(self, tmp_path: Path):
         """Edit command can enable automatic review task creation."""
 

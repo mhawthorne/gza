@@ -1313,33 +1313,33 @@ def main() -> int:
         "--group",
         dest="group_flag",
         metavar="NAME",
-        help="Deprecated alias for tag edits (empty string clears all tags)",
+        help="Deprecated alias for tag edits (empty string clears all tags); mutually exclusive with other tag mutation flags",
     )
     edit_parser.add_argument(
         "--add-tag",
         action="append",
         dest="add_tags",
         metavar="TAG",
-        help="Add a tag (repeatable)",
+        help="Add a tag (repeatable; mutually exclusive with other tag mutation flags)",
     )
     edit_parser.add_argument(
         "--remove-tag",
         action="append",
         dest="remove_tags",
         metavar="TAG",
-        help="Remove a tag (repeatable)",
+        help="Remove a tag (repeatable; mutually exclusive with other tag mutation flags)",
     )
     edit_parser.add_argument(
         "--clear-tags",
         action="store_true",
         dest="clear_tags",
-        help="Clear all task tags",
+        help="Clear all task tags (mutually exclusive with other tag mutation flags)",
     )
     edit_parser.add_argument(
         "--set-tags",
         metavar="CSV",
         dest="set_tags",
-        help="Replace task tags with a comma-separated list",
+        help="Replace task tags with a comma-separated list (mutually exclusive with other tag mutation flags)",
     )
     edit_parser.add_argument(
         "--based-on",

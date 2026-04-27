@@ -522,11 +522,11 @@ gza edit <task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `task_id` | Full prefixed task ID to edit (e.g. `gza-1234`) |
-| `--add-tag TAG` | Add one or more tags (repeatable) |
-| `--remove-tag TAG` | Remove one or more tags (repeatable) |
-| `--clear-tags` | Remove all tags from task |
-| `--set-tags CSV` | Replace all tags with comma-separated tags |
-| `--group NAME` | Deprecated alias; maps to tag mutation compatibility behavior |
+| `--add-tag TAG` | Add one or more tags (repeatable, mutually exclusive with other tag mutation flags) |
+| `--remove-tag TAG` | Remove one or more tags (repeatable, mutually exclusive with other tag mutation flags) |
+| `--clear-tags` | Remove all tags from task (mutually exclusive with other tag mutation flags) |
+| `--set-tags CSV` | Replace all tags with comma-separated tags (mutually exclusive with other tag mutation flags) |
+| `--group NAME` | Deprecated alias; maps to tag mutation compatibility behavior and is mutually exclusive with other tag mutation flags |
 | `--based-on ID` | Set lineage/parent relationship using a full prefixed task ID (branch inheritance and context; e.g. `gza-1234`) |
 | `--depends-on ID` | Set execution dependency using a full prefixed task ID (blocks task until dependency completes; e.g. `gza-1234`) |
 | `--explore` | Convert to explore task |
