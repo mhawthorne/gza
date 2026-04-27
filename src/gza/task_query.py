@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
 
-from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from gza.db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
 
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
@@ -76,6 +76,8 @@ class TaskQuery:
     root_ids: tuple[str, ...] | None = None
     branch_owner_ids: tuple[str, ...] | None = None
     groups: tuple[str | None, ...] | None = None
+    tag_filters: tuple[str, ...] | None = None
+    any_tag: bool = False
     pickup_only: bool = False
     date_filter: DateFilter | None = None
     sort: SortSpec = DEFAULT_SORT
@@ -143,6 +145,7 @@ _TASK_DEFAULT_FIELDS: tuple[str, ...] = (
     "effective_at",
     "lineage_root_id",
     "branch_owner_id",
+    "tags",
     "branch_merge_state",
     "shares_owner_branch",
     "review_verdict",
@@ -262,7 +265,11 @@ class TaskQueryPresets:
         *,
         limit: int | None = 10,
         group: str | None = None,
+        tags: tuple[str, ...] | None = None,
+        any_tag: bool = False,
     ) -> TaskQuery:
+        group_tags = (group,) if group is not None else ()
+        combined_tags = normalize_tag_filters((*group_tags, *(tags or ())))
         return TaskQuery(
             scope="tasks",
             limit=limit,
@@ -270,6 +277,8 @@ class TaskQueryPresets:
             exclude_task_types=("internal",),
             dependency_state=("unblocked",),
             groups=None if group is None else (group,),
+            tag_filters=combined_tags,
+            any_tag=any_tag,
             pickup_only=True,
             sort=SortSpec(field="pickup_order", descending=False),
             projection=ProjectionSpec(preset=TaskProjectionPreset.QUEUE_DEFAULT),
@@ -323,11 +332,13 @@ class TaskQueryService:
         if query.scope != "tasks":
             return list(self._store.get_all())
 
-        single_group = query.groups[0] if query.groups and len(query.groups) == 1 else None
+        tags = query.tag_filters
+        if tags is None and query.groups:
+            tags = tuple(group for group in query.groups if group is not None)
         if query.pickup_only:
-            return list(self._store.get_pending_pickup(limit=None, group=single_group))
+            return list(self._store.get_pending_pickup(limit=None, tags=tags, any_tag=query.any_tag))
         if query.sort.field == "pickup_order":
-            return list(self._store.get_pending(limit=None, group=single_group))
+            return list(self._store.get_pending(limit=None, tags=tags, any_tag=query.any_tag))
         return list(self._store.get_all())
 
     def _collect_lineages(self, query: TaskQuery) -> list[LineageRow]:
@@ -430,6 +441,8 @@ class TaskQueryService:
                     root_ids=query.root_ids,
                     branch_owner_ids=query.branch_owner_ids,
                     groups=query.groups,
+                    tag_filters=query.tag_filters,
+                    any_tag=query.any_tag,
                     pickup_only=query.pickup_only,
                     date_filter=query.date_filter,
                     sort=query.sort,
@@ -546,6 +559,14 @@ class TaskQueryService:
             allowed_groups = set(query.groups)
             filtered = [task for task in filtered if task.group in allowed_groups]
 
+        if query.tag_filters is not None:
+            required = normalize_tag_filters(query.tag_filters)
+            filtered = [
+                task
+                for task in filtered
+                if task_matches_tag_filters(task_tags=task.tags, tag_filters=required, any_tag=query.any_tag)
+            ]
+
         if query.merge_chain_state is not None:
             merge_states = set(query.merge_chain_state)
             filtered = [task for task in filtered if self._matches_merge_chain_state(task, merge_states)]
@@ -616,6 +637,7 @@ class TaskQueryService:
             "completed_at": task.completed_at,
             "effective_at": _effective_at(task),
             "group": task.group,
+            "tags": list(task.tags),
             "urgent": task.urgent,
             "queue_position": task.queue_position,
             "lineage_root_id": root.id,
@@ -672,6 +694,7 @@ class TaskQueryService:
             "completed_at": owner.completed_at,
             "effective_at": _effective_at(owner),
             "group": owner.group,
+            "tags": list(owner.tags),
             "urgent": owner.urgent,
             "queue_position": owner.queue_position,
             "lineage_root_id": root.id,
@@ -879,6 +902,28 @@ def parse_csv(value: str | None) -> tuple[str, ...] | None:
     return items or None
 
 
+def normalize_tag_filters(tags: tuple[str, ...] | None) -> tuple[str, ...] | None:
+    """Normalize tag filters to canonical lowercase matching semantics."""
+    if tags is None:
+        return None
+    normalized = _normalize_tags(tags)
+    return normalized or None
+
+
+def task_matches_tag_filters(
+    *,
+    task_tags: Sequence[str],
+    tag_filters: tuple[str, ...] | None,
+    any_tag: bool,
+) -> bool:
+    """Return whether a task's tags match normalized filter tags."""
+    if tag_filters is None:
+        return True
+    requested = set(tag_filters)
+    task_values = set(task_tags)
+    return bool(task_values & requested) if any_tag else requested.issubset(task_values)
+
+
 def _history_filter_cls() -> Any:
     from gza.query import HistoryFilter
 
@@ -966,5 +1011,7 @@ __all__ = [
     "TaskRow",
     "LineageRow",
     "TextFilter",
+    "normalize_tag_filters",
     "parse_csv",
+    "task_matches_tag_filters",
 ]

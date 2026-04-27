@@ -1066,6 +1066,35 @@ class TestHistoryCommand:
         assert "failed" in result.stdout
         assert "WORKER_DIED" in result.stdout
 
+    def test_history_tag_filter_is_case_insensitive_with_json_text_parity(self, tmp_path: Path):
+        """history --tag should match canonical lowercase tags regardless of filter case."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        tagged = store.add("Tagged completed history", tags=("release-1.2",))
+        assert tagged.id is not None
+        tagged.status = "completed"
+        tagged.completed_at = datetime.now(UTC)
+        store.update(tagged)
+
+        other = store.add("Other completed history", tags=("backlog",))
+        assert other.id is not None
+        other.status = "completed"
+        other.completed_at = datetime.now(UTC)
+        store.update(other)
+
+        text_result = run_gza("history", "--tag", "Release-1.2", "--project", str(tmp_path))
+        json_result = run_gza("history", "--tag", "Release-1.2", "--json", "--project", str(tmp_path))
+
+        assert text_result.returncode == 0
+        assert "Tagged completed history" in text_result.stdout
+        assert "Other completed history" not in text_result.stdout
+
+        assert json_result.returncode == 0
+        rows = json.loads(json_result.stdout)
+        prompts = [row["prompt"] for row in rows]
+        assert prompts == ["Tagged completed history"]
+
 
 class TestSearchCommand:
     """Tests for 'gza search' command."""
@@ -1246,6 +1275,34 @@ class TestSearchCommand:
 
         assert result.returncode == 2
         assert "--fields and --preset require --json for gza search" in result.stderr
+
+    def test_search_tag_filter_is_case_insensitive_with_json_text_parity(self, tmp_path: Path):
+        """search --tag should match regardless of filter case in text and JSON outputs."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("Tagged search task", tags=("release-1.2",))
+        store.add("Backlog search task", tags=("backlog",))
+
+        text_result = run_gza("search", "search task", "--tag", "Release-1.2", "--project", str(tmp_path))
+        json_result = run_gza(
+            "search",
+            "search task",
+            "--tag",
+            "Release-1.2",
+            "--json",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert text_result.returncode == 0
+        assert "Tagged search task" in text_result.stdout
+        assert "Backlog search task" not in text_result.stdout
+
+        assert json_result.returncode == 0
+        rows = json.loads(json_result.stdout)
+        prompts = [row["prompt"] for row in rows]
+        assert prompts == ["Tagged search task"]
 
 
 class TestNextCommand:
@@ -1634,6 +1691,25 @@ class TestQueueCommand:
         assert "Release blocked" not in result.stdout
         assert "Backlog runnable" not in result.stdout
         assert "1 task blocked by dependencies" in result.stdout
+
+    def test_queue_and_next_tag_filters_are_case_insensitive(self, tmp_path: Path):
+        """queue/next should match lowercase-stored tags for mixed-case --tag values."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("Release runnable", tags=("release-1.2",))
+        store.add("Backlog runnable", tags=("backlog",))
+
+        queue_result = run_gza("queue", "--tag", "Release-1.2", "--project", str(tmp_path))
+        next_result = run_gza("next", "--tag", "Release-1.2", "--project", str(tmp_path))
+
+        assert queue_result.returncode == 0
+        assert "Release runnable" in queue_result.stdout
+        assert "Backlog runnable" not in queue_result.stdout
+
+        assert next_result.returncode == 0
+        assert "Release runnable" in next_result.stdout
+        assert "Backlog runnable" not in next_result.stdout
 
 
 class TestShowCommand:
@@ -2507,6 +2583,18 @@ class TestGroupsCommand:
         assert "list" in result.stdout
         assert "rename" in result.stdout
 
+    def test_groups_warning_references_existing_command(self, tmp_path: Path):
+        """Deprecation warning should not point to non-existent commands."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Task 1", tags=("group-a",))
+
+        result = run_gza("groups", "list", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Warning: 'gza groups' is deprecated; use 'gza groups list'." in result.stdout
+        assert "use tags" not in result.stdout
+
 
 class TestStatusCommand:
     """Tests for 'gza group <group>' command."""
@@ -2603,6 +2691,18 @@ class TestRenameGroupCommand:
 
         assert result.returncode == 1
         assert "already exists" in result.stdout
+
+    def test_rename_group_warning_avoids_nonexistent_tags_command(self, tmp_path: Path):
+        """Deprecation warning should avoid suggesting missing tags rename command."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Release task", tags=("release",))
+
+        result = run_gza("groups", "rename", "release", "launch", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Warning: 'gza groups rename' is deprecated and will be removed in a future release." in result.stdout
+        assert "tags rename" not in result.stdout
 
 
 class TestPsCommand:

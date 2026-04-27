@@ -400,7 +400,12 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     explicit_task_id = task_id
     selected_task: DbTask | None = None
     resume_mode = bool(getattr(args, "resume", False))
+    selected_tags = list(getattr(args, "tags", None) or [])
     selected_group = getattr(args, "group", None)
+    if selected_group:
+        print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
+        selected_tags.append(selected_group)
+    any_tag = bool(getattr(args, "any_tag", False))
 
     if explicit_task_id is not None:
         task = store.get(explicit_task_id)
@@ -435,10 +440,10 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
             print("Error: Cannot resume without specifying a task ID")
             return 1
         # Select a candidate for UX; actual claim happens in the child runner.
-        selected_task = store.get_next_pending(group=selected_group)
+        selected_task = store.get_next_pending(tags=tuple(selected_tags) or None, any_tag=any_tag)
         if not selected_task:
-            if selected_group:
-                print(f"No pending tasks found in group '{selected_group}'")
+            if selected_tags:
+                print(f"No pending tasks found matching tags: {', '.join(selected_tags)}")
             else:
                 print("No pending tasks found")
             return 0
@@ -456,8 +461,11 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
 
     if explicit_task_id is not None:
         inner_cmd.append(str(explicit_task_id))
-    elif selected_group:
-        inner_cmd.extend(["--group", selected_group])
+    elif selected_tags:
+        for tag in selected_tags:
+            inner_cmd.extend(["--tag", tag])
+        if any_tag:
+            inner_cmd.append("--any-tag")
 
     if args.no_docker:
         inner_cmd.append("--no-docker")
@@ -906,7 +914,12 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
     """
     # Determine how many workers to spawn
     count = args.count if args.count is not None else 1
+    selected_tags = list(getattr(args, "tags", None) or [])
     selected_group = getattr(args, "group", None)
+    if selected_group:
+        print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
+        selected_tags.append(selected_group)
+    any_tag = bool(getattr(args, "any_tag", False))
     store = get_store(config)
 
     # If specific task_ids are provided, spawn one worker per task ID
@@ -926,8 +939,8 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
 
         return 0
 
-    if selected_group:
-        pending_tasks = store.get_pending_pickup(limit=count, group=selected_group)
+    if selected_tags:
+        pending_tasks = store.get_pending_pickup(limit=count, tags=tuple(selected_tags), any_tag=any_tag)
         spawned_count = 0
         for task in pending_tasks:
             if task.id is None:
@@ -938,7 +951,7 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
         if count > 1:
             print(
                 f"\n=== Attempted to spawn {count} background worker(s) "
-                f"for group '{selected_group}' ==="
+                f"for tags '{', '.join(selected_tags)}' ==="
             )
         return 0
 
@@ -1242,7 +1255,7 @@ def _create_improve_task(
         depends_on=review_task.id if review_task is not None else None,
         based_on=impl_task.id,
         same_branch=True,
-        group=impl_task.group,
+        tags=impl_task.tags,
         create_review=create_review,
         model=model,
         provider=provider,
@@ -1354,7 +1367,7 @@ def _format_lineage(
 def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask:
     """Create a new resume task pointing to the original failed task.
 
-    Copies prompt, task_type, group, session_id, branch, model, etc.
+    Copies prompt, task_type, tags, session_id, branch, model, etc.
     Preserves provider across resumes:
       - When the original task had an explicit provider override, it carries over.
       - When the resume will reuse a backend session_id, the originally resolved
@@ -1371,7 +1384,7 @@ def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask
     new_task = store.add(
         prompt=original_task.prompt,
         task_type=original_task.task_type,
-        group=original_task.group,
+        tags=original_task.tags,
         spec=original_task.spec,
         depends_on=original_task.depends_on,
         create_review=original_task.create_review,
@@ -2022,6 +2035,19 @@ def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
         dest="end_date",
         metavar="YYYY-MM-DD",
         help="Show only tasks on or before this date",
+    )
+    parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Filter by tag (repeatable, AND semantics by default)",
+    )
+    parser.add_argument(
+        "--any-tag",
+        action="store_true",
+        dest="any_tag",
+        help="With repeated --tag values, match any tag instead of all tags",
     )
 
 

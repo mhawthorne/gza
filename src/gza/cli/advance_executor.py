@@ -234,7 +234,7 @@ def execute_advance_action(
                 depends_on=failed_improve.depends_on,
                 based_on=failed_improve.id,
                 same_branch=retry_same_branch,
-                group=failed_improve.group,
+                tags=failed_improve.tags,
                 base_branch=retry_base_branch,
             )
         else:

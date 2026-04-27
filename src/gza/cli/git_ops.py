@@ -1301,7 +1301,7 @@ def _cmd_advance_unimplemented(
             prompt=prompt_text,
             task_type="implement",
             depends_on=task.id,
-            group=task.group,
+            tags=task.tags,
         )
         print(f"✓ Created implement task {impl_task.id} for {task.task_type} {task.id}")
         created_count += 1
@@ -1546,7 +1546,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 prompt=_unimplemented_implement_prompt(parent_task),
                 task_type="implement",
                 depends_on=parent_task.id,
-                group=parent_task.group,
+                tags=parent_task.tags,
             )
 
         return AdvanceActionExecutionContext(

@@ -151,8 +151,8 @@ class TestEditCommand:
         updated = store.get(task.id)
         assert updated.group == "new-group"
 
-    def test_edit_remove_group(self, tmp_path: Path):
-        """Edit command can remove task from group."""
+    def test_edit_group_empty_string_clears_single_tag_only(self, tmp_path: Path):
+        """Legacy --group '' should only clear when exactly one tag exists."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -163,10 +163,44 @@ class TestEditCommand:
         result = run_gza("edit", str(task.id), "--group", "", "--project", str(tmp_path))
 
         assert result.returncode == 0
-
-        # Verify group was removed
         updated = store.get(task.id)
         assert updated.group is None or updated.group == ""
+        assert updated.tags == ()
+
+    def test_edit_group_empty_string_rejects_multi_tag_clear(self, tmp_path: Path):
+        """Legacy --group '' should fail for multi-tag tasks with actionable guidance."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task", tags=("release-1.2", "backend"))
+        assert len(task.tags) == 2
+
+        result = run_gza("edit", str(task.id), "--group", "", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert 'Error: --group "" is ambiguous for tasks with multiple tags' in result.stdout
+        assert "--remove-tag TAG or --clear-tags" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.tags == ("backend", "release-1.2")
+
+    def test_edit_clear_tags_still_clears_multi_tag_task(self, tmp_path: Path):
+        """--clear-tags remains the explicit path for clearing all tags."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task", tags=("release-1.2", "backend"))
+        assert len(task.tags) == 2
+
+        result = run_gza("edit", str(task.id), "--clear-tags", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.tags == ()
 
     def test_edit_review_flag(self, tmp_path: Path):
         """Edit command can enable automatic review task creation."""

@@ -2,7 +2,15 @@
 
 ## Overview
 
-This spec describes extensions to gza for supporting multi-phase development workflows where tasks can depend on each other, be grouped together, and automatically trigger follow-up tasks like reviews.
+This spec describes extensions to gza for supporting multi-phase development workflows where tasks can depend on each other, be tagged, and automatically trigger follow-up tasks like reviews.
+
+## Status Update (Tags Migration)
+
+`group` was the original single-value label field. The canonical model is now multi-valued task tags:
+
+- `Task.tags` + `task_tags` table are canonical.
+- `--group`, `gza group`, and `gza groups` are deprecated compatibility aliases.
+- Existing `group` data is migrated to a same-name tag during schema migration.
 
 ## Motivation
 
@@ -16,7 +24,7 @@ For complex work (like a large refactor), a single task isn't enough. The workfl
 
 This requires:
 - Task dependencies (implementation waits for plan approval)
-- Task grouping (see all related tasks at a glance)
+- Task tagging (see all related tasks at a glance)
 - Automatic follow-up tasks (review after implementation)
 - Per-task-type configuration (cheaper models for reviews)
 
@@ -32,16 +40,14 @@ Four task types, each with distinct behavior:
 | `implement` | Build per a plan | Code changes on branch |
 | `review` | Evaluate implementation (optional) | `.gza/reviews/{task_id}.md` with verdict |
 
-## Groups
+## Tags
 
-Groups are optional labels for organizing related tasks. They are purely for human comprehension - the `depends_on` field handles execution order separately.
+Tags are optional flat labels for organizing related tasks. They are purely for slicing/filtering; `depends_on` still controls execution order.
 
-A group can contain:
-- Multiple parallel task chains (e.g., "plan transforms" and "plan builders" both in "tarantino-v2")
-- Independent tasks that are conceptually related
+A tag can be shared across:
+- Multiple parallel task chains
+- Independent but related tasks
 - A mix of task types
-
-Tasks without a group work exactly as they do today and appear under "(ungrouped)" in status output.
 
 ## Schema Changes
 
@@ -52,7 +58,7 @@ New fields on Task:
 class Task:
     # ... existing fields ...
 
-    group: str | None = None        # Optional label for related tasks (e.g., "tarantino-v2")
+    tags: tuple[str, ...] = ()      # Optional labels for related tasks (e.g., "tarantino-v2")
     depends_on: int | None = None   # Task ID that must complete first
     create_review: bool = False     # Auto-create review task on completion
     same_branch: bool = False       # If True, continue on depends_on task's branch instead of creating new
@@ -97,7 +103,7 @@ task_types:
 gza add
 
 # Plan task
-gza add --type plan --group tarantino-v2
+gza add --type plan --tag tarantino-v2
 
 # Implementation task that depends on plan, with auto-review
 gza add --type implement --based-on 1 --review
@@ -139,11 +145,10 @@ gza groups
 ### Editing tasks
 
 ```bash
-# Move a task into a group
-gza edit 5 --group tarantino-v2
-
-# Remove a task from a group
-gza edit 5 --group ""
+# Add/remove tags
+gza edit 5 --add-tag tarantino-v2
+gza edit 5 --remove-tag tarantino-v2
+gza edit 5 --clear-tags
 ```
 
 ### Listing pending tasks
@@ -186,7 +191,7 @@ Behavior:
    ```
 3. After completing an `implement` task with `create_review=True`:
    - Creates review task with `depends_on` set to the implement task
-   - Inherits `group` from parent task
+   - Inherits `tags` from parent task
    - Immediately executes the review task (auto-run)
 
 ## Runner Behavior by Task Type
@@ -248,7 +253,7 @@ def get_next_pending(self) -> Task | None:
 
 ```bash
 # 1. Create a plan task
-$ gza add --type plan --group tarantino-v2
+$ gza add --type plan --tag tarantino-v2
 # Editor: "Design the ImageTransform system per specs/v2-design.md"
 
 # 2. Run the plan
@@ -259,7 +264,7 @@ $ gza work
 # 3. Human reviews plan offline...
 
 # 4. Create implementation task with auto-review
-$ gza add --type implement --based-on 1 --review --group tarantino-v2
+$ gza add --type implement --based-on 1 --review --tag tarantino-v2
 # Editor: "Implement ImageTransform per the plan"
 
 # 5. Run implementation (and auto-review)

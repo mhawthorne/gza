@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gza.cli.watch import (
+    _collect_completed_transition_ids,
     _collect_live_running_state,
     _collect_unhandled_failures,
     _compute_failure_backoff_seconds,
@@ -2262,6 +2263,68 @@ def test_collect_unhandled_failures_includes_unknown_failures(tmp_path: Path) ->
 
     failures = _collect_unhandled_failures(old, new, store=store, config=config)
     assert [(failure.task_id, failure.reason) for failure in failures] == [(str(failed.id), "UNKNOWN")]
+
+
+def test_watch_transition_collectors_apply_case_insensitive_tag_filters(tmp_path: Path) -> None:
+    """Transition collectors should use canonical case-insensitive tag filtering."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    completed_tagged = store.add("Completed tagged", task_type="plan", tags=("release-1.2",))
+    completed_other = store.add("Completed other", task_type="plan", tags=("backlog",))
+    failed_tagged = store.add("Failed tagged", task_type="plan", tags=("release-1.2",))
+    failed_other = store.add("Failed other", task_type="plan", tags=("backlog",))
+    assert completed_tagged.id is not None
+    assert completed_other.id is not None
+    assert failed_tagged.id is not None
+    assert failed_other.id is not None
+
+    config = Config.load(tmp_path)
+    old = {
+        str(completed_tagged.id): {"status": "in_progress"},
+        str(completed_other.id): {"status": "in_progress"},
+        str(failed_tagged.id): {"status": "in_progress"},
+        str(failed_other.id): {"status": "in_progress"},
+    }
+    new = {
+        str(completed_tagged.id): {
+            "status": "completed",
+            "task_type": "plan",
+            "failure_reason": None,
+        },
+        str(completed_other.id): {
+            "status": "completed",
+            "task_type": "plan",
+            "failure_reason": None,
+        },
+        str(failed_tagged.id): {
+            "status": "failed",
+            "task_type": "plan",
+            "failure_reason": "UNKNOWN",
+        },
+        str(failed_other.id): {
+            "status": "failed",
+            "task_type": "plan",
+            "failure_reason": "UNKNOWN",
+        },
+    }
+
+    completed_ids = _collect_completed_transition_ids(
+        old,
+        new,
+        store=store,
+        tags=("Release-1.2",),
+    )
+    failures = _collect_unhandled_failures(
+        old,
+        new,
+        store=store,
+        config=config,
+        tags=("Release-1.2",),
+    )
+
+    assert completed_ids == [str(completed_tagged.id)]
+    assert [(failure.task_id, failure.reason) for failure in failures] == [(str(failed_tagged.id), "UNKNOWN")]
 
 
 def test_compute_failure_backoff_seconds_caps_at_max(tmp_path: Path) -> None:

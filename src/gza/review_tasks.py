@@ -126,12 +126,13 @@ def create_review_task(
         )
     else:
         review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
+    inherited_tags = impl_task.tags or (() if impl_task.group is None else (impl_task.group,))
 
     return store.add(
         prompt=review_prompt,
         task_type="review",
         depends_on=impl_task.id,
-        group=impl_task.group,
+        tags=inherited_tags,
         based_on=impl_task.id,
         model=model,
         provider=provider,
@@ -230,11 +231,12 @@ def create_or_reuse_followup_task(
         impl_task.id,
         finding,
     )
+    inherited_tags = impl_task.tags or (() if impl_task.group is None else (impl_task.group,))
     created = store.add(
         prompt=prompt,
         task_type="implement",
         based_on=review_task.id,
         depends_on=impl_task.id,
-        group=impl_task.group,
+        tags=inherited_tags,
     )
     return created, True

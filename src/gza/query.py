@@ -36,6 +36,8 @@ class HistoryFilter:
     end_date: str | None = None  # Only tasks on or before this date (YYYY-MM-DD)
     date_field: Literal["created", "completed", "effective"] = "effective"
     lineage_depth: int = 0  # Expand lineage N levels (0 = flat)
+    tags: tuple[str, ...] | None = None
+    any_tag: bool = False
 
 
 @dataclass
@@ -141,6 +143,8 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
             lineage_of=q.lineage_of,
             root_ids=q.root_ids,
             branch_owner_ids=q.branch_owner_ids,
+            tag_filters=f.tags,
+            any_tag=f.any_tag,
             date_filter=q.date_filter,
             sort=q.sort,
             projection=q.projection,
@@ -160,6 +164,8 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
             lineage_of=q.lineage_of,
             root_ids=q.root_ids,
             branch_owner_ids=q.branch_owner_ids,
+            tag_filters=f.tags,
+            any_tag=f.any_tag,
             date_filter=q.date_filter,
             sort=q.sort,
             projection=q.projection,

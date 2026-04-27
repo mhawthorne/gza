@@ -243,7 +243,7 @@ class TestCreateReviewTask:
         assert call_kwargs["prompt"] == "review add-feature"
         assert call_kwargs["task_type"] == "review"
         assert call_kwargs["depends_on"] == "gza-1234"
-        assert call_kwargs["group"] == "mygroup"
+        assert call_kwargs["tags"] == ("mygroup",)
         assert call_kwargs["based_on"] == "gza-1234"
 
     def test_auto_prompt_mode_strips_nested_known_suffixes_from_lineage(self):
@@ -440,4 +440,4 @@ class TestFollowupTasks:
         assert kwargs["task_type"] == "implement"
         assert kwargs["based_on"] == "gza-200"
         assert kwargs["depends_on"] == "gza-101"
-        assert kwargs["group"] == "grp-a"
+        assert kwargs["tags"] == ("grp-a",)

@@ -152,19 +152,26 @@ def cmd_next(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
     service = _TaskQueryService(store)
+    tags = list(getattr(args, "tags", None) or [])
     group = getattr(args, "group", None)
+    if group:
+        print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
+        tags.append(group)
+    tag_filters = tuple(tags) if tags else None
+    any_tag = bool(getattr(args, "any_tag", False))
 
     pending_query = _TaskQuery(
         scope="tasks",
         limit=None,
         statuses=("pending",),
-        groups=None if group is None else (group,),
+        tag_filters=tag_filters,
+        any_tag=any_tag,
         sort=_TaskSortSpec(field="pickup_order", descending=False),
     )
     pending = [row.task for row in service.run(pending_query).rows if isinstance(row, _TaskRow)]
     runnable = [
         row.task
-        for row in service.run(_TaskQueryPresets.queue(limit=None, group=group)).rows
+        for row in service.run(_TaskQueryPresets.queue(limit=None, tags=tag_filters, any_tag=any_tag)).rows
         if isinstance(row, _TaskRow)
     ]
     blocked_query = _TaskQuery(
@@ -173,7 +180,8 @@ def cmd_next(args: argparse.Namespace) -> int:
         statuses=("pending",),
         exclude_task_types=("internal",),
         dependency_state=("blocked",),
-        groups=None if group is None else (group,),
+        tag_filters=tag_filters,
+        any_tag=any_tag,
         sort=_TaskSortSpec(field="pickup_order", descending=False),
         projection=_TaskProjectionSpec(fields=("blocking_id",)),
     )
@@ -189,8 +197,8 @@ def cmd_next(args: argparse.Namespace) -> int:
     orphaned = _get_orphaned_tasks(registry, store)
 
     if not pending:
-        if group:
-            console.print(f"No pending tasks in group '{group}'")
+        if tag_filters:
+            console.print(f"No pending tasks matching tags: {', '.join(tag_filters)}")
         else:
             console.print("No pending tasks")
         if orphaned:
@@ -241,8 +249,8 @@ def cmd_next(args: argparse.Namespace) -> int:
             _print_task_row(i, task)
     else:
         if not show_all:
-            if group:
-                console.print(f"No runnable tasks in group '{group}'")
+            if tag_filters:
+                console.print(f"No runnable tasks matching tags: {', '.join(tag_filters)}")
             else:
                 console.print("No runnable tasks")
 
@@ -285,6 +293,8 @@ def cmd_history(args: argparse.Namespace) -> int:
     projection_fields = _parse_csv(getattr(args, "fields", None))
     projection_preset = getattr(args, "preset", None)
     use_json = bool(getattr(args, "json", False))
+    tags = tuple(getattr(args, "tags", None) or ())
+    any_tag = bool(getattr(args, "any_tag", False))
 
     if not use_json and (projection_fields is not None or projection_preset):
         print("error: --fields and --preset require --json for gza history", file=sys.stderr)
@@ -306,6 +316,8 @@ def cmd_history(args: argparse.Namespace) -> int:
         end_date=end_date,
         date_field=date_field,
         lineage_depth=lineage_depth,
+        tags=tags or None,
+        any_tag=any_tag,
     )
 
     if use_json:
@@ -629,6 +641,8 @@ def cmd_search(args: argparse.Namespace) -> int:
     projection_fields = _parse_csv(getattr(args, "fields", None))
     projection_preset = getattr(args, "preset", None)
     use_json = bool(getattr(args, "json", False))
+    tags = tuple(getattr(args, "tags", None) or ())
+    any_tag = bool(getattr(args, "any_tag", False))
 
     if not use_json and (projection_fields is not None or projection_preset):
         print("error: --fields and --preset require --json for gza search", file=sys.stderr)
@@ -657,6 +671,26 @@ def cmd_search(args: argparse.Namespace) -> int:
         lineage_of=lineage_of,
         root_ids=root_ids,
     )
+    query = _TaskQuery(
+        scope=query.scope,
+        limit=query.limit,
+        text=query.text,
+        statuses=query.statuses,
+        task_types=query.task_types,
+        lifecycle_state=query.lifecycle_state,
+        merge_chain_state=query.merge_chain_state,
+        dependency_state=query.dependency_state,
+        related_to=query.related_to,
+        lineage_of=query.lineage_of,
+        root_ids=query.root_ids,
+        branch_owner_ids=query.branch_owner_ids,
+        tag_filters=tags or None,
+        any_tag=any_tag,
+        date_filter=query.date_filter,
+        sort=query.sort,
+        projection=query.projection,
+        presentation=query.presentation,
+    )
     if projection_preset or projection_fields is not None:
         query = _TaskQuery(
             scope=query.scope,
@@ -671,6 +705,8 @@ def cmd_search(args: argparse.Namespace) -> int:
             lineage_of=query.lineage_of,
             root_ids=query.root_ids,
             branch_owner_ids=query.branch_owner_ids,
+            tag_filters=query.tag_filters,
+            any_tag=query.any_tag,
             date_filter=query.date_filter,
             sort=query.sort,
             projection=_TaskProjectionSpec(
@@ -1160,21 +1196,14 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
 
 
 def cmd_groups(args: argparse.Namespace) -> int:
-    """List all groups with task counts."""
+    """List all tags with task counts (compatibility alias: groups)."""
     config = Config.load(args.project_dir)
     store = get_store(config)
 
+    print("Warning: 'gza groups' is deprecated; use 'gza groups list'.")
     groups = store.get_groups()
 
-    # Count ungrouped tasks
-    all_tasks = store.get_all()
-    ungrouped_counts: dict[str, int] = {}
-    for task in all_tasks:
-        if task.group is None:
-            status = task.status
-            ungrouped_counts[status] = ungrouped_counts.get(status, 0) + 1
-
-    if not groups and not ungrouped_counts:
+    if not groups:
         print("No tasks found")
         return 0
 
@@ -1192,25 +1221,15 @@ def cmd_groups(args: argparse.Namespace) -> int:
         status_str = ", ".join(parts) if parts else "0 tasks"
         print(f"{group_name:<20} {total} tasks ({status_str})")
 
-    # Show ungrouped tasks
-    if ungrouped_counts:
-        total = sum(ungrouped_counts.values())
-        parts = []
-        for status in ["pending", "in_progress", "completed", "failed", "unmerged", "dropped"]:
-            if status in ungrouped_counts and ungrouped_counts[status] > 0:
-                parts.append(f"{ungrouped_counts[status]} {status}")
-
-        status_str = ", ".join(parts) if parts else "0 tasks"
-        print(f"{'(ungrouped)':<20} {total} tasks ({status_str})")
-
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """Show tasks in a group."""
+    """Show tasks by a single tag (compatibility alias: group)."""
     config = Config.load(args.project_dir)
     store = get_store(config)
 
+    print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.")
     group_name = args.group
     tasks = store.get_by_group(group_name)
 
@@ -1218,7 +1237,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"No tasks found in group '{group_name}'")
         return 0
 
-    print(f"Group: {group_name}")
+    print(f"Tag: {group_name}")
     print()
 
     for task in tasks:
@@ -1258,11 +1277,10 @@ def cmd_status(args: argparse.Namespace) -> int:
 
         print(f"  {icon} {task.id}. {type_label}{prompt_display:<{avail}} {status_display}{date_info}{blocked_info}")
 
-    # Check for orphaned tasks in this group and warn the user
+    # Check for orphaned tasks in this tag slice and warn the user
     registry = WorkerRegistry(config.workers_path)
     orphaned = _get_orphaned_tasks(registry, store)
-    # Filter orphaned tasks to those belonging to this group
-    group_orphaned = [t for t in orphaned if t.group == group_name]
+    group_orphaned = [t for t in orphaned if group_name in t.tags]
     if group_orphaned:
         _print_orphaned_warning(group_orphaned)
 
@@ -1270,10 +1288,11 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_group_rename(args: argparse.Namespace) -> int:
-    """Rename a task group across all attached tasks."""
+    """Rename a tag across all attached tasks (compatibility alias)."""
     config = Config.load(args.project_dir)
     store = get_store(config)
 
+    print("Warning: 'gza groups rename' is deprecated and will be removed in a future release.")
     try:
         updated = store.rename_group(args.old_group, args.new_group)
     except ValueError as exc:
@@ -2200,8 +2219,8 @@ def _cmd_show_output(
         if depended_on_by:
             dep_parts = [f"{t.id}[{t.task_type}]" for t in depended_on_by if t.id is not None]
             console.print(f"[{c['label']}]Depended on by:[/{c['label']}] [{c['value']}]{', '.join(dep_parts)}[/{c['value']}]")
-    if task.group:
-        console.print(f"[{c['label']}]Group:[/{c['label']}] [{c['value']}]{task.group}[/{c['value']}]")
+    if task.tags:
+        console.print(f"[{c['label']}]Tags:[/{c['label']}] [{c['value']}]{', '.join(task.tags)}[/{c['value']}]")
     if task.spec:
         console.print(f"[{c['label']}]Spec:[/{c['label']}] [{c['value']}]{task.spec}[/{c['value']}]")
     if task.skip_learnings:

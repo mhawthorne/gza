@@ -22,8 +22,8 @@ gza import <file> --force
 ## File Format
 
 ```yaml
-# Optional: default group for all tasks in this file
-group: task-chaining
+# Optional: default tags for all tasks in this file
+tags: [task-chaining]
 
 # Optional: spec file that provides context for plan/implement tasks
 spec: specs/task-chaining.md
@@ -36,7 +36,7 @@ tasks:
 
   - prompt: |
       Implement schema changes per the plan.
-      Add group, depends_on, create_review fields to db.py.
+      Add tags, depends_on, create_review fields to db.py.
     type: implement
     depends_on: 1
     review: true
@@ -47,10 +47,10 @@ tasks:
     depends_on: 2
 
   - prompt: |
-      Add gza groups command.
+      Add gza tags command.
     type: task
     depends_on: 2
-    group: null  # override: no group for this task
+    tags: []  # override: no tags for this task
 ```
 
 ## Task Fields
@@ -59,7 +59,8 @@ tasks:
 |-------|------|---------|-------------|
 | `prompt` | string | required | The task prompt |
 | `type` | string | `task` | Task type: `task`, `explore`, `plan`, `implement`, `review` |
-| `group` | string | file-level default | Group name, or `null` to override file default |
+| `tags` | list[string] | file-level default | Flat tag list; use `[]` to override file default |
+| `group` | string | none | Legacy alias converted to a one-item `tags` list |
 | `depends_on` | int | none | Local index (1-based) of task this depends on |
 | `review` | bool | `false` | Auto-create review task on completion |
 | `spec` | string | file-level default | Path to spec file for context |
@@ -69,18 +70,18 @@ tasks:
 Fields at the root level apply to all tasks unless overridden:
 
 ```yaml
-group: my-feature      # all tasks get this group
+tags: [my-feature]     # all tasks get this tag
 spec: specs/foo.md     # all tasks reference this spec
 
 tasks:
   - prompt: "Task 1"
-    # inherits group: my-feature, spec: specs/foo.md
+    # inherits tags: [my-feature], spec: specs/foo.md
 
   - prompt: "Task 2"
-    group: other-group  # override group
+    tags: [other-group]  # override tags
 
   - prompt: "Task 3"
-    group: null         # no group
+    tags: []            # no tags
     spec: null          # no spec context
 ```
 
@@ -106,14 +107,14 @@ Example: if "First task" gets ID #47, then "Second task" will have `depends_on: 
 
 ## Duplicate Detection
 
-By default, `gza import` checks for duplicate tasks based on prompt content and group. If a matching pending task exists, it's skipped:
+By default, `gza import` checks for duplicate tasks based on normalized prompt content plus normalized tag set. If a matching pending task exists, it's skipped:
 
 ```
 $ gza import tasks.yaml
 Importing 5 tasks...
   ✓ Created: Design schema changes (#47)
   - Skipped: Implement schema (duplicate of #48)
-  ✓ Created: Add groups command (#49)
+  ✓ Created: Add tags command (#49)
   ...
 Imported 4 tasks (1 skipped)
 ```
@@ -127,7 +128,7 @@ Preview what would be imported without creating tasks:
 ```
 $ gza import tasks.yaml --dry-run
 Would import 5 tasks:
-  1. [plan] Design schema changes (group: task-chaining)
+  1. [plan] Design schema changes (tags: task-chaining)
   2. [implement] Implement schema (depends on #1, review: true)
   3. [task] Update get_next_pending (depends on #2)
   4. [task] Add groups command (depends on #2)
@@ -146,7 +147,7 @@ For `review` tasks: agent reads spec, plan, and implementation diff.
 
 ```yaml
 # specs/auth-feature.tasks.yaml
-group: auth-feature
+tags: [auth-feature]
 spec: specs/auth-feature.md
 
 tasks:
@@ -193,8 +194,7 @@ Importing 5 tasks...
   ✓ Created: Add login UI (#54, depends on #52)
 Imported 5 tasks
 
-$ gza status auth-feature
-Group: auth-feature
+$ gza search --tag auth-feature
   ○ 50. Design auth system                    pending (plan)
   ○ 51. Implement core session                pending (blocked by #50)
   ○ 52. Add OAuth support                     pending (blocked by #51)
@@ -228,4 +228,4 @@ Error: Invalid depends_on: 5 (only 3 tasks in file)
 
 1. **Append-only**: Import only creates new tasks. There's no update/sync capability since tasks lack a stable external ID to match on. Re-running import with `--force` creates duplicates.
 
-2. **No export**: While `gza export <group>` could generate YAML from existing tasks, the complexity (converting IDs back to local indices, deciding what to include) isn't worth it for the limited use case. Task structures are typically project-specific.
+2. **No export**: While `gza export --tag <tag>` could generate YAML from existing tasks, the complexity (converting IDs back to local indices, deciding what to include) isn't worth it for the limited use case. Task structures are typically project-specific.
