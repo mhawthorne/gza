@@ -5171,6 +5171,150 @@ class TestIterateCommand:
         assert "[dry-run] First next action: merge" in output
         assert "[dry-run] First iteration 1/1 action: merge" not in output
 
+    def test_iterate_dry_run_approved_with_newer_unresolved_comments_prefers_run_improve(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: APPROVED**"
+        review.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        store.update(review)
+
+        improve = store.add("Pending improve", task_type="improve", based_on=impl.id, depends_on=review.id)
+        improve.status = "pending"
+        improve.created_at = datetime(2026, 1, 2, tzinfo=UTC)
+        store.update(improve)
+
+        store.add_comment(impl.id, "Fresh unresolved feedback after approval.")
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert "[dry-run] First iteration 1/1 action: run_improve" in output
+        assert "[dry-run] First next action: merge" not in output
+
+    def test_iterate_real_approved_with_followups_and_newer_unresolved_comments_runs_improve(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza import advance_engine as advance_engine_module
+        from gza.cli import cmd_iterate
+        from gza.review_verdict import ParsedReviewReport, ReviewFinding
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        store.update(review)
+
+        pending_improve = store.add("Pending improve", task_type="improve", based_on=impl.id, depends_on=review.id)
+        pending_improve.status = "pending"
+        pending_improve.created_at = datetime(2026, 1, 2, tzinfo=UTC)
+        store.update(pending_improve)
+
+        store.add_comment(impl.id, "Fresh unresolved issue added after followups verdict.")
+
+        def fake_run_foreground(_config, task_id, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task.id == pending_improve.id
+            task.status = "failed"
+            task.failure_reason = "TEST_FAILURE"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 1
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+            patch.object(
+                advance_engine_module,
+                "get_review_report",
+                return_value=ParsedReviewReport(
+                    verdict="APPROVED_WITH_FOLLOWUPS",
+                    findings=(
+                        ReviewFinding(
+                            id="F1",
+                            severity="FOLLOWUP",
+                            title="Hardening",
+                            body="",
+                            evidence=None,
+                            impact=None,
+                            fix_or_followup="add malformed input guard",
+                            tests=None,
+                        ),
+                    ),
+                    format_version="v2",
+                ),
+            ),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        run_foreground.assert_called_once()
+        assert run_foreground.call_args.kwargs["task_id"] == pending_improve.id
+        assert "Iteration 1/1: run_improve" in output
+        assert "merge_with_followups" not in output
+
     def test_dry_run_reuses_completed_improve_for_changes_requested_review(self, tmp_path: Path):
         """Dry-run reflects restart state when CHANGES_REQUESTED already has a completed improve."""
 

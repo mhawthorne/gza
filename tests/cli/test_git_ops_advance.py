@@ -148,6 +148,98 @@ class TestAdvanceCommand:
         assert updated_task is not None
         assert updated_task.merge_status == "merged"
 
+    def test_advance_dry_run_approved_with_newer_unresolved_comments_prefers_pending_improve(self, tmp_path: Path):
+        """Approved review with newer unresolved comments should run pending improve, not merge."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement with late comment", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feat/approved-late-comment"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+        assert task.id is not None
+
+        review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        review.output_content = "**Verdict: APPROVED**"
+        store.update(review)
+        assert review.id is not None
+
+        improve = store.add(
+            "Pending improve from newer comments",
+            task_type="improve",
+            based_on=task.id,
+            depends_on=review.id,
+        )
+        improve.status = "pending"
+        improve.created_at = datetime(2026, 1, 2, tzinfo=UTC)
+        store.update(improve)
+
+        store.add_comment(task.id, "Address this after approval.")
+
+        with patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Run pending improve for unresolved comments newer than latest review" in result.stdout
+        assert "Merge (review APPROVED)" not in result.stdout
+
+    def test_advance_dry_run_followups_with_newer_unresolved_comments_creates_improve(self, tmp_path: Path):
+        """APPROVED_WITH_FOLLOWUPS plus newer unresolved comments should prefer improve over merge_with_followups."""
+        from gza import advance_engine as advance_engine_module
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement with followups and late comment", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feat/followups-late-comment"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+        assert task.id is not None
+
+        review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        store.update(review)
+
+        store.add_comment(task.id, "New unresolved issue after followups verdict.")
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)),
+            patch.object(
+                advance_engine_module,
+                "get_review_report",
+                return_value=ParsedReviewReport(
+                    verdict="APPROVED_WITH_FOLLOWUPS",
+                    findings=(
+                        ReviewFinding(
+                            id="F1",
+                            severity="FOLLOWUP",
+                            title="Hardening",
+                            body="",
+                            evidence=None,
+                            impact=None,
+                            fix_or_followup="add malformed input guard",
+                            tests=None,
+                        ),
+                    ),
+                    format_version="v2",
+                ),
+            ),
+        ):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Create improve task (unresolved comments newer than latest review)" in result.stdout
+        assert "Merge (review APPROVED_WITH_FOLLOWUPS)" not in result.stdout
+
     def test_advance_merge_with_followups_creates_idempotent_followup_tasks(self, tmp_path: Path):
         """merge_with_followups creates one implement follow-up per finding and reuses on rerun."""
         from gza.cli import cmd_advance

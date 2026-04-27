@@ -61,6 +61,7 @@ class AdvanceContext:
     active_improve_running: DbTask | None = None
     active_improve_pending: DbTask | None = None
     has_improve_after_review: bool = False
+    has_fresh_unresolved_comments_since_latest_review: bool = False
 
     is_resumable_failed_task: bool = False
     has_resume_children: bool = False
@@ -102,6 +103,21 @@ def _review_priority_sort_key(task: DbTask) -> tuple[datetime, int]:
     return (created_at, task_id_numeric_key(task.id))
 
 
+def _normalize_time(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.min
+    if value.tzinfo is not None:
+        return value.astimezone(UTC).replace(tzinfo=None)
+    return value
+
+
+def _latest_unresolved_comment_time(store: SqliteTaskStore, task_id: str) -> datetime | None:
+    unresolved_comments = store.get_comments(task_id, unresolved_only=True)
+    if not unresolved_comments:
+        return None
+    return max(_normalize_time(comment.created_at) for comment in unresolved_comments)
+
+
 def _select_active_review(reviews: list[DbTask]) -> DbTask | None:
     """Prefer in-progress review over pending siblings, then newest deterministically."""
     in_progress = sorted(
@@ -138,6 +154,7 @@ def _resolve_review_state(
     DbTask | None,
     DbTask | None,
     bool,
+    bool,
 ]:
     """Resolve review/improve lineage state for the implementation root task."""
     reviews = get_reviews_for_root(store, task)
@@ -159,6 +176,7 @@ def _resolve_review_state(
     active_improve_running: DbTask | None = None
     active_improve_pending: DbTask | None = None
     has_improve_after_review = False
+    has_fresh_unresolved_comments_since_latest_review = False
 
     if latest_completed_review is not None:
         review_report = get_review_report(Path(config.project_dir), latest_completed_review)
@@ -166,6 +184,19 @@ def _resolve_review_state(
         followup_findings = tuple(
             finding for finding in review_report.findings if finding.severity == "FOLLOWUP"
         )
+
+        if task.task_type == "implement":
+            assert task.id is not None
+            latest_comment_time = _latest_unresolved_comment_time(store, task.id)
+            latest_review_time = _normalize_time(latest_completed_review.completed_at or latest_completed_review.created_at)
+            if latest_comment_time is not None and latest_comment_time > latest_review_time:
+                has_fresh_unresolved_comments_since_latest_review = True
+
+        assert task.id is not None
+        assert latest_completed_review.id is not None
+        improve_tasks = store.get_improve_tasks_for(task.id, latest_completed_review.id)
+        active_improve_running = next((t for t in improve_tasks if t.status == "in_progress"), None)
+        active_improve_pending = next((t for t in improve_tasks if t.status == "pending"), None)
 
         if review_cleared and latest_completed_review.completed_at is not None:
             code_changing = [
@@ -179,12 +210,7 @@ def _resolve_review_state(
                     has_improve_after_review = latest_code_change.completed_at > latest_completed_review.completed_at
 
         if review_verdict == "CHANGES_REQUESTED":
-            assert task.id is not None
             completed_review_cycles = count_completed_review_cycles(store, task.id)
-            assert latest_completed_review.id is not None
-            improve_tasks = store.get_improve_tasks_for(task.id, latest_completed_review.id)
-            active_improve_running = next((t for t in improve_tasks if t.status == "in_progress"), None)
-            active_improve_pending = next((t for t in improve_tasks if t.status == "pending"), None)
 
     return (
         reviews,
@@ -198,6 +224,7 @@ def _resolve_review_state(
         active_improve_running,
         active_improve_pending,
         has_improve_after_review,
+        has_fresh_unresolved_comments_since_latest_review,
     )
 
 
@@ -283,7 +310,8 @@ def resolve_advance_context(
         active_improve_running,
         active_improve_pending,
         has_improve_after_review,
-    ) = _resolve_review_state(config, store, task)
+        has_fresh_unresolved_comments_since_latest_review,
+) = _resolve_review_state(config, store, task)
 
     rebase_invalidates_review = False
     if (
@@ -317,6 +345,7 @@ def resolve_advance_context(
         active_improve_running=active_improve_running,
         active_improve_pending=active_improve_pending,
         has_improve_after_review=has_improve_after_review,
+        has_fresh_unresolved_comments_since_latest_review=has_fresh_unresolved_comments_since_latest_review,
         is_resumable_failed_task=is_resumable_failed,
         has_resume_children=has_resume_children,
         resume_chain_depth=resume_chain_depth,
@@ -451,6 +480,49 @@ ADVANCE_RULES: list[AdvanceRule] = [
             "type": "wait_review",
             "description": f"SKIP: review {_task_id(ctx.active_review)} is in_progress",
             "review_task": ctx.active_review,
+        },
+    ),
+    AdvanceRule(
+        name="fresh_comments_wait_improve",
+        matches=lambda ctx: ctx.task_type == "implement"
+        and ctx.latest_completed_review is not None
+        and ctx.has_fresh_unresolved_comments_since_latest_review
+        and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"})
+        and ctx.active_improve_running is not None,
+        action=lambda ctx: {
+            "type": "wait_improve",
+            "description": (
+                "SKIP: unresolved comments newer than latest review; "
+                f"improve task {_task_id(ctx.active_improve_running)} is in_progress"
+            ),
+        },
+    ),
+    AdvanceRule(
+        name="fresh_comments_run_pending_improve",
+        matches=lambda ctx: ctx.task_type == "implement"
+        and ctx.latest_completed_review is not None
+        and ctx.has_fresh_unresolved_comments_since_latest_review
+        and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"})
+        and ctx.active_improve_pending is not None,
+        action=lambda ctx: {
+            "type": "run_improve",
+            "description": (
+                "Run pending improve for unresolved comments newer than latest review: "
+                f"{_task_id(ctx.active_improve_pending)}"
+            ),
+            "improve_task": ctx.active_improve_pending,
+        },
+    ),
+    AdvanceRule(
+        name="fresh_comments_create_improve",
+        matches=lambda ctx: ctx.task_type == "implement"
+        and ctx.latest_completed_review is not None
+        and ctx.has_fresh_unresolved_comments_since_latest_review
+        and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}),
+        action=lambda ctx: {
+            "type": "improve",
+            "description": "Create improve task (unresolved comments newer than latest review)",
+            "review_task": ctx.latest_completed_review,
         },
     ),
     AdvanceRule(

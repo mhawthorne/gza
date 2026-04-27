@@ -334,3 +334,100 @@ def test_approved_with_followups_without_followup_findings_needs_discussion(tmp_
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
     assert action["type"] == "needs_discussion"
+
+
+def test_approved_with_newer_unresolved_comment_prefers_run_improve(tmp_path: Path, monkeypatch):
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feat/approved-new-comments"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+    assert task.id is not None
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    store.update(review)
+    assert review.id is not None
+
+    pending_improve = store.add(
+        "Pending improve for fresh comments",
+        task_type="improve",
+        based_on=task.id,
+        depends_on=review.id,
+    )
+    pending_improve.status = "pending"
+    pending_improve.created_at = datetime(2026, 1, 2, tzinfo=UTC)
+    store.update(pending_improve)
+
+    store.add_comment(task.id, "New unresolved feedback after approval.")
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    assert action["type"] == "run_improve"
+    assert action["improve_task"].id == pending_improve.id
+
+
+def test_approved_with_followups_and_newer_unresolved_comment_creates_improve(tmp_path: Path, monkeypatch):
+    from gza import advance_engine as advance_engine_module
+    from gza.review_verdict import ReviewFinding
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feat/approved-followups-new-comments"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+    assert task.id is not None
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    store.update(review)
+
+    store.add_comment(task.id, "Need one more tweak from operator feedback.")
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            findings=(
+                ReviewFinding(
+                    id="F1",
+                    severity="FOLLOWUP",
+                    title="Follow-up",
+                    body="Body",
+                    evidence=None,
+                    impact=None,
+                    fix_or_followup="Create follow-up task",
+                    tests=None,
+                ),
+            ),
+            format_version="v2",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    assert action["type"] == "improve"
+    assert action["review_task"].id == review.id
