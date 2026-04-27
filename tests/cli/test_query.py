@@ -2776,6 +2776,17 @@ class TestStatusCommand:
         assert "First task" in result.stdout
         assert "Second task" in result.stdout
 
+    def test_status_rejects_empty_group_without_traceback(self, tmp_path: Path):
+        """group '' should fail with user-facing validation, not traceback."""
+        setup_config(tmp_path)
+
+        result = run_gza("group", "", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: tag must not be empty" in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
+
     def test_status_warns_about_orphaned_tasks_in_group(self, tmp_path: Path):
         """Group command warns about orphaned tasks belonging to the viewed group."""
 

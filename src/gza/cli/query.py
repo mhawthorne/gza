@@ -1239,7 +1239,11 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.")
     group_name = args.group
-    tasks = store.get_by_group(group_name)
+    try:
+        tasks = store.get_by_group(group_name)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     if not tasks:
         print(f"No tasks found in group '{group_name}'")
