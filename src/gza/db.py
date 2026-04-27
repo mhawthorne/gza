@@ -10,6 +10,7 @@ import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
@@ -41,6 +42,7 @@ __all__ = [
     "preview_v25_migration",
     "preview_v26_migration",
     "check_migration_status",
+    "import_legacy_local_db",
     "resolve_task_id",
     "task_id_numeric_key",
 ]
@@ -1562,6 +1564,58 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (36, MIGRATION_V35_TO_V36),
 ]
 
+_SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
+
+
+def _legacy_local_db_path(project_dir: Path) -> Path:
+    return project_dir / ".gza" / "gza.db"
+
+
+def _shared_import_marker_path(project_dir: Path) -> Path:
+    return project_dir / ".gza" / _SHARED_DB_IMPORT_MARKER
+
+
+def _db_fingerprint(path: Path) -> str:
+    hasher = sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _marker_matches_shared_db(project_dir: Path, local_db_path: Path, active_db_path: Path) -> bool:
+    marker_path = _shared_import_marker_path(project_dir)
+    if not marker_path.exists():
+        return False
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    if not isinstance(marker, dict):
+        return False
+    marker_shared = marker.get("shared_db_path")
+    marker_fingerprint = marker.get("local_db_fingerprint")
+    if not isinstance(marker_shared, str) or not isinstance(marker_fingerprint, str):
+        return False
+    try:
+        local_fingerprint = _db_fingerprint(local_db_path)
+    except OSError:
+        return False
+    active_db_str = str(active_db_path.expanduser().resolve())
+    return marker_shared == active_db_str and marker_fingerprint == local_fingerprint
+
+
+def _write_shared_import_marker(project_dir: Path, local_db_path: Path, active_db_path: Path) -> None:
+    marker_path = _shared_import_marker_path(project_dir)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "shared_db_path": str(active_db_path.expanduser().resolve()),
+        "local_db_fingerprint": _db_fingerprint(local_db_path),
+        "imported_at": datetime.now(UTC).isoformat(),
+        "version": 1,
+    }
+    marker_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
 
 class SqliteTaskStore:
     """SQLite-based task storage."""
@@ -1598,8 +1652,10 @@ class SqliteTaskStore:
         return cls.from_config(config)
 
     @classmethod
-    def from_config(cls, config: "Config") -> "SqliteTaskStore":
+    def from_config(cls, config: "Config", *, allow_legacy_local_db: bool = False) -> "SqliteTaskStore":
         """Create a store from a loaded Config instance."""
+        from .config import ConfigError
+
         project_id = getattr(config, "project_id", None)
         if not isinstance(project_id, str) or not project_id:
             project_id = "default"
@@ -1607,6 +1663,17 @@ class SqliteTaskStore:
         if not isinstance(project_prefix, str) or not project_prefix:
             project_prefix = "gza"
         project_dir = getattr(config, "project_dir", None)
+        if isinstance(project_dir, Path) and not allow_legacy_local_db:
+            local_db = _legacy_local_db_path(project_dir)
+            active_db = config.db_path
+            if local_db.exists() and local_db.resolve() != active_db.resolve():
+                if not _marker_matches_shared_db(project_dir, local_db, active_db):
+                    raise ConfigError(
+                        "Legacy local DB detected at "
+                        f"{local_db} while active db_path is {active_db}. "
+                        "Run 'uv run gza migrate --import-local-db --yes' to import tasks "
+                        "and create an import marker."
+                    )
         config_path = getattr(config, "config_path", None)
         resolved_config_path = (
             config_path(project_dir)
@@ -1755,8 +1822,12 @@ class SqliteTaskStore:
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=15000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        for pragma in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"):
+            try:
+                conn.execute(pragma)
+            except sqlite3.OperationalError as exc:
+                if "readonly" not in str(exc).lower() and "read-only" not in str(exc).lower():
+                    raise
         return conn
 
     def _row_to_task(self, row: sqlite3.Row, *, tags: tuple[str, ...] = ()) -> Task:
@@ -4025,14 +4096,207 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
             return False
 
 
+def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[str, Any]:
+    """Import legacy project-local .gza/gza.db rows into the active shared DB.
+
+    Returns a summary dictionary with status and imported row counts.
+    """
+    local_db = _legacy_local_db_path(config.project_dir)
+    shared_db = config.db_path
+    if not local_db.exists():
+        return {
+            "status": "no_local_db",
+            "local_db_path": str(local_db),
+            "shared_db_path": str(shared_db),
+            "tasks_imported": 0,
+        }
+    if local_db.resolve() == shared_db.resolve():
+        raise ValueError(
+            "Active db_path already points to the legacy local DB; "
+            "set db_path to shared storage before importing."
+        )
+    if _marker_matches_shared_db(config.project_dir, local_db, shared_db):
+        return {
+            "status": "already_imported",
+            "local_db_path": str(local_db),
+            "shared_db_path": str(shared_db),
+            "tasks_imported": 0,
+        }
+
+    local_conn = sqlite3.connect(f"file:{local_db}?mode=ro", uri=True)
+    local_conn.row_factory = sqlite3.Row
+    try:
+        store = SqliteTaskStore.from_config(config, allow_legacy_local_db=True)
+        with store._connect() as shared_conn:
+            shared_conn.execute("ATTACH DATABASE ? AS legacy_local", (str(local_db),))
+            local_task_rows = local_conn.execute(
+                "SELECT id, prompt, status, task_type, created_at FROM tasks ORDER BY id"
+            ).fetchall()
+            local_ids = [str(row["id"]) for row in local_task_rows]
+
+            conflicts: list[str] = []
+            if local_ids:
+                placeholders = ",".join(["?"] * len(local_ids))
+                existing_rows = shared_conn.execute(
+                    f"""
+                    SELECT id, prompt, status, task_type, created_at
+                    FROM tasks
+                    WHERE project_id = ? AND id IN ({placeholders})
+                    """,
+                    (store._project_id, *local_ids),
+                ).fetchall()
+                existing_by_id = {str(row["id"]): row for row in existing_rows}
+                for row in local_task_rows:
+                    existing = existing_by_id.get(str(row["id"]))
+                    if existing is None:
+                        continue
+                    if (
+                        existing["prompt"] != row["prompt"]
+                        or existing["status"] != row["status"]
+                        or existing["task_type"] != row["task_type"]
+                        or existing["created_at"] != row["created_at"]
+                    ):
+                        conflicts.append(str(row["id"]))
+            if conflicts:
+                sample = ", ".join(conflicts[:5])
+                raise ValueError(
+                    "Conflicting task IDs already exist in shared DB for this project_id: "
+                    f"{sample}. Resolve conflicts before importing."
+                )
+
+            if dry_run:
+                existing_count = shared_conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE project_id = ?",
+                    (store._project_id,),
+                ).fetchone()[0]
+                return {
+                    "status": "dry_run",
+                    "local_db_path": str(local_db),
+                    "shared_db_path": str(shared_db),
+                    "project_id": store._project_id,
+                    "local_task_count": len(local_task_rows),
+                    "shared_existing_task_count": existing_count,
+                }
+
+            before_count = shared_conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE project_id = ?",
+                (store._project_id,),
+            ).fetchone()[0]
+
+            shared_conn.execute("BEGIN")
+            try:
+                shared_conn.execute(
+                    """
+                    INSERT OR IGNORE INTO tasks (
+                        project_id, id, prompt, status, task_type, slug, branch, log_file, report_file, based_on,
+                        has_commits, duration_seconds, num_steps_reported, num_steps_computed, num_turns,
+                        num_turns_reported, num_turns_computed, attach_count, attach_duration_seconds, cost_usd,
+                        created_at, started_at, running_pid, completed_at, "group", depends_on, spec, create_review,
+                        same_branch, task_type_hint, output_content, session_id, pr_number, model, provider,
+                        provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
+                        merge_status, merged_at, failure_reason, skip_learnings, diff_files_changed, diff_lines_added,
+                        diff_lines_removed, review_cleared_at, review_score, log_schema_version, execution_mode, base_branch
+                    )
+                    SELECT
+                        ?, id, prompt, status, task_type, slug, branch, log_file, report_file, based_on,
+                        has_commits, duration_seconds, num_steps_reported, num_steps_computed, num_turns,
+                        num_turns_reported, num_turns_computed, attach_count, attach_duration_seconds, cost_usd,
+                        created_at, started_at, running_pid, completed_at, "group", depends_on, spec, create_review,
+                        same_branch, task_type_hint, output_content, session_id, pr_number, model, provider,
+                        provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
+                        merge_status, merged_at, failure_reason, skip_learnings, diff_files_changed, diff_lines_added,
+                        diff_lines_removed, review_cleared_at, review_score, log_schema_version, execution_mode, base_branch
+                    FROM legacy_local.tasks
+                    """,
+                    (store._project_id,),
+                )
+
+                if _table_exists(local_conn, "task_tags"):
+                    shared_conn.execute(
+                        """
+                        INSERT OR IGNORE INTO task_tags(project_id, task_id, tag)
+                        SELECT ?, task_id, tag FROM legacy_local.task_tags
+                        """,
+                        (store._project_id,),
+                    )
+                if _table_exists(local_conn, "run_steps"):
+                    shared_conn.execute(
+                        """
+                        INSERT OR IGNORE INTO run_steps(
+                            project_id, run_id, step_index, step_id, provider, message_role, message_text,
+                            started_at, completed_at, outcome, summary, legacy_turn_id, legacy_event_id
+                        )
+                        SELECT
+                            ?, run_id, step_index, step_id, provider, message_role, message_text,
+                            started_at, completed_at, outcome, summary, legacy_turn_id, legacy_event_id
+                        FROM legacy_local.run_steps
+                        """,
+                        (store._project_id,),
+                    )
+                if _table_exists(local_conn, "run_substeps"):
+                    shared_conn.execute(
+                        """
+                        INSERT OR IGNORE INTO run_substeps(
+                            project_id, run_id, step_id, substep_index, substep_id, type, source, call_id,
+                            payload_json, timestamp, legacy_turn_id, legacy_event_id
+                        )
+                        SELECT
+                            ?, run_id, step_id, substep_index, substep_id, type, source, call_id,
+                            payload_json, timestamp, legacy_turn_id, legacy_event_id
+                        FROM legacy_local.run_substeps
+                        """,
+                        (store._project_id,),
+                    )
+                if _table_exists(local_conn, "task_comments"):
+                    shared_conn.execute(
+                        """
+                        INSERT INTO task_comments(project_id, task_id, content, source, author, created_at, resolved_at)
+                        SELECT ?, c.task_id, c.content, c.source, c.author, c.created_at, c.resolved_at
+                        FROM legacy_local.task_comments c
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM task_comments d
+                            WHERE d.project_id = ?
+                              AND d.task_id = c.task_id
+                              AND d.content = c.content
+                              AND d.source = c.source
+                              AND COALESCE(d.author, '') = COALESCE(c.author, '')
+                              AND d.created_at = c.created_at
+                        )
+                        """,
+                        (store._project_id, store._project_id),
+                    )
+
+                shared_conn.execute("COMMIT")
+            except Exception:
+                shared_conn.execute("ROLLBACK")
+                raise
+            finally:
+                shared_conn.execute("DETACH DATABASE legacy_local")
+
+            after_count = shared_conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE project_id = ?",
+                (store._project_id,),
+            ).fetchone()[0]
+
+        _write_shared_import_marker(config.project_dir, local_db, shared_db)
+    finally:
+        local_conn.close()
+
+    return {
+        "status": "imported",
+        "local_db_path": str(local_db),
+        "shared_db_path": str(shared_db),
+        "project_id": store._project_id,
+        "tasks_imported": max(0, int(after_count) - int(before_count)),
+    }
+
+
 # === Module-level convenience functions ===
 
 def _default_store() -> "SqliteTaskStore":
-    """Create a SqliteTaskStore using config-derived db_path, with fallback."""
-    try:
-        return SqliteTaskStore.default()
-    except Exception:
-        return SqliteTaskStore(Path(".gza/gza.db"))
+    """Create a SqliteTaskStore using config-derived db_path."""
+    return SqliteTaskStore.default()
 
 
 def _task_to_dict(task: "Task") -> dict:

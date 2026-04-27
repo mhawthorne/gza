@@ -780,7 +780,11 @@ def test_watch_cycle_uses_default_branch_for_advance_planning_off_default_branch
 
 def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Path) -> None:
     """Watch merge execution should honor merge_squash_threshold auto-squash."""
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: 2\n")
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "merge_squash_threshold: 2\n"
+    )
     store = make_store(tmp_path)
 
     task = store.add("Completed task", task_type="implement")
@@ -2391,6 +2395,7 @@ def test_compute_failure_backoff_seconds_caps_at_max(tmp_path: Path) -> None:
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
         f"worktree_dir: {worktree_dir}\n"
         "watch:\n"
         "  failure_backoff_initial: 60\n"
@@ -2409,6 +2414,7 @@ def test_cmd_watch_logs_and_sleeps_for_failure_backoff(tmp_path: Path) -> None:
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
         f"worktree_dir: {worktree_dir}\n"
         "watch:\n"
         "  failure_backoff_initial: 60\n"
@@ -2467,6 +2473,7 @@ def test_cmd_watch_halts_after_configured_failure_streak(tmp_path: Path) -> None
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
         f"worktree_dir: {worktree_dir}\n"
         "watch:\n"
         "  failure_backoff_initial: 60\n"

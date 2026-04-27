@@ -1827,9 +1827,11 @@ class TestBackgroundWorkerCommand:
 
         config_path = tmp_path / "gza.yaml"
         worktree_dir = tmp_path / ".gza-test-worktrees"
+        db_path = tmp_path / ".gza" / "gza.db"
         config_path.write_text(
             "project_name: test-project\n"
             f"worktree_dir: {worktree_dir}\n"
+            f"db_path: {db_path}\n"
             "provider: claude\n"
             "task_providers:\n"
             "  fix: codex\n"
@@ -4193,7 +4195,10 @@ class TestIterateCommand:
         assert "dry-run" in result.stdout.lower()
 
     def test_cycle_uses_default_iterations_when_flag_omitted(self, tmp_path: Path):
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+        )
         self._init_git_repo(tmp_path)
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)

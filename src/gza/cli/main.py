@@ -12,6 +12,7 @@ from ..db import (
     SchemaIntegrityError,
     SqliteTaskStore,
     check_migration_status,
+    import_legacy_local_db,
     preview_v25_migration,
     preview_v26_migration,
     run_v25_migration,
@@ -2099,6 +2100,11 @@ def main() -> int:
         action="store_true",
         help="Preview what the migration would do without writing any changes",
     )
+    migrate_parser.add_argument(
+        "--import-local-db",
+        action="store_true",
+        help="Import legacy project-local .gza/gza.db into the active shared db_path",
+    )
     add_common_args(migrate_parser)
 
     args = parser.parse_args()
@@ -2272,6 +2278,44 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
         return 1
 
     status = check_migration_status(config.db_path)
+
+    if args.import_local_db:
+        if not args.yes and not args.dry_run:
+            answer = input(
+                "Import legacy local DB into active shared DB now? [y/N]: "
+            ).strip().lower()
+            if answer not in {"y", "yes"}:
+                print("Import cancelled.")
+                return 1
+        try:
+            result = import_legacy_local_db(config, dry_run=args.dry_run)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        status_text = result.get("status", "unknown")
+        if status_text == "no_local_db":
+            print(f"No legacy local DB found at {result['local_db_path']}.")
+            return 0
+        if status_text == "already_imported":
+            print("Legacy local DB already imported for this shared DB (idempotent no-op).")
+            return 0
+        if status_text == "dry_run":
+            print("Dry-run: legacy local DB import preview")
+            print(f"  local_db: {result['local_db_path']}")
+            print(f"  shared_db: {result['shared_db_path']}")
+            print(f"  project_id: {result['project_id']}")
+            print(f"  local tasks: {result['local_task_count']}")
+            print(f"  shared existing tasks: {result['shared_existing_task_count']}")
+            return 0
+        if status_text == "imported":
+            print("Imported legacy local DB into shared DB.")
+            print(f"  local_db: {result['local_db_path']}")
+            print(f"  shared_db: {result['shared_db_path']}")
+            print(f"  project_id: {result['project_id']}")
+            print(f"  tasks_imported: {result['tasks_imported']}")
+            return 0
+        print("Error: unexpected import result", file=sys.stderr)
+        return 1
 
     if args.status:
         current = status["current_version"]

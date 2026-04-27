@@ -1658,7 +1658,11 @@ class TestWorktreeDbSnapshotIntegration:
         host_conn.execute("INSERT INTO snapshot_probe (value) VALUES ('before')")
         host_conn.commit()
         host_conn.close()
-        (tmp_path / "gza.yaml").write_text("project_name: gza\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: gza\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+        )
 
         config = self._make_code_config(tmp_path, db_path)
         observed: dict[str, str | int | None] = {
@@ -1707,7 +1711,11 @@ class TestWorktreeDbSnapshotIntegration:
                 observed["write_error"] = str(exc).lower()
             assert observed["write_error"] is not None
             snapshot_conn.close()
-            (work_dir / "gza.yaml").write_text("project_name: gza\n")
+            (work_dir / "gza.yaml").write_text(
+                "project_name: gza\n"
+                "project_id: default\n"
+                "db_path: .gza/gza.db\n"
+            )
 
             show_worktree = subprocess.run(
                 ["uv", "run", "--project", str(uv_project), "gza", "show", task.id],
@@ -4942,6 +4950,29 @@ class TestBackupDatabase:
 
         assert rows == [(1, "hello")]
 
+    def test_shared_db_writes_backups_next_to_shared_database(self, tmp_path: Path):
+        """Shared DB mode stores backups under <shared-db-dir>/backups."""
+        import sqlite3
+        from datetime import datetime
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared-home" / "gza.db"
+        shared_db.parent.mkdir(parents=True, exist_ok=True)
+
+        conn = sqlite3.connect(str(shared_db))
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)")
+        conn.close()
+
+        backup_database(shared_db, project_dir)
+
+        hour_stamp = datetime.now().strftime("%Y%m%d%H")
+        shared_backup = shared_db.parent / "backups" / f"gza-{hour_stamp}.db"
+        project_backup_dir = project_dir / BACKUP_DIR
+
+        assert shared_backup.exists()
+        assert not project_backup_dir.exists()
+
 
 class TestNoChangesWithExistingCommits:
     """Tests for the fix that prevents false 'No changes made' failure on resume."""
@@ -7058,7 +7089,11 @@ class TestExtractedRunInnerHelpers:
 
     def test_run_can_retry_pr_required_failure_via_work_pr(self, tmp_path: Path):
         """`gza work <task> --pr` should recover failed PR_REQUIRED tasks without rerunning provider."""
-        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+        )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
         task = store.add(prompt="Implement with review", task_type="implement", create_review=True)
@@ -7089,7 +7124,11 @@ class TestExtractedRunInnerHelpers:
 
     def test_run_pr_required_retry_for_improve_resolves_parent_comments(self, tmp_path: Path):
         """Improve completion should resolve unresolved comments on the based_on implementation task."""
-        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+        )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
 
@@ -7131,7 +7170,11 @@ class TestExtractedRunInnerHelpers:
 
     def test_run_pr_required_retry_for_improve_only_resolves_comments_in_snapshot(self, tmp_path: Path):
         """Improve completion should leave comments added after improve creation unresolved."""
-        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+        )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
 
@@ -7175,7 +7218,11 @@ class TestExtractedRunInnerHelpers:
 
     def test_run_pr_required_retry_for_chained_improve_updates_root_implementation_state(self, tmp_path: Path):
         """PR-required improve retries should apply completion side effects to the implementation root."""
-        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+        )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
 
@@ -7239,7 +7286,11 @@ class TestExtractedRunInnerHelpers:
 
     def test_run_pr_required_retry_for_rebase_preserves_rebase_completion_side_effects(self, tmp_path: Path):
         """PR retry completion for rebases should invalidate review state and force-push."""
-        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+        )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
 

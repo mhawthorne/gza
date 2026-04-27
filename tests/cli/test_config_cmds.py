@@ -770,7 +770,11 @@ class TestCleanCommand:
 
         wt_base = tmp_path / "worktrees"
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text(f"project_name: test-project\nworktree_dir: {wt_base}\n")
+        config_path.write_text(
+            f"project_name: test-project\n"
+            "project_id: default\n"
+            f"worktree_dir: {wt_base}\n"
+        )
         config = Config.load(tmp_path)
 
         # Create a task with recent activity
@@ -810,7 +814,11 @@ class TestCleanCommand:
 
         wt_base = tmp_path / "worktrees"
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text(f"project_name: test-project\nworktree_dir: {wt_base}\n")
+        config_path.write_text(
+            f"project_name: test-project\n"
+            "project_id: default\n"
+            f"worktree_dir: {wt_base}\n"
+        )
         config = Config.load(tmp_path)
 
         # Create a task with old activity

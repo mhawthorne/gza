@@ -1,6 +1,7 @@
 """Configuration for Gza."""
 
 import copy
+import hashlib
 import logging
 import os
 import re
@@ -8,7 +9,6 @@ import sys
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from uuid import uuid4
 
 import yaml
 
@@ -182,15 +182,13 @@ def discover_project_dir(start: Path) -> Path:
         current = parent
 
 
-def _generate_project_id(prefix_hint: str | None = None) -> str:
-    """Generate a stable opaque project ID suitable for gza.yaml."""
-    if prefix_hint:
-        hint = re.sub(r"[^a-z0-9]", "", prefix_hint.lower())
-        if hint and 12 <= len(hint) <= 64:
-            return hint
-        if hint:
-            return (hint * ((12 // len(hint)) + 1))[:12]
-    return f"p{uuid4().hex}"
+def _generate_project_id(project_dir: Path, project_name: str) -> str:
+    """Generate a deterministic project ID when gza.yaml omits project_id."""
+    canonical_root = str(project_dir.resolve())
+    seed = f"{canonical_root}\n{project_name.strip().lower()}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    # 32 chars keeps the ID compact and valid against _PROJECT_ID_RE.
+    return f"p{digest[:31]}"
 
 
 def _detect_model_provider_family(model: str) -> str | None:
@@ -436,7 +434,7 @@ class Config:
 
     def __post_init__(self):
         if not self.project_id:
-            self.project_id = _generate_project_id()
+            self.project_id = _generate_project_id(self.project_dir, self.project_name)
         if not _PROJECT_ID_RE.match(self.project_id):
             raise ConfigError(
                 "'project_id' must be 1-64 lowercase alphanumeric characters"
@@ -603,9 +601,6 @@ class Config:
             if not resolved.is_absolute():
                 resolved = self.project_dir / resolved
             return resolved
-        legacy_local = self.project_dir / DEFAULT_DB_FILE
-        if legacy_local.exists():
-            return legacy_local
         return Path(os.path.expanduser("~/.gza/gza.db"))
 
     @property
@@ -702,20 +697,6 @@ class Config:
                 f"Add 'project_name: your-project-name' to the config file."
             )
 
-        project_id_raw = data.get("project_id", "")
-        if project_id_raw:
-            if not isinstance(project_id_raw, str):
-                raise ConfigError("'project_id' must be a string")
-            if not _PROJECT_ID_RE.match(project_id_raw):
-                raise ConfigError("'project_id' must be 1-64 lowercase alphanumeric characters")
-        else:
-            project_id_raw = "default"
-            existing = config_path.read_text(encoding="utf-8")
-            with open(config_path, "a", encoding="utf-8") as f:
-                if existing and not existing.endswith("\n"):
-                    f.write("\n")
-                f.write(f"project_id: {project_id_raw}\n")
-
         db_path_raw = os.environ.get("GZA_DB_PATH")
         if db_path_raw:
             source_map["db_path"] = "env"
@@ -723,6 +704,34 @@ class Config:
             db_path_raw = data.get("db_path", "")
             if db_path_raw and not isinstance(db_path_raw, str):
                 raise ConfigError("'db_path' must be a string")
+
+        project_name_raw = data["project_name"]
+        project_id_raw = data.get("project_id", "")
+        if project_id_raw:
+            if not isinstance(project_id_raw, str):
+                raise ConfigError("'project_id' must be a string")
+            if not _PROJECT_ID_RE.match(project_id_raw):
+                raise ConfigError("'project_id' must be 1-64 lowercase alphanumeric characters")
+        else:
+            local_db_path = (project_dir / DEFAULT_DB_FILE).resolve()
+            if db_path_raw:
+                resolved_db = Path(os.path.expanduser(str(db_path_raw)))
+                if not resolved_db.is_absolute():
+                    resolved_db = project_dir / resolved_db
+                resolved_db = resolved_db.resolve()
+            else:
+                resolved_db = Path(os.path.expanduser("~/.gza/gza.db")).resolve()
+            if resolved_db == local_db_path:
+                project_id_raw = "default"
+            else:
+                project_id_raw = _generate_project_id(project_dir, str(project_name_raw))
+                source_map["project_id"] = "derived"
+                print(
+                    "Warning: 'project_id' is missing in gza.yaml; "
+                    f"using derived project_id '{project_id_raw}'. "
+                    "To persist identity across path moves/clones, set project_id explicitly in gza.yaml.",
+                    file=sys.stderr,
+                )
 
         # Parse and validate project_prefix
         project_prefix_raw = data.get("project_prefix", "")

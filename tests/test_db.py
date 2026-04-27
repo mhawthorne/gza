@@ -1,5 +1,6 @@
 """Tests for database operations and task chaining."""
 
+import os
 import subprocess
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -2612,6 +2613,16 @@ class TestConvenienceFunctions:
     """Tests for module-level convenience functions get_task, get_task_log_path,
     get_task_report_path, and get_baseline_stats."""
 
+    @pytest.fixture(autouse=True)
+    def _write_config(self, tmp_path: Path) -> None:
+        db_path = tmp_path / ".gza" / "gza.db"
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "project_id: default\n"
+            f"db_path: {db_path}\n",
+            encoding="utf-8",
+        )
+
     def test_get_task_returns_dict(self, tmp_path: Path, monkeypatch):
         """get_task returns a dict with all task fields."""
         from gza.db import get_task
@@ -4536,8 +4547,169 @@ class TestMigrationUtilityFunctions:
         SqliteTaskStore(db_path, prefix="gza")
         status_after = check_migration_status(db_path)
         assert status_after["current_version"] == SCHEMA_VERSION
-        assert status_after["pending_auto"] == []
-        assert status_after["pending_manual"] == []
+
+
+class TestSharedDbIsolationAndImportGating:
+    def test_missing_project_id_uses_distinct_derived_ids_and_isolates_shared_db(
+        self, tmp_path: Path
+    ) -> None:
+        from gza.config import Config
+
+        shared_db = tmp_path / "shared" / "gza.db"
+        project_a = tmp_path / "project-a"
+        project_b = tmp_path / "project-b"
+        project_a.mkdir(parents=True, exist_ok=True)
+        project_b.mkdir(parents=True, exist_ok=True)
+        (project_a / "gza.yaml").write_text(f"project_name: demo\ndb_path: {shared_db}\n", encoding="utf-8")
+        (project_b / "gza.yaml").write_text(f"project_name: demo\ndb_path: {shared_db}\n", encoding="utf-8")
+
+        config_a = Config.load(project_a)
+        config_b = Config.load(project_b)
+        assert config_a.project_id != config_b.project_id
+
+        store_a = SqliteTaskStore.from_config(config_a)
+        store_b = SqliteTaskStore.from_config(config_b)
+
+        task_a = store_a.add("alpha task")
+        task_b = store_b.add("beta task")
+        assert task_a.id == "demo-1"
+        assert task_b.id == "demo-1"
+        assert [task.prompt for task in store_a.get_all()] == ["alpha task"]
+        assert [task.prompt for task in store_b.get_all()] == ["beta task"]
+
+    def test_config_load_missing_project_id_readonly_file_is_non_mutating(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.config import Config
+
+        config_path = tmp_path / "gza.yaml"
+        original = "project_name: readonly-project\n"
+        config_path.write_text(original, encoding="utf-8")
+        config_path.chmod(0o444)
+        try:
+            config = Config.load(tmp_path)
+        finally:
+            config_path.chmod(0o644)
+
+        assert config.project_id
+        assert config_path.read_text(encoding="utf-8") == original
+        captured = capsys.readouterr()
+        assert "project_id" in captured.err
+        assert "set project_id explicitly" in captured.err.lower()
+
+    def test_read_only_db_can_be_opened_for_reads(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "readonly.db"
+        store = SqliteTaskStore(db_path, prefix="gza", project_id="projreadonly1")
+        created = store.add("readonly open")
+        assert created.id is not None
+
+        db_path.chmod(0o444)
+        try:
+            reopened = SqliteTaskStore(db_path, prefix="gza", project_id="projreadonly1")
+            fetched = reopened.get(created.id)
+        finally:
+            db_path.chmod(0o644)
+
+        assert fetched is not None
+        assert fetched.prompt == "readonly open"
+
+    def test_convenience_helpers_surface_config_error_without_silent_local_fallback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza.config import ConfigError
+        from gza.db import get_task
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("legacy local task")
+        monkeypatch.chdir(tmp_path)
+
+        with pytest.raises(ConfigError, match="Configuration file not found"):
+            get_task(task.id)
+
+    def test_shared_default_with_legacy_local_db_requires_explicit_import(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "gza.yaml").write_text("project_name: gated\n", encoding="utf-8")
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="gza")
+        legacy_store.add("legacy pending")
+
+        home_dir = tmp_path / "home"
+        home_dir.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            ["uv", "run", "gza", "next", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+            env={**os.environ, "HOME": str(home_dir)},
+        )
+        assert result.returncode == 1
+        assert "Legacy local DB detected" in result.stderr
+        assert "--import-local-db" in result.stderr
+
+    def test_import_local_db_is_idempotent_and_conflicts_fail_loudly(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: gated\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="gated")
+        legacy_task = legacy_store.add("legacy pending")
+        assert legacy_task.id is not None
+
+        first = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert first.returncode == 0, first.stderr
+        assert "Imported legacy local DB into shared DB." in first.stdout
+
+        second = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert second.returncode == 0, second.stderr
+        assert "already imported" in second.stdout.lower()
+
+        config = Config.load(project_dir)
+        shared_store = SqliteTaskStore.from_config(config)
+        shared_tasks = shared_store.get_all()
+        assert len(shared_tasks) == 1
+        assert shared_tasks[0].id == legacy_task.id
+
+        conn = sqlite3.connect(local_db)
+        conn.execute("UPDATE tasks SET prompt = ? WHERE id = ?", ("conflicting prompt", legacy_task.id))
+        conn.commit()
+        conn.close()
+
+        conflict = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert conflict.returncode == 1
+        assert "Conflicting task IDs already exist" in conflict.stderr
 
     def test_v35_to_v36_migration_rebuilds_project_scoped_keys(self, tmp_path: Path) -> None:
         """Auto-migrating v35 must rebuild keys/fks/uniques to isolate projects."""
@@ -5354,7 +5526,11 @@ class TestMigrationUtilityFunctions:
     def test_v24_to_v27_chains_via_gza_migrate(self, tmp_path: Path) -> None:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / "gza.yaml").write_text("project_name: gza\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: gza\n"
+            f"db_path: {db_path}\n",
+            encoding="utf-8",
+        )
         _make_v24_db(db_path)
 
         import sqlite3

@@ -141,7 +141,11 @@ class TestLogCommand:
         import json
 
         setup_config(tmp_path)
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nverify_command: uv run pytest tests/ -q\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "verify_command: uv run pytest tests/ -q\n"
+        )
 
         store = make_store(tmp_path)
         task = store.add("Failed task for failure view")
@@ -209,7 +213,11 @@ class TestLogCommand:
         import json
 
         setup_config(tmp_path)
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nverify_command: uv run pytest tests/ -q\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "verify_command: uv run pytest tests/ -q\n"
+        )
 
         store = make_store(tmp_path)
         task = store.add("Parity failure diagnostics task")

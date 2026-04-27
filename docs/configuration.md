@@ -17,9 +17,9 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `project_id` | String | `default` | Stable project identity used to scope rows inside shared DB mode. |
+| `project_id` | String | *(derived from project path/name)* | Stable project identity used to scope rows inside shared DB mode. |
 | `project_prefix` | String | *(project_name)* | Short prefix for task IDs (1–12 chars, lowercase alphanumeric only — no hyphens, since hyphen is the separator in task IDs like `gza-1234`). Defaults to `project_name`. |
-| `db_path` | String | `~/.gza/gza.db` | Task DB path. If omitted and legacy `.gza/gza.db` exists, Gza keeps using the local DB for compatibility. |
+| `db_path` | String | `~/.gza/gza.db` | Task DB path. If a legacy local `.gza/gza.db` exists, import it explicitly with `gza migrate --import-local-db`. |
 | `tasks_file` | String | `tasks.yaml` | Path to legacy tasks file |
 | `log_dir` | String | `.gza/logs` | Directory for log files |
 | `use_docker` | Boolean | `true` | Whether to run Claude in Docker container |
@@ -1375,7 +1375,7 @@ gza tv [task_id ...] [options]
 Run pending manual database migrations. This includes v25 (INTEGER primary keys to project-prefixed base36 TEXT IDs) and v26 (base36 TEXT IDs to project-prefixed decimal IDs like `gza-1234`).
 
 ```bash
-gza migrate [--status] [--dry-run] [--yes/-y]
+gza migrate [--status] [--dry-run] [--yes/-y] [--import-local-db]
 ```
 
 | Option | Description |
@@ -1383,6 +1383,7 @@ gza migrate [--status] [--dry-run] [--yes/-y]
 | `--status` | Show current schema version and list pending migrations without running anything |
 | `--dry-run` | Preview what the migration would change without writing any data |
 | `--yes`, `-y` | Skip the confirmation prompt and run migrations immediately |
+| `--import-local-db` | Import legacy project-local `.gza/gza.db` rows into active shared `db_path` and record an idempotent marker |
 
 When run without flags, `gza migrate` prompts for confirmation before applying migrations. Each migration is atomic (wrapped in BEGIN/COMMIT/ROLLBACK) and creates a pre-migration backup (for example, `<db_path>.backup.pre-v25.db` and `<db_path>.backup.pre-v26.db`). It is safe to re-run: calling it on an already-migrated database is a no-op.
 
@@ -1393,6 +1394,8 @@ Task IDs start at `{prefix}-1` for new databases (there is no `{prefix}-0`) and 
 Task ID validation is format-based (`{prefix}-{decimal}`) and does not require the prefix to match your current `project_prefix`. A mismatched but valid full ID is accepted by parsing and then fails later as "not found" if it does not exist in the current project database.
 
 If a `ManualMigrationRequired` error appears when running any other command, run `gza migrate` to upgrade the database schema.
+
+When default shared DB mode is active and a legacy local `.gza/gza.db` is detected, task commands stop with an explicit message until you run `gza migrate --import-local-db`.
 
 ### set-status
 
@@ -1518,7 +1521,7 @@ Provider credentials (API keys) have their own precedence — see [Dotenv Files]
 | `.gza/.env` | Worktree-level credentials (highest priority; shared via symlink) |
 | `.gza/` | Local state directory (add to `.gitignore`) |
 | `~/.gza/gza.db` | Default shared SQLite task database |
-| `.gza/gza.db` | Legacy project-local DB (still honored when present or when `db_path` points here) |
+| `.gza/gza.db` | Legacy project-local DB (import explicitly via `gza migrate --import-local-db`) |
 | `.gza/logs/` | Task execution logs |
 | `.gza/workers/` | Worker metadata and startup logs |
 | `etc/Dockerfile.claude` | Generated Docker image for Claude |

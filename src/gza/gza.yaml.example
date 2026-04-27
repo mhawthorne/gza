@@ -4,7 +4,8 @@
 project_name: my-project
 
 # Stable project identity used to scope rows in shared task DBs.
-# project_id: default
+# If omitted, gza derives one from project path/name and warns.
+# project_id: myproject01
 
 # Optional local override file: gza.local.yaml (gitignored)
 # Keep shared defaults here and put machine-specific settings in gza.local.yaml.
@@ -58,7 +59,8 @@ project_name: my-project
 # --- Storage ---
 
 # Task database path. Default is ~/.gza/gza.db (shared across projects).
-# Legacy project-local .gza/gza.db is still auto-used when it already exists.
+# If a legacy project-local .gza/gza.db exists, run:
+#   uv run gza migrate --import-local-db --yes
 # db_path: ~/.gza/gza.db
 
 # Directory for log files (relative to project directory)

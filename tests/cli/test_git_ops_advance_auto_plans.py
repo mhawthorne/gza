@@ -159,7 +159,9 @@ class TestAdvanceAutoPlans:
 
         # Disable review requirement so implement would normally merge
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nadvance_requires_review: false\n"
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
         )
 
         store = make_store(tmp_path)
@@ -197,7 +199,9 @@ class TestAdvanceAutoPlans:
         from gza.cli import cmd_advance
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nadvance_requires_review: false\n"
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
         )
 
         store = make_store(tmp_path)

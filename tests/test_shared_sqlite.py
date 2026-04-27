@@ -16,14 +16,14 @@ def test_discover_project_dir_uses_nearest_ancestor(tmp_path: Path) -> None:
     assert discover_project_dir(nested) == project / "a"
 
 
-def test_config_db_path_prefers_legacy_local_db_when_present(tmp_path: Path) -> None:
+def test_config_db_path_defaults_to_shared_even_when_legacy_local_db_exists(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text("project_name: demo\n")
     legacy_db = tmp_path / ".gza" / "gza.db"
     legacy_db.parent.mkdir(parents=True, exist_ok=True)
     legacy_db.write_text("")
 
     config = Config.load(tmp_path)
-    assert config.db_path == legacy_db
+    assert config.db_path == Path("~/.gza/gza.db").expanduser()
 
 
 def test_config_db_path_defaults_to_shared_when_no_local_db(tmp_path: Path) -> None:

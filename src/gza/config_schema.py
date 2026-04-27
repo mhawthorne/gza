@@ -71,7 +71,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("merge_squash_threshold", "int", 0, "Auto-squash threshold for merge operations."),
     ConfigKeySpec("model", "str", "", "Legacy global model fallback."),
     ConfigKeySpec("reasoning_effort", "str", "", "Legacy global reasoning effort fallback (Codex)."),
-    ConfigKeySpec("project_id", "str", "default", "Stable project identity used for DB row scoping."),
+    ConfigKeySpec(
+        "project_id",
+        "str",
+        "derived from project path/name",
+        "Stable project identity used for DB row scoping.",
+    ),
     ConfigKeySpec("project_name", "str", None, "Project identifier used for naming and defaults.", required=True),
     ConfigKeySpec("project_prefix", "str", "derived from project_name", "Task-ID prefix (1-12 lowercase alphanumeric chars)."),
     ConfigKeySpec("provider", "str", "claude", "Default provider when task-specific routing is absent."),
