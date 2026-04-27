@@ -26,6 +26,43 @@ def test_config_db_path_prefers_legacy_local_db_when_present(tmp_path: Path) -> 
     assert config.db_path == legacy_db
 
 
+def test_config_db_path_defaults_to_shared_when_no_local_db(tmp_path: Path) -> None:
+    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+    config = Config.load(tmp_path)
+    assert config.db_path == Path("~/.gza/gza.db").expanduser()
+
+
+def test_config_db_path_respects_explicit_db_path(tmp_path: Path) -> None:
+    (tmp_path / "gza.yaml").write_text("project_name: demo\ndb_path: custom.db\n")
+    config = Config.load(tmp_path)
+    assert config.db_path == tmp_path / "custom.db"
+
+
+def test_config_load_discover_true_uses_nearest_project(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    nested = project / "a" / "b"
+    nested.mkdir(parents=True)
+    (project / "gza.yaml").write_text("project_name: project-root\n")
+
+    config = Config.load(nested, discover=True)
+    assert config.project_dir == project
+    assert config.project_name == "project-root"
+
+
+def test_store_default_uses_discovered_project_dir(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    nested = project / "a" / "b"
+    nested.mkdir(parents=True)
+    db_path = project / "shared.db"
+    (project / "gza.yaml").write_text(f"project_name: demo\ndb_path: {db_path}\n")
+
+    store = SqliteTaskStore.default(nested)
+    created = store.add("hello")
+
+    assert created.id == "demo-1"
+    assert store.get(created.id) is not None
+
+
 def test_shared_db_is_project_scoped_by_project_id(tmp_path: Path) -> None:
     db_path = tmp_path / "shared.db"
 

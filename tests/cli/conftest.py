@@ -125,9 +125,11 @@ def setup_config(tmp_path: Path, project_name: str = "test-project") -> None:
     """Set up a minimal gza config file."""
     config_path = tmp_path / "gza.yaml"
     worktree_dir = tmp_path / ".gza-test-worktrees"
+    db_path = tmp_path / ".gza" / "gza.db"
     config_path.write_text(
         f"project_name: {project_name}\n"
         f"worktree_dir: {worktree_dir}\n"
+        f"db_path: {db_path}\n"
     )
 
 

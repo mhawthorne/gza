@@ -420,30 +420,8 @@ CREATE INDEX IF NOT EXISTS idx_task_tags_task_id ON task_tags(task_id);
 
 # Migration from v35 to v36: shared DB project scoping primitives
 MIGRATION_V35_TO_V36 = """
-CREATE TABLE IF NOT EXISTS projects (
-    id TEXT PRIMARY KEY,
-    root_path TEXT NOT NULL DEFAULT '',
-    config_path TEXT NOT NULL DEFAULT '',
-    project_name TEXT NOT NULL DEFAULT '',
-    project_prefix TEXT NOT NULL DEFAULT '',
-    db_layout_version INTEGER NOT NULL DEFAULT 36,
-    created_at TEXT NOT NULL DEFAULT '',
-    last_seen_at TEXT NOT NULL DEFAULT ''
-);
-ALTER TABLE tasks ADD COLUMN project_id TEXT;
-CREATE TABLE IF NOT EXISTS project_sequences (
-    prefix TEXT PRIMARY KEY,
-    next_seq INTEGER NOT NULL DEFAULT 1
-);
-ALTER TABLE project_sequences RENAME TO project_sequences_legacy;
-CREATE TABLE IF NOT EXISTS project_sequences (
-    project_id TEXT PRIMARY KEY,
-    prefix TEXT NOT NULL,
-    next_seq INTEGER NOT NULL DEFAULT 1
-);
-INSERT OR IGNORE INTO project_sequences(project_id, prefix, next_seq)
-SELECT 'default', prefix, next_seq FROM project_sequences_legacy;
-DROP TABLE IF EXISTS project_sequences_legacy;
+-- v36 requires a structural table rebuild to make project-scoped keys/fks/uniques
+-- equivalent to fresh SCHEMA. See _run_v35_to_v36_migration().
 """
 
 # Schema version for migrations
@@ -481,6 +459,474 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
         (table,),
     )
     return cur.fetchone() is not None
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Return the set of column names for an existing table."""
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _drop_indexes_for_table(conn: sqlite3.Connection, table: str) -> None:
+    """Drop all explicit indexes currently bound to a table."""
+    rows = list(conn.execute(f"PRAGMA index_list({table})"))
+    for row in rows:
+        index_name = str(row["name"])
+        if index_name.startswith("sqlite_autoindex_"):
+            continue
+        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+
+
+def _table_pk_columns(conn: sqlite3.Connection, table: str) -> tuple[str, ...]:
+    """Return table primary-key columns in declaration order."""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    pk_rows = sorted(
+        (row for row in rows if int(row["pk"]) > 0),
+        key=lambda row: int(row["pk"]),
+    )
+    return tuple(str(row["name"]) for row in pk_rows)
+
+
+def _table_unique_sets(conn: sqlite3.Connection, table: str) -> set[tuple[str, ...]]:
+    """Return all UNIQUE index column sets for a table."""
+    uniques: set[tuple[str, ...]] = set()
+    for row in conn.execute(f"PRAGMA index_list({table})"):
+        if int(row["unique"]) != 1:
+            continue
+        idx_name = str(row["name"])
+        idx_cols = tuple(str(col["name"]) for col in conn.execute(f"PRAGMA index_info({idx_name})"))
+        if idx_cols:
+            uniques.add(idx_cols)
+    return uniques
+
+
+def _has_fk_columns(conn: sqlite3.Connection, table: str, to_table: str, from_cols: tuple[str, ...]) -> bool:
+    """Return True when a table has an FK to to_table that starts with from_cols."""
+    grouped: dict[int, list[tuple[int, str, str, str]]] = {}
+    for row in conn.execute(f"PRAGMA foreign_key_list({table})"):
+        fk_id = int(row["id"])
+        grouped.setdefault(fk_id, []).append(
+            (
+                int(row["seq"]),
+                str(row["table"]),
+                str(row["from"]),
+                str(row["to"]),
+            )
+        )
+    for entries in grouped.values():
+        ordered = sorted(entries, key=lambda item: item[0])
+        if not ordered:
+            continue
+        if ordered[0][1] != to_table:
+            continue
+        candidate = tuple(item[2] for item in ordered)
+        if candidate[: len(from_cols)] == from_cols:
+            return True
+    return False
+
+
+def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str) -> None:
+    """Perform full structural v35→v36 migration to match fresh SCHEMA semantics."""
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                root_path TEXT NOT NULL DEFAULT '',
+                config_path TEXT NOT NULL DEFAULT '',
+                project_name TEXT NOT NULL DEFAULT '',
+                project_prefix TEXT NOT NULL DEFAULT '',
+                db_layout_version INTEGER NOT NULL DEFAULT 36,
+                created_at TEXT NOT NULL DEFAULT '',
+                last_seen_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+
+        # Rebuild project_sequences from prefix-keyed legacy shape to project-keyed shape.
+        if _table_exists(conn, "project_sequences"):
+            sequence_cols = _table_columns(conn, "project_sequences")
+            if "project_id" not in sequence_cols:
+                conn.execute("ALTER TABLE project_sequences RENAME TO project_sequences_legacy")
+                conn.execute(
+                    """
+                    CREATE TABLE project_sequences (
+                        project_id TEXT PRIMARY KEY,
+                        prefix TEXT NOT NULL,
+                        next_seq INTEGER NOT NULL DEFAULT 1
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO project_sequences(project_id, prefix, next_seq)
+                    SELECT ?, prefix, next_seq FROM project_sequences_legacy
+                    """,
+                    (project_id,),
+                )
+                conn.execute("DROP TABLE project_sequences_legacy")
+        else:
+            conn.execute(
+                """
+                CREATE TABLE project_sequences (
+                    project_id TEXT PRIMARY KEY,
+                    prefix TEXT NOT NULL,
+                    next_seq INTEGER NOT NULL DEFAULT 1
+                )
+                """
+            )
+
+        tasks_src = "tasks_v35_legacy"
+        conn.execute("ALTER TABLE tasks RENAME TO tasks_v35_legacy")
+        task_tags_exists = _table_exists(conn, "task_tags")
+        run_steps_exists = _table_exists(conn, "run_steps")
+        run_substeps_exists = _table_exists(conn, "run_substeps")
+        task_comments_exists = _table_exists(conn, "task_comments")
+        if task_tags_exists:
+            conn.execute("ALTER TABLE task_tags RENAME TO task_tags_v35_legacy")
+            _drop_indexes_for_table(conn, "task_tags_v35_legacy")
+        if run_steps_exists:
+            conn.execute("ALTER TABLE run_steps RENAME TO run_steps_v35_legacy")
+            _drop_indexes_for_table(conn, "run_steps_v35_legacy")
+        if run_substeps_exists:
+            conn.execute("ALTER TABLE run_substeps RENAME TO run_substeps_v35_legacy")
+            _drop_indexes_for_table(conn, "run_substeps_v35_legacy")
+        if task_comments_exists:
+            conn.execute("ALTER TABLE task_comments RENAME TO task_comments_v35_legacy")
+            _drop_indexes_for_table(conn, "task_comments_v35_legacy")
+
+        conn.executescript(
+            """
+            CREATE TABLE tasks (
+                project_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'implement',
+                slug TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on TEXT,
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_steps_reported INTEGER,
+                num_steps_computed INTEGER,
+                num_turns INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                attach_count INTEGER,
+                attach_duration_seconds REAL,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                running_pid INTEGER,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on TEXT,
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                model TEXT,
+                provider TEXT,
+                provider_is_explicit INTEGER DEFAULT 0,
+                urgent INTEGER DEFAULT 0,
+                urgent_bumped_at TEXT,
+                queue_position INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                merge_status TEXT,
+                merged_at TEXT,
+                failure_reason TEXT,
+                skip_learnings INTEGER DEFAULT 0,
+                diff_files_changed INTEGER,
+                diff_lines_added INTEGER,
+                diff_lines_removed INTEGER,
+                review_cleared_at TEXT,
+                review_score INTEGER,
+                log_schema_version INTEGER DEFAULT 1,
+                execution_mode TEXT,
+                base_branch TEXT,
+                PRIMARY KEY(project_id, id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_slug ON tasks(project_id, slug);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_created ON tasks(project_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_group ON tasks(project_id, "group");
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_depends_on ON tasks(project_id, depends_on);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_merge_status ON tasks(project_id, merge_status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_type_based_on ON tasks(project_id, task_type, based_on);
+
+            CREATE TABLE task_tags (
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                PRIMARY KEY(project_id, task_id, tag),
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_tags_project_tag ON task_tags(project_id, tag);
+            CREATE INDEX IF NOT EXISTS idx_task_tags_project_task_id ON task_tags(project_id, task_id);
+
+            CREATE TABLE run_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                step_index INTEGER NOT NULL,
+                step_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                message_role TEXT NOT NULL,
+                message_text TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                outcome TEXT,
+                summary TEXT,
+                legacy_turn_id TEXT,
+                legacy_event_id TEXT,
+                UNIQUE(project_id, run_id, step_index),
+                UNIQUE(project_id, run_id, step_id),
+                FOREIGN KEY(project_id, run_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_run_steps_project_run_id ON run_steps(project_id, run_id);
+            CREATE INDEX IF NOT EXISTS idx_run_steps_project_step_index ON run_steps(project_id, run_id, step_index);
+
+            CREATE TABLE run_substeps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                step_id INTEGER NOT NULL REFERENCES run_steps(id) ON DELETE CASCADE,
+                substep_index INTEGER NOT NULL,
+                substep_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                source TEXT NOT NULL,
+                call_id TEXT,
+                payload_json TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                legacy_turn_id TEXT,
+                legacy_event_id TEXT,
+                UNIQUE(project_id, step_id, substep_index),
+                UNIQUE(project_id, step_id, substep_id),
+                FOREIGN KEY(project_id, run_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_run_substeps_project_run_id ON run_substeps(project_id, run_id);
+            CREATE INDEX IF NOT EXISTS idx_run_substeps_project_step_id ON run_substeps(project_id, step_id);
+
+            CREATE TABLE task_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source TEXT NOT NULL,
+                author TEXT,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_comments_project_task_created ON task_comments(project_id, task_id, created_at ASC);
+            CREATE INDEX IF NOT EXISTS idx_task_comments_project_task_unresolved ON task_comments(project_id, task_id, resolved_at);
+            """
+        )
+
+        tasks_src_cols = _table_columns(conn, tasks_src)
+        tasks_project_expr = "COALESCE(NULLIF(project_id, ''), ?)" if "project_id" in tasks_src_cols else "?"
+        task_columns = (
+            "id", "prompt", "status", "task_type", "slug", "branch", "log_file", "report_file", "based_on", "has_commits",
+            "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns", "num_turns_reported", "num_turns_computed",
+            "attach_count", "attach_duration_seconds", "cost_usd", "created_at", "started_at", "running_pid", "completed_at",
+            "group", "depends_on", "spec", "create_review", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
+            "model", "provider", "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
+            "merge_status", "merged_at", "failure_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
+            "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
+        )
+        task_defaults: dict[str, str] = {
+            "prompt": "''",
+            "status": "'pending'",
+            "task_type": "'implement'",
+            "create_review": "0",
+            "same_branch": "0",
+            "provider_is_explicit": "0",
+            "urgent": "0",
+            "skip_learnings": "0",
+            "log_schema_version": "1",
+            "created_at": "strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')",
+        }
+        task_select_exprs: list[str] = []
+        for column in task_columns:
+            if column == "slug":
+                if "slug" in tasks_src_cols:
+                    task_select_exprs.append("slug")
+                elif "task_id" in tasks_src_cols:
+                    task_select_exprs.append("task_id")
+                else:
+                    task_select_exprs.append("NULL")
+                continue
+            source_name = f'"{column}"' if column == "group" else column
+            if column in tasks_src_cols:
+                task_select_exprs.append(source_name)
+            else:
+                task_select_exprs.append(task_defaults.get(column, "NULL"))
+
+        conn.execute(
+            f"""
+            INSERT INTO tasks (
+                project_id, id, prompt, status, task_type, slug, branch, log_file, report_file, based_on, has_commits,
+                duration_seconds, num_steps_reported, num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
+                attach_count, attach_duration_seconds, cost_usd, created_at, started_at, running_pid, completed_at,
+                "group", depends_on, spec, create_review, same_branch, task_type_hint, output_content, session_id, pr_number,
+                model, provider, provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
+                merge_status, merged_at, failure_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
+                review_cleared_at, review_score, log_schema_version, execution_mode, base_branch
+            )
+            SELECT
+                {tasks_project_expr}, {", ".join(task_select_exprs)}
+            FROM {tasks_src}
+            """,
+            (project_id,),
+        )
+
+        if task_tags_exists:
+            task_tags_cols = _table_columns(conn, "task_tags_v35_legacy")
+            task_tags_project_expr = "COALESCE(NULLIF(project_id, ''), ?)" if "project_id" in task_tags_cols else "?"
+            conn.execute(
+                f"""
+                INSERT OR IGNORE INTO task_tags(project_id, task_id, tag)
+                SELECT {task_tags_project_expr}, task_id, tag
+                FROM task_tags_v35_legacy
+                """,
+                (project_id,),
+            )
+
+        if run_steps_exists:
+            run_steps_cols = _table_columns(conn, "run_steps_v35_legacy")
+            run_steps_project_expr = "COALESCE(NULLIF(project_id, ''), ?)" if "project_id" in run_steps_cols else "?"
+            conn.execute(
+                f"""
+                INSERT INTO run_steps (
+                    id, project_id, run_id, step_index, step_id, provider, message_role, message_text,
+                    started_at, completed_at, outcome, summary, legacy_turn_id, legacy_event_id
+                )
+                SELECT
+                    id, {run_steps_project_expr}, run_id, step_index, step_id, provider, message_role, message_text,
+                    started_at, completed_at, outcome, summary, legacy_turn_id, legacy_event_id
+                FROM run_steps_v35_legacy
+                """,
+                (project_id,),
+            )
+
+        if run_substeps_exists:
+            run_substeps_cols = _table_columns(conn, "run_substeps_v35_legacy")
+            run_substeps_project_expr = (
+                "COALESCE(NULLIF(project_id, ''), ?)" if "project_id" in run_substeps_cols else "?"
+            )
+            conn.execute(
+                f"""
+                INSERT INTO run_substeps (
+                    id, project_id, run_id, step_id, substep_index, substep_id, type, source, call_id,
+                    payload_json, timestamp, legacy_turn_id, legacy_event_id
+                )
+                SELECT
+                    id, {run_substeps_project_expr}, run_id, step_id, substep_index, substep_id, type, source, call_id,
+                    payload_json, timestamp, legacy_turn_id, legacy_event_id
+                FROM run_substeps_v35_legacy
+                """,
+                (project_id,),
+            )
+
+        if task_comments_exists:
+            task_comments_cols = _table_columns(conn, "task_comments_v35_legacy")
+            task_comments_project_expr = (
+                "COALESCE(NULLIF(project_id, ''), ?)" if "project_id" in task_comments_cols else "?"
+            )
+            conn.execute(
+                f"""
+                INSERT INTO task_comments (id, project_id, task_id, content, source, author, created_at, resolved_at)
+                SELECT id, {task_comments_project_expr}, task_id, content, source, author, created_at, resolved_at
+                FROM task_comments_v35_legacy
+                """,
+                (project_id,),
+            )
+
+        conn.execute("DROP TABLE tasks_v35_legacy")
+        if task_tags_exists:
+            conn.execute("DROP TABLE task_tags_v35_legacy")
+        if run_steps_exists:
+            conn.execute("DROP TABLE run_steps_v35_legacy")
+        if run_substeps_exists:
+            conn.execute("DROP TABLE run_substeps_v35_legacy")
+        if task_comments_exists:
+            conn.execute("DROP TABLE task_comments_v35_legacy")
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_slug ON tasks(project_id, slug);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_created ON tasks(project_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_group ON tasks(project_id, "group");
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_depends_on ON tasks(project_id, depends_on);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_merge_status ON tasks(project_id, merge_status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_type_based_on ON tasks(project_id, task_type, based_on);
+            CREATE INDEX IF NOT EXISTS idx_task_tags_project_tag ON task_tags(project_id, tag);
+            CREATE INDEX IF NOT EXISTS idx_task_tags_project_task_id ON task_tags(project_id, task_id);
+            CREATE INDEX IF NOT EXISTS idx_run_steps_project_run_id ON run_steps(project_id, run_id);
+            CREATE INDEX IF NOT EXISTS idx_run_steps_project_step_index ON run_steps(project_id, run_id, step_index);
+            CREATE INDEX IF NOT EXISTS idx_run_substeps_project_run_id ON run_substeps(project_id, run_id);
+            CREATE INDEX IF NOT EXISTS idx_run_substeps_project_step_id ON run_substeps(project_id, step_id);
+            CREATE INDEX IF NOT EXISTS idx_task_comments_project_task_created ON task_comments(project_id, task_id, created_at ASC);
+            CREATE INDEX IF NOT EXISTS idx_task_comments_project_task_unresolved ON task_comments(project_id, task_id, resolved_at);
+            """
+        )
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _validate_v36_structural_schema(conn: sqlite3.Connection) -> None:
+    """Validate v36 structural key/fk/unique semantics."""
+    required_pk = {
+        "tasks": ("project_id", "id"),
+        "task_tags": ("project_id", "task_id", "tag"),
+    }
+    for table, pk_columns in required_pk.items():
+        if not _table_exists(conn, table):
+            raise RuntimeError(f"Auto-migration to v36 incomplete: missing required table {table}")
+        if _table_pk_columns(conn, table) != pk_columns:
+            raise RuntimeError(
+                f"Auto-migration to v36 incomplete: expected PRIMARY KEY{pk_columns} on {table}"
+            )
+
+    run_steps_uniques = _table_unique_sets(conn, "run_steps")
+    if ("project_id", "run_id", "step_index") not in run_steps_uniques:
+        raise RuntimeError(
+            "Auto-migration to v36 incomplete: run_steps must enforce UNIQUE(project_id, run_id, step_index)"
+        )
+    if ("project_id", "run_id", "step_id") not in run_steps_uniques:
+        raise RuntimeError(
+            "Auto-migration to v36 incomplete: run_steps must enforce UNIQUE(project_id, run_id, step_id)"
+        )
+
+    run_substeps_uniques = _table_unique_sets(conn, "run_substeps")
+    if ("project_id", "step_id", "substep_index") not in run_substeps_uniques:
+        raise RuntimeError(
+            "Auto-migration to v36 incomplete: run_substeps must enforce UNIQUE(project_id, step_id, substep_index)"
+        )
+    if ("project_id", "step_id", "substep_id") not in run_substeps_uniques:
+        raise RuntimeError(
+            "Auto-migration to v36 incomplete: run_substeps must enforce UNIQUE(project_id, step_id, substep_id)"
+        )
+
+    required_fks = (
+        ("task_tags", "tasks", ("project_id", "task_id")),
+        ("run_steps", "tasks", ("project_id", "run_id")),
+        ("run_substeps", "tasks", ("project_id", "run_id")),
+        ("task_comments", "tasks", ("project_id", "task_id")),
+    )
+    for table, to_table, from_cols in required_fks:
+        if not _has_fk_columns(conn, table, to_table, from_cols):
+            raise RuntimeError(
+                "Auto-migration to v36 incomplete: "
+                f"{table} must include FOREIGN KEY{from_cols} REFERENCES {to_table}"
+            )
 
 
 _TASK_COMMENTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -557,6 +1003,8 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
                 "Auto-migration to v32 incomplete: missing required column "
                 f"task_comments.{missing_comment_columns[0]}"
             )
+    if target_version == 36:
+        _validate_v36_structural_schema(conn)
 
     required_columns_by_version: dict[int, tuple[str, str]] = {
         30: ("tasks", "urgent_bumped_at"),
@@ -1208,7 +1656,9 @@ class SqliteTaskStore:
                             pending_manual.append(target_version)
                             # Don't advance current_version; stop processing further
                             break
-                        if migration_sql is not None:
+                        if target_version == 36:
+                            _run_v35_to_v36_migration(conn, self._project_id)
+                        elif migration_sql is not None:
                             for stmt in migration_sql.strip().split(";"):
                                 stmt = stmt.strip()
                                 if stmt:

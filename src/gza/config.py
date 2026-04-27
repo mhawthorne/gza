@@ -603,8 +603,6 @@ class Config:
             if not resolved.is_absolute():
                 resolved = self.project_dir / resolved
             return resolved
-        if self.project_id == "default":
-            return self.project_dir / DEFAULT_DB_FILE
         legacy_local = self.project_dir / DEFAULT_DB_FILE
         if legacy_local.exists():
             return legacy_local
@@ -661,6 +659,9 @@ class Config:
 
         Raises ConfigError if config file is missing or project_name is not set.
         """
+        if discover:
+            project_dir = discover_project_dir(project_dir)
+
         config_path = cls.config_path(project_dir)
         data, source_map, local_override_path, local_overrides_active = cls._load_merged_config_data(project_dir)
 

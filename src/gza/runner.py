@@ -1997,13 +1997,7 @@ def run(
     backup_database(config.db_path, config.project_dir)
 
     # Load tasks from SQLite
-    project_prefix = getattr(config, "project_prefix", "gza")
-    if not isinstance(project_prefix, str) or not project_prefix:
-        project_prefix = "gza"
-    project_id = getattr(config, "project_id", None)
-    if not isinstance(project_id, str) or not project_id:
-        project_id = "default"
-    store = SqliteTaskStore(config.db_path, prefix=project_prefix, project_id=project_id)
+    store = SqliteTaskStore.from_config(config)
     invocation_context = invocation or _resolve_default_invocation_context()
     task_execution_mode = _task_execution_mode_from_invocation(invocation_context)
 

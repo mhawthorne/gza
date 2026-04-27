@@ -3372,20 +3372,20 @@ class TestRunStepPersistence:
             SELECT name FROM sqlite_master
             WHERE type='index'
               AND name IN (
-                'idx_run_steps_run_id',
-                'idx_run_steps_step_index',
-                'idx_run_substeps_run_id',
-                'idx_run_substeps_step_id'
+                'idx_run_steps_project_run_id',
+                'idx_run_steps_project_step_index',
+                'idx_run_substeps_project_run_id',
+                'idx_run_substeps_project_step_id'
               )
             """
         )
         indexes = sorted(row[0] for row in cur.fetchall())
         conn.close()
         assert indexes == [
-            "idx_run_steps_run_id",
-            "idx_run_steps_step_index",
-            "idx_run_substeps_run_id",
-            "idx_run_substeps_step_id",
+            "idx_run_steps_project_run_id",
+            "idx_run_steps_project_step_index",
+            "idx_run_substeps_project_run_id",
+            "idx_run_substeps_project_step_id",
         ]
 
     def test_new_tasks_default_log_schema_version_1(self, tmp_path: Path):
@@ -4271,6 +4271,172 @@ def _make_v29_db_without_urgent_bumped_at(db_path: Path) -> None:
     conn.close()
 
 
+def _make_v35_db_with_legacy_key_shapes(db_path: Path) -> None:
+    """Create a v35 DB with legacy non-project-scoped keys/fks/uniques."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (35)")
+    conn.execute(
+        """
+        CREATE TABLE project_sequences (
+            prefix TEXT PRIMARY KEY,
+            next_seq INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    conn.execute("INSERT INTO project_sequences(prefix, next_seq) VALUES ('gza', 2)")
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            prompt TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            task_type TEXT NOT NULL DEFAULT 'implement',
+            task_id TEXT,
+            branch TEXT,
+            log_file TEXT,
+            report_file TEXT,
+            based_on TEXT,
+            has_commits INTEGER,
+            duration_seconds REAL,
+            num_steps_reported INTEGER,
+            num_steps_computed INTEGER,
+            num_turns INTEGER,
+            num_turns_reported INTEGER,
+            num_turns_computed INTEGER,
+            attach_count INTEGER,
+            attach_duration_seconds REAL,
+            cost_usd REAL,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            running_pid INTEGER,
+            completed_at TEXT,
+            "group" TEXT,
+            depends_on TEXT,
+            spec TEXT,
+            create_review INTEGER DEFAULT 0,
+            same_branch INTEGER DEFAULT 0,
+            task_type_hint TEXT,
+            output_content TEXT,
+            session_id TEXT,
+            pr_number INTEGER,
+            model TEXT,
+            provider TEXT,
+            provider_is_explicit INTEGER DEFAULT 0,
+            urgent INTEGER DEFAULT 0,
+            urgent_bumped_at TEXT,
+            queue_position INTEGER,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            merge_status TEXT,
+            merged_at TEXT,
+            failure_reason TEXT,
+            skip_learnings INTEGER DEFAULT 0,
+            diff_files_changed INTEGER,
+            diff_lines_added INTEGER,
+            diff_lines_removed INTEGER,
+            review_cleared_at TEXT,
+            review_score INTEGER,
+            log_schema_version INTEGER DEFAULT 1,
+            execution_mode TEXT,
+            base_branch TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_tags (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            tag TEXT NOT NULL,
+            PRIMARY KEY(task_id, tag)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE run_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            step_index INTEGER NOT NULL,
+            step_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            message_role TEXT NOT NULL,
+            message_text TEXT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            outcome TEXT,
+            summary TEXT,
+            legacy_turn_id TEXT,
+            legacy_event_id TEXT,
+            UNIQUE(run_id, step_index),
+            UNIQUE(run_id, step_id),
+            FOREIGN KEY(run_id) REFERENCES tasks(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE run_substeps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            step_id INTEGER NOT NULL REFERENCES run_steps(id) ON DELETE CASCADE,
+            substep_index INTEGER NOT NULL,
+            substep_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            call_id TEXT,
+            payload_json TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            legacy_turn_id TEXT,
+            legacy_event_id TEXT,
+            UNIQUE(step_id, substep_index),
+            UNIQUE(step_id, substep_id),
+            FOREIGN KEY(run_id) REFERENCES tasks(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            source TEXT NOT NULL,
+            author TEXT,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO tasks (id, prompt, status, task_type, task_id, created_at)
+        VALUES ('gza-1', 'legacy task', 'pending', 'implement', '20260427-gza-legacy-task', '2024-01-01T00:00:00+00:00')
+        """
+    )
+    conn.execute("INSERT INTO task_tags(task_id, tag) VALUES ('gza-1', 'legacy')")
+    conn.execute(
+        """
+        INSERT INTO run_steps (run_id, step_index, step_id, provider, message_role, message_text, started_at)
+        VALUES ('gza-1', 1, 'S1', 'codex', 'assistant', 'legacy step', '2024-01-01T00:00:00+00:00')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO run_substeps (run_id, step_id, substep_index, substep_id, type, source, payload_json, timestamp)
+        VALUES ('gza-1', 1, 1, 'S1.1', 'tool_call', 'assistant', '{}', '2024-01-01T00:00:00+00:00')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO task_comments(task_id, content, source, created_at)
+        VALUES ('gza-1', 'legacy comment', 'direct', '2024-01-01T00:00:00+00:00')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
 def _drop_tasks_column(db_path: Path, column_name: str) -> None:
     """Rebuild the tasks table without a specific column."""
     import sqlite3
@@ -4372,6 +4538,54 @@ class TestMigrationUtilityFunctions:
         assert status_after["current_version"] == SCHEMA_VERSION
         assert status_after["pending_auto"] == []
         assert status_after["pending_manual"] == []
+
+    def test_v35_to_v36_migration_rebuilds_project_scoped_keys(self, tmp_path: Path) -> None:
+        """Auto-migrating v35 must rebuild keys/fks/uniques to isolate projects."""
+        db_path = tmp_path / "test.db"
+        _make_v35_db_with_legacy_key_shapes(db_path)
+
+        store_alpha = SqliteTaskStore(db_path, prefix="gza", project_id="alpha")
+        legacy_alpha_task = store_alpha.get("gza-1")
+        assert legacy_alpha_task is not None
+        step_alpha = store_alpha.emit_step("gza-1", "alpha step", provider="codex")
+        substep_alpha = store_alpha.emit_substep(step_alpha, "tool_call", {"alpha": True}, source="assistant")
+        assert substep_alpha.substep_id.endswith(".1")
+
+        store_beta = SqliteTaskStore(db_path, prefix="gza", project_id="beta")
+        created_beta = store_beta.add("beta task")
+        assert created_beta.id == "gza-1"
+        step_beta = store_beta.emit_step("gza-1", "beta step", provider="codex")
+        substep_beta = store_beta.emit_substep(step_beta, "tool_call", {"beta": True}, source="assistant")
+        assert substep_beta.substep_id.endswith(".1")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        task_pk = tuple(
+            row[1]
+            for row in sorted(
+                conn.execute("PRAGMA table_info(tasks)").fetchall(),
+                key=lambda row: row[5],
+            )
+            if row[5] > 0
+        )
+        run_steps_unique_indexes = {
+            tuple(col[2] for col in conn.execute(f"PRAGMA index_info('{idx[1]}')").fetchall())
+            for idx in conn.execute("PRAGMA index_list(run_steps)").fetchall()
+            if idx[2] == 1
+        }
+        run_substeps_unique_indexes = {
+            tuple(col[2] for col in conn.execute(f"PRAGMA index_info('{idx[1]}')").fetchall())
+            for idx in conn.execute("PRAGMA index_list(run_substeps)").fetchall()
+            if idx[2] == 1
+        }
+        conn.close()
+
+        assert version == SCHEMA_VERSION
+        assert task_pk == ("project_id", "id")
+        assert ("project_id", "run_id", "step_index") in run_steps_unique_indexes
+        assert ("project_id", "run_id", "step_id") in run_steps_unique_indexes
+        assert ("project_id", "step_id", "substep_index") in run_substeps_unique_indexes
+        assert ("project_id", "step_id", "substep_id") in run_substeps_unique_indexes
 
     def test_preview_v25_migration_shows_samples(self, tmp_path: Path) -> None:
         """preview_v25_migration returns correct task_count and sample ID conversions."""

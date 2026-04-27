@@ -4588,7 +4588,9 @@ class TestPersistResolvedConfig:
         with patch("gza.runner.get_provider") as mock_get_provider, \
              patch("gza.runner.Git") as mock_git_class, \
              patch("gza.runner.load_dotenv"), \
-             patch("gza.runner.SqliteTaskStore", return_value=store):
+             patch("gza.runner.SqliteTaskStore") as mock_store_cls:
+
+            mock_store_cls.from_config.return_value = store
 
             mock_provider = Mock()
             mock_provider.name = "claude"
@@ -8392,3 +8394,43 @@ class TestStartupLogHelpers:
         final = rename_startup_log_to_slug(config, slug_log, "20260419-hello")
         assert final == slug_log
         assert slug_log.read_text() == "already here\n"
+
+
+class TestRunnerStoreMetadata:
+    def test_run_preserves_projects_metadata_row(self, tmp_path: Path):
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        db_path = project_dir / "shared.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: alphaproject01\n"
+            "project_prefix: gza\n"
+            f"db_path: {db_path}\n",
+            encoding="utf-8",
+        )
+
+        config = Config.load(project_dir)
+        SqliteTaskStore.from_config(config)
+
+        conn = sqlite3.connect(db_path)
+        before = conn.execute(
+            "SELECT root_path, config_path, project_name, project_prefix FROM projects WHERE id = ?",
+            (config.project_id,),
+        ).fetchone()
+        conn.close()
+        assert before is not None
+        assert before[0]
+        assert before[1]
+        assert before[2] == "demo"
+        assert before[3] == "gza"
+
+        result = run(config, task_id="gza-9999")
+        assert result == 1
+
+        conn = sqlite3.connect(db_path)
+        after = conn.execute(
+            "SELECT root_path, config_path, project_name, project_prefix FROM projects WHERE id = ?",
+            (config.project_id,),
+        ).fetchone()
+        conn.close()
+        assert after == before
