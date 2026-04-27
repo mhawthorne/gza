@@ -285,7 +285,7 @@ class Task:
     provider: str | None = None  # Per-task provider override
     provider_is_explicit: bool = False  # True when provider was explicitly set by user input
     urgent: bool = False  # Queue lane flag: urgent tasks are picked before normal pending tasks
-    queue_position: int | None = None  # Optional explicit queue order within a group bucket
+    queue_position: int | None = None  # Optional explicit queue order within the task's tag-set bucket
     merge_status: str | None = None  # None, 'unmerged', or 'merged'
     merged_at: datetime | None = None  # When merge_status was set to 'merged'
     failure_reason: str | None = None
@@ -1721,7 +1721,7 @@ class SqliteTaskStore:
             return cur.rowcount > 0
 
     def set_queue_position(self, task_id: str, position: int) -> bool:
-        """Assign an explicit queue position within the task's current group bucket.
+        """Assign an explicit queue position within the task's current tag-set bucket.
 
         Ordered tasks stay contiguous starting from 1 within their bucket.
         Unordered tasks keep queue_position=NULL and sort after ordered tasks.
@@ -1731,14 +1731,13 @@ class SqliteTaskStore:
 
         with self._connect() as conn:
             row = conn.execute(
-                'SELECT id, "group", queue_position FROM tasks WHERE id = ?',
+                "SELECT id, queue_position FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             if row is None:
                 return False
-            group = row["group"]
             current_position = row["queue_position"]
-            bucket_predicate = '("group" = ? OR ("group" IS NULL AND ? IS NULL))'
+            bucket_predicate, bucket_params = self._queue_bucket_predicate_and_params_conn(conn, task_id)
             desired_position = position
 
             if current_position is None:
@@ -1748,7 +1747,7 @@ class SqliteTaskStore:
                     FROM tasks
                     WHERE {bucket_predicate}
                     """,
-                    (group, group),
+                    bucket_params,
                 ).fetchone()
                 max_position = int(max_position_row["max_position"] or 0)
                 desired_position = min(position, max_position + 1)
@@ -1760,7 +1759,7 @@ class SqliteTaskStore:
                       AND queue_position IS NOT NULL
                       AND queue_position >= ?
                     """,
-                    (group, group, desired_position),
+                    (*bucket_params, desired_position),
                 )
             else:
                 max_position_row = conn.execute(
@@ -1769,7 +1768,7 @@ class SqliteTaskStore:
                     FROM tasks
                     WHERE {bucket_predicate}
                     """,
-                    (group, group),
+                    bucket_params,
                 ).fetchone()
                 max_position = int(max_position_row["max_position"] or current_position)
                 desired_position = min(position, max_position)
@@ -1784,7 +1783,7 @@ class SqliteTaskStore:
                           AND queue_position < ?
                           AND id != ?
                         """,
-                        (group, group, desired_position, current_position, task_id),
+                        (*bucket_params, desired_position, current_position, task_id),
                     )
                 elif desired_position > current_position:
                     conn.execute(
@@ -1797,7 +1796,7 @@ class SqliteTaskStore:
                           AND queue_position <= ?
                           AND id != ?
                         """,
-                        (group, group, current_position, desired_position, task_id),
+                        (*bucket_params, current_position, desired_position, task_id),
                     )
 
             cur = conn.execute(
@@ -1810,7 +1809,7 @@ class SqliteTaskStore:
         """Clear explicit queue ordering and close the bucket gap if needed."""
         with self._connect() as conn:
             row = conn.execute(
-                'SELECT id, "group", queue_position FROM tasks WHERE id = ?',
+                "SELECT id, queue_position FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             if row is None:
@@ -1818,8 +1817,7 @@ class SqliteTaskStore:
             current_position = row["queue_position"]
             if current_position is None:
                 return True
-            group = row["group"]
-            bucket_predicate = '("group" = ? OR ("group" IS NULL AND ? IS NULL))'
+            bucket_predicate, bucket_params = self._queue_bucket_predicate_and_params_conn(conn, task_id)
             conn.execute(
                 "UPDATE tasks SET queue_position = NULL WHERE id = ?",
                 (task_id,),
@@ -1832,9 +1830,34 @@ class SqliteTaskStore:
                   AND queue_position IS NOT NULL
                   AND queue_position > ?
                 """,
-                (group, group, current_position),
+                (*bucket_params, current_position),
             )
             return True
+
+    def _queue_bucket_predicate_and_params_conn(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+    ) -> tuple[str, tuple[str | int, ...]]:
+        """Return SQL predicate/params for the task's canonical queue bucket.
+
+        Queue bucket identity is defined as exact normalized tag-set equality.
+        Tasks with disjoint multi-tag sets must never share a queue-position bucket.
+        """
+        tags = self._fetch_tags_for_task_ids(conn, (task_id,)).get(task_id, ())
+        if not tags:
+            return (
+                "NOT EXISTS (SELECT 1 FROM task_tags qbt WHERE qbt.task_id = tasks.id)",
+                (),
+            )
+
+        placeholders = ",".join("?" for _ in tags)
+        predicate = (
+            "(SELECT COUNT(*) FROM task_tags qbt WHERE qbt.task_id = tasks.id) = ? "
+            f"AND (SELECT COUNT(*) FROM task_tags qbt WHERE qbt.task_id = tasks.id AND qbt.tag IN ({placeholders})) = ?"
+        )
+        params: tuple[str | int, ...] = (len(tags), *tags, len(tags))
+        return predicate, params
 
     def get_in_progress(self) -> list[Task]:
         """Get all in-progress tasks, oldest first."""

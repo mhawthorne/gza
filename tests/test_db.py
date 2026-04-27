@@ -243,6 +243,57 @@ class TestTaskChaining:
         assert refreshed_backlog_first.queue_position == 1
         assert refreshed_backlog_second.queue_position == 2
 
+    def test_queue_position_mutation_does_not_cross_disjoint_multi_tag_buckets(self, tmp_path: Path):
+        """Multi-tag queue mutations should stay isolated to the task's exact tag-set bucket."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        release_first = store.add("Release first", tags=("release", "backend"))
+        release_second = store.add("Release second", tags=("release", "backend"))
+        ops_first = store.add("Ops first", tags=("ops", "infra"))
+        ops_second = store.add("Ops second", tags=("ops", "infra"))
+        assert release_first.id is not None
+        assert release_second.id is not None
+        assert ops_first.id is not None
+        assert ops_second.id is not None
+
+        store.set_queue_position(release_first.id, 1)
+        store.set_queue_position(release_second.id, 2)
+        store.set_queue_position(ops_first.id, 1)
+        store.set_queue_position(ops_second.id, 2)
+
+        store.set_queue_position(release_second.id, 1)
+
+        refreshed_release_first = store.get(release_first.id)
+        refreshed_release_second = store.get(release_second.id)
+        refreshed_ops_first = store.get(ops_first.id)
+        refreshed_ops_second = store.get(ops_second.id)
+        assert refreshed_release_first is not None
+        assert refreshed_release_second is not None
+        assert refreshed_ops_first is not None
+        assert refreshed_ops_second is not None
+
+        assert refreshed_release_second.queue_position == 1
+        assert refreshed_release_first.queue_position == 2
+        assert refreshed_ops_first.queue_position == 1
+        assert refreshed_ops_second.queue_position == 2
+
+        store.clear_queue_position(release_second.id)
+
+        refreshed_release_first = store.get(release_first.id)
+        refreshed_release_second = store.get(release_second.id)
+        refreshed_ops_first = store.get(ops_first.id)
+        refreshed_ops_second = store.get(ops_second.id)
+        assert refreshed_release_first is not None
+        assert refreshed_release_second is not None
+        assert refreshed_ops_first is not None
+        assert refreshed_ops_second is not None
+
+        assert refreshed_release_second.queue_position is None
+        assert refreshed_release_first.queue_position == 1
+        assert refreshed_ops_first.queue_position == 1
+        assert refreshed_ops_second.queue_position == 2
+
     def test_get_pending_pickup_excludes_non_pickable_pending_tasks(self, tmp_path: Path):
         """Pickup listing excludes internal and dependency-blocked pending tasks."""
         db_path = tmp_path / "test.db"

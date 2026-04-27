@@ -770,7 +770,7 @@ def main() -> int:
     _add_queue_tag_scope_args(queue_unbump, action="unbumping")
     queue_move = queue_subparsers.add_parser(
         "move",
-        help="Assign an explicit queue position within the task's current group bucket",
+        help="Assign an explicit queue position within the task's current tag-set bucket",
     )
     queue_move.add_argument("task_id", type=str, help="Full prefixed task ID to reorder")
     queue_move.add_argument("position", type=_parse_non_negative_int, help="1-based queue position")
@@ -778,7 +778,7 @@ def main() -> int:
     _add_queue_tag_scope_args(queue_move, action="reordering")
     queue_next = queue_subparsers.add_parser(
         "next",
-        help="Move a pending task to explicit queue position 1 within its current group bucket",
+        help="Move a pending task to explicit queue position 1 within its current tag-set bucket",
     )
     queue_next.add_argument("task_id", type=str, help="Full prefixed task ID to move next")
     add_common_args(queue_next)

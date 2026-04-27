@@ -1687,6 +1687,66 @@ class TestQueueCommand:
         assert refreshed is not None
         assert refreshed.queue_position is None
 
+    @pytest.mark.parametrize(
+        ("action", "extra_args"),
+        [
+            ("move", ["1"]),
+            ("next", []),
+        ],
+    )
+    def test_queue_tag_scoped_move_does_not_mutate_disjoint_multi_tag_bucket(
+        self,
+        tmp_path: Path,
+        action: str,
+        extra_args: list[str],
+    ):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        release_first = store.add("Release first", tags=("release", "backend"))
+        release_second = store.add("Release second", tags=("release", "backend"))
+        ops_first = store.add("Ops first", tags=("ops", "infra"))
+        ops_second = store.add("Ops second", tags=("ops", "infra"))
+        assert release_first.id is not None
+        assert release_second.id is not None
+        assert ops_first.id is not None
+        assert ops_second.id is not None
+
+        init_release_first = run_gza("queue", "move", release_first.id, "1", "--project", str(tmp_path))
+        init_release_second = run_gza("queue", "move", release_second.id, "2", "--project", str(tmp_path))
+        init_ops_first = run_gza("queue", "move", ops_first.id, "1", "--project", str(tmp_path))
+        init_ops_second = run_gza("queue", "move", ops_second.id, "2", "--project", str(tmp_path))
+        assert init_release_first.returncode == 0
+        assert init_release_second.returncode == 0
+        assert init_ops_first.returncode == 0
+        assert init_ops_second.returncode == 0
+
+        result = run_gza(
+            "queue",
+            action,
+            release_second.id,
+            *extra_args,
+            "--tag",
+            "release",
+            "--project",
+            str(tmp_path),
+        )
+        assert result.returncode == 0
+
+        refreshed_release_first = store.get(release_first.id)
+        refreshed_release_second = store.get(release_second.id)
+        refreshed_ops_first = store.get(ops_first.id)
+        refreshed_ops_second = store.get(ops_second.id)
+        assert refreshed_release_first is not None
+        assert refreshed_release_second is not None
+        assert refreshed_ops_first is not None
+        assert refreshed_ops_second is not None
+
+        assert refreshed_release_second.queue_position == 1
+        assert refreshed_release_first.queue_position == 2
+        assert refreshed_ops_first.queue_position == 1
+        assert refreshed_ops_second.queue_position == 2
+
     def test_next_shows_bumped_task_first(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
