@@ -1631,6 +1631,12 @@ def _db_fingerprint(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _db_metadata(path: Path) -> tuple[int, int, int]:
+    """Return stable stat metadata used to guard fingerprint recomputation."""
+    stat = path.stat()
+    return (int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns))
+
+
 def _marker_matches_shared_db(project_dir: Path, local_db_path: Path, active_db_path: Path) -> bool:
     marker_path = _shared_import_marker_path(project_dir)
     if not marker_path.exists():
@@ -1645,22 +1651,49 @@ def _marker_matches_shared_db(project_dir: Path, local_db_path: Path, active_db_
     marker_fingerprint = marker.get("local_db_fingerprint")
     if not isinstance(marker_shared, str) or not isinstance(marker_fingerprint, str):
         return False
+    active_db_str = str(active_db_path.expanduser().resolve())
+    if marker_shared != active_db_str:
+        return False
+
+    # Fast path: when marker metadata still matches, skip re-hashing the full file.
+    marker_size = marker.get("local_db_size")
+    marker_mtime_ns = marker.get("local_db_mtime_ns")
+    marker_ctime_ns = marker.get("local_db_ctime_ns")
+    if (
+        isinstance(marker_size, int)
+        and isinstance(marker_mtime_ns, int)
+        and isinstance(marker_ctime_ns, int)
+    ):
+        try:
+            current_size, current_mtime_ns, current_ctime_ns = _db_metadata(local_db_path)
+        except OSError:
+            return False
+        if (
+            marker_size == current_size
+            and marker_mtime_ns == current_mtime_ns
+            and marker_ctime_ns == current_ctime_ns
+        ):
+            return True
+
     try:
         local_fingerprint = _db_fingerprint(local_db_path)
     except OSError:
         return False
-    active_db_str = str(active_db_path.expanduser().resolve())
-    return marker_shared == active_db_str and marker_fingerprint == local_fingerprint
+    return marker_fingerprint == local_fingerprint
 
 
 def _write_shared_import_marker(project_dir: Path, local_db_path: Path, active_db_path: Path) -> None:
     marker_path = _shared_import_marker_path(project_dir)
     marker_path.parent.mkdir(parents=True, exist_ok=True)
+    size, mtime_ns, ctime_ns = _db_metadata(local_db_path)
     payload = {
         "shared_db_path": str(active_db_path.expanduser().resolve()),
         "local_db_fingerprint": _db_fingerprint(local_db_path),
+        "local_db_size": size,
+        "local_db_mtime_ns": mtime_ns,
+        "local_db_ctime_ns": ctime_ns,
         "imported_at": datetime.now(UTC).isoformat(),
-        "version": 1,
+        "version": 2,
     }
     marker_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 

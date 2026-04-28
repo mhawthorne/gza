@@ -4948,6 +4948,73 @@ class TestSharedDbIsolationAndImportGating:
         assert len(imported_substeps) == 1
         assert imported_substeps[0].payload == {"ok": True}
 
+    def test_marker_check_skips_fingerprint_when_local_db_metadata_unchanged(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza.config import Config
+        from gza.db import _db_fingerprint
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demomarker01\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config)
+        assert result["status"] == "imported"
+
+        with patch("gza.db._db_fingerprint", wraps=_db_fingerprint) as fingerprint:
+            reopened = SqliteTaskStore.from_config(config)
+        assert reopened is not None
+        fingerprint.assert_not_called()
+
+    def test_marker_check_recomputes_fingerprint_when_local_db_metadata_changes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza import db as db_module
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demomarker02\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config)
+        assert result["status"] == "imported"
+
+        stat = local_db.stat()
+        os.utime(local_db, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+        with patch("gza.db._db_fingerprint", wraps=db_module._db_fingerprint) as fingerprint:
+            reopened = SqliteTaskStore.from_config(config)
+        assert reopened is not None
+        fingerprint.assert_called_once_with(local_db)
+
     def test_import_local_db_dry_run_does_not_create_missing_shared_db(self, tmp_path: Path) -> None:
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
