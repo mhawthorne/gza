@@ -299,6 +299,7 @@ def test_plan_extraction_marks_binary_diffs_in_file_summaries(tmp_path: Path) ->
 
 def test_plan_extraction_populates_renamed_text_diffstat_metadata(tmp_path: Path) -> None:
     git = _init_repo(tmp_path)
+    git._run("config", "diff.renames", "true")
     store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
 
     source_task = store.add("Source", task_type="implement")
@@ -345,6 +346,7 @@ def test_plan_extraction_populates_renamed_text_diffstat_metadata(tmp_path: Path
 
 def test_plan_extraction_marks_renamed_binary_diffstat_metadata(tmp_path: Path) -> None:
     git = _init_repo(tmp_path)
+    git._run("config", "diff.renames", "true")
     store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
 
     source_task = store.add("Source", task_type="implement")
