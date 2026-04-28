@@ -3,8 +3,15 @@
 # Project name (required) - used for branch prefixes and Docker image naming
 project_name: my-project
 
+# Project identity used to scope rows in shared task DB mode.
+# gza init writes this automatically for new projects.
+# In local DB mode (default), `project_id: default` is allowed.
+# In shared mode (explicit db_path), project_id must be unique; if omitted,
+# gza derives one from project path/name and warns.
+# project_id: myproject01
+
 # Optional local override file: gza.local.yaml (gitignored)
-# Keep shared defaults here and put machine-specific settings in gza.local.yaml.
+# Keep committed defaults here and put machine-specific settings in gza.local.yaml.
 
 # Branch naming strategy (default: project_date_slug)
 # Options: project_date_slug, monorepo, conventional, simple, date_slug,
@@ -53,6 +60,12 @@ project_name: my-project
 # worktree_dir: /tmp/gza-worktrees
 
 # --- Storage ---
+
+# Task database path. Default is .gza/gza.db (project-local).
+# To opt into a shared DB, set db_path (for example ~/.gza/gza.db).
+# If opting into shared mode with an existing legacy local .gza/gza.db, run:
+#   uv run gza migrate --import-local-db --yes
+# db_path: .gza/gza.db
 
 # Directory for log files (relative to project directory)
 # log_dir: .gza/logs

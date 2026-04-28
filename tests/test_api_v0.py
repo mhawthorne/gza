@@ -16,7 +16,10 @@ from gza.db import SqliteTaskStore
 
 def setup_config(tmp_path: Path, project_name: str = "test-project") -> None:
     """Write a minimal gza.yaml so Config.load() succeeds."""
-    (tmp_path / "gza.yaml").write_text(f"project_name: {project_name}\n")
+    (tmp_path / "gza.yaml").write_text(
+        f"project_name: {project_name}\n"
+        "db_path: .gza/gza.db\n"
+    )
 
 
 def make_store(tmp_path: Path) -> SqliteTaskStore:

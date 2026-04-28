@@ -1467,7 +1467,7 @@ class TestAdvanceCommand:
         """advance --batch B: merge actions don't count toward the worker limit."""
         # Use advance_requires_review=false so unreviewed tasks merge directly
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nadvance_requires_review: false\n"
+            "project_name: test-project\ndb_path: .gza/gza.db\nadvance_requires_review: false\n"
         )
         store = make_store(tmp_path)
 
@@ -1812,7 +1812,7 @@ class TestAdvanceCommand:
         """advance creates a review when advance_requires_review=True, advance_create_reviews=True."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\ndb_path: .gza/gza.db\n"
             "advance_create_reviews: true\n"
             "advance_requires_review: true\n"
         )
@@ -1844,7 +1844,7 @@ class TestAdvanceCommand:
         """advance skips unreviewed implement tasks when advance_create_reviews=False."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\ndb_path: .gza/gza.db\n"
             "advance_create_reviews: false\n"
             "advance_requires_review: true\n"
         )
@@ -1861,7 +1861,7 @@ class TestAdvanceCommand:
         """advance merges unreviewed implement tasks when advance_requires_review=False."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\ndb_path: .gza/gza.db\n"
             "advance_requires_review: false\n"
         )
         store = make_store(tmp_path)
@@ -1891,7 +1891,7 @@ class TestAdvanceCommand:
         """advance merges when review is cleared by improve, even with advance_requires_review=True."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\ndb_path: .gza/gza.db\n"
             "advance_create_reviews: true\n"
             "advance_requires_review: true\n"
         )
@@ -1990,7 +1990,7 @@ class TestAdvanceCommand:
     def test_advance_skips_task_at_max_review_cycles(self, tmp_path: Path):
         """advance skips task when completed improve count >= max_review_cycles."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nmax_review_cycles: 2\n"
+            "project_name: test-project\ndb_path: .gza/gza.db\nmax_review_cycles: 2\n"
         )
         store = make_store(tmp_path)
 
@@ -2023,7 +2023,7 @@ class TestAdvanceCommand:
     def test_advance_creates_improve_when_under_cycle_limit(self, tmp_path: Path):
         """advance creates an improve task when completed cycles < max_review_cycles."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nmax_review_cycles: 3\n"
+            "project_name: test-project\ndb_path: .gza/gza.db\nmax_review_cycles: 3\n"
         )
         store = make_store(tmp_path)
 
@@ -2244,7 +2244,7 @@ class TestAdvanceCommand:
     def test_advance_needs_attention_summary_printed(self, tmp_path: Path):
         """advance prints Needs attention section for actionable skips."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nmax_review_cycles: 1\n"
+            "project_name: test-project\ndb_path: .gza/gza.db\nmax_review_cycles: 1\n"
         )
         store = make_store(tmp_path)
 
@@ -2319,7 +2319,7 @@ class TestAdvanceCommand:
     def test_advance_max_review_cycles_dry_run(self, tmp_path: Path):
         """advance --dry-run shows max_cycles_reached action without executing."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nmax_review_cycles: 1\n"
+            "project_name: test-project\ndb_path: .gza/gza.db\nmax_review_cycles: 1\n"
         )
         store = make_store(tmp_path)
 
@@ -2410,7 +2410,7 @@ class TestAdvanceCommand:
 
     def test_advance_skips_failed_task_at_max_attempts(self, tmp_path: Path):
         """advance skips a failed task when chain depth >= max_resume_attempts."""
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
@@ -2462,7 +2462,7 @@ class TestAdvanceCommand:
 
     def test_determine_advance_action_returns_skip_at_max_resume_attempts(self, tmp_path: Path):
         """Action selection keeps max resume exhaustion on the skip contract."""
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
         store = make_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
 
@@ -2526,7 +2526,7 @@ class TestAdvanceCommand:
 
     def test_advance_skips_failed_task_with_failed_resume_child(self, tmp_path: Path):
         """advance skips a failed task whose resume child also failed (no double-resume of root)."""
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
 
@@ -2833,7 +2833,7 @@ class TestAdvanceCommand:
         import io
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\ndb_path: .gza/gza.db\n"
             "advance_mode: iterate\n"
         )
         store = make_store(tmp_path)
@@ -2988,7 +2988,7 @@ class TestAdvanceCommand:
         import io
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\ndb_path: .gza/gza.db\n"
             "advance_mode: iterate\n"
         )
         store = make_store(tmp_path)

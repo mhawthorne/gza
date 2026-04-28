@@ -73,7 +73,7 @@ class GzaClient:
     def __init__(self, project_dir: str | Path | None = None) -> None:
         resolved = Path(project_dir).resolve() if project_dir is not None else Path.cwd()
         self._config = Config.load(resolved)
-        self._store = SqliteTaskStore(self._config.db_path)
+        self._store = SqliteTaskStore.from_config(self._config)
 
     # ------------------------------------------------------------------ #
     # Lineage queries                                                       #

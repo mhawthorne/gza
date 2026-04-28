@@ -30,7 +30,10 @@ def run_gza(
 def setup_config(tmp_path: Path) -> None:
     """Set up a minimal gza config file."""
     config_path = tmp_path / "gza.yaml"
-    config_path.write_text("project_name: test-project\n")
+    config_path.write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+    )
 
 
 def _create_store_for_project(tmp_path: Path):

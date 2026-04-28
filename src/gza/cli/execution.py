@@ -265,7 +265,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             # Check if there are more pending tasks
             if i < count - 1:  # Not the last iteration
                 from ..db import SqliteTaskStore
-                store = SqliteTaskStore(config.db_path)
+                store = SqliteTaskStore.from_config(config)
                 next_task = store.get_next_pending(tags=selected_tags, any_tag=any_tag)
                 if not next_task:
                     elapsed = format_duration(time.time() - start_time)

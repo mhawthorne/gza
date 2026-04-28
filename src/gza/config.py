@@ -1,6 +1,7 @@
 """Configuration for Gza."""
 
 import copy
+import hashlib
 import logging
 import os
 import re
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 # Only lowercase alphanumeric — no hyphens, since the hyphen is the separator
 # between prefix and numeric suffix in task IDs (e.g., "gza-42").
 _PREFIX_RE = re.compile(r'^[a-z0-9]+$')
+_PROJECT_ID_RE = re.compile(r"^[a-z0-9]{1,64}$")
 
 __all__ = [
     "APP_NAME",
@@ -29,6 +31,7 @@ __all__ = [
     "Config",
     "TaskTypeConfig",
     "BranchStrategy",
+    "discover_project_dir",
 ]
 
 
@@ -78,6 +81,7 @@ DEFAULT_LEARNINGS_WINDOW = 25
 DEFAULT_LEARNINGS_INTERVAL = 5
 DEFAULT_LEARNINGS_MAX_ITEMS = 50
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
+    "db_path": None,
     "use_docker": None,
     "docker_image": None,
     "docker_volumes": None,
@@ -161,6 +165,32 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
 _LOCAL_OVERRIDE_NOTICE_SHOWN: set[str] = set()
 
 
+def discover_project_dir(start: Path) -> Path:
+    """Find the nearest ancestor directory that contains gza.yaml."""
+    current = start.resolve()
+    if current.is_file():
+        current = current.parent
+    while True:
+        if (current / CONFIG_FILENAME).exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            raise ConfigError(
+                f"Configuration file not found from: {start}\n"
+                f"Run 'gza init' to create one."
+            )
+        current = parent
+
+
+def _generate_project_id(project_dir: Path, project_name: str) -> str:
+    """Generate a deterministic project ID when gza.yaml omits project_id."""
+    canonical_root = str(project_dir.resolve())
+    seed = f"{canonical_root}\n{project_name.strip().lower()}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    # 32 chars keeps the ID compact and valid against _PROJECT_ID_RE.
+    return f"p{digest[:31]}"
+
+
 def _detect_model_provider_family(model: str) -> str | None:
     """Detect provider family implied by a model name."""
     model_norm = model.strip().lower()
@@ -211,6 +241,32 @@ def _read_yaml_dict(path: Path) -> dict:
     if not isinstance(data, dict):
         raise ConfigError(f"Configuration in {path} must be a YAML dictionary/object")
     return data
+
+
+def persist_project_id_if_missing(project_dir: Path, project_id: str) -> bool:
+    """Persist project_id into gza.yaml if it is currently absent.
+
+    Returns True when the file was updated, False when project_id already exists.
+    """
+    config_path = Config.config_path(project_dir)
+    data = _read_yaml_dict(config_path)
+    existing = data.get("project_id")
+    if isinstance(existing, str) and existing.strip():
+        return False
+
+    lines = config_path.read_text(encoding="utf-8").splitlines()
+    insertion = f"project_id: {project_id}"
+    insert_at = None
+    for idx, line in enumerate(lines):
+        if re.match(r"^\s*project_name\s*:", line):
+            insert_at = idx + 1
+            break
+    if insert_at is None:
+        lines.append(insertion)
+    else:
+        lines.insert(insert_at, insertion)
+    config_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return True
 
 
 def _remove_source_subtree(source_map: dict[str, str], prefix: str) -> None:
@@ -354,7 +410,9 @@ class BranchStrategy:
 class Config:
     project_dir: Path
     project_name: str  # Required - no default
+    project_id: str = ""
     project_prefix: str = ""  # Short prefix for task slugs; defaults to project_name if empty
+    db_path_value: str = ""
     tasks_file: str = DEFAULT_TASKS_FILE
     log_dir: str = DEFAULT_LOG_DIR
     use_docker: bool = DEFAULT_USE_DOCKER
@@ -401,6 +459,13 @@ class Config:
     local_overrides_active: bool = False
 
     def __post_init__(self):
+        if not self.project_id:
+            self.project_id = _generate_project_id(self.project_dir, self.project_name)
+        if not _PROJECT_ID_RE.match(self.project_id):
+            raise ConfigError(
+                "'project_id' must be 1-64 lowercase alphanumeric characters"
+            )
+
         if not self.docker_image:
             self.docker_image = f"{self.project_name}-gza"
 
@@ -557,6 +622,11 @@ class Config:
 
     @property
     def db_path(self) -> Path:
+        if self.db_path_value:
+            resolved = Path(os.path.expanduser(self.db_path_value))
+            if not resolved.is_absolute():
+                resolved = self.project_dir / resolved
+            return resolved
         return self.project_dir / DEFAULT_DB_FILE
 
     @property
@@ -605,11 +675,14 @@ class Config:
         return merged_data, source_map, (local_path if local_path.exists() else None), local_active
 
     @classmethod
-    def load(cls, project_dir: Path) -> "Config":
+    def load(cls, project_dir: Path, *, discover: bool = False) -> "Config":
         """Load config from gza.yaml in project root.
 
         Raises ConfigError if config file is missing or project_name is not set.
         """
+        if discover:
+            project_dir = discover_project_dir(project_dir)
+
         config_path = cls.config_path(project_dir)
         data, source_map, local_override_path, local_overrides_active = cls._load_merged_config_data(project_dir)
 
@@ -624,7 +697,7 @@ class Config:
 
         # Validate and warn about unknown keys
         valid_fields = {
-            "project_name", "project_prefix", "tasks_file", "log_dir", "use_docker",
+            "project_name", "project_id", "project_prefix", "tasks_file", "log_dir", "db_path", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model", "reasoning_effort",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
@@ -648,6 +721,48 @@ class Config:
             raise ConfigError(
                 f"'project_name' is required in {config_path}\n"
                 f"Add 'project_name: your-project-name' to the config file."
+            )
+
+        db_path_raw = os.environ.get("GZA_DB_PATH")
+        if db_path_raw:
+            source_map["db_path"] = "env"
+        else:
+            db_path_raw = data.get("db_path", "")
+            if db_path_raw and not isinstance(db_path_raw, str):
+                raise ConfigError("'db_path' must be a string")
+
+        project_name_raw = data["project_name"]
+        local_db_path = (project_dir / DEFAULT_DB_FILE).resolve()
+        if db_path_raw:
+            resolved_db = Path(os.path.expanduser(str(db_path_raw)))
+            if not resolved_db.is_absolute():
+                resolved_db = project_dir / resolved_db
+            resolved_db = resolved_db.resolve()
+        else:
+            resolved_db = local_db_path
+
+        project_id_raw = data.get("project_id", "")
+        if project_id_raw:
+            if not isinstance(project_id_raw, str):
+                raise ConfigError("'project_id' must be a string")
+            if not _PROJECT_ID_RE.match(project_id_raw):
+                raise ConfigError("'project_id' must be 1-64 lowercase alphanumeric characters")
+        else:
+            if resolved_db == local_db_path:
+                project_id_raw = "default"
+            else:
+                project_id_raw = _generate_project_id(project_dir, str(project_name_raw))
+                source_map["project_id"] = "derived"
+                print(
+                    "Warning: 'project_id' is missing in gza.yaml; "
+                    f"using derived project_id '{project_id_raw}'. "
+                    "Run 'uv run gza migrate --import-local-db --yes' to persist it.",
+                    file=sys.stderr,
+                )
+        if resolved_db != local_db_path and project_id_raw == "default":
+            raise ConfigError(
+                "'project_id: default' is only valid with local DB mode (db_path: .gza/gza.db). "
+                "Set a unique project_id for shared DB mode or omit project_id to derive one."
             )
 
         # Parse and validate project_prefix
@@ -1289,9 +1404,11 @@ class Config:
         return cls(
             project_dir=project_dir,
             project_name=data["project_name"],  # Already validated above
+            project_id=project_id_raw,
             project_prefix=project_prefix_raw,
             tasks_file=data.get("tasks_file", DEFAULT_TASKS_FILE),
             log_dir=data.get("log_dir", DEFAULT_LOG_DIR),
+            db_path_value=db_path_raw or "",
             use_docker=use_docker,
             docker_image=data.get("docker_image", ""),
             docker_volumes=docker_volumes,
@@ -1375,7 +1492,7 @@ class Config:
 
         # Validate known fields - unknown keys are warnings, not errors
         valid_fields = {
-            "project_name", "project_prefix", "tasks_file", "log_dir", "use_docker",
+            "project_name", "project_id", "project_prefix", "tasks_file", "log_dir", "db_path", "use_docker",
             "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
             "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model", "reasoning_effort",
             "defaults", "task_types", "providers", "branch_strategy", "verify_command",
@@ -1400,6 +1517,41 @@ class Config:
             errors.append("'project_name' is required")
         elif not isinstance(data["project_name"], str):
             errors.append("'project_name' must be a string")
+
+        if "project_id" in data and data["project_id"]:
+            project_id = data["project_id"]
+            if not isinstance(project_id, str):
+                errors.append("'project_id' must be a string")
+            elif not _PROJECT_ID_RE.match(project_id):
+                errors.append("'project_id' must be 1-64 lowercase alphanumeric characters")
+
+        if "db_path" in data and data["db_path"] is not None and not isinstance(data["db_path"], str):
+            errors.append("'db_path' must be a string")
+
+        project_name_raw = data.get("project_name")
+        project_name_for_id = str(project_name_raw) if isinstance(project_name_raw, str) else ""
+        db_path_raw = data.get("db_path")
+        local_db_path = (project_dir / DEFAULT_DB_FILE).resolve()
+        if isinstance(db_path_raw, str) and db_path_raw:
+            resolved_db = Path(os.path.expanduser(db_path_raw))
+            if not resolved_db.is_absolute():
+                resolved_db = project_dir / resolved_db
+            resolved_db = resolved_db.resolve()
+        else:
+            resolved_db = local_db_path
+        project_id_effective = data.get("project_id")
+        if not isinstance(project_id_effective, str) or not project_id_effective:
+            if resolved_db == local_db_path:
+                project_id_effective = "default"
+            elif project_name_for_id:
+                project_id_effective = _generate_project_id(project_dir, project_name_for_id)
+            else:
+                project_id_effective = ""
+        if resolved_db != local_db_path and project_id_effective == "default":
+            errors.append(
+                "'project_id: default' is only valid with local DB mode (db_path: .gza/gza.db). "
+                "Set a unique project_id for shared DB mode or omit project_id to derive one."
+            )
 
         if "project_prefix" in data and data["project_prefix"]:
             prefix_val = data["project_prefix"]

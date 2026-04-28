@@ -16,7 +16,7 @@ from typing import Any
 from rich.table import Table
 
 from .. import colors as _colors
-from ..config import Config
+from ..config import Config, _generate_project_id
 from ..config_schema import CONFIG_KEY_REGISTRY
 from ..console import console
 from ..db import SqliteTaskStore, Task, task_id_numeric_key
@@ -1256,6 +1256,7 @@ def _config_to_effective_dict(config: Config) -> dict:
     """Build an effective configuration dict from a loaded Config object."""
     return {
         "project_name": config.project_name,
+        "db_path": str(config.db_path),
         "tasks_file": config.tasks_file,
         "log_dir": config.log_dir,
         "use_docker": config.use_docker,
@@ -1991,8 +1992,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         # Non-interactive mode: use default (monorepo)
         choice = "1"
 
-    # Replace project name placeholder
+    project_id = _generate_project_id(args.project_dir, default_project_name)
+
+    # Replace project metadata placeholders
     config_content = template.replace("project_name: my-project", f"project_name: {default_project_name}")
+    config_content = config_content.replace("# project_id: myproject01", f"project_id: {project_id}")
 
     # Apply branch strategy based on user's choice
     default_branch_line = "# branch_strategy: monorepo  # Default: {project}/{task_id}"

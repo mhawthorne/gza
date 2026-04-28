@@ -1,5 +1,6 @@
 """Tests for database operations and task chaining."""
 
+import os
 import subprocess
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -16,6 +17,7 @@ from gza.db import (
     StepRef,
     Task,
     check_migration_status,
+    import_legacy_local_db,
     preview_v25_migration,
     preview_v26_migration,
     resolve_task_id,
@@ -2653,6 +2655,16 @@ class TestConvenienceFunctions:
     """Tests for module-level convenience functions get_task, get_task_log_path,
     get_task_report_path, and get_baseline_stats."""
 
+    @pytest.fixture(autouse=True)
+    def _write_config(self, tmp_path: Path) -> None:
+        db_path = tmp_path / ".gza" / "gza.db"
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "project_id: default\n"
+            f"db_path: {db_path}\n",
+            encoding="utf-8",
+        )
+
     def test_get_task_returns_dict(self, tmp_path: Path, monkeypatch):
         """get_task returns a dict with all task fields."""
         from gza.db import get_task
@@ -3413,20 +3425,20 @@ class TestRunStepPersistence:
             SELECT name FROM sqlite_master
             WHERE type='index'
               AND name IN (
-                'idx_run_steps_run_id',
-                'idx_run_steps_step_index',
-                'idx_run_substeps_run_id',
-                'idx_run_substeps_step_id'
+                'idx_run_steps_project_run_id',
+                'idx_run_steps_project_step_index',
+                'idx_run_substeps_project_run_id',
+                'idx_run_substeps_project_step_id'
               )
             """
         )
         indexes = sorted(row[0] for row in cur.fetchall())
         conn.close()
         assert indexes == [
-            "idx_run_steps_run_id",
-            "idx_run_steps_step_index",
-            "idx_run_substeps_run_id",
-            "idx_run_substeps_step_id",
+            "idx_run_steps_project_run_id",
+            "idx_run_steps_project_step_index",
+            "idx_run_substeps_project_run_id",
+            "idx_run_substeps_project_step_id",
         ]
 
     def test_new_tasks_default_log_schema_version_1(self, tmp_path: Path):
@@ -4312,6 +4324,172 @@ def _make_v29_db_without_urgent_bumped_at(db_path: Path) -> None:
     conn.close()
 
 
+def _make_v35_db_with_legacy_key_shapes(db_path: Path) -> None:
+    """Create a v35 DB with legacy non-project-scoped keys/fks/uniques."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (35)")
+    conn.execute(
+        """
+        CREATE TABLE project_sequences (
+            prefix TEXT PRIMARY KEY,
+            next_seq INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    conn.execute("INSERT INTO project_sequences(prefix, next_seq) VALUES ('gza', 2)")
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            prompt TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            task_type TEXT NOT NULL DEFAULT 'implement',
+            task_id TEXT,
+            branch TEXT,
+            log_file TEXT,
+            report_file TEXT,
+            based_on TEXT,
+            has_commits INTEGER,
+            duration_seconds REAL,
+            num_steps_reported INTEGER,
+            num_steps_computed INTEGER,
+            num_turns INTEGER,
+            num_turns_reported INTEGER,
+            num_turns_computed INTEGER,
+            attach_count INTEGER,
+            attach_duration_seconds REAL,
+            cost_usd REAL,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            running_pid INTEGER,
+            completed_at TEXT,
+            "group" TEXT,
+            depends_on TEXT,
+            spec TEXT,
+            create_review INTEGER DEFAULT 0,
+            same_branch INTEGER DEFAULT 0,
+            task_type_hint TEXT,
+            output_content TEXT,
+            session_id TEXT,
+            pr_number INTEGER,
+            model TEXT,
+            provider TEXT,
+            provider_is_explicit INTEGER DEFAULT 0,
+            urgent INTEGER DEFAULT 0,
+            urgent_bumped_at TEXT,
+            queue_position INTEGER,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            merge_status TEXT,
+            merged_at TEXT,
+            failure_reason TEXT,
+            skip_learnings INTEGER DEFAULT 0,
+            diff_files_changed INTEGER,
+            diff_lines_added INTEGER,
+            diff_lines_removed INTEGER,
+            review_cleared_at TEXT,
+            review_score INTEGER,
+            log_schema_version INTEGER DEFAULT 1,
+            execution_mode TEXT,
+            base_branch TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_tags (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            tag TEXT NOT NULL,
+            PRIMARY KEY(task_id, tag)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE run_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            step_index INTEGER NOT NULL,
+            step_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            message_role TEXT NOT NULL,
+            message_text TEXT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            outcome TEXT,
+            summary TEXT,
+            legacy_turn_id TEXT,
+            legacy_event_id TEXT,
+            UNIQUE(run_id, step_index),
+            UNIQUE(run_id, step_id),
+            FOREIGN KEY(run_id) REFERENCES tasks(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE run_substeps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            step_id INTEGER NOT NULL REFERENCES run_steps(id) ON DELETE CASCADE,
+            substep_index INTEGER NOT NULL,
+            substep_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            call_id TEXT,
+            payload_json TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            legacy_turn_id TEXT,
+            legacy_event_id TEXT,
+            UNIQUE(step_id, substep_index),
+            UNIQUE(step_id, substep_id),
+            FOREIGN KEY(run_id) REFERENCES tasks(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            source TEXT NOT NULL,
+            author TEXT,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO tasks (id, prompt, status, task_type, task_id, created_at)
+        VALUES ('gza-1', 'legacy task', 'pending', 'implement', '20260427-gza-legacy-task', '2024-01-01T00:00:00+00:00')
+        """
+    )
+    conn.execute("INSERT INTO task_tags(task_id, tag) VALUES ('gza-1', 'legacy')")
+    conn.execute(
+        """
+        INSERT INTO run_steps (run_id, step_index, step_id, provider, message_role, message_text, started_at)
+        VALUES ('gza-1', 1, 'S1', 'codex', 'assistant', 'legacy step', '2024-01-01T00:00:00+00:00')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO run_substeps (run_id, step_id, substep_index, substep_id, type, source, payload_json, timestamp)
+        VALUES ('gza-1', 1, 1, 'S1.1', 'tool_call', 'assistant', '{}', '2024-01-01T00:00:00+00:00')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO task_comments(task_id, content, source, created_at)
+        VALUES ('gza-1', 'legacy comment', 'direct', '2024-01-01T00:00:00+00:00')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
 def _drop_tasks_column(db_path: Path, column_name: str) -> None:
     """Rebuild the tasks table without a specific column."""
     import sqlite3
@@ -4323,19 +4501,25 @@ def _drop_tasks_column(db_path: Path, column_name: str) -> None:
     _quote = lambda c: f'"{c}"' if c in ("group",) else c
     cols_str = ", ".join(_quote(c) for c in kept_cols)
     col_defs = []
-    for row in conn.execute("PRAGMA table_info(tasks_old)"):
+    pragma_rows = list(conn.execute("PRAGMA table_info(tasks_old)"))
+    pk_cols = [(row[5], row[1]) for row in pragma_rows if row[1] != column_name and row[5]]
+    has_composite_pk = len(pk_cols) > 1
+    for row in pragma_rows:
         if row[1] == column_name:
             continue
         name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
         quoted_name = f'"{name}"' if name in ("group",) else name
         parts = [quoted_name, typ]
-        if pk:
+        if pk and not has_composite_pk:
             parts.append("PRIMARY KEY")
         if notnull and not pk:
             parts.append("NOT NULL")
         if dflt is not None:
             parts.append(f"DEFAULT {dflt}")
         col_defs.append(" ".join(parts))
+    if has_composite_pk:
+        ordered_pk = ", ".join(_quote(name) for _, name in sorted(pk_cols, key=lambda item: item[0]))
+        col_defs.append(f"PRIMARY KEY({ordered_pk})")
     conn.execute(f"CREATE TABLE tasks ({', '.join(col_defs)})")
     conn.execute(f"INSERT INTO tasks ({cols_str}) SELECT {cols_str} FROM tasks_old")
     conn.execute("DROP TABLE tasks_old")
@@ -4386,7 +4570,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -4398,15 +4582,942 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
         SqliteTaskStore(db_path, prefix="gza")
         status_after = check_migration_status(db_path)
         assert status_after["current_version"] == SCHEMA_VERSION
-        assert status_after["pending_auto"] == []
-        assert status_after["pending_manual"] == []
+
+
+class TestSharedDbIsolationAndImportGating:
+    def test_missing_project_id_uses_distinct_derived_ids_and_isolates_shared_db(
+        self, tmp_path: Path
+    ) -> None:
+        from gza.config import Config
+
+        shared_db = tmp_path / "shared" / "gza.db"
+        project_a = tmp_path / "project-a"
+        project_b = tmp_path / "project-b"
+        project_a.mkdir(parents=True, exist_ok=True)
+        project_b.mkdir(parents=True, exist_ok=True)
+        (project_a / "gza.yaml").write_text(f"project_name: demo\ndb_path: {shared_db}\n", encoding="utf-8")
+        (project_b / "gza.yaml").write_text(f"project_name: demo\ndb_path: {shared_db}\n", encoding="utf-8")
+
+        config_a = Config.load(project_a)
+        config_b = Config.load(project_b)
+        assert config_a.project_id != config_b.project_id
+
+        store_a = SqliteTaskStore.from_config(config_a)
+        store_b = SqliteTaskStore.from_config(config_b)
+
+        task_a = store_a.add("alpha task")
+        task_b = store_b.add("beta task")
+        assert task_a.id == "demo-1"
+        assert task_b.id == "demo-1"
+        assert [task.prompt for task in store_a.get_all()] == ["alpha task"]
+        assert [task.prompt for task in store_b.get_all()] == ["beta task"]
+
+    def test_config_load_missing_project_id_readonly_file_is_non_mutating(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.config import Config
+
+        config_path = tmp_path / "gza.yaml"
+        shared_db = tmp_path / "shared" / "gza.db"
+        original = (
+            "project_name: readonly-project\n"
+            f"db_path: {shared_db}\n"
+        )
+        config_path.write_text(original, encoding="utf-8")
+        config_path.chmod(0o444)
+        try:
+            config = Config.load(tmp_path)
+        finally:
+            config_path.chmod(0o644)
+
+        assert config.project_id
+        assert config_path.read_text(encoding="utf-8") == original
+        captured = capsys.readouterr()
+        assert "project_id" in captured.err
+        assert "persist it" in captured.err.lower()
+
+    def test_read_only_db_can_be_opened_for_reads(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "readonly.db"
+        store = SqliteTaskStore(db_path, prefix="gza", project_id="projreadonly1")
+        created = store.add("readonly open")
+        assert created.id is not None
+
+        db_path.chmod(0o444)
+        try:
+            reopened = SqliteTaskStore(db_path, prefix="gza", project_id="projreadonly1")
+            fetched = reopened.get(created.id)
+        finally:
+            db_path.chmod(0o644)
+
+        assert fetched is not None
+        assert fetched.prompt == "readonly open"
+
+    def test_convenience_helpers_surface_config_error_without_silent_local_fallback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza.config import ConfigError
+        from gza.db import get_task
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("legacy local task")
+        monkeypatch.chdir(tmp_path)
+
+        with pytest.raises(ConfigError, match="Configuration file not found"):
+            get_task(task.id)
+
+    def test_local_default_with_legacy_local_db_does_not_require_import(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "gza.yaml").write_text("project_name: gated\n", encoding="utf-8")
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="gza")
+        legacy_task = legacy_store.add("legacy pending")
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "next", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert result.returncode == 0, result.stderr
+        assert legacy_task.id in result.stdout
+        assert "Legacy local DB detected" not in result.stderr
+
+    def test_shared_opt_in_with_legacy_local_db_requires_explicit_import(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: gated\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="gza")
+        legacy_store.add("legacy pending")
+
+        home_dir = tmp_path / "home"
+        home_dir.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            ["uv", "run", "gza", "next", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+            env={**os.environ, "HOME": str(home_dir)},
+        )
+        assert result.returncode == 1
+        assert "Legacy local DB detected" in result.stderr
+        assert "--import-local-db" in result.stderr
+
+    def test_import_local_db_is_idempotent_and_conflicts_fail_loudly(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: gated\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="gated")
+        legacy_task = legacy_store.add("legacy pending")
+        assert legacy_task.id is not None
+
+        first = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert first.returncode == 0, first.stderr
+        assert "Imported legacy local DB into shared DB." in first.stdout
+
+        second = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert second.returncode == 0, second.stderr
+        assert "already imported" in second.stdout.lower()
+
+        config = Config.load(project_dir)
+        shared_store = SqliteTaskStore.from_config(config)
+        shared_tasks = shared_store.get_all()
+        assert len(shared_tasks) == 1
+        assert shared_tasks[0].id == legacy_task.id
+
+        conn = sqlite3.connect(local_db)
+        conn.execute("UPDATE tasks SET prompt = ? WHERE id = ?", ("conflicting prompt", legacy_task.id))
+        conn.commit()
+        conn.close()
+
+        conflict = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert conflict.returncode == 1
+        assert "Conflicting task IDs already exist" in conflict.stderr
+
+    def test_import_local_db_conflicts_on_non_key_field_drift(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: gated\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="gated")
+        legacy_task = legacy_store.add("legacy pending")
+        assert legacy_task.id is not None
+
+        first = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert first.returncode == 0, first.stderr
+
+        conn = sqlite3.connect(local_db)
+        conn.execute("UPDATE tasks SET merge_status = ? WHERE id = ?", ("merged", legacy_task.id))
+        conn.commit()
+        conn.close()
+
+        conflict = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert conflict.returncode == 1
+        assert "Conflicting task IDs already exist" in conflict.stderr
+
+    def test_import_local_db_conflicts_on_run_steps_payload_drift(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportstep01\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+        marker_path = project_dir / ".gza" / "shared-db-import.json"
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        task = legacy_store.add("legacy task")
+        legacy_store.emit_step(task.id, "local message", provider="codex")
+
+        first = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert first.returncode == 0, first.stderr
+        assert marker_path.exists()
+
+        with sqlite3.connect(local_db) as conn:
+            conn.execute(
+                """
+                UPDATE run_steps
+                SET message_text = ?
+                WHERE run_id = ? AND step_index = ?
+                """,
+                ("conflicting local message", task.id, 1),
+            )
+        marker_path.unlink()
+        assert not marker_path.exists()
+
+        conflict = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert conflict.returncode == 1
+        assert "Conflicting run_steps rows already exist" in conflict.stderr
+        assert not marker_path.exists()
+
+        config = Config.load(project_dir)
+        shared_store = SqliteTaskStore(shared_db, prefix=config.project_prefix, project_id=config.project_id)
+        imported_steps = shared_store.get_run_steps(task.id)
+        assert len(imported_steps) == 1
+        assert imported_steps[0].message_text == "local message"
+
+    def test_import_local_db_conflicts_on_run_substeps_payload_drift(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportsubstep01\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+        marker_path = project_dir / ".gza" / "shared-db-import.json"
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        task = legacy_store.add("legacy task")
+        step = legacy_store.emit_step(task.id, "local message", provider="codex")
+        legacy_store.emit_substep(step, "tool_call", {"ok": True}, source="assistant")
+
+        first = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert first.returncode == 0, first.stderr
+        assert marker_path.exists()
+
+        with sqlite3.connect(local_db) as conn:
+            conn.execute(
+                """
+                UPDATE run_substeps
+                SET payload_json = ?
+                WHERE run_id = ? AND substep_index = ?
+                """,
+                ('{"ok": false}', task.id, 1),
+            )
+        marker_path.unlink()
+        assert not marker_path.exists()
+
+        conflict = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert conflict.returncode == 1
+        assert "Conflicting run_substeps rows already exist" in conflict.stderr
+        assert not marker_path.exists()
+
+        config = Config.load(project_dir)
+        shared_store = SqliteTaskStore(shared_db, prefix=config.project_prefix, project_id=config.project_id)
+        imported_steps = shared_store.get_run_steps(task.id)
+        assert len(imported_steps) == 1
+        imported_substeps = shared_store.get_run_substeps(
+            StepRef(
+                id=imported_steps[0].id,
+                run_id=imported_steps[0].run_id,
+                step_index=imported_steps[0].step_index,
+                step_id=imported_steps[0].step_id,
+            )
+        )
+        assert len(imported_substeps) == 1
+        assert imported_substeps[0].payload == {"ok": True}
+
+    def test_import_local_db_dry_run_does_not_create_missing_shared_db(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared-missing" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportdryrun01\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        assert not shared_db.exists()
+        assert not shared_db.parent.exists()
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--dry-run", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "Dry-run: legacy local DB import preview" in result.stdout
+        assert not shared_db.exists()
+        assert not shared_db.parent.exists()
+
+    def test_import_local_db_dry_run_does_not_mutate_existing_projects_rows(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportdryrun02\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        seeded = SqliteTaskStore(shared_db, prefix="other", project_id="otherproject01")
+        seeded.add("seed task")
+
+        with sqlite3.connect(shared_db) as conn:
+            conn.row_factory = sqlite3.Row
+            before_count = int(conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0])
+            before_other_last_seen = conn.execute(
+                "SELECT last_seen_at FROM projects WHERE id = ?",
+                ("otherproject01",),
+            ).fetchone()["last_seen_at"]
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--dry-run", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "Dry-run: legacy local DB import preview" in result.stdout
+
+        with sqlite3.connect(shared_db) as conn:
+            conn.row_factory = sqlite3.Row
+            after_count = int(conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0])
+            after_other_last_seen = conn.execute(
+                "SELECT last_seen_at FROM projects WHERE id = ?",
+                ("otherproject01",),
+            ).fetchone()["last_seen_at"]
+            target_project_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM projects WHERE id = ?",
+                    ("demoimportdryrun02",),
+                ).fetchone()[0]
+            )
+
+        assert after_count == before_count
+        assert after_other_last_seen == before_other_last_seen
+        assert target_project_count == 0
+
+    def test_import_local_db_dry_run_errors_cleanly_when_shared_db_uninitialized(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        shared_db.parent.mkdir(parents=True, exist_ok=True)
+        shared_db.touch()
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportdryrun03\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--dry-run", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert result.returncode == 1
+        assert "Error: Shared DB at" in result.stderr
+        assert "not initialized or readable" in result.stderr
+        assert "Traceback" not in result.stderr
+
+    def test_import_local_db_then_add_task_continues_sequence(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoproject01\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy-1")
+        legacy_store.add("legacy-2")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config)
+        assert result["status"] == "imported"
+
+        shared_store = SqliteTaskStore.from_config(config)
+        created = shared_store.add("post-import")
+        assert created.id == "demo-3"
+
+    def test_import_local_db_preserves_higher_existing_shared_sequence(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoproject02\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        config = Config.load(project_dir)
+        shared_store = SqliteTaskStore.from_config(config)
+        with sqlite3.connect(shared_db) as conn:
+            conn.execute(
+                """
+                INSERT INTO project_sequences(project_id, prefix, next_seq)
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET next_seq = excluded.next_seq
+                """,
+                (config.project_id, config.project_prefix, 50),
+            )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy-1")
+
+        result = import_legacy_local_db(config)
+        assert result["status"] == "imported"
+
+        created = shared_store.add("post-import")
+        assert created.id == "demo-51"
+
+    def test_import_local_db_run_substeps_link_to_same_project_run_steps(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        shared_db = tmp_path / "shared" / "gza.db"
+        other_store = SqliteTaskStore(shared_db, prefix="other", project_id="other1")
+        other_task = other_store.add("other task")
+        other_step = other_store.emit_step(other_task.id, "other step", provider="codex")
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimport01\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        task = legacy_store.add("legacy task")
+        step = legacy_store.emit_step(task.id, "legacy step", provider="codex")
+        legacy_store.emit_substep(step, "tool_call", {"ok": True}, source="assistant")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config)
+        assert result["status"] == "imported"
+
+        shared_store = SqliteTaskStore.from_config(config)
+        imported_steps = shared_store.get_run_steps(task.id)
+        assert len(imported_steps) == 1
+        imported_step = imported_steps[0]
+        assert imported_step.id != other_step.id
+
+        substeps = shared_store.get_run_substeps(
+            StepRef(
+                id=imported_step.id,
+                run_id=imported_step.run_id,
+                step_index=imported_step.step_index,
+                step_id=imported_step.step_id,
+            )
+        )
+        assert len(substeps) == 1
+        assert substeps[0].step_id == imported_step.id
+        assert substeps[0].step_id != other_step.id
+
+    def test_import_local_db_preserves_step_substep_graph(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        shared_db = tmp_path / "shared" / "gza.db"
+        other_store = SqliteTaskStore(shared_db, prefix="other", project_id="other2")
+        other_task = other_store.add("other task")
+        other_step = other_store.emit_step(other_task.id, "other step", provider="codex")
+        other_store.emit_substep(other_step, "tool_call", {"other": True}, source="assistant")
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimport02\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        task = legacy_store.add("legacy task")
+        step = legacy_store.emit_step(task.id, "legacy step", provider="codex")
+        legacy_store.emit_substep(step, "tool_call", {"ok": True}, source="assistant")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config)
+        assert result["status"] == "imported"
+
+        with sqlite3.connect(shared_db) as conn:
+            mismatches = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM run_substeps sub
+                JOIN run_steps step ON sub.step_id = step.id
+                WHERE sub.project_id != step.project_id
+                """
+            ).fetchone()[0]
+            demo_links = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM run_substeps sub
+                JOIN run_steps step ON sub.step_id = step.id
+                WHERE sub.project_id = ? AND step.project_id = ?
+                """,
+                (config.project_id, config.project_id),
+            ).fetchone()[0]
+        assert mismatches == 0
+        assert demo_links == 1
+
+    def test_missing_project_id_is_persisted_once_via_migration_flow(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        config_path = project_dir / "gza.yaml"
+        config_path.write_text(
+            "project_name: demo\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        first = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert first.returncode == 0, first.stderr
+        text_after_first = config_path.read_text(encoding="utf-8")
+        project_id_lines = [line for line in text_after_first.splitlines() if line.startswith("project_id:")]
+        assert len(project_id_lines) == 1
+        persisted_project_id = project_id_lines[0].split(":", 1)[1].strip()
+        assert persisted_project_id
+
+        second = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert second.returncode == 0, second.stderr
+        text_after_second = config_path.read_text(encoding="utf-8")
+        assert [line for line in text_after_second.splitlines() if line.startswith("project_id:")] == project_id_lines
+
+        moved_dir = tmp_path / "project-moved"
+        project_dir.rename(moved_dir)
+        moved_config = Config.load(moved_dir)
+        assert moved_config.project_id == persisted_project_id
+
+    def test_import_local_db_cancel_does_not_persist_project_id(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        config_path = project_dir / "gza.yaml"
+        original_config = (
+            "project_name: demo\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n"
+        )
+        config_path.write_text(original_config, encoding="utf-8")
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--project", str(project_dir)],
+            input="n\n",
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert result.returncode == 1
+        assert "Import cancelled." in result.stdout
+        assert config_path.read_text(encoding="utf-8") == original_config
+
+    def test_import_local_db_confirmed_yes_persists_project_id_once(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        config_path = project_dir / "gza.yaml"
+        config_path.write_text(
+            "project_name: demo\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        first = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--project", str(project_dir)],
+            input="y\n",
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert first.returncode == 0, first.stderr
+        assert "Persisted project_id" in first.stdout
+        assert "Imported legacy local DB into shared DB." in first.stdout
+
+        second = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert second.returncode == 0, second.stderr
+        lines = [line for line in config_path.read_text(encoding="utf-8").splitlines() if line.startswith("project_id:")]
+        assert len(lines) == 1
+
+    def test_shared_mode_missing_project_id_derives_non_default_identity(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        config = Config.load(project_dir)
+        assert config.project_id != "default"
+
+    def test_shared_mode_rejects_project_id_default(self, tmp_path: Path) -> None:
+        from gza.config import Config, ConfigError
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: default\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ConfigError, match="only valid with local DB mode"):
+            Config.load(project_dir)
+
+        is_valid, errors, _warnings = Config.validate(project_dir)
+        assert is_valid is False
+        assert any("only valid with local DB mode" in err for err in errors)
+
+    def test_local_db_mode_allows_project_id_default(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n",
+            encoding="utf-8",
+        )
+
+        config = Config.load(project_dir)
+        assert config.project_id == "default"
+
+        is_valid, errors, _warnings = Config.validate(project_dir)
+        assert is_valid is True
+        assert errors == []
+
+    def test_v35_to_v36_migration_rebuilds_project_scoped_keys(self, tmp_path: Path) -> None:
+        """Auto-migrating v35 must rebuild keys/fks/uniques to isolate projects."""
+        db_path = tmp_path / "test.db"
+        _make_v35_db_with_legacy_key_shapes(db_path)
+
+        store_alpha = SqliteTaskStore(db_path, prefix="gza", project_id="alpha")
+        legacy_alpha_task = store_alpha.get("gza-1")
+        assert legacy_alpha_task is not None
+        step_alpha = store_alpha.emit_step("gza-1", "alpha step", provider="codex")
+        substep_alpha = store_alpha.emit_substep(step_alpha, "tool_call", {"alpha": True}, source="assistant")
+        assert substep_alpha.substep_id.endswith(".1")
+
+        store_beta = SqliteTaskStore(db_path, prefix="gza", project_id="beta")
+        created_beta = store_beta.add("beta task")
+        assert created_beta.id == "gza-1"
+        step_beta = store_beta.emit_step("gza-1", "beta step", provider="codex")
+        substep_beta = store_beta.emit_substep(step_beta, "tool_call", {"beta": True}, source="assistant")
+        assert substep_beta.substep_id.endswith(".1")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        task_pk = tuple(
+            row[1]
+            for row in sorted(
+                conn.execute("PRAGMA table_info(tasks)").fetchall(),
+                key=lambda row: row[5],
+            )
+            if row[5] > 0
+        )
+        run_steps_unique_indexes = {
+            tuple(col[2] for col in conn.execute(f"PRAGMA index_info('{idx[1]}')").fetchall())
+            for idx in conn.execute("PRAGMA index_list(run_steps)").fetchall()
+            if idx[2] == 1
+        }
+        run_substeps_unique_indexes = {
+            tuple(col[2] for col in conn.execute(f"PRAGMA index_info('{idx[1]}')").fetchall())
+            for idx in conn.execute("PRAGMA index_list(run_substeps)").fetchall()
+            if idx[2] == 1
+        }
+        conn.close()
+
+        assert version == SCHEMA_VERSION
+        assert task_pk == ("project_id", "id")
+        assert ("project_id", "run_id", "step_index") in run_steps_unique_indexes
+        assert ("project_id", "run_id", "step_id") in run_steps_unique_indexes
+        assert ("project_id", "step_id", "substep_index") in run_substeps_unique_indexes
+        assert ("project_id", "step_id", "substep_id") in run_substeps_unique_indexes
+
+    def test_open_read_only_v35_db_raises_schema_integrity_error_not_operational_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Read-only v35 DB should fail with controlled SchemaIntegrityError during v36 auto-migration."""
+        db_path = tmp_path / "readonly-v35.db"
+        _make_v35_db_with_legacy_key_shapes(db_path)
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"Cannot auto-migrate schema v35->v36 on a read-only database",
+            ):
+                SqliteTaskStore(db_path, prefix="gza", project_id="alpha")
+        finally:
+            db_path.chmod(0o644)
+
+    def test_cli_next_on_read_only_v35_db_surfaces_controlled_error(self, tmp_path: Path) -> None:
+        """CLI read commands against read-only v35 DB should fail without traceback."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "db_path: .gza/gza.db\n",
+            encoding="utf-8",
+        )
+        db_path = project_dir / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        _make_v35_db_with_legacy_key_shapes(db_path)
+
+        db_path.chmod(0o444)
+        try:
+            result = subprocess.run(
+                ["uv", "run", "gza", "next", "--project", str(project_dir)],
+                capture_output=True,
+                text=True,
+                cwd=project_dir,
+            )
+        finally:
+            db_path.chmod(0o644)
+
+        assert result.returncode == 1
+        assert "Cannot auto-migrate schema v35->v36 on a read-only database" in result.stderr
+        assert "Traceback" not in result.stderr
+        assert "Traceback" not in result.stdout
+
+    def test_v35_to_v36_migration_keeps_active_prefix_sequence_continuity(self, tmp_path: Path) -> None:
+        """v35→v36 migration must keep next ID above existing active-prefix task suffixes."""
+        db_path = tmp_path / "test.db"
+        _make_v35_db_with_legacy_key_shapes(db_path)
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DELETE FROM project_sequences")
+            conn.execute("INSERT INTO project_sequences(prefix, next_seq) VALUES ('old', 1)")
+            conn.execute("INSERT INTO project_sequences(prefix, next_seq) VALUES ('gza', 5)")
+            conn.execute(
+                """
+                INSERT INTO tasks (id, prompt, status, task_type, task_id, created_at)
+                VALUES ('gza-5', 'legacy task 5', 'pending', 'implement', '20260427-gza-legacy-task-5', '2024-01-01T00:00:00+00:00')
+                """
+            )
+            conn.commit()
+
+        store = SqliteTaskStore(db_path, prefix="gza", project_id="alpha")
+        created = store.add("post-migration task")
+        assert created.id == "gza-6"
+
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            seq = conn.execute(
+                "SELECT next_seq FROM project_sequences WHERE project_id = ?",
+                ("alpha",),
+            ).fetchone()
+
+        assert seq is not None
+        assert int(seq["next_seq"]) == 6
 
     def test_preview_v25_migration_shows_samples(self, tmp_path: Path) -> None:
         """preview_v25_migration returns correct task_count and sample ID conversions."""
@@ -5175,7 +6286,11 @@ class TestMigrationUtilityFunctions:
     def test_v24_to_v27_chains_via_gza_migrate(self, tmp_path: Path) -> None:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / "gza.yaml").write_text("project_name: gza\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: gza\n"
+            f"db_path: {db_path}\n",
+            encoding="utf-8",
+        )
         _make_v24_db(db_path)
 
         import sqlite3
@@ -5200,7 +6315,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36]
 
         # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")

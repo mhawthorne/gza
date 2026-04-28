@@ -13,7 +13,9 @@ from gza.db import SqliteTaskStore
 
 def _setup_task_with_log(project_dir: Path) -> tuple[str, Path]:
     (project_dir / "gza.yaml").write_text(
-        "project_name: test-project\nuse_docker: false\n"
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "use_docker: false\n"
     )
     (project_dir / ".gza" / "logs").mkdir(parents=True, exist_ok=True)
     config = Config.load(project_dir)
@@ -261,7 +263,10 @@ def test_attach_wrapper_calls_load_dotenv_before_interactive_claude(tmp_path: Pa
 
 def _setup_docker_task(project_dir: Path) -> tuple[str, Path]:
     (project_dir / "gza.yaml").write_text(
-        "project_name: test-project\nuse_docker: true\ndocker_image: test-project-gza\n"
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "use_docker: true\n"
+        "docker_image: test-project-gza\n"
     )
     (project_dir / ".gza" / "logs").mkdir(parents=True, exist_ok=True)
     config = Config.load(project_dir)

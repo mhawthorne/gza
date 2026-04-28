@@ -612,12 +612,16 @@ def backup_database(db_path: Path, project_dir: Path) -> None:
 
     Args:
         db_path: Path to the source SQLite database
-        project_dir: Project directory (used to locate the backups folder)
+        project_dir: Project directory (used for project-local DB backup location)
     """
     if not db_path.exists():
         return
 
-    backup_dir = project_dir / BACKUP_DIR
+    local_db = project_dir / f".{APP_NAME}/{APP_NAME}.db"
+    if db_path.resolve() == local_db.resolve():
+        backup_dir = project_dir / BACKUP_DIR
+    else:
+        backup_dir = db_path.parent / "backups"
     hour_stamp = datetime.now().strftime("%Y%m%d%H")
     backup_path = backup_dir / f"gza-{hour_stamp}.db"
 
@@ -2121,7 +2125,7 @@ def run(
     backup_database(config.db_path, config.project_dir)
 
     # Load tasks from SQLite
-    store = SqliteTaskStore(config.db_path)
+    store = SqliteTaskStore.from_config(config)
     invocation_context = invocation or _resolve_default_invocation_context()
     task_execution_mode = _task_execution_mode_from_invocation(invocation_context)
 

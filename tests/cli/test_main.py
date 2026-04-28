@@ -596,7 +596,12 @@ class TestIterateBackgroundForceDispatch:
         """`gza iterate --background` should use iterate_max_iterations from config when -i is omitted."""
         from gza.cli.main import main
 
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\niterate_max_iterations: 6\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "iterate_max_iterations: 6\n"
+        )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
         task = store.add("Pending implement for iterate background config max-iterations", task_type="implement")

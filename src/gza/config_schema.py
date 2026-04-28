@@ -17,6 +17,7 @@ class ConfigKeySpec:
 # Runtime-only Config dataclass fields; not user-configurable keys.
 RUNTIME_ONLY_CONFIG_FIELDS = {
     "project_dir",
+    "db_path_value",
     "source_map",
     "local_override_path",
     "local_overrides_active",
@@ -26,6 +27,7 @@ RUNTIME_ONLY_CONFIG_FIELDS = {
 NON_CONFIG_ROOT_KEYS = {
     "defaults",
     "claude_args",
+    "db_path",
 }
 
 
@@ -55,6 +57,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "Pre-warm command run synchronously inside Docker before provider CLI starts.",
     ),
     ConfigKeySpec("docker_volumes", "list[str]", [], "Extra Docker volume mounts (`source:dest[:mode]`)."),
+    ConfigKeySpec("db_path", "str", ".gza/gza.db", "SQLite database path."),
     ConfigKeySpec("interactive_worktree_dir", "str", "", "Base path for interactive worktree operations."),
     ConfigKeySpec("iterate_max_iterations", "int", 3, "Default iteration budget for `gza iterate`."),
     ConfigKeySpec("learnings_interval", "int", 5, "Auto-regenerate learnings every N completed tasks (0 disables)."),
@@ -68,6 +71,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("merge_squash_threshold", "int", 0, "Auto-squash threshold for merge operations."),
     ConfigKeySpec("model", "str", "", "Legacy global model fallback."),
     ConfigKeySpec("reasoning_effort", "str", "", "Legacy global reasoning effort fallback (Codex)."),
+    ConfigKeySpec(
+        "project_id",
+        "str",
+        "derived from project path/name",
+        "Stable project identity used for DB row scoping.",
+    ),
     ConfigKeySpec("project_name", "str", None, "Project identifier used for naming and defaults.", required=True),
     ConfigKeySpec("project_prefix", "str", "derived from project_name", "Task-ID prefix (1-12 lowercase alphanumeric chars)."),
     ConfigKeySpec("provider", "str", "claude", "Default provider when task-specific routing is absent."),

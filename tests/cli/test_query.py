@@ -2419,7 +2419,12 @@ class TestShowCommand:
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_steps: 50\nverify_command: uv run pytest tests/ -q\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "max_steps: 50\n"
+            "verify_command: uv run pytest tests/ -q\n"
+        )
 
         store = make_store(tmp_path)
         task = store.add("Failed task for show diagnostics")
@@ -2517,7 +2522,11 @@ class TestShowCommand:
 
 
         setup_config(tmp_path)
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nverify_command: uv run pytest tests/ -q\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "verify_command: uv run pytest tests/ -q\n"
+        )
 
         store = make_store(tmp_path)
         task = store.add("Failed task with non-Claude logs")

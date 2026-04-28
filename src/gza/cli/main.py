@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..config import Config, ConfigError
+from ..config import Config, ConfigError, discover_project_dir, persist_project_id_if_missing
 from ..db import (
     KNOWN_EXECUTION_MODES,
     InvalidTaskIdError,
@@ -12,6 +12,7 @@ from ..db import (
     SchemaIntegrityError,
     SqliteTaskStore,
     check_migration_status,
+    import_legacy_local_db,
     preview_v25_migration,
     preview_v26_migration,
     run_v25_migration,
@@ -2211,16 +2212,31 @@ def main() -> int:
         action="store_true",
         help="Preview what the migration would do without writing any changes",
     )
+    migrate_parser.add_argument(
+        "--import-local-db",
+        action="store_true",
+        help="Import legacy project-local .gza/gza.db into the active shared db_path",
+    )
     add_common_args(migrate_parser)
 
     args = parser.parse_args()
 
     # Validate and resolve project_dir
-    if hasattr(args, 'project_dir'):
-        args.project_dir = Path(args.project_dir).resolve()
+    project_explicit = False
+    if hasattr(args, "project_dir"):
+        raw_project = getattr(args, "project_dir", None)
+        project_explicit = raw_project is not None
+        args.project_dir = Path(raw_project or ".").resolve()
+        setattr(args, "project_explicit", project_explicit)
         if not args.project_dir.is_dir():
             print(f"Error: {args.project_dir} is not a directory")
             return 1
+        if not project_explicit:
+            try:
+                args.project_dir = discover_project_dir(args.project_dir)
+            except ConfigError:
+                # Let the command-specific config load surface the normal error path.
+                pass
 
     # Commands where reconciling orphaned in-progress tasks is useful.
     _RECONCILE_COMMANDS = {
@@ -2231,7 +2247,7 @@ def main() -> int:
     try:
         if args.command in _RECONCILE_COMMANDS:
             try:
-                cfg = Config.load(args.project_dir)
+                cfg = Config.load(args.project_dir, discover=not project_explicit)
             except Exception as exc:
                 print(f"Warning: Skipping in-progress reconciliation: {exc}", file=sys.stderr)
             else:
@@ -2370,12 +2386,74 @@ def main() -> int:
 def _cmd_migrate(args: "argparse.Namespace") -> int:
     """Handle the 'migrate' subcommand."""
     try:
-        config = Config.load(args.project_dir)
+        config = Config.load(args.project_dir, discover=not bool(getattr(args, "project_explicit", False)))
     except ConfigError as e:
         print(f"Error loading config: {e}", file=sys.stderr)
         return 1
 
     status = check_migration_status(config.db_path)
+
+    if args.import_local_db:
+        if not args.yes and not args.dry_run:
+            answer = input(
+                "Import legacy local DB into active shared DB now? [y/N]: "
+            ).strip().lower()
+            if answer not in {"y", "yes"}:
+                print("Import cancelled.")
+                return 1
+
+        project_id_source = config.source_map.get("project_id", "")
+        if project_id_source == "derived":
+            if args.dry_run:
+                print(
+                    "Dry-run: would persist missing project_id in gza.yaml "
+                    f"as '{config.project_id}' before import."
+                )
+            else:
+                try:
+                    updated = persist_project_id_if_missing(config.project_dir, config.project_id)
+                except (ConfigError, OSError) as exc:
+                    print(f"Error: unable to persist project_id in gza.yaml: {exc}", file=sys.stderr)
+                    return 1
+                if updated:
+                    print(f"Persisted project_id '{config.project_id}' to {config.config_path(config.project_dir)}")
+                    try:
+                        config = Config.load(
+                            args.project_dir,
+                            discover=not bool(getattr(args, "project_explicit", False)),
+                        )
+                    except ConfigError as e:
+                        print(f"Error loading config after persisting project_id: {e}", file=sys.stderr)
+                        return 1
+        try:
+            result = import_legacy_local_db(config, dry_run=args.dry_run)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        status_text = result.get("status", "unknown")
+        if status_text == "no_local_db":
+            print(f"No legacy local DB found at {result['local_db_path']}.")
+            return 0
+        if status_text == "already_imported":
+            print("Legacy local DB already imported for this shared DB (idempotent no-op).")
+            return 0
+        if status_text == "dry_run":
+            print("Dry-run: legacy local DB import preview")
+            print(f"  local_db: {result['local_db_path']}")
+            print(f"  shared_db: {result['shared_db_path']}")
+            print(f"  project_id: {result['project_id']}")
+            print(f"  local tasks: {result['local_task_count']}")
+            print(f"  shared existing tasks: {result['shared_existing_task_count']}")
+            return 0
+        if status_text == "imported":
+            print("Imported legacy local DB into shared DB.")
+            print(f"  local_db: {result['local_db_path']}")
+            print(f"  shared_db: {result['shared_db_path']}")
+            print(f"  project_id: {result['project_id']}")
+            print(f"  tasks_imported: {result['tasks_imported']}")
+            return 0
+        print("Error: unexpected import result", file=sys.stderr)
+        return 1
 
     if args.status:
         current = status["current_version"]
@@ -2483,7 +2561,7 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
     # will run the auto-migrations and then raise ManualMigrationRequired.
     # We swallow that exception here since we are about to run the manual migration.
     try:
-        SqliteTaskStore(config.db_path, prefix=config.project_prefix)
+        SqliteTaskStore.from_config(config)
     except ManualMigrationRequired:
         pass  # Expected — auto-migrations ran, now proceed with the manual migration
 

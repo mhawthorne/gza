@@ -180,7 +180,7 @@ class TestAdvanceMergeSquashThreshold:
         self._create_non_implement_task_with_branch(store, git, tmp_path, num_commits=3)
 
         # Write config with merge_squash_threshold=2
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: 2\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmerge_squash_threshold: 2\n")
 
         result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
         assert result.returncode == 0
@@ -197,7 +197,7 @@ class TestAdvanceMergeSquashThreshold:
     def test_yaml_merge_squash_threshold_parsed(self, tmp_path: Path):
         """merge_squash_threshold is correctly parsed from gza.yaml."""
         from gza.config import Config
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: 3\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmerge_squash_threshold: 3\n")
         config = Config.load(tmp_path)
         assert config.merge_squash_threshold == 3
 
@@ -206,7 +206,7 @@ class TestAdvanceMergeSquashThreshold:
         import pytest
 
         from gza.config import Config, ConfigError
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: two\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmerge_squash_threshold: two\n")
         with pytest.raises(ConfigError):
             Config.load(tmp_path)
 
@@ -215,14 +215,14 @@ class TestAdvanceMergeSquashThreshold:
         import pytest
 
         from gza.config import Config, ConfigError
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmerge_squash_threshold: -1\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmerge_squash_threshold: -1\n")
         with pytest.raises(ConfigError):
             Config.load(tmp_path)
 
     def test_validate_rejects_negative_max_resume_attempts(self, tmp_path: Path):
         from gza.config import Config
 
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: -1\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: -1\n")
         is_valid, errors, _warnings = Config.validate(tmp_path)
         assert is_valid is False
         assert "'max_resume_attempts' must be non-negative" in errors
@@ -230,7 +230,7 @@ class TestAdvanceMergeSquashThreshold:
     def test_validate_rejects_non_integer_max_resume_attempts(self, tmp_path: Path):
         from gza.config import Config
 
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: nope\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: nope\n")
         is_valid, errors, _warnings = Config.validate(tmp_path)
         assert is_valid is False
         assert "'max_resume_attempts' must be an integer" in errors
@@ -238,7 +238,7 @@ class TestAdvanceMergeSquashThreshold:
     def test_validate_rejects_non_positive_max_review_cycles(self, tmp_path: Path):
         from gza.config import Config
 
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_review_cycles: 0\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_review_cycles: 0\n")
         is_valid, errors, _warnings = Config.validate(tmp_path)
         assert is_valid is False
         assert "'max_review_cycles' must be positive" in errors
@@ -248,7 +248,7 @@ class TestAdvanceMergeSquashThreshold:
 
         from gza.config import Config, ConfigError
 
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: nope\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: nope\n")
         with pytest.raises(ConfigError, match="'max_resume_attempts' must be an integer"):
             Config.load(tmp_path)
 
@@ -257,7 +257,7 @@ class TestAdvanceMergeSquashThreshold:
 
         from gza.config import Config, ConfigError
 
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: -1\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: -1\n")
         with pytest.raises(ConfigError, match="'max_resume_attempts' must be non-negative"):
             Config.load(tmp_path)
 
@@ -266,7 +266,7 @@ class TestAdvanceMergeSquashThreshold:
 
         from gza.config import Config, ConfigError
 
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_review_cycles: nope\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_review_cycles: nope\n")
         with pytest.raises(ConfigError, match="'max_review_cycles' must be an integer"):
             Config.load(tmp_path)
 
@@ -275,7 +275,7 @@ class TestAdvanceMergeSquashThreshold:
 
         from gza.config import Config, ConfigError
 
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_review_cycles: 0\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_review_cycles: 0\n")
         with pytest.raises(ConfigError, match="'max_review_cycles' must be positive"):
             Config.load(tmp_path)
 
@@ -295,7 +295,7 @@ class TestAdvanceMergeSquashThreshold:
 
         from gza.config import Config, ConfigError
 
-        (tmp_path / "gza.yaml").write_text(f"project_name: test-project\n{field}: {value}\n")
+        (tmp_path / "gza.yaml").write_text(f"project_name: test-project\ndb_path: .gza/gza.db\n{field}: {value}\n")
 
         is_valid, errors, _warnings = Config.validate(tmp_path)
         assert is_valid is False

@@ -63,7 +63,7 @@ def get_store(config: Config) -> SqliteTaskStore:
         ManualMigrationRequired: If the DB needs a manual schema upgrade.
             Callers should run ``gza migrate`` to fix this.
     """
-    return SqliteTaskStore(config.db_path, prefix=config.project_prefix)
+    return SqliteTaskStore.from_config(config)
 
 
 def resolve_id(config: Config, arg: str) -> str:
@@ -2080,7 +2080,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--project",
         "-C",
         dest="project_dir",
-        default=".",
+        default=None,
         help="Target project directory (default: current directory)",
     )
 
