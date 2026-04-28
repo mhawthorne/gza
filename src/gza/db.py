@@ -1632,7 +1632,7 @@ def _db_fingerprint(path: Path) -> str:
 
 
 def _db_metadata(path: Path) -> tuple[int, int, int]:
-    """Return stable stat metadata used to guard fingerprint recomputation."""
+    """Return stat metadata persisted in shared-import markers."""
     stat = path.stat()
     return (int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns))
 
@@ -1655,7 +1655,7 @@ def _marker_matches_shared_db(project_dir: Path, local_db_path: Path, active_db_
     if marker_shared != active_db_str:
         return False
 
-    # Fast path: when marker metadata still matches, skip re-hashing the full file.
+    # Metadata is only a prefilter; content hash still decides correctness.
     marker_size = marker.get("local_db_size")
     marker_mtime_ns = marker.get("local_db_mtime_ns")
     marker_ctime_ns = marker.get("local_db_ctime_ns")
@@ -1665,15 +1665,9 @@ def _marker_matches_shared_db(project_dir: Path, local_db_path: Path, active_db_
         and isinstance(marker_ctime_ns, int)
     ):
         try:
-            current_size, current_mtime_ns, current_ctime_ns = _db_metadata(local_db_path)
+            _db_metadata(local_db_path)
         except OSError:
             return False
-        if (
-            marker_size == current_size
-            and marker_mtime_ns == current_mtime_ns
-            and marker_ctime_ns == current_ctime_ns
-        ):
-            return True
 
     try:
         local_fingerprint = _db_fingerprint(local_db_path)
