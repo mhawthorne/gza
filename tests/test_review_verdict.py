@@ -1,8 +1,12 @@
 """Tests for shared review verdict/report parsing."""
 
+from pathlib import Path
+
+from gza.db import Task
 from gza.review_verdict import (
     ParsedReview,
     compute_review_score,
+    get_backfillable_review_score,
     parse_review_report,
     parse_review_template,
     parse_review_verdict,
@@ -293,3 +297,61 @@ class TestComputeReviewScore:
         )
         assert parsed.unparseable is False
         assert compute_review_score(parsed) == 67
+
+
+class TestGetBackfillableReviewScore:
+    def test_parseable_output_content_backfills(self, tmp_path: Path) -> None:
+        review = Task(
+            id="gza-1",
+            prompt="review",
+            status="completed",
+            task_type="review",
+            output_content=_template_review_v2(
+                checklist=["- Yes - requirement 1", "- No - requirement 2"],
+                blockers="### B1 Add guard\nRequired fix: check for None input",
+                followups="### F1 Improve message\nRecommended follow-up: clarify operator hint",
+                verdict="Verdict: CHANGES_REQUESTED",
+            ),
+        )
+        assert get_backfillable_review_score(tmp_path, review) == 67
+
+    def test_parseable_report_file_backfills(self, tmp_path: Path) -> None:
+        review_path = tmp_path / ".gza" / "reports" / "review.md"
+        review_path.parent.mkdir(parents=True, exist_ok=True)
+        review_path.write_text(_template_review())
+        review = Task(
+            id="gza-2",
+            prompt="review",
+            status="completed",
+            task_type="review",
+            report_file=".gza/reports/review.md",
+        )
+        assert get_backfillable_review_score(tmp_path, review) == 100
+
+    def test_malformed_review_is_not_backfilled(self, tmp_path: Path) -> None:
+        review = Task(
+            id="gza-3",
+            prompt="review",
+            status="completed",
+            task_type="review",
+            output_content=_template_review(
+                must_fix="- broken freeform content without expected H3 entries",
+                suggestions="None.",
+                verdict="Verdict: APPROVED",
+            ),
+        )
+        assert get_backfillable_review_score(tmp_path, review) is None
+
+    def test_missing_verdict_with_structured_signals_is_backfillable(self, tmp_path: Path) -> None:
+        review = Task(
+            id="gza-4",
+            prompt="review",
+            status="completed",
+            task_type="review",
+            output_content=_template_review(
+                checklist=["- No - one missing"],
+                suggestions="### S1 Follow-up\nSuggestion: update docs",
+                verdict="No final verdict section",
+            ),
+        )
+        assert get_backfillable_review_score(tmp_path, review) == 87

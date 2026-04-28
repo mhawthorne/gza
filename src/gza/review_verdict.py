@@ -298,16 +298,10 @@ def compute_review_score(parsed: ParsedReview) -> int:
     Weight constants are intentionally heuristic and expected to be tuned over time
     as real review analytics data accumulates.
     """
-    has_structured_signals = bool(
-        parsed.must_fix_count > 0
-        or parsed.suggestion_count > 0
-        or parsed.summary_checklist
-    )
-    if parsed.unparseable:
+    if parsed.unparseable and not _parsed_review_has_usable_score_signals(parsed):
         # Fail closed for malformed or incomplete parsing outcomes, with one
-        # explicit exception: missing verdict only.
-        if parsed.parse_error != "missing_verdict" or not has_structured_signals:
-            return 0
+        # explicit exception: missing verdict only when structured findings exist.
+        return 0
 
     no_count = sum(1 for _, is_yes in parsed.summary_checklist if not is_yes)
     score = (
@@ -317,6 +311,24 @@ def compute_review_score(parsed: ParsedReview) -> int:
         - (SUMMARY_NO_WEIGHT * no_count)
     )
     return max(SCORE_MIN, min(SCORE_MAX, score))
+
+
+def _parsed_review_has_usable_score_signals(parsed: ParsedReview) -> bool:
+    has_structured_signals = bool(
+        parsed.must_fix_count > 0
+        or parsed.suggestion_count > 0
+        or parsed.summary_checklist
+    )
+    return parsed.parse_error == "missing_verdict" and has_structured_signals
+
+
+def _compute_backfillable_review_score(content: str | None) -> int | None:
+    if not content:
+        return None
+    parsed = parse_review_template(content)
+    if parsed.unparseable and not _parsed_review_has_usable_score_signals(parsed):
+        return None
+    return compute_review_score(parsed)
 
 
 def parse_review_report(content: str | None) -> ParsedReviewReport:
@@ -437,3 +449,22 @@ def get_review_score(project_dir: Path, review_task: Task) -> int | None:
         return None
 
     return compute_review_score(parse_review_template(review_path.read_text()))
+
+
+def get_backfillable_review_score(project_dir: Path, review_task: Task) -> int | None:
+    """Return score for reviews whose content is parseable enough to backfill.
+
+    Unlike ``get_review_score()``, this skips malformed legacy content instead of
+    persisting a synthetic zero score for it.
+    """
+    if review_task.output_content:
+        return _compute_backfillable_review_score(review_task.output_content)
+
+    if not review_task.report_file:
+        return None
+
+    review_path = project_dir / review_task.report_file
+    if not review_path.exists():
+        return None
+
+    return _compute_backfillable_review_score(review_path.read_text())
