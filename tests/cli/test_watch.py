@@ -210,6 +210,93 @@ def test_watch_cycle_recovery_mode_resumes_failed_task_before_starting_new_pendi
     assert result.work_done is True
     assert spawn_resume.call_count == 0
     assert spawn_iterate.call_count == 1
+    spawned_args = spawn_iterate.call_args.args[0]
+    spawned_task = spawn_iterate.call_args.args[2]
+    assert spawned_args.resume is False
+    assert spawned_args.retry is False
+    assert spawned_task.based_on == failed.id
+
+
+def test_watch_cycle_default_mode_auto_resumes_resumable_failed_task(tmp_path: Path) -> None:
+    """Plain watch should keep narrow default auto-resume behavior for resumable failures."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_impl = store.add("Pending implement", task_type="implement")
+    assert pending_impl.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    spawned_task = spawn_iterate.call_args.args[2]
+    assert spawned_task.based_on == failed.id
+    assert spawned_task.id != pending_impl.id
+
+
+def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tmp_path: Path) -> None:
+    """Restart-failed retry path for implement tasks should launch iterate on the new child without retry flags."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    spawned_args = spawn_iterate.call_args.args[0]
+    spawned_task = spawn_iterate.call_args.args[2]
+    assert spawned_args.resume is False
+    assert spawned_args.retry is False
+    assert spawned_task.based_on == failed.id
 
 
 def test_watch_cycle_dry_run_recovery_mode_reports_actions_without_mutation(tmp_path: Path) -> None:
@@ -2351,6 +2438,33 @@ def test_collect_unhandled_failures_skips_actionable_recovery_failures(tmp_path:
         restart_failed_mode=True,
         max_recovery_attempts=config.max_resume_attempts,
     )
+    assert failures == []
+
+
+def test_collect_unhandled_failures_default_mode_skips_auto_resumable_failures(tmp_path: Path) -> None:
+    """Default watch mode should keep backoff accounting limited to non-auto-resumable failures."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    resumable = store.add("Resumable implement", task_type="implement")
+    assert resumable.id is not None
+    resumable.status = "failed"
+    resumable.failure_reason = "MAX_TURNS"
+    resumable.session_id = "sess-123"
+    resumable.completed_at = datetime.now(UTC)
+    store.update(resumable)
+
+    config = Config.load(tmp_path)
+    old = {str(resumable.id): {"status": "in_progress"}}
+    new = {
+        str(resumable.id): {
+            "status": "failed",
+            "task_type": "implement",
+            "failure_reason": "MAX_TURNS",
+        }
+    }
+
+    failures = _collect_unhandled_failures(old, new, store=store, config=config, restart_failed_mode=False)
     assert failures == []
 
 
