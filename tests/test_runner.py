@@ -4048,7 +4048,8 @@ class TestResumeVerificationPrompt:
         resume_session_id = captured_prompts[0]['resume_session_id']
 
         # Verify verification instructions are in the prompt
-        assert "interrupted" in prompt.lower()
+        assert "paused" in prompt.lower()
+        assert "interrupted" not in prompt.lower()
         assert "git status" in prompt.lower()
         assert "git log" in prompt.lower()
         assert "todo list" in prompt.lower()
@@ -8549,3 +8550,147 @@ class TestProviderPromptSanitization:
         assert len(captured_prompts) == 1
         assert "work within sandbox restrictions" in captured_prompts[0]
         assert "bypass sandbox restrictions" not in captured_prompts[0]
+
+    def test_review_resume_prompt_sent_to_provider_is_sanitized(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        impl.status = "completed"
+        impl.slug = "20260212-implement-feature-x"
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        task = store.add(prompt="Review feature X", task_type="review", depends_on=impl.id)
+        task.slug = "20260213-review-feature-x"
+        task.session_id = "resume-review-session"
+        store.mark_failed(task, log_file="logs/review.log", stats=None)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
+
+        captured_prompts: list[str] = []
+
+        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_prompts.append(prompt)
+            report_dir = work_dir / ".gza" / "reviews"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: APPROVED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=0)
+        git.get_diff_numstat.return_value = ""
+        git.get_diff.return_value = ""
+        git.get_diff_stat.return_value = ""
+
+        with patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(task, config, store, provider, git, resume=True)
+
+        assert exit_code == 0
+        assert len(captured_prompts) == 1
+        assert "paused" in captured_prompts[0].lower()
+        assert "interrupted" not in captured_prompts[0].lower()
+
+    def test_improve_resume_prompt_sent_to_provider_is_sanitized(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Improve feature X", task_type="improve")
+        task.slug = "20260213-improve-feature-x"
+        task.branch = "gza/20260213-improve-feature-x"
+        task.session_id = "resume-improve-session"
+        store.mark_failed(task, log_file="logs/improve.log", stats=None)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.db_path = db_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.workers_path = tmp_path / ".gza" / "workers"
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.max_turns = 50
+        config.timeout_minutes = 60
+        config.branch_mode = "multi"
+        config.project_name = "test"
+        config.branch_strategy = Mock()
+        config.branch_strategy.pattern = "{project}/{task_id}"
+        config.branch_strategy.default_type = "feature"
+        config.get_provider_for_task.return_value = "claude"
+        config.get_model_for_task.return_value = None
+        config.get_max_steps_for_task.return_value = 50
+        config.learnings_interval = 0
+        config.learnings_window = 25
+
+        captured_prompts: list[str] = []
+
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_prompts.append(prompt)
+            summary_dir = work_dir / ".gza" / "summaries"
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            (summary_dir / f"{task.slug}.md").write_text("# Summary\n\nCompleted.")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=5.0,
+                num_turns_reported=2,
+                cost_usd=0.02,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        with patch("gza.runner.get_provider") as mock_get_provider, patch("gza.runner.Git") as mock_git_class, patch("gza.runner.load_dotenv"):
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_provider.run = mock_provider_run
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.branch_exists.return_value = True
+            mock_git.worktree_add = Mock()
+            mock_git.worktree_list.return_value = []
+
+            mock_worktree_git = Mock()
+            mock_worktree_git.has_changes.return_value = True
+            mock_worktree_git.status_porcelain.side_effect = [set(), {("M", "changed.py")}]
+            mock_worktree_git.add = Mock()
+            mock_worktree_git.commit = Mock()
+            mock_worktree_git.get_diff_numstat.return_value = ""
+            mock_log_result = Mock()
+            mock_log_result.stdout = "WIP: gza task interrupted"
+            mock_worktree_git._run.return_value = mock_log_result
+
+            mock_git_class.side_effect = [mock_git, mock_worktree_git]
+
+            worktree_path = config.worktree_path / task.slug
+            worktree_path.mkdir(parents=True, exist_ok=True)
+
+            result = run(config, task_id=task.id, resume=True)
+
+        assert result == 0
+        assert len(captured_prompts) == 1
+        assert "paused" in captured_prompts[0].lower()
+        assert "interrupted" not in captured_prompts[0].lower()

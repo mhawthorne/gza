@@ -10,7 +10,7 @@ gza now applies a prompt-normalization pass at the provider boundary for `review
 
 ## Initial Risky-Term Map
 
-To minimize false positives, replacements require both a trigger term and a nearby task/safety context:
+To minimize false positives, replacements require both a trigger term and a nearby task/safety context (within a bounded ±160-character window around each trigger match):
 
 - `bypass*` + (`sandbox|guardrail|policy|safety|restriction|constraint`) -> `work within`
 - `kill*` + (`process|task|run|session|job|agent`) -> `terminate`
@@ -21,4 +21,4 @@ Implementation notes:
 
 - Replacements are case-insensitive.
 - Fenced code blocks are preserved verbatim to avoid rewriting command/code examples.
-- If context terms are not present, no replacement is performed.
+- If context terms are not present near a trigger match, no replacement is performed for that match.

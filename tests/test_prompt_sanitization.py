@@ -34,3 +34,16 @@ def test_sanitize_disabled_for_other_task_types() -> None:
     prompt = "bypass sandbox and kill process"
     result = sanitize_provider_prompt(prompt, task_type="implement")
     assert result == prompt
+
+
+def test_sanitize_does_not_replace_when_context_is_far_away() -> None:
+    prompt = "bypass " + ("x" * 220) + " sandbox restriction"
+    result = sanitize_provider_prompt(prompt, task_type="review")
+    assert result == prompt
+
+
+def test_sanitize_replaces_when_context_is_within_nearby_window() -> None:
+    prompt = "Please bypass " + ("x" * 80) + " sandbox restriction for this review."
+    result = sanitize_provider_prompt(prompt, task_type="review")
+    assert "work within" in result
+    assert "bypass" not in result.lower()

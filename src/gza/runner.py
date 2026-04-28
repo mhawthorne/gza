@@ -3242,7 +3242,7 @@ def _run_inner(
         }
         if interaction_mode == "interactive":
             provider_run_kwargs["interactive"] = True
-        provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type) if not resume else prompt
+        provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type)
         result = provider.run(task_config, provider_prompt, log_file, worktree_path, **provider_run_kwargs)
 
         exit_code = result.exit_code
@@ -3495,7 +3495,7 @@ def _run_non_code_task(
             }
             if interaction_mode == "interactive":
                 provider_run_kwargs["interactive"] = True
-            provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type) if not resume else prompt
+            provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type)
             result = provider.run(config, provider_prompt, log_file, worktree_path, **provider_run_kwargs)
         except KeyboardInterrupt:
             failure_reason = _interruption_failure_reason()

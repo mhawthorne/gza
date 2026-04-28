@@ -14,6 +14,7 @@ class _SanitizationRule:
 
 
 _FENCED_BLOCK_RE = re.compile(r"(```[\s\S]*?```)", re.MULTILINE)
+_CONTEXT_WINDOW_CHARS = 160
 
 _RULES: tuple[_SanitizationRule, ...] = (
     _SanitizationRule(
@@ -39,14 +40,45 @@ _RULES: tuple[_SanitizationRule, ...] = (
 )
 
 
+def _match_has_nearby_context(
+    text: str,
+    *,
+    trigger_start: int,
+    trigger_end: int,
+    context_pattern: re.Pattern[str],
+    window_chars: int = _CONTEXT_WINDOW_CHARS,
+) -> bool:
+    """Return True when a context term appears near a trigger match."""
+    window_start = max(0, trigger_start - window_chars)
+    window_end = min(len(text), trigger_end + window_chars)
+    nearby_text = text[window_start:window_end]
+    return context_pattern.search(nearby_text) is not None
+
+
 def _sanitize_segment(text: str) -> str:
     result = text
     for rule in _RULES:
         if not rule.trigger.search(result):
             continue
-        if not rule.context.search(result):
+        replacements: list[tuple[int, int]] = []
+        for match in rule.trigger.finditer(result):
+            if _match_has_nearby_context(
+                result,
+                trigger_start=match.start(),
+                trigger_end=match.end(),
+                context_pattern=rule.context,
+            ):
+                replacements.append((match.start(), match.end()))
+        if not replacements:
             continue
-        result = rule.trigger.sub(rule.replacement, result)
+        rebuilt: list[str] = []
+        cursor = 0
+        for start, end in replacements:
+            rebuilt.append(result[cursor:start])
+            rebuilt.append(rule.replacement)
+            cursor = end
+        rebuilt.append(result[cursor:])
+        result = "".join(rebuilt)
     return result
 
 
