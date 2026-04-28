@@ -530,6 +530,24 @@ class TestLocalConfigOverrides:
         expected_keys = {spec.key for spec in CONFIG_KEY_REGISTRY}
         assert rendered_keys == expected_keys
 
+    def test_config_keys_table_includes_watch_recovery_registry_entries(self, tmp_path: Path):
+        """`gza config keys` should expose watch recovery config with current descriptions."""
+        setup_config(tmp_path)
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "config", "keys", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        assert "watch.restart_failed_batch" in result.stdout
+        assert "Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active." in result.stdout
+        assert (
+            "Retry cap for resume-based lifecycle automation, including watch auto-resume and --restart-failed recovery decisions."
+            in result.stdout
+        )
+
     def test_config_keys_json_emits_valid_machine_readable_registry(self, tmp_path: Path):
         """`gza config keys --json` should emit a full machine-readable registry payload."""
         from gza.config_schema import CONFIG_KEY_REGISTRY
@@ -551,6 +569,29 @@ class TestLocalConfigOverrides:
         assert {entry["key"] for entry in keys} == {spec.key for spec in CONFIG_KEY_REGISTRY}
         for entry in keys:
             assert set(entry.keys()) == {"key", "type", "required", "default", "description"}
+
+    def test_config_keys_json_includes_watch_recovery_registry_entries(self, tmp_path: Path):
+        """`gza config keys --json` should expose watch recovery config with current descriptions."""
+        setup_config(tmp_path)
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "config", "keys", "--json", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        keyed_entries = {entry["key"]: entry for entry in payload["keys"]}
+        assert keyed_entries["watch.restart_failed_batch"]["default"] == 1
+        assert (
+            keyed_entries["watch.restart_failed_batch"]["description"]
+            == "Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active."
+        )
+        assert (
+            keyed_entries["max_resume_attempts"]["description"]
+            == "Retry cap for resume-based lifecycle automation, including watch auto-resume and --restart-failed recovery decisions."
+        )
 
 
 class TestInitCommand:
