@@ -627,7 +627,7 @@ class Config:
             if not resolved.is_absolute():
                 resolved = self.project_dir / resolved
             return resolved
-        return Path(os.path.expanduser("~/.gza/gza.db"))
+        return self.project_dir / DEFAULT_DB_FILE
 
     @property
     def log_path(self) -> Path:
@@ -739,7 +739,7 @@ class Config:
                 resolved_db = project_dir / resolved_db
             resolved_db = resolved_db.resolve()
         else:
-            resolved_db = Path(os.path.expanduser("~/.gza/gza.db")).resolve()
+            resolved_db = local_db_path
 
         project_id_raw = data.get("project_id", "")
         if project_id_raw:
@@ -1538,7 +1538,7 @@ class Config:
                 resolved_db = project_dir / resolved_db
             resolved_db = resolved_db.resolve()
         else:
-            resolved_db = Path(os.path.expanduser("~/.gza/gza.db")).resolve()
+            resolved_db = local_db_path
         project_id_effective = data.get("project_id")
         if not isinstance(project_id_effective, str) or not project_id_effective:
             if resolved_db == local_db_path:

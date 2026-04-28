@@ -4637,10 +4637,35 @@ class TestSharedDbIsolationAndImportGating:
         with pytest.raises(ConfigError, match="Configuration file not found"):
             get_task(task.id)
 
-    def test_shared_default_with_legacy_local_db_requires_explicit_import(self, tmp_path: Path) -> None:
+    def test_local_default_with_legacy_local_db_does_not_require_import(self, tmp_path: Path) -> None:
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
         (project_dir / "gza.yaml").write_text("project_name: gated\n", encoding="utf-8")
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="gza")
+        legacy_task = legacy_store.add("legacy pending")
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "next", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert result.returncode == 0, result.stderr
+        assert legacy_task.id in result.stdout
+        assert "Legacy local DB detected" not in result.stderr
+
+    def test_shared_opt_in_with_legacy_local_db_requires_explicit_import(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: gated\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
 
         local_db = project_dir / ".gza" / "gza.db"
         local_db.parent.mkdir(parents=True, exist_ok=True)
