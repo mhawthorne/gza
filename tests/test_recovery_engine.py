@@ -80,6 +80,20 @@ def test_recovery_engine_existing_pending_resume_child_reuses_resume_semantics(t
     assert decision.reuse_existing is True
 
 
+def test_recovery_engine_manual_reason_with_pending_child_still_skips(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, task_type="plan", reason="TEST_FAILURE", session_id=None)
+    child = store.add("Pending retry child", task_type=task.task_type, based_on=task.id)
+    assert child.id is not None
+    child.status = "pending"
+    store.update(child)
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "manual_failure_reason"
+    assert decision.recovery_task_id is None
+    assert decision.reuse_existing is False
+
+
 def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
     attempt = store.add("Attempt", task_type=task.task_type, based_on=task.id)

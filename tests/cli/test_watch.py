@@ -2598,6 +2598,46 @@ def test_collect_unhandled_failures_skips_actionable_recovery_failures(tmp_path:
     assert failures == []
 
 
+def test_collect_unhandled_failures_restart_failed_keeps_manual_failures_visible_with_pending_child(
+    tmp_path: Path,
+) -> None:
+    """Manual-only failures must still count toward backoff even if a pending recovery child exists."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Broken plan", task_type="plan")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "TEST_FAILURE"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    child = store.add("Manually queued retry", task_type="plan", based_on=failed.id)
+    assert child.id is not None
+    child.status = "pending"
+    store.update(child)
+
+    config = Config.load(tmp_path)
+    old = {str(failed.id): {"status": "in_progress"}}
+    new = {
+        str(failed.id): {
+            "status": "failed",
+            "task_type": "plan",
+            "failure_reason": "TEST_FAILURE",
+        }
+    }
+
+    failures = _collect_unhandled_failures(
+        old,
+        new,
+        store=store,
+        config=config,
+        restart_failed_mode=True,
+        max_recovery_attempts=config.max_resume_attempts,
+    )
+    assert [(failure.task_id, failure.reason) for failure in failures] == [(str(failed.id), "TEST_FAILURE")]
+
+
 def test_collect_unhandled_failures_default_mode_skips_auto_resumable_failures(tmp_path: Path) -> None:
     """Default watch mode should keep backoff accounting limited to non-auto-resumable failures."""
     setup_config(tmp_path)
