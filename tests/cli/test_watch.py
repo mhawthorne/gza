@@ -2853,6 +2853,55 @@ def test_cmd_watch_dry_run_actionable_cycles_do_not_count_toward_max_idle(tmp_pa
     assert run_cycle.call_count == 3
 
 
+def test_cmd_watch_restart_failed_dry_run_restores_signal_handlers(tmp_path: Path) -> None:
+    """The recovery dry-run fast path must restore original signal handlers before returning."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    original_sigint = object()
+    original_sigterm = object()
+    installs: list[tuple[signal.Signals, object]] = []
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        installs.append((sig, handler))
+        if sig == signal.SIGINT and len([call for call in installs if call[0] == signal.SIGINT]) == 1:
+            return original_sigint
+        if sig == signal.SIGTERM and len([call for call in installs if call[0] == signal.SIGTERM]) == 1:
+            return original_sigterm
+        return object()
+
+    with patch("gza.cli.watch.signal.signal", side_effect=fake_signal):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert installs[0][0] == signal.SIGINT
+    assert installs[1][0] == signal.SIGTERM
+    assert installs[-2] == (signal.SIGINT, original_sigint)
+    assert installs[-1] == (signal.SIGTERM, original_sigterm)
+
+
 def test_collect_unhandled_failures_skips_actionable_recovery_failures(tmp_path: Path) -> None:
     """With restart-failed mode active, actionable failures are excluded from backoff accounting."""
     setup_config(tmp_path)

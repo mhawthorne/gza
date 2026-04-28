@@ -43,6 +43,13 @@ You have two options for recovering:
 | `gza resume` | Continue from where it left off | Task was making progress, just needs more turns |
 | `gza retry` | Start completely fresh | Task went down a wrong path, needs a fresh start |
 
+For bulk unattended recovery after fixing an environment issue, use watch recovery mode:
+
+| Command | Behavior | Use when |
+|---------|----------|----------|
+| `gza watch --restart-failed` | Drain actionable failed tasks before pending queue work, choosing `resume` or `retry` per task | You want watch to recover the failed queue first, then continue normal processing |
+| `gza watch --restart-failed --dry-run` | Print the recovery decision report and exit | You want to inspect which failed tasks would `resume`, `retry`, or `skip` before starting recovery |
+
 ## Resume a task
 
 Resume continues the existing conversation. The AI picks up where it left off with full context of what it already did.
@@ -85,6 +92,31 @@ Stats: Runtime: 8m 12s | Turns: 32 | Cost: $0.67
 ```
 
 Retry creates a new task that reuses the same branch (if it exists) but starts a new conversation.
+
+## Recover failed tasks with watch
+
+`gza watch --restart-failed` adds an explicit recovery phase ahead of normal pending work. It is opt-in; plain `gza watch` keeps the narrower legacy auto-resume behavior.
+
+Preview the full recovery plan first:
+
+```bash
+$ gza watch --restart-failed --dry-run
+Failed recovery plan (tags=*, mode=restart-failed)
+
+resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/1
+retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/1
+skip   gza-103 review    via none    reason=task_type_out_of_scope attempt=0/1
+
+Summary: 2 actionable (1 resume, 1 retry), 1 skipped
+```
+
+Then run recovery mode for real:
+
+```bash
+$ gza watch --restart-failed
+```
+
+`--max-resume-attempts` applies both to plain-watch auto-resume and to `--restart-failed` recovery decisions.
 
 ## Check history for failed tasks
 

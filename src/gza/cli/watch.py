@@ -1153,46 +1153,46 @@ def cmd_watch(args: argparse.Namespace) -> int:
     old_sigint = signal.signal(signal.SIGINT, _handle_shutdown)
     old_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
 
-    idle_seconds = 0
-    failure_streak = 0
-    previous_snapshot = _task_snapshot(store)
-
-    # Preview first cycle and ask for confirmation before executing
-    if restart_failed and dry_run:
-        _emit_recovery_dry_run_report(
-            store=store,
-            tags=tag_filters,
-            any_tag=any_tag,
-            max_recovery_attempts=max_recovery_attempts,
-        )
-        return 0
-
-    skip_confirm = dry_run or bool(getattr(args, "yes", False))
-    if not skip_confirm:
-        preview_result = _run_cycle(
-            config=config,
-            store=store,
-            batch=batch,
-            max_iterations=max_iterations,
-            dry_run=True,
-            quiet=False,
-            log=log,
-            tags=tag_filters,
-            any_tag=any_tag,
-            restart_failed=restart_failed,
-            restart_failed_batch=restart_failed_batch,
-            max_recovery_attempts=max_recovery_attempts,
-        )
-        if preview_result.work_done:
-            try:
-                answer = input("\nProceed? [y/N] ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                answer = ""
-            if answer not in ("y", "yes"):
-                print("Aborted.")
-                return 0
-
     try:
+        idle_seconds = 0
+        failure_streak = 0
+        previous_snapshot = _task_snapshot(store)
+
+        # Preview first cycle and ask for confirmation before executing
+        if restart_failed and dry_run:
+            _emit_recovery_dry_run_report(
+                store=store,
+                tags=tag_filters,
+                any_tag=any_tag,
+                max_recovery_attempts=max_recovery_attempts,
+            )
+            return 0
+
+        skip_confirm = dry_run or bool(getattr(args, "yes", False))
+        if not skip_confirm:
+            preview_result = _run_cycle(
+                config=config,
+                store=store,
+                batch=batch,
+                max_iterations=max_iterations,
+                dry_run=True,
+                quiet=False,
+                log=log,
+                tags=tag_filters,
+                any_tag=any_tag,
+                restart_failed=restart_failed,
+                restart_failed_batch=restart_failed_batch,
+                max_recovery_attempts=max_recovery_attempts,
+            )
+            if preview_result.work_done:
+                try:
+                    answer = input("\nProceed? [y/N] ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    answer = ""
+                if answer not in ("y", "yes"):
+                    print("Aborted.")
+                    return 0
+
         while True:
             if stop_requested:
                 break
