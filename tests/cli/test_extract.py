@@ -68,6 +68,16 @@ def test_extract_requires_exactly_one_source_selector(tmp_path: Path) -> None:
     assert "exactly one source selector" in with_both.stdout
 
 
+def test_extract_help_includes_source_selectors_and_file_inputs(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    result = run_gza("extract", "--help", "--project", str(tmp_path))
+    assert result.returncode == 0
+    assert "Source full prefixed task ID to extract from" in result.stdout
+    assert "--branch BRANCH" in result.stdout
+    assert "--files-from FILE" in result.stdout
+    assert "Repo-relative files to extract from the source diff" in result.stdout
+
+
 def test_extract_requires_selected_files(tmp_path: Path) -> None:
     setup_config(tmp_path)
     git = _init_repo(tmp_path)
