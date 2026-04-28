@@ -49,6 +49,7 @@ from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
 from .lineage import get_plan_for_task
 from .pr_ops import ensure_task_pr
+from .prompt_sanitization import sanitize_provider_prompt
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .providers.base import PreflightCheckResult
@@ -3241,7 +3242,8 @@ def _run_inner(
         }
         if interaction_mode == "interactive":
             provider_run_kwargs["interactive"] = True
-        result = provider.run(task_config, prompt, log_file, worktree_path, **provider_run_kwargs)
+        provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type)
+        result = provider.run(task_config, provider_prompt, log_file, worktree_path, **provider_run_kwargs)
 
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
@@ -3493,7 +3495,8 @@ def _run_non_code_task(
             }
             if interaction_mode == "interactive":
                 provider_run_kwargs["interactive"] = True
-            result = provider.run(config, prompt, log_file, worktree_path, **provider_run_kwargs)
+            provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type)
+            result = provider.run(config, provider_prompt, log_file, worktree_path, **provider_run_kwargs)
         except KeyboardInterrupt:
             failure_reason = _interruption_failure_reason()
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), failure_reason=failure_reason)
