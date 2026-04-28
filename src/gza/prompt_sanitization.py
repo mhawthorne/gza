@@ -33,7 +33,10 @@ _RULES: tuple[_SanitizationRule, ...] = (
         replacement="paused",
     ),
     _SanitizationRule(
-        trigger=re.compile(r"\boverride(?:n)?\b", re.IGNORECASE),
+        trigger=re.compile(
+            r"\b(?:override|overrides|overriding|overridden|overrode)\b",
+            re.IGNORECASE,
+        ),
         context=re.compile(r"\b(rule|policy|instruction|constraint|guardrail|safety|sandbox)s?\b", re.IGNORECASE),
         replacement="adjust",
     ),

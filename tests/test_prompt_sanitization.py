@@ -47,3 +47,23 @@ def test_sanitize_replaces_when_context_is_within_nearby_window() -> None:
     result = sanitize_provider_prompt(prompt, task_type="review")
     assert "work within" in result
     assert "bypass" not in result.lower()
+
+
+def test_sanitize_override_overridden_with_policy_context() -> None:
+    prompt = "The policy was overridden during the run; investigate why."
+    result = sanitize_provider_prompt(prompt, task_type="review")
+    assert "overridden" not in result.lower()
+    assert "policy was adjust" in result.lower()
+
+
+def test_sanitize_override_overriding_with_guardrail_context() -> None:
+    prompt = "The agent is overriding guardrail instructions in this attempt."
+    result = sanitize_provider_prompt(prompt, task_type="improve")
+    assert "overriding" not in result.lower()
+    assert "agent is adjust guardrail" in result.lower()
+
+
+def test_sanitize_override_without_context_stays_unchanged() -> None:
+    prompt = "Use override config values for this local test harness."
+    result = sanitize_provider_prompt(prompt, task_type="review")
+    assert result == prompt
