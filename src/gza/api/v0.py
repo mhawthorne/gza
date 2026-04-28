@@ -61,8 +61,10 @@ class GzaClient:
     Parameters
     ----------
     project_dir:
-        Path to the project root (directory containing gza.yaml).
-        Defaults to the current working directory if not specified.
+        Path to the project root (directory containing gza.yaml). This is
+        strict: the provided directory itself must contain ``gza.yaml``.
+        Defaults to the current working directory discovery context when not
+        specified (nearest ancestor with ``gza.yaml``).
 
     Notes
     -----
@@ -72,7 +74,7 @@ class GzaClient:
 
     def __init__(self, project_dir: str | Path | None = None) -> None:
         resolved = Path(project_dir).resolve() if project_dir is not None else Path.cwd()
-        self._config = Config.load(resolved, discover=True)
+        self._config = Config.load(resolved, discover=project_dir is None)
         self._store = SqliteTaskStore.from_config(self._config)
 
     # ------------------------------------------------------------------ #

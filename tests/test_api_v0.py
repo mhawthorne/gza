@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from gza.config import ConfigError
 from gza.db import SqliteTaskStore
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,19 @@ class TestGzaClientConstruction:
         from gza.api.v0 import GzaClient
         client = GzaClient(str(tmp_path))
         assert client is not None
+
+    def test_client_with_explicit_subdir_is_strict_and_errors(self, tmp_path: Path):
+        root = tmp_path / "root"
+        deep = root / "a" / "b"
+        deep.mkdir(parents=True)
+
+        setup_config(root)
+        make_store(root)
+
+        from gza.api.v0 import GzaClient
+
+        with pytest.raises(ConfigError, match="Configuration file not found"):
+            GzaClient(project_dir=deep)
 
     def test_client_without_project_dir_discovers_nearest_ancestor(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         root = tmp_path / "root"
