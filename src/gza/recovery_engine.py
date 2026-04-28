@@ -8,6 +8,7 @@ from typing import Literal
 
 from .db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from .failure_policy import is_resumable_failure_reason
+from .lineage import walk_based_on_descendants
 
 _ACTIONABLE_TYPES = {"implement", "plan", "explore", "fix", "internal"}
 _MANUAL_ONLY_REASONS = {
@@ -26,6 +27,11 @@ _RETRY_REASONS = {
     "WORKER_DIED",
     "NO_ACTIVITY",
 }
+_DESCENDANT_SUPERSEDED_REASONS: tuple[tuple[str, str, str], ...] = (
+    ("completed", "recovery_already_completed", "recovery descendant already completed"),
+    ("in_progress", "recovery_already_running", "recovery descendant already in progress"),
+    ("pending", "recovery_already_pending", "recovery descendant already pending"),
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +88,10 @@ def _count_recovery_attempt_depth(store: SqliteTaskStore, task_id: str) -> int:
     return depth
 
 
+def _same_type_recovery_descendants(store: SqliteTaskStore, task: DbTask) -> list[DbTask]:
+    return list(walk_based_on_descendants(store, task, task_type=task.task_type))
+
+
 def decide_failed_task_recovery(
     store: SqliteTaskStore,
     task: DbTask,
@@ -123,7 +133,7 @@ def decide_failed_task_recovery(
     if blocked:
         return _skip("dependency_not_ready", "dependency precondition not satisfied")
 
-    children = store.get_based_on_children(task_id)
+    children = store.get_based_on_children_by_type(task_id, task.task_type)
     if any(child.status == "in_progress" for child in children):
         return _skip("recovery_already_running", "recovery child already in progress")
     pending_children = [child for child in children if child.status == "pending" and child.id is not None]
@@ -145,6 +155,18 @@ def decide_failed_task_recovery(
         )
     if any(child.status == "completed" for child in children):
         return _skip("recovery_already_completed", "recovery child already completed")
+
+    descendants = _same_type_recovery_descendants(store, task)
+    direct_child_ids = {child.id for child in children if child.id is not None}
+    deeper_descendants = [child for child in descendants if child.id not in direct_child_ids]
+    for status, reason_code, reason_text in _DESCENDANT_SUPERSEDED_REASONS:
+        if any(child.status == status for child in deeper_descendants):
+            return _skip(reason_code, reason_text)
+    if any(child.status == "failed" for child in descendants):
+        return _skip(
+            "recovery_has_newer_failed_descendant",
+            "a newer failed recovery descendant must be recovered first",
+        )
 
     if is_resumable_failure_reason(reason) and task.session_id:
         return FailedRecoveryDecision(

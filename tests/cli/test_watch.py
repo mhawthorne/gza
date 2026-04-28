@@ -316,6 +316,64 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
     assert f"RECOVR {failed.id} resume via iterate -> {spawned_task.id}" not in log_text
 
 
+def test_watch_cycle_restart_failed_reuses_existing_deep_recovery_chain_without_creating_sibling(
+    tmp_path: Path,
+) -> None:
+    """Restart-failed should continue the newest recovery branch instead of forking from an older failed ancestor."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="implement")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "MAX_TURNS"
+    root.session_id = "sess-root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_retry = store.add("Failed retry", task_type="implement", based_on=root.id)
+    assert failed_retry.id is not None
+    failed_retry.status = "failed"
+    failed_retry.failure_reason = "MAX_TURNS"
+    failed_retry.session_id = root.session_id
+    failed_retry.completed_at = datetime.now(UTC)
+    store.update(failed_retry)
+
+    pending_grandchild = store.add("Pending grandchild", task_type="implement", based_on=failed_retry.id)
+    assert pending_grandchild.id is not None
+    pending_grandchild.status = "pending"
+    pending_grandchild.session_id = root.session_id
+    store.update(pending_grandchild)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=3,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    spawned_args = spawn_iterate.call_args.args[0]
+    spawned_task = spawn_iterate.call_args.args[2]
+    assert spawned_args.resume is True
+    assert spawned_task.id == pending_grandchild.id
+    assert spawned_task.based_on == failed_retry.id
+    assert [task.id for task in store.get_based_on_children(root.id)] == [failed_retry.id]
+
+
 def test_watch_cycle_dry_run_recovery_mode_reports_actions_without_mutation(tmp_path: Path) -> None:
     """Recovery-mode dry-run should log a non-mutating recovery action preview."""
     setup_config(tmp_path)
@@ -2820,6 +2878,42 @@ def test_collect_unhandled_failures_restart_failed_keeps_manual_failures_visible
     assert [(failure.task_id, failure.reason) for failure in failures] == [(str(failed.id), "TEST_FAILURE")]
 
 
+def test_collect_unhandled_failures_restart_failed_counts_skipped_resumable_out_of_scope_failures(
+    tmp_path: Path,
+) -> None:
+    """Restart-failed should keep resumable-but-skipped failures visible to backoff accounting."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed review", task_type="review")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    old = {str(failed.id): {"status": "in_progress"}}
+    new = {
+        str(failed.id): {
+            "status": "failed",
+            "task_type": "review",
+            "failure_reason": "MAX_TURNS",
+        }
+    }
+
+    failures = _collect_unhandled_failures(
+        old,
+        new,
+        store=store,
+        config=config,
+        restart_failed_mode=True,
+        max_recovery_attempts=config.max_resume_attempts,
+    )
+    assert [(failure.task_id, failure.reason) for failure in failures] == [(str(failed.id), "MAX_TURNS")]
+
+
 @pytest.mark.parametrize("task_type", ["implement", "review", "improve", "rebase"])
 def test_collect_unhandled_failures_default_mode_skips_auto_resumable_failures(
     tmp_path: Path, task_type: str
@@ -3014,6 +3108,74 @@ def test_cmd_watch_logs_and_sleeps_for_failure_backoff(tmp_path: Path) -> None:
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
     assert "BACKOFF" in log_text
     assert "sleeping 60s before starting more work" in log_text
+
+
+def test_cmd_watch_restart_failed_logs_backoff_for_skipped_resumable_review_failure(tmp_path: Path) -> None:
+    """Restart-failed should still back off when a resumable review failure is out of recovery scope."""
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        f"worktree_dir: {worktree_dir}\n"
+        "watch:\n"
+        "  failure_backoff_initial: 60\n"
+        "  failure_backoff_max: 240\n"
+        "  failure_halt_after: 10\n"
+    )
+    store = make_store(tmp_path)
+    task = store.add("Failed review", task_type="review")
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "MAX_TURNS"
+    task.session_id = "sess-123"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    snapshots = [
+        {str(task.id): {"status": "in_progress", "task_type": "review", "failure_reason": None}},
+        {str(task.id): {"status": "in_progress", "task_type": "review", "failure_reason": None}},
+        {str(task.id): {"status": "failed", "task_type": "review", "failure_reason": "MAX_TURNS"}},
+        {str(task.id): {"status": "failed", "task_type": "review", "failure_reason": "MAX_TURNS"}},
+        {str(task.id): {"status": "failed", "task_type": "review", "failure_reason": "MAX_TURNS"}},
+    ]
+    cycle_results = [
+        _CycleResult(False, 0, 0),
+        _CycleResult(False, 0, 0),
+    ]
+    sleeps: list[int] = []
+
+    def fake_sleep(seconds: int, _stop_requested) -> None:
+        sleeps.append(seconds)
+
+    with (
+        patch("gza.cli.watch._task_snapshot", side_effect=snapshots),
+        patch("gza.cli.watch._run_cycle", side_effect=cycle_results),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert sleeps == [60]
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "BACKOFF" in log_text
+    assert f"{task.id}=MAX_TURNS" in log_text
+    assert "streak 1" in log_text
 
 
 def test_cmd_watch_halts_after_configured_failure_streak(tmp_path: Path) -> None:

@@ -415,18 +415,17 @@ def _collect_unhandled_failures(
         reason = new_row.get("failure_reason") or "UNKNOWN"
         task = store.get(task_id)
         if task is not None:
-            # Default watch mode auto-resumes a narrow set of resumable failures.
-            if is_resumable_failed_task(task):
-                continue
-            # Restart-failed mode also handles retry-eligible failures.
             if restart_failed_mode:
                 decision = decide_failed_task_recovery(
                     store,
                     task,
                     max_recovery_attempts=max_recovery_attempts,
                 )
-                if decision.action == "retry":
+                if decision.action in {"resume", "retry"}:
                     continue
+            # Default watch mode auto-resumes a narrow set of resumable failures.
+            elif is_resumable_failed_task(task):
+                continue
         failures.append(
             _ObservedFailure(
                 task_id=task_id,

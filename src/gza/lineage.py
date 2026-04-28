@@ -7,6 +7,39 @@ from collections.abc import Iterator
 from .db import SqliteTaskStore, Task
 
 
+def walk_based_on_descendants(
+    store: SqliteTaskStore,
+    task: Task,
+    *,
+    task_type: str | None = None,
+) -> Iterator[Task]:
+    """Yield descendants reachable through based_on links.
+
+    When ``task_type`` is provided, only descendants of that type are followed.
+    """
+    if task.id is None:
+        return
+
+    visited: set[str] = {task.id}
+    queue: list[Task] = (
+        list(store.get_based_on_children_by_type(task.id, task_type))
+        if task_type is not None
+        else list(store.get_based_on_children(task.id))
+    )
+
+    while queue:
+        child = queue.pop(0)
+        if child.id is None or child.id in visited:
+            continue
+        visited.add(child.id)
+        yield child
+        queue.extend(
+            store.get_based_on_children_by_type(child.id, task_type)
+            if task_type is not None
+            else store.get_based_on_children(child.id)
+        )
+
+
 def walk_ancestors(
     store: SqliteTaskStore,
     task: Task,
