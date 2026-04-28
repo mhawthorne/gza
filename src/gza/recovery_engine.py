@@ -119,6 +119,10 @@ def decide_failed_task_recovery(
     if reason in _MANUAL_ONLY_REASONS:
         return _skip("manual_failure_reason", f"{reason} requires manual intervention")
 
+    blocked, _blocking_id, _blocking_status = store.is_task_blocked(task)
+    if blocked:
+        return _skip("dependency_not_ready", "dependency precondition not satisfied")
+
     children = store.get_based_on_children(task_id)
     if any(child.status == "in_progress" for child in children):
         return _skip("recovery_already_running", "recovery child already in progress")
@@ -141,10 +145,6 @@ def decide_failed_task_recovery(
         )
     if any(child.status == "completed" for child in children):
         return _skip("recovery_already_completed", "recovery child already completed")
-
-    blocked, _blocking_id, _blocking_status = store.is_task_blocked(task)
-    if blocked:
-        return _skip("dependency_not_ready", "dependency precondition not satisfied")
 
     if is_resumable_failure_reason(reason) and task.session_id:
         return FailedRecoveryDecision(

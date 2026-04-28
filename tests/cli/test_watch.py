@@ -489,6 +489,83 @@ def test_watch_cycle_reuses_preexisting_pending_resume_child_with_resume_semanti
     assert spawned_args.retry is False
 
 
+def test_watch_cycle_blocked_pending_recovery_child_waits_for_dependency_then_reuses_child(
+    tmp_path: Path,
+) -> None:
+    """Restart-failed must not launch a blocked reused child until its dependency completes."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="plan")
+    failed = store.add("Blocked failed implement", task_type="implement", depends_on=dependency.id)
+    assert dependency.id is not None
+    assert failed.id is not None
+    dependency.status = "in_progress"
+    store.update(dependency)
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    resume_child = store.add(
+        "Pending resume child",
+        task_type="implement",
+        based_on=failed.id,
+        depends_on=dependency.id,
+    )
+    assert resume_child.id is not None
+    resume_child.status = "pending"
+    resume_child.session_id = failed.session_id
+    store.update(resume_child)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        blocked_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+        dependency.status = "completed"
+        dependency.completed_at = datetime.now(UTC)
+        store.update(dependency)
+
+        ready_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert blocked_result.work_done is False
+    assert ready_result.work_done is True
+    assert spawn_worker.call_count == 0
+    assert spawn_iterate.call_count == 1
+    spawned_args = spawn_iterate.call_args.args[0]
+    spawned_task = spawn_iterate.call_args.args[2]
+    assert spawned_task.id == resume_child.id
+    assert spawned_args.resume is True
+    assert spawned_args.retry is False
+    assert len(store.get_based_on_children(failed.id)) == 1
+
+
 def test_watch_cycle_restart_failed_drains_failed_queue_before_pending_queue(tmp_path: Path) -> None:
     """Pending work must not start while actionable failed tasks remain beyond restart_failed_batch."""
     setup_config(tmp_path)

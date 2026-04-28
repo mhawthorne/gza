@@ -80,6 +80,44 @@ def test_recovery_engine_existing_pending_resume_child_reuses_resume_semantics(t
     assert decision.reuse_existing is True
 
 
+def test_recovery_engine_blocked_failed_task_with_pending_child_skips_until_dependency_ready(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="plan")
+    failed = store.add("Blocked failed task", task_type="implement", depends_on=dependency.id)
+    assert dependency.id is not None
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-1"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    child = store.add("Pending recovery child", task_type=failed.task_type, based_on=failed.id, depends_on=dependency.id)
+    assert child.id is not None
+    child.status = "pending"
+    child.session_id = failed.session_id
+    store.update(child)
+
+    blocked_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert blocked_decision.action == "skip"
+    assert blocked_decision.reason_code == "dependency_not_ready"
+    assert blocked_decision.recovery_task_id is None
+    assert blocked_decision.reuse_existing is False
+
+    dependency.status = "completed"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    ready_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert ready_decision.action == "resume"
+    assert ready_decision.recovery_task_id == child.id
+    assert ready_decision.reuse_existing is True
+
+
 def test_recovery_engine_manual_reason_with_pending_child_still_skips(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, task_type="plan", reason="TEST_FAILURE", session_id=None)
     child = store.add("Pending retry child", task_type=task.task_type, based_on=task.id)

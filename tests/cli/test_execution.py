@@ -2616,6 +2616,116 @@ class TestImproveCommand:
         assert newest.based_on == impl_task.id
         assert newest.depends_on is None
 
+    def test_improve_comments_only_retry_resets_omitted_review_model_and_provider_flags(self, tmp_path: Path):
+        """Comments-only improve retries should not inherit stale CLI flags when omitted."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Retry comments-only improve after infra failure.")
+
+        first = run_gza(
+            "improve",
+            str(impl_task.id),
+            "--queue",
+            "--review",
+            "--model",
+            "gpt-5.3-codex",
+            "--provider",
+            "codex",
+            "--project",
+            str(tmp_path),
+        )
+        assert first.returncode == 0, first.stdout
+
+        failed_improve = next(task for task in store.get_all() if task.task_type == "improve")
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed_improve.session_id = None
+        store.update(failed_improve)
+
+        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert second.returncode == 0, second.stdout
+        assert f"(retry of {failed_improve.id})" in second.stdout
+
+        retry_task = max(
+            (task for task in store.get_all() if task.task_type == "improve"),
+            key=lambda task: task_id_numeric_key(task.id),
+        )
+        assert retry_task.id != failed_improve.id
+        assert retry_task.based_on == failed_improve.id
+        assert retry_task.create_review is False
+        assert retry_task.model is None
+        assert retry_task.provider is None
+        assert retry_task.provider_is_explicit is False
+
+    def test_improve_comments_only_retry_honors_explicit_review_model_and_provider_overrides(
+        self, tmp_path: Path
+    ):
+        """Comments-only improve retries should apply the current invocation overrides."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Retry comments-only improve with new flags.")
+
+        first = run_gza(
+            "improve",
+            str(impl_task.id),
+            "--queue",
+            "--model",
+            "gpt-5.3-codex",
+            "--provider",
+            "codex",
+            "--project",
+            str(tmp_path),
+        )
+        assert first.returncode == 0, first.stdout
+
+        failed_improve = next(task for task in store.get_all() if task.task_type == "improve")
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed_improve.session_id = None
+        store.update(failed_improve)
+
+        second = run_gza(
+            "improve",
+            str(impl_task.id),
+            "--queue",
+            "--review",
+            "--model",
+            "gpt-5.4",
+            "--provider",
+            "claude",
+            "--project",
+            str(tmp_path),
+        )
+        assert second.returncode == 0, second.stdout
+        assert f"(retry of {failed_improve.id})" in second.stdout
+
+        retry_task = max(
+            (task for task in store.get_all() if task.task_type == "improve"),
+            key=lambda task: task_id_numeric_key(task.id),
+        )
+        assert retry_task.id != failed_improve.id
+        assert retry_task.based_on == failed_improve.id
+        assert retry_task.create_review is True
+        assert retry_task.model == "gpt-5.4"
+        assert retry_task.provider == "claude"
+        assert retry_task.provider_is_explicit is True
+
     def test_improve_comments_only_in_progress_task_with_newer_comment_creates_fresh_task(self, tmp_path: Path):
         """In-progress comments-only improve is ignored when newer unresolved comments require a new pass."""
         setup_config(tmp_path)

@@ -1332,13 +1332,14 @@ def cmd_improve(args: argparse.Namespace) -> int:
         elif comments_action == "retry":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
             improve_task = _create_retry_task(store, existing_comments_improve)
-            if create_review:
-                improve_task.create_review = True
-            if model is not None:
-                improve_task.model = model
-            if provider is not None:
-                improve_task.provider = provider
-                improve_task.provider_is_explicit = True
+            # Comments-only improve retries keep the shared retry creator, but
+            # preserve the historical cmd_improve contract: omitted CLI flags
+            # reset to the current invocation defaults instead of inheriting
+            # stale values from the failed improve task.
+            improve_task.create_review = create_review
+            improve_task.model = model
+            improve_task.provider = provider
+            improve_task.provider_is_explicit = provider is not None
             store.update(improve_task)
             action_message = f"Created improve task {improve_task.id} (retry of {existing_comments_improve.id})"
         else:
