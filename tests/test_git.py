@@ -1213,8 +1213,39 @@ class TestGetDiffNumstat:
             mock_run.return_value = MagicMock(returncode=0, stdout=numstat_output, stderr="")
             result = git.get_diff_numstat("main...feature")
 
-            mock_run.assert_called_once_with("diff", "--numstat", "main...feature", check=False)
+            mock_run.assert_called_once_with(
+                "diff",
+                "--numstat",
+                "--find-renames",
+                "--find-copies",
+                "--find-copies-harder",
+                "main...feature",
+                check=False,
+            )
             assert result == numstat_output
+
+    def test_get_diff_numstat_scoped_to_paths(self, tmp_path: Path):
+        """get_diff_numstat includes path filter after rename/copy flags."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="1\t0\tsrc/file.py\n", stderr="")
+            result = git.get_diff_numstat("main...feature", ("src/file.py",))
+
+            assert result == "1\t0\tsrc/file.py"
+            mock_run.assert_called_once_with(
+                "diff",
+                "--numstat",
+                "--find-renames",
+                "--find-copies",
+                "--find-copies-harder",
+                "main...feature",
+                "--",
+                "src/file.py",
+                check=False,
+            )
 
     def test_get_diff_numstat_strips_output(self, tmp_path: Path):
         """get_diff_numstat strips trailing whitespace from output."""
@@ -1373,6 +1404,30 @@ class TestExtractionGitHelpers:
                 "diff",
                 "--name-status",
                 "--find-renames",
+                "--find-copies",
+                "--find-copies-harder",
+                "main...feature",
+                "--",
+                "src/file.py",
+                check=False,
+            )
+
+    def test_get_diff_patch_for_paths_uses_rename_copy_detection(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="diff --git ...", stderr="")
+            output = git.get_diff_patch_for_paths("main...feature", ("src/file.py",), binary=True)
+
+            assert output == "diff --git ..."
+            mock_run.assert_called_once_with(
+                "diff",
+                "--find-renames",
+                "--find-copies",
+                "--find-copies-harder",
+                "--binary",
                 "main...feature",
                 "--",
                 "src/file.py",

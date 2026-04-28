@@ -409,7 +409,11 @@ class Git:
         result = self._run(*args, check=False)
         return result.stdout.strip()
 
-    def get_diff_numstat(self, revision_range: str) -> str:
+    def get_diff_numstat(
+        self,
+        revision_range: str,
+        paths: tuple[str, ...] | list[str] = (),
+    ) -> str:
         """Get diff --numstat output for a revision range.
 
         Args:
@@ -418,7 +422,11 @@ class Git:
         Returns:
             The diff --numstat output as a string (machine-readable)
         """
-        result = self._run("diff", "--numstat", revision_range, check=False)
+        args = ["diff", "--numstat", "--find-renames", "--find-copies", "--find-copies-harder", revision_range]
+        if paths:
+            args.append("--")
+            args.extend(paths)
+        result = self._run(*args, check=False)
         return result.stdout.strip()
 
     def get_diff_stat(self, revision_range: str) -> str:
@@ -484,7 +492,7 @@ class Git:
 
     def get_diff_name_status(self, revision_range: str, paths: tuple[str, ...] | list[str] = ()) -> str:
         """Get machine-readable name/status output for a revision range and optional paths."""
-        args = ["diff", "--name-status", "--find-renames", revision_range]
+        args = ["diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", revision_range]
         if paths:
             args.append("--")
             args.extend(paths)
@@ -499,7 +507,7 @@ class Git:
         binary: bool = False,
     ) -> str:
         """Get patch text for a revision range scoped to specific paths."""
-        args = ["diff", "--find-renames"]
+        args = ["diff", "--find-renames", "--find-copies", "--find-copies-harder"]
         if binary:
             args.append("--binary")
         args.append(revision_range)

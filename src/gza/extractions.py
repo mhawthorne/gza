@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .db import SqliteTaskStore, Task
-from .git import Git
+from .git import Git, _split_rename_paths, _unquote_c_style_path
 
 EXTRACTIONS_DIR = Path(".gza") / "extractions"
 MANIFEST_FILENAME = "manifest.json"
@@ -173,7 +173,7 @@ def plan_extraction(
 
     revision_range = f"{source.source_base_ref}...{source.source_branch}"
     name_status_text = git.get_diff_name_status(revision_range, selected_paths)
-    numstat_text = git.get_diff_numstat(revision_range)
+    numstat_text = git.get_diff_numstat(revision_range, selected_paths)
     summaries = _parse_file_summaries(name_status_text, numstat_text, selected_paths)
     _ensure_every_selected_path_changed(summaries, selected_paths)
 
@@ -469,7 +469,7 @@ def _parse_file_summaries(
     selected_paths: tuple[str, ...],
 ) -> list[FileDiffSummary]:
     selected = set(selected_paths)
-    diff_stats = _parse_numstat_stats(numstat_text)
+    stats_by_path = _parse_numstat_by_path(numstat_text)
     out: list[FileDiffSummary] = []
 
     for line in name_status_text.splitlines():
@@ -495,16 +495,12 @@ def _parse_file_summaries(
             continue
 
         selected_path = match_paths[0]
-        additions: int | None = None
-        deletions: int | None = None
-        binary = False
-
-        stat_key = next(
-            (path for path in (selected_path, old_path, new_path) if path and path in diff_stats),
-            None,
-        )
-        if stat_key is not None:
-            additions, deletions, binary = diff_stats[stat_key]
+        additions, deletions, binary = stats_by_path.get(selected_path, (None, None, False))
+        if (additions, deletions, binary) == (None, None, False):
+            if new_path and new_path in stats_by_path:
+                additions, deletions, binary = stats_by_path[new_path]
+            elif old_path and old_path in stats_by_path:
+                additions, deletions, binary = stats_by_path[old_path]
 
         out.append(
             FileDiffSummary(
@@ -524,60 +520,82 @@ def _parse_file_summaries(
     return out
 
 
-def _parse_numstat_stats(numstat_text: str) -> dict[str, tuple[int | None, int | None, bool]]:
+def _parse_numstat_by_path(numstat_text: str) -> dict[str, tuple[int | None, int | None, bool]]:
     stats: dict[str, tuple[int | None, int | None, bool]] = {}
+
     for line in numstat_text.splitlines():
-        parts = line.split("\t", 2)
-        if len(parts) < 3:
+        stripped = line.strip()
+        if not stripped:
             continue
 
-        raw_additions, raw_deletions, raw_path = parts
-        raw_path = raw_path.strip()
-        if not raw_path:
+        parts = stripped.split("\t", 2)
+        if len(parts) != 3:
             continue
 
-        binary = raw_additions == "-" or raw_deletions == "-"
-        if binary:
-            additions: int | None = None
-            deletions: int | None = None
-        else:
-            try:
-                additions = int(raw_additions)
-                deletions = int(raw_deletions)
-            except ValueError:
-                continue
+        raw_additions, raw_deletions, pathspec = parts
+        pathspec = pathspec.strip()
+        if not pathspec:
+            continue
 
-        for path in _expand_numstat_paths(raw_path):
-            stats[path] = (additions, deletions, binary)
+        path_keys = _numstat_path_keys(pathspec)
+        if not path_keys:
+            continue
+
+        if raw_additions == "-" and raw_deletions == "-":
+            for path_key in path_keys:
+                stats[path_key] = (None, None, True)
+            continue
+
+        try:
+            additions = int(raw_additions)
+            deletions = int(raw_deletions)
+        except ValueError:
+            continue
+
+        for path_key in path_keys:
+            stats[path_key] = (additions, deletions, False)
+
     return stats
 
 
-def _expand_numstat_paths(pathspec: str) -> tuple[str, ...]:
-    if " => " not in pathspec:
-        return (_strip_quotes(pathspec),)
+def _numstat_path_keys(pathspec: str) -> tuple[str, ...]:
+    brace_rename_paths = _split_braced_rename_paths(pathspec)
+    if brace_rename_paths is not None:
+        return brace_rename_paths
 
-    brace_start = pathspec.find("{")
-    brace_end = pathspec.rfind("}")
-    if brace_start >= 0 and brace_end > brace_start:
-        inside = pathspec[brace_start + 1 : brace_end]
-        if " => " in inside:
-            old_inside, new_inside = inside.split(" => ", 1)
-            prefix = pathspec[:brace_start]
-            suffix = pathspec[brace_end + 1 :]
-            return (
-                _strip_quotes(prefix + old_inside + suffix),
-                _strip_quotes(prefix + new_inside + suffix),
-            )
+    rename_paths = _split_rename_paths(pathspec)
+    if rename_paths is None:
+        return (_unquote_c_style_path(pathspec),)
 
-    old_path, new_path = pathspec.split(" => ", 1)
-    return (_strip_quotes(old_path), _strip_quotes(new_path))
+    old_raw, new_raw = rename_paths
+    old_path = _unquote_c_style_path(old_raw.strip())
+    new_path = _unquote_c_style_path(new_raw.strip())
+    if not old_path and not new_path:
+        return ()
+    if old_path == new_path:
+        return (old_path,)
+    if old_path and new_path:
+        return (old_path, new_path)
+    return (old_path or new_path,)
 
 
-def _strip_quotes(path: str) -> str:
-    stripped = path.strip()
-    if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
-        return stripped[1:-1]
-    return stripped
+def _split_braced_rename_paths(pathspec: str) -> tuple[str, str] | None:
+    start = pathspec.find("{")
+    end = pathspec.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    inner = pathspec[start + 1 : end]
+    marker = " => "
+    if marker not in inner:
+        return None
+
+    old_inner, new_inner = inner.split(marker, 1)
+    prefix = pathspec[:start]
+    suffix = pathspec[end + 1 :]
+    old_path = _unquote_c_style_path((prefix + old_inner + suffix).strip())
+    new_path = _unquote_c_style_path((prefix + new_inner + suffix).strip())
+    return (old_path, new_path)
 
 
 def _ensure_every_selected_path_changed(
