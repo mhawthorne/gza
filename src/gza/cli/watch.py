@@ -824,7 +824,7 @@ def _run_cycle(
                     failure_message=f"{failed.id} -> {recovered_task_id}: iterate worker spawn failed",
                     dedupe_key=f"spawn-iterate-failed:{failed.id}:{recovered_task_id}",
                     spawn_fn=lambda: _spawn_background_iterate(
-                        argparse.Namespace(max_iterations=max_iterations, no_docker=False, resume=False, retry=False),
+                        argparse.Namespace(max_iterations=max_iterations, no_docker=False, resume=True, retry=False),
                         config,
                         recovered_task,
                     ),

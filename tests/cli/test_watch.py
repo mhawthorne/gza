@@ -212,7 +212,7 @@ def test_watch_cycle_recovery_mode_resumes_failed_task_before_starting_new_pendi
     assert spawn_iterate.call_count == 1
     spawned_args = spawn_iterate.call_args.args[0]
     spawned_task = spawn_iterate.call_args.args[2]
-    assert spawned_args.resume is False
+    assert spawned_args.resume is True
     assert spawned_args.retry is False
     assert spawned_task.based_on == failed.id
 
@@ -272,7 +272,8 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
     store.update(failed)
 
     config = Config.load(tmp_path)
-    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -297,6 +298,9 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
     assert spawned_args.resume is False
     assert spawned_args.retry is False
     assert spawned_task.based_on == failed.id
+    log_text = log_path.read_text()
+    assert f"RECOVR {failed.id} retry via iterate -> {spawned_task.id}" in log_text
+    assert f"RECOVR {failed.id} resume via iterate -> {spawned_task.id}" not in log_text
 
 
 def test_watch_cycle_dry_run_recovery_mode_reports_actions_without_mutation(tmp_path: Path) -> None:
