@@ -4781,6 +4781,132 @@ class TestSharedDbIsolationAndImportGating:
         assert conflict.returncode == 1
         assert "Conflicting task IDs already exist" in conflict.stderr
 
+    def test_import_local_db_conflicts_on_run_steps_payload_drift(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportstep01\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+        marker_path = project_dir / ".gza" / "shared-db-import.json"
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        task = legacy_store.add("legacy task")
+        legacy_store.emit_step(task.id, "local message", provider="codex")
+
+        first = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert first.returncode == 0, first.stderr
+        assert marker_path.exists()
+
+        with sqlite3.connect(local_db) as conn:
+            conn.execute(
+                """
+                UPDATE run_steps
+                SET message_text = ?
+                WHERE run_id = ? AND step_index = ?
+                """,
+                ("conflicting local message", task.id, 1),
+            )
+        marker_path.unlink()
+        assert not marker_path.exists()
+
+        conflict = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert conflict.returncode == 1
+        assert "Conflicting run_steps rows already exist" in conflict.stderr
+        assert not marker_path.exists()
+
+        config = Config.load(project_dir)
+        shared_store = SqliteTaskStore(shared_db, prefix=config.project_prefix, project_id=config.project_id)
+        imported_steps = shared_store.get_run_steps(task.id)
+        assert len(imported_steps) == 1
+        assert imported_steps[0].message_text == "local message"
+
+    def test_import_local_db_conflicts_on_run_substeps_payload_drift(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportsubstep01\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+        marker_path = project_dir / ".gza" / "shared-db-import.json"
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        task = legacy_store.add("legacy task")
+        step = legacy_store.emit_step(task.id, "local message", provider="codex")
+        legacy_store.emit_substep(step, "tool_call", {"ok": True}, source="assistant")
+
+        first = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert first.returncode == 0, first.stderr
+        assert marker_path.exists()
+
+        with sqlite3.connect(local_db) as conn:
+            conn.execute(
+                """
+                UPDATE run_substeps
+                SET payload_json = ?
+                WHERE run_id = ? AND substep_index = ?
+                """,
+                ('{"ok": false}', task.id, 1),
+            )
+        marker_path.unlink()
+        assert not marker_path.exists()
+
+        conflict = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert conflict.returncode == 1
+        assert "Conflicting run_substeps rows already exist" in conflict.stderr
+        assert not marker_path.exists()
+
+        config = Config.load(project_dir)
+        shared_store = SqliteTaskStore(shared_db, prefix=config.project_prefix, project_id=config.project_id)
+        imported_steps = shared_store.get_run_steps(task.id)
+        assert len(imported_steps) == 1
+        imported_substeps = shared_store.get_run_substeps(
+            StepRef(
+                id=imported_steps[0].id,
+                run_id=imported_steps[0].run_id,
+                step_index=imported_steps[0].step_index,
+                step_id=imported_steps[0].step_id,
+            )
+        )
+        assert len(imported_substeps) == 1
+        assert imported_substeps[0].payload == {"ok": True}
+
     def test_import_local_db_dry_run_does_not_create_missing_shared_db(self, tmp_path: Path) -> None:
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)

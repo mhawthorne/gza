@@ -4197,7 +4197,29 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
     task_import_columns_sql = ", ".join(f'"{c}"' if c == "group" else c for c in task_import_columns)
     project_id, project_prefix = _project_identity_from_config(config)
 
-    def _find_conflicts(conn: sqlite3.Connection, local_rows: list[sqlite3.Row]) -> list[str]:
+    run_step_payload_columns = (
+        "provider",
+        "message_role",
+        "message_text",
+        "started_at",
+        "completed_at",
+        "outcome",
+        "summary",
+        "legacy_turn_id",
+        "legacy_event_id",
+    )
+    run_substep_payload_columns = (
+        "run_id",
+        "type",
+        "source",
+        "call_id",
+        "payload_json",
+        "timestamp",
+        "legacy_turn_id",
+        "legacy_event_id",
+    )
+
+    def _find_task_conflicts(conn: sqlite3.Connection, local_rows: list[sqlite3.Row]) -> list[str]:
         local_ids = [str(row["id"]) for row in local_rows]
         if not local_ids:
             return []
@@ -4220,6 +4242,120 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                 conflicts.append(str(row["id"]))
         return conflicts
 
+    def _find_run_step_conflicts(
+        shared_conn: sqlite3.Connection,
+        legacy_conn: sqlite3.Connection,
+    ) -> list[str]:
+        if not _table_exists(legacy_conn, "run_steps"):
+            return []
+        local_rows = legacy_conn.execute(
+            """
+            SELECT run_id, step_index, step_id, provider, message_role, message_text,
+                   started_at, completed_at, outcome, summary, legacy_turn_id, legacy_event_id
+            FROM run_steps
+            ORDER BY id
+            """
+        ).fetchall()
+        conflicts: list[str] = []
+        for local_row in local_rows:
+            matches = shared_conn.execute(
+                """
+                SELECT id, run_id, step_index, step_id, provider, message_role, message_text,
+                       started_at, completed_at, outcome, summary, legacy_turn_id, legacy_event_id
+                FROM run_steps
+                WHERE project_id = ? AND run_id = ? AND (step_index = ? OR step_id = ?)
+                """,
+                (
+                    project_id,
+                    local_row["run_id"],
+                    local_row["step_index"],
+                    local_row["step_id"],
+                ),
+            ).fetchall()
+            if not matches:
+                continue
+            exact_matches = [
+                row
+                for row in matches
+                if row["step_index"] == local_row["step_index"] and row["step_id"] == local_row["step_id"]
+            ]
+            identity = f"{local_row['run_id']}:{local_row['step_index']}:{local_row['step_id']}"
+            if len(matches) > 1 or len(exact_matches) != 1:
+                conflicts.append(identity)
+                continue
+            shared_row = exact_matches[0]
+            if any(shared_row[column] != local_row[column] for column in run_step_payload_columns):
+                conflicts.append(identity)
+        return conflicts
+
+    def _find_run_substep_conflicts(
+        shared_conn: sqlite3.Connection,
+        legacy_conn: sqlite3.Connection,
+    ) -> list[str]:
+        if not (_table_exists(legacy_conn, "run_steps") and _table_exists(legacy_conn, "run_substeps")):
+            return []
+        local_rows = legacy_conn.execute(
+            """
+            SELECT sub.run_id, sub.substep_index, sub.substep_id, sub.type, sub.source, sub.call_id,
+                   sub.payload_json, sub.timestamp, sub.legacy_turn_id, sub.legacy_event_id,
+                   step.run_id AS parent_run_id, step.step_index AS parent_step_index, step.step_id AS parent_step_id
+            FROM run_substeps sub
+            JOIN run_steps step ON sub.step_id = step.id
+            ORDER BY sub.id
+            """
+        ).fetchall()
+        conflicts: list[str] = []
+        for local_row in local_rows:
+            shared_step = shared_conn.execute(
+                """
+                SELECT id
+                FROM run_steps
+                WHERE project_id = ? AND run_id = ? AND step_index = ? AND step_id = ?
+                """,
+                (
+                    project_id,
+                    local_row["parent_run_id"],
+                    local_row["parent_step_index"],
+                    local_row["parent_step_id"],
+                ),
+            ).fetchone()
+            if shared_step is None:
+                continue
+            shared_step_id = int(shared_step["id"])
+            matches = shared_conn.execute(
+                """
+                SELECT run_id, substep_index, substep_id, type, source, call_id, payload_json,
+                       timestamp, legacy_turn_id, legacy_event_id
+                FROM run_substeps
+                WHERE project_id = ? AND step_id = ? AND (substep_index = ? OR substep_id = ?)
+                """,
+                (
+                    project_id,
+                    shared_step_id,
+                    local_row["substep_index"],
+                    local_row["substep_id"],
+                ),
+            ).fetchall()
+            if not matches:
+                continue
+            exact_matches = [
+                row
+                for row in matches
+                if row["substep_index"] == local_row["substep_index"]
+                and row["substep_id"] == local_row["substep_id"]
+            ]
+            identity = (
+                f"{local_row['parent_run_id']}:{local_row['parent_step_index']}:"
+                f"{local_row['substep_index']}:{local_row['substep_id']}"
+            )
+            if len(matches) > 1 or len(exact_matches) != 1:
+                conflicts.append(identity)
+                continue
+            shared_row = exact_matches[0]
+            if any(shared_row[column] != local_row[column] for column in run_substep_payload_columns):
+                conflicts.append(identity)
+        return conflicts
+
     local_conn = sqlite3.connect(f"file:{local_db}?mode=ro", uri=True)
     local_conn.row_factory = sqlite3.Row
     try:
@@ -4234,11 +4370,25 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                     shared_ro = sqlite3.connect(f"file:{shared_db}?mode=ro", uri=True)
                     shared_ro.row_factory = sqlite3.Row
                     try:
-                        conflicts = _find_conflicts(shared_ro, local_task_rows)
-                        if conflicts:
-                            sample = ", ".join(conflicts[:5])
+                        task_conflicts = _find_task_conflicts(shared_ro, local_task_rows)
+                        if task_conflicts:
+                            sample = ", ".join(task_conflicts[:5])
                             raise ValueError(
                                 "Conflicting task IDs already exist in shared DB for this project_id: "
+                                f"{sample}. Resolve conflicts before importing."
+                            )
+                        run_step_conflicts = _find_run_step_conflicts(shared_ro, local_conn)
+                        if run_step_conflicts:
+                            sample = ", ".join(run_step_conflicts[:5])
+                            raise ValueError(
+                                "Conflicting run_steps rows already exist in shared DB for this project_id: "
+                                f"{sample}. Resolve conflicts before importing."
+                            )
+                        run_substep_conflicts = _find_run_substep_conflicts(shared_ro, local_conn)
+                        if run_substep_conflicts:
+                            sample = ", ".join(run_substep_conflicts[:5])
+                            raise ValueError(
+                                "Conflicting run_substeps rows already exist in shared DB for this project_id: "
                                 f"{sample}. Resolve conflicts before importing."
                             )
                         existing_count = int(
@@ -4266,11 +4416,25 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         store = SqliteTaskStore.from_config(config, allow_legacy_local_db=True)
         with store._connect() as shared_conn:
             shared_conn.execute("ATTACH DATABASE ? AS legacy_local", (str(local_db),))
-            conflicts = _find_conflicts(shared_conn, local_task_rows)
-            if conflicts:
-                sample = ", ".join(conflicts[:5])
+            task_conflicts = _find_task_conflicts(shared_conn, local_task_rows)
+            if task_conflicts:
+                sample = ", ".join(task_conflicts[:5])
                 raise ValueError(
                     "Conflicting task IDs already exist in shared DB for this project_id: "
+                    f"{sample}. Resolve conflicts before importing."
+                )
+            run_step_conflicts = _find_run_step_conflicts(shared_conn, local_conn)
+            if run_step_conflicts:
+                sample = ", ".join(run_step_conflicts[:5])
+                raise ValueError(
+                    "Conflicting run_steps rows already exist in shared DB for this project_id: "
+                    f"{sample}. Resolve conflicts before importing."
+                )
+            run_substep_conflicts = _find_run_substep_conflicts(shared_conn, local_conn)
+            if run_substep_conflicts:
+                sample = ", ".join(run_substep_conflicts[:5])
+                raise ValueError(
+                    "Conflicting run_substeps rows already exist in shared DB for this project_id: "
                     f"{sample}. Resolve conflicts before importing."
                 )
 
