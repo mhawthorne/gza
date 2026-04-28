@@ -204,6 +204,16 @@ class TestHelpOutput:
         assert "use `gza queue --tag TAG` to preview the same scoped pickup order" in docs_text
         assert "canonical preview for what `gza watch --tag release-1.2` will consider and in what order" in docs_text
 
+    def test_watch_help_mentions_restart_failed_flags(self, tmp_path):
+        """watch --help should advertise failed-recovery mode flags."""
+        setup_config(tmp_path)
+        result = run_gza("watch", "--help", "--project", str(tmp_path))
+        assert result.returncode == 0
+        text = " ".join(result.stdout.split())
+        assert "--restart-failed" in text
+        assert "--restart-failed-batch" in text
+        assert "--max-resume-attempts" in text
+
     def test_queue_help_and_docs_describe_default_limit_and_all_overrides(self, tmp_path):
         """`queue --help` and docs should describe capped default output and all-task overrides."""
         setup_config(tmp_path)

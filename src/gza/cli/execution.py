@@ -45,6 +45,7 @@ from ._common import (
     _create_or_reuse_followup_tasks,
     _create_rebase_task,
     _create_resume_task,
+    _create_retry_task,
     _create_review_task,
     _run_as_worker,
     _run_foreground,
@@ -985,32 +986,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
         print(f"Error: Task {task_id} already has a successful retry ({successful_retry.id}).")
         return 1
 
-    # For same_branch tasks (improve/review) that have run and have a branch,
-    # fork a new branch from the parent branch instead of reusing it.
-    # This gives the retry agent a clean start without inheriting WIP commits
-    # from the failed attempt.
-    retry_same_branch = task.same_branch
-    retry_base_branch: str | None = None
-    if task.same_branch and task.branch:
-        retry_same_branch = False
-        retry_base_branch = task.branch
-
-    # Create new task copying relevant fields
-    new_task = store.add(
-        prompt=task.prompt,
-        task_type=task.task_type,
-        tags=task.tags,
-        spec=task.spec,
-        depends_on=task.depends_on,
-        create_review=task.create_review,
-        same_branch=retry_same_branch,
-        task_type_hint=task.task_type_hint,
-        based_on=task_id,  # Track retry lineage
-        model=task.model,
-        provider=task.provider if task.provider_is_explicit else None,
-        provider_is_explicit=task.provider_is_explicit,
-        base_branch=retry_base_branch,
-    )
+    new_task = _create_retry_task(store, task)
 
     print(f"✓ Created task {new_task.id} (retry of {task_id})")
 
@@ -1355,23 +1331,15 @@ def cmd_improve(args: argparse.Namespace) -> int:
             action_message = f"Created improve task {improve_task.id} (resume of {existing_comments_improve.id})"
         elif comments_action == "retry":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
-            retry_same_branch = existing_comments_improve.same_branch
-            retry_base_branch: str | None = None
-            if existing_comments_improve.same_branch and existing_comments_improve.branch:
-                retry_same_branch = False
-                retry_base_branch = existing_comments_improve.branch
-            improve_task = store.add(
-                prompt=existing_comments_improve.prompt,
-                task_type="improve",
-                depends_on=None,
-                based_on=existing_comments_improve.id,
-                same_branch=retry_same_branch,
-                tags=existing_comments_improve.tags,
-                base_branch=retry_base_branch,
-                create_review=create_review,
-                model=model,
-                provider=provider,
-            )
+            improve_task = _create_retry_task(store, existing_comments_improve)
+            if create_review:
+                improve_task.create_review = True
+            if model is not None:
+                improve_task.model = model
+            if provider is not None:
+                improve_task.provider = provider
+                improve_task.provider_is_explicit = True
+            store.update(improve_task)
             action_message = f"Created improve task {improve_task.id} (retry of {existing_comments_improve.id})"
         else:
             try:

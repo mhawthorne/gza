@@ -578,6 +578,45 @@ class TestRetryCommand:
         assert retry_task.same_branch is False
         assert retry_task.base_branch == "feature/impl-branch"
 
+    def test_create_retry_task_shared_helper_preserves_retry_contract(self, tmp_path: Path):
+        """Shared retry creator keeps cmd_retry branch/base-branch semantics and metadata copy."""
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        dep = store.add("Dependency", task_type="plan")
+        assert dep.id is not None
+
+        original = store.add(
+            "Retry me",
+            task_type="improve",
+            depends_on=dep.id,
+            same_branch=True,
+            tags=("release-1.2",),
+            spec="docs/spec.md",
+            model="gpt-5.3-codex",
+            provider="codex",
+        )
+        assert original.id is not None
+        original.status = "failed"
+        original.branch = "feature/old"
+        original.task_type_hint = "feature"
+        original.provider_is_explicit = True
+        store.update(original)
+
+        retry_task = _create_retry_task(store, original)
+        assert retry_task.based_on == original.id
+        assert retry_task.prompt == original.prompt
+        assert retry_task.task_type == original.task_type
+        assert retry_task.depends_on == original.depends_on
+        assert retry_task.tags == original.tags
+        assert retry_task.spec == original.spec
+        assert retry_task.model == original.model
+        assert retry_task.provider == original.provider
+        assert retry_task.provider_is_explicit is True
+        assert retry_task.same_branch is False
+        assert retry_task.base_branch == "feature/old"
+
     def test_retry_does_not_copy_non_explicit_provider(self, tmp_path: Path):
         """Retry should not preserve provider that came from resolved default state."""
 

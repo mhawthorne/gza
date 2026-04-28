@@ -171,8 +171,8 @@ def test_watch_cycle_group_prefers_explicit_queue_order(tmp_path: Path) -> None:
     assert spawn_worker.call_args.kwargs["task_id"] == ordered.id
 
 
-def test_watch_cycle_resumes_failed_task_before_starting_new_pending(tmp_path: Path) -> None:
-    """Resume-eligible failed tasks consume slots before new pending tasks."""
+def test_watch_cycle_recovery_mode_resumes_failed_task_before_starting_new_pending(tmp_path: Path) -> None:
+    """With restart-failed enabled, failed recoveries consume slots before pending work."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -203,15 +203,17 @@ def test_watch_cycle_resumes_failed_task_before_starting_new_pending(tmp_path: P
             max_iterations=10,
             dry_run=False,
             log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
         )
 
     assert result.work_done is True
-    assert spawn_resume.call_count == 1
-    assert spawn_iterate.call_count == 0
+    assert spawn_resume.call_count == 0
+    assert spawn_iterate.call_count == 1
 
 
-def test_watch_cycle_dry_run_reuses_existing_pending_resume_child_in_log(tmp_path: Path) -> None:
-    """Dry-run resume planning should reference an existing pending resume child."""
+def test_watch_cycle_dry_run_recovery_mode_reports_actions_without_mutation(tmp_path: Path) -> None:
+    """Recovery-mode dry-run should log a non-mutating recovery action preview."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -222,11 +224,6 @@ def test_watch_cycle_dry_run_reuses_existing_pending_resume_child_in_log(tmp_pat
     failed.session_id = "sess-123"
     failed.completed_at = datetime.now(UTC)
     store.update(failed)
-
-    resume_child = store.add("Resume child", task_type="implement", based_on=failed.id)
-    assert resume_child.id is not None
-    resume_child.session_id = failed.session_id
-    store.update(resume_child)
 
     config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
@@ -243,16 +240,18 @@ def test_watch_cycle_dry_run_reuses_existing_pending_resume_child_in_log(tmp_pat
             max_iterations=10,
             dry_run=True,
             log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
         )
 
     assert result.work_done is True
     log_text = log_path.read_text()
-    assert f"RESUME {failed.id} -> {resume_child.id}" in log_text
-    assert "(new task)" not in log_text
+    assert f"RECOVR {failed.id} resume via iterate -> (new task)" in log_text
+    assert len(store.get_based_on_children(failed.id)) == 0
 
 
-def test_watch_cycle_does_not_resume_test_failure_tasks(tmp_path: Path) -> None:
-    """TEST_FAILURE is excluded from watch auto-resume selection."""
+def test_watch_cycle_recovery_mode_does_not_resume_test_failure_tasks(tmp_path: Path) -> None:
+    """TEST_FAILURE is excluded from unattended recovery."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -283,6 +282,8 @@ def test_watch_cycle_does_not_resume_test_failure_tasks(tmp_path: Path) -> None:
             max_iterations=10,
             dry_run=False,
             log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
         )
 
     assert result.work_done is True
@@ -292,7 +293,7 @@ def test_watch_cycle_does_not_resume_test_failure_tasks(tmp_path: Path) -> None:
 
 
 def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(tmp_path: Path) -> None:
-    """Pending resume children must only launch via resume worker path."""
+    """Implement recovery should use iterate launch path and avoid fallback duplication."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -320,6 +321,8 @@ def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(
             max_iterations=10,
             dry_run=False,
             log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
         )
         result_second = _run_cycle(
             config=config,
@@ -328,14 +331,16 @@ def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(
             max_iterations=10,
             dry_run=False,
             log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
         )
 
     children = store.get_based_on_children(failed.id)
     pending_children = [task for task in children if task.status == "pending"]
-    assert result_first.work_done is False
-    assert result_second.work_done is False
-    assert spawn_resume.call_count == 2
-    assert spawn_iterate.call_count == 0
+    assert result_first.work_done is True
+    assert result_second.work_done is True
+    assert spawn_resume.call_count == 0
+    assert spawn_iterate.call_count == 2
     assert len(children) == 1
     assert len(pending_children) == 1
 
@@ -2186,8 +2191,8 @@ def test_watch_cycle_dedupes_merge_not_default_skip_across_cycles(tmp_path: Path
     assert log_path.read_text().count("merge actions skipped: not on default branch") == 1
 
 
-def test_watch_cycle_dedupes_max_resume_attempts_skip_across_cycles(tmp_path: Path) -> None:
-    """Persistent max-resume skip should only log once while condition is unchanged."""
+def test_watch_cycle_dedupes_attempt_cap_skip_across_cycles(tmp_path: Path) -> None:
+    """Persistent attempt-cap skip should only log once while condition is unchanged."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -2208,10 +2213,28 @@ def test_watch_cycle_dedupes_max_resume_attempts_skip_across_cycles(tmp_path: Pa
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
     ):
-        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
-        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=0,
+        )
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=0,
+        )
 
-    assert log_path.read_text().count(f"{failed.id}: max_resume_attempts reached") == 1
+    assert log_path.read_text().count(f"{failed.id} failed implement: attempt_cap_reached") == 1
 
 
 def test_watch_log_inserts_blank_line_between_cycles(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -2297,8 +2320,8 @@ def test_cmd_watch_dry_run_actionable_cycles_do_not_count_toward_max_idle(tmp_pa
     assert run_cycle.call_count == 3
 
 
-def test_collect_unhandled_failures_skips_auto_resumable_failures(tmp_path: Path) -> None:
-    """Resumable failures should not contribute to watch backoff decisions."""
+def test_collect_unhandled_failures_skips_actionable_recovery_failures(tmp_path: Path) -> None:
+    """With restart-failed mode active, actionable failures are excluded from backoff accounting."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -2320,7 +2343,14 @@ def test_collect_unhandled_failures_skips_auto_resumable_failures(tmp_path: Path
         }
     }
 
-    failures = _collect_unhandled_failures(old, new, store=store, config=config)
+    failures = _collect_unhandled_failures(
+        old,
+        new,
+        store=store,
+        config=config,
+        restart_failed_mode=True,
+        max_recovery_attempts=config.max_resume_attempts,
+    )
     assert failures == []
 
 
@@ -2656,6 +2686,8 @@ def test_watch_cycle_quiet_logs_start_failed_when_iterate_spawn_fails(
             dry_run=False,
             log=log,
             quiet=True,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
         )
 
     stdout = capsys.readouterr().out
@@ -2704,10 +2736,10 @@ def test_watch_cycle_quiet_logs_start_failed_when_worker_spawn_fails(
     assert f"{plan.id} plan: worker spawn failed" in log_text
 
 
-def test_watch_cycle_quiet_logs_start_failed_when_resume_spawn_fails(
+def test_watch_cycle_quiet_logs_start_failed_when_recovery_iterate_spawn_fails(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Quiet mode should suppress resume worker stdout and emit START_FAILED."""
+    """Quiet mode should suppress recovery iterate worker stdout and emit START_FAILED."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -2723,15 +2755,15 @@ def test_watch_cycle_quiet_logs_start_failed_when_resume_spawn_fails(
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
 
-    def noisy_resume_fail(*_args, **_kwargs):
+    def noisy_iterate_fail(*_args, **_kwargs):
         print("Error spawning background worker: boom")
         return 1
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=noisy_resume_fail),
-        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=noisy_iterate_fail) as spawn_iterate,
     ):
         _run_cycle(
             config=config,
@@ -2741,18 +2773,21 @@ def test_watch_cycle_quiet_logs_start_failed_when_resume_spawn_fails(
             dry_run=False,
             log=log,
             quiet=True,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
         )
 
     stdout = capsys.readouterr().out
     assert "Error spawning background worker" not in stdout
-    assert spawn_iterate.call_count == 0
+    assert spawn_resume.call_count == 0
+    assert spawn_iterate.call_count == 1
     children = store.get_based_on_children(failed.id)
     assert len(children) == 1
     child = children[0]
     assert child.id is not None
     log_text = log_path.read_text()
     assert "START_FAILED" in log_text
-    assert f"{failed.id} -> {child.id}: resume worker spawn failed" in log_text
+    assert f"{failed.id} -> {child.id}: iterate worker spawn failed" in log_text
 
 
 def test_cmd_watch_interrupts_sleep_promptly_on_signal(tmp_path: Path) -> None:

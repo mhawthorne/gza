@@ -665,7 +665,27 @@ def main() -> int:
         type=int,
         metavar="N",
         dest="max_iterations",
-        help="Max iterate review/improve loops for implement tasks (default: watch.max_iterations or 10)",
+        help="Max iterate review/improve loops when watch launches implement tasks (default: watch.max_iterations or 10)",
+    )
+    watch_parser.add_argument(
+        "--restart-failed",
+        action="store_true",
+        dest="restart_failed",
+        help="Enable failed-task recovery mode (resume/retry failed tasks before pending queue work)",
+    )
+    watch_parser.add_argument(
+        "--restart-failed-batch",
+        type=int,
+        metavar="N",
+        dest="restart_failed_batch",
+        help="Max concurrent failed-task recovery launches while --restart-failed is active (default: watch.restart_failed_batch or 1)",
+    )
+    watch_parser.add_argument(
+        "--max-resume-attempts",
+        type=int,
+        metavar="N",
+        dest="max_resume_attempts",
+        help="Override max_resume_attempts for unattended watch recovery attempts",
     )
     watch_parser.add_argument(
         "--dry-run",
