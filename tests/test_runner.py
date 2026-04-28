@@ -8124,16 +8124,12 @@ class TestDependencyMergePrecondition:
         store.update(downstream)
         return dep_task, retry_task, downstream
 
-    def _run_with_merge_base(
+    def _run_with_dependency_state(
         self,
         tmp_path: Path,
         *,
-        merge_base_return_code: int,
         same_branch: bool = False,
         skip_precondition_check: bool = False,
-        branch_exists: bool = True,
-        merge_base_stdout: str = "",
-        merge_base_stderr: str = "",
         setup_retry_chain: bool = False,
         dep_mark_merged: bool = False,
     ) -> tuple[int, Mock, SqliteTaskStore, Task]:
@@ -8162,24 +8158,15 @@ class TestDependencyMergePrecondition:
 
         mock_main_git = Mock()
         mock_main_git.default_branch.return_value = "main"
-        mock_main_git.branch_exists.return_value = branch_exists
         mock_main_git.worktree_list.return_value = []
         mock_main_git.worktree_add.return_value = config.worktree_path / downstream.slug
         mock_main_git.count_commits_ahead.return_value = 0
-
-        def git_run_side_effect(*args, **kwargs):
-            if args[:2] == ("merge-base", "--is-ancestor"):
-                return Mock(returncode=merge_base_return_code, stdout=merge_base_stdout, stderr=merge_base_stderr)
-            return Mock(returncode=0, stdout="", stderr="")
-
-        mock_main_git._run.side_effect = git_run_side_effect
 
         mock_worktree_git = Mock()
         mock_worktree_git.status_porcelain.side_effect = [set(), set()]
         mock_worktree_git.default_branch.return_value = "main"
         mock_worktree_git.count_commits_ahead.return_value = 0
         mock_worktree_git.get_diff_numstat.return_value = ""
-        mock_worktree_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
 
         with (
             patch("gza.runner.get_provider", return_value=mock_provider),
@@ -8195,9 +8182,9 @@ class TestDependencyMergePrecondition:
         return result, mock_provider, store, downstream
 
     def test_merged_dependency_allows_task_start(self, tmp_path: Path):
-        result, mock_provider, store, downstream = self._run_with_merge_base(
+        result, mock_provider, store, downstream = self._run_with_dependency_state(
             tmp_path,
-            merge_base_return_code=0,
+            dep_mark_merged=True,
         )
 
         assert result == 0
@@ -8207,9 +8194,8 @@ class TestDependencyMergePrecondition:
         assert refreshed.failure_reason != "PREREQUISITE_UNMERGED"
 
     def test_unmerged_dependency_fails_before_provider_run(self, tmp_path: Path):
-        result, mock_provider, store, downstream = self._run_with_merge_base(
+        result, mock_provider, store, downstream = self._run_with_dependency_state(
             tmp_path,
-            merge_base_return_code=1,
         )
 
         assert result == 1
@@ -8227,9 +8213,8 @@ class TestDependencyMergePrecondition:
         assert "test/dep-branch" in log_text
 
     def test_retry_chain_dependency_uses_completed_retry_for_precondition(self, tmp_path: Path):
-        result, mock_provider, store, downstream = self._run_with_merge_base(
+        result, mock_provider, store, downstream = self._run_with_dependency_state(
             tmp_path,
-            merge_base_return_code=1,
             setup_retry_chain=True,
         )
 
@@ -8249,9 +8234,8 @@ class TestDependencyMergePrecondition:
         assert f'"dependency_task_id": "{retry_task.id}"' in log_text
 
     def test_same_branch_skips_unmerged_dependency_check(self, tmp_path: Path):
-        result, mock_provider, store, downstream = self._run_with_merge_base(
+        result, mock_provider, store, downstream = self._run_with_dependency_state(
             tmp_path,
-            merge_base_return_code=1,
             same_branch=True,
         )
 
@@ -8262,9 +8246,8 @@ class TestDependencyMergePrecondition:
         assert refreshed.failure_reason != "PREREQUISITE_UNMERGED"
 
     def test_force_flag_skips_unmerged_dependency_check(self, tmp_path: Path):
-        result, mock_provider, store, downstream = self._run_with_merge_base(
+        result, mock_provider, store, downstream = self._run_with_dependency_state(
             tmp_path,
-            merge_base_return_code=1,
             skip_precondition_check=True,
         )
 
@@ -8277,47 +8260,6 @@ class TestDependencyMergePrecondition:
         log_file = tmp_path / "logs" / f"{downstream.slug}.log"
         assert log_file.exists()
         assert "Skipped dependency merge precondition check (--force)" in log_file.read_text()
-
-    def test_missing_dependency_branch_without_merged_status_fails_precondition(self, tmp_path: Path):
-        result, mock_provider, store, downstream = self._run_with_merge_base(
-            tmp_path,
-            merge_base_return_code=1,
-            branch_exists=False,
-        )
-
-        assert result == 1
-        assert mock_provider.run.call_count == 0
-        refreshed = store.get(downstream.id)
-        assert refreshed is not None
-        assert refreshed.failure_reason == "PREREQUISITE_UNMERGED"
-
-    def test_missing_dependency_branch_with_known_merged_status_allows_task_start(self, tmp_path: Path):
-        result, mock_provider, store, downstream = self._run_with_merge_base(
-            tmp_path,
-            merge_base_return_code=1,
-            branch_exists=False,
-            dep_mark_merged=True,
-        )
-
-        assert result == 0
-        assert mock_provider.run.call_count == 1
-        refreshed = store.get(downstream.id)
-        assert refreshed is not None
-        assert refreshed.failure_reason != "PREREQUISITE_UNMERGED"
-
-    def test_merge_base_operational_failure_is_not_rewritten_to_prerequisite_unmerged(self, tmp_path: Path):
-        result, mock_provider, store, downstream = self._run_with_merge_base(
-            tmp_path,
-            merge_base_return_code=128,
-            merge_base_stderr="fatal: Not a valid object name test/dep-branch",
-        )
-
-        assert result == 1
-        assert mock_provider.run.call_count == 0
-        refreshed = store.get(downstream.id)
-        assert refreshed is not None
-        assert refreshed.status == "failed"
-        assert refreshed.failure_reason == "GIT_ERROR"
 
     def test_followup_task_dependency_is_merge_gated_by_reviewed_implementation(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")

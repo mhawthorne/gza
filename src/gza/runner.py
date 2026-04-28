@@ -2377,26 +2377,9 @@ def _check_dependency_merge_precondition(
     dep = store.resolve_dependency_completion(task)
     if dep is None:
         return (None, None, None)
-    if not dep.branch:
-        # Non-code dependencies may have no branch and are reachable via repo files.
+    if dep.merge_status == "merged":
         return (None, None, None)
-    if not git.branch_exists(dep.branch):
-        # A missing local branch is only safe when merge status is explicitly known.
-        # Otherwise, fail closed so deleted local refs cannot bypass prerequisites.
-        if dep.merge_status == "merged":
-            return (None, None, None)
-        return (dep, default_branch, None)
-
-    result = git._run("merge-base", "--is-ancestor", dep.branch, default_branch, check=False)
-    if result.returncode == 0:
-        return (None, None, None)
-    if result.returncode == 1:
-        return (dep, default_branch, None)
-
-    stderr = (result.stderr or "").strip()
-    stdout = (result.stdout or "").strip()
-    detail = stderr or stdout or "git merge-base failed"
-    return (None, None, f"git merge-base --is-ancestor failed (exit {result.returncode}): {detail}")
+    return (dep, default_branch, None)
 
 
 def _resolve_code_task_branch_name(
