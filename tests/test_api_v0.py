@@ -58,6 +58,24 @@ class TestGzaClientConstruction:
         client = GzaClient(str(tmp_path))
         assert client is not None
 
+    def test_client_without_project_dir_discovers_nearest_ancestor(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        root = tmp_path / "root"
+        nested_project = root / "nested"
+        deep = nested_project / "a" / "b"
+        deep.mkdir(parents=True)
+
+        setup_config(root, project_name="root-project")
+        setup_config(nested_project, project_name="nested-project")
+        make_store(nested_project)
+
+        monkeypatch.chdir(deep)
+
+        from gza.api.v0 import GzaClient
+
+        client = GzaClient()
+        assert client._config.project_dir == nested_project
+        assert client._config.project_name == "nested-project"
+
 
 # ---------------------------------------------------------------------------
 # GzaClient — get_lineage
