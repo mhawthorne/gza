@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import TypeVar
 
 from ..config import Config
 from ..console import truncate
@@ -424,7 +424,11 @@ def _collect_unhandled_failures(
                 if decision.action in {"resume", "retry"}:
                     continue
             # Default watch mode auto-resumes a narrow set of resumable failures.
-            elif is_resumable_failed_task(task):
+            elif _is_default_watch_auto_resumable(
+                store,
+                task,
+                max_recovery_attempts=max_recovery_attempts,
+            ):
                 continue
         failures.append(
             _ObservedFailure(
@@ -475,6 +479,23 @@ def _compute_failure_backoff_seconds(config: Config, streak: int) -> int:
     initial = config.watch.failure_backoff_initial
     maximum = config.watch.failure_backoff_max
     return min(initial * (2 ** (streak - 1)), maximum)
+
+
+def _is_default_watch_auto_resumable(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    max_recovery_attempts: int,
+) -> bool:
+    """Return whether plain watch should auto-resume this failed task.
+
+    Default watch preserves the historical narrow auto-resume path: only
+    resumable failed tasks with preserved sessions are auto-resumed, and only
+    while their resume-chain depth remains below the configured cap.
+    """
+    if task.id is None or not is_resumable_failed_task(task):
+        return False
+    return store.count_resume_chain_depth(str(task.id)) < max_recovery_attempts
 
 
 def _run_cycle(
@@ -796,23 +817,25 @@ def _run_cycle(
         for failed in failed_tasks:
             if failed.id is None:
                 continue
-            launch_mode: Literal["iterate", "worker", "none"] = (
-                "iterate" if failed.task_type == "implement" else "worker"
-            )
-            actionable_failed.append(
-                (
-                    failed,
-                    FailedRecoveryDecision(
-                        task_id=str(failed.id),
-                        action="resume",
-                        reason_code=failed.failure_reason or "UNKNOWN",
-                        reason_text="default watch auto-resume",
-                        launch_mode=launch_mode,
-                        attempt_index=0,
-                        attempt_limit=max_recovery_attempts,
-                    ),
+            if _is_default_watch_auto_resumable(
+                store,
+                failed,
+                max_recovery_attempts=max_recovery_attempts,
+            ):
+                actionable_failed.append(
+                    (
+                        failed,
+                        FailedRecoveryDecision(
+                            task_id=str(failed.id),
+                            action="resume",
+                            reason_code=failed.failure_reason or "UNKNOWN",
+                            reason_text="default watch auto-resume",
+                            launch_mode="worker",
+                            attempt_index=store.count_resume_chain_depth(str(failed.id)) + 1,
+                            attempt_limit=max_recovery_attempts,
+                        ),
+                    )
                 )
-            )
 
     recovery_slots = max(0, min(slots, restart_failed_batch if restart_failed else slots))
     started_recovery_task_ids: set[str] = set()
@@ -821,6 +844,39 @@ def _run_cycle(
         if recovery_slots <= 0:
             break
         if failed.id is None:
+            continue
+        if not restart_failed:
+            if dry_run:
+                log.emit("START", f"(resume) {failed.task_type} for {failed.id} [dry-run]")
+                slots -= 1
+                recovery_slots -= 1
+                work_done = True
+                launched_recovery_count += 1
+                continue
+            recovered_task = _create_resume_task(store, failed)
+            assert recovered_task.id is not None
+            recovered_task_id = str(recovered_task.id)
+            rc = _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=log,
+                failure_message=f"{failed.id} -> {recovered_task_id}: resume worker spawn failed",
+                dedupe_key=f"spawn-resume-failed:{failed.id}:{recovered_task_id}",
+                spawn_fn=lambda: _spawn_background_resume_worker(
+                    argparse.Namespace(no_docker=False, max_turns=None),
+                    config,
+                    recovered_task_id,
+                    quiet=quiet,
+                ),
+            )
+            if rc != 0:
+                continue
+            started_task_ids.add(recovered_task_id)
+            started_recovery_task_ids.add(recovered_task_id)
+            slots -= 1
+            recovery_slots -= 1
+            work_done = True
+            launched_recovery_count += 1
+            log.emit("START", f"{recovered_task_id} {failed.task_type} \"{_short_prompt(recovered_task.prompt)}\"")
             continue
         if decision.action == "resume":
             if dry_run:

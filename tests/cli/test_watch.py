@@ -221,7 +221,7 @@ def test_watch_cycle_recovery_mode_resumes_failed_task_before_starting_new_pendi
 def test_watch_cycle_default_mode_auto_resumes_resumable_failed_task(
     tmp_path: Path, task_type: str
 ) -> None:
-    """Plain watch should preserve historical auto-resume behavior for all resumable task types."""
+    """Plain watch should preserve legacy resume-worker behavior for resumable failures."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -257,19 +257,68 @@ def test_watch_cycle_default_mode_auto_resumes_resumable_failed_task(
         )
 
     assert result.work_done is True
-    if task_type == "implement":
-        assert spawn_iterate.call_count == 1
-        assert spawn_resume.call_count == 0
-        spawned_task = spawn_iterate.call_args.args[2]
-        spawned_args = spawn_iterate.call_args.args[0]
-        assert spawned_args.resume is True
-    else:
-        assert spawn_iterate.call_count == 0
-        assert spawn_resume.call_count == 1
-        spawned_task = store.get(spawn_resume.call_args.args[2])
-        assert spawned_task is not None
+    assert spawn_iterate.call_count == 0
+    assert spawn_resume.call_count == 1
+    spawned_task = store.get(spawn_resume.call_args.args[2])
+    assert spawned_task is not None
     assert spawned_task.based_on == failed.id
     assert spawned_task.id != pending_impl.id
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert f'START  {spawned_task.id} {task_type} "{spawned_task.prompt}"' in log_text
+    assert f"RECOVR {failed.id}" not in log_text
+
+
+def test_watch_cycle_default_mode_attempt_cap_skips_failed_resume_and_starts_pending(tmp_path: Path) -> None:
+    """Plain watch should leave capped failed chains alone and move on to pending work."""
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="implement", tags=("backlog",))
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "MAX_TURNS"
+    root.session_id = "sess-root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed = store.add("Failed resume child", task_type="implement", based_on=root.id, tags=("release",))
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-root"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending = store.add("Pending fallback plan", task_type="plan", tags=("release",))
+    assert pending.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=config.max_resume_attempts,
+            tags=("release",),
+        )
+
+    assert result.work_done is True
+    assert spawn_resume.call_count == 0
+    assert spawn_iterate.call_count == 0
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == pending.id
 
 
 def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tmp_path: Path) -> None:
@@ -2944,6 +2993,50 @@ def test_collect_unhandled_failures_default_mode_skips_auto_resumable_failures(
     assert failures == []
 
 
+def test_collect_unhandled_failures_default_mode_counts_resumable_failure_after_attempt_cap(
+    tmp_path: Path,
+) -> None:
+    """Default watch should count capped resumable failures toward backoff."""
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="implement")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "MAX_TURNS"
+    root.session_id = "sess-123"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed = store.add("Failed capped child", task_type="implement", based_on=root.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    old = {str(failed.id): {"status": "in_progress"}}
+    new = {
+        str(failed.id): {
+            "status": "failed",
+            "task_type": "implement",
+            "failure_reason": "MAX_TURNS",
+        }
+    }
+
+    failures = _collect_unhandled_failures(
+        old,
+        new,
+        store=store,
+        config=config,
+        max_recovery_attempts=config.max_resume_attempts,
+        restart_failed_mode=False,
+    )
+    assert [(failure.task_id, failure.reason) for failure in failures] == [(str(failed.id), "MAX_TURNS")]
+
+
 def test_collect_unhandled_failures_includes_unknown_failures(tmp_path: Path) -> None:
     """Unknown failures should contribute to watch backoff decisions."""
     setup_config(tmp_path)
@@ -3176,6 +3269,71 @@ def test_cmd_watch_restart_failed_logs_backoff_for_skipped_resumable_review_fail
     assert "BACKOFF" in log_text
     assert f"{task.id}=MAX_TURNS" in log_text
     assert "streak 1" in log_text
+
+
+def test_cmd_watch_max_resume_attempts_zero_disables_default_auto_resume(tmp_path: Path) -> None:
+    """--max-resume-attempts 0 should disable plain-watch auto-resume for that invocation."""
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        f"worktree_dir: {worktree_dir}\n"
+        "watch:\n"
+        "  failure_backoff_initial: 60\n"
+        "  failure_backoff_max: 240\n"
+        "  failure_halt_after: 10\n"
+    )
+    store = make_store(tmp_path)
+    task = store.add("Failed implement", task_type="implement")
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "MAX_TURNS"
+    task.session_id = "sess-123"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=False,
+        restart_failed_batch=None,
+        max_resume_attempts=0,
+    )
+
+    snapshots = [
+        {str(task.id): {"status": "in_progress", "task_type": "implement", "failure_reason": None}},
+        {str(task.id): {"status": "in_progress", "task_type": "implement", "failure_reason": None}},
+        {str(task.id): {"status": "failed", "task_type": "implement", "failure_reason": "MAX_TURNS"}},
+        {str(task.id): {"status": "failed", "task_type": "implement", "failure_reason": "MAX_TURNS"}},
+        {str(task.id): {"status": "failed", "task_type": "implement", "failure_reason": "MAX_TURNS"}},
+    ]
+    cycle_results = [_CycleResult(False, 0, 0), _CycleResult(False, 0, 0)]
+    sleeps: list[int] = []
+
+    def fake_sleep(seconds: int, _stop_requested) -> None:
+        sleeps.append(seconds)
+
+    with (
+        patch("gza.cli.watch._task_snapshot", side_effect=snapshots),
+        patch("gza.cli.watch._run_cycle", side_effect=cycle_results) as run_cycle,
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_args_list[0].kwargs["max_recovery_attempts"] == 0
+    assert sleeps == [60]
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "BACKOFF" in log_text
+    assert f"{task.id}=MAX_TURNS" in log_text
 
 
 def test_cmd_watch_halts_after_configured_failure_streak(tmp_path: Path) -> None:
