@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -13,6 +14,7 @@ from gza.extractions import (
     normalize_selected_paths,
     plan_extraction,
     resolve_source_selection,
+    SourceSelection,
     write_extraction_bundle,
 )
 from gza.git import Git
@@ -419,6 +421,123 @@ def test_parse_file_summaries_braced_quoted_binary_copy_numstat() -> None:
     assert summary.status == "C"
     assert summary.old_path == "src/old file.bin"
     assert summary.new_path == "src/new file.bin"
+    assert summary.additions is None
+    assert summary.deletions is None
+    assert summary.binary is True
+
+
+def test_plan_extraction_parses_numstat_rename_arrow() -> None:
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+    )
+    selected = ("src/old_name.py", "src/new_name.py")
+    git = MagicMock(spec=Git)
+    git.get_diff_name_status.return_value = "R100\tsrc/old_name.py\tsrc/new_name.py\n"
+    git.get_diff_numstat.return_value = "4\t1\tsrc/old_name.py -> src/new_name.py\n"
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/src/old_name.py b/src/new_name.py\n"
+        "similarity index 100%\n"
+        "rename from src/old_name.py\n"
+        "rename to src/new_name.py\n"
+    )
+
+    draft = plan_extraction(git, source, selected, operator_prompt=None)
+
+    assert len(draft.file_summaries) == 1
+    summary = draft.file_summaries[0]
+    assert summary.status == "R"
+    assert summary.old_path == "src/old_name.py"
+    assert summary.new_path == "src/new_name.py"
+    assert summary.additions == 4
+    assert summary.deletions == 1
+    assert summary.binary is False
+
+
+def test_plan_extraction_parses_numstat_rename_brace() -> None:
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+    )
+    selected = ("src/old_name.py", "src/new_name.py")
+    git = MagicMock(spec=Git)
+    git.get_diff_name_status.return_value = "R100\tsrc/old_name.py\tsrc/new_name.py\n"
+    git.get_diff_numstat.return_value = "3\t2\tsrc/{old_name.py => new_name.py}\n"
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/src/old_name.py b/src/new_name.py\n"
+        "similarity index 100%\n"
+        "rename from src/old_name.py\n"
+        "rename to src/new_name.py\n"
+    )
+
+    draft = plan_extraction(git, source, selected, operator_prompt=None)
+
+    assert len(draft.file_summaries) == 1
+    summary = draft.file_summaries[0]
+    assert summary.status == "R"
+    assert summary.old_path == "src/old_name.py"
+    assert summary.new_path == "src/new_name.py"
+    assert summary.additions == 3
+    assert summary.deletions == 2
+    assert summary.binary is False
+
+
+def test_plan_extraction_parses_numstat_copy() -> None:
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+    )
+    selected = ("src/original.py", "src/copied.py")
+    git = MagicMock(spec=Git)
+    git.get_diff_name_status.return_value = "C100\tsrc/original.py\tsrc/copied.py\n"
+    git.get_diff_numstat.return_value = "7\t0\tsrc/original.py -> src/copied.py\n"
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/src/original.py b/src/copied.py\n"
+        "similarity index 100%\n"
+        "copy from src/original.py\n"
+        "copy to src/copied.py\n"
+    )
+
+    draft = plan_extraction(git, source, selected, operator_prompt=None)
+
+    assert len(draft.file_summaries) == 1
+    summary = draft.file_summaries[0]
+    assert summary.status == "C"
+    assert summary.old_path == "src/original.py"
+    assert summary.new_path == "src/copied.py"
+    assert summary.additions == 7
+    assert summary.deletions == 0
+    assert summary.binary is False
+
+
+def test_plan_extraction_marks_binary_rename_numstat() -> None:
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+    )
+    selected = ("assets/old.bin", "assets/new.bin")
+    git = MagicMock(spec=Git)
+    git.get_diff_name_status.return_value = "R100\tassets/old.bin\tassets/new.bin\n"
+    git.get_diff_numstat.return_value = "-\t-\tassets/old.bin -> assets/new.bin\n"
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/assets/old.bin b/assets/new.bin\n"
+        "similarity index 100%\n"
+        "rename from assets/old.bin\n"
+        "rename to assets/new.bin\n"
+        "Binary files differ\n"
+    )
+
+    draft = plan_extraction(git, source, selected, operator_prompt=None)
+
+    assert len(draft.file_summaries) == 1
+    summary = draft.file_summaries[0]
+    assert summary.status == "R"
+    assert summary.old_path == "assets/old.bin"
+    assert summary.new_path == "assets/new.bin"
     assert summary.additions is None
     assert summary.deletions is None
     assert summary.binary is True
