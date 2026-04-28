@@ -235,6 +235,16 @@ class TestHelpOutput:
         assert "Print the recovery decision report and exit" in failed_tasks_docs
         assert "`--max-resume-attempts` applies both to plain-watch auto-resume and to `--restart-failed` recovery decisions." in failed_tasks_docs
 
+    def test_internal_advance_workflow_docs_describe_watch_failed_recovery(self, tmp_path):
+        """Internal workflow docs should stay aligned with watch failed-task recovery behavior."""
+        setup_config(tmp_path)
+
+        docs_text = " ".join(Path("docs/internal/advance-workflow.md").read_text().split())
+
+        assert "`--restart-failed`" in docs_text
+        assert "drains actionable failed-task recovery before pending queue work" in docs_text
+        assert "advance-driven improve recovery" in docs_text
+
     def test_queue_help_and_docs_describe_default_limit_and_all_overrides(self, tmp_path):
         """`queue --help` and docs should describe capped default output and all-task overrides."""
         setup_config(tmp_path)

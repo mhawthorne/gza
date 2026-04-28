@@ -1981,6 +1981,73 @@ def test_watch_cycle_advances_run_improve_action(tmp_path: Path) -> None:
     assert spawn_worker.call_args.kwargs["task_id"] == improve.id
 
 
+def test_watch_cycle_max_resume_attempts_zero_skips_failed_improve_recovery(tmp_path: Path) -> None:
+    """Watch should honor the per-run attempt cap for advance-driven improve recovery."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/improve-cap-zero"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Improve feature",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "MAX_TURNS"
+    failed_improve.session_id = "sess-123"
+    failed_improve.completed_at = datetime.now(UTC)
+    store.update(failed_improve)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+    git.can_merge.return_value = True
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._determine_advance_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            max_recovery_attempts=0,
+        )
+
+    assert result.work_done is False
+    assert spawn_worker.call_count == 0
+    assert spawn_resume_worker.call_count == 0
+    log_text = log_path.read_text()
+    assert "max improve attempts (0) reached" in log_text
+    assert str(failed_improve.id) in log_text
+
+
 def test_watch_cycle_improve_creation_includes_unresolved_comments_in_prompt(tmp_path: Path) -> None:
     """Watch-created improve prompts should include unresolved comments when present."""
     setup_config(tmp_path)

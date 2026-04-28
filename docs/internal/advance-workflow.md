@@ -261,4 +261,18 @@ Advanced: 1 merged, 1 review started, 1 skipped
 | `gza improve` | Advance creates improve tasks equivalent to `gza improve --queue` |
 | `gza rebase` | Advance creates rebase tasks equivalent to `gza rebase --background` |
 | `gza merge` | Advance merges directly, same as `gza merge <id>` |
-| `gza watch` | Runs advance in a loop with sleep intervals |
+| `gza watch` | Runs advance in a loop with sleep intervals; with `--restart-failed`, drains actionable failed-task recovery before pending queue work |
+
+## Watch integration
+
+`gza watch` reuses the same advance executor and improve-resolution helpers described above; it does not maintain a separate improve retry policy.
+
+Default `gza watch` preserves the narrow legacy auto-resume path for resumable failed tasks. The broader failed-task recovery queue is opt-in via `gza watch --restart-failed`.
+
+When `--restart-failed` is enabled:
+
+- Watch evaluates failed tasks through the shared recovery engine before starting fresh pending work
+- Recovery work is recovery-first: actionable failed tasks drain before pending queue pickup, and newly failed actionable tasks continue to outrank pending work for that session
+- Implement recovery launches through iterate-aware execution; non-implement recovery launches through plain worker execution
+- `gza watch --restart-failed --dry-run` prints the failed-task recovery decision report and exits
+- `--max-resume-attempts` applies to all unattended watch-managed resume/retry decisions for that run, including plain-watch auto-resume, failed-task recovery, and advance-driven improve recovery

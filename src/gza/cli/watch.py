@@ -638,7 +638,7 @@ def _run_cycle(
         executor_context = AdvanceActionExecutionContext(
             store=store,
             dry_run=dry_run,
-            max_resume_attempts=config.max_resume_attempts,
+            max_resume_attempts=max_recovery_attempts,
             use_iterate_for_create_implement=True,
             use_iterate_for_needs_rebase=False,
             prepare_create_review=lambda t: _prepare_create_review_action(store, t),
