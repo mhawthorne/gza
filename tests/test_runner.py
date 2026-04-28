@@ -8193,6 +8193,62 @@ class TestDependencyMergePrecondition:
         assert refreshed is not None
         assert refreshed.failure_reason != "PREREQUISITE_UNMERGED"
 
+    def test_completed_plan_dependency_does_not_require_merge(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan = store.add(prompt="Plan feature", task_type="plan")
+        plan.slug = "20260412-plan-feature"
+        store.mark_in_progress(plan)
+        store.mark_completed(plan, log_file="logs/plan.log", has_commits=False)
+
+        downstream = store.add(
+            prompt="Implement from plan",
+            task_type="implement",
+            depends_on=plan.id,
+        )
+        downstream.slug = "20260412-implement-from-plan"
+        store.update(downstream)
+
+        config = self._make_config(tmp_path, db_path)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.check_credentials.return_value = True
+        mock_provider.verify_credentials.return_value = True
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=3.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        mock_main_git = Mock()
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.worktree_list.return_value = []
+        mock_main_git.worktree_add.return_value = config.worktree_path / downstream.slug
+        mock_main_git.count_commits_ahead.return_value = 0
+
+        mock_worktree_git = Mock()
+        mock_worktree_git.status_porcelain.side_effect = [set(), set()]
+        mock_worktree_git.default_branch.return_value = "main"
+        mock_worktree_git.count_commits_ahead.return_value = 0
+        mock_worktree_git.get_diff_numstat.return_value = ""
+
+        with (
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+            patch("gza.runner.load_dotenv"),
+        ):
+            result = run(config, task_id=downstream.id)
+
+        assert result == 0
+        assert mock_provider.run.call_count == 1
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason != "PREREQUISITE_UNMERGED"
+
     def test_unmerged_dependency_fails_before_provider_run(self, tmp_path: Path):
         result, mock_provider, store, downstream = self._run_with_dependency_state(
             tmp_path,
