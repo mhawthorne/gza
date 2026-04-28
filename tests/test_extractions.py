@@ -8,6 +8,7 @@ import pytest
 from gza.db import SqliteTaskStore
 from gza.extractions import (
     ExtractionError,
+    _parse_file_summaries,
     copy_bundle_to_worktree,
     normalize_selected_paths,
     plan_extraction,
@@ -381,6 +382,46 @@ def test_plan_extraction_marks_binary_numstat_entries(tmp_path: Path) -> None:
     assert summary.additions is None
     assert summary.deletions is None
     assert f"- A: {binary_path} [binary]" in draft.prompt
+
+
+def test_parse_file_summaries_braced_rename_numstat() -> None:
+    name_status_text = "R100\tsrc/old_name.py\tsrc/new_name.py\n"
+    numstat_text = "3\t2\tsrc/{old_name.py => new_name.py}\n"
+
+    summaries = _parse_file_summaries(
+        name_status_text=name_status_text,
+        numstat_text=numstat_text,
+        selected_paths=("src/old_name.py", "src/new_name.py"),
+    )
+
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary.status == "R"
+    assert summary.old_path == "src/old_name.py"
+    assert summary.new_path == "src/new_name.py"
+    assert summary.additions == 3
+    assert summary.deletions == 2
+    assert summary.binary is False
+
+
+def test_parse_file_summaries_braced_quoted_binary_copy_numstat() -> None:
+    name_status_text = "C100\tsrc/old file.bin\tsrc/new file.bin\n"
+    numstat_text = '-\t-\t"src/{old file.bin => new file.bin}"\n'
+
+    summaries = _parse_file_summaries(
+        name_status_text=name_status_text,
+        numstat_text=numstat_text,
+        selected_paths=("src/old file.bin", "src/new file.bin"),
+    )
+
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary.status == "C"
+    assert summary.old_path == "src/old file.bin"
+    assert summary.new_path == "src/new file.bin"
+    assert summary.additions is None
+    assert summary.deletions is None
+    assert summary.binary is True
 
 
 def test_resolve_source_selection_rejects_non_code_task(tmp_path: Path) -> None:
