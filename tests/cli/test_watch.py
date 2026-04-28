@@ -548,6 +548,28 @@ def test_collect_live_running_state_tracks_worker_and_pid_only_tasks(tmp_path: P
     assert running_task_ids == [worker_task.id, pid_only_task.id]
 
 
+def test_collect_live_running_state_counts_pending_task_with_live_worker(tmp_path: Path) -> None:
+    """A spawned explicit worker for a still-pending task must consume a watch slot."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    pending_task = store.add("Pending worker-claimed soon", task_type="implement")
+    assert pending_task.id is not None
+
+    config = Config.load(tmp_path)
+    registry = MagicMock()
+    registry.list_all.return_value = [
+        WorkerMetadata(worker_id="w-1", task_id=pending_task.id, pid=4242, status="running"),
+    ]
+    registry.is_running.return_value = True
+
+    with patch("gza.cli.watch.WorkerRegistry", return_value=registry):
+        live_pids, running_task_ids = _collect_live_running_state(config, store)
+
+    assert live_pids == {4242}
+    assert running_task_ids == [pending_task.id]
+
+
 def test_format_wake_message_includes_running_task_ids() -> None:
     """WAKE line should append task IDs when tasks are actively running."""
     assert _format_wake_message(running=1, pending=3, slots=0, running_task_ids=["gza-42"]) == (
