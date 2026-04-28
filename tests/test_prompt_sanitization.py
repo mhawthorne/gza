@@ -23,6 +23,32 @@ def test_sanitize_kill_in_execution_context() -> None:
     assert "terminate the stuck process" in result
 
 
+def test_sanitize_bypasses_with_safety_context() -> None:
+    prompt = "The agent bypasses safety restrictions during review."
+    result = sanitize_provider_prompt(prompt, task_type="review")
+    assert "bypasses" not in result.lower()
+    assert "work within safety restrictions" in result
+
+
+def test_sanitize_bypasses_without_context_stays_unchanged() -> None:
+    prompt = "The router bypasses cache for static assets."
+    result = sanitize_provider_prompt(prompt, task_type="review")
+    assert result == prompt
+
+
+def test_sanitize_kills_with_execution_context() -> None:
+    prompt = "The watchdog kills stuck jobs after timeout."
+    result = sanitize_provider_prompt(prompt, task_type="improve")
+    assert "kills" not in result.lower()
+    assert "terminate stuck jobs" in result
+
+
+def test_sanitize_kills_without_context_stays_unchanged() -> None:
+    prompt = "The noise kills the vibe in this scene."
+    result = sanitize_provider_prompt(prompt, task_type="improve")
+    assert result == prompt
+
+
 def test_sanitize_skips_code_fences() -> None:
     prompt = "Avoid bypassing sandbox.\n```bash\nkill -9 1234\n```"
     result = sanitize_provider_prompt(prompt, task_type="review")

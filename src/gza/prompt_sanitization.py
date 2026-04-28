@@ -18,12 +18,12 @@ _CONTEXT_WINDOW_CHARS = 160
 
 _RULES: tuple[_SanitizationRule, ...] = (
     _SanitizationRule(
-        trigger=re.compile(r"\bbypass(?:ing|ed)?\b", re.IGNORECASE),
+        trigger=re.compile(r"\bbypass\w*\b", re.IGNORECASE),
         context=re.compile(r"\b(sandbox|guardrail|policy|safety|restriction|constraint)s?\b", re.IGNORECASE),
         replacement="work within",
     ),
     _SanitizationRule(
-        trigger=re.compile(r"\bkill(?:ed|ing)?\b", re.IGNORECASE),
+        trigger=re.compile(r"\bkill\w*\b", re.IGNORECASE),
         context=re.compile(r"\b(process|task|run|session|job|agent)s?\b", re.IGNORECASE),
         replacement="terminate",
     ),
