@@ -5275,6 +5275,52 @@ class TestSharedDbIsolationAndImportGating:
         assert ("project_id", "step_id", "substep_index") in run_substeps_unique_indexes
         assert ("project_id", "step_id", "substep_id") in run_substeps_unique_indexes
 
+    def test_open_read_only_v35_db_raises_schema_integrity_error_not_operational_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Read-only v35 DB should fail with controlled SchemaIntegrityError during v36 auto-migration."""
+        db_path = tmp_path / "readonly-v35.db"
+        _make_v35_db_with_legacy_key_shapes(db_path)
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"Cannot auto-migrate schema v35->v36 on a read-only database",
+            ):
+                SqliteTaskStore(db_path, prefix="gza", project_id="alpha")
+        finally:
+            db_path.chmod(0o644)
+
+    def test_cli_next_on_read_only_v35_db_surfaces_controlled_error(self, tmp_path: Path) -> None:
+        """CLI read commands against read-only v35 DB should fail without traceback."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "db_path: .gza/gza.db\n",
+            encoding="utf-8",
+        )
+        db_path = project_dir / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        _make_v35_db_with_legacy_key_shapes(db_path)
+
+        db_path.chmod(0o444)
+        try:
+            result = subprocess.run(
+                ["uv", "run", "gza", "next", "--project", str(project_dir)],
+                capture_output=True,
+                text=True,
+                cwd=project_dir,
+            )
+        finally:
+            db_path.chmod(0o644)
+
+        assert result.returncode == 1
+        assert "Cannot auto-migrate schema v35->v36 on a read-only database" in result.stderr
+        assert "Traceback" not in result.stderr
+        assert "Traceback" not in result.stdout
+
     def test_v35_to_v36_migration_keeps_active_prefix_sequence_continuity(self, tmp_path: Path) -> None:
         """v35→v36 migration must keep next ID above existing active-prefix task suffixes."""
         db_path = tmp_path / "test.db"

@@ -1256,6 +1256,7 @@ def _config_to_effective_dict(config: Config) -> dict:
     """Build an effective configuration dict from a loaded Config object."""
     return {
         "project_name": config.project_name,
+        "db_path": str(config.db_path),
         "tasks_file": config.tasks_file,
         "log_dir": config.log_dir,
         "use_docker": config.use_docker,

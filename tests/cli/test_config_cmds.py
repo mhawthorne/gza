@@ -472,6 +472,36 @@ class TestLocalConfigOverrides:
         assert payload["sources"]["reasoning_effort"] == "base"
         assert payload["model_resolution"]["review"]["reasoning_effort"] == "medium"
 
+    def test_config_command_db_path_env_override_source_is_visible(self, tmp_path: Path):
+        """gza config --json should show db_path and attribute env override source."""
+        shared_db = tmp_path / "shared" / "gza.db"
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "db_path: .gza/gza.db\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "db_path: .gza/override.db\n"
+        )
+
+        result = run_gza(
+            "config",
+            "--json",
+            "--project",
+            str(tmp_path),
+            env={"GZA_DB_PATH": str(shared_db)},
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["db_path"] == str(shared_db.resolve())
+        assert payload["sources"]["db_path"] == "env"
+
+    def test_docs_configuration_mentions_gza_db_path_override(self):
+        """Operator docs should document GZA_DB_PATH override and precedence."""
+        docs_text = Path("docs/configuration.md").read_text()
+        assert "GZA_DB_PATH" in docs_text
+        assert "gza.yaml` < `gza.local.yaml` < `GZA_DB_PATH`" in docs_text
+
     def test_config_keys_table_lists_all_registered_keys_and_columns(self, tmp_path: Path):
         """`gza config keys` should render a tabular registry with stable columns."""
         from gza.config_schema import CONFIG_KEY_REGISTRY

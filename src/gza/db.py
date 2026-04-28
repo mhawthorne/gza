@@ -440,6 +440,12 @@ def _is_ignorable_migration_operational_error(exc: sqlite3.OperationalError) -> 
     return "duplicate column name" in message or "already exists" in message
 
 
+def _is_readonly_operational_error(exc: sqlite3.OperationalError) -> bool:
+    """Return True when sqlite reports read-only write failures."""
+    message = str(exc).lower()
+    return "readonly" in message or "read-only" in message
+
+
 def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     """Check whether a table contains a specific column."""
     try:
@@ -1771,7 +1777,15 @@ class SqliteTaskStore:
                             # Don't advance current_version; stop processing further
                             break
                         if target_version == 36:
-                            _run_v35_to_v36_migration(conn, self._project_id, self._prefix)
+                            try:
+                                _run_v35_to_v36_migration(conn, self._project_id, self._prefix)
+                            except sqlite3.OperationalError as exc:
+                                if _is_readonly_operational_error(exc):
+                                    raise SchemaIntegrityError(
+                                        "Cannot auto-migrate schema v35->v36 on a read-only database. "
+                                        "Use a writable database to complete migration, then retry."
+                                    ) from exc
+                                raise
                         elif migration_sql is not None:
                             for stmt in migration_sql.strip().split(";"):
                                 stmt = stmt.strip()
