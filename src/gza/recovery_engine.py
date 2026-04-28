@@ -37,6 +37,8 @@ class FailedRecoveryDecision:
     launch_mode: Literal["iterate", "worker", "none"]
     attempt_index: int
     attempt_limit: int
+    recovery_task_id: str | None = None
+    reuse_existing: bool = False
 
 
 def _parse_completed_at(value: datetime | None) -> datetime:
@@ -116,8 +118,23 @@ def decide_failed_task_recovery(
     children = store.get_based_on_children(task_id)
     if any(child.status == "in_progress" for child in children):
         return _skip("recovery_already_running", "recovery child already in progress")
-    if any(child.status == "pending" for child in children):
-        return _skip("recovery_already_pending", "recovery child already pending")
+    pending_children = [child for child in children if child.status == "pending" and child.id is not None]
+    if pending_children:
+        resume_child = next((child for child in pending_children if child.session_id), None)
+        reuse_child = resume_child or pending_children[0]
+        reuse_action: Literal["resume", "retry"] = "resume" if resume_child is not None else "retry"
+        reason = task.failure_reason or "UNKNOWN"
+        return FailedRecoveryDecision(
+            task_id=task_id,
+            action=reuse_action,
+            reason_code=reason,
+            reason_text=f"reusing pending {reuse_action} child {reuse_child.id}",
+            launch_mode=launch_mode,
+            attempt_index=attempt_index,
+            attempt_limit=max_recovery_attempts,
+            recovery_task_id=str(reuse_child.id),
+            reuse_existing=True,
+        )
     if any(child.status == "completed" for child in children):
         return _skip("recovery_already_completed", "recovery child already completed")
 

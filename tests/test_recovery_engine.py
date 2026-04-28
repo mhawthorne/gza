@@ -61,8 +61,23 @@ def test_recovery_engine_existing_children_skip(tmp_path: Path) -> None:
     store.update(child)
 
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
-    assert decision.action == "skip"
-    assert decision.reason_code == "recovery_already_pending"
+    assert decision.action == "retry"
+    assert decision.recovery_task_id == child.id
+    assert decision.reuse_existing is True
+
+
+def test_recovery_engine_existing_pending_resume_child_reuses_resume_semantics(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="MAX_TURNS", session_id="sess-1")
+    child = store.add("Resume child", task_type=task.task_type, based_on=task.id)
+    assert child.id is not None
+    child.status = "pending"
+    child.session_id = task.session_id
+    store.update(child)
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "resume"
+    assert decision.recovery_task_id == child.id
+    assert decision.reuse_existing is True
 
 
 def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:

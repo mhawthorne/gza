@@ -384,7 +384,7 @@ def test_watch_cycle_recovery_mode_does_not_resume_test_failure_tasks(tmp_path: 
 
 
 def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(tmp_path: Path) -> None:
-    """Implement recovery should use iterate launch path and avoid fallback duplication."""
+    """Implement recovery should reuse the same resume child and preserve resume=True after spawn failure."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -432,8 +432,161 @@ def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(
     assert result_second.work_done is True
     assert spawn_resume.call_count == 0
     assert spawn_iterate.call_count == 2
+    first_task = spawn_iterate.call_args_list[0].args[2]
+    second_args = spawn_iterate.call_args_list[1].args[0]
+    second_task = spawn_iterate.call_args_list[1].args[2]
+    assert first_task.id == second_task.id
+    assert second_args.resume is True
+    assert second_args.retry is False
     assert len(children) == 1
     assert len(pending_children) == 1
+
+
+def test_watch_cycle_reuses_preexisting_pending_resume_child_with_resume_semantics(tmp_path: Path) -> None:
+    """Restart-failed should launch an existing pending resume child with resume=True."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    resume_child = store.add("Resume child", task_type="implement", based_on=failed.id)
+    assert resume_child.id is not None
+    resume_child.status = "pending"
+    resume_child.session_id = failed.session_id
+    store.update(resume_child)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    spawned_args = spawn_iterate.call_args.args[0]
+    spawned_task = spawn_iterate.call_args.args[2]
+    assert spawned_task.id == resume_child.id
+    assert spawned_args.resume is True
+    assert spawned_args.retry is False
+
+
+def test_watch_cycle_restart_failed_drains_failed_queue_before_pending_queue(tmp_path: Path) -> None:
+    """Pending work must not start while actionable failed tasks remain beyond restart_failed_batch."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    for idx in range(2):
+        failed = store.add(f"Failed implement {idx}", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+    pending_plan = store.add("Pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=4,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            restart_failed_batch=1,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_worker.call_count == 0
+    assert store.get(pending_plan.id).status == "pending"
+
+
+def test_watch_cycle_pending_queue_starts_only_after_recovery_exhaustion(tmp_path: Path) -> None:
+    """Pending work should begin on a later cycle only after recovery work is fully exhausted."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_plan = store.add("Pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result_first = _run_cycle(
+            config=config,
+            store=store,
+            batch=4,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            restart_failed_batch=1,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        recovery_child = store.get_based_on_children(failed.id)[0]
+        recovery_child.status = "completed"
+        store.update(recovery_child)
+        result_second = _run_cycle(
+            config=config,
+            store=store,
+            batch=4,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            restart_failed_batch=1,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result_first.work_done is True
+    assert result_second.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
 
 
 @pytest.mark.parametrize(

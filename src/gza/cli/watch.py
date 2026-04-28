@@ -18,6 +18,7 @@ from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..git import Git
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..recovery_engine import (
+    FailedRecoveryDecision,
     decide_failed_task_recovery,
     list_failed_tasks_for_recovery,
 )
@@ -467,6 +468,24 @@ def _emit_recovery_dry_run_report(
     return _RecoveryReport(actionable_count=actionable, resume_count=resume, retry_count=retry)
 
 
+def _has_active_recovery_children(
+    store: SqliteTaskStore,
+    *,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+) -> bool:
+    for task in store.get_all():
+        if task.status != "in_progress" or not task.based_on:
+            continue
+        parent = store.get(task.based_on)
+        if parent is None or parent.status != "failed":
+            continue
+        if tags and not task_matches_tag_filters(task_tags=task.tags, tag_filters=tags, any_tag=any_tag):
+            continue
+        return True
+    return False
+
+
 def _compute_failure_backoff_seconds(config: Config, streak: int) -> int:
     if streak <= 0:
         return 0
@@ -766,15 +785,14 @@ def _run_cycle(
     pending_recovery_task_ids: set[str] = set()
     if restart_failed:
         log.emit("PHASE", "recovery queue enabled (--restart-failed)")
-    recovery_slots = max(0, min(slots, restart_failed_batch if restart_failed else slots))
     failed_tasks = list_failed_tasks_for_recovery(store, tags=tags, any_tag=any_tag)
-    actionable_seen = 0
+    failed_decisions: list[tuple[DbTask, FailedRecoveryDecision]] = []
+    actionable_failed: list[tuple[DbTask, FailedRecoveryDecision]] = []
     for failed in failed_tasks:
-        if recovery_slots <= 0:
-            break
         if failed.id is None:
             continue
         decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
+        failed_decisions.append((failed, decision))
         if decision.action == "skip":
             if restart_failed:
                 log.emit(
@@ -785,24 +803,41 @@ def _run_cycle(
             continue
         if not restart_failed and decision.action != "resume":
             continue
+        actionable_failed.append((failed, decision))
 
-        actionable_seen += 1
+    recovery_slots = max(0, min(slots, restart_failed_batch if restart_failed else slots))
+    started_recovery_task_ids: set[str] = set()
+    launched_recovery_count = 0
+    for failed, decision in actionable_failed:
+        if recovery_slots <= 0:
+            break
+        if failed.id is None:
+            continue
         if decision.action == "resume":
             if dry_run:
+                destination = decision.recovery_task_id or "(new task)"
                 log.emit(
                     "RECOVR",
                     (
-                        f"{failed.id} resume via {decision.launch_mode} -> (new task) "
+                        f"{failed.id} resume via {decision.launch_mode} -> {destination} "
                         f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
                     ),
                 )
                 slots -= 1
                 recovery_slots -= 1
                 work_done = True
+                launched_recovery_count += 1
                 continue
-            recovered_task = _create_resume_task(store, failed)
-            assert recovered_task.id is not None
-            recovered_task_id = str(recovered_task.id)
+            if decision.reuse_existing:
+                assert decision.recovery_task_id is not None
+                recovered_task_id = decision.recovery_task_id
+                existing_recovered_task = store.get(recovered_task_id)
+                assert existing_recovered_task is not None
+                recovered_task = existing_recovered_task
+            else:
+                recovered_task = _create_resume_task(store, failed)
+                assert recovered_task.id is not None
+                recovered_task_id = str(recovered_task.id)
             pending_recovery_task_ids.add(recovered_task_id)
             rc = (
                 _spawn_worker_with_failure_log(
@@ -832,20 +867,29 @@ def _run_cycle(
             )
         else:
             if dry_run:
+                destination = decision.recovery_task_id or "(new task)"
                 log.emit(
                     "RECOVR",
                     (
-                        f"{failed.id} retry via {decision.launch_mode} -> (new task) "
+                        f"{failed.id} retry via {decision.launch_mode} -> {destination} "
                         f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
                     ),
                 )
                 slots -= 1
                 recovery_slots -= 1
                 work_done = True
+                launched_recovery_count += 1
                 continue
-            recovered_task = _create_retry_task(store, failed)
-            assert recovered_task.id is not None
-            recovered_task_id = str(recovered_task.id)
+            if decision.reuse_existing:
+                assert decision.recovery_task_id is not None
+                recovered_task_id = decision.recovery_task_id
+                existing_recovered_task = store.get(recovered_task_id)
+                assert existing_recovered_task is not None
+                recovered_task = existing_recovered_task
+            else:
+                recovered_task = _create_retry_task(store, failed)
+                assert recovered_task.id is not None
+                recovered_task_id = str(recovered_task.id)
             pending_recovery_task_ids.add(recovered_task_id)
             rc = (
                 _spawn_worker_with_failure_log(
@@ -877,9 +921,11 @@ def _run_cycle(
         if rc != 0:
             continue
         started_task_ids.add(recovered_task_id)
+        started_recovery_task_ids.add(recovered_task_id)
         slots -= 1
         recovery_slots -= 1
         work_done = True
+        launched_recovery_count += 1
         log.emit(
             "RECOVR",
             (
@@ -887,13 +933,24 @@ def _run_cycle(
                 f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit})"
             ),
         )
-    if restart_failed and actionable_seen == 0:
+
+    recovery_phase_active = restart_failed and (
+        launched_recovery_count > 0
+        or len(actionable_failed) > launched_recovery_count
+        or any(
+            decision.reason_code == "recovery_already_running"
+            for _failed, decision in failed_decisions
+        )
+        or _has_active_recovery_children(store, tags=tags, any_tag=any_tag)
+    )
+    if restart_failed and not recovery_phase_active:
         log.emit("PHASE", "recovery queue exhausted; switching to pending queue")
 
     # 3) Start new queued tasks (consumes slots)
-    log.emit("PHASE", "pending queue active")
     pending_tasks = _pending_runnable_tasks(store, tags=tags, any_tag=any_tag)
-    if slots > 0:
+    if not recovery_phase_active:
+        log.emit("PHASE", "pending queue active")
+    if slots > 0 and not recovery_phase_active:
         for task in pending_tasks:
             if slots <= 0:
                 break
