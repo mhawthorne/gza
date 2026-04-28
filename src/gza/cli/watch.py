@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from ..config import Config
 from ..console import truncate
@@ -22,6 +22,7 @@ from ..recovery_engine import (
     decide_failed_task_recovery,
     list_failed_tasks_for_recovery,
 )
+from ..resume_policy import is_resumable_failed_task
 from ..task_query import (
     TaskQueryPresets,
     TaskQueryService,
@@ -414,17 +415,18 @@ def _collect_unhandled_failures(
         reason = new_row.get("failure_reason") or "UNKNOWN"
         task = store.get(task_id)
         if task is not None:
-            decision = decide_failed_task_recovery(
-                store,
-                task,
-                max_recovery_attempts=max_recovery_attempts,
-            )
             # Default watch mode auto-resumes a narrow set of resumable failures.
-            if decision.action == "resume":
+            if is_resumable_failed_task(task):
                 continue
             # Restart-failed mode also handles retry-eligible failures.
-            if restart_failed_mode and decision.action == "retry":
-                continue
+            if restart_failed_mode:
+                decision = decide_failed_task_recovery(
+                    store,
+                    task,
+                    max_recovery_attempts=max_recovery_attempts,
+                )
+                if decision.action == "retry":
+                    continue
         failures.append(
             _ObservedFailure(
                 task_id=task_id,
@@ -466,24 +468,6 @@ def _emit_recovery_dry_run_report(
     print()
     print(f"Summary: {actionable} actionable ({resume} resume, {retry} retry), {skipped} skipped")
     return _RecoveryReport(actionable_count=actionable, resume_count=resume, retry_count=retry)
-
-
-def _has_active_recovery_children(
-    store: SqliteTaskStore,
-    *,
-    tags: tuple[str, ...] | None,
-    any_tag: bool,
-) -> bool:
-    for task in store.get_all():
-        if task.status != "in_progress" or not task.based_on:
-            continue
-        parent = store.get(task.based_on)
-        if parent is None or parent.status != "failed":
-            continue
-        if tags and not task_matches_tag_filters(task_tags=task.tags, tag_filters=tags, any_tag=any_tag):
-            continue
-        return True
-    return False
 
 
 def _compute_failure_backoff_seconds(config: Config, streak: int) -> int:
@@ -785,25 +769,51 @@ def _run_cycle(
     pending_recovery_task_ids: set[str] = set()
     if restart_failed:
         log.emit("PHASE", "recovery queue enabled (--restart-failed)")
-    failed_tasks = list_failed_tasks_for_recovery(store, tags=tags, any_tag=any_tag)
     failed_decisions: list[tuple[DbTask, FailedRecoveryDecision]] = []
     actionable_failed: list[tuple[DbTask, FailedRecoveryDecision]] = []
-    for failed in failed_tasks:
-        if failed.id is None:
-            continue
-        decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
-        failed_decisions.append((failed, decision))
-        if decision.action == "skip":
-            if restart_failed:
+    if restart_failed:
+        failed_tasks = list_failed_tasks_for_recovery(store, tags=tags, any_tag=any_tag)
+        for failed in failed_tasks:
+            if failed.id is None:
+                continue
+            decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
+            failed_decisions.append((failed, decision))
+            if decision.action == "skip":
                 log.emit(
                     "SKIP",
                     f"{failed.id} failed {failed.task_type}: {decision.reason_code}",
                     dedupe_key=f"recovery-skip:{failed.id}:{decision.reason_code}",
                 )
-            continue
-        if not restart_failed and decision.action != "resume":
-            continue
-        actionable_failed.append((failed, decision))
+                continue
+            actionable_failed.append((failed, decision))
+    else:
+        failed_tasks = store.get_resumable_failed_tasks()
+        if tags:
+            failed_tasks = [
+                task
+                for task in failed_tasks
+                if task_matches_tag_filters(task_tags=task.tags, tag_filters=tags, any_tag=any_tag)
+            ]
+        for failed in failed_tasks:
+            if failed.id is None:
+                continue
+            launch_mode: Literal["iterate", "worker", "none"] = (
+                "iterate" if failed.task_type == "implement" else "worker"
+            )
+            actionable_failed.append(
+                (
+                    failed,
+                    FailedRecoveryDecision(
+                        task_id=str(failed.id),
+                        action="resume",
+                        reason_code=failed.failure_reason or "UNKNOWN",
+                        reason_text="default watch auto-resume",
+                        launch_mode=launch_mode,
+                        attempt_index=0,
+                        attempt_limit=max_recovery_attempts,
+                    ),
+                )
+            )
 
     recovery_slots = max(0, min(slots, restart_failed_batch if restart_failed else slots))
     started_recovery_task_ids: set[str] = set()
@@ -941,7 +951,6 @@ def _run_cycle(
             decision.reason_code == "recovery_already_running"
             for _failed, decision in failed_decisions
         )
-        or _has_active_recovery_children(store, tags=tags, any_tag=any_tag)
     )
     if restart_failed and not recovery_phase_active:
         log.emit("PHASE", "recovery queue exhausted; switching to pending queue")

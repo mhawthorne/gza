@@ -217,12 +217,15 @@ def test_watch_cycle_recovery_mode_resumes_failed_task_before_starting_new_pendi
     assert spawned_task.based_on == failed.id
 
 
-def test_watch_cycle_default_mode_auto_resumes_resumable_failed_task(tmp_path: Path) -> None:
-    """Plain watch should keep narrow default auto-resume behavior for resumable failures."""
+@pytest.mark.parametrize("task_type", ["implement", "review", "improve", "rebase"])
+def test_watch_cycle_default_mode_auto_resumes_resumable_failed_task(
+    tmp_path: Path, task_type: str
+) -> None:
+    """Plain watch should preserve historical auto-resume behavior for all resumable task types."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
-    failed = store.add("Failed implement", task_type="implement")
+    failed = store.add(f"Failed {task_type}", task_type=task_type)
     assert failed.id is not None
     failed.status = "failed"
     failed.failure_reason = "MAX_TURNS"
@@ -240,6 +243,7 @@ def test_watch_cycle_default_mode_auto_resumes_resumable_failed_task(tmp_path: P
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
     ):
         result = _run_cycle(
             config=config,
@@ -253,8 +257,17 @@ def test_watch_cycle_default_mode_auto_resumes_resumable_failed_task(tmp_path: P
         )
 
     assert result.work_done is True
-    assert spawn_iterate.call_count == 1
-    spawned_task = spawn_iterate.call_args.args[2]
+    if task_type == "implement":
+        assert spawn_iterate.call_count == 1
+        assert spawn_resume.call_count == 0
+        spawned_task = spawn_iterate.call_args.args[2]
+        spawned_args = spawn_iterate.call_args.args[0]
+        assert spawned_args.resume is True
+    else:
+        assert spawn_iterate.call_count == 0
+        assert spawn_resume.call_count == 1
+        spawned_task = store.get(spawn_resume.call_args.args[2])
+        assert spawned_task is not None
     assert spawned_task.based_on == failed.id
     assert spawned_task.id != pending_impl.id
 
@@ -662,6 +675,98 @@ def test_watch_cycle_pending_queue_starts_only_after_recovery_exhaustion(tmp_pat
     assert result_first.work_done is True
     assert result_second.work_done is True
     assert spawn_iterate.call_count == 1
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
+
+
+def test_watch_cycle_restart_failed_manual_failure_child_does_not_block_pending_queue(tmp_path: Path) -> None:
+    """Manual-only failed chains should not keep restart-failed sessions stuck in recovery phase."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Broken plan", task_type="plan")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "TEST_FAILURE"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    child = store.add("Manual retry child", task_type="plan", based_on=failed.id)
+    assert child.id is not None
+    child.status = "in_progress"
+    store.update(child)
+
+    pending_plan = store.add("Pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._collect_live_running_state", return_value=(set(), set())),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
+
+
+def test_watch_cycle_restart_failed_out_of_scope_failure_child_does_not_block_pending_queue(tmp_path: Path) -> None:
+    """Out-of-scope failed chains should not keep restart-failed sessions stuck in recovery phase."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed review", task_type="review")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    child = store.add("Review resume child", task_type="review", based_on=failed.id)
+    assert child.id is not None
+    child.status = "in_progress"
+    child.session_id = failed.session_id
+    store.update(child)
+
+    pending_plan = store.add("Pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._collect_live_running_state", return_value=(set(), set())),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
 
@@ -2715,12 +2820,15 @@ def test_collect_unhandled_failures_restart_failed_keeps_manual_failures_visible
     assert [(failure.task_id, failure.reason) for failure in failures] == [(str(failed.id), "TEST_FAILURE")]
 
 
-def test_collect_unhandled_failures_default_mode_skips_auto_resumable_failures(tmp_path: Path) -> None:
+@pytest.mark.parametrize("task_type", ["implement", "review", "improve", "rebase"])
+def test_collect_unhandled_failures_default_mode_skips_auto_resumable_failures(
+    tmp_path: Path, task_type: str
+) -> None:
     """Default watch mode should keep backoff accounting limited to non-auto-resumable failures."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
-    resumable = store.add("Resumable implement", task_type="implement")
+    resumable = store.add(f"Resumable {task_type}", task_type=task_type)
     assert resumable.id is not None
     resumable.status = "failed"
     resumable.failure_reason = "MAX_TURNS"
@@ -2733,7 +2841,7 @@ def test_collect_unhandled_failures_default_mode_skips_auto_resumable_failures(t
     new = {
         str(resumable.id): {
             "status": "failed",
-            "task_type": "implement",
+            "task_type": task_type,
             "failure_reason": "MAX_TURNS",
         }
     }
