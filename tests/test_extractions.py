@@ -69,6 +69,10 @@ def test_plan_extraction_and_bundle_roundtrip(tmp_path: Path) -> None:
 
     assert "diff --git" in draft.patch
     assert draft.touched_paths == ("src/module.py",)
+    assert len(draft.file_summaries) == 1
+    assert draft.file_summaries[0].additions == 1
+    assert draft.file_summaries[0].deletions == 0
+    assert draft.file_summaries[0].binary is False
     assert "Operator intent:" in draft.prompt
 
     target_task = store.add(draft.prompt, task_type="implement")
@@ -122,6 +126,49 @@ def test_plan_extraction_supports_quoted_diff_headers_for_spaced_paths(tmp_path:
     )
 
     assert draft.touched_paths == (spaced_path,)
+
+
+def test_plan_extraction_marks_binary_numstat_entries(tmp_path: Path) -> None:
+    git = _init_repo(tmp_path)
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+
+    source_task = store.add("Source", task_type="implement")
+    source_task.status = "completed"
+    source_task.completed_at = datetime.now(UTC)
+    source_task.branch = "feature/source"
+    source_task.slug = "20260427-source-task-binary"
+    store.update(source_task)
+
+    git._run("checkout", "-b", source_task.branch)
+    (tmp_path / "assets").mkdir(exist_ok=True)
+    binary_path = "assets/image.bin"
+    (tmp_path / binary_path).write_bytes(b"\x00\x01\x02\x03")
+    git._run("add", binary_path)
+    git._run("commit", "-m", "add binary file")
+    git._run("checkout", "main")
+
+    source = resolve_source_selection(
+        store,
+        git,
+        source_task_id=source_task.id,
+        source_branch=None,
+        base_branch_override=None,
+    )
+    selected = normalize_selected_paths([binary_path])
+    draft = plan_extraction(
+        git,
+        source,
+        selected,
+        operator_prompt=None,
+    )
+
+    assert len(draft.file_summaries) == 1
+    summary = draft.file_summaries[0]
+    assert summary.selected_path == binary_path
+    assert summary.binary is True
+    assert summary.additions is None
+    assert summary.deletions is None
+    assert f"- A: {binary_path} [binary]" in draft.prompt
 
 
 def test_resolve_source_selection_rejects_non_code_task(tmp_path: Path) -> None:

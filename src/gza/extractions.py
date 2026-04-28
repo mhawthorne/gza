@@ -173,7 +173,8 @@ def plan_extraction(
 
     revision_range = f"{source.source_base_ref}...{source.source_branch}"
     name_status_text = git.get_diff_name_status(revision_range, selected_paths)
-    summaries = _parse_file_summaries(name_status_text, selected_paths)
+    numstat_text = git.get_diff_numstat(revision_range)
+    summaries = _parse_file_summaries(name_status_text, numstat_text, selected_paths)
     _ensure_every_selected_path_changed(summaries, selected_paths)
 
     patch = git.get_diff_patch_for_paths(revision_range, selected_paths, binary=True)
@@ -462,8 +463,13 @@ def _validate_task_source(task: Task) -> None:
         raise ExtractionError(f"Task {task.id} has no branch to extract from")
 
 
-def _parse_file_summaries(name_status_text: str, selected_paths: tuple[str, ...]) -> list[FileDiffSummary]:
+def _parse_file_summaries(
+    name_status_text: str,
+    numstat_text: str,
+    selected_paths: tuple[str, ...],
+) -> list[FileDiffSummary]:
     selected = set(selected_paths)
+    diff_stats = _parse_numstat_stats(numstat_text)
     out: list[FileDiffSummary] = []
 
     for line in name_status_text.splitlines():
@@ -489,15 +495,26 @@ def _parse_file_summaries(name_status_text: str, selected_paths: tuple[str, ...]
             continue
 
         selected_path = match_paths[0]
+        additions: int | None = None
+        deletions: int | None = None
+        binary = False
+
+        stat_key = next(
+            (path for path in (selected_path, old_path, new_path) if path and path in diff_stats),
+            None,
+        )
+        if stat_key is not None:
+            additions, deletions, binary = diff_stats[stat_key]
+
         out.append(
             FileDiffSummary(
                 status=status,
                 selected_path=selected_path,
                 old_path=old_path,
                 new_path=new_path,
-                additions=None,
-                deletions=None,
-                binary=False,
+                additions=additions,
+                deletions=deletions,
+                binary=binary,
             )
         )
 
@@ -505,6 +522,62 @@ def _parse_file_summaries(name_status_text: str, selected_paths: tuple[str, ...]
         raise ExtractionError("Selected files have no diff entries on the chosen source/base")
 
     return out
+
+
+def _parse_numstat_stats(numstat_text: str) -> dict[str, tuple[int | None, int | None, bool]]:
+    stats: dict[str, tuple[int | None, int | None, bool]] = {}
+    for line in numstat_text.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3:
+            continue
+
+        raw_additions, raw_deletions, raw_path = parts
+        raw_path = raw_path.strip()
+        if not raw_path:
+            continue
+
+        binary = raw_additions == "-" or raw_deletions == "-"
+        if binary:
+            additions: int | None = None
+            deletions: int | None = None
+        else:
+            try:
+                additions = int(raw_additions)
+                deletions = int(raw_deletions)
+            except ValueError:
+                continue
+
+        for path in _expand_numstat_paths(raw_path):
+            stats[path] = (additions, deletions, binary)
+    return stats
+
+
+def _expand_numstat_paths(pathspec: str) -> tuple[str, ...]:
+    if " => " not in pathspec:
+        return (_strip_quotes(pathspec),)
+
+    brace_start = pathspec.find("{")
+    brace_end = pathspec.rfind("}")
+    if brace_start >= 0 and brace_end > brace_start:
+        inside = pathspec[brace_start + 1 : brace_end]
+        if " => " in inside:
+            old_inside, new_inside = inside.split(" => ", 1)
+            prefix = pathspec[:brace_start]
+            suffix = pathspec[brace_end + 1 :]
+            return (
+                _strip_quotes(prefix + old_inside + suffix),
+                _strip_quotes(prefix + new_inside + suffix),
+            )
+
+    old_path, new_path = pathspec.split(" => ", 1)
+    return (_strip_quotes(old_path), _strip_quotes(new_path))
+
+
+def _strip_quotes(path: str) -> str:
+    stripped = path.strip()
+    if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+        return stripped[1:-1]
+    return stripped
 
 
 def _ensure_every_selected_path_changed(
