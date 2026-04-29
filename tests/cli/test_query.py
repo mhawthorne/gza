@@ -2932,6 +2932,21 @@ class TestGroupsCommand:
         assert "Warning: 'gza groups' is deprecated; use 'gza groups list'." in result.stdout
         assert "use tags" not in result.stdout
 
+    def test_groups_remains_aggregate_summary_output(self, tmp_path: Path):
+        """groups output should stay aggregate and avoid task-line rendering."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Release prompt", tags=("release",))
+        store.add("Backlog prompt", tags=("backlog",))
+
+        result = run_gza("groups", "list", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "release" in result.stdout
+        assert "backlog" in result.stdout
+        assert "Release prompt" not in result.stdout
+        assert "Backlog prompt" not in result.stdout
+
 
 class TestStatusCommand:
     """Tests for 'gza group <group>' command."""
@@ -3007,6 +3022,52 @@ class TestStatusCommand:
         assert result.returncode == 0
         assert "orphaned" not in result.stdout
         assert "Task in group B" in result.stdout
+
+    def test_status_flat_view_uses_query_presentation(self, tmp_path: Path):
+        """group --view flat should render query-presented task rows."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Flat task A", group="release")
+        store.add("Flat task B", group="release")
+
+        result = run_gza("group", "release", "--view", "flat", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Tag: release" in result.stdout
+        assert "Flat task A" in result.stdout
+        assert "Flat task B" in result.stdout
+
+    def test_status_tree_view_renders_lineage_tree(self, tmp_path: Path):
+        """group --view tree should render lineage-tree presentation."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        root = store.add("Tree root", group="release")
+        assert root.id is not None
+        store.add("Tree child", group="release", based_on=root.id, same_branch=True)
+
+        result = run_gza("group", "release", "--view", "tree", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Tree root" in result.stdout
+        assert "Tree child" in result.stdout
+        assert "└──" in result.stdout or "├──" in result.stdout
+
+    def test_status_json_view_outputs_json_rows(self, tmp_path: Path):
+        """group --view json should render query JSON rows."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Json task", group="release")
+
+        result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'." in result.stdout
+        json_start = result.stdout.find("[")
+        assert json_start >= 0
+        payload = json.loads(result.stdout[json_start:])
+        assert len(payload) == 1
+        assert payload[0]["prompt"] == "Json task"
+        assert payload[0]["group"] == "release"
 
 
 class TestRenameGroupCommand:

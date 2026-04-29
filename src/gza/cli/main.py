@@ -2092,6 +2092,12 @@ def main() -> int:
         "group",
         help="Group name to show tasks for",
     )
+    group_parser.add_argument(
+        "--view",
+        choices=["flat", "grouped", "lineage", "tree", "json"],
+        default="flat",
+        help="Presentation mode (default: flat)",
+    )
     add_common_args(group_parser)
 
     # ps command (status is an alias for ps)

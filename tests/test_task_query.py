@@ -299,6 +299,39 @@ def test_queue_preset_filters_to_group(tmp_path: Path) -> None:
     assert prompts == ["Release runnable"]
 
 
+def test_task_query_group_filter_matches_any_of_selected_group_names(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.add("Release task", tags=("release",))
+    store.add("Backlog task", tags=("backlog",))
+    store.add("Ops task", tags=("ops",))
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="tasks",
+            groups=("release", "ops"),
+            limit=None,
+        )
+    )
+
+    prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
+    assert "Release task" in prompts
+    assert "Ops task" in prompts
+    assert "Backlog task" not in prompts
+
+
+def test_default_projection_includes_group_field(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.add("Release task", group="release")
+
+    service = TaskQueryService(store)
+    rows = service.run(TaskQueryPresets.search("Release", limit=None)).to_json()
+
+    assert rows
+    assert "group" in rows[0]
+    assert rows[0]["group"] == "release"
+
+
 def test_dependency_state_blocked_by_dropped_dep_filters_pending_only(tmp_path: Path) -> None:
     store = _store(tmp_path)
 

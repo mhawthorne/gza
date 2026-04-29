@@ -1236,65 +1236,53 @@ def cmd_status(args: argparse.Namespace) -> int:
     """Show tasks by a single tag (compatibility alias: group)."""
     config = Config.load(args.project_dir)
     store = get_store(config)
+    service = _TaskQueryService(store)
 
     print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.")
-    group_name = args.group
     try:
-        tasks = store.get_by_group(group_name)
+        groups = validate_cli_tag_values((args.group,))
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
+    group_name = groups[0]
 
-    if not tasks:
+    raw_view = str(getattr(args, "view", "flat"))
+    view_mode = cast(
+        Literal["flat", "grouped", "lineage", "tree", "json"],
+        raw_view if raw_view in {"flat", "grouped", "lineage", "tree", "json"} else "flat",
+    )
+    query_scope: Literal["tasks", "lineages"] = "lineages" if view_mode in {"lineage", "tree"} else "tasks"
+    presentation_mode = cast(_PresentationMode, "flat" if view_mode == "lineage" else view_mode)
+
+    query = _TaskQuery(
+        scope=query_scope,
+        limit=None,
+        groups=groups,
+        sort=_TaskSortSpec(field="created_at", descending=False),
+        projection=_TaskProjectionSpec(preset="history_default"),
+        presentation=_TaskPresentationSpec(mode=presentation_mode),
+    )
+    result = service.run(query)
+
+    if not result.rows:
         print(f"No tasks found in group '{group_name}'")
         return 0
 
-    print(f"Tag: {group_name}")
-    print()
+    if view_mode != "json":
+        print(f"Tag: {group_name}")
+        print()
 
-    for task in tasks:
-        # Status icon
-        if task.status == "completed":
-            icon = "✓"
-        elif task.status == "in_progress":
-            icon = "→"
-        elif task.status == "failed":
-            icon = "✗"
-        else:
-            icon = "○"
+    rendered = result.render()
+    if rendered:
+        console.print(rendered)
 
-        # Task type label
-        type_label = f"[{task.task_type}] " if task.task_type != "implement" else ""
-
-        # Status display
-        status_display = task.status
-
-        # Check if blocked
-        blocked_info = ""
-        if task.status == "pending":
-            is_blocked, blocking_id, _ = store.is_task_blocked(task)
-            if is_blocked:
-                blocked_info = f" (blocked by {blocking_id})"
-
-        # Date info for completed tasks
-        date_info = ""
-        if task.completed_at:
-            date_info = f"  {task.completed_at.strftime('%m/%d')}"
-
-        # Compute available width: "  X N. [type] " prefix + " status date blocked" suffix
-        prefix_len = len(f"  {icon} {task.id}. {type_label}")
-        suffix_len = len(f" {status_display}{date_info}{blocked_info}")
-        avail = prompt_available_width(prefix=prefix_len, suffix=suffix_len)
-        prompt_display = shorten_prompt(task.prompt, avail)
-
-        print(f"  {icon} {task.id}. {type_label}{prompt_display:<{avail}} {status_display}{date_info}{blocked_info}")
-
-    # Check for orphaned tasks in this tag slice and warn the user
-    registry = WorkerRegistry(config.workers_path)
-    orphaned = _get_orphaned_tasks(registry, store)
-    group_orphaned = [t for t in orphaned if group_name in t.tags]
-    if group_orphaned:
-        _print_orphaned_warning(group_orphaned)
+    if view_mode != "json":
+        # Preserve orphaned-task warning behavior for this tag slice.
+        registry = WorkerRegistry(config.workers_path)
+        orphaned = _get_orphaned_tasks(registry, store)
+        group_orphaned = [task for task in orphaned if group_name in task.tags]
+        if group_orphaned:
+            _print_orphaned_warning(group_orphaned)
 
     return 0
 

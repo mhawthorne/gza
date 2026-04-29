@@ -653,8 +653,13 @@ gza import [file] [options]
 Deprecated alias for tag-scoped listing.
 
 ```bash
-gza group <group>
+gza group <group> [options]
 ```
+
+| Option | Description |
+|--------|-------------|
+| `group` | Group/tag name to filter by |
+| `--view MODE` | Presentation mode: `flat`, `grouped`, `lineage`, `tree`, or `json` (default: `flat`) |
 
 ### status
 
@@ -970,6 +975,8 @@ Deprecated alias for tag listing commands.
 ```bash
 gza groups
 ```
+
+`gza groups` remains an aggregate group-count summary command (`gza groups list`), separate from task/lineage query presentation.
 
 ### history
 

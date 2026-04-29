@@ -75,7 +75,7 @@ class TaskQuery:
     lineage_of: str | None = None
     root_ids: tuple[str, ...] | None = None
     branch_owner_ids: tuple[str, ...] | None = None
-    groups: tuple[str | None, ...] | None = None
+    groups: tuple[str, ...] | None = None
     tag_filters: tuple[str, ...] | None = None
     any_tag: bool = False
     pickup_only: bool = False
@@ -140,6 +140,7 @@ _TASK_DEFAULT_FIELDS: tuple[str, ...] = (
     "prompt",
     "status",
     "task_type",
+    "group",
     "created_at",
     "completed_at",
     "effective_at",
@@ -333,8 +334,6 @@ class TaskQueryService:
             return list(self._store.get_all())
 
         tags = query.tag_filters
-        if tags is None and query.groups:
-            tags = tuple(group for group in query.groups if group is not None)
         if query.pickup_only:
             return list(self._store.get_pending_pickup(limit=None, tags=tags, any_tag=query.any_tag))
         if query.sort.field == "pickup_order":
@@ -556,8 +555,17 @@ class TaskQueryService:
             ]
 
         if query.groups is not None:
-            allowed_groups = set(query.groups)
-            filtered = [task for task in filtered if task.group in allowed_groups]
+            allowed_groups = set(normalize_tag_filters(query.groups) or ())
+            filtered = [
+                task
+                for task in filtered
+                if (
+                    (task_group_values := {*(task.tags or ())})
+                    and bool(task_group_values & allowed_groups)
+                ) or (
+                    task.group is not None and task.group in allowed_groups
+                )
+            ]
 
         if query.tag_filters is not None:
             required = normalize_tag_filters(query.tag_filters)
