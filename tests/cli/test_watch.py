@@ -1444,8 +1444,8 @@ def test_count_live_workers_dedupes_registry_and_in_progress_rows_by_pid(tmp_pat
         assert _count_live_workers(config, store) == 1
 
 
-def test_count_live_workers_ignores_shutting_down_worker_for_terminal_task(tmp_path: Path) -> None:
-    """Terminal tasks should not keep a slot occupied just because the worker PID is still alive."""
+def test_count_live_workers_counts_shutting_down_worker_for_terminal_task(tmp_path: Path) -> None:
+    """A live teardown PID must still consume a slot even after the task row flips terminal."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
     task = store.add("Implement feature", task_type="implement")
@@ -1466,11 +1466,11 @@ def test_count_live_workers_ignores_shutting_down_worker_for_terminal_task(tmp_p
         patch("gza.cli.watch.WorkerRegistry", return_value=registry),
         patch("gza.cli.watch._pid_alive", return_value=True),
     ):
-        assert _count_live_workers(config, store) == 0
+        assert _count_live_workers(config, store) == 1
 
 
-def test_collect_live_running_state_tracks_worker_and_pid_only_tasks(tmp_path: Path) -> None:
-    """WAKE task summaries should include both worker-backed and pid-only in-progress tasks."""
+def test_collect_live_running_state_counts_live_worker_pid_even_for_terminal_task(tmp_path: Path) -> None:
+    """Live worker PIDs must still consume slots even if the task row has flipped terminal."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -1507,7 +1507,7 @@ def test_collect_live_running_state_tracks_worker_and_pid_only_tasks(tmp_path: P
     ):
         live_pids, running_task_ids = _collect_live_running_state(config, store)
 
-    assert live_pids == {4242, 5252}
+    assert live_pids == {4242, 4343, 5252}
     assert running_task_ids == [worker_task.id, pid_only_task.id]
 
 
@@ -1531,6 +1531,49 @@ def test_collect_live_running_state_counts_pending_task_with_live_worker(tmp_pat
 
     assert live_pids == {4242}
     assert running_task_ids == [pending_task.id]
+
+
+def test_watch_cycle_does_not_oversubscribe_batch_when_terminal_task_worker_is_still_alive(
+    tmp_path: Path,
+) -> None:
+    """A live worker in teardown must still block new starts when batch=1."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    terminal_task = store.add("Recently failed implement", task_type="implement")
+    pending_task = store.add("Pending implement", task_type="implement")
+    assert terminal_task.id is not None
+    assert pending_task.id is not None
+
+    terminal_task.status = "failed"
+    terminal_task.failure_reason = "TERMINATED"
+    store.update(terminal_task)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    registry = MagicMock()
+    registry.list_all.return_value = [
+        WorkerMetadata(worker_id="w-1", task_id=terminal_task.id, pid=4242, status="running"),
+    ]
+    registry.is_running.return_value = True
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.WorkerRegistry", return_value=registry),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    assert spawn_iterate.call_count == 0
 
 
 def test_format_wake_message_includes_running_task_ids() -> None:

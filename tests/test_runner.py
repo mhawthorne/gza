@@ -3765,7 +3765,7 @@ class TestRunStepPersistenceIntegration:
         assert refreshed.num_steps_computed == 3
 
     def test_non_code_sigterm_interrupt_marks_terminated(self, tmp_path: Path):
-        """SIGTERM-driven interrupts should be classified separately from manual interrupts."""
+        """SIGTERM-driven interrupts should be classified separately and log their source."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Plan task", task_type="plan")
@@ -3810,7 +3810,15 @@ class TestRunStepPersistenceIntegration:
         mock_git._run.return_value = Mock(returncode=1)
 
         with (
-            patch.dict(os.environ, {"GZA_INTERRUPT_SIGNAL": "SIGTERM"}, clear=False),
+            patch.dict(
+                os.environ,
+                {
+                    "GZA_INTERRUPT_SIGNAL": "SIGTERM",
+                    "GZA_INTERRUPT_SOURCE": "watch_reconcile_no_activity",
+                    "GZA_INTERRUPT_DETAIL": "watch reconciliation detected no recent task log activity",
+                },
+                clear=False,
+            ),
             patch("gza.runner.console"),
             patch("gza.runner._snapshot_task_db_to_worktree"),
             patch("gza.runner._copy_learnings_to_worktree"),
@@ -3832,6 +3840,12 @@ class TestRunStepPersistenceIntegration:
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "TERMINATED"
         assert refreshed.session_id == "sess-terminated-inline"
+        assert refreshed.log_file is not None
+
+        log_path = tmp_path / refreshed.log_file
+        log_text = log_path.read_text()
+        assert '"subtype": "interrupt"' in log_text
+        assert '"source": "watch_reconcile_no_activity"' in log_text
 
 
 class TestResumeVerificationPrompt:

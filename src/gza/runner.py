@@ -91,6 +91,21 @@ def _interruption_failure_reason() -> str:
     return "INTERRUPTED"
 
 
+def _interruption_metadata() -> dict[str, str]:
+    """Return structured metadata describing the current interrupt context."""
+    metadata: dict[str, str] = {}
+    signal_name = os.environ.get("GZA_INTERRUPT_SIGNAL")
+    if signal_name:
+        metadata["signal"] = signal_name
+    source = os.environ.get("GZA_INTERRUPT_SOURCE")
+    if source:
+        metadata["source"] = source
+    detail = os.environ.get("GZA_INTERRUPT_DETAIL")
+    if detail:
+        metadata["detail"] = detail
+    return metadata
+
+
 _TASK_EXECUTION_MODE_BY_INVOCATION_MODE: dict[str, str] = {
     "background_worker": "worker_background",
     "foreground_worker": "worker_foreground",
@@ -3325,8 +3340,19 @@ def _run_inner(
         return 1
     except KeyboardInterrupt:
         failure_reason = _interruption_failure_reason()
+        interrupt_metadata = _interruption_metadata()
         # Save WIP changes before returning
         _save_wip_changes(task, worktree_git, config, branch_name)
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "interrupt",
+                "message": "Task interrupted by signal",
+                "failure_reason": failure_reason,
+                **interrupt_metadata,
+            },
+        )
         store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), branch=branch_name, failure_reason=failure_reason)
         console.print("\nInterrupted")
         return 130
@@ -3491,6 +3517,17 @@ def _run_non_code_task(
             result = provider.run(config, provider_prompt, log_file, worktree_path, **provider_run_kwargs)
         except KeyboardInterrupt:
             failure_reason = _interruption_failure_reason()
+            interrupt_metadata = _interruption_metadata()
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "interrupt",
+                    "message": "Task interrupted by signal",
+                    "failure_reason": failure_reason,
+                    **interrupt_metadata,
+                },
+            )
             store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), failure_reason=failure_reason)
             console.print("\nInterrupted")
             return 130

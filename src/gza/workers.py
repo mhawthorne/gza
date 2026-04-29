@@ -84,6 +84,9 @@ class WorkerRegistry:
     def _pid_path(self, worker_id: str) -> Path:
         return self.workers_dir / f"{worker_id}.pid"
 
+    def _interrupt_request_path(self, pid: int) -> Path:
+        return self.workers_dir / f"interrupt-{pid}.json"
+
     _last_timestamp: str | None = None
     _last_counter: int = 0
 
@@ -166,6 +169,48 @@ class WorkerRegistry:
         pid_path = self._pid_path(worker_id)
         if pid_path.exists():
             pid_path.unlink()
+
+    def record_interrupt_request(
+        self,
+        pid: int,
+        *,
+        signal_name: str,
+        source: str,
+        task_id: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Persist best-effort metadata explaining an upcoming signal delivery."""
+        payload = {
+            "pid": pid,
+            "signal": signal_name,
+            "source": source,
+            "task_id": task_id,
+            "detail": detail,
+            "requested_at": datetime.now(UTC).isoformat(),
+        }
+        self._interrupt_request_path(pid).write_text(json.dumps(payload, indent=2))
+
+    def consume_interrupt_request(self, pid: int) -> dict[str, str] | None:
+        """Read and remove pending interrupt attribution for a PID."""
+        path = self._interrupt_request_path(pid)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            data = None
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        if not isinstance(data, dict):
+            return None
+        result: dict[str, str] = {}
+        for key in ("signal", "source", "task_id", "detail", "requested_at"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                result[key] = value
+        return result or None
 
     def cleanup_stale(self) -> int:
         count = 0

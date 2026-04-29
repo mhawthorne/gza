@@ -1872,6 +1872,13 @@ def _kill_task(
             print(f"✗ Failed to kill task {task.id}: {exc}")
             return False
     else:
+        registry.record_interrupt_request(
+            pid,
+            signal_name="SIGTERM",
+            source="gza_kill",
+            task_id=str(task.id) if task.id is not None else None,
+            detail="manual gza kill request",
+        )
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError as exc:
@@ -2464,6 +2471,13 @@ def _stop_worker_for_attach(task: DbTask, worker: WorkerMetadata, registry: Work
         except OSError:
             return False
 
+    registry.record_interrupt_request(
+        pid,
+        signal_name="SIGTERM",
+        source="attach_takeover",
+        task_id=str(task.id) if task.id is not None else None,
+        detail="stopping worker for interactive attach takeover",
+    )
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError as exc:
