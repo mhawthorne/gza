@@ -46,6 +46,7 @@ __all__ = [
     "WatchProgressObservation",
     "WatchRecoveryBackoff",
     "TaskComment",
+    "WorkflowStuckState",
     "TaskStats",
     "SqliteTaskStore",
     "extract_failure_reason",
@@ -553,6 +554,26 @@ class TaskComment:
 
 
 @dataclass(frozen=True)
+class WorkflowStuckState:
+    """Persisted active/inactive stuck state for an implementation workflow."""
+
+    workflow_root_task_id: str
+    active: bool
+    reason: str
+    detected_at: datetime
+    detected_by: str
+    source_task_id: str | None
+    source_review_id: str | None
+    source_improve_id: str | None
+    iterate_run_id: int | None
+    fingerprint: str
+    details: dict[str, Any]
+    cleared_at: datetime | None
+    cleared_by: str | None
+    clear_reason: str | None
+
+
+@dataclass(frozen=True)
 class TaskArtifact:
     """Persisted metadata for one task artifact stored under the project .gza dir."""
 
@@ -1029,8 +1050,36 @@ MIGRATION_V56_TO_V57 = """
 ALTER TABLE tasks ADD COLUMN last_edited_at TEXT;
 """
 
+# Migration from v57 to v58: durable workflow stuck-state tracking
+MIGRATION_V57_TO_V58 = """
+CREATE TABLE IF NOT EXISTS workflow_stuck_state (
+    project_id TEXT NOT NULL,
+    workflow_root_task_id TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    reason TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    detected_by TEXT NOT NULL,
+    source_task_id TEXT,
+    source_review_id TEXT,
+    source_improve_id TEXT,
+    iterate_run_id INTEGER,
+    fingerprint TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    cleared_at TEXT,
+    cleared_by TEXT,
+    clear_reason TEXT,
+    PRIMARY KEY(project_id, workflow_root_task_id),
+    FOREIGN KEY(project_id, workflow_root_task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE,
+    FOREIGN KEY(project_id, source_task_id) REFERENCES tasks(project_id, id) ON DELETE SET NULL,
+    FOREIGN KEY(project_id, source_review_id) REFERENCES tasks(project_id, id) ON DELETE SET NULL,
+    FOREIGN KEY(project_id, source_improve_id) REFERENCES tasks(project_id, id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_stuck_active_reason
+    ON workflow_stuck_state(project_id, active, reason);
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 57
+SCHEMA_VERSION = 58
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -1809,7 +1858,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58}
 )
 
 _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -2118,6 +2167,16 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
             raise RuntimeError(
                 "Auto-migration to v56 incomplete: missing required index "
                 "idx_watch_recovery_backoffs_due"
+            )
+    if target_version >= 58:
+        if not _table_exists(conn, "workflow_stuck_state"):
+            raise RuntimeError(
+                "Auto-migration to v58 incomplete: missing required table workflow_stuck_state"
+            )
+        if not _index_exists(conn, "idx_workflow_stuck_active_reason"):
+            raise RuntimeError(
+                "Auto-migration to v58 incomplete: missing required index "
+                "idx_workflow_stuck_active_reason"
             )
 
 
@@ -2489,6 +2548,38 @@ def _ensure_required_auto_migration_artifacts(
                     "Schema integrity check failed while repairing required index "
                     "idx_watch_recovery_backoffs_due: use a writable database."
                 ) from exc
+    if target_version >= 58:
+        if not _table_exists(conn, "workflow_stuck_state"):
+            try:
+                conn.executescript(MIGRATION_V57_TO_V58)
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required table workflow_stuck_state; "
+                        "use a writable database to complete migration to v58, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required table "
+                    "workflow_stuck_state: use a writable database."
+                ) from exc
+        elif not _index_exists(conn, "idx_workflow_stuck_active_reason"):
+            try:
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_workflow_stuck_active_reason
+                        ON workflow_stuck_state(project_id, active, reason)
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required index idx_workflow_stuck_active_reason; "
+                        "use a writable database to complete migration to v58, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required index "
+                    "idx_workflow_stuck_active_reason: use a writable database."
+                ) from exc
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -2693,6 +2784,31 @@ CREATE TABLE IF NOT EXISTS task_comments (
 );
 CREATE INDEX IF NOT EXISTS idx_task_comments_project_task_created ON task_comments(project_id, task_id, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_task_comments_project_task_unresolved ON task_comments(project_id, task_id, resolved_at);
+
+CREATE TABLE IF NOT EXISTS workflow_stuck_state (
+    project_id TEXT NOT NULL,
+    workflow_root_task_id TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    reason TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    detected_by TEXT NOT NULL,
+    source_task_id TEXT,
+    source_review_id TEXT,
+    source_improve_id TEXT,
+    iterate_run_id INTEGER,
+    fingerprint TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    cleared_at TEXT,
+    cleared_by TEXT,
+    clear_reason TEXT,
+    PRIMARY KEY(project_id, workflow_root_task_id),
+    FOREIGN KEY(project_id, workflow_root_task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE,
+    FOREIGN KEY(project_id, source_task_id) REFERENCES tasks(project_id, id) ON DELETE SET NULL,
+    FOREIGN KEY(project_id, source_review_id) REFERENCES tasks(project_id, id) ON DELETE SET NULL,
+    FOREIGN KEY(project_id, source_improve_id) REFERENCES tasks(project_id, id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_stuck_active_reason
+    ON workflow_stuck_state(project_id, active, reason);
 
 CREATE TABLE IF NOT EXISTS merge_units (
     project_id TEXT NOT NULL,
@@ -3043,6 +3159,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (55, MIGRATION_V54_TO_V55),
     (56, MIGRATION_V55_TO_V56),
     (57, MIGRATION_V56_TO_V57),
+    (58, MIGRATION_V57_TO_V58),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -3284,6 +3401,13 @@ class SqliteTaskStore:
         with self._connect() as conn:
             return _table_exists(conn, "watch_recovery_backoffs")
 
+    def supports_workflow_stuck_state(self) -> bool:
+        """Return whether workflow stuck-state storage is available."""
+        if self._open_mode == "query_only":
+            return self._query_only_table_exists.get("workflow_stuck_state", False)
+        with self._connect() as conn:
+            return _table_exists(conn, "workflow_stuck_state")
+
     def supports_task_artifacts(self) -> bool:
         """Return whether task artifact storage is available."""
         if self._open_mode == "query_only":
@@ -3474,6 +3598,7 @@ class SqliteTaskStore:
             "task_artifacts",
             "watch_progress_observations",
             "watch_recovery_backoffs",
+            "workflow_stuck_state",
         )
         self._query_only_table_exists = {table: _table_exists(conn, table) for table in tables}
         self._query_only_columns = {
@@ -4024,6 +4149,34 @@ class SqliteTaskStore:
             kind=row["kind"] if "kind" in keys else TASK_COMMENT_KIND_FEEDBACK,
             created_at=created_at,
             resolved_at=_parse_db_timestamp(row["resolved_at"]),
+        )
+
+    def _row_to_workflow_stuck_state(self, row: sqlite3.Row) -> WorkflowStuckState:
+        """Convert a database row to a WorkflowStuckState."""
+        details: dict[str, Any]
+        raw_details = row["details_json"]
+        try:
+            parsed = json.loads(raw_details)
+            details = parsed if isinstance(parsed, dict) else {"value": parsed}
+        except (TypeError, json.JSONDecodeError):
+            details = {"raw": raw_details}
+        detected_at = _parse_db_timestamp(row["detected_at"])
+        assert detected_at is not None
+        return WorkflowStuckState(
+            workflow_root_task_id=str(row["workflow_root_task_id"]),
+            active=bool(row["active"]),
+            reason=str(row["reason"]),
+            detected_at=detected_at,
+            detected_by=str(row["detected_by"]),
+            source_task_id=str(row["source_task_id"]) if row["source_task_id"] is not None else None,
+            source_review_id=str(row["source_review_id"]) if row["source_review_id"] is not None else None,
+            source_improve_id=str(row["source_improve_id"]) if row["source_improve_id"] is not None else None,
+            iterate_run_id=int(row["iterate_run_id"]) if row["iterate_run_id"] is not None else None,
+            fingerprint=str(row["fingerprint"]),
+            details=details,
+            cleared_at=_parse_db_timestamp(row["cleared_at"]),
+            cleared_by=str(row["cleared_by"]) if row["cleared_by"] is not None else None,
+            clear_reason=str(row["clear_reason"]) if row["clear_reason"] is not None else None,
         )
 
     # === Task CRUD ===
@@ -7272,6 +7425,188 @@ class SqliteTaskStore:
             params.append(cutoff_value)
         with self._connect() as conn:
             conn.execute(query, tuple(params))
+
+    def get_workflow_stuck_state(self, workflow_root_task_id: str) -> WorkflowStuckState | None:
+        """Return workflow stuck state row (active or cleared) for a workflow root."""
+        if not self.supports_workflow_stuck_state():
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM workflow_stuck_state
+                WHERE project_id = ? AND workflow_root_task_id = ?
+                """,
+                (self._project_id, workflow_root_task_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._row_to_workflow_stuck_state(row)
+
+    def get_active_workflow_stuck_state(self, workflow_root_task_id: str) -> WorkflowStuckState | None:
+        """Return active stuck state for the workflow root, if present."""
+        if not self.supports_workflow_stuck_state():
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM workflow_stuck_state
+                WHERE project_id = ? AND workflow_root_task_id = ? AND active = 1
+                """,
+                (self._project_id, workflow_root_task_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._row_to_workflow_stuck_state(row)
+
+    def upsert_workflow_stuck_state(
+        self,
+        *,
+        workflow_root_task_id: str,
+        reason: str,
+        detected_at: datetime,
+        detected_by: str,
+        fingerprint: str,
+        details: dict[str, Any],
+        source_task_id: str | None = None,
+        source_review_id: str | None = None,
+        source_improve_id: str | None = None,
+        iterate_run_id: int | None = None,
+    ) -> WorkflowStuckState:
+        """Insert or replace active stuck state for a workflow root."""
+        detected_at_value = _format_db_timestamp(detected_at)
+        assert detected_at_value is not None
+        payload = json.dumps(details, sort_keys=True, ensure_ascii=True)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO workflow_stuck_state (
+                    project_id, workflow_root_task_id, active, reason, detected_at, detected_by,
+                    source_task_id, source_review_id, source_improve_id, iterate_run_id,
+                    fingerprint, details_json, cleared_at, cleared_by, clear_reason
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                ON CONFLICT(project_id, workflow_root_task_id) DO UPDATE SET
+                    active = 1,
+                    reason = excluded.reason,
+                    detected_at = excluded.detected_at,
+                    detected_by = excluded.detected_by,
+                    source_task_id = excluded.source_task_id,
+                    source_review_id = excluded.source_review_id,
+                    source_improve_id = excluded.source_improve_id,
+                    iterate_run_id = excluded.iterate_run_id,
+                    fingerprint = excluded.fingerprint,
+                    details_json = excluded.details_json,
+                    cleared_at = NULL,
+                    cleared_by = NULL,
+                    clear_reason = NULL
+                """,
+                (
+                    self._project_id,
+                    workflow_root_task_id,
+                    reason,
+                    detected_at_value,
+                    detected_by,
+                    source_task_id,
+                    source_review_id,
+                    source_improve_id,
+                    iterate_run_id,
+                    fingerprint,
+                    payload,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM workflow_stuck_state
+                WHERE project_id = ? AND workflow_root_task_id = ?
+                """,
+                (self._project_id, workflow_root_task_id),
+            ).fetchone()
+            assert row is not None
+            return self._row_to_workflow_stuck_state(row)
+
+    def clear_workflow_stuck_state(
+        self,
+        workflow_root_task_id: str,
+        *,
+        cleared_by: str,
+        clear_reason: str,
+        cleared_at: datetime | None = None,
+    ) -> WorkflowStuckState | None:
+        """Mark active stuck state inactive and record clear audit fields."""
+        ts = _format_db_timestamp(cleared_at or datetime.now(UTC))
+        assert ts is not None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE workflow_stuck_state
+                SET active = 0, cleared_at = ?, cleared_by = ?, clear_reason = ?
+                WHERE project_id = ? AND workflow_root_task_id = ? AND active = 1
+                """,
+                (ts, cleared_by, clear_reason, self._project_id, workflow_root_task_id),
+            )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM workflow_stuck_state
+                WHERE project_id = ? AND workflow_root_task_id = ?
+                """,
+                (self._project_id, workflow_root_task_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._row_to_workflow_stuck_state(row)
+
+    def list_active_workflow_stuck_states(self) -> list[WorkflowStuckState]:
+        """List active workflow stuck state rows, newest first."""
+        if not self.supports_workflow_stuck_state():
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM workflow_stuck_state
+                WHERE project_id = ? AND active = 1
+                ORDER BY detected_at DESC, workflow_root_task_id DESC
+                """,
+                (self._project_id,),
+            ).fetchall()
+            return [self._row_to_workflow_stuck_state(row) for row in rows]
+
+    def get_workflow_stuck_reason_counts(self) -> list[tuple[str, int]]:
+        """Return active stuck counts grouped by reason."""
+        if not self.supports_workflow_stuck_state():
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT reason, COUNT(*) AS cnt
+                FROM workflow_stuck_state
+                WHERE project_id = ? AND active = 1
+                GROUP BY reason
+                ORDER BY cnt DESC, reason ASC
+                """,
+                (self._project_id,),
+            ).fetchall()
+            return [(str(row["reason"]), int(row["cnt"])) for row in rows]
+
+    def get_workflow_stuck_detector_counts(self) -> list[tuple[str, int]]:
+        """Return active stuck counts grouped by detector source."""
+        if not self.supports_workflow_stuck_state():
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT detected_by, COUNT(*) AS cnt
+                FROM workflow_stuck_state
+                WHERE project_id = ? AND active = 1
+                GROUP BY detected_by
+                ORDER BY cnt DESC, detected_by ASC
+                """,
+                (self._project_id,),
+            ).fetchall()
+            return [(str(row["detected_by"]), int(row["cnt"])) for row in rows]
 
     def get_impl_tasks_by_depends_on_or_based_on(self, task_id: str) -> list[Task]:
         """Get implement tasks that depend on or are based on a given task.
