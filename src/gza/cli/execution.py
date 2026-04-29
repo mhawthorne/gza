@@ -1648,6 +1648,17 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         print(f"Error: Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
         return 1
 
+    def _matching_pending_resume_child(failed_task: DbTask) -> DbTask | None:
+        assert failed_task.id is not None
+        for child in store.get_based_on_children_by_type(str(failed_task.id), failed_task.task_type or ""):
+            if (
+                child.status == "pending"
+                and child.session_id
+                and child.session_id == failed_task.session_id
+            ):
+                return child
+        return None
+
     # Handle background mode: re-exec this command as a detached process.
     if background:
         return _spawn_background_iterate(
@@ -1725,7 +1736,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             if dry_run:
                 print(f"[dry-run] Would resume failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
                 return 0
-            run_start_task = _create_resume_task(store, impl_task)
+            run_start_task = _matching_pending_resume_child(impl_task) or _create_resume_task(store, impl_task)
             assert run_start_task.id is not None
             print(f"Resuming failed implementation {impl_task.id} as {run_start_task.id}...")
             impl_task, rc = _run_task_with_resume(run_start_task, initial_resume=True)

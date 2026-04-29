@@ -214,7 +214,7 @@ def test_watch_cycle_recovery_mode_resumes_failed_task_before_starting_new_pendi
     spawned_task = spawn_iterate.call_args.args[2]
     assert spawned_args.resume is True
     assert spawned_args.retry is False
-    assert spawned_task.based_on == failed.id
+    assert spawned_task.id == failed.id
 
 
 @pytest.mark.parametrize("task_type", ["implement", "review", "improve", "rebase"])
@@ -314,6 +314,48 @@ def test_watch_cycle_default_mode_reuses_existing_pending_resume_child(tmp_path:
     assert children[0].id == resume_child.id
 
 
+def test_watch_cycle_default_mode_does_not_reuse_pending_retry_child(tmp_path: Path) -> None:
+    """Plain watch should not broaden auto-resume into reusing a non-resume pending child."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    retry_child = store.add("Pending retry child", task_type="implement", based_on=failed.id)
+    assert retry_child.id is not None
+    retry_child.status = "pending"
+    store.update(retry_child)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is False
+    assert spawn_resume.call_count == 0
+    assert [task.id for task in store.get_based_on_children(failed.id)] == [retry_child.id]
+
+
 def test_watch_cycle_default_mode_suppresses_existing_in_progress_resume_child(tmp_path: Path) -> None:
     """Plain watch should not create or launch another resume child while one is already running."""
     setup_config(tmp_path)
@@ -357,6 +399,51 @@ def test_watch_cycle_default_mode_suppresses_existing_in_progress_resume_child(t
     assert spawn_resume.call_count == 0
     assert len(children) == 1
     assert children[0].id == resume_child.id
+
+
+def test_watch_cycle_default_mode_does_not_treat_unrelated_in_progress_child_as_resume_blocker(
+    tmp_path: Path,
+) -> None:
+    """Plain watch should ignore unrelated in-progress descendants instead of broadening auto-resume logic."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    unrelated_child = store.add("Running retry child", task_type="implement", based_on=failed.id)
+    assert unrelated_child.id is not None
+    unrelated_child.status = "in_progress"
+    unrelated_child.session_id = "different-session"
+    store.update(unrelated_child)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is False
+    assert spawn_resume.call_count == 0
+    assert [task.id for task in store.get_based_on_children(failed.id)] == [unrelated_child.id]
 
 
 def test_watch_cycle_default_mode_spawn_failure_reuses_pending_resume_child_next_cycle(tmp_path: Path) -> None:
@@ -566,9 +653,9 @@ def test_watch_cycle_restart_failed_reuses_existing_deep_recovery_chain_without_
     spawned_args = spawn_iterate.call_args.args[0]
     spawned_task = spawn_iterate.call_args.args[2]
     assert spawned_args.resume is True
-    assert spawned_task.id == pending_grandchild.id
-    assert spawned_task.based_on == failed_retry.id
+    assert spawned_task.id == failed_retry.id
     assert [task.id for task in store.get_based_on_children(root.id)] == [failed_retry.id]
+    assert [task.id for task in store.get_based_on_children(failed_retry.id)] == [pending_grandchild.id]
 
 
 def test_watch_cycle_dry_run_recovery_mode_reports_actions_without_mutation(tmp_path: Path) -> None:
@@ -652,7 +739,7 @@ def test_watch_cycle_recovery_mode_does_not_resume_test_failure_tasks(tmp_path: 
 
 
 def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(tmp_path: Path) -> None:
-    """Implement recovery should reuse the same resume child and preserve resume=True after spawn failure."""
+    """Implement recovery should retry the failed root iterate launch without creating local resume children."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -695,7 +782,6 @@ def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(
         )
 
     children = store.get_based_on_children(failed.id)
-    pending_children = [task for task in children if task.status == "pending"]
     assert result_first.work_done is True
     assert result_second.work_done is True
     assert spawn_resume.call_count == 0
@@ -704,14 +790,14 @@ def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(
     second_args = spawn_iterate.call_args_list[1].args[0]
     second_task = spawn_iterate.call_args_list[1].args[2]
     assert first_task.id == second_task.id
+    assert first_task.id == failed.id
     assert second_args.resume is True
     assert second_args.retry is False
-    assert len(children) == 1
-    assert len(pending_children) == 1
+    assert children == []
 
 
 def test_watch_cycle_reuses_preexisting_pending_resume_child_with_resume_semantics(tmp_path: Path) -> None:
-    """Restart-failed should launch an existing pending resume child with resume=True."""
+    """Restart-failed should launch iterate on the failed root and let iterate reuse the pending resume child."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -752,9 +838,10 @@ def test_watch_cycle_reuses_preexisting_pending_resume_child_with_resume_semanti
     assert spawn_iterate.call_count == 1
     spawned_args = spawn_iterate.call_args.args[0]
     spawned_task = spawn_iterate.call_args.args[2]
-    assert spawned_task.id == resume_child.id
+    assert spawned_task.id == failed.id
     assert spawned_args.resume is True
     assert spawned_args.retry is False
+    assert [task.id for task in store.get_based_on_children(failed.id)] == [resume_child.id]
 
 
 def test_watch_cycle_blocked_pending_recovery_child_waits_for_dependency_then_reuses_child(
@@ -828,7 +915,7 @@ def test_watch_cycle_blocked_pending_recovery_child_waits_for_dependency_then_re
     assert spawn_iterate.call_count == 1
     spawned_args = spawn_iterate.call_args.args[0]
     spawned_task = spawn_iterate.call_args.args[2]
-    assert spawned_task.id == resume_child.id
+    assert spawned_task.id == failed.id
     assert spawned_args.resume is True
     assert spawned_args.retry is False
     assert len(store.get_based_on_children(failed.id)) == 1
@@ -3861,13 +3948,10 @@ def test_watch_cycle_quiet_logs_start_failed_when_recovery_iterate_spawn_fails(
     assert "Error spawning background worker" not in stdout
     assert spawn_resume.call_count == 0
     assert spawn_iterate.call_count == 1
-    children = store.get_based_on_children(failed.id)
-    assert len(children) == 1
-    child = children[0]
-    assert child.id is not None
+    assert store.get_based_on_children(failed.id) == []
     log_text = log_path.read_text()
     assert "START_FAILED" in log_text
-    assert f"{failed.id} -> {child.id}: iterate worker spawn failed" in log_text
+    assert f"{failed.id} -> {failed.id}: iterate worker spawn failed" in log_text
 
 
 def test_cmd_watch_interrupts_sleep_promptly_on_signal(tmp_path: Path) -> None:

@@ -5757,6 +5757,78 @@ class TestIterateCommand:
         assert "Resuming failed implementation" in output
         assert "Iterate complete: MERGE_READY" in output
 
+    def test_failed_task_resume_reuses_matching_pending_resume_child(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """gza iterate --resume should reuse an existing pending resume child for the failed root task."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+        from datetime import datetime
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "failed"
+        impl.session_id = "resume-session-1"
+        store.update(impl)
+
+        resume_child = store.add("Pending resume child", task_type="implement", based_on=impl.id)
+        assert resume_child.id is not None
+        resume_child.status = "pending"
+        resume_child.session_id = impl.session_id
+        store.update(resume_child)
+
+        def fake_run_foreground(config, task_id, **kwargs):
+            task = store.get(task_id)
+            if task and task.status == "pending":
+                task.status = "completed"
+                if task.task_type == "implement":
+                    task.branch = "test-project/20260101-resume-reuse"
+                task.completed_at = datetime.now()
+                store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            project_dir=str(tmp_path),
+            impl_task_id=str(impl.id),
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=True,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            advance_requires_review=False,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+            patch("gza.cli.Git", return_value=mock_git),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert run_fg.call_count >= 1
+        first_task_id = run_fg.call_args_list[0][1]["task_id"]
+        assert first_task_id == resume_child.id
+        assert [task.id for task in store.get_based_on_children(impl.id)] == [resume_child.id]
+        assert "Resuming failed implementation" in output
+        assert "Iterate complete: MERGE_READY" in output
+
     def test_iterate_continue_flag_is_rejected(self, tmp_path: Path):
         setup_config(tmp_path)
         result = run_gza("iterate", "testproject-1", "--continue", "--project", str(tmp_path))

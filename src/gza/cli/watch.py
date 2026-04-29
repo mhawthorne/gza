@@ -525,13 +525,47 @@ def _select_default_watch_resume_action(
         return None
     assert task.id is not None
     children = store.get_based_on_children_by_type(str(task.id), task.task_type or "")
-    for child in children:
+    matching_session_children = [
+        child for child in children if child.session_id and child.session_id == task.session_id
+    ]
+    for child in matching_session_children:
         if child.status == "in_progress":
             return _DefaultWatchResumeSelection(action="wait_in_progress", recovery_task_id=str(child.id))
-    for child in children:
+    for child in matching_session_children:
         if child.status == "pending" and child.id is not None:
             return _DefaultWatchResumeSelection(action="reuse_pending", recovery_task_id=str(child.id))
+    for child in children:
+        if child.status in {"pending", "in_progress", "completed", "failed"}:
+            return None
     return _DefaultWatchResumeSelection(action="create_new")
+
+
+def _is_default_watch_blocked_recovery_descendant(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    max_recovery_attempts: int,
+) -> bool:
+    """Return whether plain watch should leave a pending recovery descendant untouched."""
+    if task.status != "pending" or not task.based_on or not task.task_type:
+        return False
+    parent = store.get(task.based_on)
+    if parent is None or parent.status != "failed" or parent.task_type != task.task_type:
+        return False
+    if not _is_default_watch_auto_resumable(
+        store,
+        parent,
+        max_recovery_attempts=max_recovery_attempts,
+    ):
+        return False
+    selection = _select_default_watch_resume_action(
+        store,
+        parent,
+        max_recovery_attempts=max_recovery_attempts,
+    )
+    if selection is not None and selection.action == "reuse_pending" and selection.recovery_task_id == str(task.id):
+        return False
+    return True
 
 
 def _run_cycle(
@@ -939,18 +973,15 @@ def _run_cycle(
                 work_done = True
                 launched_recovery_count += 1
                 continue
-            if decision.reuse_existing:
-                assert decision.recovery_task_id is not None
-                recovered_task_id = decision.recovery_task_id
-                existing_recovered_task = store.get(recovered_task_id)
-                assert existing_recovered_task is not None
-                recovered_task = existing_recovered_task
-            else:
-                recovered_task = _create_resume_task(store, failed)
-                assert recovered_task.id is not None
-                recovered_task_id = str(recovered_task.id)
-            pending_recovery_task_ids.add(recovered_task_id)
             if decision.launch_mode == "worker":
+                if decision.reuse_existing:
+                    assert decision.recovery_task_id is not None
+                    recovered_task_id = decision.recovery_task_id
+                else:
+                    recovered_task = _create_resume_task(store, failed)
+                    assert recovered_task.id is not None
+                    recovered_task_id = str(recovered_task.id)
+                pending_recovery_task_ids.add(recovered_task_id)
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
                     log=log,
@@ -964,8 +995,8 @@ def _run_cycle(
                     ),
                 )
             else:
-                assert recovered_task is not None
-                iterate_task = recovered_task
+                recovered_task_id = decision.recovery_task_id or str(failed.id)
+                pending_recovery_task_ids.add(recovered_task_id)
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
                     log=log,
@@ -974,7 +1005,7 @@ def _run_cycle(
                     spawn_fn=lambda: _spawn_background_iterate(
                         argparse.Namespace(max_iterations=max_iterations, no_docker=False, resume=True, retry=False),
                         config,
-                        iterate_task,
+                        failed,
                     ),
                 )
         else:
@@ -1071,6 +1102,12 @@ def _run_cycle(
             if str(task.id) in pending_recovery_task_ids:
                 continue
             if str(task.id) in step1_handled_child_task_ids:
+                continue
+            if not restart_failed and _is_default_watch_blocked_recovery_descendant(
+                store,
+                task,
+                max_recovery_attempts=max_recovery_attempts,
+            ):
                 continue
             task_type = task.task_type or "implement"
             if task_type == "implement":
