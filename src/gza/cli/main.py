@@ -697,7 +697,7 @@ def main() -> int:
         "--show-skipped",
         action="store_true",
         dest="show_skipped",
-        help="With --restart-failed --dry-run, include skipped failed tasks in the recovery report",
+        help="With --restart-failed, include skipped failed tasks in the dry-run recovery report and live watch logs",
     )
     watch_parser.add_argument(
         "--quiet",

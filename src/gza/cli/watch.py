@@ -15,6 +15,7 @@ from typing import TypeVar
 from ..config import Config
 from ..console import truncate
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from ..failed_task_ordering import sort_failed_tasks
 from ..git import Git
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..recovery_engine import (
@@ -600,6 +601,7 @@ def _run_cycle(
     restart_failed: bool = False,
     restart_failed_batch: int = 1,
     max_recovery_attempts: int = 1,
+    show_skipped: bool = False,
 ) -> _CycleResult:
     from ._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
 
@@ -886,11 +888,12 @@ def _run_cycle(
             decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
             failed_decisions.append((failed, decision))
             if decision.action == "skip":
-                log.emit(
-                    "SKIP",
-                    f"{failed.id} failed {failed.task_type}: {decision.reason_code}",
-                    dedupe_key=f"recovery-skip:{failed.id}:{decision.reason_code}",
-                )
+                if show_skipped:
+                    log.emit(
+                        "SKIP",
+                        f"{failed.id} failed {failed.task_type}: {decision.reason_code}",
+                        dedupe_key=f"recovery-skip:{failed.id}:{decision.reason_code}",
+                    )
                 continue
             actionable_failed.append((failed, decision))
     else:
@@ -901,6 +904,7 @@ def _run_cycle(
                 for task in failed_tasks
                 if task_matches_tag_filters(task_tags=task.tags, tag_filters=tags, any_tag=any_tag)
             ]
+        failed_tasks = sort_failed_tasks(failed_tasks)
         for failed in failed_tasks:
             if failed.id is None:
                 continue
@@ -1286,6 +1290,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 restart_failed=restart_failed,
                 restart_failed_batch=restart_failed_batch,
                 max_recovery_attempts=max_recovery_attempts,
+                show_skipped=show_skipped,
             )
             if preview_result.work_done:
                 try:
@@ -1323,6 +1328,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 restart_failed=restart_failed,
                 restart_failed_batch=restart_failed_batch,
                 max_recovery_attempts=max_recovery_attempts,
+                show_skipped=show_skipped,
             )
 
             current_snapshot = _task_snapshot(store)

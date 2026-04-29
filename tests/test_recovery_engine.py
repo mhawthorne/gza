@@ -221,7 +221,7 @@ def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:
     assert decision.reason_code == "attempt_cap_reached"
 
 
-def test_list_failed_tasks_for_recovery_sorts_newest_first_with_mixed_naive_and_aware_completed_at(
+def test_list_failed_tasks_for_recovery_sorts_oldest_created_first(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -242,4 +242,4 @@ def test_list_failed_tasks_for_recovery_sorts_newest_first_with_mixed_naive_and_
     store.update(current)
 
     failed = list_failed_tasks_for_recovery(store)
-    assert [task.id for task in failed] == [current.id, legacy.id]
+    assert [task.id for task in failed] == [legacy.id, current.id]

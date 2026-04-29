@@ -227,13 +227,15 @@ class TestHelpOutput:
 
         assert "with --restart-failed, print the failed-recovery report and exit" in help_text
         assert "auto-resume and --restart-failed recovery decisions" in help_text
-        assert "include skipped failed tasks in the recovery report" in help_text
+        assert "include skipped failed tasks in the dry-run recovery report and live watch logs" in help_text
 
         assert "with `--restart-failed`, print the full failed-recovery report and exit" in docs_text
         assert "applies to plain-watch auto-resume and to `--restart-failed` resume/retry decisions" in docs_text
         assert "`gza watch --restart-failed --dry-run` is the recovery inspection surface" in docs_text
+        assert "oldest-created failed task first" in docs_text
         assert "Skipped tasks are hidden by default" in docs_text
         assert "`--show-skipped` to include them" in docs_text
+        assert "live watch logs" in docs_text
 
         assert "`gza watch --restart-failed --dry-run`" in failed_tasks_docs
         assert "Print the recovery decision report and exit" in failed_tasks_docs
