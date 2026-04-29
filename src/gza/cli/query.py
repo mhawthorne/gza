@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
 
+from rich.console import Console
 from rich.markup import escape as rich_escape
 
 import gza.colors as _colors
@@ -84,7 +85,8 @@ from ._common import (
 
 _LINEAGE_REL_LABELS = _QUERY_LINEAGE_REL_LABELS
 _QueryDateField = Literal["created", "completed", "effective"]
-_PresentationMode = Literal["flat", "grouped", "tree", "one_line", "json"]
+_PresentationMode = Literal["flat", "grouped", "lineage", "tree", "one_line", "json"]
+_stderr_console = Console(highlight=False, stderr=True)
 
 
 def _parse_cli_date(value: str | None) -> _dt.date | None:
@@ -1251,65 +1253,62 @@ def cmd_status(args: argparse.Namespace) -> int:
     """Show tasks by a single tag (compatibility alias: group)."""
     config = Config.load(args.project_dir)
     store = get_store(config)
-
-    print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.")
-    group_name = args.group
+    service = _TaskQueryService(store)
     try:
-        tasks = store.get_by_group(group_name)
+        groups = validate_cli_tag_values((args.group,))
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
+    group_name = groups[0]
 
-    if not tasks:
-        print(f"No tasks found in group '{group_name}'")
+    raw_view = str(getattr(args, "view", "flat"))
+    view_mode = cast(
+        Literal["flat", "lineage", "tree", "json"],
+        raw_view if raw_view in {"flat", "lineage", "tree", "json"} else "flat",
+    )
+    if view_mode == "json":
+        print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.", file=sys.stderr)
+    else:
+        print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.")
+    query_scope: Literal["tasks", "lineages"] = "lineages" if view_mode in {"lineage", "tree"} else "tasks"
+    presentation_mode = cast(_PresentationMode, view_mode)
+
+    query = _TaskQuery(
+        scope=query_scope,
+        limit=None,
+        groups=groups,
+        sort=_TaskSortSpec(field="created_at", descending=False),
+        projection=_TaskProjectionSpec(preset="history_default"),
+        presentation=_TaskPresentationSpec(mode=presentation_mode),
+    )
+    result = service.run(query)
+
+    if not result.rows:
+        if view_mode == "json":
+            print("[]")
+        else:
+            print(f"No tasks found in group '{group_name}'")
         return 0
 
-    print(f"Tag: {group_name}")
-    print()
+    if view_mode != "json":
+        print(f"Tag: {group_name}")
+        print()
 
-    for task in tasks:
-        # Status icon
-        if task.status == "completed":
-            icon = "✓"
-        elif task.status == "in_progress":
-            icon = "→"
-        elif task.status == "failed":
-            icon = "✗"
+    rendered = result.render()
+    if rendered:
+        if view_mode == "json":
+            print(rendered)
         else:
-            icon = "○"
+            # Preserve literal prompt text (including bracketed segments) in
+            # human-readable output.
+            console.print(rendered, markup=False)
 
-        # Task type label
-        type_label = f"[{task.task_type}] " if task.task_type != "implement" else ""
-
-        # Status display
-        status_display = task.status
-
-        # Check if blocked
-        blocked_info = ""
-        if task.status == "pending":
-            is_blocked, blocking_id, _ = store.is_task_blocked(task)
-            if is_blocked:
-                blocked_info = f" (blocked by {blocking_id})"
-
-        # Date info for completed tasks
-        date_info = ""
-        if task.completed_at:
-            date_info = f"  {task.completed_at.strftime('%m/%d')}"
-
-        # Compute available width: "  X N. [type] " prefix + " status date blocked" suffix
-        prefix_len = len(f"  {icon} {task.id}. {type_label}")
-        suffix_len = len(f" {status_display}{date_info}{blocked_info}")
-        avail = prompt_available_width(prefix=prefix_len, suffix=suffix_len)
-        prompt_display = shorten_prompt(task.prompt, avail)
-
-        print(f"  {icon} {task.id}. {type_label}{prompt_display:<{avail}} {status_display}{date_info}{blocked_info}")
-
-    # Check for orphaned tasks in this tag slice and warn the user
+    # Preserve orphaned-task warning behavior for this tag slice.
     registry = WorkerRegistry(config.workers_path)
     orphaned = _get_orphaned_tasks(registry, store)
-    group_orphaned = [t for t in orphaned if group_name in t.tags]
+    group_orphaned = [task for task in orphaned if group_name in task.tags]
     if group_orphaned:
-        _print_orphaned_warning(group_orphaned)
+        _print_orphaned_warning(group_orphaned, to_stderr=view_mode == "json")
 
     return 0
 
@@ -1575,17 +1574,18 @@ def _get_orphaned_tasks(registry: WorkerRegistry, store: SqliteTaskStore) -> lis
     return [t for t in in_progress if t.id in orphaned_task_ids]
 
 
-def _print_orphaned_warning(orphaned: list[DbTask]) -> None:
+def _print_orphaned_warning(orphaned: list[DbTask], *, to_stderr: bool = False) -> None:
     """Print a warning about orphaned tasks with a suggestion to resume."""
+    out = _stderr_console if to_stderr else console
     count = len(orphaned)
     plural = "tasks" if count != 1 else "task"
-    console.print(f"\n[yellow]⚠  {count} orphaned {plural} found (in-progress with no active worker):[/yellow]")
+    out.print(f"\n[yellow]⚠  {count} orphaned {plural} found (in-progress with no active worker):[/yellow]")
     for task in orphaned:
         type_label = f"\\[{task.task_type}] " if task.task_type != "implement" else ""
         first_line = task.prompt.split('\n')[0].strip()
         prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
-        console.print(f"   [cyan]({task.id})[/cyan] {type_label}[{pink}]{prompt_display}[/{pink}]")
-    console.print(
+        out.print(f"   [cyan]({task.id})[/cyan] {type_label}[{pink}]{rich_escape(prompt_display)}[/{pink}]")
+    out.print(
         "   Run [cyan]gza work <full-task-id>[/cyan] to resume, or "
         "[cyan]gza mark-completed --force <full-task-id>[/cyan] to clear."
     )

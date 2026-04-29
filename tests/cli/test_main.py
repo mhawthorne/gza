@@ -313,6 +313,21 @@ class TestHelpOutput:
         assert "release" in result.stdout
         assert "usage:" not in result.stdout
 
+    def test_group_help_and_docs_describe_view_modes(self, tmp_path):
+        """group --help and docs should advertise query presentation modes."""
+        setup_config(tmp_path)
+
+        group_help = run_gza("group", "--help", "--project", str(tmp_path))
+        assert group_help.returncode == 0
+
+        help_text = " ".join(group_help.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "--view" in help_text
+        assert "{flat,lineage,tree,json}" in help_text
+        assert "Presentation mode (default: flat)" in help_text
+        assert "| `--view MODE` | Presentation mode: `flat`, `lineage`, `tree`, or `json` (default: `flat`) |" in docs_text
+
     def test_search_command_help_mentions_prompt_substring_scope(self, tmp_path):
         """`search --help` should describe prompt-only substring matching."""
         setup_config(tmp_path)

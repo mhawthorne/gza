@@ -11,7 +11,7 @@ from gza.db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_num
 
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
-PresentationMode = Literal["flat", "grouped", "tree", "one_line", "json"]
+PresentationMode = Literal["flat", "grouped", "lineage", "tree", "one_line", "json"]
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,7 @@ class TaskQuery:
     lineage_of: str | None = None
     root_ids: tuple[str, ...] | None = None
     branch_owner_ids: tuple[str, ...] | None = None
-    groups: tuple[str | None, ...] | None = None
+    groups: tuple[str, ...] | None = None
     tag_filters: tuple[str, ...] | None = None
     any_tag: bool = False
     pickup_only: bool = False
@@ -140,6 +140,7 @@ _TASK_DEFAULT_FIELDS: tuple[str, ...] = (
     "prompt",
     "status",
     "task_type",
+    "group",
     "created_at",
     "completed_at",
     "effective_at",
@@ -333,8 +334,6 @@ class TaskQueryService:
             return list(self._store.get_all())
 
         tags = query.tag_filters
-        if tags is None and query.groups:
-            tags = tuple(group for group in query.groups if group is not None)
         if query.pickup_only:
             return list(self._store.get_pending_pickup(limit=None, tags=tags, any_tag=query.any_tag))
         if query.sort.field == "pickup_order":
@@ -373,6 +372,8 @@ class TaskQueryService:
                 tree_by_root_id[root.id] = item.tree
 
                 for task in item.unresolved_tasks:
+                    if not self._matches_group_and_tag_filters(task, query):
+                        continue
                     owner = self._resolve_branch_owner(task)
                     owner_id = owner.id
                     if owner_id is None:
@@ -461,13 +462,26 @@ class TaskQueryService:
             for owner_id, owner_members in grouped.items():
                 owner = owner_by_id[owner_id]
                 root = _resolve_lineage_root(self._store, owner)
+                full_tree = _build_lineage_tree(self._store, root, max_depth=None)
+                rendered_tree = full_tree
+                rendered_members: tuple[DbTask, ...] = tuple(
+                    sorted(owner_members, key=lambda t: self._sort_key(t, DEFAULT_SORT), reverse=True)
+                )
+
+                if query.groups is not None or query.tag_filters is not None:
+                    keep_ids = {task.id for task in owner_members if task.id is not None}
+                    if owner.id is not None:
+                        keep_ids.add(owner.id)
+                    if root.id is not None:
+                        keep_ids.add(root.id)
+                    rendered_tree = _prune_lineage_tree_to_ids(full_tree, keep_ids)
+                    rendered_members = tuple(_flatten_lineage_tree(rendered_tree))
+
                 rows.append(
                     LineageRow(
                         owner_task=owner,
-                        members=tuple(
-                            sorted(owner_members, key=lambda t: self._sort_key(t, DEFAULT_SORT), reverse=True)
-                        ),
-                        tree=_build_lineage_tree(self._store, root, max_depth=None),
+                        members=rendered_members,
+                        tree=rendered_tree,
                     )
                 )
 
@@ -556,16 +570,9 @@ class TaskQueryService:
             ]
 
         if query.groups is not None:
-            allowed_groups = set(query.groups)
-            filtered = [task for task in filtered if task.group in allowed_groups]
-
-        if query.tag_filters is not None:
-            required = normalize_tag_filters(query.tag_filters)
-            filtered = [
-                task
-                for task in filtered
-                if task_matches_tag_filters(task_tags=task.tags, tag_filters=required, any_tag=query.any_tag)
-            ]
+            filtered = [task for task in filtered if self._matches_group_and_tag_filters(task, query)]
+        elif query.tag_filters is not None:
+            filtered = [task for task in filtered if self._matches_group_and_tag_filters(task, query)]
 
         if query.merge_chain_state is not None:
             merge_states = set(query.merge_chain_state)
@@ -576,6 +583,23 @@ class TaskQueryService:
             filtered = [task for task in filtered if self._matches_dependency_state(task, dep_states)]
 
         return filtered
+
+    def _matches_group_and_tag_filters(self, task: DbTask, query: TaskQuery) -> bool:
+        if query.groups is not None:
+            allowed_groups = set(normalize_tag_filters(query.groups) or ())
+            task_group_values = set(task.tags or ())
+            matches_group = bool(task_group_values & allowed_groups) or (
+                task.group is not None and task.group in allowed_groups
+            )
+            if not matches_group:
+                return False
+
+        if query.tag_filters is not None:
+            required = normalize_tag_filters(query.tag_filters)
+            if not task_matches_tag_filters(task_tags=task.tags, tag_filters=required, any_tag=query.any_tag):
+                return False
+
+        return True
 
     def _apply_lineage_filters(self, rows: Sequence[LineageRow], query: TaskQuery) -> list[LineageRow]:
         filtered = list(rows)

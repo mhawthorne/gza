@@ -2932,6 +2932,21 @@ class TestGroupsCommand:
         assert "Warning: 'gza groups' is deprecated; use 'gza groups list'." in result.stdout
         assert "use tags" not in result.stdout
 
+    def test_groups_remains_aggregate_summary_output(self, tmp_path: Path):
+        """groups output should stay aggregate and avoid task-line rendering."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Release prompt", tags=("release",))
+        store.add("Backlog prompt", tags=("backlog",))
+
+        result = run_gza("groups", "list", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "release" in result.stdout
+        assert "backlog" in result.stdout
+        assert "Release prompt" not in result.stdout
+        assert "Backlog prompt" not in result.stdout
+
 
 class TestStatusCommand:
     """Tests for 'gza group <group>' command."""
@@ -3007,6 +3022,220 @@ class TestStatusCommand:
         assert result.returncode == 0
         assert "orphaned" not in result.stdout
         assert "Task in group B" in result.stdout
+
+    def test_status_flat_view_uses_query_presentation(self, tmp_path: Path):
+        """group --view flat should render query-presented task rows."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Flat task A", group="release")
+        store.add("Flat task B", group="release")
+
+        result = run_gza("group", "release", "--view", "flat", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Tag: release" in result.stdout
+        assert "Flat task A" in result.stdout
+        assert "Flat task B" in result.stdout
+
+    def test_status_tree_view_renders_lineage_tree(self, tmp_path: Path):
+        """group --view tree should render lineage-tree presentation."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        root = store.add("Tree root", group="release")
+        assert root.id is not None
+        store.add("Tree child", group="release", based_on=root.id, same_branch=True)
+
+        result = run_gza("group", "release", "--view", "tree", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Tree root" in result.stdout
+        assert "Tree child" in result.stdout
+        assert "└──" in result.stdout or "├──" in result.stdout
+
+    def test_group_tree_view_omits_nonmatching_siblings_from_other_groups(self, tmp_path: Path):
+        """group --view tree should prune non-matching siblings from other groups."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        root = store.add("Shared root owner")
+        assert root.id is not None
+        store.add("Release child", group="release", based_on=root.id, same_branch=True)
+        store.add("Backlog sibling", group="backlog", based_on=root.id, same_branch=True)
+
+        result = run_gza("group", "release", "--view", "tree", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Shared root owner" in result.stdout
+        assert "Release child" in result.stdout
+        assert "Backlog sibling" not in result.stdout
+
+    def test_group_json_view_returns_pure_json_without_warning_prefix(self, tmp_path: Path):
+        """group --view json should emit pure JSON on stdout."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Json task", group="release")
+
+        result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'." not in result.stdout
+        assert "Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'." in result.stderr
+        payload = json.loads(result.stdout)
+        assert len(payload) == 1
+        assert payload[0]["prompt"] == "Json task"
+        assert payload[0]["group"] == "release"
+
+    def test_group_json_view_empty_results_returns_empty_array(self, tmp_path: Path):
+        """group --view json should return [] for empty slices."""
+        setup_config(tmp_path)
+
+        result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == "[]"
+        assert "No tasks found in group" not in result.stdout
+
+    def test_group_json_view_preserves_bracketed_prompt_text(self, tmp_path: Path):
+        """group --view json should preserve bracketed prompt text exactly."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("[release] prompt", group="release")
+
+        result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload[0]["prompt"] == "[release] prompt"
+
+    def test_group_flat_view_preserves_bracketed_prompt_text(self, tmp_path: Path):
+        """group --view flat should render bracketed prompt text literally."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("[release] prompt", group="release")
+
+        result = run_gza("group", "release", "--view", "flat", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "[release] prompt" in result.stdout
+
+    def test_group_tree_view_preserves_bracketed_prompt_text(self, tmp_path: Path):
+        """group --view tree should render bracketed prompt text literally."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        root = store.add("[release] root", group="release")
+        assert root.id is not None
+        store.add("[release] child", group="release", based_on=root.id, same_branch=True)
+
+        result = run_gza("group", "release", "--view", "tree", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "[release] root" in result.stdout
+        assert "[release] child" in result.stdout
+
+    def test_group_json_view_preserves_orphaned_warning_behavior_on_stderr(self, tmp_path: Path):
+        """group --view json should keep orphaned-task warnings while keeping stdout pure JSON."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        orphaned = store.add("Stuck release task", group="release")
+        mark_orphaned(store, orphaned)
+
+        result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload
+        assert payload[0]["prompt"] == "Stuck release task"
+        assert "orphaned" in result.stderr.lower()
+        assert "Stuck release task" in result.stderr
+
+    def test_group_flat_view_orphaned_warning_preserves_bracketed_prompt_text(self, tmp_path: Path):
+        """group default view should keep bracketed orphaned prompt text literal in warning output."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        orphaned = store.add("[release] orphaned prompt", group="release")
+        mark_orphaned(store, orphaned)
+
+        result = run_gza("group", "release", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"({orphaned.id}) [release] orphaned prompt" in result.stdout
+
+    def test_group_json_view_orphaned_warning_preserves_bracketed_prompt_text_on_stderr(
+        self,
+        tmp_path: Path,
+    ):
+        """group --view json should keep bracketed orphaned prompt text literal in stderr warning."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        orphaned = store.add("[release] orphaned prompt", group="release")
+        mark_orphaned(store, orphaned)
+
+        result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload
+        assert payload[0]["prompt"] == "[release] orphaned prompt"
+        assert f"({orphaned.id}) [release] orphaned prompt" in result.stderr
+
+    def test_group_lineage_view_surfaces_matching_descendant_when_owner_is_untagged(self, tmp_path: Path):
+        """group --view lineage should include tagged descendants even if owner lacks the tag."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        root = store.add("Untagged root owner")
+        assert root.id is not None
+        store.add("Tagged descendant", group="release", based_on=root.id, same_branch=True)
+
+        result = run_gza("group", "release", "--view", "lineage", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Tagged descendant" in result.stdout
+
+    def test_group_lineage_view_uses_first_class_lineage_presentation_mode(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """group --view lineage should pass lineage mode directly to shared query/presenter layers."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Tagged release task", group="release")
+
+        from gza.cli import query as query_module
+
+        captured_mode: dict[str, str] = {}
+        real_service = query_module._TaskQueryService(store)
+
+        class RecordingQueryService:
+            def __init__(self, _store):
+                self._store = _store
+
+            def run(self, query):
+                captured_mode["value"] = query.presentation.mode
+                return real_service.run(query)
+
+        monkeypatch.setattr(query_module, "_TaskQueryService", RecordingQueryService)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            group="release",
+            view="lineage",
+        )
+        rc = query_module.cmd_status(args)
+
+        assert rc == 0
+        assert captured_mode["value"] == "lineage"
+
+    def test_group_grouped_view_is_rejected(self, tmp_path: Path):
+        """group --view grouped should be rejected until grouped presentation exists."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Release task", group="release")
+
+        result = run_gza("group", "release", "--view", "grouped", "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "invalid choice: 'grouped'" in result.stderr
+        assert "choose from 'flat', 'lineage', 'tree', 'json'" in result.stderr
 
 
 class TestRenameGroupCommand:

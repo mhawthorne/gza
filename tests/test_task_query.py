@@ -7,8 +7,10 @@ from pathlib import Path
 import pytest
 
 from gza.db import SqliteTaskStore
+from gza.query import TaskLineageNode
 from gza.task_query import (
     DateFilter,
+    PresentationSpec,
     ProjectionSpec,
     TaskProjectionPreset,
     TaskQuery,
@@ -297,6 +299,157 @@ def test_queue_preset_filters_to_group(tmp_path: Path) -> None:
 
     prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
     assert prompts == ["Release runnable"]
+
+
+def test_task_query_group_filter_matches_any_of_selected_group_names(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.add("Release task", tags=("release",))
+    store.add("Backlog task", tags=("backlog",))
+    store.add("Ops task", tags=("ops",))
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="tasks",
+            groups=("release", "ops"),
+            limit=None,
+        )
+    )
+
+    prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
+    assert "Release task" in prompts
+    assert "Ops task" in prompts
+    assert "Backlog task" not in prompts
+
+
+def test_lineage_scope_group_filter_prunes_tree_to_matching_members_and_ancestors(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    root = store.add("Shared root owner", task_type="implement")
+    assert root.id is not None
+    store.add("Release child", task_type="implement", group="release", based_on=root.id, same_branch=True)
+    store.add("Backlog sibling", task_type="implement", group="backlog", based_on=root.id, same_branch=True)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="lineages",
+            groups=("release",),
+            limit=None,
+        )
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert hasattr(row, "tree")
+    assert row.tree is not None
+    member_prompts = [task.prompt for task in row.members]
+    assert "Shared root owner" in member_prompts
+    assert "Release child" in member_prompts
+    assert "Backlog sibling" not in member_prompts
+
+    tree_prompts: list[str] = []
+
+    def _collect_prompts(node: TaskLineageNode) -> None:
+        tree_prompts.append(node.task.prompt)
+        for child in node.children:
+            _collect_prompts(child)
+
+    _collect_prompts(row.tree)
+    assert "Shared root owner" in tree_prompts
+    assert "Release child" in tree_prompts
+    assert "Backlog sibling" not in tree_prompts
+
+
+def test_lineages_incomplete_group_filter_excludes_unrelated_owners(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    release_failed = store.add("Release failed", task_type="implement", group="release")
+    release_failed.status = "failed"
+    release_failed.completed_at = datetime.now(UTC)
+    release_failed.failure_reason = "TEST_FAILURE"
+    store.update(release_failed)
+
+    backlog_failed = store.add("Backlog failed", task_type="implement", group="backlog")
+    backlog_failed.status = "failed"
+    backlog_failed.completed_at = datetime.now(UTC)
+    backlog_failed.failure_reason = "TEST_FAILURE"
+    store.update(backlog_failed)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="lineages",
+            lifecycle_state=("incomplete",),
+            groups=("release",),
+            limit=None,
+        )
+    )
+
+    owners = [row.owner_task.prompt for row in result.rows if hasattr(row, "owner_task")]
+    assert owners == ["Release failed"]
+
+
+def test_lineages_incomplete_tag_filter_excludes_unrelated_owners(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    tagged_failed = store.add("Tagged failed", task_type="implement", tags=("release", "beta"))
+    tagged_failed.status = "failed"
+    tagged_failed.completed_at = datetime.now(UTC)
+    tagged_failed.failure_reason = "TEST_FAILURE"
+    store.update(tagged_failed)
+
+    other_failed = store.add("Other failed", task_type="implement", tags=("backlog",))
+    other_failed.status = "failed"
+    other_failed.completed_at = datetime.now(UTC)
+    other_failed.failure_reason = "TEST_FAILURE"
+    store.update(other_failed)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="lineages",
+            lifecycle_state=("incomplete",),
+            tag_filters=("release",),
+            limit=None,
+        )
+    )
+
+    owners = [row.owner_task.prompt for row in result.rows if hasattr(row, "owner_task")]
+    assert owners == ["Tagged failed"]
+
+
+def test_lineage_presentation_mode_renders_tree_layout(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    root = store.add("Lineage root owner", task_type="implement")
+    assert root.id is not None
+    store.add("Tagged release child", task_type="implement", group="release", based_on=root.id, same_branch=True)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="lineages",
+            groups=("release",),
+            limit=None,
+            presentation=PresentationSpec(mode="lineage"),
+        )
+    )
+
+    rendered = result.render()
+    assert "Lineage root owner" in rendered
+    assert "Tagged release child" in rendered
+    assert "└──" in rendered or "├──" in rendered
+
+
+def test_default_projection_includes_group_field(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.add("Release task", group="release")
+
+    service = TaskQueryService(store)
+    rows = service.run(TaskQueryPresets.search("Release", limit=None)).to_json()
+
+    assert rows
+    assert "group" in rows[0]
+    assert rows[0]["group"] == "release"
 
 
 def test_dependency_state_blocked_by_dropped_dep_filters_pending_only(tmp_path: Path) -> None:
