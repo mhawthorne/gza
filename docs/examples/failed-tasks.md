@@ -49,6 +49,8 @@ For bulk unattended recovery after fixing an environment issue, use watch recove
 |---------|----------|----------|
 | `gza watch --restart-failed` | Drain actionable failed tasks before pending queue work, choosing `resume` or `retry` per task | You want watch to recover the failed queue first, then continue normal processing |
 | `gza watch --restart-failed --dry-run` | Print the recovery decision report and exit | You want to inspect which failed tasks would `resume`, `retry`, or `skip` before starting recovery |
+| `gza watch --restart-failed --dry-run --show-skipped` | Include skipped failed tasks in the recovery decision report | You want to inspect why some failed tasks would be skipped |
+| `gza watch --restart-failed --show-skipped` | Include skipped failed tasks in live watch logs | You want restart-failed watch logs to explain why some failed tasks are being skipped |
 
 ## Resume a task
 
@@ -97,7 +99,7 @@ Retry creates a new task that reuses the same branch (if it exists) but starts a
 
 `gza watch --restart-failed` adds an explicit recovery phase ahead of normal pending work. It is opt-in; plain `gza watch` keeps the narrower legacy auto-resume behavior.
 
-Preview the full recovery plan first:
+Preview the recovery plan first:
 
 ```bash
 $ gza watch --restart-failed --dry-run
@@ -105,10 +107,24 @@ Failed recovery plan (tags=*, mode=restart-failed)
 
 resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/1
 retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/1
-skip   gza-103 review    via none    reason=task_type_out_of_scope attempt=0/1
+
+Summary: 2 actionable (1 resume, 1 retry), 1 skipped hidden
+```
+
+Include skipped tasks when you need the full picture:
+
+```bash
+$ gza watch --restart-failed --dry-run --show-skipped
+Failed recovery plan (tags=*, mode=restart-failed)
+
+resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/1
+skip   gza-103 review    via none    reason=task_type_out_of_scope attempt=1/1
+retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/1
 
 Summary: 2 actionable (1 resume, 1 retry), 1 skipped
 ```
+
+The same `--show-skipped` flag also controls live `gza watch --restart-failed` logging. Without it, skipped recovery decisions stay silent in the watch log; with it, skipped items are emitted as `SKIP` events while watch runs.
 
 Then run recovery mode for real:
 

@@ -694,6 +694,12 @@ def main() -> int:
         help="Show what watch would do without executing; with --restart-failed, print the failed-recovery report and exit",
     )
     watch_parser.add_argument(
+        "--show-skipped",
+        action="store_true",
+        dest="show_skipped",
+        help="With --restart-failed, include skipped failed tasks in the dry-run recovery report and live watch logs",
+    )
+    watch_parser.add_argument(
         "--quiet",
         action="store_true",
         help="Write events to .gza/watch.log only",

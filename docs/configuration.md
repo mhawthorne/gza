@@ -1364,6 +1364,7 @@ gza watch [options]
 | `--restart-failed-batch N` | Max concurrent failed-recovery launches (default: `watch.restart_failed_batch` or `1`) |
 | `--max-resume-attempts N` | Override `max_resume_attempts` for this watch run; applies to plain-watch auto-resume and to `--restart-failed` resume/retry decisions |
 | `--dry-run` | Show what watch would do without executing; with `--restart-failed`, print the full failed-recovery report and exit |
+| `--show-skipped` | With `--restart-failed`, include skipped failed tasks in the dry-run recovery report and live watch logs |
 | `--quiet` | Write events to `.gza/watch.log` only |
 | `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `gza queue --tag TAG` to preview the same scoped pickup order |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
@@ -1372,7 +1373,7 @@ gza watch [options]
 When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
 `INFO   scope: tags=<comma-separated-tags> mode=all|any`.
 
-`gza watch --restart-failed --dry-run` is the recovery inspection surface for this mode. It prints the full failed-task decision report for the current scope, including `resume`, `retry`, and `skip` decisions with launch mode and attempt counts, then exits without entering the normal watch loop.
+`gza watch --restart-failed --dry-run` is the recovery inspection surface for this mode. It prints the failed-task decision report for the current scope oldest-created failed task first, showing actionable `resume` and `retry` decisions by default, then exits without entering the normal watch loop. The same oldest-created ordering is used by plain watch auto-resume and `--restart-failed` recovery selection. Skipped tasks are hidden by default; pass `--show-skipped` to include them with launch mode and attempt counts in both the dry-run report and live watch logs.
 
 ### learnings
 

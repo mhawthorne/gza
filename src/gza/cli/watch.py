@@ -15,6 +15,7 @@ from typing import TypeVar
 from ..config import Config
 from ..console import truncate
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from ..failed_task_ordering import sort_failed_tasks
 from ..git import Git
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..recovery_engine import (
@@ -446,30 +447,45 @@ def _emit_recovery_dry_run_report(
     tags: tuple[str, ...] | None,
     any_tag: bool,
     max_recovery_attempts: int,
+    show_skipped: bool = False,
 ) -> _RecoveryReport:
     failed_tasks = list_failed_tasks_for_recovery(store, tags=tags, any_tag=any_tag)
     scope = ",".join(tags) if tags else "*"
     print(f"Failed recovery plan (tags={scope}, mode=restart-failed)")
     print()
     actionable = resume = retry = 0
+    skipped = 0
     for task in failed_tasks:
         if task.id is None:
             continue
         decision = decide_failed_task_recovery(store, task, max_recovery_attempts=max_recovery_attempts)
-        launch = decision.launch_mode
-        print(
-            f"{decision.action:<6} {task.id} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
-            f"attempt={decision.attempt_index}/{decision.attempt_limit}"
-        )
         if decision.action in {"resume", "retry"}:
+            launch = decision.launch_mode
+            print(
+                f"{decision.action:<6} {task.id} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
+                f"attempt={decision.attempt_index}/{decision.attempt_limit}"
+            )
             actionable += 1
-        if decision.action == "resume":
-            resume += 1
-        if decision.action == "retry":
-            retry += 1
-    skipped = max(0, len(failed_tasks) - actionable)
+            if decision.action == "resume":
+                resume += 1
+            if decision.action == "retry":
+                retry += 1
+            continue
+        skipped += 1
+        if show_skipped:
+            launch = decision.launch_mode
+            print(
+                f"{decision.action:<6} {task.id} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
+                f"attempt={decision.attempt_index}/{decision.attempt_limit}"
+            )
     print()
-    print(f"Summary: {actionable} actionable ({resume} resume, {retry} retry), {skipped} skipped")
+    if show_skipped:
+        print(f"Summary: {actionable} actionable ({resume} resume, {retry} retry), {skipped} skipped")
+    else:
+        print(
+            f"Summary: {actionable} actionable ({resume} resume, {retry} retry), "
+            f"{skipped} skipped hidden"
+        )
     return _RecoveryReport(actionable_count=actionable, resume_count=resume, retry_count=retry)
 
 
@@ -585,6 +601,7 @@ def _run_cycle(
     restart_failed: bool = False,
     restart_failed_batch: int = 1,
     max_recovery_attempts: int = 1,
+    show_skipped: bool = False,
 ) -> _CycleResult:
     from ._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
 
@@ -871,11 +888,12 @@ def _run_cycle(
             decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
             failed_decisions.append((failed, decision))
             if decision.action == "skip":
-                log.emit(
-                    "SKIP",
-                    f"{failed.id} failed {failed.task_type}: {decision.reason_code}",
-                    dedupe_key=f"recovery-skip:{failed.id}:{decision.reason_code}",
-                )
+                if show_skipped:
+                    log.emit(
+                        "SKIP",
+                        f"{failed.id} failed {failed.task_type}: {decision.reason_code}",
+                        dedupe_key=f"recovery-skip:{failed.id}:{decision.reason_code}",
+                    )
                 continue
             actionable_failed.append((failed, decision))
     else:
@@ -886,6 +904,7 @@ def _run_cycle(
                 for task in failed_tasks
                 if task_matches_tag_filters(task_tags=task.tags, tag_filters=tags, any_tag=any_tag)
             ]
+        failed_tasks = sort_failed_tasks(failed_tasks)
         for failed in failed_tasks:
             if failed.id is None:
                 continue
@@ -1193,6 +1212,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         else config.max_resume_attempts
     )
     dry_run = bool(getattr(args, "dry_run", False))
+    show_skipped = bool(getattr(args, "show_skipped", False))
     quiet = bool(getattr(args, "quiet", False))
     try:
         tag_filters, any_tag = parse_cli_tag_filters(args)
@@ -1251,6 +1271,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 tags=tag_filters,
                 any_tag=any_tag,
                 max_recovery_attempts=max_recovery_attempts,
+                show_skipped=show_skipped,
             )
             return 0
 
@@ -1269,6 +1290,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 restart_failed=restart_failed,
                 restart_failed_batch=restart_failed_batch,
                 max_recovery_attempts=max_recovery_attempts,
+                show_skipped=show_skipped,
             )
             if preview_result.work_done:
                 try:
@@ -1306,6 +1328,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 restart_failed=restart_failed,
                 restart_failed_batch=restart_failed_batch,
                 max_recovery_attempts=max_recovery_attempts,
+                show_skipped=show_skipped,
             )
 
             current_snapshot = _task_snapshot(store)
