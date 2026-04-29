@@ -105,7 +105,6 @@ class TestAdvanceAutoPlans:
 
         assert rc == 0
         assert "Created implement task" in output
-        assert "Started implement worker" in output
 
         # Verify the implement task was created with plan dependency.
         all_tasks = store.get_all()

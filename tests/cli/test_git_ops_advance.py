@@ -381,7 +381,7 @@ class TestAdvanceCommand:
         result = run_gza("advance", "--auto", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "rebase" in result.stdout.lower()
-        assert "started rebase worker" in result.stdout.lower()
+        assert "started task" in result.stdout.lower()
 
         # Task should still be unmerged (rebase worker runs in background)
         updated_task = store.get(task.id)
@@ -1044,7 +1044,7 @@ class TestAdvanceCommand:
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
         # Create a pending review
-        store.add(
+        review_task = store.add(
             f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
@@ -1053,7 +1053,9 @@ class TestAdvanceCommand:
 
         result = run_gza("advance", "--auto", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "Started review worker" in result.stdout
+        assert review_task.id is not None
+        assert f"Started task {review_task.id} in background" in result.stdout
+        assert "Started review worker" not in result.stdout
 
     def test_advance_force_propagates_to_run_review_worker(self, tmp_path: Path):
         """advance --force forwards force override when spawning run_review workers."""

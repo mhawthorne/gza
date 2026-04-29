@@ -1372,7 +1372,7 @@ def _execute_merge_action(
 
 def _advance_action_color(action_type: str) -> str:
     """Return a Rich color for an advance action type."""
-    ac = _colors.ADVANCE_COLORS
+    ac = _colors.WORK_COLORS
     if action_type in {'merge', 'merge_with_followups'}:
         return ac.merge
     if action_type in ('needs_rebase', 'needs_discussion', 'max_cycles_reached', 'max_improve_attempts'):
@@ -1387,8 +1387,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    # Themed advance colors — resolved once after Config.load() applies the theme.
-    _ac = _colors.ADVANCE_COLORS
+    # Themed work/advance colors — resolved once after Config.load() applies the theme.
+    _ac = _colors.WORK_COLORS
     _c_tid = _colors.TASK_COLORS.task_id
     _c_ok = _ac.merge
     _c_err = _ac.error
@@ -1778,10 +1778,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     rebase_rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
                     workers_started += 1
                     if rebase_rc == 0:
-                        console.print(f"      [{_c_ok}]✓ Started rebase worker[/{_c_ok}]")
                         success_count += 1
                     else:
-                        console.print(f"      [{_c_err}]✗ Failed to start rebase worker[/{_c_err}]")
                         error_count += 1
                 else:
                     console.print(f"      [{_c_err}]✗ Merge failed[/{_c_err}]")
@@ -1816,42 +1814,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if exec_result.message:
                 console.print(f"      [{_c_ok}]✓ {exec_result.message}[/{_c_ok}]")
 
-            started_id = exec_result.handled_task_id
             if exec_result.worker_started:
-                if action_type == "create_review":
-                    console.print(f"      [{_c_ok}]✓ Started review worker[/{_c_ok}]")
-                elif action_type == "run_review" and started_id is not None:
-                    console.print(f"      [{_c_ok}]✓ Started review worker for {started_id}[/{_c_ok}]")
-                elif action_type == "improve":
-                    console.print(f"      [{_c_ok}]✓ Started improve worker[/{_c_ok}]")
-                elif action_type == "run_improve" and started_id is not None:
-                    console.print(f"      [{_c_ok}]✓ Started improve worker for {started_id}[/{_c_ok}]")
-                elif action_type == "resume":
-                    console.print(f"      [{_c_ok}]✓ Started resume worker[/{_c_ok}]")
-                elif action_type == "create_implement":
-                    started_label = "iterate worker for implement task" if use_iterate_mode else "implement worker"
-                    console.print(f"      [{_c_ok}]✓ Started {started_label}[/{_c_ok}]")
-                elif action_type == "needs_rebase":
-                    started_label = "iterate worker for rebase cycle" if use_iterate_mode else "rebase worker"
-                    console.print(f"      [{_c_ok}]✓ Started {started_label}[/{_c_ok}]")
                 success_count += 1
             elif exec_result.worker_consuming:
-                if action_type == "run_review" and started_id is not None:
-                    console.print(f"      [{_c_err}]✗ Failed to start review worker for {started_id}[/{_c_err}]")
-                elif action_type == "run_improve" and started_id is not None:
-                    console.print(f"      [{_c_err}]✗ Failed to start improve worker for {started_id}[/{_c_err}]")
-                elif action_type == "create_review":
-                    console.print(f"      [{_c_err}]✗ Failed to start review worker[/{_c_err}]")
-                elif action_type == "improve":
-                    console.print(f"      [{_c_err}]✗ Failed to start improve worker[/{_c_err}]")
-                elif action_type == "resume":
-                    console.print(f"      [{_c_err}]✗ Failed to start resume worker[/{_c_err}]")
-                elif action_type == "create_implement":
-                    failed_label = "iterate worker for implement task" if use_iterate_mode else "implement worker"
-                    console.print(f"      [{_c_err}]✗ Failed to start {failed_label}[/{_c_err}]")
-                elif action_type == "needs_rebase":
-                    failed_label = "iterate worker for rebase cycle" if use_iterate_mode else "rebase worker"
-                    console.print(f"      [{_c_err}]✗ Failed to start {failed_label}[/{_c_err}]")
                 error_count += 1
 
         print()
