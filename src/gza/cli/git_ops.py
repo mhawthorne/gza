@@ -25,7 +25,13 @@ from ..console import (
     truncate,
 )
 from ..db import SqliteTaskStore, Task as DbTask
-from ..git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
+from ..git import (
+    Git,
+    GitError,
+    active_worktree_path_for_branch,
+    cleanup_worktree_for_branch,
+    parse_diff_numstat,
+)
 from ..pickup import (
     count_worker_consuming_actions,
     get_runnable_pending_tasks,
@@ -60,6 +66,156 @@ from .advance_engine import determine_next_action, is_resumable_failed_task
 from .advance_executor import AdvanceActionExecutionContext, execute_advance_action
 
 logger = logging.getLogger(__name__)
+
+
+def _paths_match(left: str | Path, right: Path) -> bool:
+    try:
+        return Path(left).resolve() == right.resolve()
+    except OSError:
+        return Path(left) == right
+
+
+def _find_worktree_entry_for_path(git: Git, path: Path) -> dict | None:
+    for entry in git.worktree_list():
+        wt_path = entry.get("path")
+        if isinstance(wt_path, str) and wt_path and _paths_match(wt_path, path):
+            return entry
+    return None
+
+
+def _remove_watch_merge_checkout(git: Git, checkout_path: Path) -> None:
+    git.worktree_remove(checkout_path, force=True)
+    if checkout_path.exists():
+        shutil.rmtree(checkout_path, ignore_errors=True)
+    git._run("worktree", "prune", "--expire", "now", check=False)
+
+    if _find_worktree_entry_for_path(git, checkout_path) is not None:
+        raise GitError(
+            f"isolated watch checkout is still registered at '{checkout_path}' after cleanup"
+        )
+
+
+def ensure_watch_main_checkout(
+    config: Config,
+    git: Git,
+    target_branch: str,
+    *,
+    rebuild: bool = False,
+) -> Git:
+    """Ensure and refresh the dedicated watch-time merge checkout.
+
+    The checkout is kept on a detached HEAD reset to ``target_branch`` so
+    watch-time merges do not move the shared ``refs/heads/<target_branch>``
+    ref underneath another worktree.
+    """
+    checkout_path = config.main_checkout_integration_path
+
+    if rebuild:
+        _remove_watch_merge_checkout(git, checkout_path)
+
+    entry = _find_worktree_entry_for_path(git, checkout_path)
+    if entry is not None and entry.get("prunable"):
+        git._run("worktree", "prune", "--expire", "now", check=False)
+        entry = _find_worktree_entry_for_path(git, checkout_path)
+
+    if entry is None and checkout_path.exists():
+        shutil.rmtree(checkout_path, ignore_errors=True)
+
+    if entry is None:
+        checkout_path.parent.mkdir(parents=True, exist_ok=True)
+        git._run("worktree", "add", "--detach", str(checkout_path), target_branch)
+
+    workspace_git = Git(checkout_path)
+    workspace_git._run("checkout", "--detach", target_branch)
+    workspace_git._run("reset", "--hard", target_branch)
+    workspace_git._run("clean", "-fd")
+
+    current_branch = workspace_git.current_branch()
+    if current_branch != "HEAD":
+        raise GitError(
+            f"isolated watch checkout expected detached HEAD at '{target_branch}', found '{current_branch}'"
+        )
+    entry = _find_worktree_entry_for_path(git, checkout_path)
+    if entry is None:
+        raise GitError(f"isolated watch checkout is not registered at '{checkout_path}'")
+    if not entry.get("detached"):
+        raise GitError("isolated watch checkout must remain detached from shared branch refs")
+    if entry.get("branch") == f"refs/heads/{target_branch}":
+        raise GitError(
+            f"isolated watch checkout must not directly check out shared branch '{target_branch}'"
+        )
+    if workspace_git.has_changes(include_untracked=True):
+        raise GitError("isolated watch checkout is dirty after refresh")
+
+    return workspace_git
+
+
+def cleanup_failed_merge_checkout(workspace_git: Git) -> None:
+    """Best-effort cleanup of a conflicted merge checkout."""
+    try:
+        workspace_git.merge_abort()
+    except GitError:
+        pass
+    workspace_git.reset_hard_head()
+    workspace_git._run("clean", "-fd")
+    if workspace_git.has_changes(include_untracked=True):
+        raise GitError("merge checkout remains dirty after cleanup")
+
+
+def _promote_isolated_merge_to_target_branch(
+    repo_git: Git,
+    merge_git: Git,
+    target_branch: str,
+) -> None:
+    """Advance the real target-branch ref to the detached isolated merge result.
+
+    Successful watch-time merges are staged in a detached integration checkout,
+    but they only count as merged once the shared target branch itself points at
+    the detached merge commit. If a real checkout currently has ``target_branch``
+    attached, it is hard-reset to the new tip so that checkout stays clean.
+    """
+    target_ref = f"refs/heads/{target_branch}"
+    previous_target_oid = repo_git.rev_parse(target_ref)
+    merged_head_oid = merge_git.rev_parse("HEAD")
+    attached_target_checkout = active_worktree_path_for_branch(repo_git, target_branch)
+    attached_target_git = Git(attached_target_checkout) if attached_target_checkout is not None else None
+
+    if attached_target_git is not None and attached_target_git.has_changes(include_untracked=False):
+        raise GitError(
+            f"shared checkout '{attached_target_checkout}' for '{target_branch}' has tracked changes"
+        )
+
+    target_ref_updated = False
+    try:
+        repo_git.update_ref(target_ref, merged_head_oid, previous_target_oid)
+        target_ref_updated = True
+        if attached_target_git is not None:
+            attached_target_git.reset_hard(target_ref)
+            if attached_target_git.has_changes(include_untracked=False):
+                raise GitError(
+                    f"shared checkout '{attached_target_checkout}' for '{target_branch}' remained dirty"
+                )
+        merge_git.reset_hard(target_ref)
+    except GitError as exc:
+        if target_ref_updated:
+            try:
+                repo_git.update_ref(target_ref, previous_target_oid, merged_head_oid)
+            except GitError as rollback_error:
+                raise GitError(
+                    f"failed to advance '{target_branch}' and rollback also failed: {rollback_error}"
+                ) from exc
+            if attached_target_git is not None:
+                try:
+                    attached_target_git.reset_hard(target_ref)
+                except GitError:
+                    pass
+        try:
+            merge_git.reset_hard(target_ref)
+        except GitError:
+            pass
+        raise GitError(
+            f"failed to advance shared branch '{target_branch}' from isolated merge: {exc}"
+        ) from exc
 
 
 def _advance_uses_iterate(config: Config) -> bool:
@@ -315,7 +471,8 @@ def _merge_single_task(
             except GitError as e:
                 print(f"Warning: Could not delete branch: {e}")
 
-        store.set_merge_status(task.id, "merged")
+        if git.repo_dir == config.project_dir:
+            store.set_merge_status(task.id, "merged")
         return 0
 
     except GitError as e:
@@ -359,7 +516,8 @@ def _merge_single_task(
                 except GitError as del_error:
                     print(f"Warning: Could not delete branch: {del_error}")
 
-            store.set_merge_status(task.id, "merged")
+            if git.repo_dir == config.project_dir:
+                store.set_merge_status(task.id, "merged")
             return 0
 
         print(f"Error during {operation}: {e}")
@@ -1344,10 +1502,14 @@ def _execute_merge_action(
     *,
     target_branch: str,
     current_branch: str,
+    merge_git: Git | None = None,
+    merge_current_branch: str | None = None,
 ) -> _MergeActionResult:
     """Execute a merge-style advance action and materialize follow-up tasks if needed."""
     created_followups: list[DbTask] = []
     reused_followups: list[DbTask] = []
+    execution_git = merge_git or git
+    execution_branch = merge_current_branch or current_branch
 
     if action.get("type") == "merge_with_followups":
         review_task = action.get("review_task")
@@ -1361,8 +1523,22 @@ def _execute_merge_action(
             )
 
     assert task.id is not None
-    merge_args = _build_auto_merge_args(config, git, task, target_branch)
-    rc = _merge_single_task(task.id, config, store, git, merge_args, current_branch)
+    merge_args = _build_auto_merge_args(config, execution_git, task, target_branch)
+    rc = _merge_single_task(
+        task.id,
+        config,
+        store,
+        execution_git,
+        merge_args,
+        execution_branch,
+    )
+    if rc == 0 and merge_git is not None and merge_git.repo_dir != git.repo_dir:
+        try:
+            _promote_isolated_merge_to_target_branch(git, execution_git, target_branch)
+            store.set_merge_status(task.id, "merged")
+        except GitError as exc:
+            print(f"Error finalizing isolated merge success: {exc}")
+            rc = 1
     return _MergeActionResult(
         rc=rc,
         created_followups=created_followups,

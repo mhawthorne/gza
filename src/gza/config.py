@@ -74,6 +74,7 @@ DEFAULT_WATCH_RESTART_FAILED_BATCH = 1
 DEFAULT_ITERATE_MAX_ITERATIONS = 3
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 DEFAULT_MERGE_SQUASH_THRESHOLD = 0
+DEFAULT_MAIN_CHECKOUT_ISOLATE = False
 DEFAULT_CLEANUP_DAYS = 30
 DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD = 500
 DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
@@ -154,6 +155,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "iterate_max_iterations": None,
     "interactive_worktree_dir": None,
     "merge_squash_threshold": None,
+    "main_checkout_isolate": None,
     "cleanup_days": None,
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
@@ -445,6 +447,7 @@ class Config:
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
     interactive_worktree_dir: str = DEFAULT_INTERACTIVE_WORKTREE_DIR
     merge_squash_threshold: int = DEFAULT_MERGE_SQUASH_THRESHOLD
+    main_checkout_isolate: bool = DEFAULT_MAIN_CHECKOUT_ISOLATE
     watch: WatchConfig = field(default_factory=WatchConfig)
     iterate_max_iterations: int = DEFAULT_ITERATE_MAX_ITERATIONS
     cleanup_days: int = DEFAULT_CLEANUP_DAYS
@@ -620,6 +623,10 @@ class Config:
         return Path(self.worktree_dir) / self.project_name
 
     @property
+    def main_checkout_integration_path(self) -> Path:
+        return self.worktree_path / "main-integration"
+
+    @property
     def tasks_path(self) -> Path:
         return self.project_dir / self.tasks_file
 
@@ -709,6 +716,7 @@ class Config:
             "watch",
             "interactive_worktree_dir",
             "merge_squash_threshold",
+            "main_checkout_isolate",
             "cleanup_days",
             "review_diff_small_threshold", "review_diff_medium_threshold", "review_context_file_limit",
             "tmux",
@@ -1277,6 +1285,9 @@ class Config:
             raise ConfigError("merge_squash_threshold must be a non-negative integer")
         if merge_squash_threshold < 0:
             raise ConfigError("merge_squash_threshold must be a non-negative integer")
+        main_checkout_isolate = data.get("main_checkout_isolate", DEFAULT_MAIN_CHECKOUT_ISOLATE)
+        if not isinstance(main_checkout_isolate, bool):
+            raise ConfigError("'main_checkout_isolate' must be a boolean (true/false)")
 
         try:
             cleanup_days = int(data.get("cleanup_days", DEFAULT_CLEANUP_DAYS))
@@ -1450,6 +1461,7 @@ class Config:
             iterate_max_iterations=iterate_max_iterations,
             interactive_worktree_dir=interactive_worktree_dir,
             merge_squash_threshold=merge_squash_threshold,
+            main_checkout_isolate=main_checkout_isolate,
             cleanup_days=cleanup_days,
             review_diff_small_threshold=review_diff_small_threshold,
             review_diff_medium_threshold=review_diff_medium_threshold,
@@ -1513,6 +1525,7 @@ class Config:
             "watch",
             "interactive_worktree_dir",
             "merge_squash_threshold",
+            "main_checkout_isolate",
             "cleanup_days",
             "review_diff_small_threshold", "review_diff_medium_threshold", "review_context_file_limit",
             "tmux",
@@ -1765,6 +1778,8 @@ class Config:
 
         if "interactive_worktree_dir" in data and not isinstance(data["interactive_worktree_dir"], str):
             errors.append("'interactive_worktree_dir' must be a string")
+        if "main_checkout_isolate" in data and not isinstance(data["main_checkout_isolate"], bool):
+            errors.append("'main_checkout_isolate' must be a boolean (true/false)")
 
         if "review_diff_small_threshold" in data:
             if not isinstance(data["review_diff_small_threshold"], int):

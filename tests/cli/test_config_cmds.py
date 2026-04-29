@@ -2576,6 +2576,35 @@ class TestWatchConfigValidation:
         assert config.watch.max_idle == 180
         assert config.watch.max_iterations == 9
 
+    def test_config_main_checkout_isolate_defaults_false(self, tmp_path: Path) -> None:
+        """Config.load defaults main_checkout_isolate to false."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "")
+        config = Config.load(tmp_path)
+        assert config.main_checkout_isolate is False
+
+    def test_config_main_checkout_isolate_true_loads(self, tmp_path: Path) -> None:
+        """Config.load stores explicit main_checkout_isolate=true."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "main_checkout_isolate: true\n")
+        config = Config.load(tmp_path)
+        assert config.main_checkout_isolate is True
+
+    @pytest.mark.parametrize("value", ["1", '"yes"', "null"])
+    def test_config_main_checkout_isolate_invalid_values_rejected(self, tmp_path: Path, value: str) -> None:
+        """Config.load and validate reject non-boolean main_checkout_isolate values."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, f"main_checkout_isolate: {value}\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert "'main_checkout_isolate' must be a boolean (true/false)" in errors
+
+        with pytest.raises(ConfigError, match="main_checkout_isolate"):
+            Config.load(tmp_path)
+
     def test_config_watch_null_max_idle_loads(self, tmp_path: Path) -> None:
         """Config.load accepts null max_idle."""
         from gza.config import Config

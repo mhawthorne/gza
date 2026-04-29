@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from gza.cli.git_ops import _execute_merge_action, ensure_watch_main_checkout
 from gza.cli.watch import (
     _collect_completed_transition_ids,
     _collect_live_running_state,
@@ -25,9 +26,10 @@ from gza.cli.watch import (
     cmd_watch,
 )
 from gza.config import Config
+from gza.git import Git, GitError
 from gza.workers import WorkerMetadata, WorkerRegistry
 
-from .conftest import make_store, run_gza, setup_config
+from .conftest import make_store, run_gza, setup_config, setup_git_repo_with_task_branch
 
 
 def _task_count(store) -> int:
@@ -1761,6 +1763,643 @@ def test_watch_cycle_uses_default_branch_for_advance_planning_off_default_branch
     assert determine_action.call_args.args[4] == "main"
 
 
+def test_watch_cycle_with_isolation_enabled_preflights_and_merges_in_isolated_checkout(tmp_path: Path) -> None:
+    """Isolation mode should preflight checkout and route merge execution through that checkout."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-merge"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    isolated_git = MagicMock()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git) as ensure_isolated,
+        patch("gza.cli.watch._require_default_branch") as require_default_branch,
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(rc=0, created_followups=[], reused_followups=[]),
+        ) as execute_merge,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    ensure_isolated.assert_called_once_with(config, repo_git, "main")
+    require_default_branch.assert_not_called()
+    assert execute_merge.call_count == 1
+    assert execute_merge.call_args.kwargs["merge_git"] is isolated_git
+    assert execute_merge.call_args.kwargs["merge_current_branch"] == "main"
+
+
+def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_failure_and_merges(
+    tmp_path: Path,
+) -> None:
+    """A stale isolated checkout at cycle start should rebuild once and still allow same-cycle merges."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-preflight-rebuild"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    rebuilt_git = MagicMock()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch(
+            "gza.cli.watch.ensure_watch_main_checkout",
+            side_effect=[GitError("stale checkout"), rebuilt_git],
+        ) as ensure_isolated,
+        patch("gza.cli.watch._require_default_branch") as require_default_branch,
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(rc=0, created_followups=[], reused_followups=[]),
+        ) as execute_merge,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert ensure_isolated.call_count == 2
+    assert ensure_isolated.call_args_list[0].args == (config, repo_git, "main")
+    assert ensure_isolated.call_args_list[1].args == (config, repo_git, "main")
+    assert ensure_isolated.call_args_list[1].kwargs["rebuild"] is True
+    require_default_branch.assert_not_called()
+    assert execute_merge.call_count == 1
+    assert execute_merge.call_args.kwargs["merge_git"] is rebuilt_git
+    assert execute_merge.call_args.kwargs["merge_current_branch"] == "main"
+    log_text = log_path.read_text()
+    assert "isolated merge checkout refresh failed; rebuilding: stale checkout" in log_text
+    assert "isolated merge checkout rebuilt" in log_text
+    assert f"MERGE  {task.id} -> main" in log_text
+
+
+def test_watch_cycle_with_isolation_enabled_dry_run_does_not_mutate_checkout(tmp_path: Path) -> None:
+    """Isolation dry-run should preview merges without reconciling isolated checkout."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-dry-run"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout") as ensure_isolated,
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+
+    assert result.work_done is True
+    ensure_isolated.assert_not_called()
+    execute_merge.assert_not_called()
+    assert f"MERGE  {task.id} -> main [dry-run]" in log_path.read_text()
+
+
+def test_ensure_watch_main_checkout_detaches_existing_shared_default_branch_worktree(tmp_path: Path) -> None:
+    """Isolation helper should not leave the integration worktree attached to the shared default-branch ref."""
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "file.txt").write_text("initial\n")
+    git._run("add", "file.txt")
+    git._run("commit", "-m", "Initial commit")
+
+    checkout_path = config.main_checkout_integration_path
+    checkout_path.parent.mkdir(parents=True, exist_ok=True)
+    git._run("worktree", "add", "--force", str(checkout_path), "main")
+
+    isolated_git = ensure_watch_main_checkout(config, git, "main")
+
+    assert isolated_git.current_branch() == "HEAD"
+    entry = next(
+        item
+        for item in git.worktree_list()
+        if Path(str(item["path"])).resolve() == checkout_path.resolve()
+    )
+    assert entry.get("detached") is True
+    assert entry.get("branch") != "refs/heads/main"
+    assert git.has_changes(include_untracked=False) is False
+
+
+def test_isolated_watch_merge_advances_primary_main_checkout_cleanly(tmp_path: Path) -> None:
+    """A successful isolated watch merge must land on main and keep the attached checkout clean."""
+    store, git, task, _wt = setup_git_repo_with_task_branch(
+        tmp_path,
+        "Successful isolated merge",
+        "feature/watch-isolated-success",
+    )
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
+    config = Config.load(tmp_path)
+
+    assert task.id is not None
+    assert git.current_branch() == "main"
+
+    isolated_git = ensure_watch_main_checkout(config, git, "main")
+    merge_result = _execute_merge_action(
+        config,
+        store,
+        git,
+        task,
+        {"type": "merge"},
+        target_branch="main",
+        current_branch="main",
+        merge_git=isolated_git,
+        merge_current_branch="main",
+    )
+
+    assert merge_result.rc == 0
+    assert isolated_git.current_branch() == "HEAD"
+    assert isolated_git.has_changes(include_untracked=True) is False
+    assert (config.main_checkout_integration_path / "feature.txt").exists()
+    assert git.current_branch() == "main"
+    assert git.has_changes(include_untracked=False) is False
+    assert (tmp_path / "feature.txt").exists()
+    assert git.is_merged(task.branch, "main") is True
+    assert git.rev_parse("main") == isolated_git.rev_parse("HEAD")
+    refreshed_task = store.get(task.id)
+    assert refreshed_task is not None
+    assert refreshed_task.merge_status == "merged"
+
+
+def test_isolated_watch_merge_promotes_real_main_before_marking_sequential_merges(tmp_path: Path) -> None:
+    """Sequential isolated merges must advance the real main ref before merge_status flips."""
+    store, git, task1, _wt = setup_git_repo_with_task_branch(
+        tmp_path,
+        "First isolated merge",
+        "feature/watch-isolated-first",
+    )
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
+    config = Config.load(tmp_path)
+
+    assert task1.id is not None
+    store.set_merge_status(task1.id, "unmerged")
+
+    task2 = store.add("Second isolated merge", task_type="implement")
+    assert task2.id is not None
+    task2.status = "completed"
+    task2.completed_at = datetime.now(UTC)
+    task2.branch = "feature/watch-isolated-second"
+    store.update(task2)
+    store.set_merge_status(task2.id, "unmerged")
+
+    git._run("checkout", "-b", task2.branch)
+    (tmp_path / "second.txt").write_text("second content")
+    git._run("add", "second.txt")
+    git._run("commit", "-m", "Add second isolated feature")
+    git._run("checkout", "main")
+
+    isolated_git = ensure_watch_main_checkout(config, git, "main")
+
+    first_result = _execute_merge_action(
+        config,
+        store,
+        git,
+        task1,
+        {"type": "merge"},
+        target_branch="main",
+        current_branch="main",
+        merge_git=isolated_git,
+        merge_current_branch="main",
+    )
+
+    assert first_result.rc == 0
+    assert git.is_merged(task1.branch, "main") is True
+    assert store.get(task1.id).merge_status == "merged"
+    first_main_oid = git.rev_parse("main")
+
+    second_result = _execute_merge_action(
+        config,
+        store,
+        git,
+        task2,
+        {"type": "merge"},
+        target_branch="main",
+        current_branch="main",
+        merge_git=isolated_git,
+        merge_current_branch="main",
+    )
+
+    assert second_result.rc == 0
+    assert git.rev_parse("main") != first_main_oid
+    assert git.is_merged(task2.branch, "main") is True
+    assert store.get(task2.id).merge_status == "merged"
+    assert (tmp_path / "feature.txt").exists()
+    assert (tmp_path / "second.txt").exists()
+    assert git.has_changes(include_untracked=False) is False
+    assert isolated_git.current_branch() == "HEAD"
+    assert isolated_git.has_changes(include_untracked=True) is False
+    assert isolated_git.rev_parse("HEAD") == git.rev_parse("main")
+
+
+def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_continues_merging(tmp_path: Path) -> None:
+    """Cleanup failures in isolated mode should rebuild checkout and continue later merges in-cycle."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    task_a = store.add("Task A", task_type="implement")
+    task_b = store.add("Task B", task_type="implement")
+    assert task_a.id is not None
+    assert task_b.id is not None
+    for task, branch in ((task_a, "feature/watch-isolated-a"), (task_b, "feature/watch-isolated-b")):
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        store.update(task)
+        store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    isolated_git = MagicMock()
+    rebuilt_git = MagicMock()
+    isolated_git.branch_exists.return_value = True
+    isolated_git.is_merged.return_value = False
+    isolated_git.can_merge.side_effect = [False]
+
+    rebase_task = SimpleNamespace(id="gza-rebase-1")
+
+    def choose_action(_cfg, _store, _git, task, _target, *, impl_based_on_ids):  # noqa: ARG001
+        if task.id == task_a.id:
+            return {"type": "merge"}
+        if task.id == task_b.id:
+            return {"type": "merge"}
+        return {"type": "skip"}
+
+    merge_results = [
+        SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
+        SimpleNamespace(rc=0, created_followups=[], reused_followups=[]),
+    ]
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", side_effect=[isolated_git, rebuilt_git]) as ensure_isolated,
+        patch("gza.cli.determine_next_action", side_effect=choose_action),
+        patch("gza.cli.watch._execute_merge_action", side_effect=merge_results) as execute_merge,
+        patch("gza.cli.watch.cleanup_failed_merge_checkout", side_effect=GitError("cleanup failed")),
+        patch("gza.cli.watch._create_rebase_task", return_value=rebase_task),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert ensure_isolated.call_count == 2
+    assert ensure_isolated.call_args_list[1].kwargs["rebuild"] is True
+    assert execute_merge.call_count == 2
+    assert execute_merge.call_args_list[0].kwargs["merge_git"] is isolated_git
+    assert execute_merge.call_args_list[1].kwargs["merge_git"] is rebuilt_git
+    assert spawn_worker.call_count == 1
+    log_text = log_path.read_text()
+    assert "isolated merge checkout rebuilt" in log_text
+    assert "merge conflict routed to rebase" in log_text
+    assert " MERGE " in log_text
+
+
+def test_watch_cycle_with_isolation_enabled_rebuild_failure_skips_later_merges_but_runs_other_actions(
+    tmp_path: Path,
+) -> None:
+    """When rebuild fails, later merge actions should skip while non-merge actions still proceed."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    merge_task = store.add("Merge task", task_type="implement")
+    plan_task = store.add("Plan task", task_type="plan")
+    assert merge_task.id is not None
+    assert plan_task.id is not None
+    merge_task.status = "completed"
+    merge_task.completed_at = datetime.now(UTC)
+    merge_task.branch = "feature/watch-isolated-rebuild-fail"
+    store.update(merge_task)
+    store.set_merge_status(merge_task.id, "unmerged")
+
+    plan_task.status = "completed"
+    plan_task.completed_at = datetime.now(UTC)
+    store.update(plan_task)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    isolated_git = MagicMock()
+    isolated_git.branch_exists.return_value = True
+    isolated_git.is_merged.return_value = False
+    isolated_git.can_merge.side_effect = [False]
+
+    def choose_action(_cfg, _store, _git, task, _target, *, impl_based_on_ids):  # noqa: ARG001
+        if task.id == merge_task.id:
+            return {"type": "merge"}
+        if task.id == plan_task.id:
+            return {"type": "create_implement"}
+        return {"type": "skip"}
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch(
+            "gza.cli.watch.ensure_watch_main_checkout",
+            side_effect=[isolated_git, GitError("rebuild failed")],
+        ),
+        patch("gza.cli.determine_next_action", side_effect=choose_action),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
+        ),
+        patch("gza.cli.watch.cleanup_failed_merge_checkout", side_effect=GitError("cleanup failed")),
+        patch("gza.cli.watch._create_rebase_task", return_value=SimpleNamespace(id="gza-rebase-fail")),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    log_text = log_path.read_text()
+    assert "isolated merge checkout rebuild failed" in log_text
+    assert "START" in log_text
+
+
+def test_watch_cycle_with_isolation_enabled_missing_branch_failure_does_not_route_to_rebase(
+    tmp_path: Path,
+) -> None:
+    """Missing task branches must not be misclassified as isolated merge conflicts."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-missing-branch"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    isolated_git = MagicMock()
+    isolated_git.branch_exists.return_value = False
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
+        ),
+        patch("gza.cli.watch._create_rebase_task") as create_rebase,
+        patch("gza.cli.watch.cleanup_failed_merge_checkout") as cleanup_checkout,
+        patch("gza.cli.watch._spawn_background_worker") as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    create_rebase.assert_not_called()
+    cleanup_checkout.assert_not_called()
+    spawn_worker.assert_not_called()
+    isolated_git.is_merged.assert_not_called()
+    isolated_git.can_merge.assert_not_called()
+    log_text = log_path.read_text()
+    assert "merge conflict routed to rebase" not in log_text
+    assert f"{task.id}: merge failed (branch missing); not routing to rebase" in log_text
+
+
+def test_watch_cycle_with_isolation_enabled_already_merged_failure_does_not_route_to_rebase(
+    tmp_path: Path,
+) -> None:
+    """Already-merged branches must not create isolated rebase work on merge failure."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-already-merged"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    isolated_git = MagicMock()
+    isolated_git.branch_exists.return_value = True
+    isolated_git.is_merged.return_value = True
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
+        ),
+        patch("gza.cli.watch._create_rebase_task") as create_rebase,
+        patch("gza.cli.watch.cleanup_failed_merge_checkout") as cleanup_checkout,
+        patch("gza.cli.watch._spawn_background_worker") as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    create_rebase.assert_not_called()
+    cleanup_checkout.assert_not_called()
+    spawn_worker.assert_not_called()
+    isolated_git.can_merge.assert_not_called()
+    log_text = log_path.read_text()
+    assert "merge conflict routed to rebase" not in log_text
+    assert f"{task.id}: merge failed (branch already merged); not routing to rebase" in log_text
+
+
+def test_watch_cycle_without_isolation_preserves_default_branch_merge_guard(tmp_path: Path) -> None:
+    """Isolation disabled should preserve legacy default-branch guard behavior."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-no-isolation-guard"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout") as ensure_isolated,
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    ensure_isolated.assert_not_called()
+    execute_merge.assert_not_called()
+    assert "merge actions skipped: not on default branch" in log_path.read_text()
+
+
 def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Path) -> None:
     """Watch merge execution should honor merge_squash_threshold auto-squash."""
     (tmp_path / "gza.yaml").write_text(
@@ -1787,7 +2426,17 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
     git.count_commits_ahead.return_value = 3
     captured: dict[str, object] = {}
 
-    def fake_execute_merge_action(config_arg, store_arg, git_arg, task_arg, action_arg, *, target_branch, current_branch):
+    def fake_execute_merge_action(
+        config_arg,
+        store_arg,
+        git_arg,
+        task_arg,
+        action_arg,
+        *,
+        target_branch,
+        current_branch,
+        **_kwargs,
+    ):
         del store_arg, action_arg, current_branch
         from types import SimpleNamespace
 

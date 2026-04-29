@@ -4,6 +4,19 @@
 
 Each task type creates a worktree at `config.worktree_path / task.slug`.
 
+## Watch isolated merge checkout
+
+When `main_checkout_isolate: true`, `gza watch` maintains a dedicated integration checkout at `config.main_checkout_integration_path` (currently `.../main-integration`).
+
+- It is refreshed to a clean detached HEAD at the default-branch tip before watch-time merge execution.
+- On successful merge staging, watch fast-forwards the real default-branch ref to the detached merge commit before `merge_status` flips to `merged`.
+- If a real checkout currently has the default branch attached, watch hard-resets that checkout to the new branch tip so it stays clean instead of drifting dirty behind the moved ref.
+- If that startup refresh fails because the checkout is stale or conflicted, watch force-rebuilds it once before suppressing merge actions for the cycle.
+- It never directly checks out the shared `refs/heads/<default>` ref, so a user checkout already on the default branch is not dirtied by watch-time merge staging.
+- It is reserved for merge staging only; task branches and provider-driven rebase resolution still use task worktrees.
+- On cleanup failure after a merge conflict, watch treats the checkout as corrupted and rebuilds it from scratch (remove registration/path, recreate, refresh).
+- If rebuild fails, watch skips later merge actions in that cycle rather than falling back to `config.project_dir`.
+
 ### Code tasks (implement, improve)
 
 - **implement**: Creates a new worktree with a new branch based on `origin/main`.

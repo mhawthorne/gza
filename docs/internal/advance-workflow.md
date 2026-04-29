@@ -267,6 +267,8 @@ Advanced: 1 merged, 1 review started, 1 skipped
 
 `gza watch` reuses the same advance executor and improve-resolution helpers described above; it does not maintain a separate improve retry policy.
 
+When `main_checkout_isolate: true`, `gza watch` still plans against the repo default branch but executes merge attempts inside a dedicated detached integration checkout reset to the default-branch tip (`config.main_checkout_integration_path`). Successful isolated merges are then promoted onto the real default-branch ref before `merge_status` flips to `merged`; if the default branch is attached in another checkout, watch hard-resets that checkout to the new tip so it stays clean. Rebase/conflict-resolution ownership is unchanged: conflicts create rebase tasks on the task branch, and those tasks run through the normal rebase workflow.
+
 Default `gza watch` preserves the narrow legacy auto-resume path for resumable failed tasks. The broader failed-task recovery queue is opt-in via `gza watch --restart-failed`.
 
 When `--restart-failed` is enabled:

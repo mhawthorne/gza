@@ -490,6 +490,18 @@ class Git:
         result = self._run("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
         return result.returncode == 0
 
+    def rev_parse(self, ref: str) -> str:
+        """Resolve a ref to its commit SHA."""
+        result = self._run("rev-parse", "--verify", f"{ref}^{{commit}}")
+        return result.stdout.strip()
+
+    def update_ref(self, ref: str, new_oid: str, old_oid: str | None = None) -> None:
+        """Update a ref, optionally requiring the current value to match ``old_oid``."""
+        args = ["update-ref", ref, new_oid]
+        if old_oid is not None:
+            args.append(old_oid)
+        self._run(*args)
+
     def get_diff_name_status(self, revision_range: str, paths: tuple[str, ...] | list[str] = ()) -> str:
         """Get machine-readable name/status output for a revision range and optional paths."""
         args = ["diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", revision_range]
@@ -642,7 +654,11 @@ class Git:
         Used as a fallback cleanup path when merge abort is unavailable
         (for example, failed squash merges without MERGE_HEAD).
         """
-        self._run("reset", "--hard", "HEAD")
+        self.reset_hard("HEAD")
+
+    def reset_hard(self, ref: str) -> None:
+        """Reset tracked files to the given ref, discarding local tracked changes."""
+        self._run("reset", "--hard", ref)
 
     def rebase(self, branch: str) -> None:
         """Rebase the current branch onto another branch.

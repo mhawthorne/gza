@@ -73,6 +73,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("max_review_cycles", "int", 3, "Cap for review/improve loops in lifecycle automation."),
     ConfigKeySpec("max_steps", "int", 50, "Global default step budget."),
     ConfigKeySpec("max_turns", "int", 50, "Deprecated global alias for `max_steps`."),
+    ConfigKeySpec("main_checkout_isolate", "bool", False, "Stage watch-time merges in a detached integration checkout before advancing the real default branch on success."),
     ConfigKeySpec("merge_squash_threshold", "int", 0, "Auto-squash threshold for merge operations."),
     ConfigKeySpec("model", "str", "", "Legacy global model fallback."),
     ConfigKeySpec("reasoning_effort", "str", "", "Legacy global reasoning effort fallback (Codex)."),

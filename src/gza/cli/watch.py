@@ -16,7 +16,7 @@ from ..config import Config
 from ..console import truncate
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..failed_task_ordering import sort_failed_tasks
-from ..git import Git
+from ..git import Git, GitError
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..recovery_engine import (
     FailedRecoveryDecision,
@@ -56,6 +56,8 @@ from .git_ops import (
     _prepare_create_review_action,
     _require_default_branch,
     _unimplemented_implement_prompt,
+    cleanup_failed_merge_checkout,
+    ensure_watch_main_checkout,
 )
 
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
@@ -83,6 +85,27 @@ def _watch_skip_message(task: DbTask, action: dict) -> str:
     if not description:
         description = action_type.replace("_", " ")
     return f"{task.id}: {description}"
+
+
+@dataclass(frozen=True)
+class _IsolatedMergeFailureAssessment:
+    is_conflict: bool
+    reason: str | None = None
+
+
+def _assess_isolated_merge_failure(
+    merge_git: Git,
+    branch: str,
+    target_branch: str,
+) -> _IsolatedMergeFailureAssessment:
+    """Classify whether an isolated merge failure is a real merge conflict."""
+    if not merge_git.branch_exists(branch):
+        return _IsolatedMergeFailureAssessment(False, "branch missing")
+    if merge_git.is_merged(branch, target_branch):
+        return _IsolatedMergeFailureAssessment(False, "branch already merged")
+    if merge_git.can_merge(branch, target_branch):
+        return _IsolatedMergeFailureAssessment(False, "no merge conflict detected")
+    return _IsolatedMergeFailureAssessment(True)
 
 
 def _short_prompt(prompt: str) -> str:
@@ -640,6 +663,7 @@ def _run_cycle(
     # 1) Execute advance actions for completed tasks (includes completed plans
     # with no implement child, aligned with gza advance).
     # Merges run first; worker-spawning actions consume available slots.
+    isolation_enabled = bool(getattr(config, "main_checkout_isolate", False))
     merge_candidates, impl_based_on_ids = _collect_advance_completed_tasks(store)
     if tags:
         merge_candidates = [
@@ -651,6 +675,44 @@ def _run_cycle(
         git = Git(config.project_dir)
         current_branch = git.current_branch()
         target_branch = git.default_branch()
+        merge_git: Git | None = None
+        merge_actions_available = True
+        merge_skip_reason = "merge-not-default-branch"
+        can_merge = True
+
+        def _rebuild_isolated_checkout() -> bool:
+            nonlocal merge_git, can_merge, merge_skip_reason, merge_actions_available
+            try:
+                merge_git = _run_with_optional_stdout_suppressed(
+                    quiet,
+                    lambda: ensure_watch_main_checkout(config, git, target_branch, rebuild=True),
+                )
+                merge_actions_available = True
+                can_merge = True
+                merge_skip_reason = "merge-not-default-branch"
+                log.emit("INFO", "isolated merge checkout rebuilt")
+                return True
+            except GitError as exc:
+                merge_git = None
+                merge_actions_available = False
+                can_merge = False
+                merge_skip_reason = "merge-isolated-checkout-unavailable"
+                log.emit("ERROR", f"isolated merge checkout rebuild failed: {exc}")
+                return False
+
+        if isolation_enabled and not dry_run:
+            try:
+                merge_git = _run_with_optional_stdout_suppressed(
+                    quiet,
+                    lambda: ensure_watch_main_checkout(config, git, target_branch),
+                )
+            except GitError as exc:
+                log.emit(
+                    "WARN",
+                    f"isolated merge checkout refresh failed; rebuilding: {exc}",
+                )
+                _rebuild_isolated_checkout()
+
         action_plan: list[tuple[DbTask, dict]] = []
         for task in merge_candidates:
             action_plan.append(
@@ -665,15 +727,21 @@ def _run_cycle(
                         impl_based_on_ids=impl_based_on_ids,
                     ),
                 )
-            )
+        )
         action_plan.sort(key=lambda item: _WATCH_ADVANCE_ACTION_ORDER.get(item[1].get("type", ""), 1))
         has_merge_action = any(action.get("type") in {"merge", "merge_with_followups"} for _, action in action_plan)
-        can_merge = True
+        can_merge = merge_actions_available
         if has_merge_action:
-            can_merge = _run_with_optional_stdout_suppressed(
-                quiet,
-                lambda: _require_default_branch(git, current_branch, "merge"),
-            )
+            if isolation_enabled:
+                if dry_run:
+                    can_merge = True
+                else:
+                    can_merge = merge_git is not None
+            else:
+                can_merge = _run_with_optional_stdout_suppressed(
+                    quiet,
+                    lambda: _require_default_branch(git, current_branch, "merge"),
+                )
 
         worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
 
@@ -758,6 +826,13 @@ def _run_cycle(
 
             if action_type in {"merge", "merge_with_followups"}:
                 if not can_merge:
+                    if isolation_enabled and merge_skip_reason == "merge-isolated-checkout-unavailable":
+                        log.emit(
+                            "SKIP",
+                            "merge actions skipped: isolated checkout unavailable",
+                            dedupe_key="merge-isolated-checkout-unavailable",
+                        )
+                        continue
                     log.emit(
                         "SKIP",
                         "merge actions skipped: not on default branch",
@@ -768,6 +843,8 @@ def _run_cycle(
                     log.emit("MERGE", f"{task.id} -> {target_branch} [dry-run]")
                     work_done = True
                     continue
+                merge_execution_git = merge_git if (isolation_enabled and merge_git is not None) else git
+                merge_execution_branch = target_branch if isolation_enabled else current_branch
                 merge_result = _run_with_optional_stdout_suppressed(
                     quiet,
                     lambda: _execute_merge_action(
@@ -778,6 +855,8 @@ def _run_cycle(
                         action,
                         target_branch=target_branch,
                         current_branch=current_branch,
+                        merge_git=merge_execution_git,
+                        merge_current_branch=merge_execution_branch,
                     ),
                 )
                 rc = merge_result.rc
@@ -789,6 +868,70 @@ def _run_cycle(
                     log.emit("MERGE", f"{task.id} -> {target_branch}")
                     work_done = True
                 else:
+                    conflict_handled = False
+                    conflict_assessment: _IsolatedMergeFailureAssessment | None = None
+                    if isolation_enabled and task.branch is not None:
+                        conflict_assessment = _assess_isolated_merge_failure(
+                            merge_execution_git,
+                            task.branch,
+                            target_branch,
+                        )
+                        if conflict_assessment.is_conflict:
+                            conflict_handled = True
+                            try:
+                                cleanup_failed_merge_checkout(merge_execution_git)
+                            except GitError as cleanup_error:
+                                log.emit(
+                                    "WARN",
+                                    (
+                                        f"{task.id}: isolated checkout cleanup failed after conflict: "
+                                        f"{cleanup_error}"
+                                    ),
+                                )
+                                _rebuild_isolated_checkout()
+                            try:
+                                rebase_task = _create_rebase_from_task(task)
+                            except Exception as rebase_error:
+                                log.emit("ERROR", f"{task.id}: failed to create rebase task ({rebase_error})")
+                                continue
+                            assert rebase_task.id is not None
+                            step1_handled_child_task_ids.add(str(rebase_task.id))
+                            work_done = True
+                            if slots > 0:
+                                rebase_rc = _watch_spawn_worker(str(rebase_task.id), "rebase")
+                                if rebase_rc == 0:
+                                    log.emit("START", f"{rebase_task.id} rebase")
+                                    started_task_ids.add(str(rebase_task.id))
+                                    slots -= 1
+                                else:
+                                    log.emit(
+                                        "SKIP",
+                                        f"{task.id}: merge conflict rebase worker spawn failed",
+                                        dedupe_key=f"merge-conflict-rebase-spawn-failed:{task.id}",
+                                    )
+                            else:
+                                log.emit(
+                                    "SKIP",
+                                    f"{task.id}: merge conflict queued rebase {rebase_task.id} (no free slots)",
+                                    dedupe_key=f"merge-conflict-rebase-queued:{task.id}",
+                                )
+                            log.emit(
+                                "SKIP",
+                                f"{task.id}: merge conflict routed to rebase",
+                                dedupe_key=f"merge-conflict:{task.id}",
+                            )
+                    if conflict_handled:
+                        continue
+                    if conflict_assessment is not None and conflict_assessment.reason is not None:
+                        log.emit(
+                            "SKIP",
+                            (
+                                f"{task.id}: merge failed ({conflict_assessment.reason}); "
+                                "not routing to rebase"
+                            ),
+                            dedupe_key=f"merge-failed-non-conflict:{task.id}",
+                        )
+                        continue
                     log.emit(
                         "SKIP",
                         f"{task.id}: merge failed",
