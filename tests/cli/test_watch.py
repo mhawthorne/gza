@@ -6,7 +6,7 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -2071,6 +2071,77 @@ def test_isolated_watch_merge_promotes_real_main_before_marking_sequential_merge
     assert isolated_git.current_branch() == "HEAD"
     assert isolated_git.has_changes(include_untracked=True) is False
     assert isolated_git.rev_parse("HEAD") == git.rev_parse("main")
+
+
+def test_isolated_watch_merge_promotion_rollback_keeps_task_unmerged_when_attached_checkout_reset_fails(
+    tmp_path: Path,
+) -> None:
+    """Promotion rollback must restore refs and keep merge_status unmerged after attached checkout reset failure."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Promotion rollback regression", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-rollback"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
+    config = Config.load(tmp_path)
+
+    repo_git = MagicMock()
+    repo_git.repo_dir = tmp_path
+    repo_git.rev_parse.return_value = "previous-main-oid"
+
+    merge_git = MagicMock()
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "isolated-merge-oid"
+
+    attached_target_git = MagicMock()
+    attached_target_git.has_changes.return_value = False
+    attached_target_git.reset_hard.side_effect = [
+        GitError("attached checkout reset failed"),
+        None,
+    ]
+
+    with (
+        patch("gza.cli.git_ops._merge_single_task", return_value=0),
+        patch(
+            "gza.cli.git_ops.active_worktree_path_for_branch",
+            return_value=config.project_dir,
+        ),
+        patch("gza.cli.git_ops.Git", return_value=attached_target_git),
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            repo_git,
+            task,
+            {"type": "merge"},
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch="main",
+        )
+
+    assert result.rc == 1
+    assert result.created_followups == []
+    assert result.reused_followups == []
+    assert repo_git.update_ref.call_args_list == [
+        call("refs/heads/main", "isolated-merge-oid", "previous-main-oid"),
+        call("refs/heads/main", "previous-main-oid", "isolated-merge-oid"),
+    ]
+    assert attached_target_git.reset_hard.call_args_list == [
+        call("refs/heads/main"),
+        call("refs/heads/main"),
+    ]
+    merge_git.reset_hard.assert_called_once_with("refs/heads/main")
+    refreshed_task = store.get(task.id)
+    assert refreshed_task is not None
+    assert refreshed_task.merge_status == "unmerged"
 
 
 def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_continues_merging(tmp_path: Path) -> None:
