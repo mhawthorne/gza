@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from gza.cli import _determine_advance_action, cmd_advance
+from gza.cli import cmd_advance
 from gza.config import Config
 from gza.db import SqliteTaskStore
 

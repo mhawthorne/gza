@@ -45,11 +45,11 @@ from ._common import (
     set_task_queue_position_scoped,
     set_task_urgency,
 )
+from .advance_engine import determine_next_action
 from .advance_executor import AdvanceActionExecutionContext, execute_advance_action
 from .execution import _spawn_background_iterate
 from .git_ops import (
     _collect_advance_completed_tasks,
-    _determine_advance_action,
     _execute_merge_action,
     _merge_single_task as _git_ops_merge_single_task,
     _prepare_create_review_action,
@@ -639,7 +639,7 @@ def _run_cycle(
             action_plan.append(
                 (
                     task,
-                    _determine_advance_action(
+                    determine_next_action(
                         config,
                         store,
                         git,
