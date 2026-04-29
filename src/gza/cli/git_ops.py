@@ -1331,7 +1331,7 @@ def _prepare_create_review_action(store: SqliteTaskStore, task: DbTask) -> _Crea
     return _CreateReviewActionResult(
         status="created",
         review_task=review_task,
-        message=f"✓ Created review task {review_task.id}",
+        message=f"Created review task {review_task.id}",
     )
 
 
@@ -1806,7 +1806,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 continue
 
             if exec_result.status == "error":
-                err_message = exec_result.message or f"Failed to execute {action_type}"
+                if exec_result.message:
+                    console.print(f"      [{_c_ok}]✓ {exec_result.message}[/{_c_ok}]")
+                err_message = exec_result.error_message or exec_result.message or f"Failed to execute {action_type}"
                 console.print(f"      [{_c_err}]✗ {err_message}[/{_c_err}]")
                 error_count += 1
                 continue
