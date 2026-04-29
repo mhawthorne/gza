@@ -3103,6 +3103,18 @@ class TestStatusCommand:
         assert result.returncode == 0
         assert "Tagged descendant" in result.stdout
 
+    def test_group_grouped_view_is_rejected(self, tmp_path: Path):
+        """group --view grouped should be rejected until grouped presentation exists."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Release task", group="release")
+
+        result = run_gza("group", "release", "--view", "grouped", "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "invalid choice: 'grouped'" in result.stderr
+        assert "choose from 'flat', 'lineage', 'tree', 'json'" in result.stderr
+
 
 class TestRenameGroupCommand:
     """Tests for 'gza groups rename' command."""

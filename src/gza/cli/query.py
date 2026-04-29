@@ -1246,8 +1246,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     raw_view = str(getattr(args, "view", "flat"))
     view_mode = cast(
-        Literal["flat", "grouped", "lineage", "tree", "json"],
-        raw_view if raw_view in {"flat", "grouped", "lineage", "tree", "json"} else "flat",
+        Literal["flat", "lineage", "tree", "json"],
+        raw_view if raw_view in {"flat", "lineage", "tree", "json"} else "flat",
     )
     if view_mode == "json":
         print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.", file=sys.stderr)

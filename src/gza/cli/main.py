@@ -2094,7 +2094,7 @@ def main() -> int:
     )
     group_parser.add_argument(
         "--view",
-        choices=["flat", "grouped", "lineage", "tree", "json"],
+        choices=["flat", "lineage", "tree", "json"],
         default="flat",
         help="Presentation mode (default: flat)",
     )

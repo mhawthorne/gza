@@ -317,9 +317,9 @@ class TestHelpOutput:
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert "--view" in help_text
-        assert "{flat,grouped,lineage,tree,json}" in help_text
+        assert "{flat,lineage,tree,json}" in help_text
         assert "Presentation mode (default: flat)" in help_text
-        assert "| `--view MODE` | Presentation mode: `flat`, `grouped`, `lineage`, `tree`, or `json` (default: `flat`) |" in docs_text
+        assert "| `--view MODE` | Presentation mode: `flat`, `lineage`, `tree`, or `json` (default: `flat`) |" in docs_text
 
     def test_search_command_help_mentions_prompt_substring_scope(self, tmp_path):
         """`search --help` should describe prompt-only substring matching."""

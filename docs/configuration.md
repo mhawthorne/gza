@@ -659,7 +659,7 @@ gza group <group> [options]
 | Option | Description |
 |--------|-------------|
 | `group` | Group/tag name to filter by |
-| `--view MODE` | Presentation mode: `flat`, `grouped`, `lineage`, `tree`, or `json` (default: `flat`) |
+| `--view MODE` | Presentation mode: `flat`, `lineage`, `tree`, or `json` (default: `flat`) |
 
 `--view json` emits JSON rows to stdout (`[]` when no rows). Deprecation warnings are written to stderr.
 
