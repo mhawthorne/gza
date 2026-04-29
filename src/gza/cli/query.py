@@ -1284,7 +1284,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         if view_mode == "json":
             print(rendered)
         else:
-            console.print(rendered)
+            # Preserve literal prompt text (including bracketed segments) in
+            # human-readable output.
+            console.print(rendered, markup=False)
 
     # Preserve orphaned-task warning behavior for this tag slice.
     registry = WorkerRegistry(config.workers_path)

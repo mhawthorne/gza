@@ -3106,6 +3106,31 @@ class TestStatusCommand:
         payload = json.loads(result.stdout)
         assert payload[0]["prompt"] == "[release] prompt"
 
+    def test_group_flat_view_preserves_bracketed_prompt_text(self, tmp_path: Path):
+        """group --view flat should render bracketed prompt text literally."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("[release] prompt", group="release")
+
+        result = run_gza("group", "release", "--view", "flat", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "[release] prompt" in result.stdout
+
+    def test_group_tree_view_preserves_bracketed_prompt_text(self, tmp_path: Path):
+        """group --view tree should render bracketed prompt text literally."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        root = store.add("[release] root", group="release")
+        assert root.id is not None
+        store.add("[release] child", group="release", based_on=root.id, same_branch=True)
+
+        result = run_gza("group", "release", "--view", "tree", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "[release] root" in result.stdout
+        assert "[release] child" in result.stdout
+
     def test_group_json_view_preserves_orphaned_warning_behavior_on_stderr(self, tmp_path: Path):
         """group --view json should keep orphaned-task warnings while keeping stdout pure JSON."""
         setup_config(tmp_path)
