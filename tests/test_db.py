@@ -4981,12 +4981,12 @@ class TestSharedDbIsolationAndImportGating:
         assert reopened is not None
         fingerprint.assert_called_once_with(local_db)
 
-    def test_marker_check_recomputes_fingerprint_when_local_db_metadata_changes(
+    def test_marker_check_skips_fingerprint_when_local_db_metadata_changes(
         self,
         tmp_path: Path,
     ) -> None:
         from gza import db as db_module
-        from gza.config import Config
+        from gza.config import Config, ConfigError
 
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -5012,9 +5012,9 @@ class TestSharedDbIsolationAndImportGating:
         os.utime(local_db, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
 
         with patch("gza.db._db_fingerprint", wraps=db_module._db_fingerprint) as fingerprint:
-            reopened = SqliteTaskStore.from_config(config)
-        assert reopened is not None
-        fingerprint.assert_called_once_with(local_db)
+            with pytest.raises(ConfigError, match="Legacy local DB detected"):
+                SqliteTaskStore.from_config(config)
+        fingerprint.assert_not_called()
 
     def test_marker_check_metadata_equality_still_requires_fingerprint_match(
         self,
