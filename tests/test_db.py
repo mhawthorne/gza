@@ -2210,6 +2210,50 @@ class TestTaskComments:
         assert [comment.content for comment in scoped] == ["First comment"]
 
 
+class TestWorkflowStuckState:
+    """Tests for workflow stuck-state persistence helpers."""
+
+    def test_upsert_list_count_and_clear_workflow_stuck_state(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Workflow root", task_type="implement")
+        assert task.id is not None
+
+        detected_at = datetime(2026, 4, 29, 16, 0, tzinfo=UTC)
+        stored = store.upsert_workflow_stuck_state(
+            workflow_root_task_id=task.id,
+            reason="repeated_review_blocker",
+            detected_at=detected_at,
+            detected_by="watch",
+            source_task_id=task.id,
+            fingerprint="fp-1",
+            details={"blocker": "verify failed"},
+            iterate_run_id=7,
+        )
+
+        assert stored.workflow_root_task_id == task.id
+        assert stored.active is True
+        assert stored.detected_at == detected_at
+        assert stored.details == {"blocker": "verify failed"}
+        assert store.get_active_workflow_stuck_state(task.id) == stored
+        assert [state.workflow_root_task_id for state in store.list_active_workflow_stuck_states()] == [task.id]
+        assert store.get_workflow_stuck_reason_counts() == [("repeated_review_blocker", 1)]
+        assert store.get_workflow_stuck_detector_counts() == [("watch", 1)]
+
+        cleared = store.clear_workflow_stuck_state(
+            task.id,
+            cleared_by="advance",
+            clear_reason="recovered",
+            cleared_at=datetime(2026, 4, 29, 17, 0, tzinfo=UTC),
+        )
+
+        assert cleared is not None
+        assert cleared.active is False
+        assert cleared.cleared_by == "advance"
+        assert cleared.clear_reason == "recovered"
+        assert store.get_active_workflow_stuck_state(task.id) is None
+        assert store.list_active_workflow_stuck_states() == []
+
+
 class TestMergeStatus:
     """Tests for merge_status field and related functionality."""
 
@@ -8823,6 +8867,41 @@ class TestSharedDbIsolationAndImportGating:
         assert "metadata_json" in columns
         assert "idx_task_artifacts_project_task_created" in index_names
         assert "idx_task_artifacts_project_task_kind_created" in index_names
+        assert version == SCHEMA_VERSION
+
+    def test_auto_migration_v52_to_v53_adds_workflow_stuck_state_and_store_accessors(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before v53 workflow stuck state")
+        assert task.id is not None
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP TABLE workflow_stuck_state")
+            conn.execute("UPDATE schema_version SET version = 52")
+            conn.commit()
+
+        migrated_store = SqliteTaskStore(db_path, prefix="gza")
+        stored = migrated_store.upsert_workflow_stuck_state(
+            workflow_root_task_id=task.id,
+            reason="max_review_cycles",
+            detected_at=datetime(2026, 5, 1, 10, 0, tzinfo=UTC),
+            detected_by="watch",
+            source_task_id=task.id,
+            fingerprint="fp-v53",
+            details={"cycle_count": 5},
+        )
+
+        with sqlite3.connect(db_path) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(workflow_stuck_state)").fetchall()}
+            index_names = {row[1] for row in conn.execute("PRAGMA index_list(workflow_stuck_state)").fetchall()}
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+
+        assert stored.workflow_root_task_id == task.id
+        assert stored.details == {"cycle_count": 5}
+        assert "details_json" in columns
+        assert "idx_workflow_stuck_active_reason" in index_names
         assert version == SCHEMA_VERSION
 
     def test_list_artifacts_filters_by_kind_and_orders_newest_first(self, tmp_path: Path) -> None:
