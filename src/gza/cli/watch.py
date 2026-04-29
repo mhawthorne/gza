@@ -546,7 +546,7 @@ def _is_default_watch_blocked_recovery_descendant(
     *,
     max_recovery_attempts: int,
 ) -> bool:
-    """Return whether plain watch should leave a pending recovery descendant untouched."""
+    """Return whether plain watch should keep a pending resume child on the legacy resume path."""
     if task.status != "pending" or not task.based_on or not task.task_type:
         return False
     parent = store.get(task.based_on)
@@ -563,9 +563,11 @@ def _is_default_watch_blocked_recovery_descendant(
         parent,
         max_recovery_attempts=max_recovery_attempts,
     )
-    if selection is not None and selection.action == "reuse_pending" and selection.recovery_task_id == str(task.id):
-        return False
-    return True
+    return (
+        selection is not None
+        and selection.action == "reuse_pending"
+        and selection.recovery_task_id == str(task.id)
+    )
 
 
 def _run_cycle(

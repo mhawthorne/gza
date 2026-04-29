@@ -314,8 +314,8 @@ def test_watch_cycle_default_mode_reuses_existing_pending_resume_child(tmp_path:
     assert children[0].id == resume_child.id
 
 
-def test_watch_cycle_default_mode_does_not_reuse_pending_retry_child(tmp_path: Path) -> None:
-    """Plain watch should not broaden auto-resume into reusing a non-resume pending child."""
+def test_watch_cycle_default_mode_starts_queued_retry_child_as_pending_work(tmp_path: Path) -> None:
+    """Plain watch should leave a queued retry child on the normal pending queue."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -339,6 +339,7 @@ def test_watch_cycle_default_mode_does_not_reuse_pending_retry_child(tmp_path: P
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -351,8 +352,10 @@ def test_watch_cycle_default_mode_does_not_reuse_pending_retry_child(tmp_path: P
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert result.work_done is False
+    assert result.work_done is True
     assert spawn_resume.call_count == 0
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == retry_child.id
     assert [task.id for task in store.get_based_on_children(failed.id)] == [retry_child.id]
 
 
