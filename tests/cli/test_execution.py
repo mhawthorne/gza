@@ -578,6 +578,45 @@ class TestRetryCommand:
         assert retry_task.same_branch is False
         assert retry_task.base_branch == "feature/impl-branch"
 
+    def test_create_retry_task_shared_helper_preserves_retry_contract(self, tmp_path: Path):
+        """Shared retry creator keeps cmd_retry branch/base-branch semantics and metadata copy."""
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        dep = store.add("Dependency", task_type="plan")
+        assert dep.id is not None
+
+        original = store.add(
+            "Retry me",
+            task_type="improve",
+            depends_on=dep.id,
+            same_branch=True,
+            tags=("release-1.2",),
+            spec="docs/spec.md",
+            model="gpt-5.3-codex",
+            provider="codex",
+        )
+        assert original.id is not None
+        original.status = "failed"
+        original.branch = "feature/old"
+        original.task_type_hint = "feature"
+        original.provider_is_explicit = True
+        store.update(original)
+
+        retry_task = _create_retry_task(store, original)
+        assert retry_task.based_on == original.id
+        assert retry_task.prompt == original.prompt
+        assert retry_task.task_type == original.task_type
+        assert retry_task.depends_on == original.depends_on
+        assert retry_task.tags == original.tags
+        assert retry_task.spec == original.spec
+        assert retry_task.model == original.model
+        assert retry_task.provider == original.provider
+        assert retry_task.provider_is_explicit is True
+        assert retry_task.same_branch is False
+        assert retry_task.base_branch == "feature/old"
+
     def test_retry_does_not_copy_non_explicit_provider(self, tmp_path: Path):
         """Retry should not preserve provider that came from resolved default state."""
 
@@ -2576,6 +2615,116 @@ class TestImproveCommand:
         assert newest.id != failed_improve.id
         assert newest.based_on == impl_task.id
         assert newest.depends_on is None
+
+    def test_improve_comments_only_retry_resets_omitted_review_model_and_provider_flags(self, tmp_path: Path):
+        """Comments-only improve retries should not inherit stale CLI flags when omitted."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Retry comments-only improve after infra failure.")
+
+        first = run_gza(
+            "improve",
+            str(impl_task.id),
+            "--queue",
+            "--review",
+            "--model",
+            "gpt-5.3-codex",
+            "--provider",
+            "codex",
+            "--project",
+            str(tmp_path),
+        )
+        assert first.returncode == 0, first.stdout
+
+        failed_improve = next(task for task in store.get_all() if task.task_type == "improve")
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed_improve.session_id = None
+        store.update(failed_improve)
+
+        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert second.returncode == 0, second.stdout
+        assert f"(retry of {failed_improve.id})" in second.stdout
+
+        retry_task = max(
+            (task for task in store.get_all() if task.task_type == "improve"),
+            key=lambda task: task_id_numeric_key(task.id),
+        )
+        assert retry_task.id != failed_improve.id
+        assert retry_task.based_on == failed_improve.id
+        assert retry_task.create_review is False
+        assert retry_task.model is None
+        assert retry_task.provider is None
+        assert retry_task.provider_is_explicit is False
+
+    def test_improve_comments_only_retry_honors_explicit_review_model_and_provider_overrides(
+        self, tmp_path: Path
+    ):
+        """Comments-only improve retries should apply the current invocation overrides."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Retry comments-only improve with new flags.")
+
+        first = run_gza(
+            "improve",
+            str(impl_task.id),
+            "--queue",
+            "--model",
+            "gpt-5.3-codex",
+            "--provider",
+            "codex",
+            "--project",
+            str(tmp_path),
+        )
+        assert first.returncode == 0, first.stdout
+
+        failed_improve = next(task for task in store.get_all() if task.task_type == "improve")
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed_improve.session_id = None
+        store.update(failed_improve)
+
+        second = run_gza(
+            "improve",
+            str(impl_task.id),
+            "--queue",
+            "--review",
+            "--model",
+            "gpt-5.4",
+            "--provider",
+            "claude",
+            "--project",
+            str(tmp_path),
+        )
+        assert second.returncode == 0, second.stdout
+        assert f"(retry of {failed_improve.id})" in second.stdout
+
+        retry_task = max(
+            (task for task in store.get_all() if task.task_type == "improve"),
+            key=lambda task: task_id_numeric_key(task.id),
+        )
+        assert retry_task.id != failed_improve.id
+        assert retry_task.based_on == failed_improve.id
+        assert retry_task.create_review is True
+        assert retry_task.model == "gpt-5.4"
+        assert retry_task.provider == "claude"
+        assert retry_task.provider_is_explicit is True
 
     def test_improve_comments_only_in_progress_task_with_newer_comment_creates_fresh_task(self, tmp_path: Path):
         """In-progress comments-only improve is ignored when newer unresolved comments require a new pass."""
@@ -5486,6 +5635,8 @@ class TestIterateCommand:
         store = make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
         impl.status = "failed"
+        impl.same_branch = True
+        impl.branch = "feature/existing-impl-branch"
         store.update(impl)
         review = store.add("Review", task_type="review")
 
@@ -5541,6 +5692,10 @@ class TestIterateCommand:
         assert run_fg.call_count >= 1
         first_task_id = run_fg.call_args_list[0][1]["task_id"]
         assert first_task_id != impl.id  # Should be a new task
+        retry_task = store.get(first_task_id)
+        assert retry_task is not None
+        assert retry_task.same_branch is False
+        assert retry_task.base_branch == "feature/existing-impl-branch"
         assert "Retrying failed implementation" in output
         assert "Iterate complete: MERGE_READY" in output
 
@@ -5605,6 +5760,78 @@ class TestIterateCommand:
         assert run_fg.call_count >= 1
         first_task_id = run_fg.call_args_list[0][1]["task_id"]
         assert first_task_id != impl.id
+        assert "Resuming failed implementation" in output
+        assert "Iterate complete: MERGE_READY" in output
+
+    def test_failed_task_resume_reuses_matching_pending_resume_child(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """gza iterate --resume should reuse an existing pending resume child for the failed root task."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+        from datetime import datetime
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "failed"
+        impl.session_id = "resume-session-1"
+        store.update(impl)
+
+        resume_child = store.add("Pending resume child", task_type="implement", based_on=impl.id)
+        assert resume_child.id is not None
+        resume_child.status = "pending"
+        resume_child.session_id = impl.session_id
+        store.update(resume_child)
+
+        def fake_run_foreground(config, task_id, **kwargs):
+            task = store.get(task_id)
+            if task and task.status == "pending":
+                task.status = "completed"
+                if task.task_type == "implement":
+                    task.branch = "test-project/20260101-resume-reuse"
+                task.completed_at = datetime.now()
+                store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            project_dir=str(tmp_path),
+            impl_task_id=str(impl.id),
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=True,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            advance_requires_review=False,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+            patch("gza.cli.Git", return_value=mock_git),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert run_fg.call_count >= 1
+        first_task_id = run_fg.call_args_list[0][1]["task_id"]
+        assert first_task_id == resume_child.id
+        assert [task.id for task in store.get_based_on_children(impl.id)] == [resume_child.id]
         assert "Resuming failed implementation" in output
         assert "Iterate complete: MERGE_READY" in output
 

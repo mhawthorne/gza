@@ -45,7 +45,7 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
-| `watch` | Dict | `{batch: 5, poll: 300, max_idle: null, max_iterations: 10}` | Defaults for `gza watch` loop behavior |
+| `watch` | Dict | `{batch: 5, poll: 300, max_idle: null, max_iterations: 10, restart_failed_batch: 1}` | Defaults for `gza watch` loop behavior |
 | `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
 | `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
 | `theme` | String | *(none)* | Built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. Override with `gza.local.yaml`. |
@@ -815,6 +815,7 @@ watch.failure_halt_after
 watch.max_idle
 watch.max_iterations
 watch.poll
+watch.restart_failed_batch
 work_count
 worktree_dir
 ```
@@ -1358,8 +1359,11 @@ gza watch [options]
 | failure backoff | After each newly observed non-auto-resumable failure, `gza watch` logs an exponential cooldown using `watch.failure_backoff_initial` and `watch.failure_backoff_max`, and exits when `watch.failure_halt_after` is reached |
 | `--poll SECS` | Poll interval in seconds (default: `watch.poll` or `300`) |
 | `--max-idle SECS` | Exit after consecutive idle time (default: `watch.max_idle`, no limit when unset) |
-| `--max-iterations N` | Iterate loop cap for implement tasks (default: `watch.max_iterations` or `10`) |
-| `--dry-run` | Show what each cycle would do without executing |
+| `--max-iterations N` | Iterate loop cap for implement tasks launched by watch (default: `watch.max_iterations` or `10`) |
+| `--restart-failed` | Enable failed-task recovery mode: failed queue drains before pending queue using resume/retry decisions |
+| `--restart-failed-batch N` | Max concurrent failed-recovery launches (default: `watch.restart_failed_batch` or `1`) |
+| `--max-resume-attempts N` | Override `max_resume_attempts` for this watch run; applies to plain-watch auto-resume and to `--restart-failed` resume/retry decisions |
+| `--dry-run` | Show what watch would do without executing; with `--restart-failed`, print the full failed-recovery report and exit |
 | `--quiet` | Write events to `.gza/watch.log` only |
 | `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `gza queue --tag TAG` to preview the same scoped pickup order |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
@@ -1367,6 +1371,8 @@ gza watch [options]
 
 When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
 `INFO   scope: tags=<comma-separated-tags> mode=all|any`.
+
+`gza watch --restart-failed --dry-run` is the recovery inspection surface for this mode. It prints the full failed-task decision report for the current scope, including `resume`, `retry`, and `skip` decisions with launch mode and attempt counts, then exits without entering the normal watch loop.
 
 ### learnings
 

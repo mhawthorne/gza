@@ -1486,6 +1486,36 @@ def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask
     return new_task
 
 
+def _create_retry_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask:
+    """Create a fresh retry task pointing to the original task.
+
+    For same-branch tasks that already ran on a branch, retries fork a fresh
+    branch from that prior branch via ``base_branch``.
+    """
+    assert original_task.id is not None
+    retry_same_branch = original_task.same_branch
+    retry_base_branch: str | None = None
+    if original_task.same_branch and original_task.branch:
+        retry_same_branch = False
+        retry_base_branch = original_task.branch
+
+    return store.add(
+        prompt=original_task.prompt,
+        task_type=original_task.task_type,
+        tags=original_task.tags,
+        spec=original_task.spec,
+        depends_on=original_task.depends_on,
+        create_review=original_task.create_review,
+        same_branch=retry_same_branch,
+        task_type_hint=original_task.task_type_hint,
+        based_on=original_task.id,
+        model=original_task.model,
+        provider=original_task.provider if original_task.provider_is_explicit else None,
+        provider_is_explicit=original_task.provider_is_explicit,
+        base_branch=retry_base_branch,
+    )
+
+
 def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
     """Rebase resumable code-task branches onto the default branch before resuming."""
     from ..git import Git

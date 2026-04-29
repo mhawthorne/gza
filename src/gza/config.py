@@ -70,6 +70,7 @@ DEFAULT_WATCH_MAX_ITERATIONS = 10
 DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL = 60
 DEFAULT_WATCH_FAILURE_BACKOFF_MAX = 3600
 DEFAULT_WATCH_FAILURE_HALT_AFTER: int | None = 10
+DEFAULT_WATCH_RESTART_FAILED_BATCH = 1
 DEFAULT_ITERATE_MAX_ITERATIONS = 3
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 DEFAULT_MERGE_SQUASH_THRESHOLD = 0
@@ -145,6 +146,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
         "poll": None,
         "max_idle": None,
         "max_iterations": None,
+        "restart_failed_batch": None,
         "failure_backoff_initial": None,
         "failure_backoff_max": None,
         "failure_halt_after": None,
@@ -368,6 +370,7 @@ class WatchConfig:
     poll: int = DEFAULT_WATCH_POLL
     max_idle: int | None = DEFAULT_WATCH_MAX_IDLE
     max_iterations: int = DEFAULT_WATCH_MAX_ITERATIONS
+    restart_failed_batch: int = DEFAULT_WATCH_RESTART_FAILED_BATCH
     failure_backoff_initial: int = DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL
     failure_backoff_max: int = DEFAULT_WATCH_FAILURE_BACKOFF_MAX
     failure_halt_after: int | None = DEFAULT_WATCH_FAILURE_HALT_AFTER
@@ -1218,6 +1221,14 @@ class Config:
         if watch_max_iterations < 1:
             raise ConfigError("watch.max_iterations must be a positive integer")
         try:
+            watch_restart_failed_batch = int(
+                watch_data.get("restart_failed_batch", DEFAULT_WATCH_RESTART_FAILED_BATCH)
+            )
+        except (TypeError, ValueError):
+            raise ConfigError("watch.restart_failed_batch must be a positive integer")
+        if watch_restart_failed_batch < 1:
+            raise ConfigError("watch.restart_failed_batch must be a positive integer")
+        try:
             watch_failure_backoff_initial = int(
                 watch_data.get("failure_backoff_initial", DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL)
             )
@@ -1253,6 +1264,7 @@ class Config:
             poll=watch_poll,
             max_idle=watch_max_idle,
             max_iterations=watch_max_iterations,
+            restart_failed_batch=watch_restart_failed_batch,
             failure_backoff_initial=watch_failure_backoff_initial,
             failure_backoff_max=watch_failure_backoff_max,
             failure_halt_after=watch_failure_halt_after,
@@ -1649,6 +1661,12 @@ class Config:
                 if "max_iterations" in watch_data:
                     if not isinstance(watch_data["max_iterations"], int) or watch_data["max_iterations"] < 1:
                         errors.append("watch.max_iterations must be a positive integer")
+                if "restart_failed_batch" in watch_data:
+                    if (
+                        not isinstance(watch_data["restart_failed_batch"], int)
+                        or watch_data["restart_failed_batch"] < 1
+                    ):
+                        errors.append("watch.restart_failed_batch must be a positive integer")
                 if "failure_backoff_initial" in watch_data:
                     if (
                         not isinstance(watch_data["failure_backoff_initial"], int)

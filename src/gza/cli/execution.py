@@ -45,6 +45,7 @@ from ._common import (
     _create_or_reuse_followup_tasks,
     _create_rebase_task,
     _create_resume_task,
+    _create_retry_task,
     _create_review_task,
     _run_as_worker,
     _run_foreground,
@@ -985,32 +986,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
         print(f"Error: Task {task_id} already has a successful retry ({successful_retry.id}).")
         return 1
 
-    # For same_branch tasks (improve/review) that have run and have a branch,
-    # fork a new branch from the parent branch instead of reusing it.
-    # This gives the retry agent a clean start without inheriting WIP commits
-    # from the failed attempt.
-    retry_same_branch = task.same_branch
-    retry_base_branch: str | None = None
-    if task.same_branch and task.branch:
-        retry_same_branch = False
-        retry_base_branch = task.branch
-
-    # Create new task copying relevant fields
-    new_task = store.add(
-        prompt=task.prompt,
-        task_type=task.task_type,
-        tags=task.tags,
-        spec=task.spec,
-        depends_on=task.depends_on,
-        create_review=task.create_review,
-        same_branch=retry_same_branch,
-        task_type_hint=task.task_type_hint,
-        based_on=task_id,  # Track retry lineage
-        model=task.model,
-        provider=task.provider if task.provider_is_explicit else None,
-        provider_is_explicit=task.provider_is_explicit,
-        base_branch=retry_base_branch,
-    )
+    new_task = _create_retry_task(store, task)
 
     print(f"✓ Created task {new_task.id} (retry of {task_id})")
 
@@ -1355,23 +1331,16 @@ def cmd_improve(args: argparse.Namespace) -> int:
             action_message = f"Created improve task {improve_task.id} (resume of {existing_comments_improve.id})"
         elif comments_action == "retry":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
-            retry_same_branch = existing_comments_improve.same_branch
-            retry_base_branch: str | None = None
-            if existing_comments_improve.same_branch and existing_comments_improve.branch:
-                retry_same_branch = False
-                retry_base_branch = existing_comments_improve.branch
-            improve_task = store.add(
-                prompt=existing_comments_improve.prompt,
-                task_type="improve",
-                depends_on=None,
-                based_on=existing_comments_improve.id,
-                same_branch=retry_same_branch,
-                tags=existing_comments_improve.tags,
-                base_branch=retry_base_branch,
-                create_review=create_review,
-                model=model,
-                provider=provider,
-            )
+            improve_task = _create_retry_task(store, existing_comments_improve)
+            # Comments-only improve retries keep the shared retry creator, but
+            # preserve the historical cmd_improve contract: omitted CLI flags
+            # reset to the current invocation defaults instead of inheriting
+            # stale values from the failed improve task.
+            improve_task.create_review = create_review
+            improve_task.model = model
+            improve_task.provider = provider
+            improve_task.provider_is_explicit = provider is not None
+            store.update(improve_task)
             action_message = f"Created improve task {improve_task.id} (retry of {existing_comments_improve.id})"
         else:
             try:
@@ -1679,6 +1648,17 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         print(f"Error: Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
         return 1
 
+    def _matching_pending_resume_child(failed_task: DbTask) -> DbTask | None:
+        assert failed_task.id is not None
+        for child in store.get_based_on_children_by_type(str(failed_task.id), failed_task.task_type or ""):
+            if (
+                child.status == "pending"
+                and child.session_id
+                and child.session_id == failed_task.session_id
+            ):
+                return child
+        return None
+
     # Handle background mode: re-exec this command as a detached process.
     if background:
         return _spawn_background_iterate(
@@ -1756,7 +1736,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             if dry_run:
                 print(f"[dry-run] Would resume failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
                 return 0
-            run_start_task = _create_resume_task(store, impl_task)
+            run_start_task = _matching_pending_resume_child(impl_task) or _create_resume_task(store, impl_task)
             assert run_start_task.id is not None
             print(f"Resuming failed implementation {impl_task.id} as {run_start_task.id}...")
             impl_task, rc = _run_task_with_resume(run_start_task, initial_resume=True)
@@ -1765,20 +1745,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             if dry_run:
                 print(f"[dry-run] Would retry failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
                 return 0
-            run_start_task = store.add(
-                prompt=impl_task.prompt,
-                task_type=impl_task.task_type,
-                tags=impl_task.tags,
-                spec=impl_task.spec,
-                depends_on=impl_task.depends_on,
-                create_review=impl_task.create_review,
-                same_branch=impl_task.same_branch,
-                task_type_hint=impl_task.task_type_hint,
-                based_on=impl_task.id,
-                model=impl_task.model,
-                provider=impl_task.provider if impl_task.provider_is_explicit else None,
-                provider_is_explicit=impl_task.provider_is_explicit,
-            )
+            run_start_task = _create_retry_task(store, impl_task)
             assert run_start_task.id is not None
             print(f"Retrying failed implementation {impl_task.id} as {run_start_task.id}...")
             impl_task, rc = _run_task_with_resume(run_start_task)

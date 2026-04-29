@@ -64,7 +64,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("learnings_max_items", "int", 50, "Max number of items retained in `.gza/learnings.md`."),
     ConfigKeySpec("learnings_window", "int", 25, "Window size used when regenerating learnings."),
     ConfigKeySpec("log_dir", "str", ".gza/logs", "Directory for task and worker logs."),
-    ConfigKeySpec("max_resume_attempts", "int", 1, "Retry cap for resume-based lifecycle automation."),
+    ConfigKeySpec(
+        "max_resume_attempts",
+        "int",
+        1,
+        "Retry cap for resume-based lifecycle automation, including watch auto-resume and --restart-failed recovery decisions.",
+    ),
     ConfigKeySpec("max_review_cycles", "int", 3, "Cap for review/improve loops in lifecycle automation."),
     ConfigKeySpec("max_steps", "int", 50, "Global default step budget."),
     ConfigKeySpec("max_turns", "int", 50, "Deprecated global alias for `max_steps`."),
@@ -111,6 +116,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("watch.max_idle", "int | null", None, "Idle timeout seconds for `gza watch` loop exit."),
     ConfigKeySpec("watch.max_iterations", "int", 10, "Default review/improve loop cap in `gza watch`."),
     ConfigKeySpec("watch.poll", "int", 300, "Polling interval seconds for `gza watch`."),
+    ConfigKeySpec(
+        "watch.restart_failed_batch",
+        "int",
+        1,
+        "Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active.",
+    ),
     ConfigKeySpec("work_count", "int", 1, "Default task count for each `gza work` run."),
     ConfigKeySpec("worktree_dir", "str", "/tmp/gza-worktrees", "Base directory for git worktrees."),
 )
