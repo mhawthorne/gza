@@ -953,7 +953,7 @@ gza merge <task_id> [task_id...] [options]
 
 ### unmerged
 
-List tasks with branches that haven't been merged to main.
+List tasks with branches that have not been merged to the default branch.
 
 ```bash
 gza unmerged [options]
@@ -961,8 +961,16 @@ gza unmerged [options]
 
 | Option | Description |
 |--------|-------------|
-| `--commits-only` | Use commit-based detection (git cherry) instead of diff-based |
-| `--all` | Include failed tasks and check git directly for commits |
+| `--commits-only` | Backwards-compatible no-op retained in the CLI surface |
+| `--all` | Backwards-compatible no-op retained in the CLI surface |
+| `-n N` | Show last N unmerged tasks (default: 5, `0` for all) |
+| `--update` | Reconcile cached unmerged state against live git before listing; this is the opt-in mutating path that backfills `merge_status`, marks merged tasks, and refreshes diff stats relative to the default branch |
+| `--into-current` | Compare against the current branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
+| `--target BRANCH` | Compare against the specified branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
+
+By default, `gza unmerged` is read-only. It opens the task store in query-only mode, reads the canonical database view of completed tasks with `merge_status='unmerged'`, and suppresses stale rows that are already merged in git at read time. It does not backfill or persist `merge_status` unless you pass `--update`.
+
+`--update` only persists reconciliation when you are using the default-branch view. With `--into-current` or `--target`, `gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged.
 
 For each unmerged implementation, output includes:
 - Branch diff/commit summary.

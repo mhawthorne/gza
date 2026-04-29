@@ -495,12 +495,12 @@ def main() -> int:
     unmerged_parser.add_argument(
         "--commits-only",
         action="store_true",
-        help="Use commit-based detection (git cherry) instead of diff-based detection",
+        help="Retained compatibility no-op; has no effect on unmerged output",
     )
     unmerged_parser.add_argument(
         "--all",
         action="store_true",
-        help="Include failed tasks and check git directly for commits instead of trusting has_commits",
+        help="Retained compatibility no-op; has no effect on unmerged output",
     )
     unmerged_parser.add_argument(
         "-n",
@@ -513,7 +513,7 @@ def main() -> int:
     unmerged_parser.add_argument(
         "--update",
         action="store_true",
-        help="Reconcile unmerged tasks against live git state before listing",
+        help="Refresh default-branch unmerged state from live git before listing and persist reconciled merge status and diff stats",
     )
     target_group = unmerged_parser.add_mutually_exclusive_group()
     target_group.add_argument(
