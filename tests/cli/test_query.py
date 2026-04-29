@@ -3052,8 +3052,8 @@ class TestStatusCommand:
         assert "Tree child" in result.stdout
         assert "└──" in result.stdout or "├──" in result.stdout
 
-    def test_status_json_view_outputs_json_rows(self, tmp_path: Path):
-        """group --view json should render query JSON rows."""
+    def test_group_json_view_returns_pure_json_without_warning_prefix(self, tmp_path: Path):
+        """group --view json should emit pure JSON on stdout."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
         store.add("Json task", group="release")
@@ -3061,13 +3061,47 @@ class TestStatusCommand:
         result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'." in result.stdout
-        json_start = result.stdout.find("[")
-        assert json_start >= 0
-        payload = json.loads(result.stdout[json_start:])
+        assert "Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'." not in result.stdout
+        assert "Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'." in result.stderr
+        payload = json.loads(result.stdout)
         assert len(payload) == 1
         assert payload[0]["prompt"] == "Json task"
         assert payload[0]["group"] == "release"
+
+    def test_group_json_view_empty_results_returns_empty_array(self, tmp_path: Path):
+        """group --view json should return [] for empty slices."""
+        setup_config(tmp_path)
+
+        result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == "[]"
+        assert "No tasks found in group" not in result.stdout
+
+    def test_group_json_view_preserves_bracketed_prompt_text(self, tmp_path: Path):
+        """group --view json should preserve bracketed prompt text exactly."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("[release] prompt", group="release")
+
+        result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload[0]["prompt"] == "[release] prompt"
+
+    def test_group_lineage_view_surfaces_matching_descendant_when_owner_is_untagged(self, tmp_path: Path):
+        """group --view lineage should include tagged descendants even if owner lacks the tag."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        root = store.add("Untagged root owner")
+        assert root.id is not None
+        store.add("Tagged descendant", group="release", based_on=root.id, same_branch=True)
+
+        result = run_gza("group", "release", "--view", "lineage", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Tagged descendant" in result.stdout
 
 
 class TestRenameGroupCommand:

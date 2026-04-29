@@ -1237,8 +1237,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
     service = _TaskQueryService(store)
-
-    print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.")
     try:
         groups = validate_cli_tag_values((args.group,))
     except ValueError as exc:
@@ -1251,8 +1249,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         Literal["flat", "grouped", "lineage", "tree", "json"],
         raw_view if raw_view in {"flat", "grouped", "lineage", "tree", "json"} else "flat",
     )
+    if view_mode == "json":
+        print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.", file=sys.stderr)
+    else:
+        print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.")
     query_scope: Literal["tasks", "lineages"] = "lineages" if view_mode in {"lineage", "tree"} else "tasks"
-    presentation_mode = cast(_PresentationMode, "flat" if view_mode == "lineage" else view_mode)
+    presentation_mode = cast(_PresentationMode, "tree" if view_mode == "lineage" else view_mode)
 
     query = _TaskQuery(
         scope=query_scope,
@@ -1265,7 +1267,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     result = service.run(query)
 
     if not result.rows:
-        print(f"No tasks found in group '{group_name}'")
+        if view_mode == "json":
+            print("[]")
+        else:
+            print(f"No tasks found in group '{group_name}'")
         return 0
 
     if view_mode != "json":
@@ -1274,7 +1279,10 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     rendered = result.render()
     if rendered:
-        console.print(rendered)
+        if view_mode == "json":
+            print(rendered)
+        else:
+            console.print(rendered)
 
     if view_mode != "json":
         # Preserve orphaned-task warning behavior for this tag slice.
