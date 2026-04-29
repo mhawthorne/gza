@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 
 from gza.cli._common import (
+    _build_failure_diagnostics,
     _extract_last_agent_message_for_failure,
     _looks_like_task_id,
     format_stats,
@@ -195,6 +196,30 @@ class TestRunWithResume:
         assert rc == 1
         assert final_task.status == "failed"
         assert len(store.get_all()) == 3  # original + 2 resume children
+
+
+def test_build_failure_diagnostics_extracts_interrupt_source(tmp_path):
+    """Structured interrupt log entries should surface a termination source."""
+    log_path = tmp_path / "task.log"
+    log_path.write_text(
+        '{"type":"gza","subtype":"interrupt","message":"Task interrupted by signal",'
+        '"failure_reason":"TERMINATED","signal":"SIGTERM",'
+        '"source":"watch_reconcile_no_activity",'
+        '"detail":"watch reconciliation detected no recent task log activity"}\n'
+    )
+
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Interrupted task")
+    task.status = "failed"
+    task.failure_reason = "TERMINATED"
+    store.update(task)
+
+    diagnostics = _build_failure_diagnostics(task, log_path, verify_command=None)
+
+    assert diagnostics.reason == "TERMINATED"
+    assert diagnostics.interrupt_source == (
+        "watch_reconcile_no_activity (watch reconciliation detected no recent task log activity)"
+    )
 
     def test_does_not_resume_on_test_failure(self, tmp_path):
         (tmp_path / "gza.yaml").write_text("project_name: test-project\n")

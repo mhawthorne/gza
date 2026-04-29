@@ -63,6 +63,42 @@ def _stdout_is_tty() -> bool:
     return sys.stdout.isatty()
 
 
+def _default_interrupt_source(signum: int) -> str:
+    """Return a stable source label when no explicit interrupt attribution exists."""
+    if signum == signal.SIGTERM:
+        return "external_sigterm_unknown"
+    if signum == signal.SIGINT:
+        return "external_sigint_unknown"
+    try:
+        signal_name = signal.Signals(signum).name.lower()
+    except ValueError:
+        signal_name = f"signal_{signum}"
+    return f"external_{signal_name}"
+
+
+def _set_interrupt_env_from_signal(
+    *,
+    registry: WorkerRegistry,
+    pid: int,
+    signum: int,
+) -> None:
+    """Populate interrupt env vars from an explicit request marker when available."""
+    try:
+        os.environ["GZA_INTERRUPT_SIGNAL"] = signal.Signals(signum).name
+    except ValueError:
+        os.environ["GZA_INTERRUPT_SIGNAL"] = str(signum)
+
+    request = registry.consume_interrupt_request(pid)
+    source = request.get("source") if request else None
+    detail = request.get("detail") if request else None
+
+    os.environ["GZA_INTERRUPT_SOURCE"] = source or _default_interrupt_source(signum)
+    if detail:
+        os.environ["GZA_INTERRUPT_DETAIL"] = detail
+    else:
+        os.environ.pop("GZA_INTERRUPT_DETAIL", None)
+
+
 def get_store(config: Config, *, open_mode: StoreOpenMode = "readwrite") -> SqliteTaskStore:
     """Get the SQLite task store.
 
@@ -301,6 +337,14 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                 # cannot later overwrite the outcome.
                 if task.running_pid is not None and task.running_pid > 0:
                     try:
+                        registry = WorkerRegistry(config.workers_path)
+                        registry.record_interrupt_request(
+                            task.running_pid,
+                            signal_name="SIGTERM",
+                            source="watch_reconcile_no_activity",
+                            task_id=str(task.id) if task.id is not None else None,
+                            detail="watch reconciliation detected no recent task log activity",
+                        )
                         os.kill(task.running_pid, signal.SIGTERM)
                     except OSError:
                         pass
@@ -482,16 +526,15 @@ def _run_foreground(
     original_sigint = signal.getsignal(signal.SIGINT)
     original_sigterm = signal.getsignal(signal.SIGTERM)
     previous_interrupt_signal = os.environ.get("GZA_INTERRUPT_SIGNAL")
+    previous_interrupt_source = os.environ.get("GZA_INTERRUPT_SOURCE")
+    previous_interrupt_detail = os.environ.get("GZA_INTERRUPT_DETAIL")
 
     def _cleanup(signum, frame):
         del frame
         # Restore original handlers and re-raise so the except block handles cleanup
         signal.signal(signal.SIGINT, original_sigint)
         signal.signal(signal.SIGTERM, original_sigterm)
-        try:
-            os.environ["GZA_INTERRUPT_SIGNAL"] = signal.Signals(signum).name
-        except ValueError:
-            os.environ["GZA_INTERRUPT_SIGNAL"] = str(signum)
+        _set_interrupt_env_from_signal(registry=registry, pid=os.getpid(), signum=signum)
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, _cleanup)
@@ -533,6 +576,14 @@ def _run_foreground(
             os.environ.pop("GZA_INTERRUPT_SIGNAL", None)
         else:
             os.environ["GZA_INTERRUPT_SIGNAL"] = previous_interrupt_signal
+        if previous_interrupt_source is None:
+            os.environ.pop("GZA_INTERRUPT_SOURCE", None)
+        else:
+            os.environ["GZA_INTERRUPT_SOURCE"] = previous_interrupt_source
+        if previous_interrupt_detail is None:
+            os.environ.pop("GZA_INTERRUPT_DETAIL", None)
+        else:
+            os.environ["GZA_INTERRUPT_DETAIL"] = previous_interrupt_detail
 
 
 def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: str | None = None, quiet: bool = False) -> int:
@@ -1918,21 +1969,45 @@ class FailureDiagnostics:
     reason: str
     marker_reason: str | None
     summary: str
+    interrupt_source: str | None
     explanation: str | None
     verify_context: str | None
     result_context: str | None
+
+
+def _extract_interrupt_source(log_path: Path) -> str | None:
+    """Extract the latest structured interrupt source label from the task log."""
+    from .log import _load_log_file_entries
+
+    try:
+        entries = _load_log_file_entries(log_path)[1]
+    except OSError:
+        return None
+
+    for entry in reversed(entries):
+        if entry.get("type") != "gza" or entry.get("subtype") != "interrupt":
+            continue
+        source = entry.get("source")
+        if isinstance(source, str) and source:
+            detail = entry.get("detail")
+            if isinstance(detail, str) and detail:
+                return f"{source} ({detail})"
+            return source
+    return None
 
 
 def _build_failure_diagnostics(task: DbTask, log_path: Path | None, verify_command: str | None) -> FailureDiagnostics:
     """Build canonical failure diagnostics for CLI rendering."""
     reason = task.failure_reason or "UNKNOWN"
     marker_reason: str | None = None
+    interrupt_source: str | None = None
     explanation: str | None = None
     verify_context: str | None = None
     result_context: str | None = None
 
     if log_path and log_path.exists():
         marker_reason = _extract_agent_failure_marker_reason(log_path)
+        interrupt_source = _extract_interrupt_source(log_path)
         explanation = _extract_last_agent_message_for_failure(log_path)
         verify_context, result_context = _extract_failure_log_context(log_path, verify_command)
 
@@ -1940,6 +2015,7 @@ def _build_failure_diagnostics(task: DbTask, log_path: Path | None, verify_comma
         reason=reason,
         marker_reason=marker_reason,
         summary=_failure_summary(reason),
+        interrupt_source=interrupt_source,
         explanation=explanation,
         verify_context=verify_context,
         result_context=result_context,
@@ -1972,6 +2048,12 @@ def _render_failure_diagnostics(
         f"[{value_color}]{diagnostics.summary}[/{value_color}]",
         soft_wrap=soft_wrap,
     )
+    if diagnostics.interrupt_source:
+        console.print(
+            f"[{label_color}]Termination Source:[/{label_color}] "
+            f"[{value_color}]{rich_escape(diagnostics.interrupt_source)}[/{value_color}]",
+            soft_wrap=soft_wrap,
+        )
 
     if include_explanation:
         console.print(f"[{label_color}]Agent Explanation:[/{label_color}]", soft_wrap=soft_wrap)

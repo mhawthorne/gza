@@ -244,6 +244,28 @@ def test_registry_is_running(temp_workers_dir):
     assert not registry.is_running("w-test-fake")
 
 
+def test_registry_record_and_consume_interrupt_request(temp_workers_dir):
+    """Interrupt attribution should round-trip once and then be removed."""
+    registry = WorkerRegistry(temp_workers_dir)
+
+    registry.record_interrupt_request(
+        12345,
+        signal_name="SIGTERM",
+        source="watch_reconcile_no_activity",
+        task_id="gza-1",
+        detail="watch reconciliation detected no recent task log activity",
+    )
+
+    consumed = registry.consume_interrupt_request(12345)
+    assert consumed is not None
+    assert consumed["signal"] == "SIGTERM"
+    assert consumed["source"] == "watch_reconcile_no_activity"
+    assert consumed["task_id"] == "gza-1"
+    assert "requested_at" in consumed
+
+    assert registry.consume_interrupt_request(12345) is None
+
+
 def test_registry_mark_completed(temp_workers_dir):
     """Test marking a worker as completed."""
     registry = WorkerRegistry(temp_workers_dir)

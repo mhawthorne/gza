@@ -2184,6 +2184,10 @@ class TestReconciliation:
         assert refreshed.failure_reason == "NO_ACTIVITY"
         # kill called once for the signal check (os.kill(pid, 0)) and once to SIGTERM
         assert mock_kill.call_count >= 1
+        request = WorkerRegistry(config.workers_path).consume_interrupt_request(os.getpid())
+        assert request is not None
+        assert request["signal"] == "SIGTERM"
+        assert request["source"] == "watch_reconcile_no_activity"
 
     def test_reconciliation_skips_recent_live_task(self, tmp_path: Path):
         """A live task under the threshold should NOT be marked NO_ACTIVITY."""

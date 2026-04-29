@@ -2758,6 +2758,41 @@ class TestShowCommand:
         assert f"gza retry {task.id}" in result.stdout
         assert "Run Context: background (w-20260227-000001)" in result.stdout
 
+    def test_show_failed_task_renders_termination_source(self, tmp_path: Path):
+        """Failed-task diagnostics should include structured termination source metadata."""
+        import json
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Interrupted task")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "TERMINATED"
+        task.log_file = ".gza/logs/interrupted.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            {
+                "type": "gza",
+                "subtype": "interrupt",
+                "message": "Task interrupted by signal",
+                "failure_reason": "TERMINATED",
+                "signal": "SIGTERM",
+                "source": "watch_reconcile_no_activity",
+                "detail": "watch reconciliation detected no recent task log activity",
+            }
+        ]
+        (log_dir / "interrupted.log").write_text("\n".join(json.dumps(line) for line in lines))
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Failure Reason: TERMINATED" in result.stdout
+        assert "Termination Source:" in result.stdout
+        assert "watch_reconcile_no_activity" in result.stdout
+
     def test_show_failed_task_extracts_verify_failure_from_tool_error_entries(self, tmp_path: Path):
         """Failed-task diagnostics should detect verify failures in non-Claude tool_* entry shapes."""
         import json
@@ -3477,7 +3512,7 @@ class TestStatusCommand:
 
         assert result.returncode == 2
         assert "invalid choice: 'grouped'" in result.stderr
-        assert "choose from 'flat', 'lineage', 'tree', 'json'" in result.stderr
+        assert "choose from flat, lineage, tree, json" in result.stderr
 
 
 class TestRenameGroupCommand:
@@ -6814,6 +6849,10 @@ class TestKillCommand:
         assert refreshed is not None
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "KILLED"
+        request = registry.consume_interrupt_request(12345)
+        assert request is not None
+        assert request["signal"] == "SIGTERM"
+        assert request["source"] == "gza_kill"
 
     def test_kill_escalates_to_sigkill_when_process_survives_sigterm(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
