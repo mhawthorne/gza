@@ -4932,6 +4932,43 @@ class TestUnmergedReviewStatus:
         assert f"latest fix {fix_task.id}" in normalized
         assert "review: reviewed [✓ approved]" not in normalized
 
+    def test_unmerged_handles_mixed_naive_and_aware_review_timestamps(self, tmp_path: Path):
+        """Legacy naive review timestamps should not crash unmerged ordering or verdict selection."""
+        import sqlite3
+
+        store, task, git = setup_unmerged_env(tmp_path)
+
+        legacy_review = store.add("Legacy review", task_type="review")
+        legacy_review.status = "completed"
+        legacy_review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        legacy_review.depends_on = task.id
+        legacy_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(legacy_review)
+        assert legacy_review.id is not None
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "UPDATE tasks SET completed_at = ? WHERE id = ?",
+            ("2026-02-12T11:00:00", legacy_review.id),
+        )
+        conn.commit()
+        conn.close()
+
+        current_review = store.add("Current review", task_type="review")
+        current_review.status = "completed"
+        current_review.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        current_review.depends_on = task.id
+        current_review.output_content = "Verdict: APPROVED"
+        store.update(current_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        normalized = " ".join(result.stdout.split())
+        assert "review: reviewed [✓ approved]" in normalized
+        assert "⚠ changes requested" not in normalized
+
     def test_unmerged_uses_review_attached_to_same_branch_improve(self, tmp_path: Path):
         """A same-branch improve review should drive the branch review status."""
         store, task, git = setup_unmerged_env(tmp_path)

@@ -92,6 +92,15 @@ def _parse_cli_date(value: str | None) -> _dt.date | None:
     return parsed.date() if parsed else None
 
 
+def _normalize_task_timestamp(value: datetime | None) -> datetime:
+    """Normalize task timestamps for stable ordering across legacy/current rows."""
+    if value is None:
+        return datetime.min.replace(tzinfo=UTC)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def _reconcile_unmerged_tasks(store: SqliteTaskStore, git: Git, default_branch: str) -> tuple[int, int]:
     """Refresh merge truth and diff stats for tasks currently marked unmerged."""
     merged_count = 0
@@ -936,7 +945,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         """Stable recency key for choosing a branch representative task."""
         return (
             _task_id_numeric_key(task.id),
-            task.completed_at or task.created_at or datetime.min,
+            _normalize_task_timestamp(task.completed_at or task.created_at),
         )
 
     # Group tasks by branch
@@ -1037,7 +1046,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         if reviews:
             reviews.sort(
                 key=lambda review: (
-                    review.completed_at or datetime.min,
+                    _normalize_task_timestamp(review.completed_at),
                     _task_id_numeric_key(review.id if isinstance(review.id, str) else None),
                 ),
                 reverse=True,
@@ -1056,7 +1065,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         latest_review = next((r for r in reviews if r.status == "completed"), None)
         latest_code_change = max(
             (task for task in same_branch_code_changing_tasks if task.completed_at is not None),
-            key=lambda task: task.completed_at or datetime.min,
+            key=lambda task: _normalize_task_timestamp(task.completed_at),
             default=None,
         )
 
@@ -1069,14 +1078,16 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         if latest_review:
             latest_review_completed = latest_review.completed_at
             assert latest_review_completed is not None
+            latest_review_completed = _normalize_task_timestamp(latest_review_completed)
 
             review_cleared_stale = bool(
-                effective_review_cleared_at and effective_review_cleared_at >= latest_review_completed
+                effective_review_cleared_at
+                and _normalize_task_timestamp(effective_review_cleared_at) >= latest_review_completed
             )
             latest_code_change_stale = bool(
                 latest_code_change
                 and latest_code_change.completed_at
-                and latest_code_change.completed_at > latest_review_completed
+                and _normalize_task_timestamp(latest_code_change.completed_at) > latest_review_completed
             )
             review_is_stale = review_cleared_stale or latest_code_change_stale
 
@@ -1105,7 +1116,11 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 for review in reviews:
                     if review.status != "completed" or review.completed_at is None:
                         continue
-                    if effective_review_cleared_at and effective_review_cleared_at >= review.completed_at:
+                    if (
+                        effective_review_cleared_at
+                        and _normalize_task_timestamp(effective_review_cleared_at)
+                        >= _normalize_task_timestamp(review.completed_at)
+                    ):
                         continue
                     verdict = get_review_verdict(config, review)
                     if verdict:

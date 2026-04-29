@@ -1408,6 +1408,28 @@ class TestGetReviewsForTask:
         assert reviews[0].id == completed_review.id
         assert reviews[1].id == incomplete_review.id
 
+    def test_get_hydrates_legacy_naive_timestamps_as_utc_aware(self, tmp_path: Path):
+        """Legacy rows without an offset should load as UTC-aware datetimes."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Legacy timestamp task")
+        assert task.id is not None
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "UPDATE tasks SET created_at = ?, completed_at = ? WHERE id = ?",
+            ("2026-01-01T10:00:00", "2026-01-01T11:00:00", task.id),
+        )
+        conn.commit()
+        conn.close()
+
+        reloaded = store.get(task.id)
+
+        assert reloaded is not None
+        assert reloaded.created_at == datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+        assert reloaded.completed_at == datetime(2026, 1, 1, 11, 0, 0, tzinfo=UTC)
+
     def test_get_reviews_for_task_returns_empty_when_no_reviews(self, tmp_path: Path):
         """Test that an empty list is returned when no reviews exist."""
         db_path = tmp_path / "test.db"
