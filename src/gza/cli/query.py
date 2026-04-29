@@ -85,7 +85,7 @@ from ._common import (
 
 _LINEAGE_REL_LABELS = _QUERY_LINEAGE_REL_LABELS
 _QueryDateField = Literal["created", "completed", "effective"]
-_PresentationMode = Literal["flat", "grouped", "tree", "one_line", "json"]
+_PresentationMode = Literal["flat", "grouped", "lineage", "tree", "one_line", "json"]
 _stderr_console = Console(highlight=False, stderr=True)
 
 
@@ -1256,7 +1256,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.")
     query_scope: Literal["tasks", "lineages"] = "lineages" if view_mode in {"lineage", "tree"} else "tasks"
-    presentation_mode = cast(_PresentationMode, "tree" if view_mode == "lineage" else view_mode)
+    presentation_mode = cast(_PresentationMode, view_mode)
 
     query = _TaskQuery(
         scope=query_scope,

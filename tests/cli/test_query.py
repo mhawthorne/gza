@@ -3135,6 +3135,41 @@ class TestStatusCommand:
         assert result.returncode == 0
         assert "Tagged descendant" in result.stdout
 
+    def test_group_lineage_view_uses_first_class_lineage_presentation_mode(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """group --view lineage should pass lineage mode directly to shared query/presenter layers."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Tagged release task", group="release")
+
+        from gza.cli import query as query_module
+
+        captured_mode: dict[str, str] = {}
+        real_service = query_module._TaskQueryService(store)
+
+        class RecordingQueryService:
+            def __init__(self, _store):
+                self._store = _store
+
+            def run(self, query):
+                captured_mode["value"] = query.presentation.mode
+                return real_service.run(query)
+
+        monkeypatch.setattr(query_module, "_TaskQueryService", RecordingQueryService)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            group="release",
+            view="lineage",
+        )
+        rc = query_module.cmd_status(args)
+
+        assert rc == 0
+        assert captured_mode["value"] == "lineage"
+
     def test_group_grouped_view_is_rejected(self, tmp_path: Path):
         """group --view grouped should be rejected until grouped presentation exists."""
         setup_config(tmp_path)

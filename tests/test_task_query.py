@@ -10,6 +10,7 @@ from gza.db import SqliteTaskStore
 from gza.query import TaskLineageNode
 from gza.task_query import (
     DateFilter,
+    PresentationSpec,
     ProjectionSpec,
     TaskProjectionPreset,
     TaskQuery,
@@ -357,6 +358,28 @@ def test_lineage_scope_group_filter_prunes_tree_to_matching_members_and_ancestor
     assert "Shared root owner" in tree_prompts
     assert "Release child" in tree_prompts
     assert "Backlog sibling" not in tree_prompts
+
+
+def test_lineage_presentation_mode_renders_tree_layout(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    root = store.add("Lineage root owner", task_type="implement")
+    assert root.id is not None
+    store.add("Tagged release child", task_type="implement", group="release", based_on=root.id, same_branch=True)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="lineages",
+            groups=("release",),
+            limit=None,
+            presentation=PresentationSpec(mode="lineage"),
+        )
+    )
+
+    rendered = result.render()
+    assert "Lineage root owner" in rendered
+    assert "Tagged release child" in rendered
+    assert "└──" in rendered or "├──" in rendered
 
 
 def test_default_projection_includes_group_field(tmp_path: Path) -> None:

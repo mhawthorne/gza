@@ -10,7 +10,7 @@ from gza.console import shorten_prompt
 from gza.query import TaskLineageNode
 from gza.task_query import LineageRow, TaskQueryResult, TaskRow
 
-PresentationMode = Literal["flat", "grouped", "tree", "one_line", "json"]
+PresentationMode = Literal["flat", "grouped", "lineage", "tree", "one_line", "json"]
 
 
 def render_query_result(result: TaskQueryResult, mode: PresentationMode) -> str:
@@ -21,7 +21,7 @@ def render_query_result(result: TaskQueryResult, mode: PresentationMode) -> str:
     if mode == "one_line":
         return _render_one_line(result)
 
-    if mode == "tree":
+    if mode in {"tree", "lineage"}:
         return _render_tree(result)
 
     if mode == "grouped":
