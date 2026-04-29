@@ -2,8 +2,9 @@
 
 import json
 import os
-import subprocess
 import sqlite3
+import stat
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -4981,12 +4982,12 @@ class TestSharedDbIsolationAndImportGating:
         assert reopened is not None
         fingerprint.assert_called_once_with(local_db)
 
-    def test_marker_check_skips_fingerprint_when_local_db_metadata_changes(
+    def test_marker_check_verifies_fingerprint_when_local_db_mtime_changes(
         self,
         tmp_path: Path,
     ) -> None:
         from gza import db as db_module
-        from gza.config import Config, ConfigError
+        from gza.config import Config
 
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -5008,20 +5009,99 @@ class TestSharedDbIsolationAndImportGating:
         result = import_legacy_local_db(config)
         assert result["status"] == "imported"
 
-        stat = local_db.stat()
-        os.utime(local_db, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        file_stat = local_db.stat()
+        os.utime(local_db, ns=(file_stat.st_atime_ns, file_stat.st_mtime_ns + 1_000_000_000))
 
         with patch("gza.db._db_fingerprint", wraps=db_module._db_fingerprint) as fingerprint:
-            with pytest.raises(ConfigError, match="Legacy local DB detected"):
-                SqliteTaskStore.from_config(config)
-        fingerprint.assert_not_called()
+            reopened = SqliteTaskStore.from_config(config)
+        assert reopened is not None
+        fingerprint.assert_called_once_with(local_db)
+
+    def test_marker_check_verifies_fingerprint_when_local_db_ctime_changes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza import db as db_module
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demomarkerctime01\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config)
+        assert result["status"] == "imported"
+
+        before = local_db.stat()
+        os.chmod(local_db, before.st_mode ^ stat.S_IXUSR)
+        after = local_db.stat()
+        if after.st_ctime_ns == before.st_ctime_ns:
+            pytest.skip("filesystem did not update ctime on chmod")
+
+        with patch("gza.db._db_fingerprint", wraps=db_module._db_fingerprint) as fingerprint:
+            reopened = SqliteTaskStore.from_config(config)
+        assert reopened is not None
+        fingerprint.assert_called_once_with(local_db)
+
+    def test_import_local_db_stays_idempotent_when_marker_metadata_drifts(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportmarker01\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_store.add("legacy task")
+
+        first = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert first.returncode == 0, first.stderr
+        assert "Imported legacy local DB into shared DB." in first.stdout
+
+        file_stat = local_db.stat()
+        os.utime(local_db, ns=(file_stat.st_atime_ns, file_stat.st_mtime_ns + 1_000_000_000))
+
+        second = subprocess.run(
+            ["uv", "run", "gza", "migrate", "--import-local-db", "--yes", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+        assert second.returncode == 0, second.stderr
+        assert "already imported" in second.stdout.lower()
 
     def test_marker_check_metadata_equality_still_requires_fingerprint_match(
         self,
         tmp_path: Path,
     ) -> None:
         from gza import db as db_module
-        from gza.config import Config
+        from gza.config import Config, ConfigError
 
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -5058,7 +5138,8 @@ class TestSharedDbIsolationAndImportGating:
             patch("gza.db._db_metadata", return_value=marker_metadata),
             patch("gza.db._db_fingerprint", wraps=db_module._db_fingerprint) as fingerprint,
         ):
-            assert db_module._marker_matches_shared_db(project_dir, local_db, shared_db) is False
+            with pytest.raises(ConfigError, match="Legacy local DB detected"):
+                SqliteTaskStore.from_config(config)
         fingerprint.assert_called_once_with(local_db)
 
     def test_import_local_db_dry_run_does_not_create_missing_shared_db(self, tmp_path: Path) -> None:

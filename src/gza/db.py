@@ -1673,7 +1673,8 @@ def _marker_matches_shared_db(project_dir: Path, local_db_path: Path, active_db_
             marker_mtime_ns,
             marker_ctime_ns,
         ):
-            return False
+            # Metadata drift alone is not authoritative; content hash decides.
+            pass
 
     try:
         local_fingerprint = _db_fingerprint(local_db_path)
