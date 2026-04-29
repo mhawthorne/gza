@@ -498,6 +498,42 @@ def _is_default_watch_auto_resumable(
     return store.count_resume_chain_depth(str(task.id)) < max_recovery_attempts
 
 
+@dataclass(frozen=True)
+class _DefaultWatchResumeSelection:
+    action: str
+    recovery_task_id: str | None = None
+
+
+def _select_default_watch_resume_action(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    max_recovery_attempts: int,
+) -> _DefaultWatchResumeSelection | None:
+    """Return the legacy plain-watch auto-resume action for a failed task.
+
+    Default watch preserves the narrow historical contract: only resumable
+    failures with preserved sessions are considered, an existing pending resume
+    child is reused, an in-progress resume child suppresses relaunch, and a new
+    resume child is created only when no such descendant already exists.
+    """
+    if not _is_default_watch_auto_resumable(
+        store,
+        task,
+        max_recovery_attempts=max_recovery_attempts,
+    ):
+        return None
+    assert task.id is not None
+    children = store.get_based_on_children_by_type(str(task.id), task.task_type or "")
+    for child in children:
+        if child.status == "in_progress":
+            return _DefaultWatchResumeSelection(action="wait_in_progress", recovery_task_id=str(child.id))
+    for child in children:
+        if child.status == "pending" and child.id is not None:
+            return _DefaultWatchResumeSelection(action="reuse_pending", recovery_task_id=str(child.id))
+    return _DefaultWatchResumeSelection(action="create_new")
+
+
 def _run_cycle(
     *,
     config: Config,
@@ -817,25 +853,29 @@ def _run_cycle(
         for failed in failed_tasks:
             if failed.id is None:
                 continue
-            if _is_default_watch_auto_resumable(
+            selection = _select_default_watch_resume_action(
                 store,
                 failed,
                 max_recovery_attempts=max_recovery_attempts,
-            ):
-                actionable_failed.append(
-                    (
-                        failed,
-                        FailedRecoveryDecision(
-                            task_id=str(failed.id),
-                            action="resume",
-                            reason_code=failed.failure_reason or "UNKNOWN",
-                            reason_text="default watch auto-resume",
-                            launch_mode="worker",
-                            attempt_index=store.count_resume_chain_depth(str(failed.id)) + 1,
-                            attempt_limit=max_recovery_attempts,
-                        ),
-                    )
+            )
+            if selection is None or selection.action == "wait_in_progress":
+                continue
+            actionable_failed.append(
+                (
+                    failed,
+                    FailedRecoveryDecision(
+                        task_id=str(failed.id),
+                        action="resume",
+                        reason_code=failed.failure_reason or "UNKNOWN",
+                        reason_text="default watch auto-resume",
+                        launch_mode="worker",
+                        attempt_index=store.count_resume_chain_depth(str(failed.id)) + 1,
+                        attempt_limit=max_recovery_attempts,
+                        recovery_task_id=selection.recovery_task_id,
+                        reuse_existing=selection.action == "reuse_pending",
+                    ),
                 )
+            )
 
     recovery_slots = max(0, min(slots, restart_failed_batch if restart_failed else slots))
     started_recovery_task_ids: set[str] = set()
@@ -853,9 +893,15 @@ def _run_cycle(
                 work_done = True
                 launched_recovery_count += 1
                 continue
-            recovered_task = _create_resume_task(store, failed)
-            assert recovered_task.id is not None
-            recovered_task_id = str(recovered_task.id)
+            if decision.reuse_existing:
+                assert decision.recovery_task_id is not None
+                recovered_task_id = decision.recovery_task_id
+                recovered_task = store.get(recovered_task_id)
+                assert recovered_task is not None
+            else:
+                recovered_task = _create_resume_task(store, failed)
+                assert recovered_task.id is not None
+                recovered_task_id = str(recovered_task.id)
             rc = _spawn_worker_with_failure_log(
                 quiet=quiet,
                 log=log,
@@ -904,8 +950,8 @@ def _run_cycle(
                 assert recovered_task.id is not None
                 recovered_task_id = str(recovered_task.id)
             pending_recovery_task_ids.add(recovered_task_id)
-            rc = (
-                _spawn_worker_with_failure_log(
+            if decision.launch_mode == "worker":
+                rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
                     log=log,
                     failure_message=f"{failed.id} -> {recovered_task_id}: resume worker spawn failed",
@@ -917,8 +963,10 @@ def _run_cycle(
                         quiet=quiet,
                     ),
                 )
-                if decision.launch_mode == "worker"
-                else _spawn_worker_with_failure_log(
+            else:
+                assert recovered_task is not None
+                iterate_task = recovered_task
+                rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
                     log=log,
                     failure_message=f"{failed.id} -> {recovered_task_id}: iterate worker spawn failed",
@@ -926,10 +974,9 @@ def _run_cycle(
                     spawn_fn=lambda: _spawn_background_iterate(
                         argparse.Namespace(max_iterations=max_iterations, no_docker=False, resume=True, retry=False),
                         config,
-                        recovered_task,
+                        iterate_task,
                     ),
                 )
-            )
         else:
             if dry_run:
                 destination = decision.recovery_task_id or "(new task)"

@@ -268,6 +268,154 @@ def test_watch_cycle_default_mode_auto_resumes_resumable_failed_task(
     assert f"RECOVR {failed.id}" not in log_text
 
 
+def test_watch_cycle_default_mode_reuses_existing_pending_resume_child(tmp_path: Path) -> None:
+    """Plain watch should reuse an existing pending resume child instead of creating a sibling."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    resume_child = store.add("Pending resume child", task_type="implement", based_on=failed.id)
+    assert resume_child.id is not None
+    resume_child.status = "pending"
+    resume_child.session_id = failed.session_id
+    store.update(resume_child)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    children = store.get_based_on_children(failed.id)
+    assert result.work_done is True
+    assert spawn_resume.call_count == 1
+    assert spawn_resume.call_args.args[2] == resume_child.id
+    assert len(children) == 1
+    assert children[0].id == resume_child.id
+
+
+def test_watch_cycle_default_mode_suppresses_existing_in_progress_resume_child(tmp_path: Path) -> None:
+    """Plain watch should not create or launch another resume child while one is already running."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    resume_child = store.add("Running resume child", task_type="implement", based_on=failed.id)
+    assert resume_child.id is not None
+    resume_child.status = "in_progress"
+    resume_child.session_id = failed.session_id
+    store.update(resume_child)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    children = store.get_based_on_children(failed.id)
+    assert result.work_done is False
+    assert spawn_resume.call_count == 0
+    assert len(children) == 1
+    assert children[0].id == resume_child.id
+
+
+def test_watch_cycle_default_mode_spawn_failure_reuses_pending_resume_child_next_cycle(tmp_path: Path) -> None:
+    """Plain watch should retry the same pending resume child after spawn failure, not create duplicates."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Blocked dependency", task_type="plan")
+    assert dependency.id is not None
+    dependency.status = "in_progress"
+    store.update(dependency)
+
+    failed = store.add("Failed implement", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=1) as spawn_resume,
+    ):
+        result_first = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        result_second = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    children = store.get_based_on_children(failed.id)
+    pending_children = [child for child in children if child.status == "pending"]
+    assert result_first.work_done is False
+    assert result_second.work_done is False
+    assert spawn_resume.call_count == 2
+    assert spawn_resume.call_args_list[0].args[2] == spawn_resume.call_args_list[1].args[2]
+    assert len(children) == 1
+    assert len(pending_children) == 1
+
+
 def test_watch_cycle_default_mode_attempt_cap_skips_failed_resume_and_starts_pending(tmp_path: Path) -> None:
     """Plain watch should leave capped failed chains alone and move on to pending work."""
     (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
