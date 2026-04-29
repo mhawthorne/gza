@@ -25,6 +25,7 @@ from ..db import (
 )
 from ..extractions import (
     ExtractionError,
+    infer_selected_paths,
     normalize_selected_paths,
     plan_extraction,
     read_paths_file,
@@ -437,10 +438,6 @@ def cmd_extract(args: argparse.Namespace) -> int:
                 selected_raw.insert(0, source_task_id_raw)
                 source_task_id_raw = None
 
-    if bool(source_task_id_raw) == bool(source_branch):
-        print("Error: Specify exactly one source selector: SOURCE task ID or --branch")
-        return 1
-
     files_from = getattr(args, "files_from", None)
     if files_from:
         try:
@@ -452,33 +449,46 @@ def cmd_extract(args: argparse.Namespace) -> int:
             print(f"Error: {exc}")
             return 1
 
-    if not selected_raw:
-        print("Error: Select at least one file via PATH arguments or --files-from")
-        return 1
-
-    try:
-        selected_paths = normalize_selected_paths(selected_raw)
-    except ExtractionError as exc:
-        print(f"Error: {exc}")
-        return 1
-
     try:
         tags = _selected_tags_for_new_task(args)
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
 
+    git = Git(config.project_dir)
+    if store is None:
+        store = get_store(config)
+
     source_task_id: str | None = None
     if source_task_id_raw:
         try:
             source_task_id = resolve_id(config, source_task_id_raw)
         except InvalidTaskIdError as exc:
-            print(f"Error: {exc}")
+            if source_branch:
+                print(f"Error: {exc}")
+                return 1
+            selected_raw.insert(0, source_task_id_raw)
+            source_task_id_raw = None
+        else:
+            if store.get(source_task_id) is None:
+                if source_branch:
+                    print(f"Error: Task {source_task_id} not found")
+                    return 1
+                selected_raw.insert(0, source_task_id_raw)
+                source_task_id = None
+                source_task_id_raw = None
+
+    if not source_task_id and not source_branch:
+        try:
+            source_branch = git.current_branch()
+        except Exception as exc:
+            print(f"Error: failed to determine current branch for extract: {exc}")
             return 1
 
-    if store is None:
-        store = get_store(config)
-    git = Git(config.project_dir)
+    if bool(source_task_id) == bool(source_branch):
+        print("Error: Specify exactly one source selector: SOURCE task ID or --branch")
+        return 1
+
     try:
         source = resolve_source_selection(
             store,
@@ -487,6 +497,10 @@ def cmd_extract(args: argparse.Namespace) -> int:
             source_branch=source_branch,
             base_branch_override=getattr(args, "base_branch", None),
         )
+        if selected_raw:
+            selected_paths = normalize_selected_paths(selected_raw)
+        else:
+            selected_paths = infer_selected_paths(git, source)
         draft = plan_extraction(
             git,
             source,

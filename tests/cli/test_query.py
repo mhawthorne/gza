@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from rich.console import Console
 
 from .conftest import (
     make_store,
@@ -3445,6 +3446,30 @@ class TestStatusCommand:
         store = make_store(tmp_path)
         orphaned = store.add("[release] orphaned prompt", group="release")
         mark_orphaned(store, orphaned)
+
+        result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload
+        assert payload[0]["prompt"] == "[release] orphaned prompt"
+        assert f"({orphaned.id}) [release] orphaned prompt" in result.stderr
+
+    def test_group_json_view_orphaned_warning_preserves_bracketed_prompt_text_on_color_stderr(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """group --view json should preserve bracketed prompt text even with ANSI-colored stderr."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        orphaned = store.add("[release] orphaned prompt", group="release")
+        mark_orphaned(store, orphaned)
+
+        monkeypatch.setattr(
+            "gza.cli.query._stderr_console",
+            Console(highlight=False, stderr=True, force_terminal=True, color_system="standard"),
+        )
 
         result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
 

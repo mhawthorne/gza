@@ -1292,6 +1292,7 @@ gza implement <plan_task_id> [prompt] [options]
 Create a new implementation task from a selected subset of file changes on a source task branch or explicit branch.
 
 ```bash
+gza extract [PATH ...] [options]
 gza extract SOURCE [PATH ...] [options]
 gza extract --branch BRANCH [PATH ...] [options]
 gza extract SOURCE --files-from FILE [options]
@@ -1299,9 +1300,9 @@ gza extract SOURCE --files-from FILE [options]
 
 | Option | Description |
 |--------|-------------|
-| `SOURCE` | Full prefixed completed/failed code task ID to extract from (alternative to `--branch`) |
-| `PATH ...` | Repo-relative selected files to extract |
-| `--branch BRANCH` | Source branch to extract from (alternative to `SOURCE`) |
+| `SOURCE` | Full prefixed completed/failed code task ID to extract from; omit to use the current branch |
+| `PATH ...` | Repo-relative selected files to extract; omit to extract all changed files from the source diff |
+| `--branch BRANCH` | Source branch to extract from (alternative to `SOURCE`; defaults to current branch when omitted) |
 | `--files-from FILE` | Read newline-delimited selected files from file |
 | `--prompt TEXT` | Additional operator intent appended to the drafted prompt |
 | `--review` | Auto-create review task on completion |

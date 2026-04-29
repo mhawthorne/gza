@@ -46,14 +46,10 @@ def _create_completed_source_task(tmp_path: Path, git: Git) -> Task:
     return task
 
 
-def test_extract_requires_exactly_one_source_selector(tmp_path: Path) -> None:
+def test_extract_rejects_conflicting_source_selectors(tmp_path: Path) -> None:
     setup_config(tmp_path)
     git = _init_repo(tmp_path)
     source_task = _create_completed_source_task(tmp_path, git)
-
-    missing_source = run_gza("extract", "--project", str(tmp_path))
-    assert missing_source.returncode == 1
-    assert "exactly one source selector" in missing_source.stdout
 
     with_both = run_gza(
         "extract",
@@ -75,17 +71,76 @@ def test_extract_help_includes_source_selectors_and_file_inputs(tmp_path: Path) 
     assert "Source full prefixed task ID to extract from" in result.stdout
     assert "--branch BRANCH" in result.stdout
     assert "--files-from FILE" in result.stdout
+    assert "current branch" in result.stdout
     assert "Repo-relative files to extract from the source diff" in result.stdout
+    assert "omit to extract all changed files" in result.stdout
 
 
-def test_extract_requires_selected_files(tmp_path: Path) -> None:
+def test_extract_without_selected_files_uses_full_source_diff(tmp_path: Path) -> None:
     setup_config(tmp_path)
     git = _init_repo(tmp_path)
     source_task = _create_completed_source_task(tmp_path, git)
+    store = make_store(tmp_path)
 
-    result = run_gza("extract", str(source_task.id), "--queue", "--project", str(tmp_path))
-    assert result.returncode == 1
-    assert "Select at least one file" in result.stdout
+    result = run_gza("extract", str(source_task.id), "-q", "--project", str(tmp_path))
+    assert result.returncode == 0
+    assert "Created extract implement task" in result.stdout
+    assert "Selected files: 1" in result.stdout
+
+    new_task = get_latest_task(store, task_type="implement")
+    assert new_task is not None
+    bundle_dir = tmp_path / ".gza" / "extractions" / new_task.slug
+    manifest = json.loads((bundle_dir / "manifest.json").read_text())
+    assert manifest["selected_paths"] == ["src/extracted.py"]
+    assert manifest["touched_paths"] == ["src/extracted.py"]
+
+
+def test_extract_without_source_selector_uses_current_branch(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    git = _init_repo(tmp_path)
+    source_task = _create_completed_source_task(tmp_path, git)
+    store = make_store(tmp_path)
+
+    git._run("checkout", source_task.branch)
+
+    result = run_gza("extract", "-q", "--project", str(tmp_path))
+
+    assert result.returncode == 0
+    assert f"Source: branch {source_task.branch}" in result.stdout
+    assert "Selected files: 1" in result.stdout
+
+    new_task = get_latest_task(store, task_type="implement")
+    assert new_task is not None
+    bundle_dir = tmp_path / ".gza" / "extractions" / new_task.slug
+    manifest = json.loads((bundle_dir / "manifest.json").read_text())
+    assert manifest["selected_paths"] == ["src/extracted.py"]
+
+
+def test_extract_current_branch_with_first_positional_path_uses_path_not_source(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    git = _init_repo(tmp_path)
+    source_task = _create_completed_source_task(tmp_path, git)
+    store = make_store(tmp_path)
+
+    git._run("checkout", source_task.branch)
+
+    result = run_gza(
+        "extract",
+        "src/extracted.py",
+        "-q",
+        "--project",
+        str(tmp_path),
+    )
+
+    assert result.returncode == 0
+    assert f"Source: branch {source_task.branch}" in result.stdout
+    assert "Selected files: 1" in result.stdout
+
+    new_task = get_latest_task(store, task_type="implement")
+    assert new_task is not None
+    bundle_dir = tmp_path / ".gza" / "extractions" / new_task.slug
+    manifest = json.loads((bundle_dir / "manifest.json").read_text())
+    assert manifest["selected_paths"] == ["src/extracted.py"]
 
 
 def test_extract_files_from_directory_reports_error_without_traceback(tmp_path: Path) -> None:
@@ -232,6 +287,37 @@ def test_extract_branch_with_single_positional_path_succeeds(tmp_path: Path) -> 
     bundle_dir = tmp_path / ".gza" / "extractions" / new_task.slug
     manifest = json.loads((bundle_dir / "manifest.json").read_text())
     assert manifest["selected_paths"] == ["src/extracted.py"]
+
+
+def test_extract_branch_without_selected_files_uses_full_source_diff(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    git = _init_repo(tmp_path)
+    source_task = _create_completed_source_task(tmp_path, git)
+    store = make_store(tmp_path)
+
+    git._run("checkout", source_task.branch)
+    (tmp_path / "src" / "second.py").write_text("print('second')\n")
+    git._run("add", "src/second.py")
+    git._run("commit", "-m", "add second file")
+    git._run("checkout", "main")
+
+    result = run_gza(
+        "extract",
+        "--branch",
+        source_task.branch,
+        "-q",
+        "--project",
+        str(tmp_path),
+    )
+
+    assert result.returncode == 0
+    assert "Selected files: 2" in result.stdout
+
+    new_task = get_latest_task(store, task_type="implement")
+    assert new_task is not None
+    bundle_dir = tmp_path / ".gza" / "extractions" / new_task.slug
+    manifest = json.loads((bundle_dir / "manifest.json").read_text())
+    assert manifest["selected_paths"] == ["src/extracted.py", "src/second.py"]
 
 
 def test_extract_branch_with_multiple_positional_paths_preserves_all(tmp_path: Path) -> None:

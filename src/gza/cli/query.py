@@ -1582,10 +1582,12 @@ def _print_orphaned_warning(orphaned: list[DbTask], *, to_stderr: bool = False) 
     plural = "tasks" if count != 1 else "task"
     out.print(f"\n[yellow]⚠  {count} orphaned {plural} found (in-progress with no active worker):[/yellow]")
     for task in orphaned:
-        type_label = f"\\[{task.task_type}] " if task.task_type != "implement" else ""
+        type_label = f"[{task.task_type}] " if task.task_type != "implement" else ""
         first_line = task.prompt.split('\n')[0].strip()
         prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
-        out.print(f"   [cyan]({task.id})[/cyan] {type_label}[{pink}]{rich_escape(prompt_display)}[/{pink}]")
+        # Keep the task line literal so bracketed prompt text remains searchable
+        # even when stderr/stdout is captured from a colorized terminal session.
+        out.print(f"   ({task.id}) {type_label}{prompt_display}", markup=False, highlight=False)
     out.print(
         "   Run [cyan]gza work <full-task-id>[/cyan] to resume, or "
         "[cyan]gza mark-completed --force <full-task-id>[/cyan] to clear."

@@ -11,6 +11,7 @@ from gza.extractions import (
     ExtractionError,
     _parse_file_summaries,
     copy_bundle_to_worktree,
+    infer_selected_paths,
     normalize_selected_paths,
     plan_extraction,
     resolve_source_selection,
@@ -34,6 +35,61 @@ def _init_repo(tmp_path: Path) -> Git:
 def test_normalize_selected_paths_rejects_escape() -> None:
     with pytest.raises(ExtractionError, match="within the repository root"):
         normalize_selected_paths(["../outside.py"])
+
+
+def test_infer_selected_paths_returns_full_source_diff(tmp_path: Path) -> None:
+    git = _init_repo(tmp_path)
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+
+    source_task = store.add("Source", task_type="implement")
+    source_task.status = "completed"
+    source_task.completed_at = datetime.now(UTC)
+    source_task.branch = "feature/source-full-diff"
+    store.update(source_task)
+
+    git._run("checkout", "-b", source_task.branch)
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src" / "module.py").write_text("value = 1\n")
+    (tmp_path / "src" / "second.py").write_text("value = 2\n")
+    git._run("add", "src/module.py")
+    git._run("add", "src/second.py")
+    git._run("commit", "-m", "add files")
+    git._run("checkout", "main")
+
+    source = resolve_source_selection(
+        store,
+        git,
+        source_task_id=source_task.id,
+        source_branch=None,
+        base_branch_override=None,
+    )
+
+    assert infer_selected_paths(git, source) == ("src/module.py", "src/second.py")
+
+
+def test_infer_selected_paths_rejects_empty_source_diff(tmp_path: Path) -> None:
+    git = _init_repo(tmp_path)
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+
+    source_task = store.add("Source", task_type="implement")
+    source_task.status = "completed"
+    source_task.completed_at = datetime.now(UTC)
+    source_task.branch = "feature/source-empty-diff"
+    store.update(source_task)
+
+    git._run("checkout", "-b", source_task.branch)
+    git._run("checkout", "main")
+
+    source = resolve_source_selection(
+        store,
+        git,
+        source_task_id=source_task.id,
+        source_branch=None,
+        base_branch_override=None,
+    )
+
+    with pytest.raises(ExtractionError, match="no extractable diff"):
+        infer_selected_paths(git, source)
 
 
 def test_plan_extraction_and_bundle_roundtrip(tmp_path: Path) -> None:
