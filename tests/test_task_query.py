@@ -360,6 +360,64 @@ def test_lineage_scope_group_filter_prunes_tree_to_matching_members_and_ancestor
     assert "Backlog sibling" not in tree_prompts
 
 
+def test_lineages_incomplete_group_filter_excludes_unrelated_owners(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    release_failed = store.add("Release failed", task_type="implement", group="release")
+    release_failed.status = "failed"
+    release_failed.completed_at = datetime.now(UTC)
+    release_failed.failure_reason = "TEST_FAILURE"
+    store.update(release_failed)
+
+    backlog_failed = store.add("Backlog failed", task_type="implement", group="backlog")
+    backlog_failed.status = "failed"
+    backlog_failed.completed_at = datetime.now(UTC)
+    backlog_failed.failure_reason = "TEST_FAILURE"
+    store.update(backlog_failed)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="lineages",
+            lifecycle_state=("incomplete",),
+            groups=("release",),
+            limit=None,
+        )
+    )
+
+    owners = [row.owner_task.prompt for row in result.rows if hasattr(row, "owner_task")]
+    assert owners == ["Release failed"]
+
+
+def test_lineages_incomplete_tag_filter_excludes_unrelated_owners(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    tagged_failed = store.add("Tagged failed", task_type="implement", tags=("release", "beta"))
+    tagged_failed.status = "failed"
+    tagged_failed.completed_at = datetime.now(UTC)
+    tagged_failed.failure_reason = "TEST_FAILURE"
+    store.update(tagged_failed)
+
+    other_failed = store.add("Other failed", task_type="implement", tags=("backlog",))
+    other_failed.status = "failed"
+    other_failed.completed_at = datetime.now(UTC)
+    other_failed.failure_reason = "TEST_FAILURE"
+    store.update(other_failed)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="lineages",
+            lifecycle_state=("incomplete",),
+            tag_filters=("release",),
+            limit=None,
+        )
+    )
+
+    owners = [row.owner_task.prompt for row in result.rows if hasattr(row, "owner_task")]
+    assert owners == ["Tagged failed"]
+
+
 def test_lineage_presentation_mode_renders_tree_layout(tmp_path: Path) -> None:
     store = _store(tmp_path)
     root = store.add("Lineage root owner", task_type="implement")

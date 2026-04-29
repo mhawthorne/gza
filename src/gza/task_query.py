@@ -372,6 +372,8 @@ class TaskQueryService:
                 tree_by_root_id[root.id] = item.tree
 
                 for task in item.unresolved_tasks:
+                    if not self._matches_group_and_tag_filters(task, query):
+                        continue
                     owner = self._resolve_branch_owner(task)
                     owner_id = owner.id
                     if owner_id is None:
@@ -568,25 +570,9 @@ class TaskQueryService:
             ]
 
         if query.groups is not None:
-            allowed_groups = set(normalize_tag_filters(query.groups) or ())
-            filtered = [
-                task
-                for task in filtered
-                if (
-                    (task_group_values := {*(task.tags or ())})
-                    and bool(task_group_values & allowed_groups)
-                ) or (
-                    task.group is not None and task.group in allowed_groups
-                )
-            ]
-
-        if query.tag_filters is not None:
-            required = normalize_tag_filters(query.tag_filters)
-            filtered = [
-                task
-                for task in filtered
-                if task_matches_tag_filters(task_tags=task.tags, tag_filters=required, any_tag=query.any_tag)
-            ]
+            filtered = [task for task in filtered if self._matches_group_and_tag_filters(task, query)]
+        elif query.tag_filters is not None:
+            filtered = [task for task in filtered if self._matches_group_and_tag_filters(task, query)]
 
         if query.merge_chain_state is not None:
             merge_states = set(query.merge_chain_state)
@@ -597,6 +583,23 @@ class TaskQueryService:
             filtered = [task for task in filtered if self._matches_dependency_state(task, dep_states)]
 
         return filtered
+
+    def _matches_group_and_tag_filters(self, task: DbTask, query: TaskQuery) -> bool:
+        if query.groups is not None:
+            allowed_groups = set(normalize_tag_filters(query.groups) or ())
+            task_group_values = set(task.tags or ())
+            matches_group = bool(task_group_values & allowed_groups) or (
+                task.group is not None and task.group in allowed_groups
+            )
+            if not matches_group:
+                return False
+
+        if query.tag_filters is not None:
+            required = normalize_tag_filters(query.tag_filters)
+            if not task_matches_tag_filters(task_tags=task.tags, tag_filters=required, any_tag=query.any_tag):
+                return False
+
+        return True
 
     def _apply_lineage_filters(self, rows: Sequence[LineageRow], query: TaskQuery) -> list[LineageRow]:
         filtered = list(rows)
