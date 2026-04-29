@@ -1569,7 +1569,7 @@ def _print_orphaned_warning(orphaned: list[DbTask], *, to_stderr: bool = False) 
         type_label = f"\\[{task.task_type}] " if task.task_type != "implement" else ""
         first_line = task.prompt.split('\n')[0].strip()
         prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
-        out.print(f"   [cyan]({task.id})[/cyan] {type_label}[{pink}]{prompt_display}[/{pink}]")
+        out.print(f"   [cyan]({task.id})[/cyan] {type_label}[{pink}]{rich_escape(prompt_display)}[/{pink}]")
     out.print(
         "   Run [cyan]gza work <full-task-id>[/cyan] to resume, or "
         "[cyan]gza mark-completed --force <full-task-id>[/cyan] to clear."

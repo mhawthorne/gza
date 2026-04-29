@@ -3147,6 +3147,36 @@ class TestStatusCommand:
         assert "orphaned" in result.stderr.lower()
         assert "Stuck release task" in result.stderr
 
+    def test_group_flat_view_orphaned_warning_preserves_bracketed_prompt_text(self, tmp_path: Path):
+        """group default view should keep bracketed orphaned prompt text literal in warning output."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        orphaned = store.add("[release] orphaned prompt", group="release")
+        mark_orphaned(store, orphaned)
+
+        result = run_gza("group", "release", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"({orphaned.id}) [release] orphaned prompt" in result.stdout
+
+    def test_group_json_view_orphaned_warning_preserves_bracketed_prompt_text_on_stderr(
+        self,
+        tmp_path: Path,
+    ):
+        """group --view json should keep bracketed orphaned prompt text literal in stderr warning."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        orphaned = store.add("[release] orphaned prompt", group="release")
+        mark_orphaned(store, orphaned)
+
+        result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload
+        assert payload[0]["prompt"] == "[release] orphaned prompt"
+        assert f"({orphaned.id}) [release] orphaned prompt" in result.stderr
+
     def test_group_lineage_view_surfaces_matching_descendant_when_owner_is_untagged(self, tmp_path: Path):
         """group --view lineage should include tagged descendants even if owner lacks the tag."""
         setup_config(tmp_path)
