@@ -213,6 +213,7 @@ class TestHelpOutput:
         assert "--restart-failed" in text
         assert "--restart-failed-batch" in text
         assert "--max-resume-attempts" in text
+        assert "--show-skipped" in text
 
     def test_watch_help_and_docs_describe_recovery_dry_run_and_attempt_scope(self, tmp_path):
         """watch help/docs should document the recovery dry-run surface and true attempt-cap scope."""
@@ -226,13 +227,17 @@ class TestHelpOutput:
 
         assert "with --restart-failed, print the failed-recovery report and exit" in help_text
         assert "auto-resume and --restart-failed recovery decisions" in help_text
+        assert "include skipped failed tasks in the recovery report" in help_text
 
         assert "with `--restart-failed`, print the full failed-recovery report and exit" in docs_text
         assert "applies to plain-watch auto-resume and to `--restart-failed` resume/retry decisions" in docs_text
         assert "`gza watch --restart-failed --dry-run` is the recovery inspection surface" in docs_text
+        assert "Skipped tasks are hidden by default" in docs_text
+        assert "`--show-skipped` to include them" in docs_text
 
         assert "`gza watch --restart-failed --dry-run`" in failed_tasks_docs
         assert "Print the recovery decision report and exit" in failed_tasks_docs
+        assert "--show-skipped" in failed_tasks_docs
         assert "`--max-resume-attempts` applies both to plain-watch auto-resume and to `--restart-failed` recovery decisions." in failed_tasks_docs
 
     def test_internal_advance_workflow_docs_describe_watch_failed_recovery(self, tmp_path):

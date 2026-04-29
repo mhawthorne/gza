@@ -217,6 +217,54 @@ def test_watch_cycle_recovery_mode_resumes_failed_task_before_starting_new_pendi
     assert spawned_task.id == failed.id
 
 
+def test_watch_cycle_restart_failed_prioritizes_newest_failed_task(tmp_path: Path) -> None:
+    """With limited slots, restart-failed should recover the newest failed task first."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    older = store.add("Older failed plan", task_type="plan")
+    assert older.id is not None
+    older.status = "failed"
+    older.failure_reason = "INFRASTRUCTURE_ERROR"
+    older.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(older)
+
+    newer = store.add("Newer failed plan", task_type="plan")
+    assert newer.id is not None
+    newer.status = "failed"
+    newer.failure_reason = "INFRASTRUCTURE_ERROR"
+    newer.completed_at = datetime(2026, 4, 28, 11, 0, 0, tzinfo=UTC)
+    store.update(newer)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert spawn_worker.call_count == 1
+    recovered = max(
+        [task for task in store.get_all() if task.based_on in {older.id, newer.id}],
+        key=lambda task: int(str(task.id).split("-")[-1]),
+    )
+    assert recovered.based_on == newer.id
+    assert spawn_worker.call_args.kwargs["task_id"] == recovered.id
+
+
 @pytest.mark.parametrize("task_type", ["implement", "review", "improve", "rebase"])
 def test_watch_cycle_default_mode_auto_resumes_resumable_failed_task(
     tmp_path: Path, task_type: str
@@ -3205,6 +3253,151 @@ def test_cmd_watch_restart_failed_dry_run_restores_signal_handlers(tmp_path: Pat
     assert installs[1][0] == signal.SIGTERM
     assert installs[-2] == (signal.SIGINT, original_sigint)
     assert installs[-1] == (signal.SIGTERM, original_sigterm)
+
+
+def test_cmd_watch_restart_failed_dry_run_handles_mixed_naive_and_aware_completed_at(tmp_path: Path) -> None:
+    """Recovery dry-run should tolerate legacy naive timestamps mixed with aware ones."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    legacy = store.add("Legacy failed implement", task_type="implement")
+    assert legacy.id is not None
+    legacy.status = "failed"
+    legacy.failure_reason = "INFRASTRUCTURE_ERROR"
+    legacy.completed_at = datetime(2026, 4, 28, 10, 0, 0)
+    store.update(legacy)
+
+    current = store.add("Current failed implement", task_type="implement")
+    assert current.id is not None
+    current.status = "failed"
+    current.failure_reason = "INFRASTRUCTURE_ERROR"
+    current.completed_at = datetime(2026, 4, 28, 11, 0, 0, tzinfo=UTC)
+    store.update(current)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+
+
+def test_cmd_watch_restart_failed_dry_run_hides_skipped_by_default_and_sorts_newest_first(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recovery dry-run should show only actionable entries by default, newest first."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    older = store.add("Older failed plan", task_type="plan")
+    assert older.id is not None
+    older.status = "failed"
+    older.failure_reason = "INFRASTRUCTURE_ERROR"
+    older.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(older)
+
+    skipped = store.add("Skipped failed review", task_type="review")
+    assert skipped.id is not None
+    skipped.status = "failed"
+    skipped.failure_reason = "MAX_TURNS"
+    skipped.session_id = "sess-skip"
+    skipped.completed_at = datetime(2026, 4, 28, 12, 0, 0, tzinfo=UTC)
+    store.update(skipped)
+
+    newer = store.add("Newer failed plan", task_type="plan")
+    assert newer.id is not None
+    newer.status = "failed"
+    newer.failure_reason = "INFRASTRUCTURE_ERROR"
+    newer.completed_at = datetime(2026, 4, 28, 11, 0, 0, tzinfo=UTC)
+    store.update(newer)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=False,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert skipped.id not in stdout
+    assert stdout.index(newer.id) < stdout.index(older.id)
+    assert "1 skipped hidden" in stdout
+
+
+def test_cmd_watch_restart_failed_dry_run_show_skipped_includes_skipped_entries(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--show-skipped should include skipped recovery decisions in the dry-run report."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    actionable = store.add("Failed plan", task_type="plan")
+    assert actionable.id is not None
+    actionable.status = "failed"
+    actionable.failure_reason = "INFRASTRUCTURE_ERROR"
+    actionable.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(actionable)
+
+    skipped = store.add("Failed review", task_type="review")
+    assert skipped.id is not None
+    skipped.status = "failed"
+    skipped.failure_reason = "MAX_TURNS"
+    skipped.session_id = "sess-skip"
+    skipped.completed_at = datetime(2026, 4, 28, 11, 0, 0, tzinfo=UTC)
+    store.update(skipped)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert skipped.id in stdout
+    assert stdout.index(skipped.id) < stdout.index(actionable.id)
+    assert "1 skipped" in stdout
 
 
 def test_collect_unhandled_failures_skips_actionable_recovery_failures(tmp_path: Path) -> None:

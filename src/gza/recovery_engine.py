@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 
 from .db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
@@ -48,7 +48,11 @@ class FailedRecoveryDecision:
 
 
 def _parse_completed_at(value: datetime | None) -> datetime:
-    return value if isinstance(value, datetime) else datetime.max
+    if not isinstance(value, datetime):
+        return datetime.min
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
 
 
 def list_failed_tasks_for_recovery(
@@ -67,7 +71,14 @@ def list_failed_tasks_for_recovery(
             for task in failed
             if task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag)
         ]
-    failed.sort(key=lambda task: (_parse_completed_at(task.completed_at), task_id_numeric_key(task.id)))
+    failed.sort(
+        key=lambda task: (
+            task.completed_at is not None,
+            _parse_completed_at(task.completed_at),
+            task_id_numeric_key(task.id),
+        ),
+        reverse=True,
+    )
     return failed
 
 

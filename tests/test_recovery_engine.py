@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from gza.recovery_engine import decide_failed_task_recovery
+from gza.recovery_engine import decide_failed_task_recovery, list_failed_tasks_for_recovery
 
 from tests.cli.conftest import make_store, setup_config
 
@@ -219,3 +219,27 @@ def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:
     decision = decide_failed_task_recovery(store, attempt, max_recovery_attempts=1)
     assert decision.action == "skip"
     assert decision.reason_code == "attempt_cap_reached"
+
+
+def test_list_failed_tasks_for_recovery_sorts_newest_first_with_mixed_naive_and_aware_completed_at(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    legacy = store.add("Legacy failed task", task_type="plan")
+    assert legacy.id is not None
+    legacy.status = "failed"
+    legacy.failure_reason = "INFRASTRUCTURE_ERROR"
+    legacy.completed_at = datetime(2026, 4, 28, 10, 0, 0)
+    store.update(legacy)
+
+    current = store.add("Current failed task", task_type="plan")
+    assert current.id is not None
+    current.status = "failed"
+    current.failure_reason = "INFRASTRUCTURE_ERROR"
+    current.completed_at = datetime(2026, 4, 28, 11, 0, 0, tzinfo=UTC)
+    store.update(current)
+
+    failed = list_failed_tasks_for_recovery(store)
+    assert [task.id for task in failed] == [current.id, legacy.id]

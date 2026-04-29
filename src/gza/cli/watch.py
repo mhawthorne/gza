@@ -446,30 +446,45 @@ def _emit_recovery_dry_run_report(
     tags: tuple[str, ...] | None,
     any_tag: bool,
     max_recovery_attempts: int,
+    show_skipped: bool = False,
 ) -> _RecoveryReport:
     failed_tasks = list_failed_tasks_for_recovery(store, tags=tags, any_tag=any_tag)
     scope = ",".join(tags) if tags else "*"
     print(f"Failed recovery plan (tags={scope}, mode=restart-failed)")
     print()
     actionable = resume = retry = 0
+    skipped = 0
     for task in failed_tasks:
         if task.id is None:
             continue
         decision = decide_failed_task_recovery(store, task, max_recovery_attempts=max_recovery_attempts)
-        launch = decision.launch_mode
-        print(
-            f"{decision.action:<6} {task.id} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
-            f"attempt={decision.attempt_index}/{decision.attempt_limit}"
-        )
         if decision.action in {"resume", "retry"}:
+            launch = decision.launch_mode
+            print(
+                f"{decision.action:<6} {task.id} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
+                f"attempt={decision.attempt_index}/{decision.attempt_limit}"
+            )
             actionable += 1
-        if decision.action == "resume":
-            resume += 1
-        if decision.action == "retry":
-            retry += 1
-    skipped = max(0, len(failed_tasks) - actionable)
+            if decision.action == "resume":
+                resume += 1
+            if decision.action == "retry":
+                retry += 1
+            continue
+        skipped += 1
+        if show_skipped:
+            launch = decision.launch_mode
+            print(
+                f"{decision.action:<6} {task.id} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
+                f"attempt={decision.attempt_index}/{decision.attempt_limit}"
+            )
     print()
-    print(f"Summary: {actionable} actionable ({resume} resume, {retry} retry), {skipped} skipped")
+    if show_skipped:
+        print(f"Summary: {actionable} actionable ({resume} resume, {retry} retry), {skipped} skipped")
+    else:
+        print(
+            f"Summary: {actionable} actionable ({resume} resume, {retry} retry), "
+            f"{skipped} skipped hidden"
+        )
     return _RecoveryReport(actionable_count=actionable, resume_count=resume, retry_count=retry)
 
 
@@ -1193,6 +1208,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         else config.max_resume_attempts
     )
     dry_run = bool(getattr(args, "dry_run", False))
+    show_skipped = bool(getattr(args, "show_skipped", False))
     quiet = bool(getattr(args, "quiet", False))
     try:
         tag_filters, any_tag = parse_cli_tag_filters(args)
@@ -1251,6 +1267,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 tags=tag_filters,
                 any_tag=any_tag,
                 max_recovery_attempts=max_recovery_attempts,
+                show_skipped=show_skipped,
             )
             return 0
 
