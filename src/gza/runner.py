@@ -33,6 +33,7 @@ from .console import (
     task_header,
 )
 from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason, task_id_numeric_key
+from .dependency_preconditions import get_unmerged_dependency_precondition
 from .extractions import (
     MANIFEST_FILENAME,
     PATCH_FILENAME,
@@ -2372,17 +2373,8 @@ def _check_dependency_merge_precondition(
     default_branch: str,
 ) -> tuple[Task | None, str | None, str | None]:
     """Return unmet dependency merge prerequisite or a git operational error."""
-    merge_required_task_types = {"task", "implement", "improve", "fix", "rebase"}
-
-    if task.same_branch or not task.depends_on:
-        return (None, None, None)
-
-    dep = store.resolve_dependency_completion(task)
+    dep = get_unmerged_dependency_precondition(store, task)
     if dep is None:
-        return (None, None, None)
-    if dep.task_type not in merge_required_task_types:
-        return (None, None, None)
-    if dep.merge_status == "merged":
         return (None, None, None)
     return (dep, default_branch, None)
 

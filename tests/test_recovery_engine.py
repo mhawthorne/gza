@@ -207,6 +207,35 @@ def test_recovery_engine_manual_reason_with_pending_child_still_skips(tmp_path: 
     assert decision.reuse_existing is False
 
 
+def test_recovery_engine_prerequisite_unmerged_retries_after_dependency_merge(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "unmerged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    blocked_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert blocked_decision.action == "skip"
+    assert blocked_decision.reason_code == "dependency_not_ready"
+
+    store.set_merge_status(dependency.id, "merged")
+
+    ready_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert ready_decision.action == "retry"
+    assert ready_decision.reason_code == "PREREQUISITE_UNMERGED"
+
+
 def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
     attempt = store.add("Attempt", task_type=task.task_type, based_on=task.id)
