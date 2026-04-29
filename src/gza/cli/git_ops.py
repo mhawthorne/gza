@@ -1806,15 +1806,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 continue
 
             if exec_result.status == "error":
-                if exec_result.message:
-                    console.print(f"      [{_c_ok}]✓ {exec_result.message}[/{_c_ok}]")
+                if exec_result.success_message:
+                    console.print(f"      [{_c_ok}]✓ {exec_result.success_message}[/{_c_ok}]")
                 err_message = exec_result.error_message or exec_result.message or f"Failed to execute {action_type}"
                 console.print(f"      [{_c_err}]✗ {err_message}[/{_c_err}]")
                 error_count += 1
                 continue
 
-            if exec_result.message:
-                console.print(f"      [{_c_ok}]✓ {exec_result.message}[/{_c_ok}]")
+            success_message = exec_result.success_message or exec_result.message
+            if success_message:
+                console.print(f"      [{_c_ok}]✓ {success_message}[/{_c_ok}]")
 
             if exec_result.worker_started:
                 success_count += 1

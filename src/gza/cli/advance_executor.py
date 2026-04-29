@@ -43,6 +43,7 @@ class AdvanceActionExecutionResult:
     action_type: str
     status: Literal["success", "skip", "error", "dry_run", "unsupported"]
     message: str = ""
+    success_message: str = ""
     error_message: str = ""
     worker_consuming: bool = False
     attempted_spawn: bool = False
@@ -145,7 +146,7 @@ def execute_advance_action(
             worker_label="review",
             created_task=review_task,
         )
-        result.message = create_result.message
+        result.success_message = create_result.message
         return result
 
     if action_type == "run_review":
@@ -317,7 +318,7 @@ def execute_advance_action(
             worker_label="resume",
             created_task=resume_task,
         )
-        result.message = f"Created resume task {resume_task.id}"
+        result.success_message = f"Created resume task {resume_task.id}"
         return result
 
     if action_type == "create_implement":
@@ -336,17 +337,19 @@ def execute_advance_action(
         assert impl_task.id is not None
         if context.use_iterate_for_create_implement:
             rc = context.spawn_iterate_worker(impl_task, "implement")
+            worker_label = "iterate"
         else:
             rc = context.spawn_worker(impl_task.id, "implement")
+            worker_label = "implement"
 
         result = _spawn_result(
             action_type=action_type,
             rc=rc,
             handled_task_id=impl_task.id,
-            worker_label="implement",
+            worker_label=worker_label,
             created_task=impl_task,
         )
-        result.message = f"Created implement task {impl_task.id}"
+        result.success_message = f"Created implement task {impl_task.id}"
         return result
 
     if action_type == "needs_rebase":
@@ -371,7 +374,7 @@ def execute_advance_action(
                 action_type=action_type,
                 rc=rc,
                 handled_task_id=task.id,
-                worker_label="rebase",
+                worker_label="iterate",
                 created_task=task,
             )
 
@@ -385,7 +388,7 @@ def execute_advance_action(
             worker_label="rebase",
             created_task=rebase_task,
         )
-        result.message = f"Created rebase task {rebase_task.id}"
+        result.success_message = f"Created rebase task {rebase_task.id}"
         return result
 
     return AdvanceActionExecutionResult(
