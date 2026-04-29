@@ -185,12 +185,22 @@ def _next_monotonic_iso_timestamp(now: datetime, floor_iso: str | None) -> str:
     """Return an ISO timestamp that is strictly later than ``floor_iso`` when needed."""
     if floor_iso:
         try:
-            floor = datetime.fromisoformat(floor_iso)
+            floor = _parse_db_timestamp(floor_iso)
         except ValueError:
             floor = None
         if floor is not None and now <= floor:
             now = floor + timedelta(microseconds=1)
     return now.isoformat()
+
+
+def _parse_db_timestamp(value: str | None) -> datetime | None:
+    """Parse persisted timestamps and normalize legacy naive values to UTC-aware."""
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 class ManualMigrationRequired(Exception):
@@ -1949,10 +1959,10 @@ class SqliteTaskStore:
             cost_usd=row["cost_usd"],
             input_tokens=row["input_tokens"] if "input_tokens" in keys else None,
             output_tokens=row["output_tokens"] if "output_tokens" in keys else None,
-            created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
-            started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+            created_at=_parse_db_timestamp(row["created_at"]),
+            started_at=_parse_db_timestamp(row["started_at"]),
             running_pid=row["running_pid"] if "running_pid" in keys else None,
-            completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+            completed_at=_parse_db_timestamp(row["completed_at"]),
             group=row["group"],
             tags=tags,
             depends_on=row["depends_on"],
@@ -1970,13 +1980,13 @@ class SqliteTaskStore:
             urgent=bool(row["urgent"]) if "urgent" in keys and row["urgent"] is not None else False,
             queue_position=row["queue_position"] if "queue_position" in keys else None,
             merge_status=row["merge_status"] if "merge_status" in keys else None,
-            merged_at=datetime.fromisoformat(row["merged_at"]) if "merged_at" in keys and row["merged_at"] else None,
+            merged_at=_parse_db_timestamp(row["merged_at"]) if "merged_at" in keys else None,
             failure_reason=row["failure_reason"] if "failure_reason" in keys else None,
             skip_learnings=bool(row["skip_learnings"]) if "skip_learnings" in keys and row["skip_learnings"] is not None else False,
             diff_files_changed=row["diff_files_changed"] if "diff_files_changed" in keys else None,
             diff_lines_added=row["diff_lines_added"] if "diff_lines_added" in keys else None,
             diff_lines_removed=row["diff_lines_removed"] if "diff_lines_removed" in keys else None,
-            review_cleared_at=datetime.fromisoformat(row["review_cleared_at"]) if "review_cleared_at" in keys and row["review_cleared_at"] else None,
+            review_cleared_at=_parse_db_timestamp(row["review_cleared_at"]) if "review_cleared_at" in keys else None,
             review_score=row["review_score"] if "review_score" in keys else None,
             log_schema_version=(
                 row["log_schema_version"]
@@ -2035,6 +2045,8 @@ class SqliteTaskStore:
 
     def _row_to_run_step(self, row: sqlite3.Row) -> RunStep:
         """Convert a database row to a RunStep."""
+        started_at = _parse_db_timestamp(row["started_at"])
+        assert started_at is not None
         return RunStep(
             id=row["id"],
             run_id=row["run_id"],
@@ -2043,8 +2055,8 @@ class SqliteTaskStore:
             provider=row["provider"],
             message_role=row["message_role"],
             message_text=row["message_text"],
-            started_at=datetime.fromisoformat(row["started_at"]),
-            completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+            started_at=started_at,
+            completed_at=_parse_db_timestamp(row["completed_at"]),
             outcome=row["outcome"],
             summary=row["summary"],
             legacy_turn_id=row["legacy_turn_id"],
@@ -2058,6 +2070,8 @@ class SqliteTaskStore:
             payload = json.loads(row["payload_json"])
         except (TypeError, json.JSONDecodeError):
             payload = row["payload_json"]
+        timestamp = _parse_db_timestamp(row["timestamp"])
+        assert timestamp is not None
 
         return RunSubstep(
             id=row["id"],
@@ -2069,21 +2083,23 @@ class SqliteTaskStore:
             source=row["source"],
             call_id=row["call_id"],
             payload=payload,
-            timestamp=datetime.fromisoformat(row["timestamp"]),
+            timestamp=timestamp,
             legacy_turn_id=row["legacy_turn_id"],
             legacy_event_id=row["legacy_event_id"],
         )
 
     def _row_to_task_comment(self, row: sqlite3.Row) -> TaskComment:
         """Convert a database row to a TaskComment."""
+        created_at = _parse_db_timestamp(row["created_at"])
+        assert created_at is not None
         return TaskComment(
             id=int(row["id"]),
             task_id=row["task_id"],
             content=row["content"],
             source=row["source"],
             author=row["author"],
-            created_at=datetime.fromisoformat(row["created_at"]),
-            resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,
+            created_at=created_at,
+            resolved_at=_parse_db_timestamp(row["resolved_at"]),
         )
 
     # === Task CRUD ===
