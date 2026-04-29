@@ -1665,7 +1665,7 @@ def _marker_matches_shared_db(project_dir: Path, local_db_path: Path, active_db_
     if marker_shared != active_db_str:
         return False
 
-    # Metadata is only a prefilter; content hash still decides correctness.
+    # Metadata acts as a cheap prefilter; content hash still decides correctness.
     marker_size = marker.get("local_db_size")
     marker_mtime_ns = marker.get("local_db_mtime_ns")
     marker_ctime_ns = marker.get("local_db_ctime_ns")
@@ -1675,9 +1675,16 @@ def _marker_matches_shared_db(project_dir: Path, local_db_path: Path, active_db_
         and isinstance(marker_ctime_ns, int)
     ):
         try:
-            _db_metadata(local_db_path)
+            local_size, local_mtime_ns, local_ctime_ns = _db_metadata(local_db_path)
         except OSError:
             return False
+        if (local_size, local_mtime_ns, local_ctime_ns) != (
+            marker_size,
+            marker_mtime_ns,
+            marker_ctime_ns,
+        ):
+            # Metadata drift alone is not authoritative; content hash decides.
+            pass
 
     try:
         local_fingerprint = _db_fingerprint(local_db_path)
