@@ -8,7 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from gza.cli import _determine_advance_action, cmd_advance
+from gza.advance_engine import evaluate_advance_rules
+from gza.cli import cmd_advance
 from gza.config import Config
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
 
@@ -292,7 +293,7 @@ class TestAdvanceCommand:
             ),
         }
 
-        with patch("gza.cli._determine_advance_action", return_value=action), patch(
+        with patch("gza.cli.determine_next_action", return_value=action), patch(
             "gza.cli._merge_single_task", return_value=1
         ):
             rc1 = cmd_advance(args)
@@ -518,7 +519,7 @@ class TestAdvanceCommand:
             batch=None,
         )
 
-        with patch("gza.cli._determine_advance_action", return_value={"type": "merge", "description": "Merge"}):
+        with patch("gza.cli.determine_next_action", return_value={"type": "merge", "description": "Merge"}):
             with patch("gza.cli._merge_single_task", return_value=1):
                 with patch("gza.git.Git.can_merge", return_value=False):
                     with patch("gza.git.Git.reset_hard_head") as mock_reset:
@@ -568,7 +569,7 @@ class TestAdvanceCommand:
         def capture_print(msg: str = "", **kwargs: object) -> None:
             output_lines.append(str(msg))
 
-        with patch("gza.cli._determine_advance_action", return_value={"type": "merge", "description": "Merge"}):
+        with patch("gza.cli.determine_next_action", return_value={"type": "merge", "description": "Merge"}):
             with patch("gza.cli._merge_single_task", return_value=1):
                 with patch("gza.git.Git.can_merge", return_value=False):
                     with patch("gza.git.Git.reset_hard_head", side_effect=GitError("reset failed")):
@@ -623,7 +624,7 @@ class TestAdvanceCommand:
         store.update(rebase_child)
 
         config = Config.load(tmp_path)
-        action = _determine_advance_action(config, store, git, task, "main")
+        action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'skip'
         assert f"rebase {rebase_child.id} already in progress" in action['description']
 
@@ -664,7 +665,7 @@ class TestAdvanceCommand:
         store.update(rebase_child)
 
         config = Config.load(tmp_path)
-        action = _determine_advance_action(config, store, git, task, "main")
+        action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'needs_discussion'
         assert f"rebase {rebase_child.id} failed" in action['description']
 
@@ -1854,7 +1855,7 @@ class TestAdvanceCommand:
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
         config = Config.load(tmp_path)
-        action = _determine_advance_action(config, store, git, task, "main")
+        action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'skip'
 
     def test_advance_requires_review_false_merges_unreviewed(self, tmp_path: Path):
@@ -1949,7 +1950,7 @@ class TestAdvanceCommand:
         assert config.advance_create_reviews is True
         assert config.advance_requires_review is True
 
-        action = _determine_advance_action(config, store, git, task, "main")
+        action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'create_review'
 
     def test_advance_failed_review_is_treated_as_unreviewed(self, tmp_path: Path):
@@ -1970,7 +1971,7 @@ class TestAdvanceCommand:
         store.update(failed_review)
 
         config = Config.load(tmp_path)
-        action = _determine_advance_action(config, store, git, task, "main")
+        action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'create_review'
 
     def _create_completed_improve(self, store, impl_task, review_task):
@@ -2015,7 +2016,7 @@ class TestAdvanceCommand:
         config = Config.load(tmp_path)
         assert config.max_review_cycles == 2
 
-        action = _determine_advance_action(config, store, git, task, "main")
+        action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'max_cycles_reached'
         assert 'max review cycles' in action['description']
         assert '2' in action['description']
@@ -2045,7 +2046,7 @@ class TestAdvanceCommand:
         self._create_completed_improve(store, task, review_task)
 
         config = Config.load(tmp_path)
-        action = _determine_advance_action(config, store, git, task, "main")
+        action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'improve'
 
     def test_advance_rebase_after_review_forces_new_review(self, tmp_path: Path):
@@ -2081,7 +2082,7 @@ class TestAdvanceCommand:
         store.update(rebase_task)
 
         config = Config.load(tmp_path)
-        action = _determine_advance_action(config, store, git, task, "main")
+        action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'create_review'
         assert 'rebase' in action['description'].lower()
 
@@ -2118,7 +2119,7 @@ class TestAdvanceCommand:
 
         # First call should want to create a review
         config = Config.load(tmp_path)
-        action = _determine_advance_action(config, store, git, task, "main")
+        action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'create_review'
 
         # Simulate the review being created (pending)
@@ -2129,7 +2130,7 @@ class TestAdvanceCommand:
         )
 
         # Second call should run the pending review, not create another
-        action2 = _determine_advance_action(config, store, git, task, "main")
+        action2 = evaluate_advance_rules(config, store, git, task, "main")
         assert action2['type'] == 'run_review'
         assert str(new_review.id) in action2['description']
 
@@ -2166,7 +2167,7 @@ class TestAdvanceCommand:
         store.update(review_task)
 
         config = Config.load(tmp_path)
-        action = _determine_advance_action(config, store, git, task, "main")
+        action = evaluate_advance_rules(config, store, git, task, "main")
         # Should proceed to merge, not force a new review
         assert action['type'] != 'create_review'
 
@@ -2190,7 +2191,7 @@ class TestAdvanceCommand:
         store.update(review_task)
 
         config = Config.load(tmp_path)
-        action = _determine_advance_action(config, store, git, task, "main")
+        action = evaluate_advance_rules(config, store, git, task, "main")
         # Should merge, not create another review
         assert action['type'] == 'merge'
 
@@ -2238,7 +2239,7 @@ class TestAdvanceCommand:
         store.update(new_rebase)
 
         config = Config.load(tmp_path)
-        action = _determine_advance_action(config, store, git, task, "main")
+        action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'create_review'
 
     def test_advance_needs_attention_summary_printed(self, tmp_path: Path):
@@ -2308,12 +2309,12 @@ class TestAdvanceCommand:
 
         # With default max_review_cycles=3, action would be 'improve' (2 < 3)
         config = Config.load(tmp_path)
-        action_default = _determine_advance_action(config, store, git, task, "main")
+        action_default = evaluate_advance_rules(config, store, git, task, "main")
         assert action_default['type'] == 'improve'
 
         # Override to 2 — now 2 completed improves == limit → max_cycles_reached
         config.max_review_cycles = 2
-        action_override = _determine_advance_action(config, store, git, task, "main")
+        action_override = evaluate_advance_rules(config, store, git, task, "main")
         assert action_override['type'] == 'max_cycles_reached'
 
     def test_advance_max_review_cycles_dry_run(self, tmp_path: Path):
@@ -2460,7 +2461,7 @@ class TestAdvanceCommand:
         first_resume_children = store.get_based_on_children(first_resume.id)
         assert len(first_resume_children) == 0
 
-    def test_determine_advance_action_returns_skip_at_max_resume_attempts(self, tmp_path: Path):
+    def test_evaluate_advance_rules_returns_skip_at_max_resume_attempts(self, tmp_path: Path):
         """Action selection keeps max resume exhaustion on the skip contract."""
         (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
         store = make_store(tmp_path)
@@ -2477,7 +2478,7 @@ class TestAdvanceCommand:
         store.update(first_resume)
 
         config = Config.load(tmp_path)
-        action = _determine_advance_action(config, store, git, first_resume, "main")
+        action = evaluate_advance_rules(config, store, git, first_resume, "main")
 
         assert action["type"] == "skip"
         assert action["description"] == "SKIP: max resume attempts (1) reached"
@@ -2862,7 +2863,7 @@ class TestAdvanceCommand:
         )
 
         with (
-            patch("gza.cli._determine_advance_action", return_value={"type": "needs_rebase", "description": "rebase"}),
+            patch("gza.cli.determine_next_action", return_value={"type": "needs_rebase", "description": "rebase"}),
             patch("gza.cli._spawn_background_iterate_worker", return_value=0) as spawn_iterate,
             patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker,
             patch("sys.stdout", new_callable=io.StringIO) as stdout,
@@ -3078,7 +3079,7 @@ class TestAdvanceCommand:
 
         with (
             patch("gza.cli.Git", return_value=self._mock_git()),
-            patch("gza.cli.git_ops._determine_advance_action", return_value={"type": "needs_rebase", "description": "Needs rebase"}),
+            patch("gza.cli.determine_next_action", return_value={"type": "needs_rebase", "description": "Needs rebase"}),
             patch("gza.cli._spawn_background_worker", side_effect=fake_spawn),
             patch("sys.stdout", new_callable=io.StringIO) as mock_stdout,
         ):

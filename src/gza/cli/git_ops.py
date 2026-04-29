@@ -1214,28 +1214,6 @@ def cmd_pr(args: argparse.Namespace) -> int:
     return 1
 
 
-# Compatibility shim: downstream imports/tests still reference this legacy name.
-def _determine_advance_action(
-    config: Config,
-    store: SqliteTaskStore,
-    git: Git,
-    task: DbTask,
-    target_branch: str,
-    impl_based_on_ids: set[str] | None = None,
-    max_resume_attempts: int | None = None,
-) -> dict:
-    """Backward-compatible wrapper around the shared advance engine."""
-    return determine_next_action(
-        config,
-        store,
-        git,
-        task,
-        target_branch,
-        impl_based_on_ids=impl_based_on_ids,
-        max_resume_attempts=max_resume_attempts,
-    )
-
-
 def _unimplemented_implement_prompt(task: DbTask) -> str:
     """Build the default implement prompt for a completed upstream task."""
     assert task.id is not None
@@ -1471,7 +1449,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         )
 
     # Pre-compute the set of plan IDs that already have implement children
-    # to avoid repeated DB queries in _determine_advance_action.
+    # to avoid repeated DB queries in evaluate_advance_rules.
     impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
 
     failed_tasks: list[DbTask] = []
@@ -1580,7 +1558,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # Analyze each task to determine the next action
     plan: list[tuple[DbTask, dict]] = []
     for task in tasks:
-        action = _determine_advance_action(
+        action = determine_next_action(
             config,
             store,
             git,
@@ -1597,7 +1575,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             continue
         plan.append((task, action))
     for failed_task in failed_tasks:
-        action = _determine_advance_action(
+        action = determine_next_action(
             config,
             store,
             git,

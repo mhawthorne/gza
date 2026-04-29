@@ -1361,7 +1361,7 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value=action),
+        patch("gza.cli.determine_next_action", return_value=action),
         patch(
             "gza.cli.watch._prepare_create_review_action",
             return_value=SimpleNamespace(
@@ -1704,7 +1704,7 @@ def test_watch_cycle_skips_merge_off_default_branch(tmp_path: Path, capsys) -> N
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action") as execute_merge,
     ):
         _run_cycle(
@@ -1746,7 +1746,7 @@ def test_watch_cycle_uses_default_branch_for_advance_planning_off_default_branch
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "skip"}) as determine_action,
+        patch("gza.cli.determine_next_action", return_value={"type": "skip"}) as determine_action,
     ):
         _run_cycle(
             config=config,
@@ -1800,7 +1800,7 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
     ):
         _run_cycle(
@@ -1851,7 +1851,7 @@ def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
             side_effect=lambda *_args, **_kwargs: SimpleNamespace(
@@ -1910,7 +1910,7 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch(
-            "gza.cli.watch._determine_advance_action",
+            "gza.cli.determine_next_action",
             return_value={
                 "type": "merge_with_followups",
                 "review_task": review,
@@ -1984,7 +1984,7 @@ def test_watch_cycle_dry_run_merges_approved_with_followups_without_creating_fol
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch(
-            "gza.cli.watch._determine_advance_action",
+            "gza.cli.determine_next_action",
             return_value={
                 "type": "merge_with_followups",
                 "review_task": review,
@@ -2153,7 +2153,7 @@ def test_watch_cycle_quiet_off_default_branch_suppresses_stdout_and_logs_skip(
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action") as merge_exec,
     ):
         _run_cycle(
@@ -2331,7 +2331,7 @@ def test_watch_cycle_does_not_double_start_pending_child_started_in_advance_step
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": action_type, action_key: child}),
+        patch("gza.cli.determine_next_action", return_value={"type": action_type, action_key: child}),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
         result = _run_cycle(
@@ -2449,7 +2449,7 @@ def test_watch_cycle_max_resume_attempts_zero_skips_failed_improve_recovery(tmp_
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
     ):
@@ -2501,7 +2501,7 @@ def test_watch_cycle_improve_creation_includes_unresolved_comments_in_prompt(tmp
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
     ):
         result = _run_cycle(
@@ -2562,7 +2562,7 @@ def test_watch_cycle_improve_action_resumes_failed_improve_chain(tmp_path: Path)
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
@@ -2629,7 +2629,7 @@ def test_watch_cycle_improve_action_retries_non_resumable_failed_improve_chain(t
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
@@ -2702,7 +2702,7 @@ def test_watch_cycle_improve_action_respects_max_improve_attempts(tmp_path: Path
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
@@ -2798,7 +2798,7 @@ def test_watch_cycle_off_default_branch_targets_rebase_to_default_branch(tmp_pat
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "needs_rebase"}),
+        patch("gza.cli.determine_next_action", return_value={"type": "needs_rebase"}),
         patch("gza.cli.watch._create_rebase_task", return_value=rebase_task) as create_rebase,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
@@ -2867,7 +2867,7 @@ def test_watch_cycle_dry_run_does_not_create_tasks_for_task_creating_advance_act
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value=action),
+        patch("gza.cli.determine_next_action", return_value=action),
         patch("gza.cli.watch._prepare_create_review_action") as create_review,
         patch("gza.cli.watch._create_rebase_task") as create_rebase,
     ):
@@ -3051,7 +3051,7 @@ def test_watch_cycle_logs_skip_events_for_non_actionable_advance_outcomes(
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": action_type, "description": description}),
+        patch("gza.cli.determine_next_action", return_value={"type": action_type, "description": description}),
     ):
         result = _run_cycle(
             config=config,
@@ -3095,7 +3095,7 @@ def test_watch_cycle_off_default_branch_still_runs_non_merge_advance_actions(tmp
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "create_review"}),
+        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
         patch(
             "gza.cli.watch._prepare_create_review_action",
             return_value=SimpleNamespace(
@@ -3151,7 +3151,7 @@ def test_watch_review_spawn_logs_start_and_review_transition_logs_verdict(tmp_pa
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "run_review", "review_task": review}),
+        patch("gza.cli.determine_next_action", return_value={"type": "run_review", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
     ):
         _run_cycle(
@@ -3206,7 +3206,7 @@ def test_watch_cycle_dedupes_merge_not_default_skip_across_cycles(tmp_path: Path
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "merge"}),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
     ):
         _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
         _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
@@ -4357,7 +4357,7 @@ def test_watch_cycle_logs_create_review_validation_skip(tmp_path: Path) -> None:
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value={"type": "create_review"}),
+        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
         patch("gza.cli.git_ops._create_review_task", side_effect=ValueError("review blocked by validation")),
     ):
         _run_cycle(
@@ -4403,7 +4403,7 @@ def test_watch_cycle_run_review_spawn_failure_not_retried_in_step3(tmp_path: Pat
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value=action),
+        patch("gza.cli.determine_next_action", return_value=action),
         # First call fails (run_review in step 1), second would be step 3
         patch("gza.cli.watch._spawn_background_worker", side_effect=[1, 0]) as spawn_worker,
     ):
@@ -4468,7 +4468,7 @@ def test_watch_cycle_run_improve_spawn_failure_not_retried_in_step3(tmp_path: Pa
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._determine_advance_action", return_value=action),
+        patch("gza.cli.determine_next_action", return_value=action),
         patch("gza.cli.git_ops.get_review_verdict", return_value="CHANGES_REQUESTED"),
         # First call fails (run_improve in step 1), second would be step 3
         patch("gza.cli.watch._spawn_background_worker", side_effect=[1, 0]) as spawn_worker,
