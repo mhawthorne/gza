@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .db import SqliteTaskStore, Task as DbTask
+from .dependency_preconditions import get_unmerged_dependency_precondition
 from .failed_task_ordering import sort_failed_tasks
 from .failure_policy import is_resumable_failure_reason
 from .lineage import walk_based_on_descendants
@@ -14,7 +15,6 @@ _ACTIONABLE_TYPES = {"implement", "plan", "explore", "fix", "internal"}
 _MANUAL_ONLY_REASONS = {
     "TEST_FAILURE",
     "GIT_ERROR",
-    "PREREQUISITE_UNMERGED",
     "PR_REQUIRED",
     "MISSING_REPORT_ARTIFACT",
     "KILLED",
@@ -120,7 +120,12 @@ def decide_failed_task_recovery(
         return _skip("attempt_cap_reached", "automatic recovery attempt limit reached")
 
     reason = task.failure_reason or "UNKNOWN"
-    if reason in _MANUAL_ONLY_REASONS:
+    if reason == "PREREQUISITE_UNMERGED":
+        if task.depends_on and store.resolve_dependency_completion(task) is None:
+            return _skip("dependency_not_ready", "dependency precondition not satisfied")
+        if get_unmerged_dependency_precondition(store, task) is not None:
+            return _skip("dependency_not_ready", "dependency precondition not satisfied")
+    elif reason in _MANUAL_ONLY_REASONS:
         return _skip("manual_failure_reason", f"{reason} requires manual intervention")
 
     blocked, _blocking_id, _blocking_status = store.is_task_blocked(task)
@@ -160,6 +165,17 @@ def decide_failed_task_recovery(
         return _skip(
             "recovery_has_newer_failed_descendant",
             "a newer failed recovery descendant must be recovered first",
+        )
+
+    if reason == "PREREQUISITE_UNMERGED":
+        return FailedRecoveryDecision(
+            task_id=task_id,
+            action="retry",
+            reason_code=reason,
+            reason_text="dependency merge prerequisite now satisfied",
+            launch_mode=launch_mode,
+            attempt_index=attempt_index,
+            attempt_limit=max_recovery_attempts,
         )
 
     if is_resumable_failure_reason(reason) and task.session_id:

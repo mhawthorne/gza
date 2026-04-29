@@ -1544,7 +1544,7 @@ Any state can be manually set to `dropped` via `gza set-status`.
 
 - Use `gza resume <task_id>` to continue from where the task left off (preserves conversation context)
 - Use `gza retry <task_id>` to start completely fresh
-- `PREREQUISITE_UNMERGED`: the resolved completed dependency is not yet marked merged to the default branch (`main` in most repos). Merge the dependency (`gza merge <dependency_task_id>`) and then retry (`gza retry <task_id>`). Use `--force` only when you intentionally want to bypass this guard.
+- `PREREQUISITE_UNMERGED`: the resolved completed dependency is not yet marked merged to the default branch (`main` in most repos). Merge the dependency (`gza merge <dependency_task_id>`); after that, `gza watch --restart-failed` can pick the task up automatically, or you can retry it manually with `gza retry <task_id>`. Use `--force` only when you intentionally want to bypass this guard.
 
 **Dependencies:**
 
