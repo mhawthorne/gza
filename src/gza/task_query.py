@@ -460,13 +460,26 @@ class TaskQueryService:
             for owner_id, owner_members in grouped.items():
                 owner = owner_by_id[owner_id]
                 root = _resolve_lineage_root(self._store, owner)
+                full_tree = _build_lineage_tree(self._store, root, max_depth=None)
+                rendered_tree = full_tree
+                rendered_members: tuple[DbTask, ...] = tuple(
+                    sorted(owner_members, key=lambda t: self._sort_key(t, DEFAULT_SORT), reverse=True)
+                )
+
+                if query.groups is not None or query.tag_filters is not None:
+                    keep_ids = {task.id for task in owner_members if task.id is not None}
+                    if owner.id is not None:
+                        keep_ids.add(owner.id)
+                    if root.id is not None:
+                        keep_ids.add(root.id)
+                    rendered_tree = _prune_lineage_tree_to_ids(full_tree, keep_ids)
+                    rendered_members = tuple(_flatten_lineage_tree(rendered_tree))
+
                 rows.append(
                     LineageRow(
                         owner_task=owner,
-                        members=tuple(
-                            sorted(owner_members, key=lambda t: self._sort_key(t, DEFAULT_SORT), reverse=True)
-                        ),
-                        tree=_build_lineage_tree(self._store, root, max_depth=None),
+                        members=rendered_members,
+                        tree=rendered_tree,
                     )
                 )
 

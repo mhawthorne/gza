@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
 
+from rich.console import Console
 from rich.markup import escape as rich_escape
 
 import gza.colors as _colors
@@ -85,6 +86,7 @@ from ._common import (
 _LINEAGE_REL_LABELS = _QUERY_LINEAGE_REL_LABELS
 _QueryDateField = Literal["created", "completed", "effective"]
 _PresentationMode = Literal["flat", "grouped", "tree", "one_line", "json"]
+_stderr_console = Console(highlight=False, stderr=True)
 
 
 def _parse_cli_date(value: str | None) -> _dt.date | None:
@@ -1284,13 +1286,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         else:
             console.print(rendered)
 
-    if view_mode != "json":
-        # Preserve orphaned-task warning behavior for this tag slice.
-        registry = WorkerRegistry(config.workers_path)
-        orphaned = _get_orphaned_tasks(registry, store)
-        group_orphaned = [task for task in orphaned if group_name in task.tags]
-        if group_orphaned:
-            _print_orphaned_warning(group_orphaned)
+    # Preserve orphaned-task warning behavior for this tag slice.
+    registry = WorkerRegistry(config.workers_path)
+    orphaned = _get_orphaned_tasks(registry, store)
+    group_orphaned = [task for task in orphaned if group_name in task.tags]
+    if group_orphaned:
+        _print_orphaned_warning(group_orphaned, to_stderr=view_mode == "json")
 
     return 0
 
@@ -1556,17 +1557,18 @@ def _get_orphaned_tasks(registry: WorkerRegistry, store: SqliteTaskStore) -> lis
     return [t for t in in_progress if t.id in orphaned_task_ids]
 
 
-def _print_orphaned_warning(orphaned: list[DbTask]) -> None:
+def _print_orphaned_warning(orphaned: list[DbTask], *, to_stderr: bool = False) -> None:
     """Print a warning about orphaned tasks with a suggestion to resume."""
+    out = _stderr_console if to_stderr else console
     count = len(orphaned)
     plural = "tasks" if count != 1 else "task"
-    console.print(f"\n[yellow]⚠  {count} orphaned {plural} found (in-progress with no active worker):[/yellow]")
+    out.print(f"\n[yellow]⚠  {count} orphaned {plural} found (in-progress with no active worker):[/yellow]")
     for task in orphaned:
         type_label = f"\\[{task.task_type}] " if task.task_type != "implement" else ""
         first_line = task.prompt.split('\n')[0].strip()
         prompt_display = truncate(first_line, MAX_PROMPT_DISPLAY)
-        console.print(f"   [cyan]({task.id})[/cyan] {type_label}[{pink}]{prompt_display}[/{pink}]")
-    console.print(
+        out.print(f"   [cyan]({task.id})[/cyan] {type_label}[{pink}]{prompt_display}[/{pink}]")
+    out.print(
         "   Run [cyan]gza work <full-task-id>[/cyan] to resume, or "
         "[cyan]gza mark-completed --force <full-task-id>[/cyan] to clear."
     )

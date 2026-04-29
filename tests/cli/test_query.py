@@ -3052,6 +3052,22 @@ class TestStatusCommand:
         assert "Tree child" in result.stdout
         assert "└──" in result.stdout or "├──" in result.stdout
 
+    def test_group_tree_view_omits_nonmatching_siblings_from_other_groups(self, tmp_path: Path):
+        """group --view tree should prune non-matching siblings from other groups."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        root = store.add("Shared root owner")
+        assert root.id is not None
+        store.add("Release child", group="release", based_on=root.id, same_branch=True)
+        store.add("Backlog sibling", group="backlog", based_on=root.id, same_branch=True)
+
+        result = run_gza("group", "release", "--view", "tree", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Shared root owner" in result.stdout
+        assert "Release child" in result.stdout
+        assert "Backlog sibling" not in result.stdout
+
     def test_group_json_view_returns_pure_json_without_warning_prefix(self, tmp_path: Path):
         """group --view json should emit pure JSON on stdout."""
         setup_config(tmp_path)
@@ -3089,6 +3105,22 @@ class TestStatusCommand:
         assert result.returncode == 0
         payload = json.loads(result.stdout)
         assert payload[0]["prompt"] == "[release] prompt"
+
+    def test_group_json_view_preserves_orphaned_warning_behavior_on_stderr(self, tmp_path: Path):
+        """group --view json should keep orphaned-task warnings while keeping stdout pure JSON."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        orphaned = store.add("Stuck release task", group="release")
+        mark_orphaned(store, orphaned)
+
+        result = run_gza("group", "release", "--view", "json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload
+        assert payload[0]["prompt"] == "Stuck release task"
+        assert "orphaned" in result.stderr.lower()
+        assert "Stuck release task" in result.stderr
 
     def test_group_lineage_view_surfaces_matching_descendant_when_owner_is_untagged(self, tmp_path: Path):
         """group --view lineage should include tagged descendants even if owner lacks the tag."""

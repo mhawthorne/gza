@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from gza.db import SqliteTaskStore
+from gza.query import TaskLineageNode
 from gza.task_query import (
     DateFilter,
     ProjectionSpec,
@@ -318,6 +319,44 @@ def test_task_query_group_filter_matches_any_of_selected_group_names(tmp_path: P
     assert "Release task" in prompts
     assert "Ops task" in prompts
     assert "Backlog task" not in prompts
+
+
+def test_lineage_scope_group_filter_prunes_tree_to_matching_members_and_ancestors(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    root = store.add("Shared root owner", task_type="implement")
+    assert root.id is not None
+    store.add("Release child", task_type="implement", group="release", based_on=root.id, same_branch=True)
+    store.add("Backlog sibling", task_type="implement", group="backlog", based_on=root.id, same_branch=True)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="lineages",
+            groups=("release",),
+            limit=None,
+        )
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert hasattr(row, "tree")
+    assert row.tree is not None
+    member_prompts = [task.prompt for task in row.members]
+    assert "Shared root owner" in member_prompts
+    assert "Release child" in member_prompts
+    assert "Backlog sibling" not in member_prompts
+
+    tree_prompts: list[str] = []
+
+    def _collect_prompts(node: TaskLineageNode) -> None:
+        tree_prompts.append(node.task.prompt)
+        for child in node.children:
+            _collect_prompts(child)
+
+    _collect_prompts(row.tree)
+    assert "Shared root owner" in tree_prompts
+    assert "Release child" in tree_prompts
+    assert "Backlog sibling" not in tree_prompts
 
 
 def test_default_projection_includes_group_field(tmp_path: Path) -> None:

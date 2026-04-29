@@ -661,7 +661,7 @@ gza group <group> [options]
 | `group` | Group/tag name to filter by |
 | `--view MODE` | Presentation mode: `flat`, `lineage`, `tree`, or `json` (default: `flat`) |
 
-`--view json` emits JSON rows to stdout (`[]` when no rows). Deprecation warnings are written to stderr.
+`--view json` emits JSON rows to stdout (`[]` when no rows). Deprecation and orphaned-task warnings are written to stderr.
 
 ### status
 
