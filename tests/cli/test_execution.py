@@ -5635,6 +5635,8 @@ class TestIterateCommand:
         store = make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
         impl.status = "failed"
+        impl.same_branch = True
+        impl.branch = "feature/existing-impl-branch"
         store.update(impl)
         review = store.add("Review", task_type="review")
 
@@ -5690,6 +5692,10 @@ class TestIterateCommand:
         assert run_fg.call_count >= 1
         first_task_id = run_fg.call_args_list[0][1]["task_id"]
         assert first_task_id != impl.id  # Should be a new task
+        retry_task = store.get(first_task_id)
+        assert retry_task is not None
+        assert retry_task.same_branch is False
+        assert retry_task.base_branch == "feature/existing-impl-branch"
         assert "Retrying failed implementation" in output
         assert "Iterate complete: MERGE_READY" in output
 

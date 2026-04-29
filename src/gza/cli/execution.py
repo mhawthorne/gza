@@ -1745,20 +1745,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             if dry_run:
                 print(f"[dry-run] Would retry failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
                 return 0
-            run_start_task = store.add(
-                prompt=impl_task.prompt,
-                task_type=impl_task.task_type,
-                tags=impl_task.tags,
-                spec=impl_task.spec,
-                depends_on=impl_task.depends_on,
-                create_review=impl_task.create_review,
-                same_branch=impl_task.same_branch,
-                task_type_hint=impl_task.task_type_hint,
-                based_on=impl_task.id,
-                model=impl_task.model,
-                provider=impl_task.provider if impl_task.provider_is_explicit else None,
-                provider_is_explicit=impl_task.provider_is_explicit,
-            )
+            run_start_task = _create_retry_task(store, impl_task)
             assert run_start_task.id is not None
             print(f"Retrying failed implementation {impl_task.id} as {run_start_task.id}...")
             impl_task, rc = _run_task_with_resume(run_start_task)
