@@ -1837,17 +1837,17 @@ def main() -> int:
     extract_parser.add_argument(
         "source",
         nargs="?",
-        help="Source full prefixed task ID to extract from (alternative to --branch)",
+        help="Source full prefixed task ID to extract from (defaults to current branch when omitted)",
     )
     extract_parser.add_argument(
         "paths",
         nargs="*",
-        help="Repo-relative files to extract from the source diff",
+        help="Repo-relative files to extract from the source diff (omit to extract all changed files)",
     )
     extract_parser.add_argument(
         "--branch",
         metavar="BRANCH",
-        help="Source branch to extract from (alternative to SOURCE task ID)",
+        help="Source branch to extract from (alternative to SOURCE task ID; defaults to current branch)",
     )
     extract_parser.add_argument(
         "--files-from",

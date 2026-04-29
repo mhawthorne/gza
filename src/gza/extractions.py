@@ -217,6 +217,16 @@ def plan_extraction(
     )
 
 
+def infer_selected_paths(git: Git, source: SourceSelection) -> tuple[str, ...]:
+    """Infer the full changed path set for a source diff."""
+    revision_range = f"{source.source_base_ref}...{source.source_branch}"
+    patch = git.get_diff_patch_for_paths(revision_range, (), binary=True)
+    selected_paths = tuple(parse_patch_touched_paths(patch))
+    if not selected_paths:
+        raise ExtractionError("Source branch has no extractable diff against the chosen base")
+    return selected_paths
+
+
 def draft_extraction_prompt(
     *,
     source: SourceSelection,
