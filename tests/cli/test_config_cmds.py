@@ -496,6 +496,48 @@ class TestLocalConfigOverrides:
         assert payload["effective"]["db_path"] == str(shared_db.resolve())
         assert payload["sources"]["db_path"] == "env"
 
+    def test_config_command_includes_main_checkout_isolate_json_and_source(self, tmp_path: Path):
+        """gza config --json should expose main_checkout_isolate with source attribution."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "main_checkout_isolate: true\n"
+        )
+
+        result = run_gza(
+            "config",
+            "--json",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["main_checkout_isolate"] is True
+        assert payload["sources"]["main_checkout_isolate"] == "base"
+
+    def test_config_command_includes_main_checkout_isolate_text_and_source(self, tmp_path: Path):
+        """gza config should render main_checkout_isolate rows with false values and sources."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "main_checkout_isolate: true\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text("main_checkout_isolate: false\n")
+
+        result = run_gza(
+            "config",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert re.search(
+            r"^main_checkout_isolate\s+false\s+\[local\]$",
+            result.stdout,
+            re.MULTILINE,
+        )
+
     def test_docs_configuration_mentions_gza_db_path_override(self):
         """Operator docs should document GZA_DB_PATH override and precedence."""
         docs_text = Path("docs/configuration.md").read_text()

@@ -1269,6 +1269,7 @@ def _config_to_effective_dict(config: Config) -> dict:
         "max_turns": config.max_turns,
         "worktree_dir": config.worktree_dir,
         "work_count": config.work_count,
+        "main_checkout_isolate": config.main_checkout_isolate,
         "provider": config.provider,
         "task_providers": config.task_providers,
         "model": config.model,
