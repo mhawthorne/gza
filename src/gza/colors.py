@@ -234,8 +234,8 @@ class RunnerColors:
 
 
 @dataclass(frozen=True)
-class AdvanceColors:
-    """Colors for ``gza advance`` action type indicators."""
+class WorkColors:
+    """Colors for worker lifecycle output and ``gza advance`` action indicators."""
 
     merge: str = default_color
     error: str = default_color
@@ -300,7 +300,7 @@ class Theme:
     lineage: dict[str, str] = field(default_factory=dict)
     next_colors: dict[str, str] = field(default_factory=dict)
     runner: dict[str, str] = field(default_factory=dict)
-    advance: dict[str, str] = field(default_factory=dict)
+    work: dict[str, str] = field(default_factory=dict)
     # Rich style-name overrides (e.g. "repr.number", "repr.path"). Applied to
     # Consoles built via :func:`build_rich_theme`, currently only the provider
     # stream console. Keys match Rich's own style names exactly.
@@ -321,7 +321,7 @@ class Theme:
             lineage=af(color, LineageColors),
             next_colors=af(color, NextColors),
             runner=af(color, RunnerColors),
-            advance=af(color, AdvanceColors),
+            work=af(color, WorkColors),
         )
 
 
@@ -361,7 +361,7 @@ _THEME_MINIMAL = Theme(
         # "heading": bold_cyan_heading,
         # "task_type": magenta_tool,
     },
-    advance={
+    work={
         "merge": green_success,
         "error": red_error,
         "waiting": yellow_warning,
@@ -476,7 +476,7 @@ def _build_themed_instances(
     lineage_c = _apply_domain_theme(LineageColors(), theme.lineage if theme else _no, base_ov, color_overrides)
     next_c = _apply_domain_theme(NextColors(), theme.next_colors if theme else _no, base_ov, color_overrides)
     runner_c = _apply_domain_theme(RunnerColors(), theme.runner if theme else _no, base_ov, color_overrides)
-    advance_c = _apply_domain_theme(AdvanceColors(), theme.advance if theme else _no, base_ov, color_overrides)
+    work_c = _apply_domain_theme(WorkColors(), theme.work if theme else _no, base_ov, color_overrides)
     rich_styles = dict(theme.rich) if theme else {}
 
     return {
@@ -488,7 +488,7 @@ def _build_themed_instances(
         "LINEAGE_COLORS": lineage_c,
         "NEXT_COLORS": next_c,
         "RUNNER_COLORS": runner_c,
-        "ADVANCE_COLORS": advance_c,
+        "WORK_COLORS": work_c,
         "TASK_COLORS_DICT": dataclasses.asdict(task_c),
         "STATUS_COLORS_DICT": dataclasses.asdict(status_c),
         "TASK_STREAM_COLORS_DICT": dataclasses.asdict(stream_c),
@@ -497,7 +497,7 @@ def _build_themed_instances(
         "LINEAGE_COLORS_DICT": dataclasses.asdict(lineage_c),
         "NEXT_COLORS_DICT": dataclasses.asdict(next_c),
         "RUNNER_COLORS_DICT": dataclasses.asdict(runner_c),
-        "ADVANCE_COLORS_DICT": dataclasses.asdict(advance_c),
+        "WORK_COLORS_DICT": dataclasses.asdict(work_c),
         "LINEAGE_STATUS_COLORS": {
             "completed": status_c.completed,
             "failed": status_c.failed,
@@ -539,7 +539,7 @@ def set_theme(
     and ``c.TASK_COLORS`` is preferred for those.
     """
     global TASK_COLORS, STATUS_COLORS, TASK_STREAM_COLORS, SHOW_COLORS
-    global UNMERGED_COLORS, LINEAGE_COLORS, NEXT_COLORS, RUNNER_COLORS, ADVANCE_COLORS
+    global UNMERGED_COLORS, LINEAGE_COLORS, NEXT_COLORS, RUNNER_COLORS, WORK_COLORS
 
     inst = _build_themed_instances(theme_name, color_overrides or {})
 
@@ -552,13 +552,13 @@ def set_theme(
     LINEAGE_COLORS = inst["LINEAGE_COLORS"]
     NEXT_COLORS = inst["NEXT_COLORS"]
     RUNNER_COLORS = inst["RUNNER_COLORS"]
-    ADVANCE_COLORS = inst["ADVANCE_COLORS"]
+    WORK_COLORS = inst["WORK_COLORS"]
 
     # Dict singletons — update in place so ``from`` imports see new values.
     for name in (
         "TASK_COLORS_DICT", "STATUS_COLORS_DICT", "TASK_STREAM_COLORS_DICT",
         "SHOW_COLORS_DICT", "UNMERGED_COLORS_DICT", "LINEAGE_COLORS_DICT",
-        "NEXT_COLORS_DICT", "RUNNER_COLORS_DICT", "ADVANCE_COLORS_DICT",
+        "NEXT_COLORS_DICT", "RUNNER_COLORS_DICT", "WORK_COLORS_DICT",
         "LINEAGE_STATUS_COLORS", "PS_STATUS_COLORS", "RICH_STYLES_DICT",
     ):
         target = globals()[name]
@@ -580,7 +580,7 @@ UNMERGED_COLORS: UnmergedColors = UnmergedColors()
 LINEAGE_COLORS: LineageColors = LineageColors()
 NEXT_COLORS: NextColors = NextColors()
 RUNNER_COLORS: RunnerColors = RunnerColors()
-ADVANCE_COLORS: AdvanceColors = AdvanceColors()
+WORK_COLORS: WorkColors = WorkColors()
 
 # ---------------------------------------------------------------------------
 # Dict variants (drop-in replacements for the old inline dictionaries)
@@ -594,7 +594,7 @@ UNMERGED_COLORS_DICT: dict[str, str] = dataclasses.asdict(UNMERGED_COLORS)
 LINEAGE_COLORS_DICT: dict[str, str] = dataclasses.asdict(LINEAGE_COLORS)
 NEXT_COLORS_DICT: dict[str, str] = dataclasses.asdict(NEXT_COLORS)
 RUNNER_COLORS_DICT: dict[str, str] = dataclasses.asdict(RUNNER_COLORS)
-ADVANCE_COLORS_DICT: dict[str, str] = dataclasses.asdict(ADVANCE_COLORS)
+WORK_COLORS_DICT: dict[str, str] = dataclasses.asdict(WORK_COLORS)
 
 # Lineage-status dict (subset of StatusColors, keyed by status string)
 LINEAGE_STATUS_COLORS: dict[str, str] = {
@@ -635,4 +635,3 @@ def build_rich_theme() -> Any:
         return None
     from rich.theme import Theme as RichTheme
     return RichTheme(dict(RICH_STYLES_DICT))
-

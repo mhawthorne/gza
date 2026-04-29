@@ -11,19 +11,18 @@ import pytest
 
 def test_import_singleton_instances() -> None:
     from gza.colors import (  # noqa: F401
-        ADVANCE_COLORS,
         NEXT_COLORS,
         SHOW_COLORS,
         STATUS_COLORS,
         TASK_COLORS,
         TASK_STREAM_COLORS,
         UNMERGED_COLORS,
+        WORK_COLORS,
     )
 
 
 def test_import_dict_variants() -> None:
     from gza.colors import (  # noqa: F401
-        ADVANCE_COLORS_DICT,
         LINEAGE_STATUS_COLORS,
         NEXT_COLORS_DICT,
         PS_STATUS_COLORS,
@@ -32,6 +31,7 @@ def test_import_dict_variants() -> None:
         TASK_COLORS_DICT,
         TASK_STREAM_COLORS_DICT,
         UNMERGED_COLORS_DICT,
+        WORK_COLORS_DICT,
     )
 
 
@@ -108,11 +108,11 @@ def test_next_colors_dict_keys() -> None:
     assert set(NEXT_COLORS_DICT.keys()) == expected_keys
 
 
-def test_advance_colors_dict_keys() -> None:
-    from gza.colors import ADVANCE_COLORS_DICT
+def test_work_colors_dict_keys() -> None:
+    from gza.colors import WORK_COLORS_DICT
 
     expected_keys = {"merge", "error", "waiting", "default"}
-    assert set(ADVANCE_COLORS_DICT.keys()) == expected_keys
+    assert set(WORK_COLORS_DICT.keys()) == expected_keys
 
 
 def test_lineage_status_colors_keys() -> None:

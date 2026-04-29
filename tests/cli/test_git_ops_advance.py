@@ -381,7 +381,7 @@ class TestAdvanceCommand:
         result = run_gza("advance", "--auto", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "rebase" in result.stdout.lower()
-        assert "started rebase worker" in result.stdout.lower()
+        assert "started task" in result.stdout.lower()
 
         # Task should still be unmerged (rebase worker runs in background)
         updated_task = store.get(task.id)
@@ -531,6 +531,57 @@ class TestAdvanceCommand:
         rebases = [t for t in store.get_all() if t.task_type == "rebase" and t.based_on == task.id]
         assert len(rebases) == 1
         assert "onto 'main'" in rebases[0].prompt
+
+    def test_advance_merge_conflict_fallback_reports_rebase_worker_start_failure(self, tmp_path: Path):
+        """Merge-conflict fallback must report child creation separately from rebase worker startup failure."""
+        from gza.cli import cmd_advance
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = store.add("Explore fallback spawn failure", task_type="explore")
+        branch = f"feat/task-{task.id}"
+        git._run("checkout", "-b", branch)
+        (tmp_path / f"feat_{task.id}.txt").write_text("feature")
+        git._run("add", f"feat_{task.id}.txt")
+        git._run("commit", "-m", f"Commit for task {task.id}")
+        git._run("checkout", "main")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            batch=None,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.determine_next_action", return_value={"type": "merge", "description": "Merge"}),
+            patch("gza.cli._merge_single_task", return_value=1),
+            patch("gza.git.Git.can_merge", return_value=False),
+            patch("gza.git.Git.reset_hard_head"),
+            patch("gza.cli._spawn_background_worker", return_value=1),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        rebases = [t for t in store.get_all() if t.task_type == "rebase" and t.based_on == task.id]
+        assert len(rebases) == 1
+        assert rebases[0].id is not None
+        assert rc == 1
+        assert f"Created rebase task {rebases[0].id}" in output
+        assert f"Failed to start rebase worker for task {rebases[0].id}" in output
 
     def test_advance_merge_conflict_fallback_reset_failure_is_hard_error(self, tmp_path: Path):
         """When reset_hard_head fails, advance increments error_count and skips rebase task creation."""
@@ -1044,7 +1095,7 @@ class TestAdvanceCommand:
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
         # Create a pending review
-        store.add(
+        review_task = store.add(
             f"Review {task.id}",
             task_type="review",
             depends_on=task.id,
@@ -1053,7 +1104,9 @@ class TestAdvanceCommand:
 
         result = run_gza("advance", "--auto", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "Started review worker" in result.stdout
+        assert review_task.id is not None
+        assert f"Started task {review_task.id} in background" in result.stdout
+        assert "Started review worker" not in result.stdout
 
     def test_advance_force_propagates_to_run_review_worker(self, tmp_path: Path):
         """advance --force forwards force override when spawning run_review workers."""
@@ -1134,6 +1187,358 @@ class TestAdvanceCommand:
 
         assert rc == 0
         assert captured_force == [True]
+
+    def test_advance_create_review_spawn_failure_reports_created_task_and_worker_error(self, tmp_path: Path):
+        """advance should report created review tasks separately from review worker startup failures."""
+        import argparse
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Completed implementation", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feat/review-spawn-failure"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git()),
+            patch("gza.cli.determine_next_action", return_value={"type": "create_review", "description": "Create review"}),
+            patch("gza.cli._spawn_background_worker", return_value=1),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        review_task = next(t for t in store.get_all() if t.task_type == "review")
+        assert review_task.id is not None
+        assert rc == 1
+        assert f"Created review task {review_task.id}" in output
+        assert f"Failed to start review worker for task {review_task.id}" in output
+        assert f"✗ Created review task {review_task.id}" not in output
+
+    def test_advance_create_implement_spawn_failure_reports_created_task_and_worker_error(self, tmp_path: Path):
+        """advance should report created implement tasks separately from implement worker startup failures."""
+        import argparse
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Completed plan", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git()),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={"type": "create_implement", "description": "Create implement"},
+            ),
+            patch("gza.cli._spawn_background_worker", return_value=1),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        impl_task = next(t for t in store.get_all() if t.task_type == "implement" and t.depends_on == plan.id)
+        assert impl_task.id is not None
+        assert rc == 1
+        assert f"Created implement task {impl_task.id}" in output
+        assert f"Failed to start implement worker for task {impl_task.id}" in output
+        assert f"✗ Created implement task {impl_task.id}" not in output
+
+    def test_advance_resume_spawn_failure_reports_created_task_and_worker_error(self, tmp_path: Path):
+        """advance should report created resume tasks separately from resume worker startup failures."""
+        import argparse
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_task = store.add("Failed implementation", task_type="implement")
+        failed_task.status = "failed"
+        failed_task.failure_reason = "MAX_STEPS"
+        failed_task.session_id = "resume-session"
+        failed_task.completed_at = datetime.now(UTC)
+        store.update(failed_task)
+        assert failed_task.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git()),
+            patch("gza.cli.determine_next_action", return_value={"type": "resume", "description": "Resume task"}),
+            patch("gza.cli._spawn_background_resume_worker", return_value=1),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        resume_task = next(t for t in store.get_based_on_children(failed_task.id) if t.task_type == "implement")
+        assert resume_task.id is not None
+        assert rc == 1
+        assert f"Created resume task {resume_task.id}" in output
+        assert f"Failed to start resume worker for task {resume_task.id}" in output
+        assert f"✗ Created resume task {resume_task.id}" not in output
+
+    def test_advance_needs_rebase_spawn_failure_reports_created_task_and_worker_error(self, tmp_path: Path):
+        """advance should report created rebase tasks separately from rebase worker startup failures."""
+        import argparse
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Needs rebase", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feat/rebase-spawn-failure"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+        assert task.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git()),
+            patch("gza.cli.determine_next_action", return_value={"type": "needs_rebase", "description": "Needs rebase"}),
+            patch("gza.cli._spawn_background_worker", return_value=1),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        rebase_task = next(t for t in store.get_based_on_children(task.id) if t.task_type == "rebase")
+        assert rebase_task.id is not None
+        assert rc == 1
+        assert f"Created rebase task {rebase_task.id}" in output
+        assert f"Failed to start rebase worker for task {rebase_task.id}" in output
+        assert f"✗ Created rebase task {rebase_task.id}" not in output
+
+    def test_advance_non_spawn_error_message_prints_only_failure_line(self, tmp_path: Path):
+        """Non-spawn execution errors must not also print a green success line."""
+        import argparse
+
+        from gza.cli.advance_executor import AdvanceActionExecutionResult
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Completed implementation", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feat/non-spawn-error"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git()),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={"type": "create_review", "description": "Create review"},
+            ),
+            patch(
+                "gza.cli.execute_advance_action",
+                return_value=AdvanceActionExecutionResult(
+                    action_type="create_review",
+                    status="error",
+                    message="review creation returned no task",
+                    attempted_spawn=False,
+                ),
+            ),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        assert rc == 1
+        assert "✗ review creation returned no task" in output
+        assert "✓ review creation returned no task" not in output
+
+    def test_advance_improve_value_error_does_not_print_green_success(self, tmp_path: Path):
+        """Improve creation ValueErrors must surface only as failures."""
+        import argparse
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path, "Improve duplicate path")
+        assert task.id is not None
+
+        review_task = store.add(
+            f"Review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nFix things."
+        store.update(review_task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli._create_improve_task", side_effect=ValueError("duplicate improve task")),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={"type": "improve", "description": "Create improve", "review_task": review_task},
+            ),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        assert rc == 1
+        assert "✗ duplicate improve task" in output
+        assert "✓ duplicate improve task" not in output
+
+    def test_advance_iterate_create_implement_spawn_failure_uses_iterate_worker_label(self, tmp_path: Path):
+        """Iterate-mode implement launch failures must mention the iterate worker path."""
+        import argparse
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\ndb_path: .gza/gza.db\n"
+            "advance_mode: iterate\n"
+        )
+        store = make_store(tmp_path)
+
+        plan = store.add("Completed plan", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git()),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={"type": "create_implement", "description": "Create implement"},
+            ),
+            patch("gza.cli._spawn_background_iterate_worker", return_value=1),
+            patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        impl_task = next(t for t in store.get_all() if t.task_type == "implement" and t.depends_on == plan.id)
+        assert impl_task.id is not None
+        assert rc == 1
+        assert f"Created implement task {impl_task.id}" in output
+        assert f"Failed to start iterate worker for task {impl_task.id}" in output
+        assert f"Failed to start implement worker for task {impl_task.id}" not in output
+        spawn_worker.assert_not_called()
+
+    def test_advance_iterate_needs_rebase_spawn_failure_uses_iterate_worker_label(self, tmp_path: Path):
+        """Iterate-mode rebase launch failures must mention the iterate worker path."""
+        import argparse
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\ndb_path: .gza/gza.db\n"
+            "advance_mode: iterate\n"
+        )
+        store = make_store(tmp_path)
+
+        task = store.add("Needs iterate rebase", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feat/iterate-rebase-failure"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+        assert task.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git()),
+            patch("gza.cli.determine_next_action", return_value={"type": "needs_rebase", "description": "Needs rebase"}),
+            patch("gza.cli._spawn_background_iterate_worker", return_value=1),
+            patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        assert rc == 1
+        assert f"Failed to start iterate worker for task {task.id}" in output
+        assert f"Failed to start rebase worker for task {task.id}" not in output
+        spawn_worker.assert_not_called()
 
     def test_advance_waits_for_in_progress_review(self, tmp_path: Path):
         """advance skips a task whose review is in_progress."""

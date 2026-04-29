@@ -380,6 +380,52 @@ def startup_log_path_for_task(config: Config, task: DbTask) -> Path | None:
     return startup_log_path
 
 
+def _print_work_message(message: str, *, color: str | None = None) -> None:
+    """Print a themed work/worker message via the shared Rich console."""
+    wc = _colors.WORK_COLORS
+    message_color = color or wc.default
+    console.print(f"[{message_color}]{rich_escape(message)}[/{message_color}]")
+
+
+def _print_background_worker_started(
+    task: DbTask,
+    *,
+    pid: int,
+    quiet: bool,
+    resume: bool = False,
+) -> None:
+    """Print shared themed startup output for background worker launches."""
+    wc = _colors.WORK_COLORS
+    task_id_color = _colors.TASK_COLORS.task_id
+    task_id = rich_escape(str(task.id) if task.id is not None else "<unknown>")
+    status_text = (
+        f"in background (resuming, PID {pid})"
+        if resume
+        else f"in background (PID {pid})"
+    )
+
+    console.print(
+        f"[{wc.default}]Started task [/{wc.default}]"
+        f"[{task_id_color}]{task_id}[/{task_id_color}]"
+        f"[{wc.default}] {status_text}[/{wc.default}]"
+    )
+    if quiet:
+        return
+
+    if task.prompt:
+        prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
+        console.print(
+            f"  [{wc.default}]Prompt:[/{wc.default}] "
+            f"[{_colors.pink}]{rich_escape(prompt_display)}[/{_colors.pink}]"
+        )
+    console.print("")
+    console.print(
+        f"[{wc.default}]Use 'gza log [/{wc.default}]"
+        f"[{task_id_color}]{task_id}[/{task_id_color}]"
+        f"[{wc.default}] -f' to follow progress[/{wc.default}]"
+    )
+
+
 def _spawn_detached_worker_process(
     cmd: list[str],
     config: Config,
@@ -511,42 +557,54 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     if explicit_task_id is not None:
         task = store.get(explicit_task_id)
         if not task:
-            print(f"Error: Task {explicit_task_id} not found")
+            _print_work_message(f"Error: Task {explicit_task_id} not found", color=_colors.WORK_COLORS.error)
             return 1
 
         if resume_mode:
             if task.status not in ("pending", "failed"):
-                print(
-                    f"Error: Task {explicit_task_id} is not resumable "
-                    f"(status: {task.status})"
+                _print_work_message(
+                    f"Error: Task {explicit_task_id} is not resumable (status: {task.status})",
+                    color=_colors.WORK_COLORS.error,
                 )
                 return 1
             if not task.session_id:
-                print(f"Error: Task {explicit_task_id} has no session ID (cannot resume)")
+                _print_work_message(
+                    f"Error: Task {explicit_task_id} has no session ID (cannot resume)",
+                    color=_colors.WORK_COLORS.error,
+                )
                 return 1
         else:
             allow_pr_retry = _allow_pr_required_retry(args, task)
             if task.status != "pending" and not allow_pr_retry:
-                print(f"Error: Task {explicit_task_id} is not pending (status: {task.status})")
+                _print_work_message(
+                    f"Error: Task {explicit_task_id} is not pending (status: {task.status})",
+                    color=_colors.WORK_COLORS.error,
+                )
                 return 1
 
             # Check if task is blocked
             is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
             if is_blocked:
-                print(f"Error: Task {explicit_task_id} is blocked by task {blocking_id} ({blocking_status})")
+                _print_work_message(
+                    f"Error: Task {explicit_task_id} is blocked by task {blocking_id} ({blocking_status})",
+                    color=_colors.WORK_COLORS.error,
+                )
                 return 1
         selected_task = task
     else:
         if resume_mode:
-            print("Error: Cannot resume without specifying a task ID")
+            _print_work_message("Error: Cannot resume without specifying a task ID", color=_colors.WORK_COLORS.error)
             return 1
         # Select a candidate for UX; actual claim happens in the child runner.
         selected_task = store.get_next_pending(tags=selected_tags, any_tag=any_tag)
         if not selected_task:
             if selected_tags:
-                print(format_no_runnable_message_for_tags(store, selected_tags, any_tag=any_tag))
+                _print_work_message(
+                    format_no_runnable_message_for_tags(store, selected_tags, any_tag=any_tag),
+                    color=_colors.WORK_COLORS.waiting,
+                )
             else:
-                print("No pending tasks found")
+                _print_work_message("No pending tasks found", color=_colors.WORK_COLORS.waiting)
             return 0
 
     assert selected_task is not None
@@ -692,18 +750,12 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         )
         registry.register(worker_metadata)
 
-        if not quiet:
-            print(f"Started task {selected_task.id} in background (PID {pid})")
-            if selected_task.prompt:
-                prompt_display = truncate(selected_task.prompt, MAX_PROMPT_DISPLAY)
-                print(f"  Prompt: {prompt_display}")
-            print()
-            print(f"Use 'gza log {selected_task.id} -f' to follow progress")
+        _print_background_worker_started(selected_task, pid=pid, quiet=quiet, resume=resume_mode)
 
         return 0
 
     except Exception as e:
-        print(f"Error spawning background worker: {e}")
+        _print_work_message(f"Error spawning background worker: {e}", color=_colors.WORK_COLORS.error)
         return 1
 
 
@@ -860,7 +912,7 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
     # Get the new resume task
     task = store.get(new_task_id)
     if not task:
-        print(f"Error: Task {new_task_id} not found")
+        _print_work_message(f"Error: Task {new_task_id} not found", color=_colors.WORK_COLORS.error)
         return 1
 
     # Build command for worker subprocess
@@ -899,18 +951,12 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         )
         registry.register(worker)
 
-        if not quiet:
-            print(f"Started task {task.id} in background (resuming, PID {proc.pid})")
-            if task.prompt:
-                prompt_display = truncate(task.prompt, MAX_PROMPT_DISPLAY)
-                print(f"  Prompt: {prompt_display}")
-            print()
-            print(f"Use 'gza log {task.id} -f' to follow progress")
+        _print_background_worker_started(task, pid=proc.pid, quiet=quiet, resume=True)
 
         return 0
 
     except Exception as e:
-        print(f"Error spawning background worker: {e}")
+        _print_work_message(f"Error spawning background worker: {e}", color=_colors.WORK_COLORS.error)
         return 1
 
 
@@ -962,15 +1008,10 @@ def _spawn_background_iterate_worker(
             startup_log_file=startup_log_rel,
         )
         registry.register(worker)
-        if quiet:
-            print(f"Started task {impl_task.id} in background (PID {proc.pid})")
-        else:
-            print(f"Started task {impl_task.id} in background (PID {proc.pid})")
-            print()
-            print(f"Use 'gza log {impl_task.id} -f' to follow progress")
+        _print_background_worker_started(impl_task, pid=proc.pid, quiet=quiet)
         return 0
     except Exception as e:
-        print(f"Error spawning background iterate worker: {e}")
+        _print_work_message(f"Error spawning background iterate worker: {e}", color=_colors.WORK_COLORS.error)
         return 1
 
 

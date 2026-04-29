@@ -1489,7 +1489,7 @@ def _prepare_create_review_action(store: SqliteTaskStore, task: DbTask) -> _Crea
     return _CreateReviewActionResult(
         status="created",
         review_task=review_task,
-        message=f"✓ Created review task {review_task.id}",
+        message=f"Created review task {review_task.id}",
     )
 
 
@@ -1548,7 +1548,7 @@ def _execute_merge_action(
 
 def _advance_action_color(action_type: str) -> str:
     """Return a Rich color for an advance action type."""
-    ac = _colors.ADVANCE_COLORS
+    ac = _colors.WORK_COLORS
     if action_type in {'merge', 'merge_with_followups'}:
         return ac.merge
     if action_type in ('needs_rebase', 'needs_discussion', 'max_cycles_reached', 'max_improve_attempts'):
@@ -1563,8 +1563,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
 
-    # Themed advance colors — resolved once after Config.load() applies the theme.
-    _ac = _colors.ADVANCE_COLORS
+    # Themed work/advance colors — resolved once after Config.load() applies the theme.
+    _ac = _colors.WORK_COLORS
     _c_tid = _colors.TASK_COLORS.task_id
     _c_ok = _ac.merge
     _c_err = _ac.error
@@ -1872,6 +1872,44 @@ def cmd_advance(args: argparse.Namespace) -> int:
     attention_tasks: list[tuple[DbTask, dict]] = []
     action_context = _build_action_context(dry_run_mode=False)
 
+    def _render_worker_action_result(task: DbTask, action_type: str, exec_result) -> None:
+        nonlocal workers_started, success_count, skip_count, error_count
+
+        if exec_result.attempted_spawn:
+            workers_started += 1
+
+        if exec_result.status == "skip":
+            console.print(f"      [{_c_warn}]{exec_result.message}[/{_c_warn}]")
+            skip_count += 1
+            if exec_result.attention_type == "max_improve_attempts":
+                attention_tasks.append(
+                    (
+                        task,
+                        {
+                            "type": "max_improve_attempts",
+                            "description": exec_result.message,
+                        },
+                    )
+                )
+            return
+
+        if exec_result.status == "error":
+            if exec_result.success_message:
+                console.print(f"      [{_c_ok}]✓ {exec_result.success_message}[/{_c_ok}]")
+            err_message = exec_result.error_message or exec_result.message or f"Failed to execute {action_type}"
+            console.print(f"      [{_c_err}]✗ {err_message}[/{_c_err}]")
+            error_count += 1
+            return
+
+        success_message = exec_result.success_message or exec_result.message
+        if success_message:
+            console.print(f"      [{_c_ok}]✓ {success_message}[/{_c_ok}]")
+
+        if exec_result.worker_started:
+            success_count += 1
+        elif exec_result.worker_consuming:
+            error_count += 1
+
     for task, action in plan:
         assert task.id is not None
         prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
@@ -1939,96 +1977,23 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         )
                         error_count += 1
                         continue
-                    assert task_branch is not None  # guaranteed by conflict_detected guard
-                    rebase_task = _create_rebase_task(store, task.id, task_branch, target_branch)
-                    assert rebase_task.id is not None
-                    console.print(
-                        f"      [{_c_ok}]✓ Created rebase task {rebase_task.id} "
-                        f"(target: {target_branch})[/{_c_ok}]"
+                    exec_result = execute_advance_action(
+                        task=task,
+                        action={"type": "needs_rebase", "description": "Create rebase task"},
+                        context=action_context,
                     )
-                    worker_args = argparse.Namespace(
-                        no_docker=getattr(args, 'no_docker', False),
-                        max_turns=None,
-                        force=force,
-                    )
-                    rebase_rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
-                    workers_started += 1
-                    if rebase_rc == 0:
-                        console.print(f"      [{_c_ok}]✓ Started rebase worker[/{_c_ok}]")
-                        success_count += 1
-                    else:
-                        console.print(f"      [{_c_err}]✗ Failed to start rebase worker[/{_c_err}]")
-                        error_count += 1
+                    if exec_result.success_message:
+                        exec_result.success_message = (
+                            f"{exec_result.success_message} (target: {target_branch})"
+                        )
+                    _render_worker_action_result(task, action_type, exec_result)
                 else:
                     console.print(f"      [{_c_err}]✗ Merge failed[/{_c_err}]")
                     error_count += 1
 
         else:
             exec_result = execute_advance_action(task=task, action=action, context=action_context)
-            if exec_result.attempted_spawn:
-                workers_started += 1
-
-            if exec_result.status == "skip":
-                console.print(f"      [{_c_warn}]{exec_result.message}[/{_c_warn}]")
-                skip_count += 1
-                if exec_result.attention_type == "max_improve_attempts":
-                    attention_tasks.append(
-                        (
-                            task,
-                            {
-                                "type": "max_improve_attempts",
-                                "description": exec_result.message,
-                            },
-                        )
-                    )
-                continue
-
-            if exec_result.status == "error":
-                err_message = exec_result.message or f"Failed to execute {action_type}"
-                console.print(f"      [{_c_err}]✗ {err_message}[/{_c_err}]")
-                error_count += 1
-                continue
-
-            if exec_result.message:
-                console.print(f"      [{_c_ok}]✓ {exec_result.message}[/{_c_ok}]")
-
-            started_id = exec_result.handled_task_id
-            if exec_result.worker_started:
-                if action_type == "create_review":
-                    console.print(f"      [{_c_ok}]✓ Started review worker[/{_c_ok}]")
-                elif action_type == "run_review" and started_id is not None:
-                    console.print(f"      [{_c_ok}]✓ Started review worker for {started_id}[/{_c_ok}]")
-                elif action_type == "improve":
-                    console.print(f"      [{_c_ok}]✓ Started improve worker[/{_c_ok}]")
-                elif action_type == "run_improve" and started_id is not None:
-                    console.print(f"      [{_c_ok}]✓ Started improve worker for {started_id}[/{_c_ok}]")
-                elif action_type == "resume":
-                    console.print(f"      [{_c_ok}]✓ Started resume worker[/{_c_ok}]")
-                elif action_type == "create_implement":
-                    started_label = "iterate worker for implement task" if use_iterate_mode else "implement worker"
-                    console.print(f"      [{_c_ok}]✓ Started {started_label}[/{_c_ok}]")
-                elif action_type == "needs_rebase":
-                    started_label = "iterate worker for rebase cycle" if use_iterate_mode else "rebase worker"
-                    console.print(f"      [{_c_ok}]✓ Started {started_label}[/{_c_ok}]")
-                success_count += 1
-            elif exec_result.worker_consuming:
-                if action_type == "run_review" and started_id is not None:
-                    console.print(f"      [{_c_err}]✗ Failed to start review worker for {started_id}[/{_c_err}]")
-                elif action_type == "run_improve" and started_id is not None:
-                    console.print(f"      [{_c_err}]✗ Failed to start improve worker for {started_id}[/{_c_err}]")
-                elif action_type == "create_review":
-                    console.print(f"      [{_c_err}]✗ Failed to start review worker[/{_c_err}]")
-                elif action_type == "improve":
-                    console.print(f"      [{_c_err}]✗ Failed to start improve worker[/{_c_err}]")
-                elif action_type == "resume":
-                    console.print(f"      [{_c_err}]✗ Failed to start resume worker[/{_c_err}]")
-                elif action_type == "create_implement":
-                    failed_label = "iterate worker for implement task" if use_iterate_mode else "implement worker"
-                    console.print(f"      [{_c_err}]✗ Failed to start {failed_label}[/{_c_err}]")
-                elif action_type == "needs_rebase":
-                    failed_label = "iterate worker for rebase cycle" if use_iterate_mode else "rebase worker"
-                    console.print(f"      [{_c_err}]✗ Failed to start {failed_label}[/{_c_err}]")
-                error_count += 1
+            _render_worker_action_result(task, action_type, exec_result)
 
         print()
 

@@ -226,6 +226,8 @@ Rebase tasks need git identity for `git rebase --continue`. The Docker container
 
 ## Output
 
+For worker-spawning actions that first create a child task (`create_review`, `create_implement`, `resume`, `needs_rebase`), operator output must distinguish creation success from worker-launch failure. If creation succeeds but the background worker fails to start, `gza advance` should print both the created task ID and a separate `Failed to start ... worker` line rather than collapsing that state into `✗ Created ...`.
+
 ```
 Will advance N task(s):
 

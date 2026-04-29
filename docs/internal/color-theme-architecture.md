@@ -14,7 +14,7 @@ Module-level constants with semantic names (`pink`, `gray_secondary`, `blue_neon
 
 ### Domain color dataclasses
 
-Seven frozen dataclasses, one per output context:
+Frozen dataclasses, one per output context:
 
 | Class | Used by |
 |-------|---------|
@@ -25,6 +25,8 @@ Seven frozen dataclasses, one per output context:
 | `UnmergedColors` | `gza unmerged` |
 | `LineageColors` | `gza lineage` |
 | `NextColors` | `gza next` |
+| `RunnerColors` | Post-task runner summaries and next-step blocks |
+| `WorkColors` | Background work startup output and `gza advance` action text |
 
 Each field has a hardcoded default (lowest priority).
 

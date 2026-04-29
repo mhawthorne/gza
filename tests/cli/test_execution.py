@@ -1716,6 +1716,128 @@ class TestBackgroundWorkerCommand:
             f"Project dir must be preceded by --project flag, but got: {captured_cmd[project_idx - 1]!r}. " \
             f"Full command: {captured_cmd}"
 
+    def test_background_worker_verbose_output_escapes_prompt_and_shows_log_hint(self, tmp_path: Path):
+        """Verbose startup output preserves literal bracket text in prompts."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+        from gza.console import console
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Prompt with [literal] brackets")
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        config = Config.load(tmp_path)
+        config.tmux.enabled = False
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 22222
+
+        with (
+            patch("gza.cli.subprocess.Popen", return_value=mock_proc),
+            console.capture() as capture,
+        ):
+            rc = _spawn_background_worker(args, config, task_id=task.id)
+
+        output = capture.get()
+        assert rc == 0
+        assert f"Started task {task.id} in background (PID {mock_proc.pid})" in output
+        assert "Prompt: Prompt with [literal] brackets" in output
+        assert f"Use 'gza log {task.id} -f' to follow progress" in output
+
+    def test_background_worker_quiet_output_is_compact(self, tmp_path: Path):
+        """Quiet startup output should omit prompt and follow instructions."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+        from gza.console import console
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Quiet worker")
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        config = Config.load(tmp_path)
+        config.tmux.enabled = False
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 33333
+
+        with (
+            patch("gza.cli.subprocess.Popen", return_value=mock_proc),
+            console.capture() as capture,
+        ):
+            rc = _spawn_background_worker(args, config, task_id=task.id, quiet=True)
+
+        output = capture.get()
+        assert rc == 0
+        assert f"Started task {task.id} in background (PID {mock_proc.pid})" in output
+        assert "Prompt:" not in output
+        assert "Use 'gza log" not in output
+
+    def test_background_resume_worker_verbose_output_matches_work_style(self, tmp_path: Path):
+        """Resume startup output reuses the same themed shape as regular work."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import _spawn_background_resume_worker
+        from gza.config import Config
+        from gza.console import console
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Resume [literal] prompt")
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        config = Config.load(tmp_path)
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 44444
+
+        with (
+            patch("gza.cli.subprocess.Popen", return_value=mock_proc),
+            console.capture() as capture,
+        ):
+            rc = _spawn_background_resume_worker(args, config, new_task_id=task.id)
+
+        output = capture.get()
+        assert rc == 0
+        assert f"Started task {task.id} in background (resuming, PID {mock_proc.pid})" in output
+        assert "Prompt: Resume [literal] prompt" in output
+        assert f"Use 'gza log {task.id} -f' to follow progress" in output
+
     def test_background_worker_registers_startup_log_file(self, tmp_path: Path):
         """Background worker captures early stdout/stderr into startup log metadata."""
         import argparse

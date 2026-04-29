@@ -43,6 +43,8 @@ class AdvanceActionExecutionResult:
     action_type: str
     status: Literal["success", "skip", "error", "dry_run", "unsupported"]
     message: str = ""
+    success_message: str = ""
+    error_message: str = ""
     worker_consuming: bool = False
     attempted_spawn: bool = False
     worker_started: bool = False
@@ -72,6 +74,7 @@ def _spawn_result(
     action_type: str,
     rc: int,
     handled_task_id: str,
+    worker_label: str,
     created_task: DbTask | None = None,
     improve_mode: str | None = None,
     failed_improve: DbTask | None = None,
@@ -79,6 +82,7 @@ def _spawn_result(
     return AdvanceActionExecutionResult(
         action_type=action_type,
         status="success" if rc == 0 else "error",
+        error_message="" if rc == 0 else f"Failed to start {worker_label} worker for task {handled_task_id}",
         worker_consuming=True,
         attempted_spawn=True,
         worker_started=rc == 0,
@@ -139,9 +143,10 @@ def execute_advance_action(
             action_type=action_type,
             rc=rc,
             handled_task_id=review_task.id,
+            worker_label="review",
             created_task=review_task,
         )
-        result.message = create_result.message
+        result.success_message = create_result.message
         return result
 
     if action_type == "run_review":
@@ -165,6 +170,7 @@ def execute_advance_action(
             action_type=action_type,
             rc=rc,
             handled_task_id=review_task.id,
+            worker_label="review",
             created_task=review_task,
         )
 
@@ -259,6 +265,7 @@ def execute_advance_action(
             action_type=action_type,
             rc=rc,
             handled_task_id=improve_task.id,
+            worker_label="improve",
             created_task=improve_task,
             improve_mode=improve_mode,
             failed_improve=failed_improve,
@@ -285,6 +292,7 @@ def execute_advance_action(
             action_type=action_type,
             rc=rc,
             handled_task_id=run_improve_task.id,
+            worker_label="improve",
             created_task=run_improve_task,
         )
 
@@ -307,9 +315,10 @@ def execute_advance_action(
             action_type=action_type,
             rc=rc,
             handled_task_id=resume_task.id,
+            worker_label="resume",
             created_task=resume_task,
         )
-        result.message = f"Created resume task {resume_task.id}"
+        result.success_message = f"Created resume task {resume_task.id}"
         return result
 
     if action_type == "create_implement":
@@ -328,16 +337,19 @@ def execute_advance_action(
         assert impl_task.id is not None
         if context.use_iterate_for_create_implement:
             rc = context.spawn_iterate_worker(impl_task, "implement")
+            worker_label = "iterate"
         else:
             rc = context.spawn_worker(impl_task.id, "implement")
+            worker_label = "implement"
 
         result = _spawn_result(
             action_type=action_type,
             rc=rc,
             handled_task_id=impl_task.id,
+            worker_label=worker_label,
             created_task=impl_task,
         )
-        result.message = f"Created implement task {impl_task.id}"
+        result.success_message = f"Created implement task {impl_task.id}"
         return result
 
     if action_type == "needs_rebase":
@@ -362,6 +374,7 @@ def execute_advance_action(
                 action_type=action_type,
                 rc=rc,
                 handled_task_id=task.id,
+                worker_label="iterate",
                 created_task=task,
             )
 
@@ -372,9 +385,10 @@ def execute_advance_action(
             action_type=action_type,
             rc=rc,
             handled_task_id=rebase_task.id,
+            worker_label="rebase",
             created_task=rebase_task,
         )
-        result.message = f"Created rebase task {rebase_task.id}"
+        result.success_message = f"Created rebase task {rebase_task.id}"
         return result
 
     return AdvanceActionExecutionResult(
