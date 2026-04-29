@@ -158,6 +158,15 @@ class TestHelpOutput:
         assert "Review and iteration analytics" in result.stdout
         assert "Review analytics (use 'gza stats reviews')" not in result.stdout
 
+    def test_ps_docs_describe_worker_prune_without_task_reconciliation(self, tmp_path):
+        """Operator docs for ps should match the non-reconciling startup path."""
+        setup_config(tmp_path)
+
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "`gza ps`/`gza status` only prune dead worker metadata" in docs_text
+        assert "On CLI startup, `in_progress` tasks are reconciled and auto-failed" not in docs_text
+
     def test_add_next_help_and_docs_describe_front_of_urgent_lane(self, tmp_path):
         """`add --next` contract should explicitly mention bump-to-front urgent-lane behavior."""
         setup_config(tmp_path)
@@ -378,15 +387,63 @@ class TestReconciliationWarnings:
         setup_config(tmp_path)
 
         with (
-            patch.object(sys, "argv", ["gza", "ps", "--project", str(tmp_path)]),
+            patch.object(sys, "argv", ["gza", "work", "--project", str(tmp_path)]),
             patch("gza.cli.main.reconcile_in_progress_tasks", side_effect=RuntimeError("boom")),
-            patch("gza.cli.main.cmd_ps", return_value=0),
+            patch("gza.cli.main.cmd_run", return_value=0),
         ):
             rc = main()
 
         captured = capsys.readouterr()
         assert rc == 0
         assert "Warning: In-progress reconciliation failed: boom" in captured.err
+
+    @pytest.mark.parametrize(
+        ("command", "patched_command"),
+        [
+            ("ps", "cmd_ps"),
+            ("status", "cmd_status"),
+        ],
+    )
+    def test_main_skips_task_reconciliation_for_query_worker_views(
+        self,
+        tmp_path,
+        command: str,
+        patched_command: str,
+    ) -> None:
+        """ps/status should prune worker metadata without reconciling DB task state."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(sys, "argv", ["gza", command, "--project", str(tmp_path)]),
+            patch("gza.cli.main.reconcile_in_progress_tasks") as reconcile,
+            patch("gza.cli.main.prune_terminal_dead_workers") as prune,
+            patch(f"gza.cli.main.{patched_command}", return_value=0),
+        ):
+            rc = main()
+
+        assert rc == 0
+        reconcile.assert_not_called()
+        prune.assert_called_once()
+
+    def test_main_reconciles_for_work_commands(self, tmp_path) -> None:
+        """Mutating lifecycle commands should still reconcile stale in-progress tasks on startup."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(sys, "argv", ["gza", "work", "--project", str(tmp_path)]),
+            patch("gza.cli.main.reconcile_in_progress_tasks") as reconcile,
+            patch("gza.cli.main.prune_terminal_dead_workers") as prune,
+            patch("gza.cli.main.cmd_run", return_value=0),
+        ):
+            rc = main()
+
+        assert rc == 0
+        reconcile.assert_called_once()
+        prune.assert_not_called()
 
 
 class TestCommandAliases:

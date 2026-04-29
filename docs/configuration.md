@@ -702,7 +702,8 @@ gza ps [options]
 
 Runtime reconciliation notes:
 - Task lifecycle state is derived from the DB `tasks` table (`status`, `started_at`, `running_pid`), while worker metadata is a process index.
-- On CLI startup, `in_progress` tasks are reconciled and auto-failed as:
+- On CLI startup, `gza ps`/`gza status` only prune dead worker metadata; they do not reconcile or auto-fail `in_progress` DB tasks.
+- DB reconciliation for stale `in_progress` tasks still happens on mutating lifecycle commands such as `gza work`, where tasks may be auto-failed as:
   - `WORKER_DIED` when `running_pid` is missing/invalid or the PID is no longer alive.
   - `TIMEOUT` when runtime exceeds configured `timeout_minutes`.
 - `gza ps` merges worker rows and DB in-progress tasks by task ownership, so healthy background runs appear as one active task row.

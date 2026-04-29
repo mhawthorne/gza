@@ -42,6 +42,37 @@ def _unmerged_branch_block(output: str, branch: str) -> str:
     raise AssertionError(f"Branch block not found for {branch}")
 
 
+def _drop_task_comments_column(db_path: Path, column_name: str) -> None:
+    """Rebuild task_comments without a specific column."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE task_comments RENAME TO task_comments_old")
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(task_comments_old)")]
+    kept_cols = [col for col in cols if col != column_name]
+    cols_str = ", ".join(kept_cols)
+    col_defs = []
+    for row in conn.execute("PRAGMA table_info(task_comments_old)"):
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        parts = [name, typ]
+        if pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    conn.execute(f"CREATE TABLE task_comments ({', '.join(col_defs)})")
+    conn.execute(f"INSERT INTO task_comments ({cols_str}) SELECT {cols_str} FROM task_comments_old")
+    conn.execute("DROP TABLE task_comments_old")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_comments_task_created ON task_comments(task_id, created_at ASC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_comments_task_unresolved ON task_comments(task_id, resolved_at)")
+    conn.commit()
+    conn.close()
+
+
 class TestHistoryCommand:
     """Tests for 'gza history' command."""
 
@@ -77,6 +108,27 @@ class TestHistoryCommand:
 
         assert result.returncode == 0
         assert "No completed or failed tasks" in result.stdout
+
+    def test_history_reads_frozen_snapshot_without_startup_write_error(self, tmp_path: Path):
+        """History should inspect a read-only snapshot without triggering startup writes."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Frozen history task")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("history", "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 0
+        assert "Frozen history task" in result.stdout
+        assert "readonly" not in result.stderr.lower()
 
     def test_history_filter_by_completed_status(self, tmp_path: Path):
         """History command filters by completed status."""
@@ -1045,8 +1097,8 @@ class TestHistoryCommand:
         assert result.returncode == 0
         assert f"← {plan.id} (dep {blocker.id})" in result.stdout
 
-    def test_history_reconciles_in_progress_tasks(self, tmp_path: Path):
-        """History command reconciles orphaned in_progress tasks to failed (WORKER_DIED)."""
+    def test_history_shows_orphaned_in_progress_tasks_without_reconciling(self, tmp_path: Path):
+        """History should display orphaned tasks directly instead of mutating DB state."""
         from datetime import datetime
 
         setup_config(tmp_path)
@@ -1062,9 +1114,11 @@ class TestHistoryCommand:
         result = run_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        # Reconciliation must have run: task should be shown as failed with WORKER_DIED reason
-        assert "failed" in result.stdout
-        assert "WORKER_DIED" in result.stdout
+        assert "orphaned" in result.stdout.lower()
+        assert "Orphaned in_progress" in result.stdout
+        reloaded = store.get(orphaned.id)
+        assert reloaded is not None
+        assert reloaded.status == "in_progress"
 
     def test_history_tag_filter_is_case_insensitive_with_json_text_parity(self, tmp_path: Path):
         """history --tag should match canonical lowercase tags regardless of filter case."""
@@ -1333,6 +1387,49 @@ class TestNextCommand:
 
         assert result.returncode == 0
         assert "No pending tasks" in result.stdout
+
+    def test_next_reads_frozen_snapshot_without_startup_write_error(self, tmp_path: Path):
+        """Next should inspect a read-only snapshot without triggering startup writes."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Frozen next task")
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("next", "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 0
+        assert "Frozen next task" in result.stdout
+        assert "readonly" not in result.stderr.lower()
+
+    def test_next_query_only_missing_task_comments_id_warns_without_traceback(self, tmp_path: Path):
+        """Next should degrade comment counts cleanly when task_comments.id is missing."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Pending task with missing comment ids")
+        assert task.id is not None
+        store.add_comment(task.id, "Existing comment", source="direct")
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        _drop_task_comments_column(db_path, "id")
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("next", "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 0
+        assert "Pending task with missing comment ids" in result.stdout
+        assert "comments:" not in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
+        assert "Warning: Query-only DB open detected incomplete task_comments schema" in result.stderr
 
     def test_next_rejects_empty_tag_without_traceback(self, tmp_path: Path):
         """next --tag '' should fail with user-facing validation, not traceback."""
@@ -2222,8 +2319,8 @@ class TestShowCommand:
         assert "First note" in result.stdout
         assert "Second note" in result.stdout
 
-    def test_show_reports_schema_integrity_error_for_readonly_damaged_db(self, tmp_path: Path):
-        """Show command should fail cleanly if schema repair is needed on a read-only DB."""
+    def test_show_warns_and_reads_when_readonly_db_is_missing_task_comments(self, tmp_path: Path):
+        """Show should warn instead of trying to repair task_comments on a frozen DB."""
         import sqlite3
 
         setup_config(tmp_path)
@@ -2233,7 +2330,6 @@ class TestShowCommand:
 
         db_path = tmp_path / ".gza" / "gza.db"
         conn = sqlite3.connect(db_path)
-        conn.execute("UPDATE schema_version SET version = 33")
         conn.execute("DROP TABLE task_comments")
         conn.commit()
         conn.close()
@@ -2245,9 +2341,155 @@ class TestShowCommand:
         finally:
             os.chmod(db_path, original_mode)
 
+        assert result.returncode == 0
+        assert "Task with damaged schema" in result.stdout
+        assert "Warning: Query-only DB open detected incomplete task_comments schema" in result.stderr
+
+    def test_show_query_only_missing_task_comments_id_warns_without_traceback(self, tmp_path: Path):
+        """Show should degrade comments cleanly when task_comments.id is missing on a frozen DB."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with missing comment ids")
+        assert task.id is not None
+        store.add_comment(task.id, "Existing comment", source="direct")
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        _drop_task_comments_column(db_path, "id")
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 0
+        assert "Task with missing comment ids" in result.stdout
+        assert "Comments:" not in result.stdout
+        assert "Existing comment" not in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
+        assert "Warning: Query-only DB open detected incomplete task_comments schema" in result.stderr
+
+    def test_show_query_only_missing_tasks_project_id_surfaces_controlled_error_without_traceback(
+        self,
+        tmp_path: Path,
+    ):
+        """Show should fail closed with a schema error when tasks.project_id is missing."""
+        import sqlite3
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with missing project_id")
+        assert task.id is not None
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
+        conn.execute(
+            """
+            CREATE TABLE tasks AS
+            SELECT
+                id,
+                prompt,
+                status,
+                task_type,
+                slug,
+                branch,
+                log_file,
+                report_file,
+                based_on,
+                has_commits,
+                duration_seconds,
+                num_steps_reported,
+                num_steps_computed,
+                num_turns,
+                num_turns_reported,
+                num_turns_computed,
+                attach_count,
+                attach_duration_seconds,
+                cost_usd,
+                created_at,
+                started_at,
+                running_pid,
+                completed_at,
+                "group",
+                depends_on,
+                spec,
+                create_review,
+                same_branch,
+                task_type_hint,
+                output_content,
+                session_id,
+                pr_number,
+                model,
+                provider,
+                provider_is_explicit,
+                urgent,
+                urgent_bumped_at,
+                queue_position,
+                input_tokens,
+                output_tokens,
+                merge_status,
+                merged_at,
+                failure_reason,
+                skip_learnings,
+                diff_files_changed,
+                diff_lines_added,
+                diff_lines_removed,
+                review_cleared_at,
+                review_score,
+                log_schema_version,
+                execution_mode,
+                base_branch
+            FROM tasks_old
+            """
+        )
+        conn.execute("DROP TABLE tasks_old")
+        conn.commit()
+        conn.close()
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
         assert result.returncode == 1
-        assert "schema integrity check failed while repairing v32" in result.stderr.lower()
-        assert "writable database" in result.stderr.lower()
+        assert "Error: Query-only DB open detected missing required column tasks.project_id" in result.stderr
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
+
+    def test_show_query_only_missing_tasks_table_surfaces_controlled_error_without_traceback(
+        self,
+        tmp_path: Path,
+    ):
+        """Show should fail closed with a schema error when the tasks table is missing."""
+        import sqlite3
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task before dropping tasks table")
+        assert task.id is not None
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE tasks")
+        conn.commit()
+        conn.close()
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 1
+        assert "Error: Query-only DB open detected missing required table tasks" in result.stderr
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
 
     def test_show_nonexistent_task(self, tmp_path: Path):
         """Show command handles nonexistent task."""
@@ -4793,6 +5035,82 @@ class TestPsCommand:
 
         registry.remove("w-test-steps-live")
 
+    def test_ps_query_only_missing_run_steps_project_id_warns_without_traceback(self, tmp_path: Path):
+        """Frozen ps snapshots should degrade damaged run_steps columns behind a warning."""
+        import json
+        import os
+        import sqlite3
+
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("In-progress task with damaged run_steps")
+        store.mark_in_progress(task)
+        assert task.id is not None
+
+        for i in range(2):
+            store.emit_step(task.id, f"Step {i + 1}", provider="claude")
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("ALTER TABLE run_steps RENAME TO run_steps_old")
+        conn.execute(
+            """
+            CREATE TABLE run_steps AS
+            SELECT
+                id,
+                run_id,
+                step_index,
+                step_id,
+                provider,
+                message_role,
+                message_text,
+                started_at,
+                completed_at,
+                outcome,
+                summary,
+                legacy_turn_id,
+                legacy_event_id
+            FROM run_steps_old
+            """
+        )
+        conn.execute("DROP TABLE run_steps_old")
+        conn.commit()
+        conn.close()
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-steps-damaged",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(UTC).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("ps", "--json", "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+            registry.remove("w-test-steps-damaged")
+
+        assert result.returncode == 0
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["steps"] == "-"
+        assert "Warning: Query-only DB open detected missing required column run_steps.project_id" in result.stderr
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
+
 
 class TestDeleteCommand:
     """Tests for 'gza delete' command."""
@@ -5944,8 +6262,8 @@ class TestUnmergedAllFlag:
         assert "Deleted branch task" in result.stdout
         assert "branch deleted" in result.stdout
 
-    def test_lazy_migration_backfills_merge_status(self, tmp_path: Path):
-        """Running gza unmerged backfills merge_status for existing tasks."""
+    def test_unmerged_update_backfills_merge_status(self, tmp_path: Path):
+        """Plain unmerged stays read-only; --update backfills merge_status for legacy rows."""
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Old task needing migration",
@@ -5960,8 +6278,16 @@ class TestUnmergedAllFlag:
         git._run("commit", "-m", "Old work")
         git._run("checkout", "main")
 
-        # Run gza unmerged - should trigger migration and show the task
         result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Migrating merge status" not in result.stdout
+        assert "Old task needing migration" not in result.stdout
+
+        unchanged_task = store.get(task.id)
+        assert unchanged_task.merge_status is None
+
+        # Run the explicit mutating path.
+        result = run_gza("unmerged", "--update", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Migrating merge status" in result.stdout
         assert "Old task needing migration" in result.stdout
@@ -6131,6 +6457,62 @@ class TestUnmergedImprovedDisplay:
         assert result.returncode == 0
         assert "Completed task" in result.stdout
         assert "Failed task" not in result.stdout
+
+    def test_unmerged_reads_frozen_snapshot_without_merge_status_backfill(self, tmp_path: Path):
+        """Plain unmerged should not try to persist merge_status on a frozen snapshot."""
+        import os
+
+        store, task, _git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Legacy merge-status task",
+            branch="feature/legacy-merge-status",
+            merge_status=None,
+        )
+        task.merge_status = None
+        store.update(task)
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("unmerged", "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.merge_status is None
+        assert result.returncode == 0
+        assert "Migrating merge status" not in result.stdout
+        assert "readonly" not in result.stderr.lower()
+        assert "No unmerged tasks" in result.stdout
+
+    def test_unmerged_only_persists_merge_status_during_explicit_update(self, tmp_path: Path):
+        """Default unmerged is read-only; --update is the mutating persistence path."""
+        store, task, _git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Legacy merge-status update task",
+            branch="feature/legacy-merge-status-update",
+            merge_status=None,
+        )
+        task.merge_status = None
+        store.update(task)
+        assert task.id is not None
+
+        read_only_view = run_gza("unmerged", "--project", str(tmp_path))
+        assert read_only_view.returncode == 0
+        assert "Migrating merge status" not in read_only_view.stdout
+        unchanged = store.get(task.id)
+        assert unchanged is not None
+        assert unchanged.merge_status is None
+
+        refreshed_view = run_gza("unmerged", "--update", "--project", str(tmp_path))
+        assert refreshed_view.returncode == 0
+        assert "Migrating merge status" in refreshed_view.stdout
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.merge_status == "unmerged"
+        assert "Legacy merge-status update task" in refreshed_view.stdout
 
     def test_unmerged_shows_diff_stats(self, tmp_path: Path):
         """Unmerged output shows diff stats (files, LOC added/removed)."""

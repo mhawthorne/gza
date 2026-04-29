@@ -4582,6 +4582,35 @@ def _drop_task_comments_column(db_path: Path, column_name: str) -> None:
     conn.close()
 
 
+def _drop_run_steps_column(db_path: Path, column_name: str) -> None:
+    """Rebuild run_steps without a specific column."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE run_steps RENAME TO run_steps_old")
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(run_steps_old)")]
+    kept_cols = [c for c in cols if c != column_name]
+    cols_str = ", ".join(kept_cols)
+    col_defs = []
+    for row in conn.execute("PRAGMA table_info(run_steps_old)"):
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        parts = [name, typ]
+        if pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    conn.execute(f"CREATE TABLE run_steps ({', '.join(col_defs)})")
+    conn.execute(f"INSERT INTO run_steps ({cols_str}) SELECT {cols_str} FROM run_steps_old")
+    conn.execute("DROP TABLE run_steps_old")
+    conn.commit()
+    conn.close()
+
+
 class TestMigrationUtilityFunctions:
     """Tests for migration utilities and manual migration chaining."""
 
@@ -5700,9 +5729,34 @@ class TestSharedDbIsolationAndImportGating:
             db_path.chmod(0o644)
 
         assert result.returncode == 1
-        assert "Cannot auto-migrate schema v35->v36 on a read-only database" in result.stderr
+        assert "query-only mode does not run automatic migrations" in result.stderr
         assert "Traceback" not in result.stderr
         assert "Traceback" not in result.stdout
+
+    def test_cli_show_on_manual_migration_db_surfaces_manual_migration_error(self, tmp_path: Path) -> None:
+        """Query-only CLI paths must still surface manual migration requirements explicitly."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "db_path: .gza/gza.db\n",
+            encoding="utf-8",
+        )
+        db_path = project_dir / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        _make_v24_db(db_path)
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "show", "demo-1", "--project", str(project_dir)],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+        )
+
+        assert result.returncode == 1
+        assert "Database requires manual migration(s): v25" in result.stderr
+        assert "Run 'gza migrate' to upgrade the database." in result.stderr
+        assert "Traceback" not in result.stderr
 
     def test_v35_to_v36_migration_keeps_active_prefix_sequence_continuity(self, tmp_path: Path) -> None:
         """v35→v36 migration must keep next ID above existing active-prefix task suffixes."""
@@ -6364,6 +6418,96 @@ class TestSharedDbIsolationAndImportGating:
                 SqliteTaskStore(db_path, prefix="gza")
         finally:
             db_path.chmod(0o644)
+
+    def test_query_only_open_current_db_missing_execution_mode_warns_but_reads(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should warn instead of repairing missing execution_mode on a frozen DB."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task with query-only execution-mode damage")
+        assert task.id is not None
+
+        _drop_tasks_column(db_path, "execution_mode")
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            reloaded = query_store.get(task.id)
+        finally:
+            db_path.chmod(0o644)
+
+        assert reloaded is not None
+        assert reloaded.prompt == "Task with query-only execution-mode damage"
+        assert any("tasks.execution_mode" in warning for warning in query_store.startup_warnings())
+
+    def test_query_only_open_current_db_missing_task_comments_source_warns_and_reads_comments(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should keep comments readable when task_comments.source is missing."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task with query-only comment damage")
+        assert task.id is not None
+        store.add_comment(task.id, "Existing comment", source="direct")
+
+        _drop_task_comments_column(db_path, "source")
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            comments = query_store.get_comments(task.id)
+        finally:
+            db_path.chmod(0o644)
+
+        assert len(comments) == 1
+        assert comments[0].content == "Existing comment"
+        assert comments[0].source == "direct"
+        assert any("task_comments" in warning for warning in query_store.startup_warnings())
+
+    def test_query_only_open_current_db_missing_task_comments_id_warns_and_degrades_comments(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should degrade comments when task_comments.id is missing."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task with query-only comment id damage")
+        assert task.id is not None
+        store.add_comment(task.id, "Existing comment", source="direct")
+
+        _drop_task_comments_column(db_path, "id")
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            comments = query_store.get_comments(task.id)
+        finally:
+            db_path.chmod(0o644)
+
+        assert comments == []
+        assert any("task_comments" in warning for warning in query_store.startup_warnings())
+
+    def test_query_only_open_current_db_missing_run_steps_project_id_warns_and_degrades_counts(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should warn and skip step counts when run_steps.project_id is missing."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task with query-only run-steps damage")
+        assert task.id is not None
+        store.emit_step(task.id, "Existing step", provider="claude")
+
+        _drop_run_steps_column(db_path, "project_id")
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            count = query_store.count_steps(task.id)
+        finally:
+            db_path.chmod(0o644)
+
+        assert count == 0
+        assert any("run_steps.project_id" in warning for warning in query_store.startup_warnings())
 
     def test_auto_migration_v30_failure_does_not_advance_schema_version(
         self,

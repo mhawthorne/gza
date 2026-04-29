@@ -2272,8 +2272,8 @@ def main() -> int:
 
     # Commands where reconciling orphaned in-progress tasks is useful.
     _RECONCILE_COMMANDS = {
-        "work", "ps", "status", "kill", "advance", "retry",
-        "mark-completed", "run-inline", "set-status", "history",
+        "work", "kill", "advance", "retry",
+        "mark-completed", "run-inline", "set-status",
     }
 
     try:
@@ -2287,11 +2287,16 @@ def main() -> int:
                     reconcile_in_progress_tasks(cfg)
                 except Exception as exc:
                     print(f"Warning: In-progress reconciliation failed: {exc}", file=sys.stderr)
-                if args.command in {"ps", "status"}:
-                    try:
-                        prune_terminal_dead_workers(cfg)
-                    except Exception as exc:
-                        print(f"Warning: Worker prune failed: {exc}", file=sys.stderr)
+        if args.command in {"ps", "status"}:
+            try:
+                cfg = Config.load(args.project_dir, discover=not project_explicit)
+            except Exception as exc:
+                print(f"Warning: Skipping worker prune: {exc}", file=sys.stderr)
+            else:
+                try:
+                    prune_terminal_dead_workers(cfg)
+                except Exception as exc:
+                    print(f"Warning: Worker prune failed: {exc}", file=sys.stderr)
         if args.command == "attach":
             return cmd_attach(args)
         elif args.command == "work":

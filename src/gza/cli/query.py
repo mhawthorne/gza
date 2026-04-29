@@ -163,7 +163,7 @@ def _suppress_stale_merged_rows(tasks: list[DbTask], git: Git, target_branch: st
 def cmd_next(args: argparse.Namespace) -> int:
     """List upcoming pending tasks in order."""
     config = Config.load(args.project_dir)
-    store = get_store(config)
+    store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
     try:
         tag_filters, any_tag = parse_cli_tag_filters(args)
@@ -290,7 +290,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     from gza.query import HistoryFilter, TaskLineageNode, query_history, query_history_with_lineage
 
     config = Config.load(args.project_dir)
-    store = get_store(config)
+    store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
 
     status = getattr(args, 'status', None)
@@ -649,7 +649,7 @@ def _render_orphaned_task(task: "DbTask", c: dict) -> None:
 def cmd_search(args: argparse.Namespace) -> int:
     """Search tasks by substring in prompt text."""
     config = Config.load(args.project_dir)
-    store = get_store(config)
+    store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
     term = args.term
     limit = None if args.last == 0 else args.last
@@ -795,7 +795,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 def cmd_incomplete(args: argparse.Namespace) -> int:
     """Show unresolved task lineages that still need attention."""
     config = Config.load(args.project_dir)
-    store = get_store(config)
+    store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
     limit = None if args.last == 0 else args.last
     blocked_by_dropped_only = bool(getattr(args, "blocked_by_dropped", False))
@@ -890,19 +890,20 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
     from gza.db import migrate_merge_status, needs_merge_status_migration
 
     config = Config.load(args.project_dir)
-    store = get_store(config)
     git = Git(config.project_dir)
     default_branch = git.default_branch()
     current_branch = git.current_branch()
     print(f"On branch {current_branch}")
     target_branch = current_branch if getattr(args, "into_current", False) else (getattr(args, "target", None) or default_branch)
+    allow_persistence = bool(getattr(args, "update", False) and not _is_branch_target_live(args))
+    store = get_store(config, open_mode="readwrite" if allow_persistence else "query_only")
 
-    # Backfill merge_status for existing tasks if needed (one-time migration)
-    if needs_merge_status_migration(store):
+    # Backfill merge_status only on explicit mutating refresh.
+    if allow_persistence and needs_merge_status_migration(store):
         console.print(f"[{TASK_COLORS['task_id']}]Migrating merge status for existing tasks...[/{TASK_COLORS['task_id']}]")
         migrate_merge_status(store, git)
 
-    if getattr(args, "update", False) and not _is_branch_target_live(args):
+    if allow_persistence:
         merged_count, refreshed_count = _reconcile_unmerged_tasks(store, git, default_branch)
         console.print(
             f"[{TASK_COLORS['task_id']}]Reconciled unmerged tasks: {merged_count} merged, "
@@ -1223,7 +1224,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
 def cmd_groups(args: argparse.Namespace) -> int:
     """List all tags with task counts (compatibility alias: groups)."""
     config = Config.load(args.project_dir)
-    store = get_store(config)
+    store = get_store(config, open_mode="query_only")
 
     print("Warning: 'gza groups' is deprecated; use 'gza groups list'.")
     groups = store.get_groups()
@@ -1252,7 +1253,7 @@ def cmd_groups(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     """Show tasks by a single tag (compatibility alias: group)."""
     config = Config.load(args.project_dir)
-    store = get_store(config)
+    store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
     try:
         groups = validate_cli_tag_values((args.group,))
@@ -1476,7 +1477,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
     import time
     config = Config.load(args.project_dir)
     registry = WorkerRegistry(config.workers_path)
-    store = get_store(config)
+    store = get_store(config, open_mode="query_only")
     # Worker registry is now a thin process index; no ps-specific cleanup.
     poll_interval: int | None = getattr(args, "poll", None)
     show_all: bool = getattr(args, "all", False)
@@ -1976,7 +1977,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
 def cmd_lineage(args: argparse.Namespace) -> int:
     """Show the full lineage tree for a given task."""
     config = Config.load(args.project_dir)
-    store = get_store(config)
+    store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
 
     task_id: str = resolve_id(config, args.task_id)
@@ -2154,7 +2155,7 @@ def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore")
 def cmd_show(args: argparse.Namespace) -> int:
     """Show details of a specific task."""
     config = Config.load(args.project_dir)
-    store = get_store(config)
+    store = get_store(config, open_mode="query_only")
 
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)

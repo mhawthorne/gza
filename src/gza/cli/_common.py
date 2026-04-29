@@ -29,7 +29,14 @@ from ..console import (
     console,
     truncate,
 )
-from ..db import ManualMigrationRequired, SqliteTaskStore, Task as DbTask, resolve_task_id, task_id_numeric_key
+from ..db import (
+    ManualMigrationRequired,
+    SqliteTaskStore,
+    StoreOpenMode,
+    Task as DbTask,
+    resolve_task_id,
+    task_id_numeric_key,
+)
 from ..failure_policy import is_resumable_failure_reason
 from ..prompts import PromptBuilder
 from ..resume_policy import is_resumable_failure
@@ -56,14 +63,18 @@ def _stdout_is_tty() -> bool:
     return sys.stdout.isatty()
 
 
-def get_store(config: Config) -> SqliteTaskStore:
+def get_store(config: Config, *, open_mode: StoreOpenMode = "readwrite") -> SqliteTaskStore:
     """Get the SQLite task store.
 
     Raises:
         ManualMigrationRequired: If the DB needs a manual schema upgrade.
             Callers should run ``gza migrate`` to fix this.
     """
-    return SqliteTaskStore.from_config(config)
+    store = SqliteTaskStore.from_config(config, open_mode=open_mode)
+    if open_mode == "query_only":
+        for warning in store.startup_warnings():
+            print(f"Warning: {warning}", file=sys.stderr)
+    return store
 
 
 def resolve_id(config: Config, arg: str) -> str:
@@ -310,7 +321,7 @@ def reconcile_in_progress_tasks(config: Config) -> None:
 def prune_terminal_dead_workers(config: Config) -> None:
     """Remove worker registry entries for terminal tasks when the worker PID is dead."""
     try:
-        store = get_store(config)
+        store = get_store(config, open_mode="query_only")
         registry = WorkerRegistry(config.workers_path)
     except (sqlite3.Error, OSError, ValueError) as exc:
         print(f"Warning: Skipping worker prune due to setup error: {exc}", file=sys.stderr)

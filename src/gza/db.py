@@ -31,6 +31,7 @@ __all__ = [
     "KNOWN_EXECUTION_MODES",
     "InvalidTaskIdError",
     "ManualMigrationRequired",
+    "SchemaIntegrityError",
     "Task",
     "TaskComment",
     "TaskStats",
@@ -46,6 +47,8 @@ __all__ = [
     "resolve_task_id",
     "task_id_numeric_key",
 ]
+
+StoreOpenMode = Literal["readwrite", "query_only"]
 
 
 # Known failure reason categories
@@ -999,6 +1002,72 @@ _TASK_COMMENTS_REQUIRED_COLUMNS: tuple[str, ...] = (
     "resolved_at",
 )
 
+_QUERY_ONLY_REQUIRED_RUN_STEP_COUNT_COLUMNS: tuple[str, ...] = (
+    "project_id",
+    "run_id",
+)
+
+_QUERY_ONLY_REQUIRED_COMMENT_COLUMNS: tuple[str, ...] = (
+    "project_id",
+    "id",
+    "task_id",
+    "content",
+    "created_at",
+    "resolved_at",
+)
+
+_QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
+    "project_id",
+    "id",
+    "prompt",
+    "status",
+    "task_type",
+    "slug",
+    "branch",
+    "log_file",
+    "report_file",
+    "based_on",
+    "has_commits",
+    "duration_seconds",
+    "num_steps_reported",
+    "num_steps_computed",
+    "num_turns_reported",
+    "num_turns_computed",
+    "attach_count",
+    "attach_duration_seconds",
+    "cost_usd",
+    "created_at",
+    "started_at",
+    "running_pid",
+    "completed_at",
+    "group",
+    "depends_on",
+    "spec",
+    "create_review",
+    "same_branch",
+    "task_type_hint",
+    "output_content",
+    "session_id",
+    "pr_number",
+    "model",
+    "provider",
+    "provider_is_explicit",
+    "urgent",
+    "input_tokens",
+    "output_tokens",
+    "merge_status",
+    "merged_at",
+    "failure_reason",
+    "skip_learnings",
+    "diff_files_changed",
+    "diff_lines_added",
+    "diff_lines_removed",
+    "review_cleared_at",
+    "review_score",
+    "log_schema_version",
+    "base_branch",
+)
+
 
 def _missing_required_columns(conn: sqlite3.Connection, table: str, required_columns: tuple[str, ...]) -> list[str]:
     """Return required columns missing from a table."""
@@ -1731,6 +1800,7 @@ class SqliteTaskStore:
         project_root: Path | None = None,
         config_path: Path | None = None,
         project_name: str | None = None,
+        open_mode: StoreOpenMode = "readwrite",
     ):
         self.db_path = db_path
         self._prefix = prefix
@@ -1738,8 +1808,16 @@ class SqliteTaskStore:
         self._project_root = project_root
         self._config_path = config_path
         self._project_name = project_name
-        self._ensure_db()
-        self._ensure_project_row()
+        self._open_mode = open_mode
+        self._startup_warnings: list[str] = []
+        self._query_only_empty_db = False
+        self._query_only_table_exists: dict[str, bool] = {}
+        self._query_only_columns: dict[str, set[str]] = {}
+        if self._open_mode == "query_only":
+            self._ensure_db_query_only()
+        else:
+            self._ensure_db()
+            self._ensure_project_row()
 
     @classmethod
     def default(cls, project_dir: Path | None = None) -> "SqliteTaskStore":
@@ -1754,7 +1832,13 @@ class SqliteTaskStore:
         return cls.from_config(config)
 
     @classmethod
-    def from_config(cls, config: "Config", *, allow_legacy_local_db: bool = False) -> "SqliteTaskStore":
+    def from_config(
+        cls,
+        config: "Config",
+        *,
+        allow_legacy_local_db: bool = False,
+        open_mode: StoreOpenMode = "readwrite",
+    ) -> "SqliteTaskStore":
         """Create a store from a loaded Config instance."""
         project_id, project_prefix = _project_identity_from_config(config)
         project_dir = getattr(config, "project_dir", None)
@@ -1787,7 +1871,12 @@ class SqliteTaskStore:
             project_root=project_dir if isinstance(project_dir, Path) else None,
             config_path=resolved_config_path,
             project_name=project_name,
+            open_mode=open_mode,
         )
+
+    def startup_warnings(self) -> tuple[str, ...]:
+        """Return deterministic startup warnings collected during store open."""
+        return tuple(self._startup_warnings)
 
     def _ensure_db(self) -> None:
         """Ensure database exists and schema is current.
@@ -1884,6 +1973,188 @@ class SqliteTaskStore:
             # or partial migrations removed them.
             _ensure_required_auto_migration_artifacts(conn, target_version=SCHEMA_VERSION)
 
+    def _ensure_db_query_only(self) -> None:
+        """Open a store for best-effort reads without any startup writes."""
+        if not self.db_path.exists():
+            self._query_only_empty_db = True
+            return
+
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+            )
+            if cur.fetchone() is None:
+                raise SchemaIntegrityError(
+                    "Database is missing schema_version; query-only mode cannot initialize schema. "
+                    "Use a writable database to repair or initialize it, then retry."
+                )
+
+            row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+            current_version = int(row["version"]) if row and row["version"] is not None else 0
+
+            pending_manual: list[int] = []
+            for target_version, _migration_sql in _MIGRATIONS:
+                if current_version >= target_version:
+                    continue
+                if target_version in _MANUAL_MIGRATION_VERSIONS:
+                    pending_manual.append(target_version)
+                    break
+                raise SchemaIntegrityError(
+                    f"Database is at schema v{current_version}; query-only mode does not run "
+                    f"automatic migrations to v{SCHEMA_VERSION}. Use a writable database to "
+                    "upgrade, then retry."
+                )
+
+            if pending_manual:
+                raise ManualMigrationRequired(pending_manual)
+
+            self._prime_query_only_schema_state(conn)
+            self._validate_query_only_core_schema()
+            self._collect_query_only_warnings()
+
+    def _prime_query_only_schema_state(self, conn: sqlite3.Connection) -> None:
+        """Cache table and column availability for degraded query-only reads."""
+        tables = (
+            "tasks",
+            "task_tags",
+            "task_comments",
+            "run_steps",
+            "run_substeps",
+            "projects",
+        )
+        self._query_only_table_exists = {table: _table_exists(conn, table) for table in tables}
+        self._query_only_columns = {
+            table: (_table_columns(conn, table) if self._query_only_table_exists[table] else set())
+            for table in tables
+        }
+
+    def _collect_query_only_warnings(self) -> None:
+        """Record warnings for degraded query-only reads on damaged current schemas."""
+        if not self._query_only_has_column("tasks", "execution_mode"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing required column tasks.execution_mode; "
+                "continuing with degraded read behavior."
+            )
+        if not self._query_only_has_column("tasks", "urgent_bumped_at"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing required column tasks.urgent_bumped_at; "
+                "queue ordering will fall back to created_at."
+            )
+        if not self._query_only_has_column("tasks", "queue_position"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing required column tasks.queue_position; "
+                "explicit queue ordering will be unavailable."
+            )
+        if not self._query_only_supports_tags():
+            self._startup_warnings.append(
+                "Query-only DB open detected incomplete task_tags schema; "
+                "tag metadata and tag-filtered queries will be unavailable."
+            )
+        if not self._query_only_supports_comments():
+            self._startup_warnings.append(
+                "Query-only DB open detected incomplete task_comments schema; "
+                "task comments will be unavailable."
+            )
+        elif not self._query_only_has_column("task_comments", "source"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing required column task_comments.source; "
+                "task comments will use default source values."
+            )
+        run_steps_issue = self._query_only_run_steps_warning()
+        if run_steps_issue is not None:
+            self._startup_warnings.append(run_steps_issue)
+
+    def _validate_query_only_core_schema(self) -> None:
+        """Fail closed when the core task schema is too damaged for safe reads."""
+        if self._query_only_empty_db:
+            return
+        if not self._query_only_table_exists.get("tasks", False):
+            raise SchemaIntegrityError(
+                "Query-only DB open detected missing required table tasks; "
+                "cannot safely read task data from this snapshot."
+            )
+        missing_columns = [
+            column
+            for column in _QUERY_ONLY_REQUIRED_TASK_COLUMNS
+            if not self._query_only_has_column("tasks", column)
+        ]
+        if missing_columns:
+            raise SchemaIntegrityError(
+                "Query-only DB open detected missing required column "
+                f"tasks.{missing_columns[0]}; cannot safely read task data from this snapshot."
+            )
+
+    def _query_only_has_column(self, table: str, column: str) -> bool:
+        """Return True when a cached query-only schema contains the given column."""
+        if self._open_mode != "query_only":
+            return True
+        return column in self._query_only_columns.get(table, set())
+
+    def _query_only_supports_tags(self) -> bool:
+        """Return True when query-only reads can safely use task tag artifacts."""
+        if self._open_mode != "query_only":
+            return True
+        return self._query_only_table_exists.get("task_tags", False) and all(
+            self._query_only_has_column("task_tags", column)
+            for column in ("project_id", "task_id", "tag")
+        )
+
+    def _query_only_supports_comments(self) -> bool:
+        """Return True when query-only reads can safely use task comment artifacts."""
+        if self._open_mode != "query_only":
+            return True
+        return self._query_only_table_exists.get("task_comments", False) and all(
+            self._query_only_has_column("task_comments", column)
+            for column in _QUERY_ONLY_REQUIRED_COMMENT_COLUMNS
+        )
+
+    def _query_only_supports_run_steps(self) -> bool:
+        """Return True when query-only reads can safely use run_steps."""
+        if self._open_mode != "query_only":
+            return True
+        return self._query_only_table_exists.get("run_steps", False) and all(
+            self._query_only_has_column("run_steps", column)
+            for column in _QUERY_ONLY_REQUIRED_RUN_STEP_COUNT_COLUMNS
+        )
+
+    def _query_only_run_steps_warning(self) -> str | None:
+        """Describe degraded query-only run_steps support, if any."""
+        if self._open_mode != "query_only":
+            return None
+        if not self._query_only_table_exists.get("run_steps", False):
+            return (
+                "Query-only DB open detected missing required table run_steps; "
+                "step counts will be unavailable."
+            )
+        missing_columns = [
+            column
+            for column in _QUERY_ONLY_REQUIRED_RUN_STEP_COUNT_COLUMNS
+            if not self._query_only_has_column("run_steps", column)
+        ]
+        if missing_columns:
+            return (
+                "Query-only DB open detected missing required column "
+                f"run_steps.{missing_columns[0]}; step counts will be unavailable."
+            )
+        return None
+
+    def _task_pickup_order_sql(self, alias: str = "t") -> str:
+        """Return the canonical pending-task ORDER BY clause for the current schema."""
+        queue_position = f"{alias}.queue_position"
+        urgent = f"{alias}.urgent"
+        urgent_bumped_at = f"{alias}.urgent_bumped_at"
+        created_at = f"{alias}.created_at"
+        order_parts: list[str] = []
+        if self._query_only_has_column("tasks", "queue_position"):
+            order_parts.append(f"CASE WHEN {queue_position} IS NULL THEN 1 ELSE 0 END")
+            order_parts.append(f"COALESCE({queue_position}, 0) ASC")
+        if self._query_only_has_column("tasks", "urgent"):
+            order_parts.append(f"{urgent} DESC")
+        if self._query_only_has_column("tasks", "urgent_bumped_at"):
+            order_parts.append(f"COALESCE({urgent_bumped_at}, '') DESC")
+        order_parts.append(f"{created_at} ASC")
+        return ", ".join(order_parts)
+
     def _ensure_project_row(self) -> None:
         """Ensure the current project is registered in the shared DB."""
         now = datetime.now(UTC).isoformat()
@@ -1919,6 +2190,19 @@ class SqliteTaskStore:
 
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection with auto-commit."""
+        if self._query_only_empty_db:
+            conn = sqlite3.connect(
+                ":memory:",
+                isolation_level=None,
+                timeout=15,
+                factory=_ClosingSqliteConnection,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=15000")
+            conn.executescript(SCHEMA)
+            conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+            return conn
+
         conn = sqlite3.connect(
             self.db_path,
             isolation_level=None,
@@ -1927,6 +2211,12 @@ class SqliteTaskStore:
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=15000")
+        if self._open_mode == "query_only":
+            try:
+                conn.execute("PRAGMA query_only=ON")
+            except sqlite3.OperationalError:
+                pass
+            return conn
         for pragma in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"):
             try:
                 conn.execute(pragma)
@@ -2005,6 +2295,8 @@ class SqliteTaskStore:
 
     def _fetch_tags_for_task_ids(self, conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, tuple[str, ...]]:
         """Fetch tags for many tasks in one query."""
+        if not self._query_only_supports_tags():
+            return {}
         ids = sorted({task_id for task_id in task_ids if task_id})
         if not ids:
             return {}
@@ -2097,14 +2389,15 @@ class SqliteTaskStore:
 
     def _row_to_task_comment(self, row: sqlite3.Row) -> TaskComment:
         """Convert a database row to a TaskComment."""
+        keys = row.keys()
         created_at = _parse_db_timestamp(row["created_at"])
         assert created_at is not None
         return TaskComment(
             id=int(row["id"]),
             task_id=row["task_id"],
             content=row["content"],
-            source=row["source"],
-            author=row["author"],
+            source=row["source"] if "source" in keys else "direct",
+            author=row["author"] if "author" in keys else None,
             created_at=created_at,
             resolved_at=_parse_db_timestamp(row["resolved_at"]),
         )
@@ -2441,14 +2734,13 @@ class SqliteTaskStore:
                     OR t.depends_on IN (SELECT id FROM successful_ancestors)
                 )
                 ORDER BY
-                    CASE WHEN t.queue_position IS NULL THEN 1 ELSE 0 END,
-                    COALESCE(t.queue_position, 0) ASC,
-                    t.urgent DESC,
-                    COALESCE(t.urgent_bumped_at, '') DESC,
-                    t.created_at ASC
+                    {order_by}
                 """
             params: list[str | int | None] = [self._project_id, self._project_id, self._project_id]
+            query = query.format(order_by=self._task_pickup_order_sql("t"))
             if normalized_tags:
+                if not self._query_only_supports_tags():
+                    return []
                 placeholders = ",".join("?" for _ in normalized_tags)
                 if any_tag:
                     query = query.replace(
@@ -2518,14 +2810,12 @@ class SqliteTaskStore:
             query = (
                 "SELECT t.* FROM tasks t WHERE t.project_id = ? AND t.status = 'pending' "
                 "ORDER BY "
-                "CASE WHEN queue_position IS NULL THEN 1 ELSE 0 END, "
-                "COALESCE(queue_position, 0) ASC, "
-                "urgent DESC, "
-                "COALESCE(urgent_bumped_at, '') DESC, "
-                "created_at ASC"
+                f"{self._task_pickup_order_sql('t')}"
             )
             params: list[str | int | None] = [self._project_id]
             if normalized_tags:
+                if not self._query_only_supports_tags():
+                    return []
                 placeholders = ",".join("?" for _ in normalized_tags)
                 if any_tag:
                     query = query.replace(
@@ -3216,6 +3506,8 @@ class SqliteTaskStore:
 
     def count_steps(self, run_id: str) -> int:
         """Count the number of run_steps rows for a given run_id."""
+        if not self._query_only_supports_run_steps():
+            return 0
         with self._connect() as conn:
             cur = conn.execute(
                 "SELECT COUNT(*) AS cnt FROM run_steps WHERE project_id = ? AND run_id = ?",
@@ -3489,6 +3781,8 @@ class SqliteTaskStore:
         created_on_or_before: datetime | None = None,
     ) -> list[TaskComment]:
         """Return comments for a task in creation order."""
+        if not self._query_only_supports_comments():
+            return []
         query = "SELECT * FROM task_comments WHERE project_id = ? AND task_id = ?"
         params: list[Any] = [self._project_id, task_id]
         if unresolved_only:
@@ -3594,6 +3888,8 @@ class SqliteTaskStore:
 
     def get_task_tags(self, task_id: str) -> tuple[str, ...]:
         """Return canonical tags for a task."""
+        if not self._query_only_supports_tags():
+            return ()
         with self._connect() as conn:
             cur = conn.execute(
                 "SELECT tag FROM task_tags WHERE project_id = ? AND task_id = ? ORDER BY tag ASC",
@@ -3626,6 +3922,8 @@ class SqliteTaskStore:
 
     def get_tag_counts(self) -> dict[str, int]:
         """Return counts for every known tag."""
+        if not self._query_only_supports_tags():
+            return {}
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -3649,6 +3947,8 @@ class SqliteTaskStore:
         Returns:
             Dict mapping tag to dict of status counts.
         """
+        if not self._query_only_supports_tags():
+            return {}
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -3672,6 +3972,8 @@ class SqliteTaskStore:
 
     def get_by_group(self, group: str) -> list[Task]:
         """Compatibility alias: get all tasks carrying a tag."""
+        if not self._query_only_supports_tags():
+            return []
         normalized = _normalize_tag(group)
         with self._connect() as conn:
             cur = conn.execute(
