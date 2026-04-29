@@ -532,6 +532,57 @@ class TestAdvanceCommand:
         assert len(rebases) == 1
         assert "onto 'main'" in rebases[0].prompt
 
+    def test_advance_merge_conflict_fallback_reports_rebase_worker_start_failure(self, tmp_path: Path):
+        """Merge-conflict fallback must report child creation separately from rebase worker startup failure."""
+        from gza.cli import cmd_advance
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = store.add("Explore fallback spawn failure", task_type="explore")
+        branch = f"feat/task-{task.id}"
+        git._run("checkout", "-b", branch)
+        (tmp_path / f"feat_{task.id}.txt").write_text("feature")
+        git._run("add", f"feat_{task.id}.txt")
+        git._run("commit", "-m", f"Commit for task {task.id}")
+        git._run("checkout", "main")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            batch=None,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.determine_next_action", return_value={"type": "merge", "description": "Merge"}),
+            patch("gza.cli._merge_single_task", return_value=1),
+            patch("gza.git.Git.can_merge", return_value=False),
+            patch("gza.git.Git.reset_hard_head"),
+            patch("gza.cli._spawn_background_worker", return_value=1),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+            output = stdout.getvalue()
+
+        rebases = [t for t in store.get_all() if t.task_type == "rebase" and t.based_on == task.id]
+        assert len(rebases) == 1
+        assert rebases[0].id is not None
+        assert rc == 1
+        assert f"Created rebase task {rebases[0].id}" in output
+        assert f"Failed to start rebase worker for task {rebases[0].id}" in output
+
     def test_advance_merge_conflict_fallback_reset_failure_is_hard_error(self, tmp_path: Path):
         """When reset_hard_head fails, advance increments error_count and skips rebase task creation."""
         from gza.cli import cmd_advance

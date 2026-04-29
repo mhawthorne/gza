@@ -1696,6 +1696,44 @@ def cmd_advance(args: argparse.Namespace) -> int:
     attention_tasks: list[tuple[DbTask, dict]] = []
     action_context = _build_action_context(dry_run_mode=False)
 
+    def _render_worker_action_result(task: DbTask, action_type: str, exec_result) -> None:
+        nonlocal workers_started, success_count, skip_count, error_count
+
+        if exec_result.attempted_spawn:
+            workers_started += 1
+
+        if exec_result.status == "skip":
+            console.print(f"      [{_c_warn}]{exec_result.message}[/{_c_warn}]")
+            skip_count += 1
+            if exec_result.attention_type == "max_improve_attempts":
+                attention_tasks.append(
+                    (
+                        task,
+                        {
+                            "type": "max_improve_attempts",
+                            "description": exec_result.message,
+                        },
+                    )
+                )
+            return
+
+        if exec_result.status == "error":
+            if exec_result.success_message:
+                console.print(f"      [{_c_ok}]✓ {exec_result.success_message}[/{_c_ok}]")
+            err_message = exec_result.error_message or exec_result.message or f"Failed to execute {action_type}"
+            console.print(f"      [{_c_err}]✗ {err_message}[/{_c_err}]")
+            error_count += 1
+            return
+
+        success_message = exec_result.success_message or exec_result.message
+        if success_message:
+            console.print(f"      [{_c_ok}]✓ {success_message}[/{_c_ok}]")
+
+        if exec_result.worker_started:
+            success_count += 1
+        elif exec_result.worker_consuming:
+            error_count += 1
+
     for task, action in plan:
         assert task.id is not None
         prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
@@ -1763,64 +1801,23 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         )
                         error_count += 1
                         continue
-                    assert task_branch is not None  # guaranteed by conflict_detected guard
-                    rebase_task = _create_rebase_task(store, task.id, task_branch, target_branch)
-                    assert rebase_task.id is not None
-                    console.print(
-                        f"      [{_c_ok}]✓ Created rebase task {rebase_task.id} "
-                        f"(target: {target_branch})[/{_c_ok}]"
+                    exec_result = execute_advance_action(
+                        task=task,
+                        action={"type": "needs_rebase", "description": "Create rebase task"},
+                        context=action_context,
                     )
-                    worker_args = argparse.Namespace(
-                        no_docker=getattr(args, 'no_docker', False),
-                        max_turns=None,
-                        force=force,
-                    )
-                    rebase_rc = _spawn_background_worker(worker_args, config, task_id=rebase_task.id, quiet=True)
-                    workers_started += 1
-                    if rebase_rc == 0:
-                        success_count += 1
-                    else:
-                        error_count += 1
+                    if exec_result.success_message:
+                        exec_result.success_message = (
+                            f"{exec_result.success_message} (target: {target_branch})"
+                        )
+                    _render_worker_action_result(task, action_type, exec_result)
                 else:
                     console.print(f"      [{_c_err}]✗ Merge failed[/{_c_err}]")
                     error_count += 1
 
         else:
             exec_result = execute_advance_action(task=task, action=action, context=action_context)
-            if exec_result.attempted_spawn:
-                workers_started += 1
-
-            if exec_result.status == "skip":
-                console.print(f"      [{_c_warn}]{exec_result.message}[/{_c_warn}]")
-                skip_count += 1
-                if exec_result.attention_type == "max_improve_attempts":
-                    attention_tasks.append(
-                        (
-                            task,
-                            {
-                                "type": "max_improve_attempts",
-                                "description": exec_result.message,
-                            },
-                        )
-                    )
-                continue
-
-            if exec_result.status == "error":
-                if exec_result.success_message:
-                    console.print(f"      [{_c_ok}]✓ {exec_result.success_message}[/{_c_ok}]")
-                err_message = exec_result.error_message or exec_result.message or f"Failed to execute {action_type}"
-                console.print(f"      [{_c_err}]✗ {err_message}[/{_c_err}]")
-                error_count += 1
-                continue
-
-            success_message = exec_result.success_message or exec_result.message
-            if success_message:
-                console.print(f"      [{_c_ok}]✓ {success_message}[/{_c_ok}]")
-
-            if exec_result.worker_started:
-                success_count += 1
-            elif exec_result.worker_consuming:
-                error_count += 1
+            _render_worker_action_result(task, action_type, exec_result)
 
         print()
 
