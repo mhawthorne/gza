@@ -1,7 +1,11 @@
-"""Smoke tests verifying ruff and ty are installed and pass on the project source."""
+"""Integration smoke tests for external lint/type-check tools."""
 
 import subprocess
 import sys
+
+import pytest
+
+pytestmark = pytest.mark.integration
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess[str]:

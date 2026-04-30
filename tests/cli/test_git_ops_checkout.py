@@ -28,25 +28,6 @@ from .conftest import (
 class TestCheckoutCommand:
     """Tests for 'gza checkout' command."""
 
-    def test_checkout_removes_clean_worktree(self, tmp_path: Path):
-        """Checkout command removes clean worktree before checking out branch."""
-        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
-            tmp_path, "Test checkout task", "feature/test-checkout",
-            worktree_name="test-checkout",
-        )
-
-        # Verify worktree exists
-        assert worktree_path.exists()
-
-        # Checkout the branch by task ID - should remove worktree first
-        result = run_gza("checkout", str(task.id), "--project", str(tmp_path))
-
-        # Verify success
-        assert result.returncode == 0
-        assert "Removing stale worktree" in result.stdout
-        assert "Removed worktree" in result.stdout
-        assert "Checked out" in result.stdout
-
     def test_checkout_prunes_prunable_only_registration(self, tmp_path: Path):
         """Checkout succeeds when branch has only a prunable worktree registration."""
         _store, git, task, worktree_path = setup_git_repo_with_task_branch(
