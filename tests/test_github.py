@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from gza.github import GitHub, GitHubError, PullRequest
+from gza.github import GitHub, GitHubError, PullRequest, PullRequestDetails
 
 
 class TestGitHubRun:
@@ -349,6 +349,78 @@ class TestGetPRNumber:
 
         mock_run.assert_called_once_with(
             "pr", "view", "test-branch", "--json", "number", "-q", ".number", check=False
+        )
+
+
+class TestPullRequestDetails:
+    """Tests for detailed PR lookup helpers."""
+
+    def test_get_pr_details(self):
+        gh = GitHub()
+        mock_result = Mock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "url": "https://github.com/owner/repo/pull/55",
+                    "number": 55,
+                    "state": "OPEN",
+                    "baseRefName": "main",
+                }
+            ),
+            stderr="",
+        )
+
+        with patch.object(gh, "_run", return_value=mock_result) as mock_run:
+            details = gh.get_pr_details(55)
+
+        mock_run.assert_called_once_with(
+            "pr", "view", "55", "--json", "number,url,state,baseRefName", check=False
+        )
+        assert details == PullRequestDetails(
+            url="https://github.com/owner/repo/pull/55",
+            number=55,
+            state="open",
+            base_ref_name="main",
+        )
+
+    def test_discover_pr_by_branch(self):
+        gh = GitHub()
+        mock_result = Mock(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "url": "https://github.com/owner/repo/pull/77",
+                        "number": 77,
+                        "state": "MERGED",
+                        "baseRefName": "main",
+                    }
+                ]
+            ),
+            stderr="",
+        )
+
+        with patch.object(gh, "_run", return_value=mock_result) as mock_run:
+            details = gh.discover_pr_by_branch("feature/test")
+
+        mock_run.assert_called_once_with(
+            "pr",
+            "list",
+            "--head",
+            "feature/test",
+            "--state",
+            "all",
+            "--limit",
+            "1",
+            "--json",
+            "number,url,state,baseRefName",
+            check=False,
+        )
+        assert details == PullRequestDetails(
+            url="https://github.com/owner/repo/pull/77",
+            number=77,
+            state="merged",
+            base_ref_name="main",
         )
 
 

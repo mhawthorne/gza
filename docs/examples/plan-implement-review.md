@@ -228,6 +228,10 @@ PR created: https://github.com/myorg/myapp/pull/143
 # After PR approval, merge locally
 $ uv run gza merge gza-2 --squash
 Merged: feature/implement-the-jwt-authentication → main (squashed)
+
+# Reconcile cached PR state and close stale open PRs if origin proves the merge landed
+$ uv run gza sync gza-2
+feature/implement-the-jwt-authentication | merge=merged | pr=#143:closed
 ```
 
 ## Summary
@@ -238,4 +242,4 @@ The complete workflow:
 2. **Implement** - `uv run gza add --type implement --based-on <plan_id>` → `uv run gza work <task_id>`
 3. **Review** - `uv run gza review <impl_id>`
 4. **Improve** (if needed) - `uv run gza improve <task_id>` → `uv run gza review <task_id>` (accepts implement, improve, or review ID — auto-resolves)
-5. **Merge** - `uv run gza pr <impl_id>` → `uv run gza merge <impl_id> --squash`
+5. **Merge** - `uv run gza pr <impl_id>` → `uv run gza merge <impl_id> --squash` → `uv run gza sync <impl_id>`

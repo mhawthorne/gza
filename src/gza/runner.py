@@ -61,6 +61,7 @@ from .review_verdict import (
     parse_review_template,
     parse_review_verdict,
 )
+from .sync_ops import resolve_branch_pr
 from .task_slug import (
     extract_task_id_suffix,
     get_base_task_slug,
@@ -1758,21 +1759,25 @@ def post_review_to_pr(
             print("Info: GitHub CLI not available, skipping PR comment")
             return
 
-    # Find PR number
+    # Find an open PR, preferring cached metadata but falling back to branch lookup.
     pr_number = None
-
-    # Try cached pr_number first
-    if impl_task.pr_number:
-        pr_number = impl_task.pr_number
-        print(f"Found PR #{pr_number} (cached)")
-    elif impl_task.branch:
-        # Try to discover PR via branch
-        pr_number = gh.get_pr_number(impl_task.branch)
-        if pr_number:
-            print(f"Found PR #{pr_number} for branch {impl_task.branch}")
-            # Cache it for future use
-            impl_task.pr_number = pr_number
+    if impl_task.branch:
+        resolved_pr = resolve_branch_pr(
+            gh,
+            impl_task.branch,
+            cached_pr_numbers=((impl_task.pr_number,) if impl_task.pr_number is not None else ()),
+            allow_discovery=True,
+        )
+        if resolved_pr.details is not None and resolved_pr.details.state == "open":
+            pr_number = resolved_pr.details.number
+            impl_task.pr_number = resolved_pr.details.number
+            impl_task.pr_state = resolved_pr.details.state
+            impl_task.pr_last_synced_at = datetime.now(UTC)
             store.update(impl_task)
+            if resolved_pr.source == "cached":
+                print(f"Found PR #{pr_number} (cached)")
+            else:
+                print(f"Found PR #{pr_number} for branch {impl_task.branch}")
 
     if not pr_number:
         if required:

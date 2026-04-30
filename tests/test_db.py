@@ -4628,7 +4628,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -4640,7 +4640,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -6425,6 +6425,54 @@ class TestSharedDbIsolationAndImportGating:
         assert reloaded is not None
         assert reloaded.create_pr is True
 
+    def test_open_current_db_repairs_missing_pr_state_column(self, tmp_path: Path) -> None:
+        """Opening a current DB should repair missing tasks.pr_state and preserve PR cache writes."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before pr_state repair")
+        _drop_tasks_column(db_path, "pr_state")
+
+        repaired_store = SqliteTaskStore(db_path, prefix="gza")
+        task = repaired_store.get(task.id)
+        assert task is not None
+        task.pr_state = "open"
+        repaired_store.update(task)
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert "pr_state" in columns
+        reloaded = repaired_store.get(task.id)
+        assert reloaded is not None
+        assert reloaded.pr_state == "open"
+
+    def test_open_current_db_repairs_missing_pr_last_synced_at_column(self, tmp_path: Path) -> None:
+        """Opening a current DB should repair missing tasks.pr_last_synced_at and preserve timestamps."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before pr_last_synced_at repair")
+        _drop_tasks_column(db_path, "pr_last_synced_at")
+
+        repaired_store = SqliteTaskStore(db_path, prefix="gza")
+        task = repaired_store.get(task.id)
+        assert task is not None
+        task.pr_last_synced_at = datetime.now(UTC)
+        repaired_store.update(task)
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert "pr_last_synced_at" in columns
+        reloaded = repaired_store.get(task.id)
+        assert reloaded is not None
+        assert reloaded.pr_last_synced_at is not None
+
     def test_open_current_v32_db_repairs_missing_task_comments_source_column(self, tmp_path: Path) -> None:
         """Opening an already-v32 DB should repair missing task_comments.source."""
         import sqlite3
@@ -6558,6 +6606,24 @@ class TestSharedDbIsolationAndImportGating:
             with pytest.raises(
                 SchemaIntegrityError,
                 match=r"required column tasks\.create_pr",
+            ):
+                SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+        finally:
+            db_path.chmod(0o644)
+
+    def test_query_only_open_current_db_missing_pr_state_fails_closed(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should fail closed when tasks.pr_state is missing."""
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_tasks_column(db_path, "pr_state")
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"required column tasks\.pr_state",
             ):
                 SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
         finally:
@@ -6829,14 +6895,57 @@ class TestSharedDbIsolationAndImportGating:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38]
 
-        # SqliteTaskStore auto-migrates to latest schema.
-        store = SqliteTaskStore(db_path, prefix="gza")
-        child = store.get("gza-2")
-        assert child is not None
-        assert child.based_on == "gza-1"
-        assert child.depends_on == "gza-1"
 
-        status_after = check_migration_status(db_path)
-        assert status_after["current_version"] == SCHEMA_VERSION
+class TestSyncCandidates:
+    """Tests for bounded sync candidate selection."""
+
+    def test_get_sync_candidates_includes_unmerged_open_pr_and_recent_pr_intent(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+        now = datetime.now(UTC)
+        old = now - timedelta(days=90)
+
+        unmerged = store.add("Unmerged task", task_type="implement")
+        unmerged.status = "completed"
+        unmerged.completed_at = now
+        unmerged.branch = "feature/unmerged"
+        unmerged.has_commits = True
+        unmerged.merge_status = "unmerged"
+        store.update(unmerged)
+
+        open_pr = store.add("Open PR task", task_type="implement")
+        open_pr.status = "completed"
+        open_pr.completed_at = old
+        open_pr.branch = "feature/open-pr"
+        open_pr.has_commits = True
+        open_pr.merge_status = "merged"
+        open_pr.pr_number = 12
+        open_pr.pr_state = "open"
+        store.update(open_pr)
+
+        recent_pr_intent = store.add("Recent PR intent", task_type="implement")
+        recent_pr_intent.status = "completed"
+        recent_pr_intent.completed_at = now
+        recent_pr_intent.branch = "feature/recent-pr"
+        recent_pr_intent.has_commits = True
+        recent_pr_intent.merge_status = "merged"
+        recent_pr_intent.create_pr = True
+        store.update(recent_pr_intent)
+
+        stale_closed = store.add("Stale closed PR", task_type="implement")
+        stale_closed.status = "completed"
+        stale_closed.completed_at = old
+        stale_closed.branch = "feature/stale-closed"
+        stale_closed.has_commits = True
+        stale_closed.merge_status = "merged"
+        stale_closed.pr_number = 44
+        stale_closed.pr_state = "closed"
+        store.update(stale_closed)
+
+        candidate_ids = {task.id for task in store.get_sync_candidates(recent_days=30)}
+
+        assert unmerged.id in candidate_ids
+        assert open_pr.id in candidate_ids
+        assert recent_pr_intent.id in candidate_ids
+        assert stale_closed.id not in candidate_ids

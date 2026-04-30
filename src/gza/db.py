@@ -301,6 +301,8 @@ class Task:
     output_content: str | None = None  # Actual content of report/plan/review (for persistence)
     session_id: str | None = None  # Claude session ID for resume capability
     pr_number: int | None = None  # GitHub PR number
+    pr_state: str | None = None  # Cached GitHub PR state: open, closed, merged
+    pr_last_synced_at: datetime | None = None  # When PR metadata was last refreshed
     model: str | None = None  # Per-task model override
     provider: str | None = None  # Per-task provider override
     provider_is_explicit: bool = False  # True when provider was explicitly set by user input
@@ -445,8 +447,14 @@ MIGRATION_V36_TO_V37 = """
 ALTER TABLE tasks ADD COLUMN create_pr INTEGER DEFAULT 0;
 """
 
+# Migration from v37 to v38: cached PR state metadata
+MIGRATION_V37_TO_V38 = """
+ALTER TABLE tasks ADD COLUMN pr_state TEXT;
+ALTER TABLE tasks ADD COLUMN pr_last_synced_at TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 37
+SCHEMA_VERSION = 38
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -675,6 +683,8 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 output_content TEXT,
                 session_id TEXT,
                 pr_number INTEGER,
+                pr_state TEXT,
+                pr_last_synced_at TEXT,
                 model TEXT,
                 provider TEXT,
                 provider_is_explicit INTEGER DEFAULT 0,
@@ -781,7 +791,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns", "num_turns_reported", "num_turns_computed",
             "attach_count", "attach_duration_seconds", "cost_usd", "created_at", "started_at", "running_pid", "completed_at",
             "group", "depends_on", "spec", "create_review", "create_pr", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
-            "model", "provider", "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
+            "pr_state", "pr_last_synced_at", "model", "provider", "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
             "merge_status", "merged_at", "failure_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
             "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
         )
@@ -821,7 +831,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 duration_seconds, num_steps_reported, num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                 attach_count, attach_duration_seconds, cost_usd, created_at, started_at, running_pid, completed_at,
                 "group", depends_on, spec, create_review, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
-                model, provider, provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
+                pr_state, pr_last_synced_at, model, provider, provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
                 merge_status, merged_at, failure_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
                 review_cleared_at, review_score, log_schema_version, execution_mode, base_branch
             )
@@ -1058,6 +1068,8 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "output_content",
     "session_id",
     "pr_number",
+    "pr_state",
+    "pr_last_synced_at",
     "model",
     "provider",
     "provider_is_explicit",
@@ -1143,6 +1155,12 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
             )
     if target_version == 36:
         _validate_v36_structural_schema(conn)
+    if target_version == 38:
+        for column in ("pr_state", "pr_last_synced_at"):
+            if not _table_has_column(conn, "tasks", column):
+                raise RuntimeError(
+                    f"Auto-migration to v38 incomplete: missing required column tasks.{column}"
+                )
 
     required_columns_by_version: dict[int, tuple[str, str]] = {
         30: ("tasks", "urgent_bumped_at"),
@@ -1214,6 +1232,8 @@ def _ensure_required_auto_migration_artifacts(
         (36, "task_comments", "project_id", "ALTER TABLE task_comments ADD COLUMN project_id TEXT"),
         (36, "task_tags", "project_id", "ALTER TABLE task_tags ADD COLUMN project_id TEXT"),
         (37, "tasks", "create_pr", "ALTER TABLE tasks ADD COLUMN create_pr INTEGER DEFAULT 0"),
+        (38, "tasks", "pr_state", "ALTER TABLE tasks ADD COLUMN pr_state TEXT"),
+        (38, "tasks", "pr_last_synced_at", "ALTER TABLE tasks ADD COLUMN pr_last_synced_at TEXT"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -1320,6 +1340,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     output_content TEXT,
     session_id TEXT,
     pr_number INTEGER,
+    pr_state TEXT,
+    pr_last_synced_at TEXT,
     model TEXT,
     provider TEXT,
     provider_is_explicit INTEGER DEFAULT 0,
@@ -1702,6 +1724,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (35, MIGRATION_V34_TO_V35),
     (36, MIGRATION_V35_TO_V36),
     (37, MIGRATION_V36_TO_V37),
+    (38, MIGRATION_V37_TO_V38),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -2285,6 +2308,8 @@ class SqliteTaskStore:
             output_content=row["output_content"] if "output_content" in keys else None,
             session_id=row["session_id"] if "session_id" in keys else None,
             pr_number=row["pr_number"] if "pr_number" in keys else None,
+            pr_state=row["pr_state"] if "pr_state" in keys else None,
+            pr_last_synced_at=_parse_db_timestamp(row["pr_last_synced_at"]) if "pr_last_synced_at" in keys else None,
             model=row["model"] if "model" in keys else None,
             provider=row["provider"] if "provider" in keys else None,
             provider_is_explicit=bool(row["provider_is_explicit"]) if "provider_is_explicit" in keys and row["provider_is_explicit"] is not None else False,
@@ -2614,6 +2639,8 @@ class SqliteTaskStore:
                     output_content = ?,
                     session_id = ?,
                     pr_number = ?,
+                    pr_state = ?,
+                    pr_last_synced_at = ?,
                     model = ?,
                     provider = ?,
                     provider_is_explicit = ?,
@@ -2666,6 +2693,8 @@ class SqliteTaskStore:
                     task.output_content,
                     task.session_id,
                     task.pr_number,
+                    task.pr_state,
+                    task.pr_last_synced_at.isoformat() if task.pr_last_synced_at else None,
                     task.model,
                     task.provider,
                     1 if task.provider_is_explicit else 0,
@@ -3295,6 +3324,44 @@ class SqliteTaskStore:
                 ORDER BY completed_at DESC
                 """,
                 (self._project_id,),
+            )
+            return self._rows_to_tasks(conn, cur.fetchall())
+
+    def get_tasks_for_branch(self, branch: str) -> list[Task]:
+        """Return all task rows attached to a branch, oldest first."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE project_id = ?
+                  AND branch = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (self._project_id, branch),
+            )
+            return self._rows_to_tasks(conn, cur.fetchall())
+
+    def get_sync_candidates(self, recent_days: int = 30) -> list[Task]:
+        """Return a bounded set of branch-bearing task rows for `gza sync`."""
+        cutoff = (datetime.now(UTC) - timedelta(days=recent_days)).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE project_id = ?
+                  AND branch IS NOT NULL
+                  AND has_commits = 1
+                  AND (
+                        merge_status = 'unmerged'
+                        OR (pr_number IS NOT NULL AND (pr_state IS NULL OR pr_state = 'open'))
+                        OR (
+                            COALESCE(merged_at, completed_at, created_at) >= ?
+                            AND (pr_number IS NOT NULL OR create_pr = 1)
+                        )
+                  )
+                ORDER BY COALESCE(merged_at, completed_at, created_at) DESC, created_at DESC
+                """,
+                (self._project_id, cutoff),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -4621,7 +4688,8 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "num_turns_reported", "num_turns_computed", "attach_count", "attach_duration_seconds", "cost_usd",
         "created_at", "started_at", "running_pid", "completed_at", "group", "depends_on", "spec", "create_review",
         "create_pr",
-        "same_branch", "task_type_hint", "output_content", "session_id", "pr_number", "model", "provider",
+        "same_branch", "task_type_hint", "output_content", "session_id", "pr_number", "pr_state",
+        "pr_last_synced_at", "model", "provider",
         "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
         "merge_status", "merged_at", "failure_reason", "skip_learnings", "diff_files_changed", "diff_lines_added",
         "diff_lines_removed", "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
@@ -4629,6 +4697,8 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
     task_import_columns_sql = ", ".join(f'"{c}"' if c == "group" else c for c in task_import_columns)
     legacy_task_fallbacks = {
         "create_pr": "0",
+        "pr_state": "NULL",
+        "pr_last_synced_at": "NULL",
     }
     project_id, project_prefix = _project_identity_from_config(config)
 
@@ -5142,6 +5212,8 @@ def _task_to_dict(task: "Task") -> dict:
         "output_content": task.output_content,
         "session_id": task.session_id,
         "pr_number": task.pr_number,
+        "pr_state": task.pr_state,
+        "pr_last_synced_at": task.pr_last_synced_at.isoformat() if task.pr_last_synced_at else None,
         "model": task.model,
         "provider": task.provider,
         "provider_is_explicit": task.provider_is_explicit,

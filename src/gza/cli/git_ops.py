@@ -26,7 +26,6 @@ from ..git import (
     GitError,
     active_worktree_path_for_branch,
     cleanup_worktree_for_branch,
-    parse_diff_numstat,
 )
 from ..pickup import (
     count_worker_consuming_actions,
@@ -41,6 +40,12 @@ from ..runner import (
     load_dotenv,
     task_log_storage_path,
     write_log_entry,
+)
+from ..sync_ops import (
+    build_branch_cohorts_for_task_ids,
+    build_default_branch_cohorts,
+    refresh_branch_diff_stats,
+    sync_branch_cohorts,
 )
 from ._common import (
     DuplicateReviewError,
@@ -256,7 +261,6 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
     git = Git(config.project_dir)
-    default_branch = git.default_branch()
 
     if args.task_id is not None:
         # Single task by ID
@@ -276,24 +280,23 @@ def cmd_refresh(args: argparse.Namespace) -> int:
                 if t.branch and t not in tasks_to_refresh:
                     tasks_to_refresh.append(t)
 
+    results, skipped = refresh_branch_diff_stats(store, git, tasks_to_refresh)
     refreshed = 0
-    skipped = 0
-    for task in tasks_to_refresh:
-        if not task.branch:
-            console.print(f"[dim]{task.id}: no branch, skipping[/dim]")
-            skipped += 1
+    for result in results:
+        if result.skipped_reason == "no branch":
+            task_id = result.task_ids[0] if result.task_ids else "<unknown>"
+            console.print(f"[dim]{task_id}: no branch, skipping[/dim]")
             continue
-        if not git.branch_exists(task.branch):
-            console.print(f"[dim]{task.id} {task.branch}: branch no longer exists, skipping[/dim]")
-            skipped += 1
+        if result.skipped_reason == "branch no longer exists":
+            task_id = result.task_ids[0] if result.task_ids else "<unknown>"
+            console.print(f"[dim]{task_id} {result.branch}: branch no longer exists, skipping[/dim]")
             continue
-        revision_range = f"{default_branch}...{task.branch}"
-        numstat_output = git.get_diff_numstat(revision_range)
-        files_changed, lines_added, lines_removed = parse_diff_numstat(numstat_output)
-        assert task.id is not None
-        store.update_diff_stats(task.id, files_changed, lines_added, lines_removed)
-        console.print(f"{task.id} {task.branch}: +{lines_added} -{lines_removed} in {files_changed} files")
         refreshed += 1
+        task_label = ",".join(result.task_ids) if result.task_ids else result.branch
+        console.print(
+            f"{task_label} {result.branch}: +{result.diff_lines_added} -{result.diff_lines_removed} "
+            f"in {result.diff_files_changed} files"
+        )
 
     print(f"\nRefreshed {refreshed} task(s), skipped {skipped}.")
     return 0
@@ -1212,8 +1215,8 @@ def cmd_pr(args: argparse.Namespace) -> int:
     if result.ok and result.status == "existing":
         print(f"PR already exists: {result.pr_url}")
         return 0
-    if result.ok and result.status == "cached" and task.pr_number:
-        print(f"PR already exists: #{task.pr_number}")
+    if result.ok and result.status == "cached" and result.pr_number:
+        print(f"PR already exists: #{result.pr_number}")
         return 0
     if result.status == "gh_unavailable":
         print("Error: GitHub CLI (gh) is not installed or not authenticated")
@@ -1231,6 +1234,73 @@ def cmd_pr(args: argparse.Namespace) -> int:
         return 1
     print("Error creating PR")
     return 1
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Explicitly reconcile branch state across git and GitHub."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
+
+    include_git = not getattr(args, "pr_only", False)
+    include_pr = not getattr(args, "git_only", False)
+
+    preliminary_results: list = []
+    if args.task_ids:
+        resolved_ids = [resolve_id(config, task_id) for task_id in args.task_ids]
+        cohorts, preliminary_results = build_branch_cohorts_for_task_ids(store, resolved_ids)
+    else:
+        cohorts = build_default_branch_cohorts(store)
+
+    if not cohorts and not preliminary_results:
+        print("No sync candidates")
+        return 0
+
+    results = list(preliminary_results)
+    partial_failure = False
+    if cohorts:
+        cohort_results, partial_failure = sync_branch_cohorts(
+            store,
+            git,
+            cohorts,
+            include_git=include_git,
+            include_pr=include_pr,
+            dry_run=bool(getattr(args, "dry_run", False)),
+            fetch_remote=not bool(getattr(args, "no_fetch", False)),
+        )
+        results.extend(cohort_results)
+
+    synced = 0
+    skipped = 0
+    errors = 0
+    for result in results:
+        if result.errors:
+            errors += 1
+        if result.skipped_reason is not None:
+            skipped += 1
+            task_label = result.task_ids[0] if result.task_ids else result.branch
+            print(f"{task_label}: skipped ({result.skipped_reason})")
+            continue
+
+        synced += 1
+        parts = [result.branch]
+        if result.merge_status is not None:
+            parts.append(f"merge={result.merge_status}")
+        if result.diff_files_changed is not None:
+            parts.append(
+                f"diff=+{result.diff_lines_added}/-{result.diff_lines_removed} {result.diff_files_changed} files"
+            )
+        if result.pr_number is not None or result.pr_state is not None:
+            pr_num = f"#{result.pr_number}" if result.pr_number is not None else "#?"
+            parts.append(f"pr={pr_num}:{result.pr_state or 'unknown'}")
+        if result.actions:
+            parts.append(", ".join(result.actions))
+        if result.errors:
+            parts.append(f"errors: {'; '.join(result.errors)}")
+        print(" | ".join(parts))
+
+    print(f"\nSynced {synced} branch(es), skipped {skipped}, errors {errors}.")
+    return 1 if partial_failure or errors else 0
 
 
 def _unimplemented_implement_prompt(task: DbTask) -> str:

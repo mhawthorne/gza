@@ -1,5 +1,6 @@
 """GitHub operations for Gza."""
 
+import json
 import subprocess
 from dataclasses import dataclass
 
@@ -14,6 +15,16 @@ class PullRequest:
     """A GitHub pull request."""
     url: str
     number: int
+
+
+@dataclass(frozen=True)
+class PullRequestDetails:
+    """Detailed GitHub pull request metadata."""
+
+    url: str
+    number: int
+    state: str
+    base_ref_name: str
 
 
 class GitHub:
@@ -89,7 +100,6 @@ class GitHub:
         """
         result = self._run("pr", "view", head, "--json", "url", check=False)
         if result.returncode == 0:
-            import json
             data = json.loads(result.stdout)
             return data.get("url")
         return None
@@ -111,12 +121,64 @@ class GitHub:
                 return None
         return None
 
+    def get_pr_details(self, pr_ref: str | int) -> PullRequestDetails | None:
+        """Return detailed PR metadata for a PR number/ref."""
+        result = self._run(
+            "pr",
+            "view",
+            str(pr_ref),
+            "--json",
+            "number,url,state,baseRefName",
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = json.loads(result.stdout)
+        try:
+            return PullRequestDetails(
+                url=str(data["url"]),
+                number=int(data["number"]),
+                state=str(data["state"]).lower(),
+                base_ref_name=str(data["baseRefName"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def discover_pr_by_branch(self, branch: str) -> PullRequestDetails | None:
+        """Return the most recent PR associated with a branch, if any."""
+        result = self._run(
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--limit",
+            "1",
+            "--json",
+            "number,url,state,baseRefName",
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = json.loads(result.stdout)
+        if not data:
+            return None
+        item = data[0]
+        try:
+            return PullRequestDetails(
+                url=str(item["url"]),
+                number=int(item["number"]),
+                state=str(item["state"]).lower(),
+                base_ref_name=str(item["baseRefName"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
     def get_pr_url(self, pr_ref: str | int) -> str | None:
         """Get PR URL for a PR number/ref, or None if no live PR exists."""
-        result = self._run("pr", "view", str(pr_ref), "--json", "url", "-q", ".url", check=False)
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-        return None
+        details = self.get_pr_details(pr_ref)
+        return details.url if details is not None else None
 
     def add_pr_comment(self, pr_number: int, body: str) -> None:
         """Add a comment to a PR.
@@ -129,3 +191,7 @@ class GitHub:
             GitHubError: If comment fails
         """
         self._run("pr", "comment", str(pr_number), "--body", body)
+
+    def close_pr(self, pr_number: int) -> None:
+        """Close a pull request without deleting its branch."""
+        self._run("pr", "close", str(pr_number))

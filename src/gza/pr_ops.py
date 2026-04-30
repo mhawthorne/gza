@@ -2,6 +2,7 @@
 
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal
 
 from .config import Config
@@ -10,6 +11,7 @@ from .db import SqliteTaskStore, Task
 from .git import Git, GitError
 from .github import GitHub, GitHubError
 from .prompts import PromptBuilder
+from .sync_ops import resolve_branch_pr
 
 PrEnsureStatus = Literal[
     "cached",
@@ -208,25 +210,30 @@ def ensure_task_pr(
     except GitError as e:
         return EnsureTaskPrResult(ok=False, status="push_failed", error=str(e))
 
-    if task.pr_number:
-        pr_url = gh.get_pr_url(task.pr_number)
-        if pr_url:
+    pr_lookup_time = datetime.now(UTC)
+    resolved_pr = resolve_branch_pr(
+        gh,
+        task.branch,
+        cached_pr_numbers=((task.pr_number,) if task.pr_number is not None else ()),
+        allow_discovery=True,
+    )
+    if resolved_pr.details is not None:
+        task.pr_number = resolved_pr.details.number
+        task.pr_state = resolved_pr.details.state
+        task.pr_last_synced_at = pr_lookup_time
+        store.update(task)
+        if resolved_pr.details.state == "open":
             return EnsureTaskPrResult(
                 ok=True,
-                status="cached",
-                pr_url=pr_url,
-                pr_number=task.pr_number,
+                status="cached" if resolved_pr.source == "cached" else "existing",
+                pr_url=resolved_pr.details.url,
+                pr_number=resolved_pr.details.number,
             )
+    elif resolved_pr.clear_cached_number:
         task.pr_number = None
+        task.pr_state = None
+        task.pr_last_synced_at = pr_lookup_time
         store.update(task)
-
-    existing_pr_url = gh.pr_exists(task.branch)
-    if existing_pr_url:
-        pr_number = gh.get_pr_number(task.branch)
-        if pr_number:
-            task.pr_number = pr_number
-            store.update(task)
-        return EnsureTaskPrResult(ok=True, status="existing", pr_url=existing_pr_url, pr_number=pr_number)
 
     if git.is_merged(task.branch, default_branch):
         if merged_behavior == "error":
@@ -246,5 +253,7 @@ def ensure_task_pr(
 
     if pr.number:
         task.pr_number = pr.number
+        task.pr_state = "open"
+        task.pr_last_synced_at = datetime.now(UTC)
         store.update(task)
     return EnsureTaskPrResult(ok=True, status="created", pr_url=pr.url, pr_number=pr.number)

@@ -195,6 +195,26 @@ class TestHelpOutput:
         assert "--pr" in docs_text
         assert "Create/reuse a GitHub PR for completed code tasks before auto-created review runs" in docs_text
 
+    def test_sync_help_and_docs_describe_explicit_git_and_github_reconciliation(self, tmp_path):
+        """`sync --help` and docs should expose the new explicit reconciliation surface."""
+        setup_config(tmp_path)
+
+        sync_help = run_gza("sync", "--help", "--project", str(tmp_path))
+        assert sync_help.returncode == 0
+
+        help_text = " ".join(sync_help.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "--git-only" in sync_help.stdout
+        assert "--pr-only" in sync_help.stdout
+        assert "--no-fetch" in sync_help.stdout
+        assert "Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch" in help_text
+
+        assert "### sync" in docs_text
+        assert "gza sync [task_id ...] [options]" in docs_text
+        assert "`gza sync` is the only command that performs GitHub-side reconciliation." in docs_text
+        assert "Run `gza sync` after those merges" in docs_text
+
     def test_watch_and_queue_tag_help_point_to_same_scoped_pickup_preview(self, tmp_path):
         """Help/docs should make `queue --tag` the preview for `watch --tag`."""
         setup_config(tmp_path)

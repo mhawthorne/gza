@@ -625,6 +625,10 @@ gza pr <task_id> [options]
 | `--title TITLE` | Override auto-generated PR title |
 | `--draft` | Create as draft PR |
 
+`gza pr` reuses an open PR when the branch already has one. If the most recent associated PR is closed or merged while the branch is still unmerged, `gza pr` creates a new PR and updates the cached `pr_number`.
+
+`gza pr` does not reconcile or close stale GitHub PRs after manual or squash merges outside GitHub. Run `gza sync` after those merges to refresh cached PR state and close stale open PRs only when `origin/<default-branch>` proves the branch changes already landed.
+
 ### delete
 
 Delete a task.
@@ -954,6 +958,8 @@ gza merge <task_id> [task_id...] [options]
 | `--remote` | Fetch from origin and rebase against remote (requires --rebase) |
 | `--mark-only` | Mark branch as merged without performing actual merge (deletes branch) |
 | `--resolve` | Auto-resolve conflicts using AI when rebasing (requires --rebase) |
+
+`gza merge` only performs the local git merge/rebase path and updates local task `merge_status`. It does not reconcile GitHub PR state. After merge, run `gza sync` to refresh cached PR metadata and close any stale still-open PRs when remote default-branch state proves the changes already landed.
 
 ### unmerged
 
@@ -1431,6 +1437,32 @@ gza refresh [task_id] [options]
 |--------|-------------|
 | `task_id` | Full prefixed task ID to refresh (e.g. `gza-1234`; omit to refresh all unmerged tasks) |
 | `--include-failed` | Also refresh failed tasks that have branches |
+
+`gza refresh` only updates cached diff stats. It does not reconcile PR metadata or perform any GitHub cleanup.
+
+### sync
+
+Explicitly reconcile branch-scoped task state across local git, fetched remote default-branch git state, and GitHub PR metadata.
+
+```bash
+gza sync [task_id ...] [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Full prefixed task ID(s) whose branch cohorts should be synced (e.g. `gza-1234`; omit to use the bounded default candidate set) |
+| `--dry-run` | Show intended DB writes and PR cleanup without making changes |
+| `--git-only` | Only reconcile merge status and diff stats; skip GitHub PR sync |
+| `--pr-only` | Only reconcile PR metadata and stale-PR cleanup; skip git diff refresh |
+| `--no-fetch` | Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch |
+
+`gza sync` is the only command that performs GitHub-side reconciliation. It:
+- dedupes work by branch and writes normalized state back to every same-branch task row that carries commits
+- refreshes cached `merge_status`, `diff_*` stats, `pr_number`, `pr_state`, and `pr_last_synced_at`
+- discovers PRs by branch for bounded candidates that need PR reconciliation
+- auto-closes stale open PRs only after posting a comment and only when a fresh `origin/<default-branch>` fetch proves the branch content is already present upstream
+
+Default `gza sync` scope is intentionally bounded. It includes unresolved branches, tasks with known or unknown open-PR cache state, and recently touched PR-intended work. Pass explicit task IDs to force-sync specific branch cohorts outside that default window.
 
 ### tv
 

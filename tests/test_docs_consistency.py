@@ -52,6 +52,7 @@ def test_configuration_docs_require_full_prefixed_ids_for_strict_commands() -> N
         "| `task_id` | Specific full prefixed task ID to advance",
         "| `impl_task_id` | Full prefixed implementation task ID to iterate",
         "| `task_id` | Full prefixed task ID to refresh",
+        "| `task_id` | Full prefixed task ID(s) whose branch cohorts should be synced",
         "`task_id` must be a full prefixed task ID (for example `gza-1234`).",
     ]
 
@@ -79,6 +80,24 @@ def test_configuration_docs_cover_force_execution_flags_and_prerequisite_unmerge
 
     for snippet in required_snippets:
         assert snippet in config_content
+
+
+def test_configuration_docs_describe_sync_as_explicit_github_reconciliation_surface() -> None:
+    """Canonical docs should keep `gza sync` scoped as the explicit PR reconciliation command."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    config_content = (docs_root / "configuration.md").read_text()
+    workflow_example = (docs_root / "examples" / "plan-implement-review.md").read_text()
+
+    required_snippets = [
+        "### sync",
+        "gza sync [task_id ...] [options]",
+        "`gza sync` is the only command that performs GitHub-side reconciliation.",
+        "`gza pr` does not reconcile or close stale GitHub PRs",
+        "`gza merge` only performs the local git merge/rebase path",
+        "`uv run gza sync <impl_id>`",
+    ]
+    for snippet in required_snippets:
+        assert snippet in config_content or snippet in workflow_example
 
 
 def test_skills_docs_do_not_advertise_unsupported_gza_log_task_flag() -> None:
