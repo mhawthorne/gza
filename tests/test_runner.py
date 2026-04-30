@@ -16,6 +16,7 @@ from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError
 from gza.lineage import get_plan_for_task
 from gza.providers import ClaudeProvider, RunResult
+from gza.providers.base import PreflightCheckResult
 from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
@@ -56,7 +57,6 @@ from gza.runner import (
     write_log_entry,
     write_worker_start_event,
 )
-from gza.providers.base import PreflightCheckResult
 
 
 class TestGetTaskOutputPaths:
@@ -6317,11 +6317,20 @@ class TestExtractedRunInnerHelpers:
         git.is_merged.return_value = False
 
         ensure_result = Mock(ok=True, status="created", pr_url="https://github.com/o/r/pull/99")
-        with patch("gza.runner.ensure_task_pr", return_value=ensure_result) as ensure_pr:
+        with (
+            patch(
+                "gza.runner.build_task_pr_content",
+                return_value=("Shared title", "Shared body"),
+            ) as build_content,
+            patch("gza.runner.ensure_task_pr", return_value=ensure_result) as ensure_pr,
+        ):
             ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
         assert ok is True
+        build_content.assert_called_once_with(task, git, config, store)
         ensure_pr.assert_called_once()
+        assert ensure_pr.call_args.kwargs["title"] == "Shared title"
+        assert ensure_pr.call_args.kwargs["body"] == "Shared body"
         git.needs_push.assert_not_called()
 
     def test_ensure_work_pr_skips_when_branch_has_no_commits(self, tmp_path: Path):
