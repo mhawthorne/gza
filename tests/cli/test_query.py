@@ -3537,7 +3537,7 @@ class TestStatusCommand:
 
         assert result.returncode == 2
         assert "invalid choice: 'grouped'" in result.stderr
-        assert "choose from flat, lineage, tree, json" in result.stderr
+        assert "--view {flat,lineage,tree,json}" in result.stderr
 
 
 class TestRenameGroupCommand:
