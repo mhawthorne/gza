@@ -4627,6 +4627,9 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "diff_lines_removed", "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
     )
     task_import_columns_sql = ", ".join(f'"{c}"' if c == "group" else c for c in task_import_columns)
+    legacy_task_fallbacks = {
+        "create_pr": "0",
+    }
     project_id, project_prefix = _project_identity_from_config(config)
 
     run_step_payload_columns = (
@@ -4788,11 +4791,33 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                 conflicts.append(identity)
         return conflicts
 
+    def _legacy_task_projection_sql(*, source_prefix: str = "") -> str:
+        legacy_task_columns = _table_columns(local_conn, "tasks")
+        prefix = f"{source_prefix}." if source_prefix else ""
+        select_exprs: list[str] = []
+        for column in task_import_columns:
+            quoted_column = f'"{column}"' if column == "group" else column
+            quoted_alias = f'"{column}"' if column == "group" else column
+            if column in legacy_task_columns:
+                select_exprs.append(f"{prefix}{quoted_column} AS {quoted_alias}")
+                continue
+            fallback = legacy_task_fallbacks.get(column)
+            if fallback is not None:
+                select_exprs.append(f"{fallback} AS {quoted_alias}")
+                continue
+            raise ValueError(
+                "Legacy local DB is missing required tasks column "
+                f"{column}; run 'uv run gza migrate' on the legacy project first."
+            )
+        return ", ".join(select_exprs)
+
     local_conn = sqlite3.connect(f"file:{local_db}?mode=ro", uri=True)
     local_conn.row_factory = sqlite3.Row
     try:
+        task_source_select_sql = _legacy_task_projection_sql()
+        task_source_select_sql_qualified = _legacy_task_projection_sql(source_prefix="legacy_local.tasks")
         local_task_rows = local_conn.execute(
-            f"SELECT {task_import_columns_sql} FROM tasks ORDER BY id"
+            f"SELECT {task_source_select_sql} FROM tasks ORDER BY id"
         ).fetchall()
 
         if dry_run:
@@ -4893,7 +4918,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                         project_id, {task_import_columns_sql}
                     )
                     SELECT
-                        ?, {task_import_columns_sql}
+                        ?, {task_source_select_sql_qualified}
                     FROM legacy_local.tasks
                     """,
                     (store._project_id,),

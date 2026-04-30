@@ -5284,6 +5284,66 @@ class TestSharedDbIsolationAndImportGating:
         assert after_other_last_seen == before_other_last_seen
         assert target_project_count == 0
 
+    def test_import_local_db_dry_run_pre_v37_missing_create_pr_defaults_false(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportdryrun04\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_task = legacy_store.add("legacy task before v37")
+        _drop_tasks_column(local_db, "create_pr")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config, dry_run=True)
+
+        assert result["status"] == "dry_run"
+        assert result["local_task_count"] == 1
+        assert result["shared_existing_task_count"] == 0
+        with sqlite3.connect(local_db) as conn:
+            row = conn.execute("SELECT id FROM tasks").fetchone()
+        assert row is not None
+        assert row[0] == legacy_task.id
+
+    def test_import_local_db_pre_v37_missing_create_pr_imports_with_false(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimport03\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_task = legacy_store.add("legacy task before v37")
+        _drop_tasks_column(local_db, "create_pr")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config)
+        assert result["status"] == "imported"
+
+        shared_store = SqliteTaskStore.from_config(config)
+        imported = shared_store.get(legacy_task.id)
+        assert imported is not None
+        assert imported.create_pr is False
+
     def test_import_local_db_dry_run_errors_cleanly_when_shared_db_uninitialized(self, tmp_path: Path) -> None:
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
