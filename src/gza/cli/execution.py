@@ -18,6 +18,7 @@ from ..db import (
     InvalidTaskIdError,
     SqliteTaskStore,
     Task as DbTask,
+    _normalize_tags,
     add_task_interactive,
     edit_task_interactive,
     task_id_numeric_key,
@@ -935,36 +936,44 @@ def cmd_edit(args: argparse.Namespace) -> int:
         update_messages.append(f"✓ Updated task {task.id}")
         changed = True
 
-    if changed:
-        store.update(task)
+    tag_message: str | None = None
+    if tag_action is not None:
+        # Let store.update derive the legacy group mirror from the final tag set.
+        task.group = None
+
     if tag_action == "clear":
-        store.replace_task_tags(task_row_id, ())
-        update_messages.append(f"✓ Cleared tags for task {task_row_id}")
+        task.tags = ()
+        tag_message = f"✓ Cleared tags for task {task_row_id}"
     elif tag_action == "set":
         try:
-            final_tags = store.replace_task_tags(task_row_id, tag_values)
+            final_tags = _normalize_tags(tag_values)
         except ValueError as exc:
             print(f"Error: {exc}")
             return 1
-        update_messages.append(
-            f"✓ Set tags for task {task_row_id}: {', '.join(final_tags) if final_tags else '(none)'}",
-        )
+        task.tags = final_tags
+        tag_message = f"✓ Set tags for task {task_row_id}: {', '.join(final_tags) if final_tags else '(none)'}"
     elif tag_action == "add":
         try:
-            final_tags = store.add_task_tags(task_row_id, tag_values)
+            final_tags = _normalize_tags((*task.tags, *tag_values))
         except ValueError as exc:
             print(f"Error: {exc}")
             return 1
-        update_messages.append(f"✓ Added tags for task {task_row_id}: {', '.join(final_tags)}")
+        task.tags = final_tags
+        tag_message = f"✓ Added tags for task {task_row_id}: {', '.join(final_tags)}"
     elif tag_action == "remove":
         try:
-            final_tags = store.remove_task_tags(task_row_id, tag_values)
+            removed_tags = set(_normalize_tags(tag_values))
         except ValueError as exc:
             print(f"Error: {exc}")
             return 1
-        update_messages.append(
-            f"✓ Updated tags for task {task_row_id}: {', '.join(final_tags) if final_tags else '(none)'}",
-        )
+        final_tags = tuple(tag for tag in task.tags if tag not in removed_tags)
+        task.tags = final_tags
+        tag_message = f"✓ Updated tags for task {task_row_id}: {', '.join(final_tags) if final_tags else '(none)'}"
+
+    if changed or tag_action is not None:
+        store.update(task)
+        if tag_message is not None:
+            update_messages.append(tag_message)
 
     if changed or tag_action is not None:
         for message in update_messages:

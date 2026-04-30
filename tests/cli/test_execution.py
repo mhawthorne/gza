@@ -403,6 +403,58 @@ class TestEditCommand:
         assert updated.create_pr is True
         assert updated.tags == ("cli",)
 
+    def test_edit_pr_and_invalid_add_tag_is_atomic(self, tmp_path: Path):
+        """Failed tag validation must not persist earlier non-tag mutations."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task")
+        assert task.create_pr is False
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            "--pr",
+            "--add-tag",
+            "",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "Error: tag must not be empty" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.create_pr is False
+
+    def test_edit_review_and_invalid_remove_tag_is_atomic(self, tmp_path: Path):
+        """Failed tag removal validation must not persist earlier non-tag mutations."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task")
+        assert task.create_review is False
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            "--review",
+            "--remove-tag",
+            "",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "Error: tag must not be empty" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.create_review is False
+
     def test_edit_with_prompt_file(self, tmp_path: Path):
         """Edit command can update prompt from file."""
 
