@@ -294,6 +294,7 @@ class Task:
     depends_on: str | None = None  # Task ID this task depends on (string)
     spec: str | None = None  # Path to spec file for context
     create_review: bool = False  # Auto-create review task on completion
+    create_pr: bool = False  # Auto-create/reuse PR on successful code-task completion
     same_branch: bool = False  # Continue on depends_on task's branch instead of creating new
     base_branch: str | None = None  # Optional branch ref used when creating a fresh retry branch
     task_type_hint: str | None = None  # Explicit branch type hint (e.g., "fix", "feature")
@@ -439,8 +440,13 @@ MIGRATION_V35_TO_V36 = """
 -- equivalent to fresh SCHEMA. See _run_v35_to_v36_migration().
 """
 
+# Migration from v36 to v37: persisted PR-creation intent
+MIGRATION_V36_TO_V37 = """
+ALTER TABLE tasks ADD COLUMN create_pr INTEGER DEFAULT 0;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 37
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -663,6 +669,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 depends_on TEXT,
                 spec TEXT,
                 create_review INTEGER DEFAULT 0,
+                create_pr INTEGER DEFAULT 0,
                 same_branch INTEGER DEFAULT 0,
                 task_type_hint TEXT,
                 output_content TEXT,
@@ -773,7 +780,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "id", "prompt", "status", "task_type", "slug", "branch", "log_file", "report_file", "based_on", "has_commits",
             "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns", "num_turns_reported", "num_turns_computed",
             "attach_count", "attach_duration_seconds", "cost_usd", "created_at", "started_at", "running_pid", "completed_at",
-            "group", "depends_on", "spec", "create_review", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
+            "group", "depends_on", "spec", "create_review", "create_pr", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
             "model", "provider", "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
             "merge_status", "merged_at", "failure_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
             "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
@@ -783,6 +790,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "status": "'pending'",
             "task_type": "'implement'",
             "create_review": "0",
+            "create_pr": "0",
             "same_branch": "0",
             "provider_is_explicit": "0",
             "urgent": "0",
@@ -812,7 +820,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 project_id, id, prompt, status, task_type, slug, branch, log_file, report_file, based_on, has_commits,
                 duration_seconds, num_steps_reported, num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                 attach_count, attach_duration_seconds, cost_usd, created_at, started_at, running_pid, completed_at,
-                "group", depends_on, spec, create_review, same_branch, task_type_hint, output_content, session_id, pr_number,
+                "group", depends_on, spec, create_review, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
                 model, provider, provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
                 merge_status, merged_at, failure_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
                 review_cleared_at, review_score, log_schema_version, execution_mode, base_branch
@@ -1044,6 +1052,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "depends_on",
     "spec",
     "create_review",
+    "create_pr",
     "same_branch",
     "task_type_hint",
     "output_content",
@@ -1140,6 +1149,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         31: ("tasks", "execution_mode"),
         33: ("tasks", "review_score"),
         34: ("tasks", "queue_position"),
+        37: ("tasks", "create_pr"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is None:
@@ -1203,6 +1213,7 @@ def _ensure_required_auto_migration_artifacts(
         (36, "run_substeps", "project_id", "ALTER TABLE run_substeps ADD COLUMN project_id TEXT"),
         (36, "task_comments", "project_id", "ALTER TABLE task_comments ADD COLUMN project_id TEXT"),
         (36, "task_tags", "project_id", "ALTER TABLE task_tags ADD COLUMN project_id TEXT"),
+        (37, "tasks", "create_pr", "ALTER TABLE tasks ADD COLUMN create_pr INTEGER DEFAULT 0"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -1303,6 +1314,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     depends_on TEXT,
     spec TEXT,
     create_review INTEGER DEFAULT 0,
+    create_pr INTEGER DEFAULT 0,
     same_branch INTEGER DEFAULT 0,
     task_type_hint TEXT,
     output_content TEXT,
@@ -1689,6 +1701,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (34, MIGRATION_V33_TO_V34),
     (35, MIGRATION_V34_TO_V35),
     (36, MIGRATION_V35_TO_V36),
+    (37, MIGRATION_V36_TO_V37),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -2265,6 +2278,7 @@ class SqliteTaskStore:
             depends_on=row["depends_on"],
             spec=row["spec"],
             create_review=bool(row["create_review"]) if row["create_review"] is not None else False,
+            create_pr=bool(row["create_pr"]) if "create_pr" in keys and row["create_pr"] is not None else False,
             same_branch=bool(row["same_branch"]) if row["same_branch"] is not None else False,
             base_branch=row["base_branch"] if "base_branch" in keys else None,
             task_type_hint=row["task_type_hint"] if "task_type_hint" in keys else None,
@@ -2435,6 +2449,7 @@ class SqliteTaskStore:
         depends_on: str | None = None,
         spec: str | None = None,
         create_review: bool = False,
+        create_pr: bool = False,
         same_branch: bool = False,
         base_branch: str | None = None,
         task_type_hint: str | None = None,
@@ -2456,8 +2471,8 @@ class SqliteTaskStore:
             new_id = self._next_id(conn)
             conn.execute(
                 """
-                INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, urgent, skip_learnings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, create_pr, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, urgent, skip_learnings)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._project_id,
@@ -2470,6 +2485,7 @@ class SqliteTaskStore:
                     depends_on,
                     spec,
                     1 if create_review else 0,
+                    1 if create_pr else 0,
                     1 if same_branch else 0,
                     base_branch,
                     task_type_hint,
@@ -2591,6 +2607,7 @@ class SqliteTaskStore:
                     depends_on = ?,
                     spec = ?,
                     create_review = ?,
+                    create_pr = ?,
                     same_branch = ?,
                     base_branch = ?,
                     task_type_hint = ?,
@@ -2642,6 +2659,7 @@ class SqliteTaskStore:
                     task.depends_on,
                     task.spec,
                     1 if task.create_review else 0,
+                    1 if task.create_pr else 0,
                     1 if task.same_branch else 0,
                     task.base_branch,
                     task.task_type_hint,
@@ -4380,6 +4398,7 @@ def edit_prompt(
     tags: Iterable[str] | None = None,
     depends_on: str | None = None,
     create_review: bool = False,
+    create_pr: bool = False,
     same_branch: bool = False,
     model: str | None = None,
     provider: str | None = None,
@@ -4405,6 +4424,8 @@ def edit_prompt(
         options.append(f"# Spec: {spec}")
     if create_review:
         options.append("# Create review: yes")
+    if create_pr:
+        options.append("# Create PR: yes")
     if same_branch:
         options.append("# Same branch: yes")
     if model:
@@ -4454,6 +4475,7 @@ def add_task_interactive(
     tags: Iterable[str] | None = None,
     depends_on: str | None = None,
     create_review: bool = False,
+    create_pr: bool = False,
     same_branch: bool = False,
     task_type_hint: str | None = None,
     model: str | None = None,
@@ -4481,6 +4503,7 @@ def add_task_interactive(
             tags=tags,
             depends_on=depends_on,
             create_review=create_review,
+            create_pr=create_pr,
             same_branch=same_branch,
             model=model,
             provider=provider,
@@ -4503,6 +4526,7 @@ def add_task_interactive(
                 depends_on=depends_on,
                 spec=spec,
                 create_review=create_review,
+                create_pr=create_pr,
                 same_branch=same_branch,
                 task_type_hint=task_type_hint,
                 model=model,
@@ -4537,6 +4561,7 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
             tags=task.tags,
             depends_on=task.depends_on,
             create_review=task.create_review,
+            create_pr=task.create_pr,
             same_branch=task.same_branch,
             model=task.model,
             provider=task.provider,
@@ -4595,12 +4620,16 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "has_commits", "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns",
         "num_turns_reported", "num_turns_computed", "attach_count", "attach_duration_seconds", "cost_usd",
         "created_at", "started_at", "running_pid", "completed_at", "group", "depends_on", "spec", "create_review",
+        "create_pr",
         "same_branch", "task_type_hint", "output_content", "session_id", "pr_number", "model", "provider",
         "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
         "merge_status", "merged_at", "failure_reason", "skip_learnings", "diff_files_changed", "diff_lines_added",
         "diff_lines_removed", "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
     )
     task_import_columns_sql = ", ".join(f'"{c}"' if c == "group" else c for c in task_import_columns)
+    legacy_task_fallbacks = {
+        "create_pr": "0",
+    }
     project_id, project_prefix = _project_identity_from_config(config)
 
     run_step_payload_columns = (
@@ -4762,11 +4791,33 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                 conflicts.append(identity)
         return conflicts
 
+    def _legacy_task_projection_sql(*, source_prefix: str = "") -> str:
+        legacy_task_columns = _table_columns(local_conn, "tasks")
+        prefix = f"{source_prefix}." if source_prefix else ""
+        select_exprs: list[str] = []
+        for column in task_import_columns:
+            quoted_column = f'"{column}"' if column == "group" else column
+            quoted_alias = f'"{column}"' if column == "group" else column
+            if column in legacy_task_columns:
+                select_exprs.append(f"{prefix}{quoted_column} AS {quoted_alias}")
+                continue
+            fallback = legacy_task_fallbacks.get(column)
+            if fallback is not None:
+                select_exprs.append(f"{fallback} AS {quoted_alias}")
+                continue
+            raise ValueError(
+                "Legacy local DB is missing required tasks column "
+                f"{column}; run 'uv run gza migrate' on the legacy project first."
+            )
+        return ", ".join(select_exprs)
+
     local_conn = sqlite3.connect(f"file:{local_db}?mode=ro", uri=True)
     local_conn.row_factory = sqlite3.Row
     try:
+        task_source_select_sql = _legacy_task_projection_sql()
+        task_source_select_sql_qualified = _legacy_task_projection_sql(source_prefix="legacy_local.tasks")
         local_task_rows = local_conn.execute(
-            f"SELECT {task_import_columns_sql} FROM tasks ORDER BY id"
+            f"SELECT {task_source_select_sql} FROM tasks ORDER BY id"
         ).fetchall()
 
         if dry_run:
@@ -4867,7 +4918,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                         project_id, {task_import_columns_sql}
                     )
                     SELECT
-                        ?, {task_import_columns_sql}
+                        ?, {task_source_select_sql_qualified}
                     FROM legacy_local.tasks
                     """,
                     (store._project_id,),
@@ -5085,6 +5136,7 @@ def _task_to_dict(task: "Task") -> dict:
         "depends_on": task.depends_on,
         "spec": task.spec,
         "create_review": task.create_review,
+        "create_pr": task.create_pr,
         "same_branch": task.same_branch,
         "task_type_hint": task.task_type_hint,
         "output_content": task.output_content,
@@ -5366,6 +5418,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                 depends_on TEXT REFERENCES tasks_v25(id),
                 spec TEXT,
                 create_review INTEGER DEFAULT 0,
+                create_pr INTEGER DEFAULT 0,
                 same_branch INTEGER DEFAULT 0,
                 task_type_hint TEXT,
                 output_content TEXT,
@@ -5407,14 +5460,14 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                     num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                     attach_count, attach_duration_seconds, cost_usd,
                     created_at, started_at, running_pid, completed_at,
-                    "group", depends_on, spec, create_review, same_branch, task_type_hint,
+                    "group", depends_on, spec, create_review, create_pr, same_branch, task_type_hint,
                     output_content, session_id, pr_number, model, provider, provider_is_explicit,
                     input_tokens, output_tokens, merge_status, merged_at, failure_reason,
                     skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
                     review_cleared_at, log_schema_version, cycle_id, cycle_iteration_index,
                     cycle_role
                 ) VALUES (
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
                 )
                 """,
                 (
@@ -5435,6 +5488,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                     depends_on_new,
                     row["spec"],
                     row["create_review"] if "create_review" in row.keys() else 0,
+                    row["create_pr"] if "create_pr" in row.keys() else 0,
                     row["same_branch"] if "same_branch" in row.keys() else 0,
                     row["task_type_hint"] if "task_type_hint" in row.keys() else None,
                     row["output_content"] if "output_content" in row.keys() else None,
@@ -5938,6 +5992,7 @@ def run_v27_migration(db_path: Path) -> None:
                 depends_on TEXT REFERENCES tasks(id),
                 spec TEXT,
                 create_review INTEGER DEFAULT 0,
+                create_pr INTEGER DEFAULT 0,
                 same_branch INTEGER DEFAULT 0,
                 task_type_hint TEXT,
                 output_content TEXT,
@@ -5960,14 +6015,16 @@ def run_v27_migration(db_path: Path) -> None:
             )
         """)
 
-        conn.execute("""
+        legacy_create_pr_expr = "create_pr" if _table_has_column(conn, "tasks", "create_pr") else "0 AS create_pr"
+
+        conn.execute(f"""
             INSERT INTO tasks_v27 (
                 id, prompt, status, task_type, slug, branch, log_file, report_file,
                 based_on, has_commits, duration_seconds, num_steps_reported,
                 num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                 attach_count, attach_duration_seconds,
                 cost_usd, created_at, started_at, running_pid, completed_at, "group",
-                depends_on, spec, create_review, same_branch, task_type_hint,
+                depends_on, spec, create_review, create_pr, same_branch, task_type_hint,
                 output_content, session_id, pr_number, model, provider,
                 provider_is_explicit, input_tokens, output_tokens, merge_status,
                 merged_at, failure_reason, skip_learnings, diff_files_changed,
@@ -5979,7 +6036,7 @@ def run_v27_migration(db_path: Path) -> None:
                 num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                 attach_count, attach_duration_seconds,
                 cost_usd, created_at, started_at, running_pid, completed_at, "group",
-                depends_on, spec, create_review, same_branch, task_type_hint,
+                depends_on, spec, create_review, {legacy_create_pr_expr}, same_branch, task_type_hint,
                 output_content, session_id, pr_number, model, provider,
                 provider_is_explicit, input_tokens, output_tokens, merge_status,
                 merged_at, failure_reason, skip_learnings, diff_files_changed,

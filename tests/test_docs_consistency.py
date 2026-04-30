@@ -140,6 +140,24 @@ def test_configuration_docs_describe_comments_only_improve_path() -> None:
     assert "improve still runs using comments-only feedback" in config_content
 
 
+def test_plan_implement_review_example_uses_uv_run_gza_shell_snippets() -> None:
+    """Workflow example should not mix bare gza shell snippets with uv run gza guidance."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    example_content = (docs_root / "examples" / "plan-implement-review.md").read_text()
+
+    required_snippets = [
+        "$ uv run gza add --type implement --based-on gza-1 --review \"Implement...\"",
+        "$ uv run gza add --type implement --based-on gza-1 --review --pr \"Implement...\"",
+    ]
+    for snippet in required_snippets:
+        assert snippet in example_content
+
+    for line in example_content.splitlines():
+        stripped = line.lstrip()
+        assert not stripped.startswith("$ gza ")
+        assert not stripped.startswith("> $ gza ")
+
+
 def test_docker_setup_command_docs_describe_prewarm_hook_and_race_avoidance() -> None:
     """Docker config docs should explain pre-warm semantics and why first-use lazy installs race."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"

@@ -512,6 +512,7 @@ gza add [prompt] [options]
 | `--based-on ID` | Base on previous task by full prefixed task ID (e.g. `gza-1234`) |
 | `--depends-on ID` | Set dependency on another task by full prefixed task ID (e.g. `gza-1234`) |
 | `--review` | Auto-create review task on completion |
+| `--pr` | Auto-create/reuse a GitHub PR after successful code-task completion |
 | `--same-branch` | Continue on depends_on task's branch |
 | `--spec FILE` | Path to spec file for context |
 | `--prompt-file FILE` | Read prompt from file (for non-interactive use) |
@@ -541,8 +542,11 @@ gza edit <task_id> [options]
 | `--explore` | Convert to explore task |
 | `--task` | Convert to regular task |
 | `--review` | Enable automatic review task creation on completion |
+| `--pr` | Enable automatic PR creation on successful code-task completion |
 | `--prompt TEXT` | Set new prompt directly (use `-` for stdin) |
 | `--prompt-file FILE` | Read new prompt from file |
+
+Non-conflicting edit mutations can be combined in one invocation. Tag mutation flags remain mutually exclusive with each other.
 
 ### log
 
@@ -1160,6 +1164,7 @@ gza improve <impl_task_id> [options]
 | `impl_task_id` | Full prefixed task ID (implement, improve, review, or fix — auto-resolves to root implementation; e.g. `gza-1234`) |
 | `--review-id ID` | Explicit full prefixed review task ID to base the improve on (overrides auto-pick of most recent completed review; e.g. `gza-1234`) |
 | `--review` | Auto-create review task on completion |
+| `--pr` | Auto-create/reuse a GitHub PR after successful code-task completion |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
@@ -1274,6 +1279,7 @@ gza implement <plan_task_id> [prompt] [options]
 | `plan_task_id` | Full prefixed completed plan task ID to implement (e.g. `gza-1234`) |
 | `prompt` | Implementation prompt (defaults to plan-derived prompt) |
 | `--review` | Auto-create review task on completion |
+| `--pr` | Auto-create/reuse a GitHub PR after successful code-task completion |
 | `--tag TAG` | Add task tag (repeatable) |
 | `--group NAME` | Deprecated alias for `--tag NAME` |
 | `--same-branch` | Continue on depends_on task's branch instead of creating new |
@@ -1306,6 +1312,7 @@ gza extract SOURCE --files-from FILE [options]
 | `--files-from FILE` | Read newline-delimited selected files from file |
 | `--prompt TEXT` | Additional operator intent appended to the drafted prompt |
 | `--review` | Auto-create review task on completion |
+| `--pr` | Auto-create/reuse a GitHub PR after successful code-task completion |
 | `--tag TAG` | Add task tag (repeatable) |
 | `--group NAME` | Deprecated alias for `--tag NAME` |
 | `--branch-type TYPE` | Set branch type hint for branch naming |
@@ -1513,7 +1520,7 @@ Gza supports several task types, each with distinct behavior:
 **Typical workflow:**
 
 1. `plan` - Design the approach, saved to `.gza/plans/`
-2. `implement --based-on <plan_id> --review` - Build per plan, auto-create review
+2. `implement --based-on <plan_id> --review --pr` - Build per plan, auto-create review and ensure a PR exists for later review comments
 3. `review` runs automatically, saved to `.gza/reviews/`
 4. If changes requested: `improve <impl_id>` addresses feedback on same branch
 

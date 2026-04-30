@@ -5,14 +5,14 @@ A multi-phase workflow for larger features requiring design review.
 ## Phase 1: Create and run a plan
 
 ```bash
-$ gza add --type plan --group auth-refactor
+$ uv run gza add --type plan --group auth-refactor
 # Opens $EDITOR to write the prompt
 ```
 
 Or provide the prompt directly:
 
 ```bash
-$ gza add --type plan --group auth-refactor \
+$ uv run gza add --type plan --group auth-refactor \
   "Design a new authentication system using JWT tokens. Consider:
    - Token refresh strategy
    - Secure storage on client
@@ -23,12 +23,12 @@ Created task gza-1: 20260108-design-a-new-authentication (plan)
 Group: auth-refactor
 ```
 
-> **Note:** The `--group` flag is optional. Groups make it easier to track the status of related tasks with `gza status <group>`.
+> **Note:** The `--group` flag is optional. Groups make it easier to track the status of related tasks with `uv run gza status <group>`.
 
 Run the plan task:
 
 ```bash
-$ gza work gza-1
+$ uv run gza work gza-1
 === Task: Design a new authentication system... ===
     ID: gza-1 20260108-design-a-new-authentication
     Type: plan
@@ -37,7 +37,7 @@ $ gza work gza-1
 Stats: Runtime: 8m 12s | Turns: 15 | Cost: $0.42
 ```
 
-> **Tip:** If you don't provide a task ID, `gza work` runs the next pending task.
+> **Tip:** If you don't provide a task ID, `uv run gza work` runs the next pending task.
 
 ## Review the plan
 
@@ -54,7 +54,7 @@ The plan content is also stored in the database, so it's available to dependent 
 After reviewing and approving the plan, create an implementation task:
 
 ```bash
-$ gza add --type implement --based-on gza-1 --group auth-refactor \
+$ uv run gza add --type implement --based-on gza-1 --group auth-refactor \
   "Implement the JWT authentication system per the plan"
 
 Created task gza-2: 20260108-implement-the-jwt-authentication (implement)
@@ -67,7 +67,7 @@ The `--based-on` flag takes a task ID (not a slug) and links the implementation 
 Run the implementation:
 
 ```bash
-$ gza work gza-2
+$ uv run gza work gza-2
 === Task: Implement the JWT authentication system... ===
     ID: gza-2 20260108-implement-the-jwt-authentication
     Type: implement
@@ -82,7 +82,7 @@ Branch: feature/implement-the-jwt-authentication
 Create and run a review task:
 
 ```bash
-$ gza review gza-2
+$ uv run gza review gza-2
 ✓ Created review task gza-3
 === Task: Review implementation... ===
     ID: gza-3 20260108-review-implementation
@@ -92,9 +92,14 @@ $ gza review gza-2
 Stats: Runtime: 3m 18s | Turns: 8 | Cost: $0.28
 ```
 
-> **Alternative:** You can use `--review` with `gza add` to auto-create a review task upfront:
+> **Alternative:** You can use `--review` with `uv run gza add` to auto-create a review task upfront:
 > ```bash
-> $ gza add --type implement --based-on gza-1 --review "Implement..."
+> $ uv run gza add --type implement --based-on gza-1 --review "Implement..."
+> ```
+>
+> Add `--pr` as well if you want the implementation to open or reuse a PR as soon as it first completes, so later `uv run gza review` runs can post PR comments automatically:
+> ```bash
+> $ uv run gza add --type implement --based-on gza-1 --review --pr "Implement..."
 > ```
 
 View the review:
@@ -134,7 +139,7 @@ Verdict: CHANGES_REQUESTED
 If the review requests changes, create and run an improve task (runs immediately by default):
 
 ```bash
-$ gza improve gza-2
+$ uv run gza improve gza-2
 ✓ Created improve task gza-4
 === Task: Improve implementation based on review... ===
     ID: gza-4 20260108-improve-implementation
@@ -150,7 +155,7 @@ Stats: Runtime: 5m 22s | Turns: 14 | Cost: $0.45
 Run a follow-up review to verify the changes:
 
 ```bash
-$ gza review gza-2
+$ uv run gza review gza-2
 ✓ Created review task gza-5
 === Task: Review implementation... ===
     ID: gza-5 20260108-review-implementation
@@ -195,7 +200,7 @@ Verdict: APPROVED
 Check the group status:
 
 ```bash
-$ gza status auth-refactor
+$ uv run gza status auth-refactor
 Group: auth-refactor
 
   ✓ gza-1 20260108-design-a-new-authentication (plan)
@@ -217,11 +222,11 @@ Group: auth-refactor
 Create and merge the PR:
 
 ```bash
-$ gza pr gza-2
+$ uv run gza pr gza-2
 PR created: https://github.com/myorg/myapp/pull/143
 
 # After PR approval, merge locally
-$ gza merge gza-2 --squash
+$ uv run gza merge gza-2 --squash
 Merged: feature/implement-the-jwt-authentication → main (squashed)
 ```
 
@@ -229,8 +234,8 @@ Merged: feature/implement-the-jwt-authentication → main (squashed)
 
 The complete workflow:
 
-1. **Plan** - `gza add --type plan` → `gza work <task_id>` → review `.gza/plans/`
-2. **Implement** - `gza add --type implement --based-on <plan_id>` → `gza work <task_id>`
-3. **Review** - `gza review <impl_id>`
-4. **Improve** (if needed) - `gza improve <task_id>` → `gza review <task_id>` (accepts implement, improve, or review ID — auto-resolves)
-5. **Merge** - `gza pr <impl_id>` → `gza merge <impl_id> --squash`
+1. **Plan** - `uv run gza add --type plan` → `uv run gza work <task_id>` → review `.gza/plans/`
+2. **Implement** - `uv run gza add --type implement --based-on <plan_id>` → `uv run gza work <task_id>`
+3. **Review** - `uv run gza review <impl_id>`
+4. **Improve** (if needed) - `uv run gza improve <task_id>` → `uv run gza review <task_id>` (accepts implement, improve, or review ID — auto-resolves)
+5. **Merge** - `uv run gza pr <impl_id>` → `uv run gza merge <impl_id> --squash`

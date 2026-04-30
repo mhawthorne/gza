@@ -130,6 +130,28 @@ class TestAddCommand:
         assert task.task_type == "implement"
         assert task.group == "features"
 
+    def test_add_with_pr_flag_persists_create_pr(self, tmp_path: Path):
+        """Add command with --pr stores automatic PR intent on the task."""
+
+        setup_config(tmp_path)
+
+        result = run_gza(
+            "add",
+            "--type",
+            "implement",
+            "--pr",
+            "Implement feature X",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+
+        store = make_store(tmp_path)
+        task = get_latest_task(store, task_type="implement", prompt="Implement feature X")
+        assert task is not None
+        assert task.create_pr is True
+
     def test_add_rejects_empty_tag_without_traceback(self, tmp_path: Path):
         """add --tag '' should fail with user-facing validation, not traceback."""
         setup_config(tmp_path)
@@ -285,6 +307,153 @@ class TestEditCommand:
         # Verify create_review was enabled
         updated = store.get(task.id)
         assert updated.create_review is True
+
+    def test_edit_pr_flag(self, tmp_path: Path):
+        """Edit command can enable automatic PR creation."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task")
+        assert task.create_pr is False
+
+        result = run_gza("edit", str(task.id), "--pr", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+        updated = store.get(task.id)
+        assert updated.create_pr is True
+
+    def test_edit_review_and_pr_flags_apply_both_mutations(self, tmp_path: Path):
+        """Edit command should persist both review and PR intent in one invocation."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task")
+        assert task.create_review is False
+        assert task.create_pr is False
+
+        result = run_gza("edit", str(task.id), "--review", "--pr", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "automatic review task creation" in result.stdout
+        assert "automatic PR creation" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.create_review is True
+        assert updated.create_pr is True
+
+    def test_edit_pr_and_model_flags_apply_both_mutations(self, tmp_path: Path):
+        """Edit command should persist PR and model overrides together."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task")
+        assert task.create_pr is False
+        assert task.model is None
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            "--pr",
+            "--model",
+            "claude-3-5-haiku-latest",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "automatic PR creation" in result.stdout
+        assert "Set model override" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.create_pr is True
+        assert updated.model == "claude-3-5-haiku-latest"
+
+    def test_edit_pr_and_add_tag_apply_both_mutations(self, tmp_path: Path):
+        """Edit command should not short-circuit tag edits ahead of other mutations."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task")
+        assert task.create_pr is False
+        assert task.tags == ()
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            "--pr",
+            "--add-tag",
+            "cli",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "automatic PR creation" in result.stdout
+        assert "Added tags" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.create_pr is True
+        assert updated.tags == ("cli",)
+
+    def test_edit_pr_and_invalid_add_tag_is_atomic(self, tmp_path: Path):
+        """Failed tag validation must not persist earlier non-tag mutations."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task")
+        assert task.create_pr is False
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            "--pr",
+            "--add-tag",
+            "",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "Error: tag must not be empty" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.create_pr is False
+
+    def test_edit_review_and_invalid_remove_tag_is_atomic(self, tmp_path: Path):
+        """Failed tag removal validation must not persist earlier non-tag mutations."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task")
+        assert task.create_review is False
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            "--review",
+            "--remove-tag",
+            "",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "Error: tag must not be empty" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.create_review is False
 
     def test_edit_with_prompt_file(self, tmp_path: Path):
         """Edit command can update prompt from file."""
@@ -1504,6 +1673,41 @@ class TestWorkCommandMultiTask:
         assert rc == 0
         run_mock.assert_called_once()
 
+    def test_work_allows_failed_pr_required_task_with_persisted_create_pr(self, tmp_path: Path):
+        """work <task> should allow retrying failed PR_REQUIRED tasks via stored create_pr intent."""
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Retry PR-required task", create_pr=True)
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[task.id],
+            count=1,
+            force=False,
+            resume=False,
+            create_pr=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.run", return_value=0) as run_mock,
+        ):
+            rc = cmd_run(args)
+
+        assert rc == 0
+        run_mock.assert_called_once()
+
 
 class TestBackgroundWorkerCommand:
     """Tests for background worker subprocess command construction."""
@@ -1961,6 +2165,46 @@ class TestBackgroundWorkerCommand:
             worker_mode=False,
             project_dir=str(tmp_path),
             create_pr=True,
+            resume=False,
+            force=False,
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+
+        with patch("gza.cli.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            rc = _spawn_background_worker(args, config, task_id=task.id)
+
+        assert rc == 0
+        mock_popen.assert_called_once()
+
+    def test_background_worker_allows_failed_pr_required_task_with_persisted_create_pr(self, tmp_path: Path):
+        """Background explicit work should allow retrying failed PR_REQUIRED tasks via stored create_pr intent."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Retry PR-required task in background", create_pr=True)
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        config = Config.load(tmp_path)
+        config.tmux.enabled = False
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+            create_pr=False,
             resume=False,
             force=False,
         )
@@ -2637,6 +2881,34 @@ class TestImproveCommand:
         assert len(improves_after) == 1
         assert improves_after[0].id == first_improve.id
 
+    def test_improve_comments_only_reuse_pending_applies_create_pr_override(self, tmp_path: Path):
+        """Reused pending comments-only improve should honor current --pr intent."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Address validation gaps.")
+
+        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert first.returncode == 0, first.stdout
+
+        pending_improve = next(task for task in store.get_all() if task.task_type == "improve")
+        assert pending_improve.id is not None
+        assert pending_improve.create_pr is False
+
+        second = run_gza("improve", str(impl_task.id), "--queue", "--pr", "--project", str(tmp_path))
+        assert second.returncode == 0, second.stdout
+        assert f"Reusing pending improve task {pending_improve.id}" in second.stdout
+
+        reused = store.get(pending_improve.id)
+        assert reused is not None
+        assert reused.create_pr is True
+
     def test_improve_comments_only_pending_task_with_newer_comment_creates_fresh_task(self, tmp_path: Path):
         """Pending comments-only improve is not reused when newer unresolved comments were added."""
         setup_config(tmp_path)
@@ -2704,6 +2976,41 @@ class TestImproveCommand:
         resumed = max(improves_after, key=lambda t: task_id_numeric_key(t.id))
         assert resumed.based_on == failed_improve.id
         assert resumed.depends_on is None
+
+    def test_improve_comments_only_resume_applies_create_pr_override(self, tmp_path: Path):
+        """Resumed comments-only improve should honor current --pr intent."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Handle edge-case parsing.")
+
+        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert first.returncode == 0, first.stdout
+
+        failed_improve = next(task for task in store.get_all() if task.task_type == "improve")
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "TIMEOUT"
+        failed_improve.session_id = "improve-session-1"
+        store.update(failed_improve)
+
+        second = run_gza("improve", str(impl_task.id), "--queue", "--pr", "--project", str(tmp_path))
+        assert second.returncode == 0, second.stdout
+        assert f"(resume of {failed_improve.id})" in second.stdout
+
+        resumed = max(
+            (task for task in store.get_all() if task.task_type == "improve"),
+            key=lambda task: task_id_numeric_key(task.id),
+        )
+        assert resumed.id != failed_improve.id
+        assert resumed.based_on == failed_improve.id
+        assert resumed.create_pr is True
 
     def test_improve_comments_only_failed_task_with_newer_comment_creates_fresh_task(self, tmp_path: Path):
         """Failed comments-only improve is not resumed/retried when newer unresolved comments exist."""

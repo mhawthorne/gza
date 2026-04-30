@@ -48,6 +48,7 @@ class TestTaskChaining:
             depends_on=None,
             spec="specs/test.md",
             create_review=True,
+            create_pr=True,
             same_branch=True,
         )
 
@@ -63,6 +64,7 @@ class TestTaskChaining:
         assert retrieved.group == "test-group"
         assert retrieved.spec == "specs/test.md"
         assert retrieved.create_review is True
+        assert retrieved.create_pr is True
         assert retrieved.same_branch is True
 
     def test_depends_on_relationship(self, tmp_path: Path):
@@ -597,10 +599,12 @@ class TestConnectionLifecycle:
         task = store.add("Test task")
         assert task.group is None
         assert task.create_review is False
+        assert task.create_pr is False
 
         # Update with new fields
         task.group = "new-group"
         task.create_review = True
+        task.create_pr = True
         task.same_branch = True
         store.update(task)
 
@@ -608,6 +612,7 @@ class TestConnectionLifecycle:
         retrieved = store.get(task.id)
         assert retrieved.group == "new-group"
         assert retrieved.create_review is True
+        assert retrieved.create_pr is True
         assert retrieved.same_branch is True
 
     def test_task_with_branch_field(self, tmp_path: Path):
@@ -4623,7 +4628,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -4635,7 +4640,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -5278,6 +5283,66 @@ class TestSharedDbIsolationAndImportGating:
         assert after_count == before_count
         assert after_other_last_seen == before_other_last_seen
         assert target_project_count == 0
+
+    def test_import_local_db_dry_run_pre_v37_missing_create_pr_defaults_false(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportdryrun04\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_task = legacy_store.add("legacy task before v37")
+        _drop_tasks_column(local_db, "create_pr")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config, dry_run=True)
+
+        assert result["status"] == "dry_run"
+        assert result["local_task_count"] == 1
+        assert result["shared_existing_task_count"] == 0
+        with sqlite3.connect(local_db) as conn:
+            row = conn.execute("SELECT id FROM tasks").fetchone()
+        assert row is not None
+        assert row[0] == legacy_task.id
+
+    def test_import_local_db_pre_v37_missing_create_pr_imports_with_false(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimport03\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_task = legacy_store.add("legacy task before v37")
+        _drop_tasks_column(local_db, "create_pr")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config)
+        assert result["status"] == "imported"
+
+        shared_store = SqliteTaskStore.from_config(config)
+        imported = shared_store.get(legacy_task.id)
+        assert imported is not None
+        assert imported.create_pr is False
 
     def test_import_local_db_dry_run_errors_cleanly_when_shared_db_uninitialized(self, tmp_path: Path) -> None:
         project_dir = tmp_path / "project"
@@ -6339,6 +6404,27 @@ class TestSharedDbIsolationAndImportGating:
 
         assert "urgent_bumped_at" in columns
 
+    def test_open_current_db_repairs_missing_create_pr_column(self, tmp_path: Path) -> None:
+        """Opening a current DB should repair missing tasks.create_pr and restore writes."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        _drop_tasks_column(db_path, "create_pr")
+
+        repaired_store = SqliteTaskStore(db_path, prefix="gza")
+        created = repaired_store.add("Task after create_pr repair", create_pr=True)
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert "create_pr" in columns
+        reloaded = repaired_store.get(created.id)
+        assert reloaded is not None
+        assert reloaded.create_pr is True
+
     def test_open_current_v32_db_repairs_missing_task_comments_source_column(self, tmp_path: Path) -> None:
         """Opening an already-v32 DB should repair missing task_comments.source."""
         import sqlite3
@@ -6399,6 +6485,24 @@ class TestSharedDbIsolationAndImportGating:
         finally:
             db_path.chmod(0o644)
 
+    def test_open_current_db_missing_create_pr_column_fails_on_read_only_db(
+        self, tmp_path: Path
+    ) -> None:
+        """Read-only current-schema damage should fail early with SchemaIntegrityError for create_pr."""
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_tasks_column(db_path, "create_pr")
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"required column tasks\.create_pr",
+            ):
+                SqliteTaskStore(db_path, prefix="gza")
+        finally:
+            db_path.chmod(0o644)
+
     def test_open_current_v32_db_missing_task_comments_source_fails_on_read_only_db(
         self, tmp_path: Path
     ) -> None:
@@ -6440,6 +6544,24 @@ class TestSharedDbIsolationAndImportGating:
         assert reloaded is not None
         assert reloaded.prompt == "Task with query-only execution-mode damage"
         assert any("tasks.execution_mode" in warning for warning in query_store.startup_warnings())
+
+    def test_query_only_open_current_db_missing_create_pr_fails_closed(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should fail closed when the core tasks.create_pr column is missing."""
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_tasks_column(db_path, "create_pr")
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"required column tasks\.create_pr",
+            ):
+                SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+        finally:
+            db_path.chmod(0o644)
 
     def test_query_only_open_current_db_missing_task_comments_source_warns_and_reads_comments(
         self, tmp_path: Path
@@ -6643,6 +6765,38 @@ class TestSharedDbIsolationAndImportGating:
         assert child.based_on == "gza-1"
         assert child.depends_on == "gza-1"
 
+    def test_run_v27_migration_defaults_missing_legacy_create_pr_to_false(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, created_at) VALUES (1, 'parent', '2024-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        run_v25_migration(db_path, "gza")
+        run_v26_migration(db_path)
+        _drop_tasks_column(db_path, "create_pr")
+
+        run_v27_migration(db_path)
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        conn.close()
+
+        assert version == 27
+        assert "create_pr" in columns
+
+        store = SqliteTaskStore(db_path, prefix="gza")
+        migrated = store.get("gza-1")
+        assert migrated is not None
+        assert migrated.create_pr is False
+
     def test_v24_to_v27_chains_via_gza_migrate(self, tmp_path: Path) -> None:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6675,7 +6829,7 @@ class TestSharedDbIsolationAndImportGating:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37]
 
         # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")
