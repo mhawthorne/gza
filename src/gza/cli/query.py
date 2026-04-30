@@ -50,6 +50,7 @@ from ..query import (
     resolve_lineage_root as _resolve_lineage_root_task,
 )
 from ..runner import _get_task_output, get_effective_config_for_task, write_log_entry
+from ..sync_ops import BranchCohort, summarize_git_reconcile, sync_branch_cohorts
 from ..task_query import (
     DateFilter as _TaskDateFilter,
     LineageRow as _LineageRow,
@@ -904,7 +905,23 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         migrate_merge_status(store, git)
 
     if allow_persistence:
-        merged_count, refreshed_count = _reconcile_unmerged_tasks(store, git, default_branch)
+        seen_branches: set[str] = set()
+        cohorts: list[BranchCohort] = []
+        for task in store.get_unmerged():
+            if not task.branch or task.branch in seen_branches:
+                continue
+            seen_branches.add(task.branch)
+            cohorts.append(BranchCohort(branch=task.branch, tasks=tuple(store.get_tasks_for_branch(task.branch))))
+        reconcile_results, _partial = sync_branch_cohorts(
+            store,
+            git,
+            cohorts,
+            include_git=True,
+            include_pr=False,
+            dry_run=False,
+            fetch_remote=False,
+        )
+        merged_count, refreshed_count = summarize_git_reconcile(reconcile_results)
         console.print(
             f"[{TASK_COLORS['task_id']}]Reconciled unmerged tasks: {merged_count} merged, "
             f"{refreshed_count} refreshed[/{TASK_COLORS['task_id']}]"

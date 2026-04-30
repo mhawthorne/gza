@@ -12,17 +12,13 @@ from pathlib import Path
 import gza.colors as _colors
 from gza.query import get_base_task_slug as _get_base_task_slug
 
-from .. import runner as runner_mod
 from ..colors import pink
 from ..commit_messages import build_task_commit_message
 from ..config import Config
 from ..console import (
-    MAX_PR_BODY_LENGTH,
-    MAX_PR_TITLE_LENGTH,
     console,
     prompt_available_width,
     shorten_prompt,
-    truncate,
 )
 from ..db import SqliteTaskStore, Task as DbTask
 from ..git import (
@@ -30,15 +26,13 @@ from ..git import (
     GitError,
     active_worktree_path_for_branch,
     cleanup_worktree_for_branch,
-    parse_diff_numstat,
 )
 from ..pickup import (
     count_worker_consuming_actions,
     get_runnable_pending_tasks,
     is_worker_consuming_advance_action,
 )
-from ..pr_ops import ensure_task_pr
-from ..prompts import PromptBuilder
+from ..pr_ops import build_task_pr_content, ensure_task_pr
 from ..runner import (
     TaskExecutionLogger,
     ensure_task_log_path,
@@ -46,6 +40,12 @@ from ..runner import (
     load_dotenv,
     task_log_storage_path,
     write_log_entry,
+)
+from ..sync_ops import (
+    build_branch_cohorts_for_task_ids,
+    build_default_branch_cohorts,
+    refresh_branch_diff_stats,
+    sync_branch_cohorts,
 )
 from ._common import (
     DuplicateReviewError,
@@ -261,7 +261,6 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
     git = Git(config.project_dir)
-    default_branch = git.default_branch()
 
     if args.task_id is not None:
         # Single task by ID
@@ -281,24 +280,23 @@ def cmd_refresh(args: argparse.Namespace) -> int:
                 if t.branch and t not in tasks_to_refresh:
                     tasks_to_refresh.append(t)
 
+    results, skipped = refresh_branch_diff_stats(store, git, tasks_to_refresh)
     refreshed = 0
-    skipped = 0
-    for task in tasks_to_refresh:
-        if not task.branch:
-            console.print(f"[dim]{task.id}: no branch, skipping[/dim]")
-            skipped += 1
+    for result in results:
+        if result.skipped_reason == "no branch":
+            task_id = result.task_ids[0] if result.task_ids else "<unknown>"
+            console.print(f"[dim]{task_id}: no branch, skipping[/dim]")
             continue
-        if not git.branch_exists(task.branch):
-            console.print(f"[dim]{task.id} {task.branch}: branch no longer exists, skipping[/dim]")
-            skipped += 1
+        if result.skipped_reason == "branch no longer exists":
+            task_id = result.task_ids[0] if result.task_ids else "<unknown>"
+            console.print(f"[dim]{task_id} {result.branch}: branch no longer exists, skipping[/dim]")
             continue
-        revision_range = f"{default_branch}...{task.branch}"
-        numstat_output = git.get_diff_numstat(revision_range)
-        files_changed, lines_added, lines_removed = parse_diff_numstat(numstat_output)
-        assert task.id is not None
-        store.update_diff_stats(task.id, files_changed, lines_added, lines_removed)
-        console.print(f"{task.id} {task.branch}: +{lines_added} -{lines_removed} in {files_changed} files")
         refreshed += 1
+        task_label = ",".join(result.task_ids) if result.task_ids else result.branch
+        console.print(
+            f"{task_label} {result.branch}: +{result.diff_lines_added} -{result.diff_lines_removed} "
+            f"in {result.diff_files_changed} files"
+        )
 
     print(f"\nRefreshed {refreshed} task(s), skipped {skipped}.")
     return 0
@@ -1156,141 +1154,6 @@ def cmd_diff(args: argparse.Namespace) -> int:
         return 1
 
 
-def _generate_pr_content(
-    task: DbTask,
-    commit_log: str,
-    diff_stat: str,
-    config: Config,
-    store: SqliteTaskStore,
-) -> tuple[str, str]:
-    """Generate PR title and body using an internal task.
-
-    Args:
-        task: The task to create a PR for
-        commit_log: Git log output for the branch
-        diff_stat: Git diff --stat output
-
-    Returns:
-        Tuple of (title, body)
-    """
-    # Build prompt using the strict PR description contract template.
-    prompt = PromptBuilder().pr_description_prompt(
-        task_prompt=task.prompt,
-        commit_log=commit_log,
-        diff_stat=diff_stat,
-    )
-
-    internal_task = store.add(
-        prompt=prompt,
-        task_type="internal",
-        skip_learnings=True,
-    )
-
-    if internal_task.id is None:
-        return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
-    internal_task_id = internal_task.id
-
-    def _mark_internal_task_failed_if_nonterminal() -> None:
-        refreshed = store.get(internal_task_id)
-        if refreshed is None:
-            return
-        if refreshed.status in {"pending", "in_progress"}:
-            store.mark_failed(refreshed, failure_reason="UNKNOWN")
-
-    try:
-        exit_code = runner_mod.run(config, task_id=internal_task_id)
-    except Exception as exc:
-        _mark_internal_task_failed_if_nonterminal()
-        print(
-            f"Warning: PR description internal task {internal_task_id} failed: {exc}",
-            file=sys.stderr,
-        )
-        return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
-
-    completed_task = store.get(internal_task_id)
-    if exit_code != 0 or completed_task is None or completed_task.status != "completed":
-        _mark_internal_task_failed_if_nonterminal()
-        print(
-            f"Warning: PR description internal task {internal_task_id} did not complete successfully",
-            file=sys.stderr,
-        )
-        return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
-
-    response = (completed_task.output_content or "").strip()
-    if not response:
-        print(
-            f"Warning: PR description internal task {internal_task_id} produced no output",
-            file=sys.stderr,
-        )
-        return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
-
-    has_title = any(line.startswith("TITLE:") for line in response.splitlines())
-    has_body = any(line.strip() == "BODY:" for line in response.splitlines())
-    if not (has_title and has_body):
-        print(
-            f"Warning: PR description internal task {internal_task_id} produced malformed output",
-            file=sys.stderr,
-        )
-        return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
-
-    return _parse_pr_response(response, task)
-
-
-
-def _parse_pr_response(response: str, task: DbTask) -> tuple[str, str]:
-    """Parse Claude's response into title and body."""
-    lines = response.split("\n")
-    title = ""
-    body_lines = []
-    in_body = False
-
-    for line in lines:
-        if line.startswith("TITLE:"):
-            title = line[6:].strip()
-        elif line.strip() == "BODY:":
-            in_body = True
-        elif in_body:
-            body_lines.append(line)
-
-    if not title:
-        # Use task_id or first line of prompt
-        title = task.slug or truncate(task.prompt.split("\n")[0], MAX_PR_TITLE_LENGTH)
-
-    body = "\n".join(body_lines).strip()
-    if not body:
-        body = f"Task: {truncate(task.prompt, MAX_PR_BODY_LENGTH)}"
-
-    return title, body
-
-
-def _fallback_pr_content(
-    task: DbTask, commit_log: str, project_prefix: str | None = None
-) -> tuple[str, str]:
-    """Generate simple PR content without AI."""
-    # Title from task_id or prompt
-    if task.slug:
-        # Convert slug like "20240106-myproj-add-feature" to "Add feature"
-        # Strip date prefix (8-digit prefix + hyphen)
-        slug_no_date = task.slug.split("-", 1)[1] if "-" in task.slug else task.slug
-        # Strip project_prefix if present at the start
-        if project_prefix and slug_no_date.startswith(f"{project_prefix}-"):
-            slug_no_date = slug_no_date[len(project_prefix) + 1:]
-        title = slug_no_date.replace("-", " ").capitalize()
-    else:
-        title = truncate(task.prompt.split("\n")[0], MAX_PR_TITLE_LENGTH)
-
-    body = f"""## Task Prompt
-
-> {truncate(task.prompt, MAX_PR_BODY_LENGTH).replace(chr(10), chr(10) + '> ')}
-
-## Commits
-```
-{commit_log}
-```
-"""
-    return title, body
-
-
 def cmd_pr(args: argparse.Namespace) -> int:
     """Create a GitHub PR from a completed task."""
     config = Config.load(args.project_dir)
@@ -1324,17 +1187,18 @@ def cmd_pr(args: argparse.Namespace) -> int:
 
     default_branch = git.default_branch()
 
-    # Get commit log and diff stat for context
-    commit_log = git.get_log(f"{default_branch}..{task.branch}")
-    diff_stat = git.get_diff_stat(f"{default_branch}...{task.branch}")
-
     # Generate or use provided title/body
     if args.title:
-        title = args.title
-        body = f"## Summary\n{truncate(task.prompt, MAX_PR_BODY_LENGTH)}"
+        title, body = build_task_pr_content(
+            task,
+            git,
+            config,
+            store,
+            title_override=args.title,
+        )
     else:
         print("Generating PR description...")
-        title, body = _generate_pr_content(task, commit_log, diff_stat, config, store)
+        title, body = build_task_pr_content(task, git, config, store)
 
     result = ensure_task_pr(
         task,
@@ -1351,8 +1215,8 @@ def cmd_pr(args: argparse.Namespace) -> int:
     if result.ok and result.status == "existing":
         print(f"PR already exists: {result.pr_url}")
         return 0
-    if result.ok and result.status == "cached" and task.pr_number:
-        print(f"PR already exists: #{task.pr_number}")
+    if result.ok and result.status == "cached" and result.pr_number:
+        print(f"PR already exists: #{result.pr_number}")
         return 0
     if result.status == "gh_unavailable":
         print("Error: GitHub CLI (gh) is not installed or not authenticated")
@@ -1370,6 +1234,73 @@ def cmd_pr(args: argparse.Namespace) -> int:
         return 1
     print("Error creating PR")
     return 1
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Explicitly reconcile branch state across git and GitHub."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
+
+    include_git = not getattr(args, "pr_only", False)
+    include_pr = not getattr(args, "git_only", False)
+
+    preliminary_results: list = []
+    if args.task_ids:
+        resolved_ids = [resolve_id(config, task_id) for task_id in args.task_ids]
+        cohorts, preliminary_results = build_branch_cohorts_for_task_ids(store, resolved_ids)
+    else:
+        cohorts = build_default_branch_cohorts(store)
+
+    if not cohorts and not preliminary_results:
+        print("No sync candidates")
+        return 0
+
+    results = list(preliminary_results)
+    partial_failure = False
+    if cohorts:
+        cohort_results, partial_failure = sync_branch_cohorts(
+            store,
+            git,
+            cohorts,
+            include_git=include_git,
+            include_pr=include_pr,
+            dry_run=bool(getattr(args, "dry_run", False)),
+            fetch_remote=not bool(getattr(args, "no_fetch", False)),
+        )
+        results.extend(cohort_results)
+
+    synced = 0
+    skipped = 0
+    errors = 0
+    for result in results:
+        if result.errors:
+            errors += 1
+        if result.skipped_reason is not None:
+            skipped += 1
+            task_label = result.task_ids[0] if result.task_ids else result.branch
+            print(f"{task_label}: skipped ({result.skipped_reason})")
+            continue
+
+        synced += 1
+        parts = [result.branch]
+        if result.merge_status is not None:
+            parts.append(f"merge={result.merge_status}")
+        if result.diff_files_changed is not None:
+            parts.append(
+                f"diff=+{result.diff_lines_added}/-{result.diff_lines_removed} {result.diff_files_changed} files"
+            )
+        if result.pr_number is not None or result.pr_state is not None:
+            pr_num = f"#{result.pr_number}" if result.pr_number is not None else "#?"
+            parts.append(f"pr={pr_num}:{result.pr_state or 'unknown'}")
+        if result.actions:
+            parts.append(", ".join(result.actions))
+        if result.errors:
+            parts.append(f"errors: {'; '.join(result.errors)}")
+        print(" | ".join(parts))
+
+    print(f"\nSynced {synced} branch(es), skipped {skipped}, errors {errors}.")
+    return 1 if partial_failure or errors else 0
 
 
 def _unimplemented_implement_prompt(task: DbTask) -> str:

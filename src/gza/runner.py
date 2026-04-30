@@ -49,7 +49,7 @@ from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
 from .lineage import get_plan_for_task
-from .pr_ops import ensure_task_pr
+from .pr_ops import build_task_pr_content, ensure_task_pr
 from .prompt_sanitization import sanitize_provider_prompt
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
@@ -61,6 +61,7 @@ from .review_verdict import (
     parse_review_template,
     parse_review_verdict,
 )
+from .sync_ops import resolve_branch_pr
 from .task_slug import (
     extract_task_id_suffix,
     get_base_task_slug,
@@ -1758,21 +1759,25 @@ def post_review_to_pr(
             print("Info: GitHub CLI not available, skipping PR comment")
             return
 
-    # Find PR number
+    # Find an open PR, preferring cached metadata but falling back to branch lookup.
     pr_number = None
-
-    # Try cached pr_number first
-    if impl_task.pr_number:
-        pr_number = impl_task.pr_number
-        print(f"Found PR #{pr_number} (cached)")
-    elif impl_task.branch:
-        # Try to discover PR via branch
-        pr_number = gh.get_pr_number(impl_task.branch)
-        if pr_number:
-            print(f"Found PR #{pr_number} for branch {impl_task.branch}")
-            # Cache it for future use
-            impl_task.pr_number = pr_number
+    if impl_task.branch:
+        resolved_pr = resolve_branch_pr(
+            gh,
+            impl_task.branch,
+            cached_pr_numbers=((impl_task.pr_number,) if impl_task.pr_number is not None else ()),
+            allow_discovery=True,
+        )
+        if resolved_pr.details is not None and resolved_pr.details.state == "open":
+            pr_number = resolved_pr.details.number
+            impl_task.pr_number = resolved_pr.details.number
+            impl_task.pr_state = resolved_pr.details.state
+            impl_task.pr_last_synced_at = datetime.now(UTC)
             store.update(impl_task)
+            if resolved_pr.source == "cached":
+                print(f"Found PR #{pr_number} (cached)")
+            else:
+                print(f"Found PR #{pr_number} for branch {impl_task.branch}")
 
     if not pr_number:
         if required:
@@ -1865,17 +1870,7 @@ def _ensure_work_pr_for_completed_code_task(
         print(f"Info: Task {task.id} has no commits on branch '{task.branch}', skipping PR creation")
         return True
 
-    first_line = task.prompt.strip().splitlines()
-    title = first_line[0] if first_line else f"Task {task.id}"
-    title = title[:72].strip() or f"Task {task.id}"
-    body = f"""## Task
-
-{task.prompt}
-
-## Task ID
-
-{task.id}
-"""
+    title, body = build_task_pr_content(task, git, config, store)
     result = ensure_task_pr(
         task,
         store,

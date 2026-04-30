@@ -66,6 +66,7 @@ from .git_ops import (
     cmd_pr,
     cmd_rebase,
     cmd_refresh,
+    cmd_sync,
 )
 from .log import cmd_log
 from .query import (
@@ -845,6 +846,41 @@ def main() -> int:
         dest="include_failed",
         help="Also refresh failed tasks that have branches (cannot be used with task_id)",
     )
+
+    # sync command
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="Reconcile branch task state across local git, origin, and GitHub PR state",
+    )
+    sync_parser.add_argument(
+        "task_ids",
+        type=str,
+        nargs="*",
+        metavar="task_id",
+        help="Full prefixed task ID(s) whose branch cohorts should be synced",
+    )
+    sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show intended DB writes and PR cleanup without making changes",
+    )
+    sync_scope = sync_parser.add_mutually_exclusive_group()
+    sync_scope.add_argument(
+        "--git-only",
+        action="store_true",
+        help="Only reconcile merge status and diff stats; skip GitHub PR sync",
+    )
+    sync_scope.add_argument(
+        "--pr-only",
+        action="store_true",
+        help="Only reconcile PR metadata and stale-PR cleanup; skip git diff refresh",
+    )
+    sync_parser.add_argument(
+        "--no-fetch",
+        action="store_true",
+        help="Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch",
+    )
+    add_common_args(sync_parser)
 
     # merge command
     merge_parser = subparsers.add_parser("merge", help="Merge task branches into current branch")
@@ -2351,6 +2387,8 @@ def main() -> int:
             return cmd_queue(args)
         elif args.command == "refresh":
             return cmd_refresh(args)
+        elif args.command == "sync":
+            return cmd_sync(args)
         elif args.command == "merge":
             return cmd_merge(args)
         elif args.command == "rebase":
