@@ -7,7 +7,7 @@ import stat
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -29,6 +29,7 @@ from gza.db import (
 )
 from gza.review_tasks import build_auto_review_prompt
 from gza.runner import _compute_slug_override
+from gza.sync_ops import BranchCohort, sync_branch_cohorts
 
 
 class TestTaskChaining:
@@ -6949,3 +6950,42 @@ class TestSyncCandidates:
         assert open_pr.id in candidate_ids
         assert recent_pr_intent.id in candidate_ids
         assert stale_closed.id not in candidate_ids
+
+    def test_get_sync_candidates_does_not_keep_old_merged_task_recent_after_resync(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+        old = datetime.now(UTC) - timedelta(days=60)
+
+        task = store.add("Old merged task", task_type="implement")
+        task.status = "completed"
+        task.completed_at = old
+        task.branch = "feature/old-merged"
+        task.has_commits = True
+        task.merge_status = "merged"
+        task.merged_at = old
+        task.pr_number = 77
+        task.pr_state = "closed"
+        store.update(task)
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
+        git.is_merged.return_value = True
+
+        results, partial = sync_branch_cohorts(
+            store,
+            git,
+            [BranchCohort(branch="feature/old-merged", tasks=(task,))],
+            include_git=True,
+            include_pr=False,
+            dry_run=False,
+            fetch_remote=False,
+        )
+
+        assert partial is False
+        assert "marked merged" in results[0].actions
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.merged_at == old
+        candidate_ids = {candidate.id for candidate in store.get_sync_candidates(recent_days=30)}
+        assert task.id not in candidate_ids

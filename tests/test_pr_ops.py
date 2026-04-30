@@ -126,3 +126,49 @@ class TestEnsureTaskPr:
         assert refreshed is not None
         assert refreshed.pr_number == 82
         assert refreshed.pr_state == "open"
+
+    def test_closed_cached_pr_reuses_discovered_open_pr_before_creating(self, tmp_path):
+        """A closed cached PR must fall back to branch discovery before creating a new PR."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Implement X", task_type="implement")
+        task.branch = "feature/reuse-open-pr"
+        task.pr_number = 81
+        store.update(task)
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git.needs_push.return_value = False
+        git.is_merged.return_value = False
+
+        gh = Mock()
+        gh.is_available.return_value = True
+        gh.get_pr_details.return_value = PullRequestDetails(
+            url="https://github.com/o/r/pull/81",
+            number=81,
+            state="closed",
+            base_ref_name="main",
+        )
+        gh.discover_pr_by_branch.return_value = PullRequestDetails(
+            url="https://github.com/o/r/pull/82",
+            number=82,
+            state="open",
+            base_ref_name="main",
+        )
+
+        with patch("gza.pr_ops.GitHub", return_value=gh):
+            result = ensure_task_pr(
+                task,
+                store,
+                git,
+                title="Manual title",
+                body="body",
+            )
+
+        assert result.ok is True
+        assert result.status == "existing"
+        assert result.pr_number == 82
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.pr_number == 82
+        assert refreshed.pr_state == "open"
+        gh.create_pr.assert_not_called()

@@ -62,6 +62,7 @@ class BranchSyncResult:
     pr_state: str | None = None
     fetch_attempted: bool = False
     fetch_succeeded: bool = False
+    reconciled: bool = False
     actions: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -80,21 +81,52 @@ def resolve_branch_pr(
     """Resolve the most relevant PR for a branch."""
     had_cached = False
     seen_numbers: set[int] = set()
+    cached_non_open: PullRequestDetails | None = None
     for pr_number in cached_pr_numbers:
         if pr_number in seen_numbers:
             continue
         seen_numbers.add(pr_number)
         had_cached = True
         details = gh.get_pr_details(pr_number)
-        if details is not None:
+        if details is None:
+            continue
+        if details.state == "open":
             return ResolvedBranchPr(details=details, source="cached")
+        if cached_non_open is None:
+            cached_non_open = details
 
     if allow_discovery:
         details = gh.discover_pr_by_branch(branch)
         if details is not None:
-            return ResolvedBranchPr(details=details, source="discovered")
+            if cached_non_open is None:
+                return ResolvedBranchPr(details=details, source="discovered")
+            if details.state == "open" or details.number != cached_non_open.number:
+                return ResolvedBranchPr(details=details, source="discovered")
+        if cached_non_open is not None:
+            return ResolvedBranchPr(details=cached_non_open, source="cached")
+    elif cached_non_open is not None:
+        return ResolvedBranchPr(details=cached_non_open, source="cached")
 
     return ResolvedBranchPr(details=None, source=None, clear_cached_number=had_cached and allow_discovery)
+
+
+def _mark_merged(result: BranchSyncResult) -> None:
+    """Record a merge normalization action once."""
+    if "marked merged" not in result.actions:
+        result.actions.append("marked merged")
+
+
+def _merge_status_transition_time(
+    previous_merge_status: str | None,
+    previous_merged_at: datetime | None,
+    merge_status: str | None,
+) -> datetime | None:
+    """Return the merged_at value for the requested merge-status transition."""
+    if merge_status != "merged":
+        return None
+    if previous_merge_status == "merged" and previous_merged_at is not None:
+        return previous_merged_at
+    return datetime.now(UTC)
 
 
 def build_branch_cohorts_for_task_ids(
@@ -291,6 +323,7 @@ def refresh_branch_diff_stats(
         result = BranchSyncResult(
             branch=cohort.branch,
             task_ids=tuple(task.id for task in cohort.code_tasks if task.id is not None),
+            reconciled=True,
         )
         diff_output = git.get_diff_numstat(f"{default_branch}...{cohort.branch}")
         files_changed, lines_added, lines_removed = parse_diff_numstat(diff_output)
@@ -326,25 +359,30 @@ def _sync_single_branch(
     code_tasks = cohort.code_tasks
     representative = cohort.representative_task
     branch_exists = git.branch_exists(branch)
+    result.reconciled = include_git or include_pr
 
     desired_merge_status = code_tasks[0].merge_status
     diff_stats: tuple[int | None, int | None, int | None] | None = None
     remote_merged: bool | None = None
     local_merged: bool | None = None
 
-    if include_git:
+    if include_git or include_pr:
         if remote_default_ref is not None:
             remote_merged = git.is_merged(branch, into=remote_default_ref)
         local_merged = git.is_merged(branch, into=default_branch)
 
+    if include_git:
         if remote_merged or local_merged:
             desired_merge_status = "merged"
-            result.actions.append("marked merged")
+            _mark_merged(result)
         elif branch_exists:
             desired_merge_status = "unmerged"
             diff_output = git.get_diff_numstat(f"{default_branch}...{branch}")
             diff_stats = parse_diff_numstat(diff_output)
             result.actions.append("refreshed diff stats")
+    elif remote_merged or local_merged:
+        desired_merge_status = "merged"
+        _mark_merged(result)
 
     pr_lookup_time: datetime | None = None
     resolved_pr: ResolvedBranchPr | None = None
@@ -365,8 +403,7 @@ def _sync_single_branch(
             result.actions.append(f"{resolved_pr.source} PR #{details.number} ({details.state})")
             if details.state == "merged" and details.base_ref_name == default_branch:
                 desired_merge_status = "merged"
-                if "marked merged" not in result.actions:
-                    result.actions.append("marked merged")
+                _mark_merged(result)
             if (
                 details.state == "open"
                 and fetched_this_run
@@ -403,10 +440,15 @@ def _sync_single_branch(
         result.diff_files_changed, result.diff_lines_added, result.diff_lines_removed = diff_stats
 
     if not dry_run:
+        persisted_merge_status: str | None | object = _UNSET
+        if include_git:
+            persisted_merge_status = desired_merge_status
+        elif include_pr and desired_merge_status != code_tasks[0].merge_status:
+            persisted_merge_status = desired_merge_status
         _persist_branch_state(
             store,
             code_tasks,
-            merge_status=desired_merge_status if include_git or (result.pr_state == "merged") else _UNSET,
+            merge_status=persisted_merge_status,
             diff_stats=diff_stats if diff_stats is not None else _UNSET,
             pr_number=(
                 resolved_pr.details.number
@@ -439,8 +481,14 @@ def _persist_branch_state(
             continue
         if merge_status is not _UNSET:
             typed_merge_status = cast("str | None", merge_status)
+            previous_merge_status = task.merge_status
+            previous_merged_at = task.merged_at
             task.merge_status = typed_merge_status
-            task.merged_at = datetime.now(UTC) if typed_merge_status == "merged" else None
+            task.merged_at = _merge_status_transition_time(
+                previous_merge_status,
+                previous_merged_at,
+                typed_merge_status,
+            )
         if diff_stats is not _UNSET:
             files_changed, lines_added, lines_removed = cast(
                 "tuple[int | None, int | None, int | None]",
