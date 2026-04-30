@@ -1341,6 +1341,16 @@ def cmd_improve(args: argparse.Namespace) -> int:
     improve_task: DbTask
     action_message: str | None = None
 
+    def _apply_comments_only_invocation_overrides(task: DbTask) -> DbTask:
+        """Reset comments-only improve reuse/restart state to current CLI intent."""
+        task.create_review = create_review
+        task.create_pr = create_pr
+        task.model = model
+        task.provider = provider
+        task.provider_is_explicit = provider is not None
+        store.update(task)
+        return task
+
     if review_task is None:
         comments_action, existing_comments_improve = resolve_comments_improve_action(
             store,
@@ -1356,7 +1366,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
             return 1
         if comments_action == "reuse_pending":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
-            improve_task = existing_comments_improve
+            improve_task = _apply_comments_only_invocation_overrides(existing_comments_improve)
             action_message = f"Reusing pending improve task {improve_task.id}"
         elif comments_action == "give_up":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
@@ -1367,21 +1377,19 @@ def cmd_improve(args: argparse.Namespace) -> int:
             return 1
         elif comments_action == "resume":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
-            improve_task = _create_resume_task(store, existing_comments_improve)
+            improve_task = _apply_comments_only_invocation_overrides(
+                _create_resume_task(store, existing_comments_improve)
+            )
             action_message = f"Created improve task {improve_task.id} (resume of {existing_comments_improve.id})"
         elif comments_action == "retry":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
-            improve_task = _create_retry_task(store, existing_comments_improve)
-            # Comments-only improve retries keep the shared retry creator, but
-            # preserve the historical cmd_improve contract: omitted CLI flags
+            # Comments-only improve restarts keep the shared retry/resume creators,
+            # but preserve the historical cmd_improve contract: omitted CLI flags
             # reset to the current invocation defaults instead of inheriting
-            # stale values from the failed improve task.
-            improve_task.create_review = create_review
-            improve_task.create_pr = create_pr
-            improve_task.model = model
-            improve_task.provider = provider
-            improve_task.provider_is_explicit = provider is not None
-            store.update(improve_task)
+            # stale values from an older improve task.
+            improve_task = _apply_comments_only_invocation_overrides(
+                _create_retry_task(store, existing_comments_improve)
+            )
             action_message = f"Created improve task {improve_task.id} (retry of {existing_comments_improve.id})"
         else:
             try:

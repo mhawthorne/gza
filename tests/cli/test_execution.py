@@ -2881,6 +2881,34 @@ class TestImproveCommand:
         assert len(improves_after) == 1
         assert improves_after[0].id == first_improve.id
 
+    def test_improve_comments_only_reuse_pending_applies_create_pr_override(self, tmp_path: Path):
+        """Reused pending comments-only improve should honor current --pr intent."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Address validation gaps.")
+
+        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert first.returncode == 0, first.stdout
+
+        pending_improve = next(task for task in store.get_all() if task.task_type == "improve")
+        assert pending_improve.id is not None
+        assert pending_improve.create_pr is False
+
+        second = run_gza("improve", str(impl_task.id), "--queue", "--pr", "--project", str(tmp_path))
+        assert second.returncode == 0, second.stdout
+        assert f"Reusing pending improve task {pending_improve.id}" in second.stdout
+
+        reused = store.get(pending_improve.id)
+        assert reused is not None
+        assert reused.create_pr is True
+
     def test_improve_comments_only_pending_task_with_newer_comment_creates_fresh_task(self, tmp_path: Path):
         """Pending comments-only improve is not reused when newer unresolved comments were added."""
         setup_config(tmp_path)
@@ -2948,6 +2976,41 @@ class TestImproveCommand:
         resumed = max(improves_after, key=lambda t: task_id_numeric_key(t.id))
         assert resumed.based_on == failed_improve.id
         assert resumed.depends_on is None
+
+    def test_improve_comments_only_resume_applies_create_pr_override(self, tmp_path: Path):
+        """Resumed comments-only improve should honor current --pr intent."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Handle edge-case parsing.")
+
+        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert first.returncode == 0, first.stdout
+
+        failed_improve = next(task for task in store.get_all() if task.task_type == "improve")
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "TIMEOUT"
+        failed_improve.session_id = "improve-session-1"
+        store.update(failed_improve)
+
+        second = run_gza("improve", str(impl_task.id), "--queue", "--pr", "--project", str(tmp_path))
+        assert second.returncode == 0, second.stdout
+        assert f"(resume of {failed_improve.id})" in second.stdout
+
+        resumed = max(
+            (task for task in store.get_all() if task.task_type == "improve"),
+            key=lambda task: task_id_numeric_key(task.id),
+        )
+        assert resumed.id != failed_improve.id
+        assert resumed.based_on == failed_improve.id
+        assert resumed.create_pr is True
 
     def test_improve_comments_only_failed_task_with_newer_comment_creates_fresh_task(self, tmp_path: Path):
         """Failed comments-only improve is not resumed/retried when newer unresolved comments exist."""

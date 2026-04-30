@@ -6015,7 +6015,9 @@ def run_v27_migration(db_path: Path) -> None:
             )
         """)
 
-        conn.execute("""
+        legacy_create_pr_expr = "create_pr" if _table_has_column(conn, "tasks", "create_pr") else "0 AS create_pr"
+
+        conn.execute(f"""
             INSERT INTO tasks_v27 (
                 id, prompt, status, task_type, slug, branch, log_file, report_file,
                 based_on, has_commits, duration_seconds, num_steps_reported,
@@ -6034,7 +6036,7 @@ def run_v27_migration(db_path: Path) -> None:
                 num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                 attach_count, attach_duration_seconds,
                 cost_usd, created_at, started_at, running_pid, completed_at, "group",
-                depends_on, spec, create_review, create_pr, same_branch, task_type_hint,
+                depends_on, spec, create_review, {legacy_create_pr_expr}, same_branch, task_type_hint,
                 output_content, session_id, pr_number, model, provider,
                 provider_is_explicit, input_tokens, output_tokens, merge_status,
                 merged_at, failure_reason, skip_learnings, diff_files_changed,

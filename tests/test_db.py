@@ -6765,6 +6765,38 @@ class TestSharedDbIsolationAndImportGating:
         assert child.based_on == "gza-1"
         assert child.depends_on == "gza-1"
 
+    def test_run_v27_migration_defaults_missing_legacy_create_pr_to_false(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, created_at) VALUES (1, 'parent', '2024-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        run_v25_migration(db_path, "gza")
+        run_v26_migration(db_path)
+        _drop_tasks_column(db_path, "create_pr")
+
+        run_v27_migration(db_path)
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        conn.close()
+
+        assert version == 27
+        assert "create_pr" in columns
+
+        store = SqliteTaskStore(db_path, prefix="gza")
+        migrated = store.get("gza-1")
+        assert migrated is not None
+        assert migrated.create_pr is False
+
     def test_v24_to_v27_chains_via_gza_migrate(self, tmp_path: Path) -> None:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
