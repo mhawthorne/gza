@@ -49,7 +49,7 @@ from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
 from .lineage import get_plan_for_task
-from .pr_ops import ensure_task_pr
+from .pr_ops import build_task_pr_content, ensure_task_pr
 from .prompt_sanitization import sanitize_provider_prompt
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
@@ -1865,17 +1865,7 @@ def _ensure_work_pr_for_completed_code_task(
         print(f"Info: Task {task.id} has no commits on branch '{task.branch}', skipping PR creation")
         return True
 
-    first_line = task.prompt.strip().splitlines()
-    title = first_line[0] if first_line else f"Task {task.id}"
-    title = title[:72].strip() or f"Task {task.id}"
-    body = f"""## Task
-
-{task.prompt}
-
-## Task ID
-
-{task.id}
-"""
+    title, body = build_task_pr_content(task, git, config, store)
     result = ensure_task_pr(
         task,
         store,
