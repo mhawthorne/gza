@@ -1,30 +1,12 @@
 """Tests for the skills-install command."""
 
-import os
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import yaml
-
-
-def run_gza(
-    *args: str,
-    cwd: Path | None = None,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess:
-    """Run gza command and return result."""
-    run_env = os.environ.copy()
-    if env:
-        run_env.update(env)
-    return subprocess.run(
-        ["uv", "run", "gza", *args],
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-        env=run_env,
-    )
+from tests.helpers.cli import run_gza
 
 
 def setup_config(tmp_path: Path) -> None:
@@ -45,18 +27,20 @@ def _create_store_for_project(tmp_path: Path):
     return config, store
 
 
-def _assign_slug_like_runner(task, store, config) -> None:
+def _assign_slug_like_runner(task, store, config, *, git=None) -> None:
     from gza.git import Git
     from gza.runner import _compute_slug_override, generate_slug
 
     if task.slug is not None:
         return
+    if git is None:
+        git = Git(config.project_dir)
     slug_override = _compute_slug_override(task, store)
     task.slug = generate_slug(
         task.prompt,
         existing_id=None,
         log_path=config.log_path,
-        git=Git(config.project_dir),
+        git=git,
         project_name=config.project_name,
         project_prefix=config.project_prefix,
         slug_override=slug_override,
@@ -451,7 +435,9 @@ class TestSkillContentValidation:
         report_path_before, _summary_path_before = get_task_output_paths(created, config.project_dir)
         assert report_path_before is None
 
-        _assign_slug_like_runner(created, store, config)
+        mock_git = Mock()
+        mock_git.branch_exists.return_value = False
+        _assign_slug_like_runner(created, store, config, git=mock_git)
         refreshed = store.get(created.id)
         assert refreshed is not None
 
@@ -514,7 +500,9 @@ class TestSkillContentValidation:
         _report_path_before, summary_path_before = get_task_output_paths(created, config.project_dir)
         assert summary_path_before is None
 
-        _assign_slug_like_runner(created, store, config)
+        mock_git = Mock()
+        mock_git.branch_exists.return_value = False
+        _assign_slug_like_runner(created, store, config, git=mock_git)
         refreshed = store.get(created.id)
         assert refreshed is not None
 

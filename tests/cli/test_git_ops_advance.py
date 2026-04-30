@@ -3,8 +3,7 @@
 
 import argparse
 import io
-import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -12,6 +11,7 @@ from gza.advance_engine import evaluate_advance_rules
 from gza.cli import cmd_advance
 from gza.config import Config
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
+from tests.helpers.cli import capture_background_worker_spawns
 
 from .conftest import (
     make_store,
@@ -349,44 +349,6 @@ class TestAdvanceCommand:
         assert result.returncode == 0
         assert "needs manual attention" in result.stdout
         assert "Merge (review APPROVED_WITH_FOLLOWUPS)" not in result.stdout
-
-    def test_advance_spawns_rebase_worker_on_conflicts(self, tmp_path: Path):
-        """advance spawns a background rebase --resolve worker when conflicts are detected."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        git = self._setup_git_repo(tmp_path)
-
-        # Create a branch that conflicts with main
-        branch = "feat/conflicting"
-        git._run("checkout", "-b", branch)
-        (tmp_path / "README.md").write_text("feature version")
-        git._run("add", "README.md")
-        git._run("commit", "-m", "Conflict commit")
-        git._run("checkout", "main")
-
-        # Modify same file on main to create a conflict
-        (tmp_path / "README.md").write_text("main version")
-        git._run("add", "README.md")
-        git._run("commit", "-m", "Main change")
-
-        task = store.add("Conflicting feature", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(UTC)
-        task.branch = branch
-        task.merge_status = "unmerged"
-        task.has_commits = True
-        store.update(task)
-
-        result = run_gza("advance", "--auto", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "rebase" in result.stdout.lower()
-        assert "started task" in result.stdout.lower()
-
-        # Task should still be unmerged (rebase worker runs in background)
-        updated_task = store.get(task.id)
-        assert updated_task is not None
-        assert updated_task.merge_status == "unmerged"
 
     def test_advance_targets_current_branch_for_conflict_check_and_rebase(self, tmp_path: Path):
         """advance uses the current branch (not default) for conflict detection and rebase target."""
@@ -1088,11 +1050,17 @@ class TestAdvanceCommand:
 
     def test_advance_spawns_worker_for_pending_review(self, tmp_path: Path):
         """advance spawns a worker for a pending review instead of skipping."""
+        import argparse
+
         setup_config(tmp_path)
         store = make_store(tmp_path)
-
-        git = self._setup_git_repo(tmp_path)
-        task = self._create_implement_task_with_branch(store, git, tmp_path)
+        task = store.add("Implement feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+        task.branch = "feat/pending-review"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
 
         # Create a pending review
         review_task = store.add(
@@ -1102,11 +1070,37 @@ class TestAdvanceCommand:
         )
         # review_task.status is 'pending' by default
 
-        result = run_gza("advance", "--auto", "--project", str(tmp_path))
-        assert result.returncode == 0
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            batch=None,
+            force=False,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            new=False,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+        worker_calls, fake_spawn = capture_background_worker_spawns()
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)),
+            patch("gza.cli._spawn_background_worker", side_effect=fake_spawn),
+        ):
+            rc = cmd_advance(args)
+
+        assert rc == 0
         assert review_task.id is not None
-        assert f"Started task {review_task.id} in background" in result.stdout
-        assert "Started review worker" not in result.stdout
+        assert len(worker_calls) == 1
+        assert worker_calls[0]["task_id"] == review_task.id
 
     def test_advance_force_propagates_to_run_review_worker(self, tmp_path: Path):
         """advance --force forwards force override when spawning run_review workers."""
@@ -1794,9 +1788,7 @@ class TestAdvanceCommand:
 
         # Set review_cleared_at on the task to a time AFTER the review completed
         # (simulates an improve task having run after the review)
-        import time
-        time.sleep(0.01)  # ensure strictly after
-        task.review_cleared_at = datetime.now(UTC)
+        task.review_cleared_at = review_task.completed_at + timedelta(microseconds=1)
         store.update(task)
 
         args = argparse.Namespace(
@@ -2318,8 +2310,7 @@ class TestAdvanceCommand:
         store.update(review_task)
 
         # Mark review as cleared (simulates improve task having run)
-        time.sleep(0.01)
-        task.review_cleared_at = datetime.now(UTC)
+        task.review_cleared_at = review_task.completed_at + timedelta(microseconds=1)
         store.update(task)
 
         args = argparse.Namespace(
