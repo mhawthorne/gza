@@ -96,6 +96,11 @@ Stats: Runtime: 3m 18s | Turns: 8 | Cost: $0.28
 > ```bash
 > $ gza add --type implement --based-on gza-1 --review "Implement..."
 > ```
+>
+> Add `--pr` as well if you want the implementation to open or reuse a PR as soon as it first completes, so later `gza review` runs can post PR comments automatically:
+> ```bash
+> $ gza add --type implement --based-on gza-1 --review --pr "Implement..."
+> ```
 
 View the review:
 

@@ -1405,6 +1405,7 @@ def _create_improve_task(
     impl_task: DbTask,
     review_task: DbTask | None,
     create_review: bool = False,
+    create_pr: bool = False,
     model: str | None = None,
     provider: str | None = None,
 ) -> DbTask:
@@ -1442,6 +1443,7 @@ def _create_improve_task(
         same_branch=True,
         tags=impl_task.tags,
         create_review=create_review,
+        create_pr=create_pr,
         model=model,
         provider=provider,
     )
@@ -1573,6 +1575,7 @@ def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask
         spec=original_task.spec,
         depends_on=original_task.depends_on,
         create_review=original_task.create_review,
+        create_pr=original_task.create_pr,
         same_branch=original_task.same_branch,
         task_type_hint=original_task.task_type_hint,
         based_on=original_task.id,  # Track resume lineage (points to failed task)
@@ -1609,6 +1612,7 @@ def _create_retry_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask:
         spec=original_task.spec,
         depends_on=original_task.depends_on,
         create_review=original_task.create_review,
+        create_pr=original_task.create_pr,
         same_branch=retry_same_branch,
         task_type_hint=original_task.task_type_hint,
         based_on=original_task.id,
