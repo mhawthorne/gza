@@ -454,7 +454,6 @@ class TestEditCommand:
         updated = store.get(task.id)
         assert updated is not None
         assert updated.create_review is False
-
     def test_edit_with_prompt_file(self, tmp_path: Path):
         """Edit command can update prompt from file."""
 

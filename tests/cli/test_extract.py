@@ -29,7 +29,7 @@ def _init_repo(tmp_path: Path) -> Git:
 
 def _create_completed_source_task(tmp_path: Path, git: Git) -> Task:
     store = make_store(tmp_path)
-    task = store.add("Source implementation", task_type="implement")
+    task = store.add("Add extracted source module", task_type="implement")
     task.status = "completed"
     task.completed_at = datetime.now(UTC)
     task.branch = "feature/source"
@@ -247,8 +247,9 @@ def test_extract_creates_implement_task_and_bundle(tmp_path: Path) -> None:
     assert new_task is not None
     assert new_task.id != source_task.id
     assert new_task.slug is not None
-    assert "Finish and validate the extracted change set." in new_task.prompt
+    assert new_task.prompt.startswith("Carry over: Add extracted source module\n")
     assert "Operator intent:" in new_task.prompt
+    assert new_task.slug.endswith("carry-over-add-extracted-source-module")
 
     bundle_dir = tmp_path / ".gza" / "extractions" / new_task.slug
     assert (bundle_dir / "manifest.json").exists()
@@ -452,7 +453,7 @@ def test_extract_queued_duplicates_get_distinct_slugs_and_bundle_dirs(tmp_path: 
     extract_tasks = [
         task
         for task in store.get_pending()
-        if task.task_type == "implement" and "Finish and validate the extracted change set." in task.prompt
+        if task.task_type == "implement" and task.prompt.startswith("Carry over: Add extracted source module\n")
     ]
     assert len(extract_tasks) == 2
     first_task, second_task = sorted(extract_tasks, key=lambda task: task.id or "")
@@ -529,7 +530,7 @@ def test_extract_queued_duplicates_run_without_extraction_identity_collision(tmp
     extract_tasks = [
         task
         for task in store.get_all()
-        if task.task_type == "implement" and "Finish and validate the extracted change set." in task.prompt
+        if task.task_type == "implement" and task.prompt.startswith("Carry over: Add extracted source module\n")
     ]
     assert len(extract_tasks) == 2
     for task in extract_tasks:
