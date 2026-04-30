@@ -6344,6 +6344,27 @@ class TestSharedDbIsolationAndImportGating:
 
         assert "urgent_bumped_at" in columns
 
+    def test_open_current_db_repairs_missing_create_pr_column(self, tmp_path: Path) -> None:
+        """Opening a current DB should repair missing tasks.create_pr and restore writes."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        _drop_tasks_column(db_path, "create_pr")
+
+        repaired_store = SqliteTaskStore(db_path, prefix="gza")
+        created = repaired_store.add("Task after create_pr repair", create_pr=True)
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert "create_pr" in columns
+        reloaded = repaired_store.get(created.id)
+        assert reloaded is not None
+        assert reloaded.create_pr is True
+
     def test_open_current_v32_db_repairs_missing_task_comments_source_column(self, tmp_path: Path) -> None:
         """Opening an already-v32 DB should repair missing task_comments.source."""
         import sqlite3
@@ -6404,6 +6425,24 @@ class TestSharedDbIsolationAndImportGating:
         finally:
             db_path.chmod(0o644)
 
+    def test_open_current_db_missing_create_pr_column_fails_on_read_only_db(
+        self, tmp_path: Path
+    ) -> None:
+        """Read-only current-schema damage should fail early with SchemaIntegrityError for create_pr."""
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_tasks_column(db_path, "create_pr")
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"required column tasks\.create_pr",
+            ):
+                SqliteTaskStore(db_path, prefix="gza")
+        finally:
+            db_path.chmod(0o644)
+
     def test_open_current_v32_db_missing_task_comments_source_fails_on_read_only_db(
         self, tmp_path: Path
     ) -> None:
@@ -6445,6 +6484,24 @@ class TestSharedDbIsolationAndImportGating:
         assert reloaded is not None
         assert reloaded.prompt == "Task with query-only execution-mode damage"
         assert any("tasks.execution_mode" in warning for warning in query_store.startup_warnings())
+
+    def test_query_only_open_current_db_missing_create_pr_fails_closed(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should fail closed when the core tasks.create_pr column is missing."""
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_tasks_column(db_path, "create_pr")
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"required column tasks\.create_pr",
+            ):
+                SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+        finally:
+            db_path.chmod(0o644)
 
     def test_query_only_open_current_db_missing_task_comments_source_warns_and_reads_comments(
         self, tmp_path: Path

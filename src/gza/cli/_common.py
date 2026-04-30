@@ -1162,9 +1162,9 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
 
 
 def _allow_pr_required_retry(args: argparse.Namespace, task: DbTask) -> bool:
-    """Return whether explicit `work --pr` may retry a failed PR_REQUIRED task."""
+    """Return whether work may retry a failed PR_REQUIRED task."""
     return bool(
-        getattr(args, "create_pr", False)
+        (getattr(args, "create_pr", False) or task.create_pr)
         and task.status == "failed"
         and task.failure_reason == "PR_REQUIRED"
     )

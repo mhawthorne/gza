@@ -1149,6 +1149,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         31: ("tasks", "execution_mode"),
         33: ("tasks", "review_score"),
         34: ("tasks", "queue_position"),
+        37: ("tasks", "create_pr"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is None:
@@ -1212,6 +1213,7 @@ def _ensure_required_auto_migration_artifacts(
         (36, "run_substeps", "project_id", "ALTER TABLE run_substeps ADD COLUMN project_id TEXT"),
         (36, "task_comments", "project_id", "ALTER TABLE task_comments ADD COLUMN project_id TEXT"),
         (36, "task_tags", "project_id", "ALTER TABLE task_tags ADD COLUMN project_id TEXT"),
+        (37, "tasks", "create_pr", "ALTER TABLE tasks ADD COLUMN create_pr INTEGER DEFAULT 0"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:

@@ -1542,6 +1542,41 @@ class TestWorkCommandMultiTask:
         assert rc == 0
         run_mock.assert_called_once()
 
+    def test_work_allows_failed_pr_required_task_with_persisted_create_pr(self, tmp_path: Path):
+        """work <task> should allow retrying failed PR_REQUIRED tasks via stored create_pr intent."""
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Retry PR-required task", create_pr=True)
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[task.id],
+            count=1,
+            force=False,
+            resume=False,
+            create_pr=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.run", return_value=0) as run_mock,
+        ):
+            rc = cmd_run(args)
+
+        assert rc == 0
+        run_mock.assert_called_once()
+
 
 class TestBackgroundWorkerCommand:
     """Tests for background worker subprocess command construction."""
@@ -1999,6 +2034,46 @@ class TestBackgroundWorkerCommand:
             worker_mode=False,
             project_dir=str(tmp_path),
             create_pr=True,
+            resume=False,
+            force=False,
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+
+        with patch("gza.cli.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            rc = _spawn_background_worker(args, config, task_id=task.id)
+
+        assert rc == 0
+        mock_popen.assert_called_once()
+
+    def test_background_worker_allows_failed_pr_required_task_with_persisted_create_pr(self, tmp_path: Path):
+        """Background explicit work should allow retrying failed PR_REQUIRED tasks via stored create_pr intent."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Retry PR-required task in background", create_pr=True)
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        config = Config.load(tmp_path)
+        config.tmux.enabled = False
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+            create_pr=False,
             resume=False,
             force=False,
         )
