@@ -324,6 +324,85 @@ class TestEditCommand:
         updated = store.get(task.id)
         assert updated.create_pr is True
 
+    def test_edit_review_and_pr_flags_apply_both_mutations(self, tmp_path: Path):
+        """Edit command should persist both review and PR intent in one invocation."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task")
+        assert task.create_review is False
+        assert task.create_pr is False
+
+        result = run_gza("edit", str(task.id), "--review", "--pr", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "automatic review task creation" in result.stdout
+        assert "automatic PR creation" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.create_review is True
+        assert updated.create_pr is True
+
+    def test_edit_pr_and_model_flags_apply_both_mutations(self, tmp_path: Path):
+        """Edit command should persist PR and model overrides together."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task")
+        assert task.create_pr is False
+        assert task.model is None
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            "--pr",
+            "--model",
+            "claude-3-5-haiku-latest",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "automatic PR creation" in result.stdout
+        assert "Set model override" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.create_pr is True
+        assert updated.model == "claude-3-5-haiku-latest"
+
+    def test_edit_pr_and_add_tag_apply_both_mutations(self, tmp_path: Path):
+        """Edit command should not short-circuit tag edits ahead of other mutations."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task")
+        assert task.create_pr is False
+        assert task.tags == ()
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            "--pr",
+            "--add-tag",
+            "cli",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "automatic PR creation" in result.stdout
+        assert "Added tags" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.create_pr is True
+        assert updated.tags == ("cli",)
+
     def test_edit_with_prompt_file(self, tmp_path: Path):
         """Edit command can update prompt from file."""
 

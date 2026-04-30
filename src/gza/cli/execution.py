@@ -785,196 +785,197 @@ def cmd_edit(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # Handle explicit tag mutation flags
-    if getattr(args, "clear_tags", False):
-        store.replace_task_tags(task_row_id, ())
-        print(f"✓ Cleared tags for task {task_row_id}")
-        return 0
+    if args.explore and args.task:
+        print("Error: Cannot use both --explore and --task")
+        return 1
 
-    if getattr(args, "set_tags", None) is not None:
-        set_tags = tuple(part.strip() for part in str(args.set_tags).split(",") if part.strip())
-        try:
-            store.replace_task_tags(task_row_id, set_tags)
-        except ValueError as exc:
-            print(f"Error: {exc}")
-            return 1
-        refreshed = store.get(task_row_id)
-        if refreshed is not None:
-            task = refreshed
-        print(f"✓ Set tags for task {task_row_id}: {', '.join(task.tags) if task.tags else '(none)'}")
-        return 0
+    prompt_file_arg = getattr(args, "prompt_file", None) if hasattr(args, "prompt_file") else None
+    prompt_arg = getattr(args, "prompt", None) if hasattr(args, "prompt") else None
+    if prompt_file_arg is not None and prompt_arg is not None:
+        print("Error: Cannot use both --prompt-file and --prompt")
+        return 1
 
-    if getattr(args, "add_tags", None):
-        try:
-            store.add_task_tags(task_row_id, tuple(args.add_tags))
-        except ValueError as exc:
-            print(f"Error: {exc}")
-            return 1
-        refreshed = store.get(task_row_id)
-        if refreshed is not None:
-            task = refreshed
-        print(f"✓ Added tags for task {task_row_id}: {', '.join(task.tags)}")
-        return 0
-
-    if getattr(args, "remove_tags", None):
-        try:
-            store.remove_task_tags(task_row_id, tuple(args.remove_tags))
-        except ValueError as exc:
-            print(f"Error: {exc}")
-            return 1
-        refreshed = store.get(task_row_id)
-        if refreshed is not None:
-            task = refreshed
-        print(f"✓ Updated tags for task {task_row_id}: {', '.join(task.tags) if task.tags else '(none)'}")
-        return 0
-
-    # Handle legacy --group flag
-    if hasattr(args, 'group_flag') and args.group_flag is not None:
-        print(
-            "Warning: --group is deprecated; use --add-tag/--remove-tag/--clear-tags/--set-tags.",
-            file=sys.stderr,
-        )
-        if args.group_flag == "":
-            if len(task.tags) <= 1:
-                store.replace_task_tags(task_row_id, ())
-                print(f"✓ Cleared tags for task {task_row_id}")
-                return 0
-            print(
-                "Error: --group \"\" is ambiguous for tasks with multiple tags; "
-                "use --remove-tag TAG or --clear-tags instead.",
-            )
-            return 1
-        else:
-            try:
-                store.replace_task_tags(task_row_id, (args.group_flag,))
-            except ValueError as exc:
-                print(f"Error: {exc}")
-                return 1
-            refreshed = store.get(task_row_id)
-            if refreshed is not None:
-                task = refreshed
-            print(f"✓ Set tags for task {task_row_id}: {', '.join(task.tags)}")
-            return 0
-
-    # Handle --based-on flag (lineage/parent relationship)
-    if hasattr(args, 'based_on_flag') and args.based_on_flag is not None:
+    based_on_id: str | None = None
+    if hasattr(args, "based_on_flag") and args.based_on_flag is not None:
         based_on_id = resolve_id(config, args.based_on_flag)
         parent_task = store.get(based_on_id)
         if not parent_task:
             print(f"Error: Task {based_on_id} not found")
             return 1
-        task.based_on = based_on_id
-        store.update(task)
-        print(f"✓ Set task {task.id} based_on task {based_on_id}")
-        return 0
 
-    # Handle --depends-on flag (execution blocking dependency)
-    if hasattr(args, 'depends_on_flag') and args.depends_on_flag is not None:
+    depends_on_id: str | None = None
+    if hasattr(args, "depends_on_flag") and args.depends_on_flag is not None:
         depends_on_id = resolve_id(config, args.depends_on_flag)
         dep_task = store.get(depends_on_id)
         if not dep_task:
             print(f"Error: Task {depends_on_id} not found")
             return 1
+
+    prompt_requested = False
+    new_prompt: str | None = None
+    if prompt_file_arg is not None:
+        try:
+            with open(prompt_file_arg) as f:
+                new_prompt = f.read().strip()
+        except FileNotFoundError:
+            print(f"Error: File not found: {prompt_file_arg}")
+            return 1
+        except Exception as e:
+            print(f"Error reading file: {e}")
+            return 1
+        prompt_requested = True
+
+    if prompt_arg is not None:
+        prompt_requested = True
+        if prompt_arg == "-":
+            new_prompt = sys.stdin.read().strip()
+        else:
+            new_prompt = prompt_arg
+
+    if prompt_requested:
+        assert new_prompt is not None
+        errors = validate_prompt(new_prompt)
+        if errors:
+            print("Validation errors:")
+            for error in errors:
+                print(f"  - {error}")
+            return 1
+
+    tag_action: str | None = None
+    tag_values: tuple[str, ...] = ()
+    if getattr(args, "clear_tags", False):
+        tag_action = "clear"
+    elif getattr(args, "set_tags", None) is not None:
+        tag_action = "set"
+        tag_values = tuple(part.strip() for part in str(args.set_tags).split(",") if part.strip())
+    elif getattr(args, "add_tags", None):
+        tag_action = "add"
+        tag_values = tuple(args.add_tags)
+    elif getattr(args, "remove_tags", None):
+        tag_action = "remove"
+        tag_values = tuple(args.remove_tags)
+    elif hasattr(args, "group_flag") and args.group_flag is not None:
+        print(
+            "Warning: --group is deprecated; use --add-tag/--remove-tag/--clear-tags/--set-tags.",
+            file=sys.stderr,
+        )
+        if args.group_flag == "":
+            if len(task.tags) > 1:
+                print(
+                    "Error: --group \"\" is ambiguous for tasks with multiple tags; "
+                    "use --remove-tag TAG or --clear-tags instead.",
+                )
+                return 1
+            tag_action = "clear"
+        else:
+            tag_action = "set"
+            tag_values = (args.group_flag,)
+
+    update_messages: list[str] = []
+    info_messages: list[str] = []
+    changed = False
+
+    # Handle --based-on flag (lineage/parent relationship)
+    if based_on_id is not None:
+        task.based_on = based_on_id
+        update_messages.append(f"✓ Set task {task.id} based_on task {based_on_id}")
+        changed = True
+
+    # Handle --depends-on flag (execution blocking dependency)
+    if depends_on_id is not None:
         task.depends_on = depends_on_id
-        store.update(task)
-        print(f"✓ Set task {task.id} to depend on task {depends_on_id}")
-        return 0
+        update_messages.append(f"✓ Set task {task.id} to depend on task {depends_on_id}")
+        changed = True
 
     # Handle --review flag
-    if hasattr(args, 'review') and args.review:
+    if hasattr(args, "review") and args.review:
         task.create_review = True
-        store.update(task)
-        print(f"✓ Enabled automatic review task creation for task {task.id}")
-        return 0
+        update_messages.append(f"✓ Enabled automatic review task creation for task {task.id}")
+        changed = True
 
     # Handle --pr flag
     if getattr(args, "create_pr", False):
         task.create_pr = True
-        store.update(task)
-        print(f"✓ Enabled automatic PR creation for task {task.id}")
-        return 0
+        update_messages.append(f"✓ Enabled automatic PR creation for task {task.id}")
+        changed = True
 
     # Handle --model flag
-    if hasattr(args, 'model') and args.model is not None:
+    if hasattr(args, "model") and args.model is not None:
         task.model = args.model
-        store.update(task)
-        print(f"✓ Set model override to '{args.model}' for task {task.id}")
-        return 0
+        update_messages.append(f"✓ Set model override to '{args.model}' for task {task.id}")
+        changed = True
 
     # Handle --provider flag
-    if hasattr(args, 'provider') and args.provider is not None:
+    if hasattr(args, "provider") and args.provider is not None:
         task.provider = args.provider
         task.provider_is_explicit = True
-        store.update(task)
-        print(f"✓ Set provider override to '{args.provider}' for task {task.id}")
-        return 0
+        update_messages.append(f"✓ Set provider override to '{args.provider}' for task {task.id}")
+        changed = True
 
     # Handle --no-learnings flag
-    if hasattr(args, 'skip_learnings') and args.skip_learnings:
+    if hasattr(args, "skip_learnings") and args.skip_learnings:
         task.skip_learnings = True
-        store.update(task)
-        print(f"✓ Set skip_learnings for task {task.id}")
-        return 0
-
-    if args.explore and args.task:
-        print("Error: Cannot use both --explore and --task")
-        return 1
+        update_messages.append(f"✓ Set skip_learnings for task {task.id}")
+        changed = True
 
     # Handle type conversion without opening editor
     if args.explore or args.task:
         new_type = "explore" if args.explore else "implement"
         if task.task_type == new_type:
-            print(f"Task {task.id} is already a {new_type}")
-            return 0
-        task.task_type = new_type
-        store.update(task)
-        print(f"✓ Converted task {task.id} to {new_type}")
-        return 0
+            info_messages.append(f"Task {task.id} is already a {new_type}")
+        else:
+            task.task_type = new_type
+            update_messages.append(f"✓ Converted task {task.id} to {new_type}")
+            changed = True
 
     # Handle non-interactive prompt editing
-    if hasattr(args, 'prompt_file') and args.prompt_file is not None:
-        if hasattr(args, 'prompt') and args.prompt is not None:
-            print("Error: Cannot use both --prompt-file and --prompt")
-            return 1
-        try:
-            with open(args.prompt_file) as f:
-                new_prompt = f.read().strip()
-        except FileNotFoundError:
-            print(f"Error: File not found: {args.prompt_file}")
-            return 1
-        except Exception as e:
-            print(f"Error reading file: {e}")
-            return 1
-
-        errors = validate_prompt(new_prompt)
-        if errors:
-            print("Validation errors:")
-            for error in errors:
-                print(f"  - {error}")
-            return 1
-
+    if prompt_requested:
+        assert new_prompt is not None
         task.prompt = new_prompt
+        update_messages.append(f"✓ Updated task {task.id}")
+        changed = True
+
+    if changed:
         store.update(task)
-        print(f"✓ Updated task {task.id}")
+    if tag_action == "clear":
+        store.replace_task_tags(task_row_id, ())
+        update_messages.append(f"✓ Cleared tags for task {task_row_id}")
+    elif tag_action == "set":
+        try:
+            final_tags = store.replace_task_tags(task_row_id, tag_values)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
+        update_messages.append(
+            f"✓ Set tags for task {task_row_id}: {', '.join(final_tags) if final_tags else '(none)'}",
+        )
+    elif tag_action == "add":
+        try:
+            final_tags = store.add_task_tags(task_row_id, tag_values)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
+        update_messages.append(f"✓ Added tags for task {task_row_id}: {', '.join(final_tags)}")
+    elif tag_action == "remove":
+        try:
+            final_tags = store.remove_task_tags(task_row_id, tag_values)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
+        update_messages.append(
+            f"✓ Updated tags for task {task_row_id}: {', '.join(final_tags) if final_tags else '(none)'}",
+        )
+
+    if changed or tag_action is not None:
+        for message in update_messages:
+            print(message)
+        for message in info_messages:
+            print(message)
         return 0
 
-    if hasattr(args, 'prompt') and args.prompt is not None:
-        # Handle stdin (-) or direct prompt text
-        if args.prompt == '-':
-            new_prompt = sys.stdin.read().strip()
-        else:
-            new_prompt = args.prompt
-
-        errors = validate_prompt(new_prompt)
-        if errors:
-            print("Validation errors:")
-            for error in errors:
-                print(f"  - {error}")
-            return 1
-
-        task.prompt = new_prompt
-        store.update(task)
-        print(f"✓ Updated task {task.id}")
+    if info_messages:
+        for message in info_messages:
+            print(message)
         return 0
 
     if edit_task_interactive(store, task):

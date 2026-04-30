@@ -546,6 +546,8 @@ gza edit <task_id> [options]
 | `--prompt TEXT` | Set new prompt directly (use `-` for stdin) |
 | `--prompt-file FILE` | Read new prompt from file |
 
+Non-conflicting edit mutations can be combined in one invocation. Tag mutation flags remain mutually exclusive with each other.
+
 ### log
 
 View task or worker logs.
