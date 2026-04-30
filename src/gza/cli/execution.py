@@ -366,6 +366,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
         print(f"Error: {exc}")
         return 1
     create_review = args.review if hasattr(args, 'review') and args.review else False
+    create_pr = bool(getattr(args, "create_pr", False))
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
     branch_type = args.branch_type if hasattr(args, 'branch_type') and args.branch_type else None
     model = args.model if hasattr(args, 'model') and args.model else None
@@ -378,6 +379,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
         depends_on=plan_task.id,
         tags=tags,
         create_review=create_review,
+        create_pr=create_pr,
         same_branch=same_branch,
         task_type_hint=branch_type,
         model=model,
@@ -512,6 +514,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
         return 1
 
     create_review = bool(getattr(args, "review", False))
+    create_pr = bool(getattr(args, "create_pr", False))
     branch_type = args.branch_type if hasattr(args, "branch_type") and args.branch_type else None
     model = args.model if hasattr(args, "model") and args.model else None
     provider = args.provider if hasattr(args, "provider") and args.provider else None
@@ -523,6 +526,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
         task_type="implement",
         tags=tags,
         create_review=create_review,
+        create_pr=create_pr,
         same_branch=False,
         base_branch=base_branch,
         task_type_hint=branch_type,
@@ -622,6 +626,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     depends_on = resolve_id(config, args.depends_on) if hasattr(args, 'depends_on') and args.depends_on else None
     based_on = resolve_id(config, args.based_on) if hasattr(args, 'based_on') and args.based_on else None
     create_review = args.review if hasattr(args, 'review') and args.review else False
+    create_pr = bool(getattr(args, "create_pr", False))
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
     spec = args.spec if hasattr(args, 'spec') and args.spec else None
     branch_type = args.branch_type if hasattr(args, 'branch_type') and args.branch_type else None
@@ -682,6 +687,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             tags=tags,
             depends_on=depends_on,
             create_review=create_review,
+            create_pr=create_pr,
             same_branch=same_branch,
             spec=spec,
             task_type_hint=branch_type,
@@ -705,6 +711,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             tags=tags,
             depends_on=depends_on,
             create_review=create_review,
+            create_pr=create_pr,
             same_branch=same_branch,
             task_type_hint=branch_type,
             model=model,
@@ -727,6 +734,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             tags=tags,
             depends_on=depends_on,
             create_review=create_review,
+            create_pr=create_pr,
             same_branch=same_branch,
             spec=spec,
             task_type_hint=branch_type,
@@ -877,6 +885,13 @@ def cmd_edit(args: argparse.Namespace) -> int:
         task.create_review = True
         store.update(task)
         print(f"✓ Enabled automatic review task creation for task {task.id}")
+        return 0
+
+    # Handle --pr flag
+    if getattr(args, "create_pr", False):
+        task.create_pr = True
+        store.update(task)
+        print(f"✓ Enabled automatic PR creation for task {task.id}")
         return 0
 
     # Handle --model flag
@@ -1309,6 +1324,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
             return 1
 
     create_review = args.review if hasattr(args, 'review') and args.review else False
+    create_pr = bool(getattr(args, "create_pr", False))
     model = args.model if hasattr(args, 'model') and args.model else None
     provider = args.provider if hasattr(args, 'provider') and args.provider else None
 
@@ -1351,6 +1367,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
             # reset to the current invocation defaults instead of inheriting
             # stale values from the failed improve task.
             improve_task.create_review = create_review
+            improve_task.create_pr = create_pr
             improve_task.model = model
             improve_task.provider = provider
             improve_task.provider_is_explicit = provider is not None
@@ -1363,6 +1380,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
                     impl_task,
                     None,
                     create_review=create_review,
+                    create_pr=create_pr,
                     model=model,
                     provider=provider,
                 )
@@ -1377,6 +1395,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
                 impl_task,
                 review_task,
                 create_review=create_review,
+                create_pr=create_pr,
                 model=model,
                 provider=provider,
             )

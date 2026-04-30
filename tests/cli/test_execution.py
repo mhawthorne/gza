@@ -130,6 +130,28 @@ class TestAddCommand:
         assert task.task_type == "implement"
         assert task.group == "features"
 
+    def test_add_with_pr_flag_persists_create_pr(self, tmp_path: Path):
+        """Add command with --pr stores automatic PR intent on the task."""
+
+        setup_config(tmp_path)
+
+        result = run_gza(
+            "add",
+            "--type",
+            "implement",
+            "--pr",
+            "Implement feature X",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+
+        store = make_store(tmp_path)
+        task = get_latest_task(store, task_type="implement", prompt="Implement feature X")
+        assert task is not None
+        assert task.create_pr is True
+
     def test_add_rejects_empty_tag_without_traceback(self, tmp_path: Path):
         """add --tag '' should fail with user-facing validation, not traceback."""
         setup_config(tmp_path)
@@ -285,6 +307,22 @@ class TestEditCommand:
         # Verify create_review was enabled
         updated = store.get(task.id)
         assert updated.create_review is True
+
+    def test_edit_pr_flag(self, tmp_path: Path):
+        """Edit command can enable automatic PR creation."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test task")
+        assert task.create_pr is False
+
+        result = run_gza("edit", str(task.id), "--pr", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+        updated = store.get(task.id)
+        assert updated.create_pr is True
 
     def test_edit_with_prompt_file(self, tmp_path: Path):
         """Edit command can update prompt from file."""

@@ -1301,6 +1301,12 @@ def main() -> int:
         help="Auto-create review task on completion (for implement tasks)",
     )
     add_parser.add_argument(
+        "--pr",
+        action="store_true",
+        dest="create_pr",
+        help="Auto-create/reuse a GitHub PR after successful code-task completion",
+    )
+    add_parser.add_argument(
         "--same-branch",
         action="store_true",
         help="Continue on depends_on task's branch instead of creating new",
@@ -1406,6 +1412,12 @@ def main() -> int:
         "--review",
         action="store_true",
         help="Enable automatic review task creation on completion",
+    )
+    edit_parser.add_argument(
+        "--pr",
+        action="store_true",
+        dest="create_pr",
+        help="Enable automatic PR creation on successful code-task completion",
     )
     edit_parser.add_argument(
         "--prompt-file",
@@ -1582,6 +1594,12 @@ def main() -> int:
         "--review",
         action="store_true",
         help="Auto-create review task on completion",
+    )
+    improve_parser.add_argument(
+        "--pr",
+        action="store_true",
+        dest="create_pr",
+        help="Auto-create/reuse a GitHub PR after successful code-task completion",
     )
     improve_parser.add_argument(
         "--review-id",
@@ -1763,6 +1781,12 @@ def main() -> int:
         help="Auto-create review task on completion",
     )
     implement_parser.add_argument(
+        "--pr",
+        action="store_true",
+        dest="create_pr",
+        help="Auto-create/reuse a GitHub PR after successful code-task completion",
+    )
+    implement_parser.add_argument(
         "--group",
         metavar="NAME",
         help="Deprecated alias for --tag",
@@ -1863,6 +1887,12 @@ def main() -> int:
         "--review",
         action="store_true",
         help="Auto-create review task on completion",
+    )
+    extract_parser.add_argument(
+        "--pr",
+        action="store_true",
+        dest="create_pr",
+        help="Auto-create/reuse a GitHub PR after successful code-task completion",
     )
     extract_parser.add_argument(
         "--group",

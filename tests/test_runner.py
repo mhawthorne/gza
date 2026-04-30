@@ -6468,6 +6468,31 @@ class TestExtractedRunInnerHelpers:
         assert rc == 7
         assert call_order == ["pr", "review"]
 
+    def test_run_uses_persisted_create_pr_intent_without_work_flag(self, tmp_path: Path):
+        """Stored task create_pr intent should drive the runner even without `work --pr`."""
+        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Implement with persisted PR intent", task_type="implement", create_pr=True)
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Claude"
+            mock_provider.supports_interactive_foreground = True
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_get_provider.return_value = mock_provider
+
+            result = run(config, task_id=task.id)
+
+        assert result == 0
+        assert mock_run_inner.call_args.kwargs["create_pr"] is True
+
     def test_complete_code_task_chained_improve_updates_root_implementation_state(self, tmp_path: Path):
         """Chained improve completion should clear review state on the implementation root, not the prior improve."""
         db_path = tmp_path / "test.db"
@@ -7129,6 +7154,46 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.task_footer"),
         ):
             rc = run(config, task_id=task.id, create_pr=True)
+
+        assert rc == 0
+        run_review.assert_called_once()
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.failure_reason is None
+
+    def test_run_can_retry_pr_required_failure_via_persisted_create_pr(self, tmp_path: Path):
+        """Stored create_pr intent should recover failed PR_REQUIRED tasks without needing `work --pr`."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(
+            prompt="Implement with review",
+            task_type="implement",
+            create_review=True,
+            create_pr=True,
+        )
+        task.slug = "20260414-pr-required-retry-persisted"
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        task.branch = "feature/retry-pr-required-persisted"
+        task.log_file = "logs/retry-persisted.log"
+        task.output_content = "summary"
+        task.has_commits = True
+        store.update(task)
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch("gza.runner._create_and_run_review_task", return_value=0) as run_review,
+            patch("gza.runner.task_footer"),
+        ):
+            rc = run(config, task_id=task.id)
 
         assert rc == 0
         run_review.assert_called_once()

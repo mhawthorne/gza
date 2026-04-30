@@ -48,6 +48,7 @@ class TestTaskChaining:
             depends_on=None,
             spec="specs/test.md",
             create_review=True,
+            create_pr=True,
             same_branch=True,
         )
 
@@ -63,6 +64,7 @@ class TestTaskChaining:
         assert retrieved.group == "test-group"
         assert retrieved.spec == "specs/test.md"
         assert retrieved.create_review is True
+        assert retrieved.create_pr is True
         assert retrieved.same_branch is True
 
     def test_depends_on_relationship(self, tmp_path: Path):
@@ -597,10 +599,12 @@ class TestConnectionLifecycle:
         task = store.add("Test task")
         assert task.group is None
         assert task.create_review is False
+        assert task.create_pr is False
 
         # Update with new fields
         task.group = "new-group"
         task.create_review = True
+        task.create_pr = True
         task.same_branch = True
         store.update(task)
 
@@ -608,6 +612,7 @@ class TestConnectionLifecycle:
         retrieved = store.get(task.id)
         assert retrieved.group == "new-group"
         assert retrieved.create_review is True
+        assert retrieved.create_pr is True
         assert retrieved.same_branch is True
 
     def test_task_with_branch_field(self, tmp_path: Path):
@@ -4623,7 +4628,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -4635,7 +4640,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -6675,7 +6680,7 @@ class TestSharedDbIsolationAndImportGating:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37]
 
         # SqliteTaskStore auto-migrates to latest schema.
         store = SqliteTaskStore(db_path, prefix="gza")

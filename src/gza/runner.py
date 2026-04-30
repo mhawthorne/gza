@@ -2188,8 +2188,9 @@ def run(
             if is_blocked:
                 error_message(f"Error: Task {task_id} is blocked by task {blocking_id} ({blocking_status})")
                 return 1
+            requested_create_pr = bool(create_pr or task.create_pr)
             allow_pr_retry = (
-                create_pr
+                requested_create_pr
                 and task.status == "failed"
                 and task.failure_reason == PR_REQUIRED_FAILURE_REASON
             )
@@ -2242,6 +2243,7 @@ def run(
     if not task:
         console.print("No pending tasks found")
         return 0
+    requested_create_pr = bool(create_pr or task.create_pr)
     if on_task_claimed is not None:
         on_task_claimed(task)
     if pr_retry_mode:
@@ -2374,7 +2376,7 @@ def run(
         resume=resume,
         open_after=open_after,
         skip_precondition_check=skip_precondition_check,
-        create_pr=create_pr,
+        create_pr=requested_create_pr,
         invocation=invocation_context,
         interaction_mode=resolved_interaction_mode,
     )
@@ -2720,7 +2722,7 @@ def _complete_code_task(
     if create_pr:
         pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
         if not pr_ready:
-            print("Error: `gza work --pr` requested PR creation/reuse, aborting before auto-review")
+            print("Error: Task requested PR creation/reuse, aborting before auto-review")
             task.output_content = output_content
             task.diff_files_changed = diff_files
             task.diff_lines_added = diff_added
@@ -2930,7 +2932,7 @@ def _handle_fix_follow_up_review(
 
 
 def _retry_pr_required_code_task_completion(task: Task, config: Config, store: SqliteTaskStore) -> int:
-    """Retry post-code PR/completion steps for tasks blocked by explicit `work --pr`."""
+    """Retry post-code PR/completion steps for tasks blocked on required PR creation."""
     if not task.branch:
         print(f"Error: Task {task.id} has no branch to create/reuse PR")
         store.mark_failed(
@@ -2944,7 +2946,7 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
     git = Git(config.project_dir)
     pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, git)
     if not pr_ready:
-        print("Error: `gza work --pr` retry still could not create/reuse PR")
+        print("Error: PR-required retry still could not create/reuse PR")
         store.mark_failed(
             task,
             log_file=task.log_file,
