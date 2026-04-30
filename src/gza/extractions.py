@@ -14,6 +14,7 @@ from typing import Any
 
 from .db import SqliteTaskStore, Task
 from .git import Git, _split_rename_paths, _unquote_c_style_path
+from .task_slug import get_task_slug
 
 EXTRACTIONS_DIR = Path(".gza") / "extractions"
 MANIFEST_FILENAME = "manifest.json"
@@ -35,6 +36,8 @@ class SourceSelection:
     source_task_id: str | None
     source_branch: str
     source_base_ref: str
+    source_task_prompt: str | None = None
+    source_task_slug: str | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +151,8 @@ def resolve_source_selection(
             source_task_id=task.id,
             source_branch=branch,
             source_base_ref=base_ref,
+            source_task_prompt=task.prompt,
+            source_task_slug=task.slug,
         )
 
     assert source_branch is not None
@@ -157,7 +162,11 @@ def resolve_source_selection(
         raise ExtractionError(f"Source branch not found: {branch}")
     if not git.ref_exists(base_ref):
         raise ExtractionError(f"Source base ref not found: {base_ref}")
-    return SourceSelection(source_task_id=None, source_branch=branch, source_base_ref=base_ref)
+    return SourceSelection(
+        source_task_id=None,
+        source_branch=branch,
+        source_base_ref=base_ref,
+    )
 
 
 def plan_extraction(
@@ -235,18 +244,23 @@ def draft_extraction_prompt(
     operator_prompt: str | None,
 ) -> str:
     """Draft the implement prompt for an extracted task."""
+    objective = _describe_source_objective(source)
     if source.source_task_id:
         source_label = f"task {source.source_task_id}"
     else:
         source_label = f"branch {source.source_branch}"
 
     lines = [
-        "Finish and validate the extracted change set.",
+        f"Carry over: {objective}",
         "",
         f"Source: {source_label} (branch `{source.source_branch}` vs `{source.source_base_ref}`).",
         "",
-        f"Selected files ({len(selected_paths)}):",
     ]
+
+    if source.source_task_prompt:
+        lines.extend(["", "Original task prompt:", source.source_task_prompt.strip()])
+
+    lines.extend(["", f"Selected files ({len(selected_paths)}):"])
 
     for path in selected_paths:
         lines.append(f"- {path}")
@@ -277,6 +291,49 @@ def draft_extraction_prompt(
         lines.extend(["", "Operator intent:", operator_prompt.strip()])
 
     return "\n".join(lines).strip() + "\n"
+
+
+def _describe_source_objective(source: SourceSelection) -> str:
+    """Derive a concise extract title from task metadata or branch identity."""
+    prompt_summary = _summarize_prompt_line(source.source_task_prompt)
+    if prompt_summary:
+        return prompt_summary
+
+    if source.source_task_slug:
+        slug_text = get_task_slug(source.source_task_slug) or source.source_task_slug
+        humanized_slug = _humanize_identifier(slug_text)
+        if humanized_slug:
+            return humanized_slug
+
+    branch_summary = source.source_branch.rsplit("/", 1)[-1]
+    humanized_branch = _humanize_identifier(branch_summary)
+    if humanized_branch:
+        return humanized_branch
+
+    return "selected source changes"
+
+
+def _summarize_prompt_line(prompt: str | None) -> str | None:
+    """Extract a short single-line summary from a task prompt."""
+    if not prompt:
+        return None
+
+    for raw_line in prompt.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^(task|prompt)\s*:\s*", "", line, flags=re.IGNORECASE)
+        line = re.sub(r"\s+", " ", line).strip(" -:.")
+        if line:
+            return line
+    return None
+
+
+def _humanize_identifier(value: str) -> str:
+    """Convert slug/branch fragments into readable text."""
+    normalized = value.replace("/", " ").replace("_", " ").replace("-", " ")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
 
 
 def write_extraction_bundle(

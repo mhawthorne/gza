@@ -537,8 +537,12 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
     # Assign slug at creation time so extraction artifacts can be persisted at the slug path.
     if impl_task.slug is None:
+        slug_prompt = next(
+            (line.strip() for line in draft.prompt.splitlines() if line.strip()),
+            draft.prompt,
+        )
         impl_task.slug = generate_slug(
-            impl_task.prompt,
+            slug_prompt,
             existing_id=None,
             log_path=config.log_path,
             git=git,

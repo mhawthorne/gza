@@ -96,7 +96,7 @@ def test_plan_extraction_and_bundle_roundtrip(tmp_path: Path) -> None:
     git = _init_repo(tmp_path)
     store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
 
-    source_task = store.add("Source", task_type="implement")
+    source_task = store.add("Add source module", task_type="implement")
     source_task.status = "completed"
     source_task.completed_at = datetime.now(UTC)
     source_task.branch = "feature/source"
@@ -132,6 +132,8 @@ def test_plan_extraction_and_bundle_roundtrip(tmp_path: Path) -> None:
     assert draft.file_summaries[0].additions == 1
     assert draft.file_summaries[0].deletions == 0
     assert draft.file_summaries[0].binary is False
+    assert draft.prompt.startswith("Carry over: Add source module\n")
+    assert "Original task prompt:\nAdd source module\n" in draft.prompt
     assert "Operator intent:" in draft.prompt
 
     target_task = store.add(draft.prompt, task_type="implement")
@@ -148,6 +150,36 @@ def test_plan_extraction_and_bundle_roundtrip(tmp_path: Path) -> None:
     copied = copy_bundle_to_worktree(bundle_dir, worktree)
     assert copied.exists()
     assert (copied / "manifest.json").exists()
+
+
+def test_plan_extraction_branch_source_uses_branch_name_in_prompt(tmp_path: Path) -> None:
+    git = _init_repo(tmp_path)
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+
+    git._run("checkout", "-b", "feature/auth-cleanup")
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src" / "module.py").write_text("value = 1\n")
+    git._run("add", "src/module.py")
+    git._run("commit", "-m", "add module")
+    git._run("checkout", "main")
+
+    source = resolve_source_selection(
+        store,
+        git,
+        source_task_id=None,
+        source_branch="feature/auth-cleanup",
+        base_branch_override=None,
+    )
+
+    selected = normalize_selected_paths(["src/module.py"])
+    draft = plan_extraction(
+        git,
+        source,
+        selected,
+        operator_prompt=None,
+    )
+
+    assert draft.prompt.startswith("Carry over: auth cleanup\n")
 
 
 def test_plan_extraction_supports_quoted_diff_headers_for_spaced_paths(tmp_path: Path) -> None:
