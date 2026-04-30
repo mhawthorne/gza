@@ -87,7 +87,12 @@ def resolve_branch_pr(
             continue
         seen_numbers.add(pr_number)
         had_cached = True
-        details = gh.get_pr_details(pr_number)
+        try:
+            details = gh.get_pr_details(pr_number)
+        except GitHubError as exc:
+            raise GitHubError(
+                f"failed to look up cached PR #{pr_number} for branch '{branch}': {exc}"
+            ) from exc
         if details is None:
             continue
         if details.state == "open":
@@ -96,7 +101,10 @@ def resolve_branch_pr(
             cached_non_open = details
 
     if allow_discovery:
-        details = gh.discover_pr_by_branch(branch)
+        try:
+            details = gh.discover_pr_by_branch(branch)
+        except GitHubError as exc:
+            raise GitHubError(f"failed to discover PR for branch '{branch}': {exc}") from exc
         if details is not None:
             if cached_non_open is None:
                 return ResolvedBranchPr(details=details, source="discovered")
@@ -369,10 +377,11 @@ def _sync_single_branch(
     if include_git or include_pr:
         if remote_default_ref is not None:
             remote_merged = git.is_merged(branch, into=remote_default_ref)
-        local_merged = git.is_merged(branch, into=default_branch)
+        if include_git:
+            local_merged = git.is_merged(branch, into=default_branch)
 
     if include_git:
-        if remote_merged or local_merged:
+        if remote_merged is True or local_merged is True:
             desired_merge_status = "merged"
             _mark_merged(result)
         elif branch_exists:
@@ -380,9 +389,6 @@ def _sync_single_branch(
             diff_output = git.get_diff_numstat(f"{default_branch}...{branch}")
             diff_stats = parse_diff_numstat(diff_output)
             result.actions.append("refreshed diff stats")
-    elif remote_merged or local_merged:
-        desired_merge_status = "merged"
-        _mark_merged(result)
 
     pr_lookup_time: datetime | None = None
     resolved_pr: ResolvedBranchPr | None = None
@@ -394,9 +400,13 @@ def _sync_single_branch(
             )
             if pr_number is not None
         )
-        pr_lookup_time = datetime.now(UTC)
-        resolved_pr = resolve_branch_pr(gh, branch, cached_pr_numbers=cached_numbers, allow_discovery=True)
-        if resolved_pr.details is not None:
+        try:
+            resolved_pr = resolve_branch_pr(gh, branch, cached_pr_numbers=cached_numbers, allow_discovery=True)
+        except GitHubError as exc:
+            result.errors.append(str(exc))
+        else:
+            pr_lookup_time = datetime.now(UTC)
+        if resolved_pr is not None and resolved_pr.details is not None:
             details = resolved_pr.details
             result.pr_number = details.number
             result.pr_state = details.state
@@ -410,8 +420,10 @@ def _sync_single_branch(
                 and remote_default_ref is not None
                 and details.base_ref_name == default_branch
                 and branch_exists
-                and remote_merged
+                and remote_merged is True
             ):
+                desired_merge_status = "merged"
+                _mark_merged(result)
                 comment_body = (
                     f"Closing automatically via `gza sync`: the changes from task {representative.id} "
                     f"on branch `{branch}` are already present on `origin/{default_branch}`, "
@@ -432,7 +444,7 @@ def _sync_single_branch(
                         else:
                             result.actions.append(f"closed stale PR #{details.number}")
                             result.pr_state = "closed"
-        elif resolved_pr.clear_cached_number:
+        elif resolved_pr is not None and resolved_pr.clear_cached_number:
             result.actions.append("cleared stale cached PR")
 
     result.merge_status = desired_merge_status

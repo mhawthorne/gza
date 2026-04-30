@@ -14,6 +14,7 @@ import pytest
 from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError
+from gza.github import GitHubError
 from gza.lineage import get_plan_for_task
 from gza.providers import ClaudeProvider, RunResult
 from gza.providers.base import PreflightCheckResult
@@ -53,6 +54,7 @@ from gza.runner import (
     open_task_startup_log,
     rename_startup_log_to_slug,
     run,
+    post_review_to_pr,
     write_execution_provenance_event,
     write_log_entry,
     write_worker_start_event,
@@ -102,6 +104,42 @@ class TestGetTaskOutputPaths:
         report_path, summary_path = get_task_output_paths(task, tmp_path)
         assert report_path is None
         assert summary_path is None
+
+
+class TestPostReviewToPr:
+    """Tests for posting review output to pull requests."""
+
+    def test_lookup_failure_preserves_cached_pr_state_and_surfaces_error(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement feature", task_type="implement")
+        impl_task.branch = "feature/review-lookup-failure"
+        impl_task.pr_number = 42
+        impl_task.pr_state = "open"
+        store.update(impl_task)
+
+        review_task = store.add("Review feature", task_type="review")
+        review_task.output_content = "Looks good"
+        store.update(review_task)
+
+        gh = Mock()
+        gh.is_available.return_value = True
+        gh.get_pr_details.side_effect = GitHubError("gh pr view 42 failed: authentication failed")
+
+        with patch("gza.runner.GitHub", return_value=gh):
+            post_review_to_pr(review_task, impl_task, store, tmp_path, required=False)
+
+        output = capsys.readouterr().out
+        assert "Failed to look up PR for task" in output
+        assert "No PR found" not in output
+        refreshed = store.get(impl_task.id)
+        assert refreshed is not None
+        assert refreshed.pr_number == 42
+        assert refreshed.pr_state == "open"
+        gh.add_pr_comment.assert_not_called()
 
 
 class TestGetTaskOutput:

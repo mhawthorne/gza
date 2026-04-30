@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from gza.github import GitHub, GitHubError, PullRequest, PullRequestDetails
+from gza.github import GitHub, GitHubError, GitHubLookupError, PullRequest, PullRequestDetails
 
 
 class TestGitHubRun:
@@ -383,6 +383,47 @@ class TestPullRequestDetails:
             base_ref_name="main",
         )
 
+    def test_get_pr_details_returns_none_for_explicit_not_found(self):
+        gh = GitHub()
+        mock_result = Mock(
+            returncode=1,
+            stdout="",
+            stderr="could not resolve to a pull request",
+        )
+
+        with patch.object(gh, "_run", return_value=mock_result):
+            details = gh.get_pr_details(404)
+
+        assert details is None
+
+    def test_get_pr_details_raises_for_lookup_failure(self):
+        gh = GitHub()
+        mock_result = Mock(
+            returncode=1,
+            stdout="",
+            stderr="authentication failed",
+        )
+
+        with patch.object(gh, "_run", return_value=mock_result):
+            with pytest.raises(GitHubLookupError) as exc_info:
+                gh.get_pr_details(55)
+
+        assert "gh pr view 55 failed" in str(exc_info.value)
+
+    def test_discover_pr_by_branch_raises_for_malformed_output(self):
+        gh = GitHub()
+        mock_result = Mock(
+            returncode=0,
+            stdout='[{"number": 77}]',
+            stderr="",
+        )
+
+        with patch.object(gh, "_run", return_value=mock_result):
+            with pytest.raises(GitHubLookupError) as exc_info:
+                gh.discover_pr_by_branch("feature/test")
+
+        assert "returned malformed PR details" in str(exc_info.value)
+
     def test_discover_pr_by_branch(self):
         gh = GitHub()
         mock_result = Mock(
@@ -422,6 +463,20 @@ class TestPullRequestDetails:
             state="merged",
             base_ref_name="main",
         )
+
+    def test_discover_pr_by_branch_raises_for_command_failure(self):
+        gh = GitHub()
+        mock_result = Mock(
+            returncode=1,
+            stdout="",
+            stderr="HTTP 502 from api.github.com",
+        )
+
+        with patch.object(gh, "_run", return_value=mock_result):
+            with pytest.raises(GitHubLookupError) as exc_info:
+                gh.discover_pr_by_branch("feature/test")
+
+        assert "gh pr list --head feature/test failed" in str(exc_info.value)
 
 
 class TestAddPRComment:

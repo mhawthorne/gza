@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock, patch
 
 from gza.db import SqliteTaskStore
-from gza.github import PullRequestDetails
+from gza.github import GitHubError, PullRequestDetails
 from gza.sync_ops import BranchCohort, build_branch_cohorts_for_task_ids, sync_branch_cohorts
 
 
@@ -305,6 +305,124 @@ def test_sync_branch_cohorts_pr_only_does_not_refresh_diff_stats(tmp_path):
     assert refreshed.diff_files_changed == 7
     assert refreshed.diff_lines_added == 20
     assert refreshed.diff_lines_removed == 4
+
+
+def test_sync_branch_cohorts_preserves_cached_pr_state_on_lookup_failure(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task with cached PR", "feature/pr-lookup-failure")
+    old_synced_at = datetime.now(UTC) - timedelta(days=2)
+    task.pr_number = 41
+    task.pr_state = "open"
+    task.pr_last_synced_at = old_synced_at
+    store.update(task)
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+
+    gh = Mock()
+    gh.is_available.return_value = True
+    gh.get_pr_details.side_effect = GitHubError("gh pr view 41 failed: authentication failed")
+
+    with patch("gza.sync_ops.GitHub", return_value=gh):
+        results, partial = sync_branch_cohorts(
+            store,
+            git,
+            [BranchCohort(branch="feature/pr-lookup-failure", tasks=(task,))],
+            include_git=False,
+            include_pr=True,
+            dry_run=False,
+            fetch_remote=False,
+        )
+
+    assert partial is True
+    assert results[0].errors == [
+        "failed to look up cached PR #41 for branch 'feature/pr-lookup-failure': gh pr view 41 failed: authentication failed"
+    ]
+    assert "cleared stale cached PR" not in results[0].actions
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.pr_number == 41
+    assert refreshed.pr_state == "open"
+    assert refreshed.pr_last_synced_at == old_synced_at
+
+
+def test_sync_branch_cohorts_pr_only_does_not_mark_merged_from_local_git_heuristic(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task with local merge heuristic", "feature/pr-only-local-merge")
+    task.pr_number = 51
+    store.update(task)
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = True
+
+    gh = Mock()
+    gh.is_available.return_value = True
+    gh.get_pr_details.return_value = PullRequestDetails(
+        url="https://github.com/o/r/pull/51",
+        number=51,
+        state="open",
+        base_ref_name="main",
+    )
+    gh.discover_pr_by_branch.return_value = None
+
+    with patch("gza.sync_ops.GitHub", return_value=gh):
+        results, partial = sync_branch_cohorts(
+            store,
+            git,
+            [BranchCohort(branch="feature/pr-only-local-merge", tasks=(task,))],
+            include_git=False,
+            include_pr=True,
+            dry_run=False,
+            fetch_remote=False,
+        )
+
+    assert partial is False
+    assert results[0].merge_status == "unmerged"
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+
+
+def test_sync_branch_cohorts_pr_only_does_not_mark_merged_when_branch_missing_without_pr_proof(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task with missing local branch", "feature/pr-only-missing-branch")
+    task.pr_number = 61
+    store.update(task)
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = False
+    git.is_merged.return_value = True
+
+    gh = Mock()
+    gh.is_available.return_value = True
+    gh.get_pr_details.return_value = PullRequestDetails(
+        url="https://github.com/o/r/pull/61",
+        number=61,
+        state="open",
+        base_ref_name="main",
+    )
+    gh.discover_pr_by_branch.return_value = None
+
+    with patch("gza.sync_ops.GitHub", return_value=gh):
+        results, partial = sync_branch_cohorts(
+            store,
+            git,
+            [BranchCohort(branch="feature/pr-only-missing-branch", tasks=(task,))],
+            include_git=False,
+            include_pr=True,
+            dry_run=False,
+            fetch_remote=False,
+        )
+
+    assert partial is False
+    assert results[0].merge_status == "unmerged"
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
 
 
 def test_sync_branch_cohorts_does_not_close_pr_when_branch_missing_locally(tmp_path):

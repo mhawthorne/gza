@@ -1762,12 +1762,19 @@ def post_review_to_pr(
     # Find an open PR, preferring cached metadata but falling back to branch lookup.
     pr_number = None
     if impl_task.branch:
-        resolved_pr = resolve_branch_pr(
-            gh,
-            impl_task.branch,
-            cached_pr_numbers=((impl_task.pr_number,) if impl_task.pr_number is not None else ()),
-            allow_discovery=True,
-        )
+        try:
+            resolved_pr = resolve_branch_pr(
+                gh,
+                impl_task.branch,
+                cached_pr_numbers=((impl_task.pr_number,) if impl_task.pr_number is not None else ()),
+                allow_discovery=True,
+            )
+        except GitHubError as exc:
+            if required:
+                print(f"Error: Failed to look up PR for task {impl_task.id}: {exc}")
+            else:
+                print(f"Info: Failed to look up PR for task {impl_task.id}, skipping PR comment: {exc}")
+            return
         if resolved_pr.details is not None and resolved_pr.details.state == "open":
             pr_number = resolved_pr.details.number
             impl_task.pr_number = resolved_pr.details.number
@@ -1896,6 +1903,8 @@ def _ensure_work_pr_for_completed_code_task(
         print("Error: GitHub CLI (gh) not available, cannot create PR")
     elif result.status == "push_failed":
         print(f"Error: Failed to push branch '{task.branch}' before PR creation: {result.error}")
+    elif result.status == "lookup_failed":
+        print(f"Error: Failed to look up PR for task {task.id}: {result.error}")
     elif result.status == "create_failed":
         print(f"Error: Failed to create PR for task {task.id}: {result.error}")
     else:

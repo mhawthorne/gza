@@ -1223,6 +1223,9 @@ def cmd_pr(args: argparse.Namespace) -> int:
         print("Install: https://cli.github.com/")
         print("Auth: gh auth login")
         return 1
+    if result.status == "lookup_failed":
+        print(f"Error looking up PR:\n{result.error}")
+        return 1
     if result.status == "push_failed":
         print(f"Error pushing branch: {result.error}")
         return 1

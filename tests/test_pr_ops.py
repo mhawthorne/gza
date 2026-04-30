@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 from gza.db import SqliteTaskStore
 from gza.pr_ops import ensure_task_pr
-from gza.github import PullRequestDetails
+from gza.github import GitHubError, PullRequestDetails
 
 
 class TestEnsureTaskPr:
@@ -171,4 +171,42 @@ class TestEnsureTaskPr:
         assert refreshed is not None
         assert refreshed.pr_number == 82
         assert refreshed.pr_state == "open"
+        gh.create_pr.assert_not_called()
+
+    def test_lookup_failure_preserves_cached_pr_state_and_returns_error(self, tmp_path):
+        """Lookup failures should surface as errors without clearing cached PR metadata."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Implement X", task_type="implement")
+        task.branch = "feature/lookup-failure"
+        task.pr_number = 81
+        task.pr_state = "open"
+        store.update(task)
+        original_synced_at = task.pr_last_synced_at
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git.needs_push.return_value = False
+        git.is_merged.return_value = False
+
+        gh = Mock()
+        gh.is_available.return_value = True
+        gh.get_pr_details.side_effect = GitHubError("gh pr view 81 failed: authentication failed")
+
+        with patch("gza.pr_ops.GitHub", return_value=gh):
+            result = ensure_task_pr(
+                task,
+                store,
+                git,
+                title="Manual title",
+                body="body",
+            )
+
+        assert result.ok is False
+        assert result.status == "lookup_failed"
+        assert "failed to look up cached PR #81" in result.error
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.pr_number == 81
+        assert refreshed.pr_state == "open"
+        assert refreshed.pr_last_synced_at == original_synced_at
         gh.create_pr.assert_not_called()

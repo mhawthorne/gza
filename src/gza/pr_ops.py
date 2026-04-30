@@ -19,6 +19,7 @@ PrEnsureStatus = Literal[
     "created",
     "merged",
     "gh_unavailable",
+    "lookup_failed",
     "push_failed",
     "create_failed",
 ]
@@ -211,12 +212,15 @@ def ensure_task_pr(
         return EnsureTaskPrResult(ok=False, status="push_failed", error=str(e))
 
     pr_lookup_time = datetime.now(UTC)
-    resolved_pr = resolve_branch_pr(
-        gh,
-        task.branch,
-        cached_pr_numbers=((task.pr_number,) if task.pr_number is not None else ()),
-        allow_discovery=True,
-    )
+    try:
+        resolved_pr = resolve_branch_pr(
+            gh,
+            task.branch,
+            cached_pr_numbers=((task.pr_number,) if task.pr_number is not None else ()),
+            allow_discovery=True,
+        )
+    except GitHubError as e:
+        return EnsureTaskPrResult(ok=False, status="lookup_failed", error=str(e))
     if resolved_pr.details is not None:
         task.pr_number = resolved_pr.details.number
         task.pr_state = resolved_pr.details.state

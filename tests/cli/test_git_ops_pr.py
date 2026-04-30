@@ -231,6 +231,47 @@ class TestPrCommand:
         assert "PR already exists: #42" in output
         ensure_pr.assert_called_once()
 
+    def test_pr_command_surfaces_lookup_failures_without_generic_create_message(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """`gza pr` should report lookup failures distinctly from PR creation failures."""
+        from gza.cli.git_ops import cmd_pr
+
+        store, task = self._make_completed_pr_task(
+            tmp_path,
+            branch="feature/lookup-failure",
+            pr_number=42,
+        )
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(task.id),
+            title="Manual title",
+            draft=False,
+        )
+        ensure_result = Mock(
+            ok=False,
+            status="lookup_failed",
+            error="failed to look up cached PR #42 for branch 'feature/lookup-failure': gh pr view 42 failed: authentication failed",
+        )
+
+        with (
+            patch("gza.cli.git_ops.get_store", return_value=store),
+            patch("gza.cli.git_ops.Git", return_value=git),
+            patch("gza.cli.git_ops.ensure_task_pr", return_value=ensure_result),
+        ):
+            rc = cmd_pr(args)
+
+        output = capsys.readouterr().out
+        assert rc == 1
+        assert "Error looking up PR:" in output
+        assert "Error creating PR" not in output
+
     def test_pr_command_uses_shared_pr_content_when_title_not_overridden(self, tmp_path: Path):
         """`gza pr` should delegate default title/body generation to the shared helper."""
         from gza.cli.git_ops import cmd_pr
