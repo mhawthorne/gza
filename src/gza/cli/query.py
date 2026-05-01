@@ -220,6 +220,27 @@ def _format_blocked_dependency_label(
     return "(blocked by dependency)"
 
 
+def _reconcile_unmerged_tasks(store: SqliteTaskStore, git: Git, default_branch: str) -> tuple[int, int]:
+    """Refresh merge truth and diff stats for tasks currently marked unmerged."""
+    merged_count = 0
+    refreshed_count = 0
+
+    for task in store.get_unmerged():
+        if task.id is None or not task.branch:
+            continue
+
+        if git.is_merged(task.branch, default_branch):
+            store.set_merge_status(task.id, "merged")
+            merged_count += 1
+            continue
+
+        files_changed, insertions, deletions = git.get_diff_stat_parsed(f"{default_branch}...{task.branch}")
+        store.update_diff_stats(task.id, files_changed, insertions, deletions)
+        refreshed_count += 1
+
+    return merged_count, refreshed_count
+
+
 def _is_branch_target_live(args: argparse.Namespace) -> bool:
     """Whether unmerged should use a live git target instead of canonical DB state."""
     return bool(getattr(args, "into_current", False) or getattr(args, "target", None))
