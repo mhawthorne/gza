@@ -118,7 +118,6 @@ _INCOMPLETE_DEPRECATION_LINES: tuple[str, ...] = (
     "After `gza unimplemented` ships, it will replace the temporary `advance --unimplemented` spelling.",
 )
 
-
 class _UnmergedGit(Protocol):
     def default_branch(self) -> str:
         ...
@@ -154,7 +153,6 @@ class _UnmergedGit(Protocol):
 
     def fetch(self, remote: str = "origin") -> None:
         ...
-
 
 def _parse_cli_date(value: str | None) -> _dt.date | None:
     parsed = _parse_iso(value) if value else None

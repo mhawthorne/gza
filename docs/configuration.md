@@ -1081,7 +1081,6 @@ gza search <term> [options]
 | `--json` | Output JSON rows from the unified query API |
 
 Text output ends with a summary footer such as `Showing results 1-9 out of 55`.
-
 ### checkout
 
 Checkout a task's branch, removing any stale worktree if needed.
