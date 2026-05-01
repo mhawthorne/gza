@@ -111,22 +111,24 @@ Use `/gza-task-debug` when a task has failed and you need to understand why befo
 
 ## gza-summary
 
-**Summarize recent gza task activity and suggest next steps.**
+**Synthesize operator triage guidance from the canonical gza surfaces.**
 
-Use `/gza-summary` for a quick status overview: what completed recently, what's unmerged, and what's pending. Returns a prioritized list of suggested next actions.
+Use `/gza-summary` when you want a synthesized "what should I do next?" view without reviving `gza incomplete` as a mixed-bucket CLI command.
 
 **Key behaviors:**
-- Runs `uv run gza history`, `uv run gza unmerged`, and `uv run gza next` to collect current state
-- Highlights failed tasks, unmerged branches, and blocked pending tasks
-- For plan/explore/review tasks, includes the report file path so you can open it directly
-- Suggests specific commands to run (e.g., `uv run gza work`, `git merge`, `uv run gza log gza-p`)
+- Runs `uv run gza history --status failed`, `uv run gza advance --unimplemented`, `uv run gza unmerged`, and `uv run gza next --all`
+- Optionally uses `uv run gza watch --restart-failed --dry-run` when failed-task recovery needs a decision surface
+- Treats `uv run gza history --status failed` as factual failed-attempt history, not an unresolved-only recovery queue
+- Distinguishes factual history filters from recommendation synthesis
+- Suggests gza-native follow-up commands such as `uv run gza work`, `uv run gza merge <id>`, `uv run gza sync <id>`, and `uv run gza log <id>`
 
 **Output sections:**
 
 ```
-## Recent Activity
+## Failed Recovery
+## Unimplemented Plans/Explores
 ## Unmerged Work
-## Pending Tasks
+## Queue State
 ## Suggested Next Steps
 ```
 

@@ -1,107 +1,109 @@
 ---
 name: gza-summary
-description: Summarize recent gza task activity and suggest next steps by checking history, unmerged branches, and pending tasks
-allowed-tools: Bash(uv run gza history:*), Bash(uv run gza unmerged:*), Bash(uv run gza next:*)
-version: 1.0.0
+description: Synthesize operator triage guidance from failed-task history, unimplemented plan and explore work, unmerged branches, and queue state
+allowed-tools: Bash(uv run gza history:*), Bash(uv run gza unmerged:*), Bash(uv run gza next:*), Bash(uv run gza advance:*), Bash(uv run gza watch:*)
+version: 2.0.0
 public: true
 ---
 
 # Gza Summary
 
-Get an overview of recent gza task activity, unmerged work, and pending tasks, then suggest concrete next steps.
+Produce an operator triage summary by combining dedicated gza surfaces, then recommend the next concrete actions.
 
 ## Process
 
 ### Step 1: Gather task data
 
-Run all three commands in sequence to collect current state:
+Run these commands to collect the canonical source data:
 
-**Recent history (completed/failed tasks):**
+**Failed-task history:**
 ```bash
-uv run gza history
+uv run gza history --status failed
 ```
 
-**Unmerged work (tasks with branches not yet merged):**
+**Unimplemented plan/explore work:**
+```bash
+uv run gza advance --unimplemented
+```
+
+Until `uv run gza unimplemented` exists, `uv run gza advance --unimplemented` is the canonical surface.
+
+**Unmerged code work:**
 ```bash
 uv run gza unmerged
 ```
 
-**Pending tasks (upcoming work):**
+**Queue state, including blocked rows:**
 ```bash
-uv run gza next
+uv run gza next --all
+```
+
+**Optional failed-recovery decision surface:**
+```bash
+uv run gza watch --restart-failed --dry-run
 ```
 
 ### Step 2: Analyze the output
 
-Review the combined output and identify actionable items:
+Treat each command as the authoritative surface for one domain:
 
-**From `uv run gza history`:**
-- Note any recently failed tasks — these may need to be retried or their errors investigated
-- Note recently completed tasks that produced branches (candidates for merging or PR creation)
-- Note completed plan/explore tasks whose output hasn't been acted on yet
+**From `uv run gza history --status failed`:**
+- Treat this as factual failed-task history, including attempts that were later retried or resumed successfully
+- Suggest factual follow-up like `uv run gza log <full prefixed task id>` when operators need details
+- Use `uv run gza watch --restart-failed --dry-run` when operators need the current failed-task recovery decision surface
+- Do not treat this as a replacement for the old mixed-bucket `gza incomplete` output
 
 **From `uv run gza unmerged`:**
-- Each branch listed here represents completed work that hasn't been merged to the base branch
-- Identify which branches are ready to merge (no conflicts expected) vs which need review first
-- Check if any unmerged branches have associated PRs or reviews pending
+- Each listed row is completed code work that still needs merge/review/sync attention
+- Prefer gza-native guidance like `uv run gza merge <full prefixed task id>` or `uv run gza sync <full prefixed task id>`
 
-**From `uv run gza next`:**
-- Identify the next pending task(s) — the most immediate work to run with `uv run gza work`
-- Note any tasks that are blocked by dependencies or require prerequisite steps (e.g., terraform apply, file uploads)
-- Look for tasks that are grouped together and may benefit from being run in sequence
+**From `uv run gza advance --unimplemented`:**
+- Identify completed `plan` or `explore` rows that do not yet have implementation work
+- Suggest `uv run gza implement <full prefixed task id>` only for completed plan rows
+- Suggest `uv run gza advance --unimplemented --create` when implement tasks should be queued from listed source rows
+
+**From `uv run gza next --all`:**
+- Identify the runnable next task(s) for `uv run gza work`
+- Call out blocked rows, including dropped-dependency blockers, as queue state rather than lineage state
+
+**From `uv run gza watch --restart-failed --dry-run` (optional):**
+- Use it only when failed tasks exist and the operator needs the failed-recovery decision surface
+- Treat it as supplemental guidance, not as the primary summary source
 
 ### Step 3: Suggest next steps
 
-Based on the analysis, provide a prioritized list of specific, actionable suggestions. Examples:
+Produce a prioritized set of specific recommendations. Keep recommendations mapped back to the dedicated surface they came from.
 
-**For unmerged branches:**
-- "Merge branch `20260115-add-authentication` — task gza-i is complete and has 3 commits ready"
-- "Create a PR for task gza-m (`20260118-fix-api-pagination`) before merging"
+Examples:
 
-**For failed tasks:**
-- "Retry failed task gza-n — it failed due to a missing module, which may now be installed"
-- "Investigate task gza-p failure: check the log with `uv run gza log gza-p`"
+- "Inspect failed task `gza-1234` with `uv run gza log gza-1234` before choosing a recovery action."
+- "Queue implementation follow-up for `gza-1250` with `uv run gza advance --unimplemented --create`."
+- "Merge unmerged implementation `gza-1301` with `uv run gza merge gza-1301`."
+- "Run `uv run gza work` to start the next runnable pending task from the queue."
 
-**For pending tasks:**
-- "Run `uv run gza work` to start the next pending task: gza-v (implement CSV export)"
-- "Task gza-s depends on gza-r which is still in_progress — wait before running"
-
-**For infrastructure/ops tasks:**
-- "Apply terraform changes before running task gza-y (requires infrastructure update)"
-- "Upload config files to S3 before running task gza-10"
-- "Review and merge branch X before starting dependent task Y"
-
-**General workflow suggestions:**
-- If history shows a completed plan task, suggest creating an implement task based on it
-- If there are many unmerged branches, suggest a merge/cleanup session
-- If no pending tasks exist, suggest reviewing completed work or adding new tasks
+Avoid broad restatements of task state. Focus on what the operator should do next and why.
 
 ## Output format
 
-Present the summary in three clearly labeled sections:
+Present the summary in these sections:
 
 ```
-## Recent Activity
-[Key highlights from gza history — 3-5 most notable items]
+## Failed Recovery
+
+## Unimplemented Plans/Explores
 
 ## Unmerged Work
-[List of branches/tasks with unmerged commits, if any]
 
-## Pending Tasks
-[Next tasks in queue, if any]
+## Queue State
 
 ## Suggested Next Steps
-1. [Most urgent/impactful action]
-2. [Second priority action]
-3. [Further actions...]
 ```
 
-Keep the summary concise — focus on what requires human attention or decision-making.
+Keep it concise. If a section has no actionable items, say so briefly and move on.
 
 ## Important notes
 
-- **Run all three commands** even if one returns no results — the combination gives the full picture
-- **Be specific** in suggestions: name the task ID, branch name, or command to run
-- **Prioritize** unmerged work and failed tasks over pending tasks (existing work first)
-- **Respect dependencies**: don't suggest running a task that depends on an incomplete task
-- If all sections are empty (no history, no unmerged, no pending), report that the queue is clean and suggest adding new tasks with `uv run gza add`
+- `/gza-summary` is the synthesized recommendation layer. It is not a canonical replacement for `gza incomplete`.
+- `uv run gza history --incomplete` remains a factual unresolved-history filter, not an action-planning summary.
+- Prefer gza-native commands in recommendations.
+- Use full prefixed task IDs in every command example.

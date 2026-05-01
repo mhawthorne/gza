@@ -153,8 +153,8 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
         "gza run-inline <task_id> [options]",
         "### search",
         "gza search <term> [options]",
-        "### incomplete",
-        "gza incomplete [options]",
+        "Replacing `gza incomplete`",
+        "`uv run gza history --incomplete` remains available as a factual unresolved-history filter.",
         "### tv",
         "gza tv [task_id ...] [options]",
         "### comment",
@@ -165,6 +165,33 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
     ]
     for snippet in required_snippets:
         assert snippet in config_content
+
+
+def test_summary_docs_and_skill_use_dedicated_triage_surfaces() -> None:
+    """`/gza-summary` docs should synthesize dedicated surfaces instead of reviving `gza incomplete`."""
+    repo_root = Path(__file__).resolve().parents[1]
+    skills_doc_content = (repo_root / "docs" / "skills.md").read_text()
+    skill_content = (repo_root / "src" / "gza" / "skills" / "gza-summary" / "SKILL.md").read_text()
+
+    required_snippets = [
+        "uv run gza history --status failed",
+        "uv run gza advance --unimplemented",
+        "uv run gza unmerged",
+        "uv run gza next --all",
+        "/gza-summary",
+        "Failed Recovery",
+        "Queue State",
+    ]
+    for snippet in required_snippets:
+        assert snippet in skills_doc_content
+        assert snippet in skill_content
+
+    assert "git merge" not in skills_doc_content
+    assert "git merge" not in skill_content
+    assert "factual failed-attempt history" in skills_doc_content
+    assert "factual failed-task history" in skill_content
+    assert "unresolved failed tasks" not in skill_content
+    assert "not a canonical replacement for `gza incomplete`" in skill_content
 
 
 def test_configuration_docs_describe_comments_only_improve_path() -> None:

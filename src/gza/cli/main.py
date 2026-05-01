@@ -75,7 +75,7 @@ from .query import (
     cmd_group_rename,
     cmd_groups,
     cmd_history,
-    cmd_incomplete,
+    cmd_incomplete_deprecated,
     cmd_kill,
     cmd_lineage,
     cmd_next,
@@ -97,17 +97,6 @@ def _parse_search_last(value: str) -> int:
         raise argparse.ArgumentTypeError("--last must be an integer") from exc
     if parsed < 0:
         raise argparse.ArgumentTypeError("--last must be >= 0 (use 0 for all matches)")
-    return parsed
-
-
-def _parse_incomplete_last(value: str) -> int:
-    """Parse `incomplete --last` where 0 means unlimited and negatives are invalid."""
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("--last must be an integer") from exc
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("--last must be >= 0 (use 0 for all unresolved lineages)")
     return parsed
 
 
@@ -340,6 +329,74 @@ def main() -> int:
         help="Output JSON rows from the unified query API",
     )
 
+    # hidden deprecated incomplete command
+    incomplete_parser = subparsers.add_parser(
+        "incomplete",
+        help=argparse.SUPPRESS,
+        add_help=False,
+    )
+    add_common_args(incomplete_parser)
+    incomplete_parser.add_argument(
+        "-h",
+        "--help",
+        action="store_true",
+        dest="legacy_help",
+        help=argparse.SUPPRESS,
+    )
+    incomplete_parser.add_argument(
+        "--json",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    incomplete_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    incomplete_parser.add_argument(
+        "--blocked-by-dropped",
+        action="store_true",
+        dest="blocked_by_dropped",
+        help=argparse.SUPPRESS,
+    )
+    incomplete_parser.add_argument(
+        "--last",
+        "-n",
+        type=int,
+        metavar="N",
+        help=argparse.SUPPRESS,
+    )
+    incomplete_parser.add_argument(
+        "--tree",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    incomplete_parser.add_argument(
+        "--type",
+        type=str,
+        choices=["explore", "plan", "implement", "review", "improve", "fix", "rebase", "internal"],
+        help=argparse.SUPPRESS,
+    )
+    incomplete_parser.add_argument(
+        "--days",
+        type=int,
+        metavar="N",
+        help=argparse.SUPPRESS,
+    )
+    incomplete_parser.add_argument(
+        "--date-field",
+        choices=["created", "completed", "effective"],
+        help=argparse.SUPPRESS,
+    )
+    # Keep the deprecated parser choice available for parsing, but remove its
+    # pseudo-action so top-level help does not advertise it during the
+    # compatibility window.
+    subparsers._choices_actions = [
+        action
+        for action in subparsers._choices_actions
+        if getattr(action, "dest", None) != "incomplete"
+    ]
+
     # search command
     search_parser = subparsers.add_parser(
         "search",
@@ -435,59 +492,6 @@ def main() -> int:
         action="store_true",
         dest="any_tag",
         help="With repeated --tag values, match any tag instead of all tags",
-    )
-
-    # incomplete command
-    incomplete_parser = subparsers.add_parser(
-        "incomplete",
-        help="Show unresolved task lineages that still need attention",
-    )
-    add_common_args(incomplete_parser)
-    incomplete_parser.set_defaults(last=5)
-    incomplete_parser.add_argument(
-        "--last",
-        "-n",
-        type=_parse_incomplete_last,
-        metavar="N",
-        help="Show last N unresolved lineages (0 for all)",
-    )
-    incomplete_parser.add_argument(
-        "--type",
-        type=str,
-        choices=["explore", "plan", "implement", "review", "improve", "fix", "rebase", "internal"],
-        help="Filter tasks by task_type before lineage rollup",
-    )
-    incomplete_parser.add_argument(
-        "--days",
-        type=_parse_non_negative_int,
-        metavar="N",
-        help="Show only unresolved lineages with activity in the last N days",
-    )
-    incomplete_parser.add_argument(
-        "--date-field",
-        choices=["created", "completed", "effective"],
-        default="effective",
-        help="Date field used by --days filters (default: effective)",
-    )
-    incomplete_parser.add_argument(
-        "--tree",
-        action="store_true",
-        help="Show unresolved lineages as trees instead of one-line summaries",
-    )
-    incomplete_parser.add_argument(
-        "--blocked-by-dropped",
-        action="store_true",
-        help="Show pending tasks blocked by dropped dependencies",
-    )
-    incomplete_parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Include owner metadata under one-line summaries",
-    )
-    incomplete_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output JSON rows from the unified query API",
     )
 
     # unmerged command
@@ -2322,6 +2326,9 @@ def main() -> int:
     )
     add_common_args(migrate_parser)
 
+    visible_commands = sorted(name for name in subparsers.choices if name != "incomplete")
+    subparsers.metavar = "{" + ",".join(visible_commands) + "}"
+
     args = parser.parse_args()
 
     # Validate and resolve project_dir
@@ -2378,10 +2385,10 @@ def main() -> int:
             return cmd_next(args)
         elif args.command == "history":
             return cmd_history(args)
+        elif args.command == "incomplete":
+            return cmd_incomplete_deprecated(args)
         elif args.command == "search":
             return cmd_search(args)
-        elif args.command == "incomplete":
-            return cmd_incomplete(args)
         elif args.command == "unmerged":
             return cmd_unmerged(args)
         elif args.command == "advance":

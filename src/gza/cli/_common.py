@@ -2142,7 +2142,7 @@ class GzaArgumentParser(argparse.ArgumentParser):
     """ArgumentParser that prints a terse git-style error for unknown subcommands."""
 
     _INVALID_CHOICE_RE = re.compile(
-        r"argument command: invalid choice: ['\"]?(?P<cmd>[^'\"\s]+)['\"]?"
+        r"argument (?:command|\{[^}]+\}): invalid choice: ['\"]?(?P<cmd>[^'\"\s]+)['\"]?"
     )
 
     def error(self, message: str) -> NoReturn:

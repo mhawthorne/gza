@@ -829,6 +829,31 @@ class TestHistoryCommand:
         assert result.returncode == 0
         assert f"→ retried as {retry.id} ✓" in result.stdout
 
+    def test_history_status_failed_keeps_resolved_retry_in_factual_history(self, tmp_path: Path):
+        """`history --status failed` remains historical and still includes retried rows."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Original failed", task_type="implement")
+        original.status = "failed"
+        original.failure_reason = "MAX_STEPS"
+        original.completed_at = datetime.now(UTC)
+        store.update(original)
+
+        assert original.id is not None
+        retry = store.add("Retry succeeded", task_type="implement", based_on=original.id)
+        retry.status = "completed"
+        retry.completed_at = datetime.now(UTC)
+        store.update(retry)
+        assert retry.id is not None
+
+        result = run_gza("history", "--status", "failed", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Original failed" in result.stdout
+        assert f"→ retried as {retry.id} ✓" in result.stdout
+        assert "Retry succeeded" not in result.stdout
+
     def test_history_annotates_failed_task_with_resume_outcome(self, tmp_path: Path):
         """Failed tasks show 'resumed' when the next attempt reused session + branch."""
         setup_config(tmp_path)
@@ -6973,6 +6998,27 @@ class TestNextCommandWithDependencies:
         assert "First task" in result.stdout
         assert "Blocked task" in result.stdout
 
+    def test_next_all_marks_dropped_dependency_blockers_explicitly(self, tmp_path: Path):
+        """Next --all carries blocker status so dropped dependencies are visible."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        prereq = store.add("Dropped prereq")
+        prereq.status = "dropped"
+        prereq.completed_at = datetime.now(UTC)
+        store.update(prereq)
+        assert prereq.id is not None
+
+        dependent = store.add("Blocked by dropped prereq", depends_on=prereq.id)
+        assert dependent.id is not None
+
+        result = run_gza("next", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert dependent.id in normalized
+        assert f"blocked-by-dropped {prereq.id}" in normalized
+
     def test_next_shows_blocked_count(self, tmp_path: Path):
         """Next command shows count of blocked tasks."""
 
@@ -7871,174 +7917,21 @@ class TestPsSortKey:
 
 
 class TestIncompleteCommand:
-    """Tests for `gza incomplete` command."""
+    """Tests for the deprecated `gza incomplete` compatibility stub."""
 
-    def test_incomplete_json_empty_results_returns_empty_array_without_human_message(self, tmp_path: Path):
+    def test_incomplete_json_fails_closed_with_deprecation_message(self, tmp_path: Path):
         setup_config(tmp_path)
 
         result = run_gza("incomplete", "--json", "--project", str(tmp_path))
 
-        assert result.returncode == 0
-        assert json.loads(result.stdout) == []
-        assert "No unresolved task lineages" not in result.stdout
+        assert result.returncode == 2
+        assert result.stdout == ""
+        assert "invalid choice" not in result.stderr
+        assert "deprecated and no longer supported" in result.stderr
+        assert "uv run gza unmerged" in result.stderr
 
-    def test_incomplete_hides_merged_root_with_completed_review_improve(self, tmp_path: Path):
+    def test_incomplete_blocked_by_dropped_points_to_next_all(self, tmp_path: Path):
         setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Implement root", task_type="implement")
-        root.status = "completed"
-        root.completed_at = datetime.now(UTC)
-        root.merge_status = "merged"
-        store.update(root)
-        assert root.id is not None
-
-        review = store.add("Review done", task_type="review", based_on=root.id, depends_on=root.id)
-        review.status = "completed"
-        review.completed_at = datetime.now(UTC)
-        review.merge_status = "unmerged"
-        store.update(review)
-        assert review.id is not None
-
-        improve = store.add("Improve done", task_type="improve", based_on=root.id, depends_on=review.id, same_branch=True)
-        improve.status = "completed"
-        improve.completed_at = datetime.now(UTC)
-        improve.merge_status = "unmerged"
-        store.update(improve)
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "No unresolved task lineages" in result.stdout
-        assert "Implement root" not in result.stdout
-
-    def test_incomplete_shows_failed_improve_under_merged_root(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Implement root", task_type="implement")
-        root.status = "completed"
-        root.completed_at = datetime.now(UTC)
-        root.merge_status = "merged"
-        store.update(root)
-        assert root.id is not None
-
-        improve = store.add("Improve failed", task_type="improve", based_on=root.id, same_branch=True)
-        improve.status = "failed"
-        improve.completed_at = datetime.now(UTC)
-        improve.failure_reason = "TEST_FAILURE"
-        store.update(improve)
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Implement root" in result.stdout
-        assert "Improve failed" in result.stdout
-
-    def test_incomplete_shows_unmerged_root_with_unresolved_completed_improve_child(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Implement root", task_type="implement")
-        root.status = "completed"
-        root.completed_at = datetime.now(UTC)
-        root.has_commits = True
-        root.merge_status = "unmerged"
-        store.update(root)
-        assert root.id is not None
-
-        improve = store.add("Improve completed", task_type="improve", based_on=root.id, same_branch=True)
-        improve.status = "completed"
-        improve.completed_at = datetime.now(UTC)
-        improve.has_commits = True
-        improve.merge_status = "unmerged"
-        store.update(improve)
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Implement root" in result.stdout
-        assert "Improve completed" in result.stdout
-
-    def test_incomplete_retry_chain_keeps_only_latest_attempt_unresolved(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        first = store.add("Attempt one", task_type="implement")
-        first.status = "failed"
-        first.completed_at = datetime.now(UTC)
-        first.failure_reason = "FIRST_FAILURE"
-        store.update(first)
-        assert first.id is not None
-
-        second = store.add("Attempt two", task_type="implement", based_on=first.id)
-        second.status = "failed"
-        second.completed_at = datetime.now(UTC)
-        second.failure_reason = "SECOND_FAILURE"
-        store.update(second)
-        assert second.id is not None
-
-        third = store.add("Attempt three", task_type="implement", based_on=second.id)
-        third.status = "completed"
-        third.completed_at = datetime.now(UTC)
-        third.has_commits = True
-        third.merge_status = "unmerged"
-        store.update(third)
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Attempt three" in result.stdout
-        assert "Attempt one" in result.stdout
-        assert "Attempt two" in result.stdout
-        # Resolved anchors remain for lineage context, but their failure detail
-        # should be suppressed because only the latest attempt is unresolved.
-        assert "FIRST_FAILURE" not in result.stdout
-        assert "SECOND_FAILURE" not in result.stdout
-
-    def test_incomplete_includes_legacy_unmerged_status_rows(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        legacy = store.add("Legacy unmerged", task_type="implement")
-        legacy.status = "unmerged"
-        legacy.completed_at = datetime.now(UTC)
-        legacy.has_commits = True
-        store.update(legacy)
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Legacy unmerged" in result.stdout
-
-    def test_incomplete_includes_dropped_status_rows(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        dropped = store.add("Dropped lineage", task_type="implement")
-        dropped.status = "dropped"
-        dropped.completed_at = datetime.now(UTC)
-        dropped.has_commits = True
-        store.update(dropped)
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Dropped lineage" in result.stdout
-        assert "dropped" in result.stdout
-
-    def test_incomplete_blocked_by_dropped_surfaces_pending_with_indicator(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        dep = store.add("Dropped dependency", task_type="implement")
-        dep.status = "dropped"
-        dep.completed_at = datetime.now(UTC)
-        store.update(dep)
-        assert dep.id is not None
-
-        blocked = store.add("Blocked dependent", task_type="implement", depends_on=dep.id)
-        assert blocked.id is not None
 
         result = run_gza(
             "incomplete",
@@ -8047,480 +7940,44 @@ class TestIncompleteCommand:
             str(tmp_path),
         )
 
-        assert result.returncode == 0
-        assert "Blocked dependent" in result.stdout
-        assert f"[blocked-by-dropped {dep.id}]" in result.stdout
+        assert result.returncode == 2
+        assert "invalid choice" not in result.stderr
+        assert "unrecognized arguments" not in result.stderr
+        assert "uv run gza next --all" in result.stderr
+        assert "dropped-dependency blockers" in result.stderr
 
-    def test_incomplete_blocked_by_dropped_hides_dep_with_completed_retry(self, tmp_path: Path):
+    def test_incomplete_reports_ignored_legacy_args(self, tmp_path: Path):
         setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        dep = store.add("Dropped dependency", task_type="implement")
-        dep.status = "dropped"
-        dep.completed_at = datetime.now(UTC) - timedelta(hours=2)
-        store.update(dep)
-        assert dep.id is not None
-
-        retry = store.add("Completed retry", task_type="implement", based_on=dep.id)
-        retry.status = "completed"
-        retry.completed_at = datetime.now(UTC) - timedelta(hours=1)
-        retry.has_commits = True
-        retry.merge_status = "unmerged"
-        store.update(retry)
-
-        blocked = store.add("Blocked dependent", task_type="implement", depends_on=dep.id)
 
         result = run_gza(
             "incomplete",
-            "--blocked-by-dropped",
+            "--last",
+            "0",
+            "--tree",
             "--project",
             str(tmp_path),
         )
 
-        assert result.returncode == 0
-        assert "No pending tasks blocked by dropped dependencies" in result.stdout
-        assert blocked.prompt not in result.stdout
+        assert result.returncode == 2
+        assert "invalid choice" not in result.stderr
+        assert "Ignoring legacy arguments" in result.stderr
+        assert "--last" in result.stderr
+        assert "--tree" in result.stderr
 
-    def test_incomplete_blocked_by_dropped_hides_dropped_dependent(self, tmp_path: Path):
+    def test_incomplete_verbose_routes_to_deprecation_stub(self, tmp_path: Path):
         setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        dep = store.add("Dropped dependency", task_type="implement")
-        dep.status = "dropped"
-        dep.completed_at = datetime.now(UTC)
-        store.update(dep)
-        assert dep.id is not None
-
-        blocked = store.add("Dropped dependent", task_type="implement", depends_on=dep.id)
-        blocked.status = "dropped"
-        blocked.completed_at = datetime.now(UTC)
-        store.update(blocked)
 
         result = run_gza(
             "incomplete",
-            "--blocked-by-dropped",
+            "--verbose",
             "--project",
             str(tmp_path),
         )
 
-        assert result.returncode == 0
-        assert "No pending tasks blocked by dropped dependencies" in result.stdout
-        assert "Dropped dependent" not in result.stdout
-
-    def test_incomplete_branching_retry_shows_all_unresolved_siblings_under_one_root(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Root failed", task_type="implement")
-        root.status = "failed"
-        root.completed_at = datetime.now(UTC)
-        root.failure_reason = "ROOT_TEST_FAILURE"
-        store.update(root)
-        assert root.id is not None
-
-        retry_completed = store.add("Retry completed", task_type="implement", based_on=root.id)
-        retry_completed.status = "completed"
-        retry_completed.completed_at = datetime.now(UTC)
-        retry_completed.has_commits = True
-        retry_completed.merge_status = "unmerged"
-        store.update(retry_completed)
-        assert retry_completed.id is not None
-
-        retry_failed = store.add("Retry failed", task_type="implement", based_on=root.id)
-        retry_failed.status = "failed"
-        retry_failed.completed_at = datetime.now(UTC)
-        retry_failed.failure_reason = "RETRY_TEST_FAILURE"
-        store.update(retry_failed)
-        assert retry_failed.id is not None
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Root failed" in result.stdout
-        assert "Retry completed" in result.stdout
-        assert "Retry failed" in result.stdout
-        # The resolved root anchor must not be rendered as a normal failed row:
-        # it should not repeat its own failure reason or retry-as annotation.
-        assert "ROOT_TEST_FAILURE" not in result.stdout
-        # The unresolved retry's own failure reason should still be rendered.
-        assert "RETRY_TEST_FAILURE" in result.stdout
-
-    def test_incomplete_tree_renders_owner_grouped_subtrees(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Root failed", task_type="implement")
-        root.status = "failed"
-        root.completed_at = datetime.now(UTC)
-        root.failure_reason = "ROOT_TEST_FAILURE"
-        store.update(root)
-        assert root.id is not None
-
-        retry_completed = store.add("Retry completed", task_type="implement", based_on=root.id)
-        retry_completed.status = "completed"
-        retry_completed.completed_at = datetime.now(UTC)
-        retry_completed.has_commits = True
-        retry_completed.merge_status = "unmerged"
-        store.update(retry_completed)
-        assert retry_completed.id is not None
-
-        retry_failed = store.add("Retry failed", task_type="implement", based_on=root.id)
-        retry_failed.status = "failed"
-        retry_failed.completed_at = datetime.now(UTC)
-        retry_failed.failure_reason = "RETRY_TEST_FAILURE"
-        store.update(retry_failed)
-        assert retry_failed.id is not None
-
-        result = run_gza("incomplete", "--tree", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "└──" in result.stdout
-        assert "--------------------------------" in result.stdout
-
-    def test_incomplete_tree_marks_context_nodes_resolved(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Root failed", task_type="implement")
-        root.status = "failed"
-        root.completed_at = datetime.now(UTC)
-        root.failure_reason = "ROOT_TEST_FAILURE"
-        store.update(root)
-        assert root.id is not None
-
-        retry_completed = store.add("Retry completed", task_type="implement", based_on=root.id)
-        retry_completed.status = "completed"
-        retry_completed.completed_at = datetime.now(UTC)
-        retry_completed.has_commits = True
-        retry_completed.merge_status = "unmerged"
-        store.update(retry_completed)
-        assert retry_completed.id is not None
-
-        retry_failed = store.add("Retry failed", task_type="implement", based_on=root.id)
-        retry_failed.status = "failed"
-        retry_failed.completed_at = datetime.now(UTC)
-        retry_failed.failure_reason = "RETRY_TEST_FAILURE"
-        store.update(retry_failed)
-        assert retry_failed.id is not None
-
-        result = run_gza("incomplete", "--tree", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert re.search(rf"resolved\s+{re.escape(root.id)}\s+Root failed", result.stdout)
-        assert not re.search(rf"failed\s+{re.escape(root.id)}\s+Root failed", result.stdout)
-        assert "ROOT_TEST_FAILURE" not in result.stdout
-        assert re.search(rf"failed\s+{re.escape(retry_failed.id)}\s+Retry failed", result.stdout)
-
-    def test_incomplete_hides_failed_root_when_completed_descendant_has_different_type(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Failed implement root", task_type="implement")
-        root.status = "failed"
-        root.completed_at = datetime.now(UTC)
-        root.failure_reason = "TEST_FAILURE"
-        store.update(root)
-        assert root.id is not None
-
-        improve = store.add("Completed improve descendant", task_type="improve", based_on=root.id, same_branch=True)
-        improve.status = "completed"
-        improve.completed_at = datetime.now(UTC)
-        improve.has_commits = True
-        improve.merge_status = "merged"
-        store.update(improve)
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "No unresolved task lineages" in result.stdout
-        assert "Failed implement root" not in result.stdout
-
-    def test_incomplete_completed_unmerged_root_hidden_when_retry_merges(self, tmp_path: Path):
-        """Regression: a completed-unmerged root should disappear from
-        `gza incomplete` once a later same-lineage retry has merged."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        first = store.add("First attempt unmerged", task_type="implement")
-        first.status = "completed"
-        first.completed_at = datetime.now(UTC)
-        first.has_commits = True
-        first.merge_status = "unmerged"
-        store.update(first)
-        assert first.id is not None
-
-        second = store.add("Second attempt merged", task_type="implement", based_on=first.id)
-        second.status = "completed"
-        second.completed_at = datetime.now(UTC)
-        second.has_commits = True
-        second.merge_status = "merged"
-        store.update(second)
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "No unresolved task lineages" in result.stdout
-        assert "First attempt unmerged" not in result.stdout
-
-    def test_incomplete_hides_completed_rebase_under_merged_root(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Implement root", task_type="implement")
-        root.status = "completed"
-        root.completed_at = datetime.now(UTC)
-        root.merge_status = "merged"
-        store.update(root)
-        assert root.id is not None
-
-        rebase = store.add("Rebase done", task_type="rebase", based_on=root.id, same_branch=True)
-        rebase.status = "completed"
-        rebase.completed_at = datetime.now(UTC)
-        rebase.merge_status = "unmerged"
-        store.update(rebase)
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "No unresolved task lineages" in result.stdout
-        assert "Rebase done" not in result.stdout
-
-    def test_incomplete_shows_failed_rebase_under_merged_root(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Implement root", task_type="implement")
-        root.status = "completed"
-        root.completed_at = datetime.now(UTC)
-        root.merge_status = "merged"
-        store.update(root)
-        assert root.id is not None
-
-        rebase = store.add("Rebase failed", task_type="rebase", based_on=root.id, same_branch=True)
-        rebase.status = "failed"
-        rebase.completed_at = datetime.now(UTC)
-        rebase.failure_reason = "TEST_FAILURE"
-        store.update(rebase)
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Implement root" in result.stdout
-        assert "Rebase failed" in result.stdout
-
-    def test_incomplete_ignores_completed_no_commit_plan_root(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        plan = store.add("Plan complete", task_type="plan")
-        plan.status = "completed"
-        plan.completed_at = datetime.now(UTC)
-        plan.has_commits = False
-        plan.merge_status = None
-        store.update(plan)
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "No unresolved task lineages" in result.stdout
-        assert "Plan complete" not in result.stdout
-
-    def test_incomplete_days_filter_hides_old_failed_root_with_recent_merged_retry(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Old failed root", task_type="implement")
-        root.status = "failed"
-        root.created_at = datetime.now(UTC) - timedelta(days=30)
-        root.completed_at = datetime.now(UTC) - timedelta(days=30)
-        root.failure_reason = "TEST_FAILURE"
-        store.update(root)
-        assert root.id is not None
-
-        retry = store.add("Recent merged retry", task_type="implement", based_on=root.id)
-        retry.status = "completed"
-        retry.created_at = datetime.now(UTC) - timedelta(hours=12)
-        retry.completed_at = datetime.now(UTC) - timedelta(hours=12)
-        retry.has_commits = True
-        retry.merge_status = "merged"
-        store.update(retry)
-
-        result = run_gza("incomplete", "--days", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "No unresolved task lineages" in result.stdout
-        assert "Old failed root" not in result.stdout
-
-    def test_incomplete_type_filter_hides_failed_root_when_same_type_retry_succeeds(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Failed implement root", task_type="implement")
-        root.status = "failed"
-        root.completed_at = datetime.now(UTC) - timedelta(hours=2)
-        root.failure_reason = "TEST_FAILURE"
-        store.update(root)
-        assert root.id is not None
-
-        improve = store.add("Intervening improve", task_type="improve", based_on=root.id, same_branch=True)
-        improve.status = "completed"
-        improve.completed_at = datetime.now(UTC) - timedelta(hours=1)
-        improve.has_commits = True
-        improve.merge_status = "unmerged"
-        store.update(improve)
-
-        retry = store.add("Successful implement retry", task_type="implement", based_on=root.id)
-        retry.status = "completed"
-        retry.completed_at = datetime.now(UTC)
-        retry.has_commits = True
-        retry.merge_status = "merged"
-        store.update(retry)
-
-        result = run_gza("incomplete", "--type", "implement", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "No unresolved task lineages" in result.stdout
-        assert "Failed implement root" not in result.stdout
-
-    def test_incomplete_last_zero_shows_all_matching_lineages(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        for index in range(3):
-            task = store.add(f"Unresolved lineage {index}", task_type="implement")
-            task.status = "failed"
-            task.completed_at = datetime.now(UTC)
-            task.failure_reason = "TEST_FAILURE"
-            store.update(task)
-
-        result = run_gza("incomplete", "--last", "0", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Unresolved lineage 0" in result.stdout
-        assert "Unresolved lineage 1" in result.stdout
-        assert "Unresolved lineage 2" in result.stdout
-
-    def test_incomplete_last_rejects_negative_values(self, tmp_path: Path):
-        setup_config(tmp_path)
-
-        result = run_gza("incomplete", "--last", "-1", "--project", str(tmp_path))
-
-        assert result.returncode != 0
-        assert "--last must be >= 0 (use 0 for all unresolved lineages)" in result.stderr
-
-    def test_incomplete_days_rejects_negative_values(self, tmp_path: Path):
-        setup_config(tmp_path)
-
-        result = run_gza("incomplete", "--days", "-1", "--project", str(tmp_path))
-
-        assert result.returncode != 0
-        assert "value must be >= 0" in result.stderr
-
-    def test_incomplete_one_line_groups_by_owner_for_multiple_unresolved_branches(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Merged root", task_type="implement")
-        root.status = "completed"
-        root.completed_at = datetime.now(UTC) - timedelta(hours=3)
-        root.has_commits = True
-        root.merge_status = "merged"
-        store.update(root)
-        assert root.id is not None
-
-        retry_failed = store.add("Retry branch failed", task_type="implement", based_on=root.id)
-        retry_failed.status = "failed"
-        retry_failed.completed_at = datetime.now(UTC) - timedelta(hours=2)
-        retry_failed.failure_reason = "TEST_FAILURE"
-        store.update(retry_failed)
-        assert retry_failed.id is not None
-
-        retry_unmerged = store.add("Retry branch unmerged", task_type="implement", based_on=root.id)
-        retry_unmerged.status = "completed"
-        retry_unmerged.completed_at = datetime.now(UTC) - timedelta(hours=1)
-        retry_unmerged.has_commits = True
-        retry_unmerged.merge_status = "unmerged"
-        store.update(retry_unmerged)
-        assert retry_unmerged.id is not None
-
-        result = run_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert f"{retry_failed.id}:" in result.stdout
-        assert f"{retry_unmerged.id}:" in result.stdout
-        assert f"{root.id}:" not in result.stdout
-
-    def test_incomplete_json_next_action_owner_id_matches_owner_row(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Merged root", task_type="implement")
-        root.status = "completed"
-        root.completed_at = datetime.now(UTC) - timedelta(hours=3)
-        root.has_commits = True
-        root.merge_status = "merged"
-        store.update(root)
-        assert root.id is not None
-
-        retry_failed = store.add("Retry branch failed", task_type="implement", based_on=root.id)
-        retry_failed.status = "failed"
-        retry_failed.completed_at = datetime.now(UTC) - timedelta(hours=2)
-        retry_failed.failure_reason = "TEST_FAILURE"
-        store.update(retry_failed)
-        assert retry_failed.id is not None
-
-        retry_unmerged = store.add("Retry branch unmerged", task_type="implement", based_on=root.id)
-        retry_unmerged.status = "completed"
-        retry_unmerged.completed_at = datetime.now(UTC) - timedelta(hours=1)
-        retry_unmerged.has_commits = True
-        retry_unmerged.merge_status = "unmerged"
-        store.update(retry_unmerged)
-        assert retry_unmerged.id is not None
-
-        result = run_gza("incomplete", "--json", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        payload = json.loads(result.stdout)
-        ids = {row["id"] for row in payload}
-        assert retry_failed.id in ids
-        assert retry_unmerged.id in ids
-        assert root.id not in ids
-        for row in payload:
-            assert row["next_action_owner_id"] == row["id"]
-            assert row["id"] in row["unresolved_ids"]
-
-    def test_incomplete_last_one_uses_owner_row_ranking_after_owner_rollup(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root_a = store.add("Root A owner old", task_type="implement")
-        root_a.status = "completed"
-        root_a.completed_at = datetime.now(UTC) - timedelta(days=30)
-        root_a.has_commits = True
-        root_a.merge_status = "merged"
-        store.update(root_a)
-        assert root_a.id is not None
-
-        recent_failed_descendant = store.add(
-            "Recent unresolved descendant on A",
-            task_type="improve",
-            based_on=root_a.id,
-            same_branch=True,
-        )
-        recent_failed_descendant.status = "failed"
-        recent_failed_descendant.completed_at = datetime.now(UTC) - timedelta(hours=1)
-        recent_failed_descendant.failure_reason = "TEST_FAILURE"
-        store.update(recent_failed_descendant)
-
-        root_b = store.add("Root B owner newer", task_type="implement")
-        root_b.status = "failed"
-        root_b.completed_at = datetime.now(UTC) - timedelta(hours=2)
-        root_b.failure_reason = "TEST_FAILURE"
-        store.update(root_b)
-        assert root_b.id is not None
-
-        result = run_gza("incomplete", "--last", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert f"{root_b.id}:" in result.stdout
-        assert f"{root_a.id}:" not in result.stdout
+        assert result.returncode == 2
+        assert result.stdout == ""
+        assert "invalid choice" not in result.stderr
+        assert "unrecognized arguments" not in result.stderr
+        assert "Ignoring legacy arguments: --verbose" in result.stderr
+        assert "deprecated and no longer supported" in result.stderr
+        assert "uv run gza unmerged" in result.stderr

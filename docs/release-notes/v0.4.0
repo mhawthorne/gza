@@ -45,6 +45,7 @@ This release brings significant orchestration improvements, expanded skill ecosy
 ## Major Improvements
 
 ### Observability & User Experience
+- **Deprecate `gza incomplete` as a migration stub**: The command is no longer advertised in help/docs, now exits non-zero with a replacement map to `gza unmerged`, `gza advance --unimplemented`, `gza history --status failed`, `gza next --all`, and `/gza-summary`
 - **Colorized terminal output**: Rich formatting for `gza next`, `gza show`, `gza history`, and logs with colored status indicators
 - **Live step count updates**: Real-time step progress in `gza ps` polling
 - **Improved `gza ps` display**: Better task visibility, worker tracking, and filtering

@@ -1026,6 +1026,20 @@ gza history [options]
 | `--preset NAME` | Projection preset override for JSON output only (requires `--json`) |
 | `--json` | Output JSON rows from the unified query API |
 
+#### Replacing `gza incomplete`
+
+`gza incomplete` is deprecated and removed from the documented CLI surface. Use a dedicated command for the specific domain you want:
+
+| Old need | Use now |
+|--------|-------------|
+| Unmerged code work | `uv run gza unmerged` |
+| Completed `plan`/`explore` work without implementation | `uv run gza advance --unimplemented` (temporary spelling until `uv run gza unimplemented` lands) |
+| Failed-task recovery decisions | Start with factual failed-task history from `uv run gza history --status failed`; use the failed-task recovery workflow, and optionally `uv run gza watch --restart-failed --dry-run` when you need the recovery decision surface |
+| Pending queue state, including dropped-dependency blockers | `uv run gza next` or `uv run gza next --all` (blocked rows include blocker status, so dropped dependencies are called out explicitly) |
+| Synthesized "what should I do next?" triage guidance | `/gza-summary` |
+
+`uv run gza history --incomplete` remains available as a factual unresolved-history filter. It is not the successor to the old mixed-bucket `gza incomplete` workflow.
+
 ### search
 
 Search task prompts by substring.
@@ -1049,25 +1063,6 @@ gza search <term> [options]
 | `--root CSV` | Restrict by lineage root IDs (comma-separated) |
 | `--fields CSV` | Projection fields override for JSON output only (comma-separated; requires `--json`) |
 | `--preset NAME` | Projection preset override for JSON output only (requires `--json`) |
-| `--json` | Output JSON rows from the unified query API |
-
-### incomplete
-
-Show unresolved task lineages that still need attention. Default output is one line per unresolved lineage owner.
-
-```bash
-gza incomplete [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--last N`, `-n N` | Show last N unresolved lineages (default: 5; use `0` for all) |
-| `--type TYPE` | Filter tasks by task type before lineage rollup: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
-| `--days N` | Show only unresolved lineages with activity in the last N days |
-| `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `effective`) |
-| `--tree` | Show tree output instead of one-line summaries |
-| `--blocked-by-dropped` | Show pending tasks blocked by dropped dependencies (tagged as `[blocked-by-dropped <task_id>]`) |
-| `--verbose` | Include owner metadata under one-line output |
 | `--json` | Output JSON rows from the unified query API |
 
 ### checkout

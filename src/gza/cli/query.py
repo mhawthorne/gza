@@ -91,10 +91,63 @@ _QueryDateField = Literal["created", "completed", "effective"]
 _PresentationMode = Literal["flat", "grouped", "lineage", "tree", "one_line", "json"]
 _stderr_console = Console(highlight=False, stderr=True)
 
+_INCOMPLETE_DEPRECATION_LINES: tuple[str, ...] = (
+    "Error: `gza incomplete` is deprecated and no longer supported.",
+    "",
+    "Use these dedicated surfaces instead:",
+    "  `uv run gza unmerged` for unmerged code work",
+    "  `uv run gza advance --unimplemented` for completed plan/explore work without implementation",
+    "  `uv run gza history --status failed` for factual failed-task history",
+    "  `uv run gza watch --restart-failed --dry-run` for failed-task recovery decisions",
+    "  `uv run gza next` / `uv run gza next --all` for pending and blocked queue state",
+    "  `/gza-summary` for synthesized operator triage and next-step guidance",
+    "",
+    "For dropped-dependency blockers, use `uv run gza next --all`.",
+    "After `gza unimplemented` ships, it will replace the temporary `advance --unimplemented` spelling.",
+)
+
 
 def _parse_cli_date(value: str | None) -> _dt.date | None:
     parsed = _parse_iso(value) if value else None
     return parsed.date() if parsed else None
+
+
+def _collect_incomplete_legacy_args(args: argparse.Namespace) -> tuple[str, ...]:
+    """Render accepted legacy `incomplete` flags in a stable human-readable order."""
+    legacy_args: list[str] = []
+    if getattr(args, "legacy_help", False):
+        legacy_args.append("--help")
+    if getattr(args, "json", False):
+        legacy_args.append("--json")
+    if getattr(args, "verbose", False):
+        legacy_args.append("--verbose")
+    if getattr(args, "blocked_by_dropped", False):
+        legacy_args.append("--blocked-by-dropped")
+    if getattr(args, "last", None) is not None:
+        legacy_args.extend(["--last", str(args.last)])
+    if getattr(args, "tree", False):
+        legacy_args.append("--tree")
+    if getattr(args, "type", None):
+        legacy_args.extend(["--type", str(args.type)])
+    if getattr(args, "days", None) is not None:
+        legacy_args.extend(["--days", str(args.days)])
+    if getattr(args, "date_field", None):
+        legacy_args.extend(["--date-field", str(args.date_field)])
+    return tuple(legacy_args)
+
+
+def cmd_incomplete_deprecated(args: argparse.Namespace) -> int:
+    """Print migration guidance for the deprecated `gza incomplete` entrypoint."""
+    legacy_args = _collect_incomplete_legacy_args(args)
+    if legacy_args:
+        _stderr_console.print(
+            rich_escape(
+                "Ignoring legacy arguments: " + " ".join(shlex.quote(arg) for arg in legacy_args)
+            )
+        )
+    for line in _INCOMPLETE_DEPRECATION_LINES:
+        _stderr_console.print(line)
+    return 2
 
 
 def _normalize_task_timestamp(value: datetime | None) -> datetime:
@@ -104,6 +157,20 @@ def _normalize_task_timestamp(value: datetime | None) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _format_blocked_dependency_label(
+    blocking_id: str | None,
+    blocking_status: str | None,
+) -> str:
+    """Render a truthful blocked-dependency label for `gza next --all` rows."""
+    if blocking_status and blocking_id:
+        return f"(blocked-by-{blocking_status} {blocking_id})"
+    if blocking_status:
+        return f"(blocked-by-{blocking_status})"
+    if blocking_id:
+        return f"(blocked by {blocking_id})"
+    return "(blocked by dependency)"
 
 
 def _reconcile_unmerged_tasks(store: SqliteTaskStore, git: Git, default_branch: str) -> tuple[int, int]:
@@ -197,11 +264,15 @@ def cmd_next(args: argparse.Namespace) -> int:
         tag_filters=tag_filters,
         any_tag=any_tag,
         sort=_TaskSortSpec(field="pickup_order", descending=False),
-        projection=_TaskProjectionSpec(fields=("blocking_id",)),
+        projection=_TaskProjectionSpec(fields=("blocking_id", "blocking_status")),
     )
     blocked_rows = service.run(blocked_query).rows
-    blocked: list[tuple[DbTask, str | None]] = [
-        (row.task, cast(str | None, row.values.get("blocking_id")))
+    blocked: list[tuple[DbTask, str | None, str | None]] = [
+        (
+            row.task,
+            cast(str | None, row.values.get("blocking_id")),
+            cast(str | None, row.values.get("blocking_status")),
+        )
         for row in blocked_rows
         if isinstance(row, _TaskRow)
     ]
@@ -234,7 +305,12 @@ def cmd_next(args: argparse.Namespace) -> int:
     fixed_cols = idx_width + 2 + id_width + 2 + type_width + 2
     prompt_width = max(20, terminal_width - fixed_cols)
 
-    def _print_task_row(i: int, task: DbTask, blocking_id: str | None = None) -> None:
+    def _print_task_row(
+        i: int,
+        task: DbTask,
+        blocking_id: str | None = None,
+        blocking_status: str | None = None,
+    ) -> None:
         idx_str = str(i)
         id_str = f"{task.id}"
         type_str = task.task_type or "implement"
@@ -242,11 +318,13 @@ def cmd_next(args: argparse.Namespace) -> int:
         type_visible = f"[{type_str}]"
         type_padded = f"{type_visible:<{type_width}}"
         first_line = task.prompt.split('\n')[0].strip()
-        blocked_label = (
-            f" [{c['blocked']}](blocked by {blocking_id})[/{c['blocked']}]"
-            if blocking_id else ""
+        blocked_text = (
+            _format_blocked_dependency_label(blocking_id, blocking_status)
+            if blocking_id or blocking_status
+            else ""
         )
-        blocked_raw_len = len(f" (blocked by {blocking_id})") if blocking_id else 0
+        blocked_label = f" [{c['blocked']}]{blocked_text}[/{c['blocked']}]" if blocked_text else ""
+        blocked_raw_len = len(f" {blocked_text}") if blocked_text else 0
         avail = max(10, prompt_width - blocked_raw_len)
         prompt_display = truncate(first_line, avail)
         console.print(
@@ -272,8 +350,8 @@ def cmd_next(args: argparse.Namespace) -> int:
     if show_all and blocked:
         if runnable:
             console.print()
-        for i, (task, blocking_id) in enumerate(blocked, len(runnable) + 1):
-            _print_task_row(i, task, blocking_id)
+        for i, (task, blocking_id, blocking_status) in enumerate(blocked, len(runnable) + 1):
+            _print_task_row(i, task, blocking_id, blocking_status)
 
     # Show blocked count at the bottom (only if not showing all)
     if not show_all and blocked:

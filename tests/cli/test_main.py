@@ -1,6 +1,7 @@
 """Tests for CLI parser and help output."""
 
 
+import importlib
 import subprocess
 import sys
 from pathlib import Path
@@ -79,19 +80,58 @@ class TestHelpOutput:
         assert "from each resolved root" in result.stdout
         assert "Expand lineage N levels for each matching task" not in result.stdout
 
-    def test_incomplete_help_mentions_unresolved_lineages(self, tmp_path):
-        """incomplete --help should frame command as unresolved lineage attention view."""
+    def test_top_level_help_hides_incomplete_command(self, tmp_path):
+        """Top-level help should stop advertising `gza incomplete`."""
+        setup_config(tmp_path)
+
+        result = run_gza("--help", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "incomplete" not in result.stdout
+
+    def test_incomplete_command_returns_deprecation_guidance(self, tmp_path):
+        """Legacy `gza incomplete` should print directed replacements and fail closed."""
         setup_config(tmp_path)
 
         result = run_gza("incomplete", "--help", "--project", str(tmp_path))
 
-        assert result.returncode == 0
-        normalized_output = " ".join(result.stdout.split())
-        assert "filter tasks by task_type before lineage rollup" in normalized_output.lower()
-        assert "--blocked-by-dropped" in result.stdout
-        assert "--status" not in result.stdout
-        assert "--incomplete" not in result.stdout
-        assert "--lineage-depth" not in result.stdout
+        assert result.returncode == 2
+        output = result.stdout + result.stderr
+        assert "invalid choice" not in output
+        assert "deprecated and no longer supported" in output
+        assert "uv run gza unmerged" in output
+        assert "uv run gza advance --unimplemented" in output
+        assert "uv run gza history --status failed" in output
+        assert "factual failed-task history" in output
+        assert "uv run gza watch --restart-failed --dry-run" in output
+        assert "uv run gza next --all" in output
+        assert "/gza-summary" in output
+
+    def test_incomplete_command_dispatches_through_hidden_parser(self, tmp_path, monkeypatch):
+        """`gza incomplete` should dispatch through parsed `args.command`, not a raw argv trapdoor."""
+        setup_config(tmp_path)
+
+        cli_main_module = importlib.import_module("gza.cli.main")
+
+        captured = {}
+
+        def fake_cmd(args):
+            captured["command"] = args.command
+            captured["legacy_help"] = args.legacy_help
+            captured["project_dir"] = args.project_dir
+            return 2
+
+        monkeypatch.setattr(cli_main_module, "cmd_incomplete_deprecated", fake_cmd)
+
+        with patch.object(sys, "argv", ["gza", "incomplete", "--help", "--project", str(tmp_path)]):
+            result = cli_main_module.main()
+
+        assert result == 2
+        assert captured == {
+            "command": "incomplete",
+            "legacy_help": True,
+            "project_dir": tmp_path.resolve(),
+        }
 
     def test_advance_help_shows_unimplemented_and_hides_plans_alias(self):
         """advance --help should show --unimplemented/--force and keep --plans hidden."""
