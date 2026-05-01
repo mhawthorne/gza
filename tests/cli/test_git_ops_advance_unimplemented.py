@@ -178,6 +178,38 @@ class TestAdvanceUnimplementedCommand:
         assert str(explore.id) not in result.stdout
         assert str(plan.id) not in result.stdout
 
+    def test_advance_unimplemented_excludes_lineage_with_depends_on_linked_descendant_implement(self, tmp_path: Path):
+        """advance --unimplemented should drop a lineage when a descendant source is implemented via depends_on."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        explore = store.add("Explore cache invalidation options", task_type="explore")
+        _set_task_times(
+            store,
+            explore,
+            created_at=datetime(2026, 3, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 3, 2, tzinfo=UTC),
+            status="completed",
+        )
+
+        plan = store.add("Plan cache invalidation rollout", task_type="plan", based_on=explore.id)
+        _set_task_times(
+            store,
+            plan,
+            created_at=datetime(2026, 3, 3, tzinfo=UTC),
+            completed_at=datetime(2026, 3, 4, tzinfo=UTC),
+            status="completed",
+        )
+
+        store.add("Implement cache invalidation rollout", task_type="implement", depends_on=plan.id)
+
+        result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No plan/explore lineages without implementation tasks." in result.stdout
+        assert str(explore.id) not in result.stdout
+        assert str(plan.id) not in result.stdout
+
     def test_advance_unimplemented_prefers_newest_explore_descendant_deterministically(self, tmp_path: Path):
         """advance --unimplemented should choose the newest explore descendant when no implement exists."""
         setup_config(tmp_path)
@@ -314,6 +346,43 @@ class TestAdvanceUnimplementedCommand:
         assert len(implement_tasks) == 2
         assert {task.depends_on for task in implement_tasks} == {first_plan.id, second_plan.id}
         assert all(task.based_on is None for task in implement_tasks)
+
+    def test_advance_unimplemented_create_rerun_excludes_ancestor_lineage(self, tmp_path: Path):
+        """advance --unimplemented rerun should suppress source ancestors after --create queues a depends_on implement."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        explore = store.add("Explore queue visibility options", task_type="explore")
+        _set_task_times(
+            store,
+            explore,
+            created_at=datetime(2026, 4, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 2, tzinfo=UTC),
+            status="completed",
+        )
+
+        plan = store.add("Plan queue visibility rollout", task_type="plan", based_on=explore.id)
+        _set_task_times(
+            store,
+            plan,
+            created_at=datetime(2026, 4, 3, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 4, tzinfo=UTC),
+            status="completed",
+        )
+
+        create_result = run_gza("advance", "--unimplemented", "--create", "--project", str(tmp_path))
+
+        assert create_result.returncode == 0
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+        assert len(implement_tasks) == 1
+        assert implement_tasks[0].depends_on == plan.id
+
+        rerun_result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
+
+        assert rerun_result.returncode == 0
+        assert "No plan/explore lineages without implementation tasks." in rerun_result.stdout
+        assert str(explore.id) not in rerun_result.stdout
+        assert str(plan.id) not in rerun_result.stdout
 
     def test_advance_unimplemented_guidance_distinguishes_completed_plan_vs_explore(self, tmp_path: Path):
         """advance --unimplemented should only suggest `gza implement` for completed plan rows."""
