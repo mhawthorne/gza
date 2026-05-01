@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import gza.colors as _colors
@@ -20,7 +21,7 @@ from ..console import (
     prompt_available_width,
     shorten_prompt,
 )
-from ..db import SqliteTaskStore, Task as DbTask
+from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..git import (
     Git,
     GitError,
@@ -1316,6 +1317,95 @@ def _unimplemented_implement_prompt(task: DbTask) -> str:
     return f"Implement findings from task {task.id}: {slug}" if slug else f"Implement findings from task {task.id}"
 
 
+def _normalize_task_created_at(value: datetime | None) -> datetime:
+    if not isinstance(value, datetime):
+        return datetime.min
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _unimplemented_target_sort_key(task: DbTask) -> tuple[datetime, int]:
+    return (_normalize_task_created_at(task.created_at), task_id_numeric_key(task.id))
+
+
+def _collect_unimplemented_lineage_component(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    task_cache: dict[str, DbTask],
+    children_cache: dict[str, list[DbTask]],
+) -> list[DbTask]:
+    """Collect the based_on-connected lineage component for an unimplemented source task."""
+    assert task.id is not None
+
+    component: list[DbTask] = []
+    queue: list[DbTask] = [task]
+    seen_ids: set[str] = set()
+
+    while queue:
+        current = queue.pop(0)
+        assert current.id is not None
+        if current.id in seen_ids:
+            continue
+        seen_ids.add(current.id)
+        component.append(current)
+        task_cache[current.id] = current
+
+        parent_id = current.based_on
+        if parent_id:
+            parent = task_cache.get(parent_id)
+            if parent is None:
+                parent = store.get(parent_id)
+                if parent is not None and parent.id is not None:
+                    task_cache[parent.id] = parent
+            if parent is not None and parent.id is not None and parent.id not in seen_ids:
+                queue.append(parent)
+
+        children = children_cache.get(current.id)
+        if children is None:
+            children = store.get_based_on_children(current.id)
+            children_cache[current.id] = children
+            for child in children:
+                if child.id is not None:
+                    task_cache[child.id] = child
+        for child in children:
+            if child.id is not None and child.id not in seen_ids:
+                queue.append(child)
+
+    return component
+
+
+def _resolve_unimplemented_source_target(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    impl_based_on_ids: set[str],
+    task_types: tuple[str, ...],
+    task_cache: dict[str, DbTask],
+    children_cache: dict[str, list[DbTask]],
+) -> tuple[DbTask | None, set[str]]:
+    """Resolve the preferred plan/explore task to show for one source lineage."""
+    component = _collect_unimplemented_lineage_component(
+        store,
+        task,
+        task_cache=task_cache,
+        children_cache=children_cache,
+    )
+    component_ids = {candidate.id for candidate in component if candidate.id is not None}
+    source_tasks = [candidate for candidate in component if candidate.task_type in task_types]
+    source_ids = {candidate.id for candidate in source_tasks if candidate.id is not None}
+
+    if any(candidate.task_type == "implement" for candidate in component):
+        return None, component_ids
+    if source_ids & impl_based_on_ids:
+        return None, component_ids
+    if not source_tasks:
+        return None, component_ids
+
+    return max(source_tasks, key=_unimplemented_target_sort_key), component_ids
+
+
 def _cmd_advance_unimplemented(
     config: "Config",
     store: SqliteTaskStore,
@@ -1323,28 +1413,47 @@ def _cmd_advance_unimplemented(
     create: bool = False,
     task_types: tuple[str, ...] = ("plan", "explore"),
 ) -> int:
-    """List completed task types that have no implementation task.
+    """List plan/explore lineages that do not yet have an implementation task.
 
-    With --create, creates queued implement tasks for each such task.
+    With --create, creates queued implement tasks for each listed plan/explore task.
     """
     all_completed: list[DbTask] = []
     for task_type in task_types:
         all_completed.extend(store.get_history(limit=None, status="completed", task_type=task_type))
 
-    # Find tasks that have no implement task pointing at them (via based_on).
-    # Use a targeted query instead of a full table scan to avoid loading every
-    # task (including output_content blobs) into memory.
+    # Find source lineages that have no implement task pointing at any plan/explore
+    # task in the based_on-connected component. Prefer the newest plan/explore
+    # descendant so the listing surfaces the truer implementation target without
+    # ever showing implement tasks directly.
     impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
+    task_cache = {task.id: task for task in all_completed if task.id is not None}
+    children_cache: dict[str, list[DbTask]] = {}
+    covered_ids: set[str] = set()
+    pending_tasks: list[DbTask] = []
 
-    pending_tasks = [task for task in all_completed if task.id not in impl_based_on_ids]
+    for task in all_completed:
+        assert task.id is not None
+        if task.id in covered_ids:
+            continue
+        preferred_task, component_ids = _resolve_unimplemented_source_target(
+            store,
+            task,
+            impl_based_on_ids=impl_based_on_ids,
+            task_types=task_types,
+            task_cache=task_cache,
+            children_cache=children_cache,
+        )
+        covered_ids.update(component_ids)
+        if preferred_task is not None:
+            pending_tasks.append(preferred_task)
 
     if not pending_tasks:
         task_label = "/".join(task_types)
-        print(f"No completed {task_label} tasks without implementation tasks.")
+        print(f"No {task_label} lineages without implementation tasks.")
         return 0
 
     task_label = "/".join(task_types)
-    print(f"Completed {task_label} tasks without implementation ({len(pending_tasks)}):")
+    print(f"{task_label.capitalize()} lineages without implementation ({len(pending_tasks)}):")
     print()
     for task in pending_tasks:
         assert task.id is not None
