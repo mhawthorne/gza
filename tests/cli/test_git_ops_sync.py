@@ -50,7 +50,14 @@ def test_sync_explicit_task_id_expands_to_branch_cohort(tmp_path, capsys):
         patch(
             "gza.cli.git_ops.sync_branch_cohorts",
             return_value=(
-                [BranchSyncResult(branch="feature/shared", task_ids=(parent.id, child.id), merge_status="unmerged")],
+                [
+                    BranchSyncResult(
+                        branch="feature/shared",
+                        task_ids=(parent.id, child.id),
+                        merge_status="unmerged",
+                        reconciled=True,
+                    )
+                ],
                 False,
             ),
         ) as sync_call,
@@ -87,3 +94,44 @@ def test_sync_missing_explicit_task_id_returns_error(tmp_path, capsys):
     assert rc == 1
     output = capsys.readouterr().out
     assert "not found" in output
+    assert "Synced 0 branch(es), skipped 0, errors 1." in output
+
+
+def test_sync_mixed_valid_and_missing_explicit_task_ids_report_accurate_totals(tmp_path, capsys):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_branch_task(store, "Valid task", "feature/valid")
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_ids=[task.id, "testproject-999"],
+        dry_run=False,
+        git_only=True,
+        pr_only=False,
+        no_fetch=False,
+    )
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        patch("gza.cli.git_ops.Git", return_value=Mock()),
+        patch(
+            "gza.cli.git_ops.sync_branch_cohorts",
+            return_value=(
+                [
+                    BranchSyncResult(
+                        branch="feature/valid",
+                        task_ids=(task.id,),
+                        merge_status="unmerged",
+                        reconciled=True,
+                    )
+                ],
+                False,
+            ),
+        ),
+    ):
+        rc = cmd_sync(args)
+
+    assert rc == 1
+    output = capsys.readouterr().out
+    assert "Task testproject-999 not found" in output
+    assert "Synced 1 branch(es), skipped 0, errors 1." in output

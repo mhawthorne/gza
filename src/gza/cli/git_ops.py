@@ -1223,6 +1223,9 @@ def cmd_pr(args: argparse.Namespace) -> int:
         print("Install: https://cli.github.com/")
         print("Auth: gh auth login")
         return 1
+    if result.status == "lookup_failed":
+        print(f"Error looking up PR:\n{result.error}")
+        return 1
     if result.status == "push_failed":
         print(f"Error pushing branch: {result.error}")
         return 1
@@ -1282,7 +1285,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
             print(f"{task_label}: skipped ({result.skipped_reason})")
             continue
 
-        synced += 1
+        if result.reconciled:
+            synced += 1
         parts = [result.branch]
         if result.merge_status is not None:
             parts.append(f"merge={result.merge_status}")

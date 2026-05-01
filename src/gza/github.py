@@ -10,6 +10,11 @@ class GitHubError(Exception):
     pass
 
 
+class GitHubLookupError(GitHubError):
+    """GitHub PR lookup failed for reasons other than explicit not-found."""
+    pass
+
+
 @dataclass
 class PullRequest:
     """A GitHub pull request."""
@@ -29,6 +34,12 @@ class PullRequestDetails:
 
 class GitHub:
     """GitHub operations wrapper using gh CLI."""
+
+    _PR_NOT_FOUND_MARKERS = (
+        "could not resolve to a pull request",
+        "no pull requests found",
+        "pull request not found",
+    )
 
     def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         """Run a gh command."""
@@ -121,6 +132,27 @@ class GitHub:
                 return None
         return None
 
+    def _is_pr_not_found(self, stderr: str) -> bool:
+        """Return True when gh explicitly reported that a PR does not exist."""
+        message = stderr.lower()
+        return any(marker in message for marker in self._PR_NOT_FOUND_MARKERS)
+
+    def _parse_pr_details(self, payload: str, *, command: str) -> PullRequestDetails:
+        """Parse detailed PR metadata from a gh JSON payload."""
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise GitHubLookupError(f"{command} returned invalid JSON: {exc}") from exc
+        try:
+            return PullRequestDetails(
+                url=str(data["url"]),
+                number=int(data["number"]),
+                state=str(data["state"]).lower(),
+                base_ref_name=str(data["baseRefName"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubLookupError(f"{command} returned malformed PR details") from exc
+
     def get_pr_details(self, pr_ref: str | int) -> PullRequestDetails | None:
         """Return detailed PR metadata for a PR number/ref."""
         result = self._run(
@@ -131,18 +163,14 @@ class GitHub:
             "number,url,state,baseRefName",
             check=False,
         )
-        if result.returncode != 0 or not result.stdout.strip():
-            return None
-        data = json.loads(result.stdout)
-        try:
-            return PullRequestDetails(
-                url=str(data["url"]),
-                number=int(data["number"]),
-                state=str(data["state"]).lower(),
-                base_ref_name=str(data["baseRefName"]),
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
+        command = f"gh pr view {pr_ref}"
+        if result.returncode != 0:
+            if self._is_pr_not_found(result.stderr):
+                return None
+            raise GitHubLookupError(f"{command} failed: {result.stderr.strip()}")
+        if not result.stdout.strip():
+            raise GitHubLookupError(f"{command} returned empty output")
+        return self._parse_pr_details(result.stdout, command=command)
 
     def discover_pr_by_branch(self, branch: str) -> PullRequestDetails | None:
         """Return the most recent PR associated with a branch, if any."""
@@ -159,21 +187,23 @@ class GitHub:
             "number,url,state,baseRefName",
             check=False,
         )
-        if result.returncode != 0 or not result.stdout.strip():
-            return None
-        data = json.loads(result.stdout)
+        command = f"gh pr list --head {branch}"
+        if result.returncode != 0:
+            raise GitHubLookupError(f"{command} failed: {result.stderr.strip()}")
+        if not result.stdout.strip():
+            raise GitHubLookupError(f"{command} returned empty output")
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise GitHubLookupError(f"{command} returned invalid JSON: {exc}") from exc
         if not data:
             return None
+        if not isinstance(data, list):
+            raise GitHubLookupError(f"{command} returned malformed PR list")
         item = data[0]
-        try:
-            return PullRequestDetails(
-                url=str(item["url"]),
-                number=int(item["number"]),
-                state=str(item["state"]).lower(),
-                base_ref_name=str(item["baseRefName"]),
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
+        if not isinstance(item, dict):
+            raise GitHubLookupError(f"{command} returned malformed PR list")
+        return self._parse_pr_details(json.dumps(item), command=command)
 
     def get_pr_url(self, pr_ref: str | int) -> str | None:
         """Get PR URL for a PR number/ref, or None if no live PR exists."""
