@@ -7,5 +7,5 @@ uv run ruff check src/gza/
 uv run ty check src/gza/
 uv run mypy src/gza/
 uv run python -m checks
-uv run pytest tests/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -xv -o faulthandler_timeout=5
+uv run pytest tests/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x -o faulthandler_timeout=2
 uv run pytest tests_integration -xv
