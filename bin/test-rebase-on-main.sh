@@ -35,6 +35,16 @@ assert_file_contains() {
     fi
 }
 
+assert_file_not_contains() {
+    local file="$1"
+    local unexpected="$2"
+    local message="$3"
+
+    if grep -Fq -- "$unexpected" "$file"; then
+        fail "$message"
+    fi
+}
+
 create_mock_tools() {
     local case_dir="$1"
     local mock_bin="$case_dir/mock-bin"
@@ -186,6 +196,7 @@ count=$((count + 1))
 printf '%s' "$count" > "$STATE_DIR/claude_count"
 printf '%s\n' "$*" > "$STATE_DIR/claude_args_${count}.txt"
 cat > "$STATE_DIR/claude_prompt_${count}.txt"
+scenario=$(cat "$STATE_DIR/scenario")
 
 case " $* " in
     *" -p - "*) ;;
@@ -203,6 +214,9 @@ case " $* " in
 esac
 
 rm -f "$STATE_DIR/conflicts"
+if [[ "$scenario" == "agent_abort" ]]; then
+    rm -rf "$STATE_DIR/rebase-merge" "$STATE_DIR/rebase-apply"
+fi
 EOF
 
     cat <<'EOF' > "$mock_bin/codex"
@@ -215,11 +229,12 @@ count=$((count + 1))
 printf '%s' "$count" > "$STATE_DIR/codex_count"
 printf '%s\n' "$*" > "$STATE_DIR/codex_args_${count}.txt"
 cat > "$STATE_DIR/codex_prompt_${count}.txt"
+scenario=$(cat "$STATE_DIR/scenario")
 
 case " $* " in
-    *" exec "*) ;;
+    *" exec --json "*) ;;
     *)
-        echo "codex must run via codex exec" >&2
+        echo "codex must run via codex exec --json" >&2
         exit 1
         ;;
 esac
@@ -232,7 +247,26 @@ case " $* " in
         ;;
 esac
 
+case " $* " in
+    *" --skip-git-repo-check "*) ;;
+    *)
+        echo "codex must skip git repo checks in this workflow" >&2
+        exit 1
+        ;;
+esac
+
+case " $* " in
+    *" -C $PWD "*) ;;
+    *)
+        echo "codex must set the working directory explicitly" >&2
+        exit 1
+        ;;
+esac
+
 rm -f "$STATE_DIR/conflicts"
+if [[ "$scenario" == "agent_abort" ]]; then
+    rm -rf "$STATE_DIR/rebase-merge" "$STATE_DIR/rebase-apply"
+fi
 EOF
 
     chmod +x "$mock_bin/git" "$mock_bin/claude" "$mock_bin/codex"
@@ -263,17 +297,25 @@ run_script_case() {
     initialize_state "$case_dir/state" "$scenario"
     create_mock_tools "$case_dir"
 
+    local status
+
+    set +e
     if [[ -n "$agent" ]]; then
         printf '\nY\n' | env \
             PATH="$case_dir/mock-bin:$PATH" \
             FAKE_GIT_STATE_DIR="$case_dir/state" \
-            bash "$SCRIPT_UNDER_TEST" "$agent" > "$output_file" 2>&1
+            bash -c "cd '$REPO_ROOT' && bash '$SCRIPT_UNDER_TEST' '$agent'" > "$output_file" 2>&1
+        status=$?
     else
         printf '\nY\n' | env \
             PATH="$case_dir/mock-bin:$PATH" \
             FAKE_GIT_STATE_DIR="$case_dir/state" \
-            bash "$SCRIPT_UNDER_TEST" > "$output_file" 2>&1
+            bash -c "cd '$REPO_ROOT' && bash '$SCRIPT_UNDER_TEST'" > "$output_file" 2>&1
+        status=$?
     fi
+    set -e
+
+    printf '%s' "$status" > "$case_dir/exit_status"
 
     printf '%s\n' "$case_dir"
 }
@@ -282,6 +324,7 @@ test_no_conflict_path() {
     local case_dir
     case_dir=$(run_script_case "no_conflict" "")
 
+    assert_eq "$(cat "$case_dir/exit_status")" "0" "no-conflict path should succeed"
     assert_eq "$(cat "$case_dir/state/push_count")" "1" "no-conflict path should offer and run push"
     assert_eq "$(cat "$case_dir/state/claude_count")" "0" "no-conflict path should not invoke claude"
     assert_file_contains "$case_dir/output.txt" "Rebase completed successfully!" "no-conflict path should report success"
@@ -291,6 +334,7 @@ test_conflict_loop_with_claude() {
     local case_dir
     case_dir=$(run_script_case "conflict_loop" "claude")
 
+    assert_eq "$(cat "$case_dir/exit_status")" "0" "claude conflict flow should succeed"
     assert_eq "$(cat "$case_dir/state/claude_count")" "2" "claude should resolve each conflict round"
     assert_eq "$(cat "$case_dir/state/push_count")" "1" "claude conflict flow should return to scripted push"
     assert_eq "$(cat "$case_dir/state/continue_index")" "2" "script should own rebase --continue across rounds"
@@ -299,19 +343,36 @@ test_conflict_loop_with_claude() {
     assert_file_contains "$case_dir/output.txt" "Continuing rebase..." "conflict flow should report scripted continue step"
 }
 
-test_conflict_loop_with_codex() {
+test_conflict_loop_with_codex_uses_supported_headless_exec_flags() {
     local case_dir
     case_dir=$(run_script_case "conflict_loop" "codex")
 
+    assert_eq "$(cat "$case_dir/exit_status")" "0" "codex conflict flow should succeed"
     assert_eq "$(cat "$case_dir/state/codex_count")" "2" "codex should resolve each conflict round"
     assert_eq "$(cat "$case_dir/state/push_count")" "1" "codex conflict flow should return to scripted push"
     assert_eq "$(cat "$case_dir/state/continue_index")" "2" "script should continue rebases after codex exits"
     assert_file_contains "$case_dir/state/codex_prompt_1.txt" "Do not run git push." "codex prompt should keep push in the shell script"
-    assert_file_contains "$case_dir/state/codex_args_1.txt" "exec" "codex should run in one-shot exec mode"
+    assert_file_contains "$case_dir/state/codex_args_1.txt" "exec --json" "codex should run in supported headless exec --json mode"
+    assert_file_contains "$case_dir/state/codex_args_1.txt" "--dangerously-bypass-approvals-and-sandbox" "codex should bypass approvals in headless mode"
+    assert_file_contains "$case_dir/state/codex_args_1.txt" "--skip-git-repo-check" "codex should skip repo checks in detached contexts"
+    assert_file_contains "$case_dir/state/codex_args_1.txt" "-C $REPO_ROOT" "codex should set the repo root as its working directory"
+    assert_file_not_contains "$case_dir/state/codex_args_1.txt" "--dangerously-work" "codex should not use the unsupported dangerously-work flag"
+}
+
+test_agent_abort_does_not_report_rebase_success() {
+    local case_dir
+    case_dir=$(run_script_case "agent_abort" "claude")
+
+    assert_eq "$(cat "$case_dir/exit_status")" "1" "agent-abort flow should fail"
+    assert_eq "$(cat "$case_dir/state/push_count")" "0" "agent-abort flow should not push"
+    assert_file_contains "$case_dir/output.txt" "did not complete it" "agent-abort flow should report that the script did not complete the rebase"
+    assert_file_contains "$case_dir/output.txt" "HEAD is unchanged from before the rebase attempt." "agent-abort flow should explain the unchanged HEAD signal"
+    assert_file_not_contains "$case_dir/output.txt" "Rebase completed successfully!" "agent-abort flow must not report success"
 }
 
 test_no_conflict_path
 test_conflict_loop_with_claude
-test_conflict_loop_with_codex
+test_conflict_loop_with_codex_uses_supported_headless_exec_flags
+test_agent_abort_does_not_report_rebase_success
 
 echo "bin/rebase-on-main.sh targeted checks passed"

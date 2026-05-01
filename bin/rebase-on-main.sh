@@ -97,6 +97,7 @@ invoke_agent_for_conflicts() {
         printf '%s\n' "$resolution_prompt" | codex \
             -c check_for_update_on_startup=false \
             exec \
+            --json \
             --dangerously-bypass-approvals-and-sandbox \
             --skip-git-repo-check \
             -C "$(pwd)" \
@@ -125,7 +126,24 @@ finish_rebase_success() {
     fi
 }
 
+report_rebase_state_cleared_without_completion() {
+    local post_agent_head
+
+    post_agent_head=$(git rev-parse HEAD)
+
+    echo ""
+    echo -e "${RED}$SELECTED_AGENT exited and the rebase is no longer in progress, but this script did not complete it.${NC}"
+    if [[ "$PRE_REBASE_HEAD" == "$post_agent_head" ]]; then
+        echo "HEAD is unchanged from before the rebase attempt."
+    fi
+    echo "The rebase may have been aborted or altered manually."
+    echo "Inspect the branch state and rerun the rebase if needed."
+    echo "To abort any partial state manually: git rebase --abort"
+}
+
 resolve_rebase_conflicts() {
+    local rebase_completed_by_script=0
+
     while rebase_in_progress; do
         echo ""
         echo -e "${YELLOW}=== Merge conflicts detected ===${NC}"
@@ -136,7 +154,12 @@ resolve_rebase_conflicts() {
         invoke_agent_for_conflicts
 
         if ! rebase_in_progress; then
-            return 0
+            if [[ "$rebase_completed_by_script" -eq 1 ]]; then
+                return 0
+            fi
+
+            report_rebase_state_cleared_without_completion
+            return 1
         fi
 
         if [[ -n "$(list_conflicted_files)" ]]; then
@@ -149,6 +172,9 @@ resolve_rebase_conflicts() {
         echo ""
         echo "Continuing rebase..."
         if git -c core.editor=true rebase --continue; then
+            if ! rebase_in_progress; then
+                rebase_completed_by_script=1
+            fi
             continue
         fi
 
