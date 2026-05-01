@@ -1374,7 +1374,7 @@ def _resolve_unimplemented_source_targets(
     store: SqliteTaskStore,
     task: DbTask,
     *,
-    impl_based_on_ids: set[str],
+    impl_source_ids: set[str],
     task_types: tuple[str, ...],
     task_cache: dict[str, DbTask],
     children_cache: dict[str, list[DbTask]],
@@ -1398,7 +1398,7 @@ def _resolve_unimplemented_source_targets(
                 task_cache[child.id] = child
 
         child_targets: list[DbTask] = []
-        has_implement_in_subtree = current.task_type == "implement"
+        has_implement_in_subtree = current.task_type == "implement" or current.id in impl_source_ids
 
         for child in children:
             if child.id is None:
@@ -1409,7 +1409,7 @@ def _resolve_unimplemented_source_targets(
 
         if child_targets:
             result = child_targets
-        elif current.task_type in task_types and current.id not in impl_based_on_ids and not has_implement_in_subtree:
+        elif current.task_type in task_types and current.id not in impl_source_ids and not has_implement_in_subtree:
             result = [current]
         else:
             result = []
@@ -1439,7 +1439,7 @@ def _cmd_advance_unimplemented(
     # Find the current unimplemented source frontier for each lineage tree. A newer
     # descendant source row can replace its own ancestors, but sibling branches stay
     # independently eligible and implement tasks are never shown directly.
-    impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
+    impl_source_ids: set[str] = store.get_impl_based_on_ids()
     task_cache = {task.id: task for task in all_completed if task.id is not None}
     children_cache: dict[str, list[DbTask]] = {}
     frontier_cache: dict[str, tuple[list[DbTask], bool]] = {}
@@ -1457,7 +1457,7 @@ def _cmd_advance_unimplemented(
             _resolve_unimplemented_source_targets(
                 store,
                 root,
-                impl_based_on_ids=impl_based_on_ids,
+                impl_source_ids=impl_source_ids,
                 task_types=task_types,
                 task_cache=task_cache,
                 children_cache=children_cache,
