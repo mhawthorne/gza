@@ -2347,6 +2347,151 @@ class TestShowCommand:
         assert result.returncode == 0
         assert "Task with damaged schema" in result.stdout
         assert "Warning: Query-only DB open detected incomplete task_comments schema" in result.stderr
+    def test_show_query_only_missing_task_comments_id_warns_without_traceback(self, tmp_path: Path):
+        """Show should degrade comments cleanly when task_comments.id is missing on a frozen DB."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with missing comment ids")
+        assert task.id is not None
+        store.add_comment(task.id, "Existing comment", source="direct")
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        _drop_task_comments_column(db_path, "id")
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 0
+        assert "Task with missing comment ids" in result.stdout
+        assert "Comments:" not in result.stdout
+        assert "Existing comment" not in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
+        assert "Warning: Query-only DB open detected incomplete task_comments schema" in result.stderr
+
+    def test_show_query_only_missing_tasks_project_id_surfaces_controlled_error_without_traceback(
+        self,
+        tmp_path: Path,
+    ):
+        """Show should fail closed with a schema error when tasks.project_id is missing."""
+        import sqlite3
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with missing project_id")
+        assert task.id is not None
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
+        conn.execute(
+            """
+            CREATE TABLE tasks AS
+            SELECT
+                id,
+                prompt,
+                status,
+                task_type,
+                slug,
+                branch,
+                log_file,
+                report_file,
+                based_on,
+                has_commits,
+                duration_seconds,
+                num_steps_reported,
+                num_steps_computed,
+                num_turns,
+                num_turns_reported,
+                num_turns_computed,
+                attach_count,
+                attach_duration_seconds,
+                cost_usd,
+                created_at,
+                started_at,
+                running_pid,
+                completed_at,
+                "group",
+                depends_on,
+                spec,
+                create_review,
+                same_branch,
+                task_type_hint,
+                output_content,
+                session_id,
+                pr_number,
+                model,
+                provider,
+                provider_is_explicit,
+                urgent,
+                urgent_bumped_at,
+                queue_position,
+                input_tokens,
+                output_tokens,
+                merge_status,
+                merged_at,
+                failure_reason,
+                skip_learnings,
+                diff_files_changed,
+                diff_lines_added,
+                diff_lines_removed,
+                review_cleared_at,
+                review_score,
+                log_schema_version,
+                execution_mode,
+                base_branch
+            FROM tasks_old
+            """
+        )
+        conn.execute("DROP TABLE tasks_old")
+        conn.commit()
+        conn.close()
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 1
+        assert "Error: Query-only DB open detected missing required column tasks.project_id" in result.stderr
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
+
+    def test_show_query_only_missing_tasks_table_surfaces_controlled_error_without_traceback(
+        self,
+        tmp_path: Path,
+    ):
+        """Show should fail closed with a schema error when the tasks table is missing."""
+        import sqlite3
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task before dropping tasks table")
+        assert task.id is not None
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE tasks")
+        conn.commit()
+        conn.close()
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 1
+        assert "Error: Query-only DB open detected missing required table tasks" in result.stderr
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
 
     def test_show_query_only_missing_task_comments_id_warns_without_traceback(self, tmp_path: Path):
         """Show should degrade comments cleanly when task_comments.id is missing on a frozen DB."""

@@ -6630,7 +6630,6 @@ class TestSharedDbIsolationAndImportGating:
                 SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
         finally:
             db_path.chmod(0o644)
-
     def test_query_only_open_current_db_missing_task_comments_source_warns_and_reads_comments(
         self, tmp_path: Path
     ) -> None:
@@ -6698,7 +6697,6 @@ class TestSharedDbIsolationAndImportGating:
 
         assert count == 0
         assert any("run_steps.project_id" in warning for warning in query_store.startup_warnings())
-
     def test_auto_migration_v30_failure_does_not_advance_schema_version(
         self,
         tmp_path: Path,

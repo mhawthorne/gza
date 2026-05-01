@@ -1033,7 +1033,6 @@ _QUERY_ONLY_REQUIRED_COMMENT_COLUMNS: tuple[str, ...] = (
     "created_at",
     "resolved_at",
 )
-
 _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "project_id",
     "id",

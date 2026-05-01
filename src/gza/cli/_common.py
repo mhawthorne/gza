@@ -97,8 +97,6 @@ def _set_interrupt_env_from_signal(
         os.environ["GZA_INTERRUPT_DETAIL"] = detail
     else:
         os.environ.pop("GZA_INTERRUPT_DETAIL", None)
-
-
 def get_store(config: Config, *, open_mode: StoreOpenMode = "readwrite") -> SqliteTaskStore:
     """Get the SQLite task store.
 
