@@ -23,6 +23,7 @@ PrEnsureStatus = Literal[
     "push_failed",
     "create_failed",
 ]
+PrLookupStatus = Literal["cached", "existing", "missing", "gh_unavailable"]
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,58 @@ def _fallback_pr_content(
 ```
 """
     return title, body
+
+
+@dataclass(frozen=True)
+class LookupTaskPrResult:
+    """Result from resolving whether a task branch already has an open PR."""
+
+    found: bool
+    status: PrLookupStatus
+    pr_url: str | None = None
+    pr_number: int | None = None
+
+
+def lookup_task_pr(
+    task: Task,
+    *,
+    store: SqliteTaskStore | None = None,
+    gh: GitHub | None = None,
+    available: bool | None = None,
+    refresh_cache: bool = False,
+    include_number: bool = True,
+) -> LookupTaskPrResult:
+    """Resolve an existing open PR for a task without creating or pushing anything."""
+    gh_client = gh or GitHub()
+    gh_available = gh_client.is_available() if available is None else available
+    if not gh_available:
+        return LookupTaskPrResult(found=False, status="gh_unavailable")
+
+    if task.pr_number:
+        pr_url = gh_client.get_pr_url(task.pr_number)
+        if pr_url:
+            return LookupTaskPrResult(
+                found=True,
+                status="cached",
+                pr_url=pr_url,
+                pr_number=task.pr_number,
+            )
+        if refresh_cache and store is not None:
+            task.pr_number = None
+            store.update(task)
+
+    if not task.branch:
+        return LookupTaskPrResult(found=False, status="missing")
+
+    pr_url = gh_client.pr_exists(task.branch)
+    if not pr_url:
+        return LookupTaskPrResult(found=False, status="missing")
+
+    pr_number = gh_client.get_pr_number(task.branch) if include_number else None
+    if refresh_cache and store is not None and pr_number:
+        task.pr_number = pr_number
+        store.update(task)
+    return LookupTaskPrResult(found=True, status="existing", pr_url=pr_url, pr_number=pr_number)
 
 
 def ensure_task_pr(

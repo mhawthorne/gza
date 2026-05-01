@@ -40,6 +40,8 @@ from ..console import (
 )
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key as _task_id_numeric_key
 from ..git import Git, GitError, active_worktree_path_for_branch
+from ..github import GitHub
+from ..pr_ops import lookup_task_pr
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
     TaskLineageNode,
@@ -960,6 +962,8 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
 
     # Colors for unmerged output — defined in gza.colors.
     UNMERGED_COLORS = UNMERGED_COLORS_DICT
+    gh = GitHub()
+    gh_available = gh.is_available()
 
     def _task_recency_key(task: DbTask) -> tuple[int, datetime]:
         """Stable recency key for choosing a branch representative task."""
@@ -1221,6 +1225,15 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         else:
             deleted_branch = representative_branch or branch
             console.print(f"branch: [{c['branch']}]{deleted_branch}[/{c['branch']}] ([{c['task_id']}]branch deleted[/{c['task_id']}])")
+
+        pr_lookup = lookup_task_pr(
+            representative_task,
+            gh=gh,
+            available=gh_available,
+            include_number=False,
+        )
+        if pr_lookup.found and pr_lookup.pr_url:
+            console.print(f"pr: [{c['task_id']}]{pr_lookup.pr_url}[/{c['task_id']}]")
 
         # Review freshness status for this implementation.
         console.print(f"review: [{review_status_color}]{review_line}[/{review_status_color}]")

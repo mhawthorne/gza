@@ -71,6 +71,7 @@ def test_extract_help_includes_source_selectors_and_file_inputs(tmp_path: Path) 
     assert "Source full prefixed task ID to extract from" in result.stdout
     assert "--branch BRANCH" in result.stdout
     assert "--files-from FILE" in result.stdout
+    assert "--dry-run" in result.stdout
     assert "current branch" in result.stdout
     assert "Repo-relative files to extract from the source diff" in result.stdout
     assert "omit to extract all changed files" in result.stdout
@@ -95,6 +96,35 @@ def test_extract_without_selected_files_uses_full_source_diff(tmp_path: Path) ->
     assert manifest["touched_paths"] == ["src/extracted.py"]
 
 
+def test_extract_dry_run_shows_selected_files_without_creating_task_or_bundle(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    git = _init_repo(tmp_path)
+    source_task = _create_completed_source_task(tmp_path, git)
+    store = make_store(tmp_path)
+
+    result = run_gza(
+        "extract",
+        str(source_task.id),
+        "src/extracted.py",
+        "--dry-run",
+        "--project",
+        str(tmp_path),
+    )
+
+    assert result.returncode == 0
+    assert "Dry run: extraction plan preview" in result.stdout
+    assert f"Source: task {source_task.id}" in result.stdout
+    assert "Selected files: 1" in result.stdout
+    assert "    - src/extracted.py" in result.stdout
+    assert "Diff summary:" in result.stdout
+    assert "No task created; no extraction bundle written." in result.stdout
+
+    tasks = store.get_all()
+    assert len(tasks) == 1
+    assert tasks[0].id == source_task.id
+    assert not (tmp_path / ".gza" / "extractions").exists()
+
+
 def test_extract_without_source_selector_uses_current_branch(tmp_path: Path) -> None:
     setup_config(tmp_path)
     git = _init_repo(tmp_path)
@@ -114,6 +144,25 @@ def test_extract_without_source_selector_uses_current_branch(tmp_path: Path) -> 
     bundle_dir = tmp_path / ".gza" / "extractions" / new_task.slug
     manifest = json.loads((bundle_dir / "manifest.json").read_text())
     assert manifest["selected_paths"] == ["src/extracted.py"]
+
+
+def test_extract_dry_run_without_source_selector_uses_current_branch(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    git = _init_repo(tmp_path)
+    source_task = _create_completed_source_task(tmp_path, git)
+    store = make_store(tmp_path)
+
+    git._run("checkout", source_task.branch)
+
+    result = run_gza("extract", "--dry-run", "--project", str(tmp_path))
+
+    assert result.returncode == 0
+    assert "Dry run: extraction plan preview" in result.stdout
+    assert f"Source: branch {source_task.branch}" in result.stdout
+    assert "Selected files: 1" in result.stdout
+    assert "    - src/extracted.py" in result.stdout
+    assert len(store.get_all()) == 1
+    assert not (tmp_path / ".gza" / "extractions").exists()
 
 
 def test_extract_current_branch_with_first_positional_path_uses_path_not_source(tmp_path: Path) -> None:
