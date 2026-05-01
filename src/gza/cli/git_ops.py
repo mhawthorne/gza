@@ -1309,7 +1309,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 def _unimplemented_implement_prompt(task: DbTask) -> str:
-    """Build the default implement prompt for a completed upstream task."""
+    """Build the default implement prompt for an upstream source task."""
     assert task.id is not None
     slug = _get_base_task_slug(task)
     if task.task_type == "plan":
@@ -1327,6 +1327,25 @@ def _normalize_task_created_at(value: datetime | None) -> datetime:
 
 def _unimplemented_target_sort_key(task: DbTask) -> tuple[datetime, int]:
     return (_normalize_task_created_at(task.created_at), task_id_numeric_key(task.id))
+
+
+def _is_directly_implementable_plan(task: DbTask) -> bool:
+    """Return True when the row can be handed directly to `gza implement`."""
+    return task.task_type == "plan" and task.status == "completed"
+
+
+def _unimplemented_status_label(task: DbTask) -> str:
+    """Render task type and status for the unimplemented source list."""
+    status = task.status or "pending"
+    return f"[{task.task_type}] ({status})"
+
+
+def _unimplemented_followup_command(task: DbTask) -> str:
+    """Return truthful operator guidance for one listed source row."""
+    assert task.id is not None
+    if _is_directly_implementable_plan(task):
+        return f"gza implement {task.id}"
+    return "gza advance --unimplemented --create"
 
 
 def _collect_unimplemented_lineage_component(
@@ -1415,7 +1434,7 @@ def _cmd_advance_unimplemented(
 ) -> int:
     """List plan/explore lineages that do not yet have an implementation task.
 
-    With --create, creates queued implement tasks for each listed plan/explore task.
+    With --create, queues implement tasks for each listed plan/explore source row.
     """
     all_completed: list[DbTask] = []
     for task_type in task_types:
@@ -1457,16 +1476,21 @@ def _cmd_advance_unimplemented(
     print()
     for task in pending_tasks:
         assert task.id is not None
-        prefix_len = len(f"  {task.id}  [{task.task_type}] ")
+        status_label = _unimplemented_status_label(task)
+        prefix_len = len(f"  {task.id}  {status_label} ")
         prompt_display = shorten_prompt(task.prompt, prompt_available_width(prefix=prefix_len))
-        print(f"  {task.id}  [{task.task_type}] {prompt_display}")
-        print(f"       → gza implement {task.id}")
+        print(f"  {task.id}  {status_label} {prompt_display}")
+        print(f"       → {_unimplemented_followup_command(task)}")
     print()
 
     if not create:
-        print("Run 'gza advance' to create and start implement tasks for completed plan tasks.")
-        if "explore" in task_types:
-            print("Run 'gza advance --unimplemented --create' to create implement tasks for completed explore tasks.")
+        if any(_is_directly_implementable_plan(task) for task in pending_tasks):
+            print("Completed plan rows can be run directly with 'gza implement <task_id>' or auto-started with 'gza advance'.")
+        if any(not _is_directly_implementable_plan(task) for task in pending_tasks):
+            print(
+                "Use 'gza advance --unimplemented --create' to queue implement tasks "
+                "for listed explore rows or incomplete source descendants."
+            )
         return 0
 
     # Create queued implement tasks
