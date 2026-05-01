@@ -567,7 +567,7 @@ def main() -> int:
     advance_parser.add_argument(
         "--unimplemented",
         action="store_true",
-        help="List completed plans/explores with no implementation task yet",
+        help="List plan/explore lineages whose latest applicable source task has no implementation yet",
     )
     advance_parser.add_argument(
         "--plans",

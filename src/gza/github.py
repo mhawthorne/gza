@@ -54,7 +54,10 @@ class GitHub:
 
     def is_available(self) -> bool:
         """Check if gh CLI is available and authenticated."""
-        result = self._run("auth", "status", check=False)
+        try:
+            result = self._run("auth", "status", check=False)
+        except FileNotFoundError:
+            return False
         return result.returncode == 0
 
     def create_pr(

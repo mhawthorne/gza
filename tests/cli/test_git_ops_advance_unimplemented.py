@@ -25,6 +25,23 @@ from .conftest import (
 )
 
 
+def _set_task_times(
+    store: SqliteTaskStore,
+    task,
+    *,
+    created_at: datetime | None = None,
+    completed_at: datetime | None = None,
+    status: str | None = None,
+) -> None:
+    if created_at is not None:
+        task.created_at = created_at
+    if completed_at is not None:
+        task.completed_at = completed_at
+    if status is not None:
+        task.status = status
+    store.update(task)
+
+
 class TestAdvanceUnimplementedCommand:
     """Tests for 'gza advance --unimplemented' command."""
 
@@ -78,7 +95,139 @@ class TestAdvanceUnimplementedCommand:
         result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "No completed plan/explore tasks without implementation tasks." in result.stdout
+        assert "No plan/explore lineages without implementation tasks." in result.stdout
+
+    def test_advance_unimplemented_prefers_pending_plan_descendant_and_create_targets_it(self, tmp_path: Path):
+        """advance --unimplemented should surface the newer plan descendant, not the completed explore ancestor."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        explore = store.add("Explore the ingestion approach", task_type="explore")
+        _set_task_times(
+            store,
+            explore,
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 1, 2, tzinfo=UTC),
+            status="completed",
+        )
+
+        plan = store.add("Plan the ingestion implementation", task_type="plan", based_on=explore.id)
+        _set_task_times(store, plan, created_at=datetime(2026, 1, 3, tzinfo=UTC))
+
+        result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert str(plan.id) in result.stdout
+        assert "Plan the ingestion implementation" in result.stdout
+        assert str(explore.id) not in result.stdout
+        assert "Explore the ingestion approach" not in result.stdout
+        assert f"gza implement {plan.id}" in result.stdout
+
+        create_result = run_gza("advance", "--unimplemented", "--create", "--project", str(tmp_path))
+
+        assert create_result.returncode == 0
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+        assert len(implement_tasks) == 1
+        assert implement_tasks[0].depends_on == plan.id
+        assert implement_tasks[0].depends_on != explore.id
+        assert implement_tasks[0].prompt.startswith(f"Implement plan from task {plan.id}")
+
+    def test_advance_unimplemented_still_lists_completed_plan_without_descendants(self, tmp_path: Path):
+        """advance --unimplemented should keep showing a completed plan with no more specific source descendant."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan the scheduler rewrite", task_type="plan")
+        _set_task_times(
+            store,
+            plan,
+            created_at=datetime(2026, 2, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 2, 2, tzinfo=UTC),
+            status="completed",
+        )
+
+        result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert str(plan.id) in result.stdout
+        assert "Plan the scheduler rewrite" in result.stdout
+        assert f"gza implement {plan.id}" in result.stdout
+
+    def test_advance_unimplemented_excludes_lineage_with_descendant_implement(self, tmp_path: Path):
+        """advance --unimplemented should drop the lineage when a descendant implement already exists."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        explore = store.add("Explore cache invalidation options", task_type="explore")
+        _set_task_times(
+            store,
+            explore,
+            created_at=datetime(2026, 3, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 3, 2, tzinfo=UTC),
+            status="completed",
+        )
+
+        plan = store.add("Plan cache invalidation rollout", task_type="plan", based_on=explore.id)
+        _set_task_times(
+            store,
+            plan,
+            created_at=datetime(2026, 3, 3, tzinfo=UTC),
+            completed_at=datetime(2026, 3, 4, tzinfo=UTC),
+            status="completed",
+        )
+
+        store.add("Implement cache invalidation rollout", task_type="implement", based_on=plan.id)
+
+        result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No plan/explore lineages without implementation tasks." in result.stdout
+        assert str(explore.id) not in result.stdout
+        assert str(plan.id) not in result.stdout
+
+    def test_advance_unimplemented_prefers_newest_explore_descendant_deterministically(self, tmp_path: Path):
+        """advance --unimplemented should choose the newest explore descendant when no implement exists."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Explore reporting architecture", task_type="explore")
+        _set_task_times(
+            store,
+            root,
+            created_at=datetime(2026, 4, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 2, tzinfo=UTC),
+            status="completed",
+        )
+
+        first_descendant = store.add("Explore reporting storage choices", task_type="explore", based_on=root.id)
+        _set_task_times(
+            store,
+            first_descendant,
+            created_at=datetime(2026, 4, 3, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 4, tzinfo=UTC),
+            status="completed",
+        )
+
+        latest_descendant = store.add(
+            "Explore reporting delivery tradeoffs",
+            task_type="explore",
+            based_on=first_descendant.id,
+        )
+        _set_task_times(
+            store,
+            latest_descendant,
+            created_at=datetime(2026, 4, 5, tzinfo=UTC),
+        )
+
+        result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert str(latest_descendant.id) in result.stdout
+        assert "Explore reporting delivery tradeoffs" in result.stdout
+        assert str(root.id) not in result.stdout
+        assert str(first_descendant.id) not in result.stdout
+        assert "Explore reporting architecture" not in result.stdout
+        assert "Explore reporting storage choices" not in result.stdout
 
     def test_advance_unimplemented_guidance_distinguishes_plan_vs_explore(self, tmp_path: Path):
         """advance --unimplemented guidance is accurate for explores in list mode."""

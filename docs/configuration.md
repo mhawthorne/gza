@@ -1347,7 +1347,7 @@ gza advance [task_id] [options]
 | `--max N` | Limit the number of tasks to advance |
 | `--no-docker` | Run workers directly instead of in Docker |
 | `--force` | Skip dependency merge precondition checks when advance starts workers |
-| `--unimplemented` | List completed plans/explores with no implementation task yet |
+| `--unimplemented` | List plan/explore lineages whose latest applicable source task has no implementation task yet |
 | `--create` | With `--unimplemented`: create queued implement tasks for listed tasks |
 | `--auto`, `-y` | Skip confirmation and execute immediately |
 | `--batch B` | Stop after spawning B background workers |
