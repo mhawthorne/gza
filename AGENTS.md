@@ -61,7 +61,7 @@ Key modules: `src/gza/db.py` (storage), `src/gza/cli/` (CLI), `src/gza/runner.py
 
 **Write tests for every change.** Tests go in `tests/` with `test_` prefix. Run: `uv run pytest tests/ -v`
 
-**Scripts are not project code.** Do not add `tests/test_*.py` coverage for one-off repo scripts under `scripts/`; validate them ad hoc instead.
+**Scripts are not project code.** Do not add `tests/test_*.py` coverage for repo scripts (including `scripts/` and `bin/`); validate them ad hoc instead.
 
 **Use Explore subagents** for multi-file research (3+ files) instead of sequential reads.
 

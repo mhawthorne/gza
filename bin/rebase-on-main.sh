@@ -87,9 +87,18 @@ esac
 
 echo "Rebasing $CURRENT_BRANCH onto $REBASE_TARGET..."
 
+PRE_REBASE_HEAD=$(git rev-parse HEAD)
+
 # Attempt rebase
 if git rebase $REBASE_TARGET; then
+    POST_REBASE_HEAD=$(git rev-parse HEAD)
     echo -e "${GREEN}Rebase completed successfully!${NC}"
+    if [[ "$PRE_REBASE_HEAD" == "$POST_REBASE_HEAD" ]]; then
+        echo -e "${YELLOW}$CURRENT_BRANCH is already up to date with $REBASE_TARGET.${NC}"
+        echo "Rebase made no changes, so there is nothing new to push from this run."
+        exit 0
+    fi
+
     echo "Rebased $CURRENT_BRANCH onto $REBASE_TARGET"
     echo ""
     read -p "Push with --force-with-lease? [y/N]: " PUSH_CHOICE
