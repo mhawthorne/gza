@@ -123,9 +123,6 @@ def _parse_queue_limit(value: str) -> int:
 
 
 def main() -> int:
-    if len(sys.argv) > 1 and sys.argv[1] == "incomplete":
-        return cmd_incomplete_deprecated(sys.argv[2:])
-
     parser = GzaArgumentParser(
         description="Gza - AI agent task runner",
         formatter_class=SortingHelpFormatter,
