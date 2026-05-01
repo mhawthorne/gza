@@ -233,6 +233,88 @@ class TestAdvanceUnimplementedCommand:
         assert implement_tasks[0].depends_on == latest_descendant.id
         assert implement_tasks[0].prompt.startswith(f"Implement findings from task {latest_descendant.id}")
 
+    def test_advance_unimplemented_keeps_sibling_source_branches(self, tmp_path: Path):
+        """advance --unimplemented should suppress the stale ancestor but keep sibling source branches."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        explore = store.add("Explore rollout options", task_type="explore")
+        _set_task_times(
+            store,
+            explore,
+            created_at=datetime(2026, 4, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 2, tzinfo=UTC),
+            status="completed",
+        )
+
+        first_plan = store.add("Plan one", task_type="plan", based_on=explore.id)
+        _set_task_times(
+            store,
+            first_plan,
+            created_at=datetime(2026, 4, 3, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 4, tzinfo=UTC),
+            status="completed",
+        )
+
+        second_plan = store.add("Plan two", task_type="plan", based_on=explore.id)
+        _set_task_times(
+            store,
+            second_plan,
+            created_at=datetime(2026, 4, 5, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 6, tzinfo=UTC),
+            status="completed",
+        )
+
+        result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Plan one" in result.stdout
+        assert "Plan two" in result.stdout
+        assert str(first_plan.id) in result.stdout
+        assert str(second_plan.id) in result.stdout
+        assert "Explore rollout options" not in result.stdout
+        assert str(explore.id) not in result.stdout
+
+    def test_advance_unimplemented_create_queues_one_implement_per_sibling_source_branch(self, tmp_path: Path):
+        """advance --unimplemented --create should queue one implement task per sibling source row."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        explore = store.add("Explore rollout options", task_type="explore")
+        _set_task_times(
+            store,
+            explore,
+            created_at=datetime(2026, 4, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 2, tzinfo=UTC),
+            status="completed",
+        )
+
+        first_plan = store.add("Plan one", task_type="plan", based_on=explore.id)
+        _set_task_times(
+            store,
+            first_plan,
+            created_at=datetime(2026, 4, 3, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 4, tzinfo=UTC),
+            status="completed",
+        )
+
+        second_plan = store.add("Plan two", task_type="plan", based_on=explore.id)
+        _set_task_times(
+            store,
+            second_plan,
+            created_at=datetime(2026, 4, 5, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 6, tzinfo=UTC),
+            status="completed",
+        )
+
+        result = run_gza("advance", "--unimplemented", "--create", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+        assert len(implement_tasks) == 2
+        assert {task.depends_on for task in implement_tasks} == {first_plan.id, second_plan.id}
+        assert all(task.based_on is None for task in implement_tasks)
+
     def test_advance_unimplemented_guidance_distinguishes_completed_plan_vs_explore(self, tmp_path: Path):
         """advance --unimplemented should only suggest `gza implement` for completed plan rows."""
         from datetime import datetime

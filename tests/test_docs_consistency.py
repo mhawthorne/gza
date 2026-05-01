@@ -88,9 +88,10 @@ def test_configuration_docs_describe_unimplemented_lineage_guidance() -> None:
     config_content = (docs_root / "configuration.md").read_text()
 
     required_snippets = [
-        "| `--unimplemented` | List plan/explore lineages whose latest source task has no implementation task yet |",
+        "| `--unimplemented` | List unimplemented plan/explore source rows, preferring newer descendants within each lineage branch |",
         "| `--create` | With `--unimplemented`: queue implement tasks for the listed source rows |",
         "It may surface a newer pending",
+        "keeping sibling branches as separate source rows",
         "Only completed plan rows are directly runnable with `uv run gza implement <id>`;",
         "use `uv run gza advance --unimplemented --create` to queue implement tasks",
     ]
