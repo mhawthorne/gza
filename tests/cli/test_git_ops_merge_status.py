@@ -1,27 +1,14 @@
 """Tests for git operations CLI commands."""
 
-
-import argparse
-import io
 import os
-import shutil
-import time
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
-
-import pytest
-
-from gza.cli import cmd_advance
-from gza.config import Config
-from gza.db import SqliteTaskStore
+from unittest.mock import patch
 
 from .conftest import (
     make_store,
     run_gza,
     setup_config,
-    setup_db_with_tasks,
-    setup_git_repo_with_task_branch,
 )
 
 
@@ -179,6 +166,33 @@ class TestMergeStatusTracking:
         assert "Unmerged task" in result.stdout
         assert "Merged task" not in result.stdout
         assert "No merge status" not in result.stdout
+
+    def test_cmd_unmerged_handles_missing_gh_binary(self, tmp_path: Path):
+        """gza unmerged should still render results when the gh binary is missing."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+
+        task = store.add("Unmerged without gh")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feature/unmerged-without-gh"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        git._run("checkout", "-b", "feature/unmerged-without-gh")
+        (tmp_path / "nogh.txt").write_text("content")
+        git._run("add", "nogh.txt")
+        git._run("commit", "-m", "Unmerged without gh")
+        git._run("checkout", "main")
+
+        with patch("gza.github.GitHub._run", side_effect=FileNotFoundError()):
+            result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Unmerged without gh" in result.stdout
 
     def test_cmd_history_shows_merged_label(self, tmp_path: Path):
         """gza history shows [merged] label for tasks with merge_status='merged'."""

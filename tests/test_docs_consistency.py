@@ -82,6 +82,23 @@ def test_configuration_docs_cover_force_execution_flags_and_prerequisite_unmerge
         assert snippet in config_content
 
 
+def test_configuration_docs_describe_unimplemented_lineage_guidance() -> None:
+    """advance docs should explain pending-descendant lineage selection and truthful follow-up actions."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    config_content = (docs_root / "configuration.md").read_text()
+
+    required_snippets = [
+        "| `--unimplemented` | List plan/explore lineages whose latest source task has no implementation task yet |",
+        "| `--create` | With `--unimplemented`: queue implement tasks for the listed source rows |",
+        "It may surface a newer pending",
+        "Only completed plan rows are directly runnable with `uv run gza implement <id>`;",
+        "use `uv run gza advance --unimplemented --create` to queue implement tasks",
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in config_content
+
+
 def test_configuration_docs_describe_sync_as_explicit_github_reconciliation_surface() -> None:
     """Canonical docs should keep `gza sync` scoped as the explicit PR reconciliation command."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"

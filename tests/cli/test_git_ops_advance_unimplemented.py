@@ -1,27 +1,14 @@
 """Tests for git operations CLI commands."""
 
-
-import argparse
-import io
-import os
-import shutil
-import time
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
 
-import pytest
-
-from gza.cli import cmd_advance
-from gza.config import Config
 from gza.db import SqliteTaskStore
 
 from .conftest import (
     make_store,
     run_gza,
     setup_config,
-    setup_db_with_tasks,
-    setup_git_repo_with_task_branch,
 )
 
 
@@ -69,7 +56,10 @@ class TestAdvanceUnimplementedCommand:
         assert str(explore.id) in result.stdout
         assert "[plan]" in result.stdout
         assert "[explore]" in result.stdout
-        assert "gza implement" in result.stdout
+        assert "(completed)" in result.stdout
+        assert f"gza implement {plan.id}" in result.stdout
+        assert f"gza implement {explore.id}" not in result.stdout
+        assert "gza advance --unimplemented --create" in result.stdout
 
     def test_advance_unimplemented_excludes_tasks_with_impl(self, tmp_path: Path):
         """advance --unimplemented excludes tasks that already have an implement task."""
@@ -98,7 +88,7 @@ class TestAdvanceUnimplementedCommand:
         assert "No plan/explore lineages without implementation tasks." in result.stdout
 
     def test_advance_unimplemented_prefers_pending_plan_descendant_and_create_targets_it(self, tmp_path: Path):
-        """advance --unimplemented should surface the newer plan descendant, not the completed explore ancestor."""
+        """advance --unimplemented should surface a pending plan descendant without invalid implement guidance."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -119,9 +109,11 @@ class TestAdvanceUnimplementedCommand:
         assert result.returncode == 0
         assert str(plan.id) in result.stdout
         assert "Plan the ingestion implementation" in result.stdout
+        assert "(pending)" in result.stdout
         assert str(explore.id) not in result.stdout
         assert "Explore the ingestion approach" not in result.stdout
-        assert f"gza implement {plan.id}" in result.stdout
+        assert f"gza implement {plan.id}" not in result.stdout
+        assert "gza advance --unimplemented --create" in result.stdout
 
         create_result = run_gza("advance", "--unimplemented", "--create", "--project", str(tmp_path))
 
@@ -151,6 +143,7 @@ class TestAdvanceUnimplementedCommand:
         assert result.returncode == 0
         assert str(plan.id) in result.stdout
         assert "Plan the scheduler rewrite" in result.stdout
+        assert "(completed)" in result.stdout
         assert f"gza implement {plan.id}" in result.stdout
 
     def test_advance_unimplemented_excludes_lineage_with_descendant_implement(self, tmp_path: Path):
@@ -224,13 +217,24 @@ class TestAdvanceUnimplementedCommand:
         assert result.returncode == 0
         assert str(latest_descendant.id) in result.stdout
         assert "Explore reporting delivery tradeoffs" in result.stdout
+        assert "(pending)" in result.stdout
         assert str(root.id) not in result.stdout
         assert str(first_descendant.id) not in result.stdout
         assert "Explore reporting architecture" not in result.stdout
         assert "Explore reporting storage choices" not in result.stdout
+        assert f"gza implement {latest_descendant.id}" not in result.stdout
+        assert "gza advance --unimplemented --create" in result.stdout
 
-    def test_advance_unimplemented_guidance_distinguishes_plan_vs_explore(self, tmp_path: Path):
-        """advance --unimplemented guidance is accurate for explores in list mode."""
+        create_result = run_gza("advance", "--unimplemented", "--create", "--project", str(tmp_path))
+
+        assert create_result.returncode == 0
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+        assert len(implement_tasks) == 1
+        assert implement_tasks[0].depends_on == latest_descendant.id
+        assert implement_tasks[0].prompt.startswith(f"Implement findings from task {latest_descendant.id}")
+
+    def test_advance_unimplemented_guidance_distinguishes_completed_plan_vs_explore(self, tmp_path: Path):
+        """advance --unimplemented should only suggest `gza implement` for completed plan rows."""
         from datetime import datetime
 
         setup_config(tmp_path)
@@ -249,9 +253,16 @@ class TestAdvanceUnimplementedCommand:
         result = run_gza("advance", "--unimplemented", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Run 'gza advance' to create and start implement tasks for completed plan tasks." in result.stdout
-        assert "Run 'gza advance --unimplemented --create' to create implement tasks for completed explore tasks." in result.stdout
-        assert "Run 'gza advance' to create and start implement tasks." not in result.stdout
+        assert f"gza implement {plan.id}" in result.stdout
+        assert f"gza implement {explore.id}" not in result.stdout
+        assert (
+            "Completed plan rows can be run directly with 'gza implement <task_id>' "
+            "or auto-started with 'gza advance'."
+        ) in result.stdout
+        assert (
+            "Use 'gza advance --unimplemented --create' to queue implement tasks "
+            "for listed explore rows or incomplete source descendants."
+        ) in result.stdout
 
     def test_advance_unimplemented_create_queues_implement_tasks(self, tmp_path: Path):
         """advance --unimplemented --create creates implement tasks for each listed task."""

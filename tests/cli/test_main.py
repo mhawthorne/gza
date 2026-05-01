@@ -100,10 +100,13 @@ class TestHelpOutput:
             capture_output=True,
             text=True,
         )
+        normalized_output = " ".join(result.stdout.split())
 
         assert result.returncode == 0
         assert "--unimplemented" in result.stdout
         assert "--force" in result.stdout
+        assert "List plan/explore lineages whose latest source task has no implementation yet" in normalized_output
+        assert "With --unimplemented: queue implement tasks for the listed source rows" in normalized_output
         assert "--plans" not in result.stdout
 
     def test_iterate_help_uses_lifecycle_wording_and_config_default(self, tmp_path):

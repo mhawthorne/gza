@@ -94,14 +94,6 @@ class TestIsAvailable:
 
         mock_run.assert_called_once_with("auth", "status", check=False)
 
-    def test_is_available_false_when_gh_is_missing(self):
-        """is_available returns False when the gh binary is not installed."""
-        gh = GitHub()
-
-        with patch.object(gh, "_run", side_effect=FileNotFoundError()):
-            assert gh.is_available() is False
-
-
 class TestCreatePR:
     """Tests for GitHub.create_pr() method."""
 
