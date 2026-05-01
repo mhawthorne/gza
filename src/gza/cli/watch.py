@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from ..config import Config
-from ..console import truncate
+from ..console import prompt_available_width, shorten_prompt
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..failed_task_ordering import sort_failed_tasks
 from ..git import Git, GitError
@@ -108,8 +108,9 @@ def _assess_isolated_merge_failure(
     return _IsolatedMergeFailureAssessment(True)
 
 
-def _short_prompt(prompt: str) -> str:
-    return truncate(prompt.replace("\n", " "), 56)
+def _format_prompt_for_width(prompt: str, *, prefix: int = 0, suffix: int = 0) -> str:
+    available = prompt_available_width(prefix=prefix, suffix=suffix)
+    return shorten_prompt(prompt, available)
 
 
 def _format_hms() -> str:
@@ -1120,7 +1121,12 @@ def _run_cycle(
             recovery_slots -= 1
             work_done = True
             launched_recovery_count += 1
-            log.emit("START", f"{recovered_task_id} {failed.task_type} \"{_short_prompt(recovered_task.prompt)}\"")
+            recovered_prompt = _format_prompt_for_width(
+                recovered_task.prompt,
+                prefix=16 + len(f"{recovered_task_id} {failed.task_type} \""),
+                suffix=len('"'),
+            )
+            log.emit("START", f"{recovered_task_id} {failed.task_type} \"{recovered_prompt}\"")
             continue
         if decision.action == "resume":
             if dry_run:
@@ -1276,7 +1282,12 @@ def _run_cycle(
             task_type = task.task_type or "implement"
             if task_type == "implement":
                 if dry_run:
-                    log.emit("START", f"{task.id} {task_type} \"{_short_prompt(task.prompt)}\" [dry-run]")
+                    dry_run_prompt = _format_prompt_for_width(
+                        task.prompt,
+                        prefix=16 + len(f"{task.id} {task_type} \""),
+                        suffix=len('" [dry-run]'),
+                    )
+                    log.emit("START", f"{task.id} {task_type} \"{dry_run_prompt}\" [dry-run]")
                     started_task_ids.add(str(task.id))
                     slots -= 1
                     work_done = True
@@ -1299,11 +1310,21 @@ def _run_cycle(
                 slots -= 1
                 work_done = True
                 started_task_ids.add(str(task.id))
-                log.emit("START", f"{task.id} {task_type} \"{_short_prompt(task.prompt)}\"")
+                started_prompt = _format_prompt_for_width(
+                    task.prompt,
+                    prefix=16 + len(f"{task.id} {task_type} \""),
+                    suffix=len('"'),
+                )
+                log.emit("START", f"{task.id} {task_type} \"{started_prompt}\"")
                 continue
 
             if dry_run:
-                log.emit("START", f"{task.id} {task_type} \"{_short_prompt(task.prompt)}\" [dry-run]")
+                dry_run_prompt = _format_prompt_for_width(
+                    task.prompt,
+                    prefix=16 + len(f"{task.id} {task_type} \""),
+                    suffix=len('" [dry-run]'),
+                )
+                log.emit("START", f"{task.id} {task_type} \"{dry_run_prompt}\" [dry-run]")
                 started_task_ids.add(str(task.id))
                 slots -= 1
                 work_done = True
@@ -1321,7 +1342,12 @@ def _run_cycle(
             slots -= 1
             work_done = True
             started_task_ids.add(str(task.id))
-            log.emit("START", f"{task.id} {task_type} \"{_short_prompt(task.prompt)}\"")
+            started_prompt = _format_prompt_for_width(
+                task.prompt,
+                prefix=16 + len(f"{task.id} {task_type} \""),
+                suffix=len('"'),
+            )
+            log.emit("START", f"{task.id} {task_type} \"{started_prompt}\"")
 
     pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
     log.end_cycle()
@@ -1678,7 +1704,9 @@ def cmd_queue(args: argparse.Namespace) -> int:
     for index, task in enumerate(visible_pending, start=1):
         lane = "urgent" if task.urgent else "normal"
         position_label = f"[#{task.queue_position}] " if task.queue_position is not None else ""
-        print(f"{index:>3}  {task.id}  {position_label}[{lane}] [{task.task_type}] {_short_prompt(task.prompt)}")
+        prompt_prefix = len(f"{index:>3}  {task.id}  {position_label}[{lane}] [{task.task_type}] ")
+        queue_prompt = _format_prompt_for_width(task.prompt, prefix=prompt_prefix)
+        print(f"{index:>3}  {task.id}  {position_label}[{lane}] [{task.task_type}] {queue_prompt}")
 
     if display_limit is not None and len(pending) > display_limit:
         remaining = len(pending) - display_limit

@@ -25,6 +25,7 @@ from ..db import (
     validate_prompt,
 )
 from ..extractions import (
+    ExtractionDraft,
     ExtractionError,
     infer_selected_paths,
     normalize_selected_paths,
@@ -87,6 +88,47 @@ def _selected_tag_filters(args: argparse.Namespace) -> tuple[tuple[str, ...] | N
 def _selected_tags_for_new_task(args: argparse.Namespace) -> tuple[str, ...]:
     tags, _any_tag = parse_cli_tag_filters(args)
     return tags or ()
+
+
+def _format_extraction_diff_summary(draft: ExtractionDraft) -> list[str]:
+    """Render concise per-file diff metadata for extract command summaries."""
+    lines: list[str] = []
+    for summary in draft.file_summaries:
+        path_repr = summary.selected_path
+        if summary.status in {"R", "C"} and summary.old_path and summary.new_path:
+            path_repr = f"{summary.old_path} -> {summary.new_path}"
+
+        stat_suffix = ""
+        if summary.binary:
+            stat_suffix = " [binary]"
+        elif summary.additions is not None and summary.deletions is not None:
+            stat_suffix = f" (+{summary.additions}/-{summary.deletions})"
+
+        lines.append(f"    - {summary.status}: {path_repr}{stat_suffix}")
+    return lines
+
+
+def _print_extraction_plan_summary(
+    *,
+    draft: ExtractionDraft,
+    source_label: str,
+    heading: str,
+    bundle_path: Path | None = None,
+    dry_run: bool = False,
+) -> None:
+    """Print a concise summary of the extraction plan."""
+    print(heading)
+    print(f"  Source: {source_label}")
+    print(f"  Selected files: {len(draft.selected_paths)}")
+    for path in draft.selected_paths:
+        print(f"    - {path}")
+    print("  Diff summary:")
+    for line in _format_extraction_diff_summary(draft):
+        print(line)
+    if bundle_path is not None:
+        print(f"  Bundle: {bundle_path}")
+    if dry_run:
+        print("  No task created; no extraction bundle written.")
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -514,6 +556,18 @@ def cmd_extract(args: argparse.Namespace) -> int:
         print(f"Error: {exc}")
         return 1
 
+    source_label = (
+        f"task {source.source_task_id}" if source.source_task_id else f"branch {source.source_branch}"
+    )
+    if getattr(args, "dry_run", False):
+        _print_extraction_plan_summary(
+            draft=draft,
+            source_label=source_label,
+            heading="✓ Dry run: extraction plan preview",
+            dry_run=True,
+        )
+        return 0
+
     create_review = bool(getattr(args, "review", False))
     create_pr = bool(getattr(args, "create_pr", False))
     branch_type = args.branch_type if hasattr(args, "branch_type") and args.branch_type else None
@@ -574,13 +628,12 @@ def cmd_extract(args: argparse.Namespace) -> int:
         print(f"Error: {exc}")
         return 1
 
-    source_label = (
-        f"task {source.source_task_id}" if source.source_task_id else f"branch {source.source_branch}"
+    _print_extraction_plan_summary(
+        draft=draft,
+        source_label=source_label,
+        heading=f"✓ Created extract implement task {impl_task.id}",
+        bundle_path=bundle_dir.relative_to(config.project_dir),
     )
-    print(f"✓ Created extract implement task {impl_task.id}")
-    print(f"  Source: {source_label}")
-    print(f"  Selected files: {len(selected_paths)}")
-    print(f"  Bundle: {bundle_dir.relative_to(config.project_dir)}")
 
     if hasattr(args, "background") and args.background:
         assert impl_task.id is not None

@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from rich.console import Console
 
+from gza.pr_ops import LookupTaskPrResult
+
 from .conftest import (
     make_store,
     mark_orphaned,
@@ -6655,6 +6657,24 @@ class TestUnmergedImprovedDisplay:
         # Review should be on its own line starting with "review:"
         assert "review:" in result.stdout
         assert "✓ approved" in result.stdout
+
+    def test_unmerged_shows_open_pr_url_on_its_own_line(self, tmp_path: Path):
+        """Open PR metadata should be surfaced directly in unmerged output."""
+        setup_unmerged_env(tmp_path)
+
+        with patch(
+            "gza.cli.lookup_task_pr",
+            return_value=LookupTaskPrResult(
+                found=True,
+                status="existing",
+                pr_url="https://github.com/o/r/pull/123",
+            ),
+        ):
+            result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "pr:" in result.stdout
+        assert "https://github.com/o/r/pull/123" in result.stdout
 
     def test_unmerged_shows_no_review_when_missing(self, tmp_path: Path):
         """Unmerged output shows 'no review' when no review exists."""

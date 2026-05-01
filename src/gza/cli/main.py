@@ -1920,6 +1920,11 @@ def main() -> int:
         help="Additional operator intent appended to the drafted extraction prompt",
     )
     extract_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the exact extraction plan and selected files without creating or running a task",
+    )
+    extract_parser.add_argument(
         "--review",
         action="store_true",
         help="Auto-create review task on completion",

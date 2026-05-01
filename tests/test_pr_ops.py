@@ -3,8 +3,8 @@
 from unittest.mock import Mock, patch
 
 from gza.db import SqliteTaskStore
-from gza.pr_ops import ensure_task_pr
 from gza.github import GitHubError, PullRequestDetails
+from gza.pr_ops import ensure_task_pr, lookup_task_pr
 
 
 class TestEnsureTaskPr:
@@ -210,3 +210,50 @@ class TestEnsureTaskPr:
         assert refreshed.pr_state == "open"
         assert refreshed.pr_last_synced_at == original_synced_at
         gh.create_pr.assert_not_called()
+
+
+class TestLookupTaskPr:
+    """Focused regressions for read-only PR lookup behavior."""
+
+    def test_lookup_task_pr_revalidates_stale_cached_pr_and_falls_back_to_branch(self, tmp_path):
+        """Read-only lookup should ignore stale cached numbers and still find the live branch PR."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Implement X", task_type="implement")
+        task.branch = "feature/stale-cached-pr"
+        task.pr_number = 81
+        store.update(task)
+
+        gh = Mock()
+        gh.is_available.return_value = True
+        gh.get_pr_url.return_value = None
+        gh.pr_exists.return_value = "https://github.com/o/r/pull/82"
+        gh.get_pr_number.return_value = 82
+
+        result = lookup_task_pr(task, store=store, gh=gh, refresh_cache=True)
+
+        assert result.found is True
+        assert result.status == "existing"
+        assert result.pr_number == 82
+        assert result.pr_url == "https://github.com/o/r/pull/82"
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.pr_number == 82
+
+    def test_lookup_task_pr_can_skip_pr_number_fetch_when_only_url_is_needed(self, tmp_path):
+        """Unmerged-style lookup should be able to show the PR URL without an extra number query."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Implement X", task_type="implement")
+        task.branch = "feature/existing-pr"
+        store.update(task)
+
+        gh = Mock()
+        gh.is_available.return_value = True
+        gh.pr_exists.return_value = "https://github.com/o/r/pull/55"
+
+        result = lookup_task_pr(task, store=store, gh=gh, include_number=False)
+
+        assert result.found is True
+        assert result.status == "existing"
+        assert result.pr_url == "https://github.com/o/r/pull/55"
+        assert result.pr_number is None
+        gh.get_pr_number.assert_not_called()
