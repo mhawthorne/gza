@@ -2036,6 +2036,56 @@ class TestQueueCommand:
         assert "[#2]" in lines[1]
         assert "[#3]" in lines[2]
 
+    def test_queue_tag_scoped_clear_shares_order_across_tasks_with_extra_tags(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        release_plain = store.add("Release plain", tags=("release",))
+        release_backend = store.add("Release backend", tags=("release", "backend"))
+        release_docs = store.add("Release docs", tags=("release", "docs"))
+        ops_first = store.add("Ops first", tags=("ops", "infra"))
+        ops_second = store.add("Ops second", tags=("ops", "infra"))
+        assert release_plain.id is not None
+        assert release_backend.id is not None
+        assert release_docs.id is not None
+        assert ops_first.id is not None
+        assert ops_second.id is not None
+
+        assert run_gza("queue", "move", release_plain.id, "1", "--tag", "release", "--project", str(tmp_path)).returncode == 0
+        assert run_gza("queue", "move", release_backend.id, "2", "--tag", "release", "--project", str(tmp_path)).returncode == 0
+        assert run_gza("queue", "move", release_docs.id, "3", "--tag", "release", "--project", str(tmp_path)).returncode == 0
+        assert run_gza("queue", "move", ops_first.id, "1", "--project", str(tmp_path)).returncode == 0
+        assert run_gza("queue", "move", ops_second.id, "2", "--project", str(tmp_path)).returncode == 0
+
+        clear = run_gza(
+            "queue",
+            "clear",
+            release_backend.id,
+            "--tag",
+            "release",
+            "--project",
+            str(tmp_path),
+        )
+        assert clear.returncode == 0
+        assert "Cleared explicit queue order" in clear.stdout
+
+        refreshed_release_plain = store.get(release_plain.id)
+        refreshed_release_backend = store.get(release_backend.id)
+        refreshed_release_docs = store.get(release_docs.id)
+        refreshed_ops_first = store.get(ops_first.id)
+        refreshed_ops_second = store.get(ops_second.id)
+        assert refreshed_release_plain is not None
+        assert refreshed_release_backend is not None
+        assert refreshed_release_docs is not None
+        assert refreshed_ops_first is not None
+        assert refreshed_ops_second is not None
+
+        assert refreshed_release_plain.queue_position == 1
+        assert refreshed_release_backend.queue_position is None
+        assert refreshed_release_docs.queue_position == 2
+        assert refreshed_ops_first.queue_position == 1
+        assert refreshed_ops_second.queue_position == 2
+
     def test_next_shows_explicitly_ordered_task_first(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)

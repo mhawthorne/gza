@@ -342,6 +342,25 @@ class TestTaskChaining:
         assert refreshed_ops_first.queue_position == 1
         assert refreshed_ops_second.queue_position == 2
 
+        store.clear_queue_position(release_backend.id, tags=("release",))
+
+        refreshed_release_plain = store.get(release_plain.id)
+        refreshed_release_backend = store.get(release_backend.id)
+        refreshed_release_docs = store.get(release_docs.id)
+        refreshed_ops_first = store.get(ops_first.id)
+        refreshed_ops_second = store.get(ops_second.id)
+        assert refreshed_release_plain is not None
+        assert refreshed_release_backend is not None
+        assert refreshed_release_docs is not None
+        assert refreshed_ops_first is not None
+        assert refreshed_ops_second is not None
+
+        assert refreshed_release_plain.queue_position == 1
+        assert refreshed_release_backend.queue_position is None
+        assert refreshed_release_docs.queue_position == 2
+        assert refreshed_ops_first.queue_position == 1
+        assert refreshed_ops_second.queue_position == 2
+
     def test_get_pending_pickup_excludes_non_pickable_pending_tasks(self, tmp_path: Path):
         """Pickup listing excludes internal and dependency-blocked pending tasks."""
         db_path = tmp_path / "test.db"
