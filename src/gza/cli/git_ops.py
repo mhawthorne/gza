@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import gza.colors as _colors
@@ -20,7 +21,7 @@ from ..console import (
     prompt_available_width,
     shorten_prompt,
 )
-from ..db import SqliteTaskStore, Task as DbTask
+from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..git import (
     Git,
     GitError,
@@ -1308,12 +1309,116 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 def _unimplemented_implement_prompt(task: DbTask) -> str:
-    """Build the default implement prompt for a completed upstream task."""
+    """Build the default implement prompt for an upstream source task."""
     assert task.id is not None
     slug = _get_base_task_slug(task)
     if task.task_type == "plan":
         return f"Implement plan from task {task.id}: {slug}" if slug else f"Implement plan from task {task.id}"
     return f"Implement findings from task {task.id}: {slug}" if slug else f"Implement findings from task {task.id}"
+
+
+def _normalize_task_created_at(value: datetime | None) -> datetime:
+    if not isinstance(value, datetime):
+        return datetime.min
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _unimplemented_target_sort_key(task: DbTask) -> tuple[datetime, int]:
+    return (_normalize_task_created_at(task.created_at), task_id_numeric_key(task.id))
+
+
+def _is_directly_implementable_plan(task: DbTask) -> bool:
+    """Return True when the row can be handed directly to `gza implement`."""
+    return task.task_type == "plan" and task.status == "completed"
+
+
+def _unimplemented_status_label(task: DbTask) -> str:
+    """Render task type and status for the unimplemented source list."""
+    status = task.status or "pending"
+    return f"[{task.task_type}] ({status})"
+
+
+def _unimplemented_followup_command(task: DbTask) -> str:
+    """Return truthful operator guidance for one listed source row."""
+    assert task.id is not None
+    if _is_directly_implementable_plan(task):
+        return f"gza implement {task.id}"
+    return "gza advance --unimplemented --create"
+
+
+def _get_unimplemented_lineage_root(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    task_cache: dict[str, DbTask],
+) -> DbTask:
+    """Walk to the absolute based_on root so each lineage tree is processed once."""
+    assert task.id is not None
+
+    current = task
+    while current.based_on:
+        parent = task_cache.get(current.based_on)
+        if parent is None:
+            parent = store.get(current.based_on)
+            if parent is None or parent.id is None:
+                break
+            task_cache[parent.id] = parent
+        current = parent
+
+    return current
+
+
+def _resolve_unimplemented_source_targets(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    impl_source_ids: set[str],
+    task_types: tuple[str, ...],
+    task_cache: dict[str, DbTask],
+    children_cache: dict[str, list[DbTask]],
+    frontier_cache: dict[str, tuple[list[DbTask], bool]],
+) -> list[DbTask]:
+    """Resolve the newest unimplemented plan/explore source rows for each lineage branch."""
+
+    def _walk(current: DbTask) -> tuple[list[DbTask], bool]:
+        assert current.id is not None
+        cached = frontier_cache.get(current.id)
+        if cached is not None:
+            return cached
+
+        task_cache[current.id] = current
+        children = children_cache.get(current.id)
+        if children is None:
+            children = store.get_based_on_children(current.id)
+            children_cache[current.id] = children
+        for child in children:
+            if child.id is not None:
+                task_cache[child.id] = child
+
+        child_targets: list[DbTask] = []
+        has_implement_in_subtree = current.task_type == "implement" or current.id in impl_source_ids
+
+        for child in children:
+            if child.id is None:
+                continue
+            branch_targets, branch_has_implement = _walk(child)
+            child_targets.extend(branch_targets)
+            has_implement_in_subtree = has_implement_in_subtree or branch_has_implement
+
+        if child_targets:
+            result = child_targets
+        elif current.task_type in task_types and current.id not in impl_source_ids and not has_implement_in_subtree:
+            result = [current]
+        else:
+            result = []
+
+        frontier_cache[current.id] = (result, has_implement_in_subtree)
+        return frontier_cache[current.id]
+
+    targets, _ = _walk(task)
+    return targets
 
 
 def _cmd_advance_unimplemented(
@@ -1323,41 +1428,68 @@ def _cmd_advance_unimplemented(
     create: bool = False,
     task_types: tuple[str, ...] = ("plan", "explore"),
 ) -> int:
-    """List completed task types that have no implementation task.
+    """List plan/explore lineages that do not yet have an implementation task.
 
-    With --create, creates queued implement tasks for each such task.
+    With --create, queues implement tasks for each listed plan/explore source row.
     """
     all_completed: list[DbTask] = []
     for task_type in task_types:
         all_completed.extend(store.get_history(limit=None, status="completed", task_type=task_type))
 
-    # Find tasks that have no implement task pointing at them (via based_on).
-    # Use a targeted query instead of a full table scan to avoid loading every
-    # task (including output_content blobs) into memory.
-    impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
+    # Find the current unimplemented source frontier for each lineage tree. A newer
+    # descendant source row can replace its own ancestors, but sibling branches stay
+    # independently eligible and implement tasks are never shown directly.
+    impl_source_ids: set[str] = store.get_impl_based_on_ids()
+    task_cache = {task.id: task for task in all_completed if task.id is not None}
+    children_cache: dict[str, list[DbTask]] = {}
+    frontier_cache: dict[str, tuple[list[DbTask], bool]] = {}
+    covered_root_ids: set[str] = set()
+    pending_tasks: list[DbTask] = []
 
-    pending_tasks = [task for task in all_completed if task.id not in impl_based_on_ids]
+    for task in all_completed:
+        assert task.id is not None
+        root = _get_unimplemented_lineage_root(store, task, task_cache=task_cache)
+        assert root.id is not None
+        if root.id in covered_root_ids:
+            continue
+        covered_root_ids.add(root.id)
+        pending_tasks.extend(
+            _resolve_unimplemented_source_targets(
+                store,
+                root,
+                impl_source_ids=impl_source_ids,
+                task_types=task_types,
+                task_cache=task_cache,
+                children_cache=children_cache,
+                frontier_cache=frontier_cache,
+            )
+        )
 
     if not pending_tasks:
         task_label = "/".join(task_types)
-        print(f"No completed {task_label} tasks without implementation tasks.")
+        print(f"No {task_label} lineages without implementation tasks.")
         return 0
 
     task_label = "/".join(task_types)
-    print(f"Completed {task_label} tasks without implementation ({len(pending_tasks)}):")
+    print(f"{task_label.capitalize()} lineages without implementation ({len(pending_tasks)}):")
     print()
     for task in pending_tasks:
         assert task.id is not None
-        prefix_len = len(f"  {task.id}  [{task.task_type}] ")
+        status_label = _unimplemented_status_label(task)
+        prefix_len = len(f"  {task.id}  {status_label} ")
         prompt_display = shorten_prompt(task.prompt, prompt_available_width(prefix=prefix_len))
-        print(f"  {task.id}  [{task.task_type}] {prompt_display}")
-        print(f"       → gza implement {task.id}")
+        print(f"  {task.id}  {status_label} {prompt_display}")
+        print(f"       → {_unimplemented_followup_command(task)}")
     print()
 
     if not create:
-        print("Run 'gza advance' to create and start implement tasks for completed plan tasks.")
-        if "explore" in task_types:
-            print("Run 'gza advance --unimplemented --create' to create implement tasks for completed explore tasks.")
+        if any(_is_directly_implementable_plan(task) for task in pending_tasks):
+            print("Completed plan rows can be run directly with 'gza implement <task_id>' or auto-started with 'gza advance'.")
+        if any(not _is_directly_implementable_plan(task) for task in pending_tasks):
+            print(
+                "Use 'gza advance --unimplemented --create' to queue implement tasks "
+                "for listed explore rows or incomplete source descendants."
+            )
         return 0
 
     # Create queued implement tasks

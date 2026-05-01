@@ -567,7 +567,7 @@ def main() -> int:
     advance_parser.add_argument(
         "--unimplemented",
         action="store_true",
-        help="List completed plans/explores with no implementation task yet",
+        help="List plan/explore source rows without implementation, preferring newer descendants per branch",
     )
     advance_parser.add_argument(
         "--plans",
@@ -577,7 +577,7 @@ def main() -> int:
     advance_parser.add_argument(
         "--create",
         action="store_true",
-        help="With --unimplemented: create queued implement tasks for listed tasks",
+        help="With --unimplemented: queue implement tasks for the listed source rows",
     )
     advance_parser.add_argument(
         "--auto",

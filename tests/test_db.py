@@ -3587,7 +3587,7 @@ class TestRunStepPersistence:
 
 
 def test_get_impl_based_on_ids_returns_targeted_set(tmp_path: Path):
-    """get_impl_based_on_ids returns only based_on IDs from implement tasks."""
+    """get_impl_based_on_ids returns source IDs referenced by implement tasks."""
     store = SqliteTaskStore(tmp_path / "test.db")
 
     plan1 = store.add("Plan 1", task_type="plan")
@@ -3595,8 +3595,9 @@ def test_get_impl_based_on_ids_returns_targeted_set(tmp_path: Path):
     plan3 = store.add("Plan 3", task_type="plan")
     assert plan1.id is not None and plan2.id is not None and plan3.id is not None
 
-    # Only plan1 has an implement task based on it
+    # plan1 is implemented via based_on and plan2 via depends_on.
     store.add("Impl 1", task_type="implement", based_on=plan1.id)
+    store.add("Impl 2", task_type="implement", depends_on=plan2.id)
     # A review task with based_on should NOT be included
     store.add("Review of plan2", task_type="review", based_on=plan2.id)
     # A plain task with no based_on
@@ -3604,7 +3605,7 @@ def test_get_impl_based_on_ids_returns_targeted_set(tmp_path: Path):
 
     result = store.get_impl_based_on_ids()
 
-    assert result == {plan1.id}
+    assert result == {plan1.id, plan2.id}
 
 def test_get_impl_based_on_ids_empty_db(tmp_path: Path):
     """get_impl_based_on_ids returns empty set when no implement tasks exist."""

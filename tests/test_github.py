@@ -94,7 +94,6 @@ class TestIsAvailable:
 
         mock_run.assert_called_once_with("auth", "status", check=False)
 
-
 class TestCreatePR:
     """Tests for GitHub.create_pr() method."""
 
