@@ -4,10 +4,13 @@ import argparse
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call
 
 import pytest
 
 from gza.cli import tv as tv_module
+from gza.db import Task
 
 from .conftest import make_store, run_gza, setup_config
 
@@ -521,3 +524,59 @@ def test_tv_parser_path_renders_header_for_fixed_slot_flag(monkeypatch, tmp_path
 def test_lines_per_panel_reserves_header_row(monkeypatch):
     monkeypatch.setattr(tv_module, "_get_terminal_size", lambda: os.terminal_size((120, 20)))
     assert tv_module._lines_per_panel(2) == 6
+
+
+def _explicit_id_args(tmp_path: Path, task_id: str) -> argparse.Namespace:
+    return argparse.Namespace(project_dir=tmp_path, task_ids=[task_id], number=None, min_slots=None, max_slots=None)
+
+
+def test_cmd_tv_skips_refresh_for_displayed_task_without_id(monkeypatch, tmp_path: Path) -> None:
+    """Refresh loop should not call store.get(None) when a displayed task has no ID."""
+    task = Task(id=None, prompt="Task without id", status="completed")
+    store = MagicMock()
+    store.get = MagicMock(return_value=task)
+
+    monkeypatch.setattr(tv_module.Config, "load", lambda _project_dir: SimpleNamespace(workers_path=tmp_path / "workers"))
+    monkeypatch.setattr(tv_module, "get_store", lambda _config: store)
+    monkeypatch.setattr(tv_module, "WorkerRegistry", lambda _path: MagicMock())
+    monkeypatch.setattr(tv_module, "resolve_id", lambda _store, _raw_id: "gza-1")
+    monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(tv_module, "_render_all", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(tv_module, "Live", _FakeLive)
+    monkeypatch.setattr(tv_module, "_sleep", lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt))
+
+    rc = tv_module.cmd_tv(_explicit_id_args(tmp_path, "gza-1"))
+
+    assert rc == 0
+    assert store.get.call_args_list == [call("gza-1")]
+
+
+def test_cmd_tv_reresolves_missing_log_path_during_refresh(monkeypatch, tmp_path: Path) -> None:
+    """Refresh loop should re-resolve log path when previously discovered path is missing."""
+    task = Task(id="gza-2", prompt="Task with missing log", status="completed")
+    missing_log = tmp_path / "missing.log"
+    store = MagicMock()
+    store.get = MagicMock(side_effect=[task, task])
+    resolve_log = MagicMock(side_effect=[(missing_log, None), (None, None)])
+    sleep_calls = 0
+
+    def fake_sleep(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(tv_module.Config, "load", lambda _project_dir: SimpleNamespace(workers_path=tmp_path / "workers"))
+    monkeypatch.setattr(tv_module, "get_store", lambda _config: store)
+    monkeypatch.setattr(tv_module, "WorkerRegistry", lambda _path: MagicMock())
+    monkeypatch.setattr(tv_module, "resolve_id", lambda _store, _raw_id: "gza-2")
+    monkeypatch.setattr(tv_module, "_resolve_task_log_path", resolve_log)
+    monkeypatch.setattr(tv_module, "_render_all", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(tv_module, "Live", _FakeLive)
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
+
+    rc = tv_module.cmd_tv(_explicit_id_args(tmp_path, "gza-2"))
+
+    assert rc == 0
+    assert resolve_log.call_count == 2
+    assert store.get.call_args_list == [call("gza-2"), call("gza-2")]
