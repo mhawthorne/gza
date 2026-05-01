@@ -240,6 +240,14 @@ case " $* " in
 esac
 
 case " $* " in
+    *" -c check_for_update_on_startup=false "*) ;;
+    *)
+        echo "codex must disable startup update checks for scripted execution" >&2
+        exit 1
+        ;;
+esac
+
+case " $* " in
     *" --dangerously-bypass-approvals-and-sandbox "*) ;;
     *)
         echo "codex must run in non-interactive auto mode" >&2
@@ -345,17 +353,16 @@ test_conflict_loop_with_claude() {
 
 test_conflict_loop_with_codex_uses_supported_headless_exec_flags() {
     local case_dir
+    local expected_args
     case_dir=$(run_script_case "conflict_loop" "codex")
+    expected_args="-c check_for_update_on_startup=false exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C $REPO_ROOT -"
 
     assert_eq "$(cat "$case_dir/exit_status")" "0" "codex conflict flow should succeed"
     assert_eq "$(cat "$case_dir/state/codex_count")" "2" "codex should resolve each conflict round"
     assert_eq "$(cat "$case_dir/state/push_count")" "1" "codex conflict flow should return to scripted push"
     assert_eq "$(cat "$case_dir/state/continue_index")" "2" "script should continue rebases after codex exits"
     assert_file_contains "$case_dir/state/codex_prompt_1.txt" "Do not run git push." "codex prompt should keep push in the shell script"
-    assert_file_contains "$case_dir/state/codex_args_1.txt" "exec --json" "codex should run in supported headless exec --json mode"
-    assert_file_contains "$case_dir/state/codex_args_1.txt" "--dangerously-bypass-approvals-and-sandbox" "codex should bypass approvals in headless mode"
-    assert_file_contains "$case_dir/state/codex_args_1.txt" "--skip-git-repo-check" "codex should skip repo checks in detached contexts"
-    assert_file_contains "$case_dir/state/codex_args_1.txt" "-C $REPO_ROOT" "codex should set the repo root as its working directory"
+    assert_eq "$(cat "$case_dir/state/codex_args_1.txt")" "$expected_args" "codex should use the repo-supported headless exec contract"
     assert_file_not_contains "$case_dir/state/codex_args_1.txt" "--dangerously-work" "codex should not use the unsupported dangerously-work flag"
 }
 
