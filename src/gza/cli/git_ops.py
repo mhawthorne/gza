@@ -1348,54 +1348,29 @@ def _unimplemented_followup_command(task: DbTask) -> str:
     return "gza advance --unimplemented --create"
 
 
-def _collect_unimplemented_lineage_component(
+def _get_unimplemented_lineage_root(
     store: SqliteTaskStore,
     task: DbTask,
     *,
     task_cache: dict[str, DbTask],
-    children_cache: dict[str, list[DbTask]],
-) -> list[DbTask]:
-    """Collect the based_on-connected lineage component for an unimplemented source task."""
+) -> DbTask:
+    """Walk to the absolute based_on root so each lineage tree is processed once."""
     assert task.id is not None
 
-    component: list[DbTask] = []
-    queue: list[DbTask] = [task]
-    seen_ids: set[str] = set()
+    current = task
+    while current.based_on:
+        parent = task_cache.get(current.based_on)
+        if parent is None:
+            parent = store.get(current.based_on)
+            if parent is None or parent.id is None:
+                break
+            task_cache[parent.id] = parent
+        current = parent
 
-    while queue:
-        current = queue.pop(0)
-        assert current.id is not None
-        if current.id in seen_ids:
-            continue
-        seen_ids.add(current.id)
-        component.append(current)
-        task_cache[current.id] = current
-
-        parent_id = current.based_on
-        if parent_id:
-            parent = task_cache.get(parent_id)
-            if parent is None:
-                parent = store.get(parent_id)
-                if parent is not None and parent.id is not None:
-                    task_cache[parent.id] = parent
-            if parent is not None and parent.id is not None and parent.id not in seen_ids:
-                queue.append(parent)
-
-        children = children_cache.get(current.id)
-        if children is None:
-            children = store.get_based_on_children(current.id)
-            children_cache[current.id] = children
-            for child in children:
-                if child.id is not None:
-                    task_cache[child.id] = child
-        for child in children:
-            if child.id is not None and child.id not in seen_ids:
-                queue.append(child)
-
-    return component
+    return current
 
 
-def _resolve_unimplemented_source_target(
+def _resolve_unimplemented_source_targets(
     store: SqliteTaskStore,
     task: DbTask,
     *,
@@ -1403,26 +1378,47 @@ def _resolve_unimplemented_source_target(
     task_types: tuple[str, ...],
     task_cache: dict[str, DbTask],
     children_cache: dict[str, list[DbTask]],
-) -> tuple[DbTask | None, set[str]]:
-    """Resolve the preferred plan/explore task to show for one source lineage."""
-    component = _collect_unimplemented_lineage_component(
-        store,
-        task,
-        task_cache=task_cache,
-        children_cache=children_cache,
-    )
-    component_ids = {candidate.id for candidate in component if candidate.id is not None}
-    source_tasks = [candidate for candidate in component if candidate.task_type in task_types]
-    source_ids = {candidate.id for candidate in source_tasks if candidate.id is not None}
+    frontier_cache: dict[str, tuple[list[DbTask], bool]],
+) -> list[DbTask]:
+    """Resolve the newest unimplemented plan/explore source rows for each lineage branch."""
 
-    if any(candidate.task_type == "implement" for candidate in component):
-        return None, component_ids
-    if source_ids & impl_based_on_ids:
-        return None, component_ids
-    if not source_tasks:
-        return None, component_ids
+    def _walk(current: DbTask) -> tuple[list[DbTask], bool]:
+        assert current.id is not None
+        cached = frontier_cache.get(current.id)
+        if cached is not None:
+            return cached
 
-    return max(source_tasks, key=_unimplemented_target_sort_key), component_ids
+        task_cache[current.id] = current
+        children = children_cache.get(current.id)
+        if children is None:
+            children = store.get_based_on_children(current.id)
+            children_cache[current.id] = children
+        for child in children:
+            if child.id is not None:
+                task_cache[child.id] = child
+
+        child_targets: list[DbTask] = []
+        has_implement_in_subtree = current.task_type == "implement"
+
+        for child in children:
+            if child.id is None:
+                continue
+            branch_targets, branch_has_implement = _walk(child)
+            child_targets.extend(branch_targets)
+            has_implement_in_subtree = has_implement_in_subtree or branch_has_implement
+
+        if child_targets:
+            result = child_targets
+        elif current.task_type in task_types and current.id not in impl_based_on_ids and not has_implement_in_subtree:
+            result = [current]
+        else:
+            result = []
+
+        frontier_cache[current.id] = (result, has_implement_in_subtree)
+        return frontier_cache[current.id]
+
+    targets, _ = _walk(task)
+    return targets
 
 
 def _cmd_advance_unimplemented(
@@ -1440,31 +1436,34 @@ def _cmd_advance_unimplemented(
     for task_type in task_types:
         all_completed.extend(store.get_history(limit=None, status="completed", task_type=task_type))
 
-    # Find source lineages that have no implement task pointing at any plan/explore
-    # task in the based_on-connected component. Prefer the newest plan/explore
-    # descendant so the listing surfaces the truer implementation target without
-    # ever showing implement tasks directly.
+    # Find the current unimplemented source frontier for each lineage tree. A newer
+    # descendant source row can replace its own ancestors, but sibling branches stay
+    # independently eligible and implement tasks are never shown directly.
     impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
     task_cache = {task.id: task for task in all_completed if task.id is not None}
     children_cache: dict[str, list[DbTask]] = {}
-    covered_ids: set[str] = set()
+    frontier_cache: dict[str, tuple[list[DbTask], bool]] = {}
+    covered_root_ids: set[str] = set()
     pending_tasks: list[DbTask] = []
 
     for task in all_completed:
         assert task.id is not None
-        if task.id in covered_ids:
+        root = _get_unimplemented_lineage_root(store, task, task_cache=task_cache)
+        assert root.id is not None
+        if root.id in covered_root_ids:
             continue
-        preferred_task, component_ids = _resolve_unimplemented_source_target(
-            store,
-            task,
-            impl_based_on_ids=impl_based_on_ids,
-            task_types=task_types,
-            task_cache=task_cache,
-            children_cache=children_cache,
+        covered_root_ids.add(root.id)
+        pending_tasks.extend(
+            _resolve_unimplemented_source_targets(
+                store,
+                root,
+                impl_based_on_ids=impl_based_on_ids,
+                task_types=task_types,
+                task_cache=task_cache,
+                children_cache=children_cache,
+                frontier_cache=frontier_cache,
+            )
         )
-        covered_ids.update(component_ids)
-        if preferred_task is not None:
-            pending_tasks.append(preferred_task)
 
     if not pending_tasks:
         task_label = "/".join(task_types)

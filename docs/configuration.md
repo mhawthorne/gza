@@ -1347,7 +1347,7 @@ gza advance [task_id] [options]
 | `--max N` | Limit the number of tasks to advance |
 | `--no-docker` | Run workers directly instead of in Docker |
 | `--force` | Skip dependency merge precondition checks when advance starts workers |
-| `--unimplemented` | List plan/explore lineages whose latest source task has no implementation task yet |
+| `--unimplemented` | List unimplemented plan/explore source rows, preferring newer descendants within each lineage branch |
 | `--create` | With `--unimplemented`: queue implement tasks for the listed source rows |
 | `--auto`, `-y` | Skip confirmation and execute immediately |
 | `--batch B` | Stop after spawning B background workers |
@@ -1359,10 +1359,10 @@ gza advance [task_id] [options]
 | `--squash-threshold N` | Squash-merge branches with N or more commits (0 disables) |
 
 `--unimplemented` stays restricted to `plan` and `explore` lineages. It may surface a newer pending
-`plan`/`explore` descendant instead of an older completed ancestor, but it never shows `implement`
-descendants directly. Only completed plan rows are directly runnable with `uv run gza implement <id>`;
-use `uv run gza advance --unimplemented --create` to queue implement tasks for explore rows or
-incomplete source descendants.
+or completed `plan`/`explore` descendant instead of an older ancestor on the same branch, while
+keeping sibling branches as separate source rows. It never shows `implement` tasks directly.
+Only completed plan rows are directly runnable with `uv run gza implement <id>`; use `uv run gza advance --unimplemented --create` to queue implement tasks
+for explore rows or incomplete source descendants.
 
 ### iterate
 
