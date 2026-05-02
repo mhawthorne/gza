@@ -8,6 +8,7 @@ import pytest
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.github import PullRequestDetails
 
 from .conftest import (
     make_store,
@@ -231,6 +232,55 @@ class TestPrCommand:
         assert "PR already exists: #42" in output
         ensure_pr.assert_called_once()
 
+    def test_pr_reuses_existing_pr_without_generating_pr_content(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """`gza pr` should short-circuit existing PR reuse before spawning PR-content work."""
+        from gza.cli.git_ops import cmd_pr
+
+        store, task = self._make_completed_pr_task(
+            tmp_path,
+            branch="feature/existing-pr",
+        )
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git.needs_push.return_value = False
+        git.is_merged.return_value = False
+
+        gh = Mock()
+        gh.is_available.return_value = True
+        gh.get_pr_details.return_value = None
+        gh.discover_pr_by_branch.return_value = PullRequestDetails(
+            url="https://github.com/o/r/pull/55",
+            number=55,
+            state="open",
+            base_ref_name="main",
+        )
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(task.id),
+            title=None,
+            draft=False,
+        )
+
+        with (
+            patch("gza.cli.git_ops.get_store", return_value=store),
+            patch("gza.cli.git_ops.Git", return_value=git),
+            patch("gza.cli.git_ops.build_task_pr_content", side_effect=AssertionError("should not build PR content")),
+            patch("gza.pr_ops.GitHub", return_value=gh),
+        ):
+            rc = cmd_pr(args)
+
+        output = capsys.readouterr().out
+        assert rc == 0
+        assert "Generating PR description..." not in output
+        assert "PR already exists: https://github.com/o/r/pull/55" in output
+        assert [saved.task_type for saved in store.get_all()] == ["implement"]
+
     def test_pr_command_surfaces_lookup_failures_without_generic_create_message(
         self,
         tmp_path: Path,
@@ -273,7 +323,7 @@ class TestPrCommand:
         assert "Error creating PR" not in output
 
     def test_pr_command_uses_shared_pr_content_when_title_not_overridden(self, tmp_path: Path):
-        """`gza pr` should delegate default title/body generation to the shared helper."""
+        """`gza pr` should pass lazy shared PR-content generation into the helper."""
         from gza.cli.git_ops import cmd_pr
 
         store, task = self._make_completed_pr_task(
@@ -302,12 +352,14 @@ class TestPrCommand:
             patch("gza.cli.git_ops.ensure_task_pr", return_value=ensure_result) as ensure_pr,
         ):
             rc = cmd_pr(args)
+            ensure_pr.assert_called_once()
+            assert ensure_pr.call_args.kwargs["merged_behavior"] == "error"
+            assert ensure_pr.call_args.kwargs["draft"] is False
+            title, body = ensure_pr.call_args.kwargs["content_builder"]()
+            assert (title, body) == (shared_title, shared_body)
+            build_content.assert_called_once_with(task, git, Config.load(tmp_path), store, title_override=None)
 
         assert rc == 0
-        build_content.assert_called_once_with(task, git, Config.load(tmp_path), store)
-        ensure_pr.assert_called_once()
-        assert ensure_pr.call_args.kwargs["title"] == shared_title
-        assert ensure_pr.call_args.kwargs["body"] == shared_body
 
     def test_build_task_pr_content_title_override_preserves_existing_summary_body(self, tmp_path: Path):
         """Custom-title PR flows should keep the existing summary-body contract."""

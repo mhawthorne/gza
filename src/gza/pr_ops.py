@@ -1,6 +1,7 @@
 """Shared pull-request ensure/create flow for task branches."""
 
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
@@ -24,6 +25,7 @@ PrEnsureStatus = Literal[
     "create_failed",
 ]
 PrLookupStatus = Literal["cached", "existing", "missing", "gh_unavailable"]
+PrContentBuilder = Callable[[], tuple[str, str]]
 
 
 @dataclass(frozen=True)
@@ -240,8 +242,9 @@ def ensure_task_pr(
     store: SqliteTaskStore,
     git: Git,
     *,
-    title: str,
-    body: str,
+    title: str | None = None,
+    body: str | None = None,
+    content_builder: PrContentBuilder | None = None,
     draft: bool = False,
     merged_behavior: Literal["skip", "error"] = "skip",
 ) -> EnsureTaskPrResult:
@@ -296,6 +299,15 @@ def ensure_task_pr(
         if merged_behavior == "error":
             return EnsureTaskPrResult(ok=False, status="merged", error=default_branch)
         return EnsureTaskPrResult(ok=True, status="merged")
+
+    if title is None or body is None:
+        if content_builder is None:
+            return EnsureTaskPrResult(
+                ok=False,
+                status="create_failed",
+                error="PR content is required to create a PR",
+            )
+        title, body = content_builder()
 
     try:
         pr = gh.create_pr(

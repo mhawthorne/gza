@@ -14,7 +14,7 @@ import pytest
 from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError
-from gza.github import GitHubError
+from gza.github import GitHubError, PullRequestDetails
 from gza.lineage import get_plan_for_task
 from gza.providers import ClaudeProvider, RunResult
 from gza.providers.base import PreflightCheckResult
@@ -6122,7 +6122,7 @@ class TestExtractedRunInnerHelpers:
         assert summary_path.exists()
 
     def test_ensure_work_pr_creates_pr_for_committed_branch(self, tmp_path: Path):
-        """`work --pr` should create a PR when branch has commits and no PR exists."""
+        """`work --pr` should pass lazy shared PR-content generation into the helper."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Implement X", task_type="implement")
@@ -6145,12 +6145,15 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.ensure_task_pr", return_value=ensure_result) as ensure_pr,
         ):
             ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+            ensure_pr.assert_called_once()
+            assert "content_builder" in ensure_pr.call_args.kwargs
+            assert ensure_pr.call_args.kwargs["merged_behavior"] == "skip"
+            assert ensure_pr.call_args.kwargs["draft"] is False
+            title, body = ensure_pr.call_args.kwargs["content_builder"]()
+            assert (title, body) == ("Shared title", "Shared body")
+            build_content.assert_called_once_with(task, git, config, store)
 
         assert ok is True
-        build_content.assert_called_once_with(task, git, config, store)
-        ensure_pr.assert_called_once()
-        assert ensure_pr.call_args.kwargs["title"] == "Shared title"
-        assert ensure_pr.call_args.kwargs["body"] == "Shared body"
         git.needs_push.assert_not_called()
 
     def test_ensure_work_pr_skips_when_branch_has_no_commits(self, tmp_path: Path):
@@ -6190,6 +6193,40 @@ class TestExtractedRunInnerHelpers:
             ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
         assert ok is True
+
+    def test_ensure_work_pr_reuses_existing_pr_without_generating_pr_content(self, tmp_path: Path):
+        """`work --pr` should short-circuit existing PR reuse before spawning PR-content work."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/existing-pr"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 1
+        git.needs_push.return_value = False
+        git.is_merged.return_value = False
+
+        gh = Mock()
+        gh.is_available.return_value = True
+        gh.get_pr_details.return_value = None
+        gh.discover_pr_by_branch.return_value = PullRequestDetails(
+            url="https://github.com/o/r/pull/55",
+            number=55,
+            state="open",
+            base_ref_name="main",
+        )
+
+        with (
+            patch("gza.runner.build_task_pr_content", side_effect=AssertionError("should not build PR content")),
+            patch("gza.pr_ops.GitHub", return_value=gh),
+        ):
+            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        assert ok is True
+        assert [saved.task_type for saved in store.get_all()] == ["implement"]
 
     def test_ensure_work_pr_reuses_revalidated_cached_pr(self, tmp_path: Path):
         """`work --pr` should reuse cached PRs only after remote revalidation."""

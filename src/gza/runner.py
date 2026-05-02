@@ -1877,13 +1877,11 @@ def _ensure_work_pr_for_completed_code_task(
         print(f"Info: Task {task.id} has no commits on branch '{task.branch}', skipping PR creation")
         return True
 
-    title, body = build_task_pr_content(task, git, config, store)
     result = ensure_task_pr(
         task,
         store,
         git,
-        title=title,
-        body=body,
+        content_builder=lambda: build_task_pr_content(task, git, config, store),
         draft=False,
         merged_behavior="skip",
     )

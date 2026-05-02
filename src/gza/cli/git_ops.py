@@ -1188,25 +1188,11 @@ def cmd_pr(args: argparse.Namespace) -> int:
 
     default_branch = git.default_branch()
 
-    # Generate or use provided title/body
-    if args.title:
-        title, body = build_task_pr_content(
-            task,
-            git,
-            config,
-            store,
-            title_override=args.title,
-        )
-    else:
-        print("Generating PR description...")
-        title, body = build_task_pr_content(task, git, config, store)
-
     result = ensure_task_pr(
         task,
         store,
         git,
-        title=title,
-        body=body,
+        content_builder=lambda: _build_pr_content_for_cmd_pr(task, git, config, store, title_override=args.title),
         draft=args.draft,
         merged_behavior="error",
     )
@@ -1238,6 +1224,20 @@ def cmd_pr(args: argparse.Namespace) -> int:
         return 1
     print("Error creating PR")
     return 1
+
+
+def _build_pr_content_for_cmd_pr(
+    task,
+    git: Git,
+    config: Config,
+    store,
+    *,
+    title_override: str | None,
+) -> tuple[str, str]:
+    """Build PR content lazily so reused/skip paths avoid provider work."""
+    if title_override is None:
+        print("Generating PR description...")
+    return build_task_pr_content(task, git, config, store, title_override=title_override)
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
