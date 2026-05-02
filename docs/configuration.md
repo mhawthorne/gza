@@ -546,6 +546,9 @@ gza edit <task_id> [options]
 | `--prompt TEXT` | Set new prompt directly (use `-` for stdin) |
 | `--prompt-file FILE` | Read new prompt from file |
 
+Pending tasks may use any supported edit flag. Non-pending tasks may only use tag mutation flags (`--add-tag`, `--remove-tag`, `--clear-tags`, `--set-tags`, or deprecated `--group`).
+All other edit flags (`--based-on`, `--depends-on`, `--explore`, `--task`, `--review`, `--pr`, `--prompt`, `--prompt-file`, `--model`, `--provider`, and `--no-learnings`) remain pending-only.
+
 Non-conflicting edit mutations can be combined in one invocation. Tag mutation flags remain mutually exclusive with each other.
 
 ### log

@@ -241,6 +241,29 @@ class TestHelpOutput:
         assert "--pr" in docs_text
         assert "Create/reuse a GitHub PR for completed code tasks before auto-created review runs" in docs_text
 
+    def test_edit_help_and_docs_describe_non_pending_tag_only_restriction(self, tmp_path):
+        """`edit --help` and docs should both explain the non-pending tag-only contract."""
+        setup_config(tmp_path)
+
+        help_result = run_gza("edit", "--help", "--project", str(tmp_path))
+
+        assert help_result.returncode == 0
+        normalized_help = " ".join(help_result.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "Non-pending tasks may only use tag mutation flags" in normalized_help
+        assert "Non-pending tasks may only use tag mutation flags" in docs_text
+        assert "remain pending-only" in normalized_help
+        assert "remain pending-only" in docs_text
+
+        for flag in ("--add-tag", "--remove-tag", "--clear-tags", "--set-tags", "--group"):
+            assert flag in normalized_help
+            assert flag in docs_text
+
+        for flag in ("--based-on", "--depends-on", "--review", "--pr", "--prompt-file", "--model"):
+            assert flag in normalized_help
+            assert flag in docs_text
+
     def test_sync_help_and_docs_describe_explicit_git_and_github_reconciliation(self, tmp_path):
         """`sync --help` and docs should expose the new explicit reconciliation surface."""
         setup_config(tmp_path)

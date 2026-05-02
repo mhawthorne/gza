@@ -818,12 +818,6 @@ def cmd_edit(args: argparse.Namespace) -> int:
         print(f"Error: Task {task_id} not found")
         return 1
 
-    if task.status != "pending":
-        print(f"Error: Can only edit pending tasks (task is {task.status})")
-        return 1
-    assert task.id is not None
-    task_row_id = task.id
-
     tag_mutation_flags: list[str] = []
     if getattr(args, "clear_tags", False):
         tag_mutation_flags.append("--clear-tags")
@@ -843,12 +837,48 @@ def cmd_edit(args: argparse.Namespace) -> int:
         )
         return 1
 
+    prompt_file_arg = getattr(args, "prompt_file", None) if hasattr(args, "prompt_file") else None
+    prompt_arg = getattr(args, "prompt", None) if hasattr(args, "prompt") else None
+    pending_only_flags: list[str] = []
+    if prompt_file_arg is not None:
+        pending_only_flags.append("--prompt-file")
+    if prompt_arg is not None:
+        pending_only_flags.append("--prompt")
+    if getattr(args, "based_on_flag", None) is not None:
+        pending_only_flags.append("--based-on")
+    if getattr(args, "depends_on_flag", None) is not None:
+        pending_only_flags.append("--depends-on")
+    if getattr(args, "explore", False):
+        pending_only_flags.append("--explore")
+    if getattr(args, "task", False):
+        pending_only_flags.append("--task")
+    if getattr(args, "review", False):
+        pending_only_flags.append("--review")
+    if getattr(args, "create_pr", False):
+        pending_only_flags.append("--pr")
+    if getattr(args, "model", None) is not None:
+        pending_only_flags.append("--model")
+    if getattr(args, "provider", None) is not None:
+        pending_only_flags.append("--provider")
+    if getattr(args, "skip_learnings", False):
+        pending_only_flags.append("--no-learnings")
+
+    if task.status != "pending" and (pending_only_flags or not tag_mutation_flags):
+        print(
+            f"Error: Task {task_id} is {task.status}; non-pending tasks only allow "
+            "tag edits via --set-tags, --add-tag, --remove-tag, --clear-tags, or deprecated --group.",
+        )
+        if pending_only_flags:
+            print(f"Error: Pending-only edit flags requested: {', '.join(pending_only_flags)}")
+        return 1
+
+    assert task.id is not None
+    task_row_id = task.id
+
     if args.explore and args.task:
         print("Error: Cannot use both --explore and --task")
         return 1
 
-    prompt_file_arg = getattr(args, "prompt_file", None) if hasattr(args, "prompt_file") else None
-    prompt_arg = getattr(args, "prompt", None) if hasattr(args, "prompt") else None
     if prompt_file_arg is not None and prompt_arg is not None:
         print("Error: Cannot use both --prompt-file and --prompt")
         return 1

@@ -291,6 +291,79 @@ class TestEditCommand:
         assert "Traceback" not in result.stdout
         assert "Traceback" not in result.stderr
 
+    def test_edit_set_tags_allowed_for_completed_task(self, tmp_path: Path):
+        """Completed tasks should still allow tag-only edits."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Release task", tags=("backend",))
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("edit", str(task.id), "--set-tags", "release-1.2,ops", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Set tags for task" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.status == "completed"
+        assert updated.tags == ("ops", "release-1.2")
+
+    def test_edit_add_tag_allowed_for_failed_task(self, tmp_path: Path):
+        """Failed tasks should still allow tag-only edits."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Failed release task", tags=("backend",))
+        task.status = "failed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("edit", str(task.id), "--add-tag", "release-1.2", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Added tags for task" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.status == "failed"
+        assert updated.tags == ("backend", "release-1.2")
+
+    def test_edit_non_tag_mutation_stays_restricted_for_non_pending_task(self, tmp_path: Path):
+        """Non-pending tasks should reject prompt or metadata edits outside tag mutations."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Running task", tags=("backend",))
+        task.status = "in_progress"
+        task.started_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            "--add-tag",
+            "release-1.2",
+            "--review",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "non-pending tasks only allow tag edits" in result.stdout
+        assert "Pending-only edit flags requested: --review" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.status == "in_progress"
+        assert updated.create_review is False
+        assert updated.tags == ("backend",)
+
     def test_edit_review_flag(self, tmp_path: Path):
         """Edit command can enable automatic review task creation."""
 

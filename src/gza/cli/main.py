@@ -1386,7 +1386,18 @@ def main() -> int:
     add_common_args(add_parser)
 
     # edit command
-    edit_parser = subparsers.add_parser("edit", help="Edit a pending task's prompt or metadata")
+    edit_parser = subparsers.add_parser(
+        "edit",
+        help="Edit a task; non-pending tasks only support tag edits",
+        description="Edit an existing task. Pending tasks may use any supported edit flag.",
+        epilog=(
+            "Non-pending tasks may only use tag mutation flags "
+            "(`--add-tag`, `--remove-tag`, `--clear-tags`, `--set-tags`, or deprecated `--group`). "
+            "All other edit flags (`--based-on`, `--depends-on`, `--explore`, `--task`, "
+            "`--review`, `--pr`, `--prompt`, `--prompt-file`, `--model`, `--provider`, "
+            "and `--no-learnings`) remain pending-only."
+        ),
+    )
     edit_parser.add_argument(
         "task_id",
         type=str,
