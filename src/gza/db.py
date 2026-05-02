@@ -489,11 +489,13 @@ def _is_ignorable_migration_operational_error(exc: sqlite3.OperationalError) -> 
 def _is_readonly_operational_error(exc: sqlite3.OperationalError) -> bool:
     """Return True when sqlite reports read-only write failures."""
     message = str(exc).lower()
-    return (
-        "readonly" in message
-        or "read-only" in message
-        or "disk i/o error" in message
-    )
+    return "readonly" in message or "read-only" in message
+
+
+def _is_readonly_snapshot_operational_error(exc: sqlite3.OperationalError) -> bool:
+    """Return True for known read-only snapshot write failures seen in canonical unmerged refreshes."""
+    message = str(exc).lower()
+    return _is_readonly_operational_error(exc) or "disk i/o error" in message
 
 
 def _is_readonly_snapshot_operational_error(exc: sqlite3.OperationalError) -> bool:
