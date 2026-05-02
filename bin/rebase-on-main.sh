@@ -142,6 +142,7 @@ report_rebase_state_cleared_without_completion() {
 }
 
 resolve_rebase_conflicts() {
+    local agent_exit_status=0
     local rebase_completed_by_script=0
 
     while rebase_in_progress; do
@@ -151,7 +152,11 @@ resolve_rebase_conflicts() {
         show_conflicted_files
         echo ""
 
-        invoke_agent_for_conflicts
+        if invoke_agent_for_conflicts; then
+            agent_exit_status=0
+        else
+            agent_exit_status=$?
+        fi
 
         if ! rebase_in_progress; then
             if [[ "$rebase_completed_by_script" -eq 1 ]]; then
@@ -164,9 +169,19 @@ resolve_rebase_conflicts() {
 
         if [[ -n "$(list_conflicted_files)" ]]; then
             echo ""
-            echo -e "${RED}$SELECTED_AGENT exited, but conflicts are still present.${NC}"
+            if [[ "$agent_exit_status" -ne 0 ]]; then
+                echo -e "${RED}$SELECTED_AGENT exited with status $agent_exit_status, and conflicts are still present.${NC}"
+            else
+                echo -e "${RED}$SELECTED_AGENT exited, but conflicts are still present.${NC}"
+            fi
             echo "Resolve the remaining conflicts manually or abort with: git rebase --abort"
             return 1
+        fi
+
+        if [[ "$agent_exit_status" -ne 0 ]]; then
+            echo ""
+            echo -e "${YELLOW}$SELECTED_AGENT exited with status $agent_exit_status after resolving the current conflict set.${NC}"
+            echo "Attempting scripted git rebase --continue anyway."
         fi
 
         echo ""

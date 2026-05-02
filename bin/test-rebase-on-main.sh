@@ -149,20 +149,31 @@ case "$cmd" in
 
         if [[ "$target" == "--continue" ]]; then
             continue_index=$(cat "$STATE_DIR/continue_index")
-            if [[ "$scenario" != "conflict_loop" ]]; then
-                echo "unexpected rebase --continue" >&2
-                exit 1
-            fi
-            if [[ "$continue_index" == "0" ]]; then
-                printf '%s\n' "src/second.py" > "$STATE_DIR/conflicts"
-                printf '1' > "$STATE_DIR/continue_index"
-                exit 1
-            fi
-            rm -f "$STATE_DIR/conflicts"
-            rm -rf "$STATE_DIR/rebase-merge" "$STATE_DIR/rebase-apply"
-            printf '%s\n' "head-after" > "$STATE_DIR/head"
-            printf '2' > "$STATE_DIR/continue_index"
-            exit 0
+            case "$scenario" in
+                conflict_loop)
+                    if [[ "$continue_index" == "0" ]]; then
+                        printf '%s\n' "src/second.py" > "$STATE_DIR/conflicts"
+                        printf '1' > "$STATE_DIR/continue_index"
+                        exit 1
+                    fi
+                    rm -f "$STATE_DIR/conflicts"
+                    rm -rf "$STATE_DIR/rebase-merge" "$STATE_DIR/rebase-apply"
+                    printf '%s\n' "head-after" > "$STATE_DIR/head"
+                    printf '2' > "$STATE_DIR/continue_index"
+                    exit 0
+                    ;;
+                agent_nonzero_continue)
+                    rm -f "$STATE_DIR/conflicts"
+                    rm -rf "$STATE_DIR/rebase-merge" "$STATE_DIR/rebase-apply"
+                    printf '%s\n' "head-after" > "$STATE_DIR/head"
+                    printf '1' > "$STATE_DIR/continue_index"
+                    exit 0
+                    ;;
+                *)
+                    echo "unexpected rebase --continue" >&2
+                    exit 1
+                    ;;
+            esac
         fi
 
         if [[ "$scenario" == "no_conflict" ]]; then
@@ -216,6 +227,13 @@ esac
 rm -f "$STATE_DIR/conflicts"
 if [[ "$scenario" == "agent_abort" ]]; then
     rm -rf "$STATE_DIR/rebase-merge" "$STATE_DIR/rebase-apply"
+fi
+if [[ "$scenario" == "agent_nonzero_continue" ]]; then
+    exit 42
+fi
+if [[ "$scenario" == "agent_nonzero_unresolved" ]]; then
+    printf '%s\n' "src/first.py" > "$STATE_DIR/conflicts"
+    exit 43
 fi
 EOF
 
@@ -274,6 +292,13 @@ esac
 rm -f "$STATE_DIR/conflicts"
 if [[ "$scenario" == "agent_abort" ]]; then
     rm -rf "$STATE_DIR/rebase-merge" "$STATE_DIR/rebase-apply"
+fi
+if [[ "$scenario" == "agent_nonzero_continue" ]]; then
+    exit 42
+fi
+if [[ "$scenario" == "agent_nonzero_unresolved" ]]; then
+    printf '%s\n' "src/first.py" > "$STATE_DIR/conflicts"
+    exit 43
 fi
 EOF
 
@@ -377,9 +402,36 @@ test_agent_abort_does_not_report_rebase_success() {
     assert_file_not_contains "$case_dir/output.txt" "Rebase completed successfully!" "agent-abort flow must not report success"
 }
 
+test_agent_nonzero_after_resolving_conflicts_still_continues_rebase() {
+    local case_dir
+    case_dir=$(run_script_case "agent_nonzero_continue" "claude")
+
+    assert_eq "$(cat "$case_dir/exit_status")" "0" "nonzero agent exit after resolving conflicts should still succeed"
+    assert_eq "$(cat "$case_dir/state/claude_count")" "1" "recoverable nonzero path should invoke claude once"
+    assert_eq "$(cat "$case_dir/state/push_count")" "1" "recoverable nonzero path should still reach scripted push"
+    assert_eq "$(cat "$case_dir/state/continue_index")" "1" "recoverable nonzero path should continue the rebase in the shell script"
+    assert_file_contains "$case_dir/state/git.log" "-c core.editor=true rebase --continue" "recoverable nonzero path should still run git rebase --continue"
+    assert_file_contains "$case_dir/output.txt" "claude exited with status 42 after resolving the current conflict set." "recoverable nonzero path should report the agent failure explicitly"
+    assert_file_contains "$case_dir/output.txt" "Attempting scripted git rebase --continue anyway." "recoverable nonzero path should explain the scripted recovery step"
+}
+
+test_agent_nonzero_with_remaining_conflicts_reports_recovery_guidance() {
+    local case_dir
+    case_dir=$(run_script_case "agent_nonzero_unresolved" "claude")
+
+    assert_eq "$(cat "$case_dir/exit_status")" "1" "nonzero agent exit with remaining conflicts should fail cleanly"
+    assert_eq "$(cat "$case_dir/state/claude_count")" "1" "unresolved nonzero path should invoke claude once"
+    assert_eq "$(cat "$case_dir/state/push_count")" "0" "unresolved nonzero path should not push"
+    assert_file_contains "$case_dir/output.txt" "claude exited with status 43, and conflicts are still present." "unresolved nonzero path should report the agent exit status"
+    assert_file_contains "$case_dir/output.txt" "Resolve the remaining conflicts manually or abort with: git rebase --abort" "unresolved nonzero path should print explicit recovery guidance"
+    assert_file_not_contains "$case_dir/state/git.log" "-c core.editor=true rebase --continue" "unresolved nonzero path should not continue the rebase"
+}
+
 test_no_conflict_path
 test_conflict_loop_with_claude
 test_conflict_loop_with_codex_uses_supported_headless_exec_flags
 test_agent_abort_does_not_report_rebase_success
+test_agent_nonzero_after_resolving_conflicts_still_continues_rebase
+test_agent_nonzero_with_remaining_conflicts_reports_recovery_guidance
 
 echo "bin/rebase-on-main.sh targeted checks passed"
