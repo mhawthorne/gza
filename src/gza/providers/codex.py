@@ -349,6 +349,25 @@ class CodexProvider(Provider):
         on_step_count: Callable[[int], None] | None = None,
     ) -> RunResult:
         """Run Codex directly (no Docker)."""
+        cmd = self.build_noninteractive_command(config, work_dir, resume_session_id)
+
+        return self._run_with_output_parsing(
+            cmd, log_file, config.timeout_minutes, cwd=work_dir,
+            stdin_input=prompt, model=config.model,
+            max_steps=config.max_steps,
+            chat_text_display_length=config.chat_text_display_length,
+            on_session_id=on_session_id,
+            on_step_count=on_step_count,
+        )
+
+    @classmethod
+    def build_noninteractive_command(
+        cls,
+        config: Config,
+        work_dir: Path,
+        resume_session_id: str | None = None,
+    ) -> list[str]:
+        """Build the direct non-interactive Codex command used by headless callers."""
         cmd = [
             "timeout", f"{config.timeout_minutes}m",
         ]
@@ -366,7 +385,7 @@ class CodexProvider(Provider):
             # Add model if specified
             if config.model:
                 cmd.extend(["-m", config.model])
-            self._append_reasoning_effort_override(cmd, config.reasoning_effort)
+            cls._append_reasoning_effort_override(cmd, config.reasoning_effort)
         else:
             cmd.extend([
                 "codex",
@@ -381,16 +400,9 @@ class CodexProvider(Provider):
             # Add model if specified
             if config.model:
                 cmd.extend(["-m", config.model])
-            self._append_reasoning_effort_override(cmd, config.reasoning_effort)
+            cls._append_reasoning_effort_override(cmd, config.reasoning_effort)
 
-        return self._run_with_output_parsing(
-            cmd, log_file, config.timeout_minutes, cwd=work_dir,
-            stdin_input=prompt, model=config.model,
-            max_steps=config.max_steps,
-            chat_text_display_length=config.chat_text_display_length,
-            on_session_id=on_session_id,
-            on_step_count=on_step_count,
-        )
+        return cmd
 
     @staticmethod
     def _append_reasoning_effort_override(cmd: list[str], reasoning_effort: str) -> None:

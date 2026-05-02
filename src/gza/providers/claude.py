@@ -375,6 +375,22 @@ class ClaudeProvider(Provider):
 
         return args
 
+    @classmethod
+    def build_noninteractive_command(
+        cls,
+        config: Config,
+        work_dir: Path,
+        resume_session_id: str | None = None,
+    ) -> list[str]:
+        """Build the direct non-interactive Claude command used by headless callers."""
+        _ = work_dir
+        return [
+            "timeout",
+            f"{config.timeout_minutes}m",
+            "claude",
+            *cls._build_claude_args(config, resume_session_id),
+        ]
+
     def _run_docker_interactive(
         self,
         config: Config,
@@ -484,8 +500,7 @@ class ClaudeProvider(Provider):
         if getattr(config.tmux, "session_name", None):
             return self._run_direct_tmux(config, prompt, log_file, work_dir)
 
-        cmd = ["timeout", f"{config.timeout_minutes}m", "claude"]
-        cmd.extend(self._build_claude_args(config, resume_session_id))
+        cmd = self.build_noninteractive_command(config, work_dir, resume_session_id)
 
         return self._run_with_output_parsing(
             cmd, log_file, config.timeout_minutes, cwd=work_dir, stdin_input=prompt, model=config.model,

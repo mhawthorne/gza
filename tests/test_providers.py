@@ -178,6 +178,78 @@ class TestDockerConfig:
         mock_get_cfg.assert_called_once_with("myproj-gza-gemini")
 
 
+class TestSharedHeadlessCommands:
+    """Tests for shared provider CLI command builders."""
+
+    def test_claude_noninteractive_command_matches_headless_contract(self, tmp_path):
+        """Claude should expose one shared non-interactive argv contract."""
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            provider="claude",
+            timeout_minutes=7,
+            max_steps=23,
+            model="claude-sonnet-4",
+        )
+
+        cmd = ClaudeProvider.build_noninteractive_command(config, tmp_path)
+
+        assert cmd == [
+            "timeout",
+            "7m",
+            "claude",
+            "-p",
+            "-",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "claude-sonnet-4",
+            "--allowedTools",
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "Bash",
+            "--max-turns",
+            "23",
+        ]
+
+    def test_codex_noninteractive_command_matches_headless_contract(self, tmp_path):
+        """Codex should expose one shared non-interactive argv contract."""
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            provider="codex",
+            timeout_minutes=9,
+            max_steps=31,
+            model="gpt-5.3-codex",
+            reasoning_effort="high",
+        )
+
+        cmd = CodexProvider.build_noninteractive_command(config, tmp_path)
+
+        assert cmd == [
+            "timeout",
+            "9m",
+            "codex",
+            "-c",
+            "check_for_update_on_startup=false",
+            "exec",
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--skip-git-repo-check",
+            "-C",
+            str(tmp_path),
+            "-",
+            "-m",
+            "gpt-5.3-codex",
+            "-c",
+            "model_reasoning_effort=high",
+        ]
+
+
 class TestProviderCommandLogging:
     """Tests for provider command logging output."""
 
