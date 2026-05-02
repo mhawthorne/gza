@@ -35,11 +35,10 @@ build_agent_command() {
     local agent="$1"
     local project_root="$2"
     local work_dir="$3"
+    local output_file="$4"
 
-    local -a cmd=()
-    mapfile -d '' -t cmd < <(
-        PYTHONPATH="$project_root/src${PYTHONPATH:+:$PYTHONPATH}" \
-            uv run python - "$agent" "$project_root" "$work_dir" <<'PY'
+    PYTHONPATH="$project_root/src${PYTHONPATH:+:$PYTHONPATH}" \
+        uv run python - "$agent" "$project_root" "$work_dir" >"$output_file" <<'PY'
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -75,9 +74,6 @@ for arg in cmd:
     sys.stdout.buffer.write(arg.encode("utf-8"))
     sys.stdout.buffer.write(b"\0")
 PY
-    )
-
-    printf '%s\0' "${cmd[@]}"
 }
 
 LAST_AGENT_INVOCATION_PHASE=""
