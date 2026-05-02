@@ -493,9 +493,8 @@ def _is_readonly_operational_error(exc: sqlite3.OperationalError) -> bool:
 
 
 def _is_readonly_snapshot_operational_error(exc: sqlite3.OperationalError) -> bool:
-    """Return True for known read-only snapshot write failures seen in canonical unmerged refreshes."""
-    message = str(exc).lower()
-    return _is_readonly_operational_error(exc) or "disk i/o error" in message
+    """Return True for explicit sqlite read-only write failures."""
+    return _is_readonly_operational_error(exc)
 
 
 def _is_readonly_snapshot_operational_error(exc: sqlite3.OperationalError) -> bool:

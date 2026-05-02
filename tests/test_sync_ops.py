@@ -106,6 +106,8 @@ def test_reconcile_branch_merge_truth_marks_merged_without_persisting(tmp_path):
 def test_reconcile_branch_merge_truth_missing_local_branch_without_remote_proof_stays_unmerged(tmp_path):
     store = SqliteTaskStore(tmp_path / "test.db")
     task = _completed_branch_task(store, "Task", "feature/deleted")
+    task.merge_status = "merged"
+    store.update(task)
     cohort = BranchCohort(branch=task.branch, tasks=(task,))
 
     git = Mock()
