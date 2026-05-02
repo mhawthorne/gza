@@ -56,10 +56,10 @@ Auth priority in `_get_docker_config()`:
 
 ```bash
 # Test OAuth auth
-docker run --rm -v ~/.codex:/home/gza/.codex -v /tmp/test:/workspace -w /workspace gza-codex codex exec --json --skip-git-repo-check "Say hello"
+docker run --rm -v ~/.codex:/home/gza/.codex -v /tmp/test:/workspace -w /workspace gza-codex codex -c check_for_update_on_startup=false exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C /workspace "Say hello"
 
 # Test API key auth
-source ~/.gza/.env && docker run --rm -e CODEX_API_KEY="$CODEX_API_KEY" -v /tmp/test:/workspace -w /workspace gza-codex codex exec --json --skip-git-repo-check "Say hello"
+source ~/.gza/.env && docker run --rm -e CODEX_API_KEY="$CODEX_API_KEY" -v /tmp/test:/workspace -w /workspace gza-codex codex -c check_for_update_on_startup=false exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C /workspace "Say hello"
 
 # Check API key is passed
 docker run --rm -e CODEX_API_KEY="$CODEX_API_KEY" gza-codex sh -c 'echo "CODEX_API_KEY length: ${#CODEX_API_KEY}"'
