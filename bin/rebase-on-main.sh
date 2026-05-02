@@ -76,6 +76,25 @@ Important:
 EOF
 }
 
+build_codex_headless_exec_cmd() {
+    local work_dir="$1"
+    local args_output
+
+    # Keep the shell workflow on the same argv contract as the provider adapter.
+    args_output="$(uv run python - "$work_dir" <<'PY'
+from pathlib import Path
+import sys
+
+from gza.providers.codex import build_headless_exec_args
+
+for arg in build_headless_exec_args(Path(sys.argv[1])):
+    print(arg)
+PY
+)"
+
+    mapfile -t CODEX_HEADLESS_EXEC_CMD <<<"$args_output"
+}
+
 invoke_agent_for_conflicts() {
     local resolution_prompt
 
@@ -94,14 +113,10 @@ invoke_agent_for_conflicts() {
             --allowedTools 'Glob' \
             --allowedTools 'Grep'
     else
-        printf '%s\n' "$resolution_prompt" | codex \
-            -c check_for_update_on_startup=false \
-            exec \
-            --json \
-            --dangerously-bypass-approvals-and-sandbox \
-            --skip-git-repo-check \
-            -C "$(pwd)" \
-            -
+        local -a CODEX_HEADLESS_EXEC_CMD
+
+        build_codex_headless_exec_cmd "$(pwd)"
+        printf '%s\n' "$resolution_prompt" | codex "${CODEX_HEADLESS_EXEC_CMD[@]}"
     fi
 }
 

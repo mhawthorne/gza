@@ -5852,3 +5852,21 @@ class TestPreflightLogging:
             str(tmp_path),
             "-",
         ]
+
+    def test_codex_provider_spec_examples_match_shared_headless_exec_contract(self):
+        """Spec examples should stay aligned with the shared Codex headless exec argv."""
+        repo_root = Path(__file__).resolve().parents[1]
+        spec_text = (repo_root / "specs" / "codex-provider.md").read_text()
+        expected_cli = f"`codex {' '.join(build_headless_exec_args('<workdir>'))}`"
+
+        assert expected_cli in spec_text
+        assert "--dangerously-work" not in spec_text
+
+    def test_codex_debug_doc_examples_match_shared_headless_exec_contract(self):
+        """Debug docs should reuse the supported Codex headless exec argv verbatim."""
+        repo_root = Path(__file__).resolve().parents[1]
+        debug_doc_text = (repo_root / "docs" / "debug" / "codex-docker-investigation.md").read_text()
+        expected_subcommand = f"codex {' '.join(build_headless_exec_args('/workspace'))}"
+
+        assert debug_doc_text.count(expected_subcommand) == 2
+        assert "--dangerously-work" not in debug_doc_text
