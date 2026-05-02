@@ -229,6 +229,12 @@ if git merge --no-ff "$BRANCH" -m "Merge branch '$BRANCH'"; then
     echo ""
     echo -e "${GREEN}Merged $BRANCH into $MAIN_BRANCH.${NC}"
 else
+    if ! git diff --name-only --diff-filter=U | grep -q .; then
+        echo ""
+        echo -e "${RED}Merge failed before conflict resolution could start.${NC}"
+        exit 1
+    fi
+
     if ! command -v "$SELECTED_AGENT" >/dev/null 2>&1; then
         echo ""
         echo -e "${RED}Error: '$SELECTED_AGENT' CLI not found on PATH.${NC}"
