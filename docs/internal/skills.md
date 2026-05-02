@@ -41,13 +41,14 @@ Use `/gza-code-review-full` before a release or when you want a full quality ass
 
 ## gza-generate-commit-message
 
-**Generate a concise commit message for staged git changes using Claude.**
+**Generate a concise commit message for staged git changes using Codex by default, with Claude available as an override.**
 
 Use `/gza-generate-commit-message` after staging changes with `git add` to get a well-formatted commit message without writing it manually.
 
 **Key behaviors:**
 - Checks for staged changes first; exits with a message if nothing is staged
 - Reads `git diff --staged` and recent `git log` for style context
+- Uses Codex by default for generation; `--claude` preserves the legacy Claude path when needed
 - Outputs the raw commit message only — no explanations or markdown fences
 - Follows imperative mood convention ("Add", "Fix", "Update") and keeps the summary under 50 characters
 
