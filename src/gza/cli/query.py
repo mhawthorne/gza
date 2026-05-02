@@ -1101,7 +1101,6 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
             build_branch_cohorts_for_tasks(store, branch_candidates),
             target_branch=target_branch,
             include_diff_stats=True,
-            treat_missing_branch_as_merged=False,
         )
         first_live_error = next(
             (
