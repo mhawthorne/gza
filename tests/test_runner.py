@@ -7387,6 +7387,108 @@ class TestExtractedRunInnerHelpers:
         assert "Continuing with auto-review without PR sync." in output
         assert "Skipping auto-review" not in output
 
+    def test_post_complete_improve_gh_unavailable_still_runs_auto_review_without_noise(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Missing GitHub CLI should preserve historical improve auto-review behavior."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with review", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/improve-no-gh"
+        store.update(impl)
+
+        improve = store.add(
+            prompt="Improve with review",
+            task_type="improve",
+            based_on=impl.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+
+        with (
+            patch("gza.runner.sync_task_branch_if_live_pr", return_value=Mock(ok=False, status="gh_unavailable")),
+            patch("gza.runner._create_and_run_review_task", return_value=9) as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 9
+        run_review.assert_called_once_with(improve, config, store)
+        output = capsys.readouterr().out
+        assert "GitHub CLI is not available" not in output
+        assert "Skipping auto-review" not in output
+
+    def test_post_complete_improve_lookup_failure_warns_but_still_runs_auto_review(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Unconfirmed PR lookup failures should no longer block improve follow-up review."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with review", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/improve-lookup-failure"
+        store.update(impl)
+
+        improve = store.add(
+            prompt="Improve with review",
+            task_type="improve",
+            based_on=impl.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+
+        with (
+            patch(
+                "gza.runner.sync_task_branch_if_live_pr",
+                return_value=Mock(ok=False, status="lookup_failed", error="auth failed"),
+            ),
+            patch("gza.runner._create_and_run_review_task", return_value=7) as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 7
+        run_review.assert_called_once_with(improve, config, store)
+        output = capsys.readouterr().out
+        assert "could not look up a live PR" in output
+        assert "Continuing with auto-review without PR sync." in output
+        assert "Skipping auto-review" not in output
+
     def test_run_uses_persisted_create_pr_intent_without_work_flag(self, tmp_path: Path):
         """Stored task create_pr intent should drive the runner even without `work --pr`."""
         (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
