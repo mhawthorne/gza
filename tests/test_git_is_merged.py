@@ -61,8 +61,26 @@ class TestIsMergedMergeTreeBased:
             result = git.is_merged("deleted-branch", "main")
 
             assert result is True
-            # Verify only branch_exists was called
-            assert mock_run.call_count == 1
+            # Verify the generic-ref fallback also checked for a non-branch ref.
+            assert mock_run.call_count == 2
+
+    def test_remote_ref_is_checked_without_local_branch(self, tmp_path: Path):
+        """Remote refs should be treated as valid merge inputs for sync reconciliation."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=1),  # branch_exists
+                MagicMock(returncode=0),  # ref_exists
+                MagicMock(returncode=0, stdout="abc123def456"),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout="abc123def456"),  # rev-parse main^{tree}
+            ]
+
+            result = git.is_merged("origin/feature-branch", "main")
+
+            assert result is True
 
     def test_squash_merge_detected(self, tmp_path: Path):
         """Test that a squash-merged branch is detected as merged."""

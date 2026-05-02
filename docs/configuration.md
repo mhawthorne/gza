@@ -977,13 +977,21 @@ gza unmerged [options]
 | `--commits-only` | Backwards-compatible no-op retained in the CLI surface |
 | `--all` | Backwards-compatible no-op retained in the CLI surface |
 | `-n N` | Show last N unmerged tasks (default: 5, `0` for all) |
-| `--update` | Reconcile cached unmerged state against live git before listing; this is the opt-in mutating path that backfills `merge_status`, marks merged tasks, and refreshes diff stats relative to the default branch |
+| `--update` | Deprecated compatibility alias for the default default-branch refresh; plain `gza unmerged` already persists canonical merge truth before listing. Has no effect with `--into-current` or `--target` |
 | `--into-current` | Compare against the current branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 | `--target BRANCH` | Compare against the specified branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 
-By default, `gza unmerged` is read-only. It opens the task store in query-only mode, reads the canonical database view of completed tasks with `merge_status='unmerged'`, and suppresses stale rows that are already merged in git at read time. It does not backfill or persist `merge_status` unless you pass `--update`.
+`gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills legacy `merge_status` when needed, refreshes canonical branch-cohort merge truth from live git, persists normalized `merge_status` and diff stats, and then prints the reconciled default-branch unmerged list.
 
-`--update` only persists reconciliation when you are using the default-branch view. With `--into-current` or `--target`, `gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged.
+This is the deliberate narrow exception to the usual read-only query convention: only plain default-branch `gza unmerged` mutates, because its entire purpose is to answer the canonical question "what still needs to be merged?" without leaving stale cached rows behind.
+
+Deleted local feature branches are not treated as merge proof by themselves. Canonical reconciliation keeps them unmerged and visible until the target branch is explicitly proven to contain the changes, for example via a surviving `origin/<feature>` ref or merged PR metadata from `gza sync`.
+
+If the canonical default-branch refresh cannot persist because the database is read-only, `gza unmerged` fails with a targeted error instead of silently falling back to stale split-brain behavior.
+
+`--update` is deprecated because plain `gza unmerged` now does the canonical refresh automatically. During the compatibility window it behaves the same as plain `gza unmerged` for the default-branch view and prints a deprecation warning.
+
+With `--into-current` or `--target`, `gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged. `--update` has no effect in those modes beyond the deprecation warning. If a live branch comparison or diff-stat refresh fails for any branch, the command exits non-zero and does not print a potentially stale unmerged list from fallback state.
 
 For each unmerged implementation, output includes:
 - Branch diff/commit summary.
@@ -1461,7 +1469,7 @@ gza sync [task_id ...] [options]
 | `--pr-only` | Only reconcile PR metadata and stale-PR cleanup; skip git diff refresh |
 | `--no-fetch` | Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch |
 
-`gza sync` is the canonical explicit command for full GitHub-side reconciliation. It:
+Use `gza unmerged` for the daily "what still needs to be merged?" check. `gza sync` remains the broader explicit branch and PR reconciliation command. It:
 - dedupes work by branch and writes normalized state back to every same-branch task row that carries commits
 - refreshes cached `merge_status`, `diff_*` stats, `pr_number`, `pr_state`, and `pr_last_synced_at`
 - discovers PRs by branch for bounded candidates that need PR reconciliation
@@ -1469,7 +1477,7 @@ gza sync [task_id ...] [options]
 
 The only GitHub-side exception outside `gza sync` is improve completion with `--review`: before auto-running the follow-up review, gza may do a narrow branch-scoped live-PR check and push for that same branch. It does not replace `gza sync` for broader cache refresh, merge-state reconciliation, or stale-PR cleanup.
 
-Default `gza sync` scope is intentionally bounded. It includes unresolved branches, tasks with known or unknown open-PR cache state, and recently touched PR-intended work. Pass explicit task IDs to force-sync specific branch cohorts outside that default window.
+Default `gza sync` scope is intentionally bounded. It includes unresolved branches, tasks with known or unknown open-PR cache state, and recently touched PR-intended work. Pass explicit task IDs to force-sync specific branch cohorts outside that default window. That bounded scope is acceptable because `gza sync` is no longer the primary daily merge-truth refresh surface.
 
 ### tv
 

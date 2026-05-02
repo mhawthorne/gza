@@ -174,6 +174,11 @@ class Git:
         """
         self._run("fetch", remote)
 
+    def remote_exists(self, remote: str = "origin") -> bool:
+        """Return True when a named git remote is configured."""
+        result = self._run("remote", "get-url", remote, check=False)
+        return result.returncode == 0
+
     def create_branch(self, branch: str, force: bool = False) -> None:
         """Create and checkout a new branch."""
         if force:
@@ -555,9 +560,10 @@ class Git:
         if into is None:
             into = self.default_branch()
 
-        # Check if branch exists
-        if not self.branch_exists(branch):
-            return True  # Branch deleted, assume merged
+        # Accept either a local branch name or any other resolvable ref
+        # (for example ``origin/feature`` during canonical sync reconciliation).
+        if not self.branch_exists(branch) and not self.ref_exists(branch):
+            return True  # Ref deleted, assume merged
 
         if use_cherry:
             # Legacy method: Use git cherry to detect if commits have been applied

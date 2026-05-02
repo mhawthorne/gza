@@ -4,8 +4,17 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock, patch
 
 from gza.db import SqliteTaskStore
+from gza.git import GitError
 from gza.github import GitHubError, PullRequestDetails
-from gza.sync_ops import BranchCohort, build_branch_cohorts_for_task_ids, sync_branch_cohorts
+from gza.sync_ops import (
+    BranchCohort,
+    build_branch_cohorts_for_task_ids,
+    build_task_branch_cohort,
+    build_unmerged_branch_cohorts,
+    reconcile_branch_merge_truth,
+    reconcile_task_branch_merge_truth,
+    sync_branch_cohorts,
+)
 
 
 def _completed_branch_task(store: SqliteTaskStore, prompt: str, branch: str):
@@ -38,6 +47,106 @@ def test_build_branch_cohorts_for_task_ids_expands_same_branch_chains(tmp_path):
     assert len(cohorts) == 1
     assert cohorts[0].branch == "feature/shared"
     assert {task.id for task in cohorts[0].tasks} == {parent.id, child.id}
+
+
+def test_build_unmerged_branch_cohorts_uses_canonical_branch_deduping(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    parent = _completed_branch_task(store, "Parent task", "feature/shared")
+    child = store.add("Fix task", task_type="fix", based_on=parent.id)
+    child.status = "completed"
+    child.completed_at = datetime.now(UTC)
+    child.branch = "feature/shared"
+    child.has_commits = True
+    child.merge_status = "unmerged"
+    child.same_branch = True
+    store.update(child)
+
+    cohorts = build_unmerged_branch_cohorts(store)
+
+    assert len(cohorts) == 1
+    assert cohorts[0].branch == "feature/shared"
+    assert {task.id for task in cohorts[0].tasks} == {parent.id, child.id}
+
+
+def test_build_task_branch_cohort_returns_cohort_for_task_scoped_callers(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/scoped")
+
+    cohort, preliminary = build_task_branch_cohort(store, task.id)
+
+    assert preliminary is None
+    assert cohort is not None
+    assert cohort.branch == "feature/scoped"
+    assert {row.id for row in cohort.tasks} == {task.id}
+
+
+def test_reconcile_branch_merge_truth_marks_merged_without_persisting(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/merged")
+    cohort = BranchCohort(branch=task.branch, tasks=(task,))
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = True
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=True,
+    )
+
+    assert results[0].merge_status == "merged"
+    assert "marked merged" in results[0].actions
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+
+
+def test_reconcile_branch_merge_truth_missing_local_branch_without_remote_proof_stays_unmerged(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/deleted")
+    cohort = BranchCohort(branch=task.branch, tasks=(task,))
+
+    git = Mock()
+    git.branch_exists.return_value = False
+    git.ref_exists.return_value = False
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=True,
+    )
+
+    assert results[0].merge_status == "unmerged"
+    assert "marked merged" not in results[0].actions
+    git.is_merged.assert_not_called()
+
+
+def test_reconcile_task_branch_merge_truth_persists_branch_state(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/scoped-sync")
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    result = reconcile_task_branch_merge_truth(
+        store,
+        git,
+        task.id,
+        target_branch="main",
+        include_diff_stats=True,
+        persist=True,
+    )
+
+    assert result.merge_status == "unmerged"
+    assert result.diff_files_changed == 1
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.diff_files_changed == 1
 
 
 def test_sync_branch_cohorts_normalizes_same_branch_rows(tmp_path):
@@ -79,6 +188,153 @@ def test_sync_branch_cohorts_normalizes_same_branch_rows(tmp_path):
     assert refreshed_child.diff_files_changed == 1
     assert refreshed_parent.merge_status == "unmerged"
     assert refreshed_child.merge_status == "unmerged"
+
+
+def test_sync_branch_cohorts_marks_merged_when_origin_default_ref_proves_remote_merge(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task with remote-only merge", "feature/remote-only-merge")
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.ref_exists.return_value = True
+    git.branch_exists.return_value = True
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    def _is_merged(branch, into):
+        return into == "origin/main"
+
+    git.is_merged.side_effect = _is_merged
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        [BranchCohort(branch="feature/remote-only-merge", tasks=(task,))],
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=True,
+    )
+
+    assert partial is False
+    assert results[0].merge_status == "merged"
+    assert "marked merged" in results[0].actions
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+
+
+def test_sync_branch_cohorts_missing_local_branch_uses_remote_feature_ref_before_marking_merged(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task with deleted local branch", "feature/remote-survivor")
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.ref_exists.side_effect = lambda ref: ref in {"origin/main", "origin/feature/remote-survivor"}
+    git.branch_exists.return_value = False
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    def _is_merged(branch, into):
+        return False
+
+    git.is_merged.side_effect = _is_merged
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        [BranchCohort(branch="feature/remote-survivor", tasks=(task,))],
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=True,
+    )
+
+    assert partial is False
+    assert results[0].merge_status == "unmerged"
+    assert "marked merged" not in results[0].actions
+    git.is_merged.assert_any_call("origin/feature/remote-survivor", into="origin/main")
+    git.is_merged.assert_any_call("origin/feature/remote-survivor", into="main")
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+
+
+def test_sync_branch_cohorts_skips_persisting_errored_cohorts(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task with fetch failure", "feature/fetch-failure")
+    task.diff_files_changed = 99
+    task.diff_lines_added = 999
+    task.diff_lines_removed = 111
+    store.update(task)
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.remote_exists.return_value = True
+    git.fetch.side_effect = GitError("network down")
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        [BranchCohort(branch="feature/fetch-failure", tasks=(task,))],
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=True,
+    )
+
+    assert partial is True
+    assert results[0].errors == ["git fetch origin failed: network down"]
+    assert "refreshed diff stats" in results[0].actions
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+    assert refreshed.diff_files_changed == 99
+    assert refreshed.diff_lines_added == 999
+    assert refreshed.diff_lines_removed == 111
+
+
+def test_sync_branch_cohorts_missing_local_branch_open_pr_does_not_override_to_merged(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task with open PR", "feature/open-pr-deleted-local")
+    task.pr_number = 88
+    store.update(task)
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = False
+    git.ref_exists.return_value = False
+
+    gh = Mock()
+    gh.is_available.return_value = True
+    gh.get_pr_details.return_value = PullRequestDetails(
+        url="https://github.com/o/r/pull/88",
+        number=88,
+        state="open",
+        base_ref_name="main",
+    )
+    gh.discover_pr_by_branch.return_value = None
+
+    with patch("gza.sync_ops.GitHub", return_value=gh):
+        results, partial = sync_branch_cohorts(
+            store,
+            git,
+            [BranchCohort(branch="feature/open-pr-deleted-local", tasks=(task,))],
+            include_git=True,
+            include_pr=True,
+            dry_run=False,
+            fetch_remote=False,
+        )
+
+    assert partial is False
+    assert results[0].merge_status == "unmerged"
+    assert results[0].pr_state == "open"
+    assert "marked merged" not in results[0].actions
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+    assert refreshed.pr_state == "open"
 
 
 def test_sync_branch_cohorts_pr_merged_marks_merge_status_without_git_phase(tmp_path):

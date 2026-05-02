@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -12,7 +13,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from rich.console import Console
 
+from gza.cli import query as query_cli
+from gza.git import GitError
 from gza.pr_ops import LookupTaskPrResult
+from gza.sync_ops import BranchSyncResult
 
 from .conftest import (
     make_store,
@@ -6514,7 +6518,7 @@ class TestUnmergedAllFlag:
         assert "No commits task" not in result.stdout
 
     def test_unmerged_shows_deleted_branch_if_merge_status_unmerged(self, tmp_path: Path):
-        """Tasks with merge_status='unmerged' show even if branch is deleted."""
+        """Plain unmerged keeps deleted local branches visible without merge proof."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -6529,7 +6533,7 @@ class TestUnmergedAllFlag:
         git._run("add", "file.txt")
         git._run("commit", "-m", "Initial commit")
 
-        # Task with merge_status='unmerged' but branch doesn't exist
+        # Task with merge_status='unmerged' but branch doesn't exist anywhere
         task = store.add("Deleted branch task", task_type="implement")
         task.status = "completed"
         task.branch = "feature/nonexistent-branch"
@@ -6543,9 +6547,62 @@ class TestUnmergedAllFlag:
         assert result.returncode == 0
         assert "Deleted branch task" in result.stdout
         assert "branch deleted" in result.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.merge_status == "unmerged"
+
+    def test_unmerged_keeps_deleted_local_branch_visible_when_remote_feature_still_exists(self, tmp_path: Path):
+        """Plain canonical unmerged must not persist merged when only the local branch is gone."""
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Deleted local remote survivor task",
+            task_id="20260220-deleted-local-remote-survivor",
+            branch="feature/deleted-local-remote-survivor",
+        )
+
+        remote_dir = tmp_path / "origin.git"
+        git._run("init", "--bare", str(remote_dir))
+        git._run("remote", "add", "origin", str(remote_dir))
+        git._run("push", "-u", "origin", "main")
+        git._run("push", "-u", "origin", "feature/deleted-local-remote-survivor")
+        git._run("branch", "-D", "feature/deleted-local-remote-survivor")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Deleted local remote survivor task" in result.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.merge_status == "unmerged"
+
+    def test_unmerged_migrates_deleted_local_branch_with_remote_survivor_via_shared_reconcile(self, tmp_path: Path):
+        """Legacy merge_status=None rows keep deleted local branches visible when origin/<branch> survives."""
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Legacy deleted local remote survivor task",
+            task_id="20260220-legacy-deleted-local-remote-survivor",
+            branch="feature/legacy-deleted-local-remote-survivor",
+            merge_status=None,
+        )
+
+        remote_dir = tmp_path / "origin.git"
+        git._run("init", "--bare", str(remote_dir))
+        git._run("remote", "add", "origin", str(remote_dir))
+        git._run("push", "-u", "origin", "main")
+        git._run("push", "-u", "origin", "feature/legacy-deleted-local-remote-survivor")
+        git._run("branch", "-D", "feature/legacy-deleted-local-remote-survivor")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Migrating merge status" in result.stdout
+        assert "Legacy deleted local remote survivor task" in result.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.merge_status == "unmerged"
 
     def test_unmerged_update_backfills_merge_status(self, tmp_path: Path):
-        """Plain unmerged stays read-only; --update backfills merge_status for legacy rows."""
+        """Plain unmerged backfills canonical merge_status; --update only warns."""
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Old task needing migration",
@@ -6562,29 +6619,27 @@ class TestUnmergedAllFlag:
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "Migrating merge status" not in result.stdout
-        assert "Old task needing migration" not in result.stdout
-
-        unchanged_task = store.get(task.id)
-        assert unchanged_task.merge_status is None
-
-        # Run the explicit mutating path.
-        result = run_gza("unmerged", "--update", "--project", str(tmp_path))
-        assert result.returncode == 0
         assert "Migrating merge status" in result.stdout
         assert "Old task needing migration" in result.stdout
 
-        # Verify merge_status was set in the database
+        migrated_task = store.get(task.id)
+        assert migrated_task.merge_status == "unmerged"
+
+        result = run_gza("unmerged", "--update", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "deprecated" in result.stderr
+        assert "Migrating merge status" not in result.stdout
+        assert "Old task needing migration" in result.stdout
+
         updated_task = store.get(task.id)
         assert updated_task.merge_status == "unmerged"
 
-        # Running again should not show migration message
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Migrating merge status" not in result.stdout
 
     def test_unmerged_update_marks_stale_merged_task_as_merged(self, tmp_path: Path):
-        """Default unmerged suppresses stale merged rows; --update reconciles persisted state."""
+        """Plain unmerged repairs stale merged rows in the canonical DB view."""
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Stale unmerged task",
@@ -6600,18 +6655,87 @@ class TestUnmergedAllFlag:
         assert "No unmerged tasks" in result.stdout
 
         stale_task = store.get(task.id)
-        assert stale_task.merge_status == "unmerged"
+        assert stale_task.merge_status == "merged"
 
         result = run_gza("unmerged", "--update", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "Reconciled unmerged tasks: 1 merged, 0 refreshed" in result.stdout
+        assert "deprecated" in result.stderr
         assert "No unmerged tasks" in result.stdout
 
         updated_task = store.get(task.id)
         assert updated_task.merge_status == "merged"
 
+    def test_unmerged_fetches_origin_default_branch_before_canonical_reconcile(self, tmp_path: Path):
+        """Plain canonical unmerged should use freshly fetched origin/default merge evidence."""
+        from gza.git import Git
+
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Remote-only merged task",
+            task_id="20260220-remote-only-merged-task",
+            branch="feature/remote-only-merged-task",
+        )
+
+        remote_dir = tmp_path / "origin.git"
+        git._run("init", "--bare", str(remote_dir))
+        git._run("remote", "add", "origin", str(remote_dir))
+        git._run("push", "-u", "origin", "main")
+        git._run("push", "-u", "origin", "feature/remote-only-merged-task")
+
+        updater_dir = tmp_path / "origin-updater"
+        git._run("clone", str(remote_dir), str(updater_dir))
+        updater_git = Git(updater_dir)
+        updater_git._run("config", "user.name", "Test User")
+        updater_git._run("config", "user.email", "test@example.com")
+        updater_git._run("checkout", "-b", "main", "origin/main")
+        updater_git._run("merge", "--no-ff", "origin/feature/remote-only-merged-task", "-m", "Merge feature remotely")
+        updater_git._run("push", "origin", "main")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Remote-only merged task" not in result.stdout
+        assert "No unmerged tasks" in result.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.merge_status == "merged"
+
+    def test_unmerged_fetch_failure_fails_closed_without_rendering_stale_rows(self, tmp_path: Path):
+        """Plain canonical unmerged should stop instead of showing stale rows after fetch failures."""
+        store, task, _git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Fetch failure task",
+            task_id="20260220-fetch-failure-task",
+            branch="feature/fetch-failure-task",
+        )
+        task.diff_files_changed = 99
+        task.diff_lines_added = 999
+        task.diff_lines_removed = 111
+        task.pr_number = 123
+        task.pr_state = "open"
+        store.update(task)
+
+        with (
+            patch("gza.git.Git.remote_exists", return_value=True),
+            patch("gza.git.Git.fetch", side_effect=GitError("network down")),
+        ):
+            result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "failed to refresh canonical merge truth" in result.stdout
+        assert "git fetch origin failed: network down" in result.stdout
+        assert "Fetch failure task" not in result.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.merge_status == "unmerged"
+        assert refreshed.diff_files_changed == 99
+        assert refreshed.diff_lines_added == 999
+        assert refreshed.diff_lines_removed == 111
+        assert refreshed.pr_number == 123
+        assert refreshed.pr_state == "open"
+
     def test_unmerged_update_refreshes_diff_stats_for_live_branch(self, tmp_path: Path):
-        """--update refreshes cached diff stats for branches that are still unmerged."""
+        """Plain unmerged refreshes canonical diff stats for branches still unmerged."""
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Refresh diff stats task",
@@ -6630,9 +6754,8 @@ class TestUnmergedAllFlag:
         git._run("commit", "-m", "Update diff stats")
         git._run("checkout", "main")
 
-        result = run_gza("unmerged", "--update", "--project", str(tmp_path))
+        result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "Reconciled unmerged tasks: 0 merged, 1 refreshed" in result.stdout
         assert "+2/-0 LOC, 1 files" in result.stdout
 
         updated_task = store.get(task.id)
@@ -6662,6 +6785,31 @@ class TestUnmergedAllFlag:
         assert "Showing tasks unmerged relative to integration" in result.stdout
         assert "No unmerged tasks" in result.stdout
 
+    def test_unmerged_into_current_keeps_deleted_branch_visible_when_not_merged_into_current(
+        self,
+        tmp_path: Path,
+    ):
+        """Deleted local branches stay visible for read-only current-branch comparisons."""
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Deleted branch current-target task",
+            task_id="20260220-deleted-current-target-task",
+            branch="feature/deleted-current-target-task",
+        )
+
+        git._run("checkout", "-b", "integration")
+        git._run("branch", "-D", "feature/deleted-current-target-task")
+
+        result = run_gza("unmerged", "--into-current", "--project", str(tmp_path), cwd=tmp_path)
+
+        assert result.returncode == 0
+        assert "Showing tasks unmerged relative to integration" in result.stdout
+        assert "Deleted branch current-target task" in result.stdout
+        assert "branch deleted" in result.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.merge_status == "unmerged"
+
     def test_unmerged_target_uses_specified_branch(self, tmp_path: Path):
         """--target uses live git state against the specified branch."""
         store, task, git = setup_unmerged_env(
@@ -6679,6 +6827,65 @@ class TestUnmergedAllFlag:
         assert result.returncode == 0
         assert "Showing tasks unmerged relative to integration" in result.stdout
         assert "No unmerged tasks" in result.stdout
+
+    def test_unmerged_target_keeps_deleted_branch_visible_when_not_merged_into_target(
+        self,
+        tmp_path: Path,
+    ):
+        """Deleted local branches stay visible for live targets even with cached default-branch merges."""
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Deleted branch explicit-target task",
+            task_id="20260220-deleted-explicit-target-task",
+            branch="feature/deleted-explicit-target-task",
+            merge_status="merged",
+        )
+
+        git._run("checkout", "-b", "integration")
+        git._run("checkout", "main")
+        git._run("branch", "-D", "feature/deleted-explicit-target-task")
+
+        result = run_gza("unmerged", "--target", "integration", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Showing tasks unmerged relative to integration" in result.stdout
+        assert "Deleted branch explicit-target task" in result.stdout
+        assert "branch deleted" in result.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.merge_status == "merged"
+
+    def test_unmerged_update_warns_and_does_not_persist_for_live_targets(self, tmp_path: Path):
+        """Deprecated `--update` remains a no-op for non-canonical target comparisons."""
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Live target no-op task",
+            task_id="20260220-live-target-noop",
+            branch="feature/live-target-noop",
+            merge_status=None,
+        )
+
+        git._run("checkout", "-b", "integration")
+        git._run("merge", "--no-ff", "feature/live-target-noop", "-m", "Merge feature into integration")
+        git._run("checkout", "main")
+
+        result = run_gza(
+            "unmerged",
+            "--update",
+            "--target",
+            "integration",
+            "--project",
+            str(tmp_path),
+        )
+        assert result.returncode == 0
+        assert "deprecated" in result.stderr
+        assert "has no effect" in result.stderr
+        assert "Migrating merge status" not in result.stdout
+        assert "No unmerged tasks" in result.stdout
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.merge_status is None
 
     def test_unmerged_live_target_excludes_same_branch_fix_descendants(self, tmp_path: Path):
         """Live-target unmerged (--into-current/--target) must not double-list a fix task
@@ -6741,7 +6948,7 @@ class TestUnmergedImprovedDisplay:
         assert "Failed task" not in result.stdout
 
     def test_unmerged_reads_frozen_snapshot_without_merge_status_backfill(self, tmp_path: Path):
-        """Plain unmerged should not try to persist merge_status on a frozen snapshot."""
+        """Plain canonical unmerged should fail clearly when the DB snapshot is read-only."""
         import os
 
         store, task, _git = setup_unmerged_env(
@@ -6764,13 +6971,160 @@ class TestUnmergedImprovedDisplay:
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.merge_status is None
-        assert result.returncode == 0
-        assert "Migrating merge status" not in result.stdout
-        assert "readonly" not in result.stderr.lower()
-        assert "No unmerged tasks" in result.stdout
+        assert result.returncode == 1
+        assert "writable task DB" in result.stdout
+        assert "read-only" in result.stdout
+
+    def test_unmerged_canonical_disk_io_snapshot_error_shows_targeted_message(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Canonical unmerged normalizes disk I/O snapshot write errors without traceback."""
+        setup_unmerged_env(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            update=False,
+            limit=5,
+            commits_only=False,
+            all=False,
+        )
+
+        with patch(
+            "gza.cli.query.sync_branch_cohorts",
+            side_effect=sqlite3.OperationalError("disk I/O error"),
+        ):
+            try:
+                result = query_cli.cmd_unmerged(args)
+            finally:
+                os.chmod(db_path, original_mode)
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert "writable task DB" in captured.out
+        assert "read-only" in captured.out
+        assert "disk I/O error" not in captured.out
+        assert "Traceback" not in captured.err
+
+    def test_unmerged_canonical_writable_disk_io_error_is_not_rewritten_as_read_only(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Writable canonical unmerged should surface real storage failures unchanged."""
+        setup_unmerged_env(tmp_path)
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            update=False,
+            limit=5,
+            commits_only=False,
+            all=False,
+        )
+
+        with patch(
+            "gza.cli.query.sync_branch_cohorts",
+            side_effect=sqlite3.OperationalError("disk I/O error"),
+        ):
+            with pytest.raises(sqlite3.OperationalError, match=r"disk I/O error"):
+                query_cli.cmd_unmerged(args)
+
+        captured = capsys.readouterr()
+        assert "writable task DB" not in captured.out
+        assert "read-only" not in captured.out
+
+    def test_unmerged_target_fails_closed_on_live_compare_error(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Live-target `--target` must not render stale fallback rows after compare errors."""
+        _store, task, _git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Live compare failure task",
+            branch="feature/live-compare-failure",
+        )
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target="integration",
+            update=False,
+            limit=5,
+            commits_only=False,
+            all=False,
+        )
+
+        with patch(
+            "gza.cli.query.reconcile_branch_merge_truth",
+            return_value=[
+                BranchSyncResult(
+                    branch="feature/live-compare-failure",
+                    task_ids=(task.id,) if task.id is not None else (),
+                    merge_status="unmerged",
+                    reconciled=True,
+                    errors=["git compare failed"],
+                )
+            ],
+        ):
+            result = query_cli.cmd_unmerged(args)
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert "failed to reconcile unmerged branches relative to integration" in captured.out
+        assert "feature/live-compare-failure: git compare failed" in captured.out
+        assert "Showing tasks unmerged relative to integration" not in captured.out
+        assert "Live compare failure task" not in captured.out
+
+    def test_unmerged_into_current_fails_closed_on_live_diff_stat_error(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Live-target `--into-current` must stop on diff-stat refresh errors."""
+        _store, task, _git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Live diff-stat failure task",
+            branch="feature/live-diff-stat-failure",
+        )
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=True,
+            target=None,
+            update=False,
+            limit=5,
+            commits_only=False,
+            all=False,
+        )
+
+        with patch(
+            "gza.cli.query.reconcile_branch_merge_truth",
+            return_value=[
+                BranchSyncResult(
+                    branch="feature/live-diff-stat-failure",
+                    task_ids=(task.id,) if task.id is not None else (),
+                    merge_status="unmerged",
+                    reconciled=True,
+                    errors=["diff-stat refresh failed"],
+                )
+            ],
+        ):
+            result = query_cli.cmd_unmerged(args)
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert "failed to reconcile unmerged branches relative to main" in captured.out
+        assert "feature/live-diff-stat-failure: diff-stat refresh failed" in captured.out
+        assert "Showing tasks unmerged relative to main" not in captured.out
+        assert "Live diff-stat failure task" not in captured.out
 
     def test_unmerged_only_persists_merge_status_during_explicit_update(self, tmp_path: Path):
-        """Default unmerged is read-only; --update is the mutating persistence path."""
+        """Default unmerged persists canonical merge truth; `--update` only warns."""
         store, task, _git = setup_unmerged_env(
             tmp_path,
             task_prompt="Legacy merge-status update task",
@@ -6783,14 +7137,14 @@ class TestUnmergedImprovedDisplay:
 
         read_only_view = run_gza("unmerged", "--project", str(tmp_path))
         assert read_only_view.returncode == 0
-        assert "Migrating merge status" not in read_only_view.stdout
-        unchanged = store.get(task.id)
-        assert unchanged is not None
-        assert unchanged.merge_status is None
+        assert "Migrating merge status" in read_only_view.stdout
+        migrated = store.get(task.id)
+        assert migrated is not None
+        assert migrated.merge_status == "unmerged"
 
         refreshed_view = run_gza("unmerged", "--update", "--project", str(tmp_path))
         assert refreshed_view.returncode == 0
-        assert "Migrating merge status" in refreshed_view.stdout
+        assert "deprecated" in refreshed_view.stderr
         updated = store.get(task.id)
         assert updated is not None
         assert updated.merge_status == "unmerged"
@@ -6814,7 +7168,7 @@ class TestUnmergedImprovedDisplay:
         assert "files" in result.stdout
 
     def test_unmerged_uses_cached_diff_stats(self, tmp_path: Path):
-        """gza unmerged uses cached diff stats from DB when available (no live git call)."""
+        """gza unmerged refreshes cached diff stats before showing the canonical view."""
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Cached stats task",
@@ -6829,8 +7183,14 @@ class TestUnmergedImprovedDisplay:
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
-        # Cached stats should be displayed in +N/-N LOC, N files format
-        assert "+42/-7 LOC, 5 files" in result.stdout
+        assert "+42/-7 LOC, 5 files" not in result.stdout
+        assert "+1/-0 LOC, 1 files" in result.stdout
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.diff_files_changed == 1
+        assert refreshed.diff_lines_added == 1
+        assert refreshed.diff_lines_removed == 0
 
     def test_unmerged_target_branch_ignores_default_branch_cached_stats(self, tmp_path: Path):
         """When `--target` is used, unmerged recomputes diff stats for that merge target."""
@@ -6854,7 +7214,8 @@ class TestUnmergedImprovedDisplay:
 
         default_result = run_gza("unmerged", "--project", str(tmp_path))
         assert default_result.returncode == 0
-        assert "+999/-999 LOC, 999 files" in default_result.stdout
+        assert "+999/-999 LOC, 999 files" not in default_result.stdout
+        assert "+1/-0 LOC, 1 files" in default_result.stdout
 
         target_result = run_gza("unmerged", "--target", "target/base", "--project", str(tmp_path))
         assert target_result.returncode == 0

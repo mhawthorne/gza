@@ -518,7 +518,11 @@ def main() -> int:
     unmerged_parser.add_argument(
         "--update",
         action="store_true",
-        help="Refresh default-branch unmerged state from live git before listing and persist reconciled merge status and diff stats",
+        help=(
+            "Deprecated compatibility alias for the default default-branch refresh; "
+            "plain `gza unmerged` already persists canonical merge truth before listing. "
+            "Has no effect with `--into-current` or `--target`."
+        ),
     )
     target_group = unmerged_parser.add_mutually_exclusive_group()
     target_group.add_argument(
@@ -854,7 +858,7 @@ def main() -> int:
     # sync command
     sync_parser = subparsers.add_parser(
         "sync",
-        help="Reconcile branch task state across local git, origin, and GitHub PR state",
+        help="Explicitly reconcile branch task state across local git, origin, and GitHub PR state",
     )
     sync_parser.add_argument(
         "task_ids",

@@ -24,6 +24,7 @@ from ..recovery_engine import (
     list_failed_tasks_for_recovery,
 )
 from ..resume_policy import is_resumable_failed_task
+from ..sync_ops import reconcile_task_branch_merge_truth
 from ..task_query import (
     TaskQueryPresets,
     TaskQueryService,
@@ -923,6 +924,26 @@ def _run_cycle(
                             )
                     if conflict_handled:
                         continue
+                    if (
+                        conflict_assessment is not None
+                        and conflict_assessment.reason == "branch already merged"
+                        and task.id is not None
+                    ):
+                        repaired = reconcile_task_branch_merge_truth(
+                            store,
+                            git,
+                            str(task.id),
+                            target_branch=target_branch,
+                            include_diff_stats=True,
+                            persist=True,
+                        )
+                        if repaired.ok and repaired.merge_status == "merged":
+                            log.emit(
+                                "REPAIR",
+                                f"{task.id}: marked merged after shared reconciliation against {target_branch}",
+                            )
+                            work_done = True
+                            continue
                     if conflict_assessment is not None and conflict_assessment.reason is not None:
                         log.emit(
                             "SKIP",

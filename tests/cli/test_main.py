@@ -264,8 +264,8 @@ class TestHelpOutput:
             assert flag in normalized_help
             assert flag in docs_text
 
-    def test_sync_help_and_docs_describe_explicit_git_and_github_reconciliation(self, tmp_path):
-        """`sync --help` and docs should expose the new explicit reconciliation surface."""
+    def test_sync_help_and_docs_describe_explicit_branch_and_pr_reconciliation(self, tmp_path):
+        """`sync --help` and docs should keep sync as the broader explicit maintenance surface."""
         setup_config(tmp_path)
 
         sync_help = run_gza("sync", "--help", "--project", str(tmp_path))
@@ -281,7 +281,8 @@ class TestHelpOutput:
 
         assert "### sync" in docs_text
         assert "gza sync [task_id ...] [options]" in docs_text
-        assert "`gza sync` is the canonical explicit command for full GitHub-side reconciliation." in docs_text
+        assert "Use `gza unmerged` for the daily \"what still needs to be merged?\" check." in docs_text
+        assert "`gza sync` remains the broader explicit branch and PR reconciliation command." in docs_text
         assert "The only GitHub-side exception outside `gza sync` is improve completion with `--review`" in docs_text
         assert "Run `gza sync` after those merges" in docs_text
 
@@ -396,8 +397,8 @@ class TestHelpOutput:
         assert "Those commands fail closed when the target task does not match the provided tag scope" in docs_text
         assert "within each task's current tag-set bucket" not in docs_text
 
-    def test_unmerged_help_and_docs_describe_query_only_default_and_update_refresh(self, tmp_path):
-        """unmerged help/docs should expose current flags and read-only-by-default semantics."""
+    def test_unmerged_help_and_docs_describe_daily_refresh_and_update_deprecation(self, tmp_path):
+        """unmerged help/docs should expose the daily mutating default and `--update` deprecation."""
         setup_config(tmp_path)
 
         unmerged_help = run_gza("unmerged", "--help", "--project", str(tmp_path))
@@ -411,17 +412,18 @@ class TestHelpOutput:
         assert "--target BRANCH" in unmerged_help.stdout
         assert help_text.count("Retained compatibility no-op; has no effect on unmerged output") == 2
         assert "Show last N unmerged tasks (default: 5, 0 for all)" in help_text
-        assert (
-            "Refresh default-branch unmerged state from live git before listing and persist "
-            "reconciled merge status and diff stats"
-        ) in help_text
+        assert "Deprecated compatibility alias for the default default-branch refresh" in help_text
+        assert "plain `gza unmerged` already persists canonical merge truth before listing" in help_text
+        assert "Has no effect with `--into-current` or `--target`" in help_text
 
-        assert "`gza unmerged` is read-only" in docs_text
+        assert "`gza unmerged` is the daily merge-truth command" in docs_text
         assert "`--commits-only` | Backwards-compatible no-op retained in the CLI surface" in docs_text
         assert "`--all` | Backwards-compatible no-op retained in the CLI surface" in docs_text
-        assert "does not backfill or persist `merge_status` unless you pass `--update`" in docs_text
-        assert "`--update` only persists reconciliation when you are using the default-branch view" in docs_text
-        assert "`--into-current` or `--target`, `gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged" in docs_text
+        assert "opens the task store read/write" in docs_text
+        assert "This is the deliberate narrow exception to the usual read-only query convention" in docs_text
+        assert "If the canonical default-branch refresh cannot persist because the database is read-only" in docs_text
+        assert "`--update` is deprecated because plain `gza unmerged` now does the canonical refresh automatically" in docs_text
+        assert "With `--into-current` or `--target`, `gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged" in docs_text
 
     def test_show_help_and_docs_describe_prompt_as_plain_text(self, tmp_path):
         """`show --prompt` should be documented as plain prompt-text output, not JSON."""

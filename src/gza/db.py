@@ -473,6 +473,11 @@ def _is_readonly_operational_error(exc: sqlite3.OperationalError) -> bool:
     return "readonly" in message or "read-only" in message
 
 
+def _is_readonly_snapshot_operational_error(exc: sqlite3.OperationalError) -> bool:
+    """Return True for explicit sqlite read-only write failures."""
+    return _is_readonly_operational_error(exc)
+
+
 def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     """Check whether a table contains a specific column."""
     try:
@@ -3326,6 +3331,33 @@ class SqliteTaskStore:
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
+    def get_canonical_unmerged_candidates(self) -> list[Task]:
+        """Return canonical default-branch unmerged refresh candidates.
+
+        Includes legacy completed code-bearing rows whose ``merge_status`` has not
+        been backfilled yet so the shared reconciliation path can migrate them
+        using the same merge-truth rules as current rows.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE project_id = ?
+                AND has_commits = 1
+                AND (
+                    merge_status = 'unmerged'
+                    OR merge_status IS NULL
+                )
+                AND (
+                    task_type NOT IN ('improve', 'rebase', 'fix')
+                    OR based_on IS NULL
+                )
+                ORDER BY completed_at DESC
+                """,
+                (self._project_id,),
+            )
+            return self._rows_to_tasks(conn, cur.fetchall())
+
     def get_tasks_for_branch(self, branch: str) -> list[Task]:
         """Return all task rows attached to a branch, oldest first."""
         with self._connect() as conn:
@@ -4395,54 +4427,73 @@ def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
         store: The task store
         git: A Git instance for the project
     """
-    from .git import Git as GitClass
+    from .git import Git as GitClass, GitError
+    from .sync_ops import build_branch_cohorts_for_tasks, reconcile_branch_merge_truth
+
     assert isinstance(git, GitClass)
 
-    with store._connect() as conn:
-        cur = conn.execute(
-            "SELECT id, has_commits, branch FROM tasks WHERE project_id = ? AND merge_status IS NULL",
-            (store._project_id,),
-        )
-        rows = cur.fetchall()
-
     default_branch = git.default_branch()
+    candidate_tasks = [
+        task for task in store.get_canonical_unmerged_candidates() if task.merge_status is None
+    ]
 
-    for row in rows:
-        task_id = row["id"]
-        has_commits = row["has_commits"]
-        branch = row["branch"]
-
-        if not has_commits:
-            merge_status = None
-        elif not branch:
-            merge_status = None
-        elif not git.branch_exists(branch):
-            # Branch deleted - assume merged
-            merge_status = "merged"
+    remote_default_ref: str | None = None
+    remote_exists = getattr(git, "remote_exists", None)
+    has_origin_remote = True
+    if callable(remote_exists):
+        try:
+            remote_present = remote_exists("origin")
+        except Exception:
+            logger.warning(
+                "Could not inspect origin while backfilling merge status; continuing without remote proof",
+                exc_info=True,
+            )
+            has_origin_remote = False
         else:
-            try:
-                # Check if branch is an ancestor of main (i.e., fully merged)
-                result = git._run(
-                    "merge-base", "--is-ancestor", branch, default_branch, check=False
-                )
-                if result.returncode == 0:
-                    merge_status = "merged"
-                elif git.is_merged(branch, default_branch):
-                    # No diff (squash merged or equivalent content)
-                    merge_status = "merged"
-                else:
-                    merge_status = "unmerged"
-            except Exception:
+            if isinstance(remote_present, bool):
+                has_origin_remote = remote_present
+    if has_origin_remote:
+        try:
+            git.fetch("origin")
+        except GitError:
+            logger.warning(
+                "Could not fetch origin while backfilling merge status; continuing without remote proof",
+                exc_info=True,
+            )
+        else:
+            remote_default_candidate = f"origin/{default_branch}"
+            if git.ref_exists(remote_default_candidate):
+                remote_default_ref = remote_default_candidate
+
+    cohorts = build_branch_cohorts_for_tasks(store, candidate_tasks)
+    results = reconcile_branch_merge_truth(
+        git,
+        cohorts,
+        target_branch=default_branch,
+        include_diff_stats=False,
+        remote_target_ref=remote_default_ref,
+    )
+    status_by_branch = {
+        result.branch: result.merge_status
+        for result in results
+    }
+
+    for task in candidate_tasks:
+        if task.id is None:
+            continue
+        if not task.branch:
+            merge_status = None
+        else:
+            merge_status = status_by_branch.get(task.branch)
+            if merge_status is None:
                 logger.warning(
                     "Could not determine merge status for task_id=%s branch=%s against %s; defaulting to 'unmerged'",
-                    task_id,
-                    branch,
+                    task.id,
+                    task.branch,
                     default_branch,
-                    exc_info=True,
                 )
                 merge_status = "unmerged"
-
-        store.set_merge_status(task_id, merge_status)
+        store.set_merge_status(task.id, merge_status)
 
 
 # === Editor support ===

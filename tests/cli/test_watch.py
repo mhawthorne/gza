@@ -2411,7 +2411,7 @@ def test_watch_cycle_with_isolation_enabled_missing_branch_failure_does_not_rout
 def test_watch_cycle_with_isolation_enabled_already_merged_failure_does_not_route_to_rebase(
     tmp_path: Path,
 ) -> None:
-    """Already-merged branches must not create isolated rebase work on merge failure."""
+    """Already-merged branches should repair canonical merge state instead of creating rebase work."""
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
@@ -2437,6 +2437,7 @@ def test_watch_cycle_with_isolation_enabled_already_merged_failure_does_not_rout
     isolated_git = MagicMock()
     isolated_git.branch_exists.return_value = True
     isolated_git.is_merged.return_value = True
+    repaired_result = SimpleNamespace(ok=True, merge_status="merged")
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -2448,6 +2449,7 @@ def test_watch_cycle_with_isolation_enabled_already_merged_failure_does_not_rout
             "gza.cli.watch._execute_merge_action",
             return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
         ),
+        patch("gza.cli.watch.reconcile_task_branch_merge_truth", return_value=repaired_result) as reconcile_branch,
         patch("gza.cli.watch._create_rebase_task") as create_rebase,
         patch("gza.cli.watch.cleanup_failed_merge_checkout") as cleanup_checkout,
         patch("gza.cli.watch._spawn_background_worker") as spawn_worker,
@@ -2461,14 +2463,22 @@ def test_watch_cycle_with_isolation_enabled_already_merged_failure_does_not_rout
             log=log,
         )
 
-    assert result.work_done is False
+    assert result.work_done is True
+    reconcile_branch.assert_called_once_with(
+        store,
+        repo_git,
+        str(task.id),
+        target_branch="main",
+        include_diff_stats=True,
+        persist=True,
+    )
     create_rebase.assert_not_called()
     cleanup_checkout.assert_not_called()
     spawn_worker.assert_not_called()
     isolated_git.can_merge.assert_not_called()
     log_text = log_path.read_text()
     assert "merge conflict routed to rebase" not in log_text
-    assert f"{task.id}: merge failed (branch already merged); not routing to rebase" in log_text
+    assert f"{task.id}: marked merged after shared reconciliation against main" in log_text
 
 
 def test_watch_cycle_without_isolation_preserves_default_branch_merge_guard(tmp_path: Path) -> None:

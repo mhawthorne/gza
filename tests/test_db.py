@@ -18,6 +18,8 @@ from gza.db import (
     SqliteTaskStore,
     StepRef,
     Task,
+    _is_readonly_operational_error,
+    _is_readonly_snapshot_operational_error,
     check_migration_status,
     import_legacy_local_db,
     preview_v25_migration,
@@ -30,6 +32,26 @@ from gza.db import (
 from gza.review_tasks import build_auto_review_prompt
 from gza.runner import _compute_slug_override
 from gza.sync_ops import BranchCohort, sync_branch_cohorts
+
+
+def test_is_readonly_operational_error_accepts_explicit_readonly_variants() -> None:
+    """Generic sqlite read-only classification should stay limited to explicit variants."""
+    assert _is_readonly_operational_error(sqlite3.OperationalError("attempt to write a readonly database"))
+    assert _is_readonly_operational_error(sqlite3.OperationalError("attempt to write a read-only database"))
+    assert not _is_readonly_operational_error(sqlite3.OperationalError("disk I/O error"))
+    assert not _is_readonly_operational_error(sqlite3.OperationalError("database is locked"))
+
+
+def test_is_readonly_snapshot_operational_error_accepts_snapshot_variants() -> None:
+    """Shared snapshot classifier should stay limited to explicit read-only variants."""
+    assert _is_readonly_snapshot_operational_error(
+        sqlite3.OperationalError("attempt to write a readonly database")
+    )
+    assert _is_readonly_snapshot_operational_error(
+        sqlite3.OperationalError("attempt to write a read-only database")
+    )
+    assert not _is_readonly_snapshot_operational_error(sqlite3.OperationalError("disk I/O error"))
+    assert not _is_readonly_snapshot_operational_error(sqlite3.OperationalError("database is locked"))
 
 
 class TestTaskChaining:
@@ -1791,8 +1813,8 @@ class TestMergeStatus:
         assert impl_task.id in unmerged_ids
         assert fix_task.id not in unmerged_ids
 
-    def test_migrate_merge_status_logs_when_git_check_fails(self, tmp_path: Path, caplog: pytest.LogCaptureFixture):
-        """Migration logs a warning and defaults to unmerged when git checks fail."""
+    def test_migrate_merge_status_logs_when_remote_probe_fails(self, tmp_path: Path, caplog: pytest.LogCaptureFixture):
+        """Migration logs a warning and defaults safely when origin inspection fails."""
         from gza.db import migrate_merge_status
         from gza.git import Git
 
@@ -1809,7 +1831,7 @@ class TestMergeStatus:
             def _run(self, *args, **kwargs):
                 raise RuntimeError("git failure")
 
-            def is_merged(self, source: str, target: str) -> bool:
+            def is_merged(self, source: str, into: str) -> bool:
                 return False
 
         db_path = tmp_path / "test.db"
@@ -1824,7 +1846,46 @@ class TestMergeStatus:
         updated = store.get(task.id)
         assert updated is not None
         assert updated.merge_status == "unmerged"
-        assert "Could not determine merge status" in caplog.text
+        assert "Could not inspect origin while backfilling merge status" in caplog.text
+
+    def test_migrate_merge_status_deleted_local_branch_with_remote_survivor_stays_unmerged(self, tmp_path: Path):
+        """Migration should use shared remote-aware merge truth for deleted local branches."""
+        from gza.db import migrate_merge_status
+        from gza.git import Git
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "file.txt").write_text("initial")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "Initial commit")
+
+        task = store.add(prompt="Legacy deleted local branch")
+        store.mark_completed(task, has_commits=True, branch="feature/remote-survivor")
+        store.set_merge_status(task.id, None)
+
+        git._run("checkout", "-b", "feature/remote-survivor")
+        (tmp_path / "feature.txt").write_text("feature\n")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Feature work")
+        git._run("checkout", "main")
+
+        remote_dir = tmp_path / "origin.git"
+        git._run("init", "--bare", str(remote_dir))
+        git._run("remote", "add", "origin", str(remote_dir))
+        git._run("push", "-u", "origin", "main")
+        git._run("push", "-u", "origin", "feature/remote-survivor")
+        git._run("branch", "-D", "feature/remote-survivor")
+
+        migrate_merge_status(store, git)
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.merge_status == "unmerged"
 
     def test_migration_v9_to_v10_adds_merge_status_column(self, tmp_path: Path):
         """Migration from v9 to v10 adds merge_status column."""
@@ -5789,6 +5850,20 @@ class TestSharedDbIsolationAndImportGating:
                 SqliteTaskStore(db_path, prefix="gza", project_id="alpha")
         finally:
             db_path.chmod(0o644)
+
+    def test_v35_to_v36_writable_disk_io_error_is_not_rewritten_as_read_only_schema_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Writable v35 auto-migration should preserve real disk I/O failures."""
+        db_path = tmp_path / "disk-io-v35.db"
+        _make_v35_db_with_legacy_key_shapes(db_path)
+
+        with patch(
+            "gza.db._run_v35_to_v36_migration",
+            side_effect=sqlite3.OperationalError("disk I/O error"),
+        ):
+            with pytest.raises(sqlite3.OperationalError, match=r"disk I/O error"):
+                SqliteTaskStore(db_path, prefix="gza", project_id="alpha")
 
     def test_cli_next_on_read_only_v35_db_surfaces_controlled_error(self, tmp_path: Path) -> None:
         """CLI read commands against read-only v35 DB should fail without traceback."""

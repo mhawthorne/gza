@@ -9,6 +9,7 @@ import os
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -38,7 +39,12 @@ from ..console import (
     shorten_prompt,
     truncate,
 )
-from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key as _task_id_numeric_key
+from ..db import (
+    SqliteTaskStore,
+    Task as DbTask,
+    _is_readonly_snapshot_operational_error,
+    task_id_numeric_key as _task_id_numeric_key,
+)
 from ..git import Git, GitError, active_worktree_path_for_branch
 from ..github import GitHub
 from ..pr_ops import lookup_task_pr
@@ -52,7 +58,12 @@ from ..query import (
     resolve_lineage_root as _resolve_lineage_root_task,
 )
 from ..runner import _get_task_output, get_effective_config_for_task, write_log_entry
-from ..sync_ops import BranchCohort, summarize_git_reconcile, sync_branch_cohorts
+from ..sync_ops import (
+    build_branch_cohorts_for_tasks,
+    build_unmerged_branch_cohorts,
+    reconcile_branch_merge_truth,
+    sync_branch_cohorts,
+)
 from ..task_query import (
     DateFilter as _TaskDateFilter,
     LineageRow as _LineageRow,
@@ -173,61 +184,9 @@ def _format_blocked_dependency_label(
     return "(blocked by dependency)"
 
 
-def _reconcile_unmerged_tasks(store: SqliteTaskStore, git: Git, default_branch: str) -> tuple[int, int]:
-    """Refresh merge truth and diff stats for tasks currently marked unmerged."""
-    merged_count = 0
-    refreshed_count = 0
-
-    for task in store.get_unmerged():
-        if task.id is None or not task.branch:
-            continue
-
-        if git.is_merged(task.branch, default_branch):
-            store.set_merge_status(task.id, "merged")
-            merged_count += 1
-            continue
-
-        files_changed, insertions, deletions = git.get_diff_stat_parsed(f"{default_branch}...{task.branch}")
-        store.update_diff_stats(task.id, files_changed, insertions, deletions)
-        refreshed_count += 1
-
-    return merged_count, refreshed_count
-
-
 def _is_branch_target_live(args: argparse.Namespace) -> bool:
     """Whether unmerged should use a live git target instead of canonical DB state."""
     return bool(getattr(args, "into_current", False) or getattr(args, "target", None))
-
-
-def _suppress_stale_merged_rows(tasks: list[DbTask], git: Git, target_branch: str) -> list[DbTask]:
-    """Hide rows that are stale in DB but already merged in git.
-
-    This is a read-time suppression only. It keeps default `gza unmerged`
-    output truthful without requiring `--update`, while preserving the
-    explicit reconcile behavior (`--update`) for DB writes.
-    """
-    merged_by_branch: dict[str, bool] = {}
-    filtered: list[DbTask] = []
-
-    for task in tasks:
-        branch = task.branch
-        if not branch:
-            continue
-
-        cached = merged_by_branch.get(branch)
-        if cached is None:
-            try:
-                # Keep deleted/missing branches visible; deletion alone does not
-                # prove the branch was merged into the target branch.
-                merged_by_branch[branch] = git.branch_exists(branch) and git.is_merged(branch, target_branch)
-            except GitError:
-                merged_by_branch[branch] = False
-            cached = merged_by_branch[branch]
-
-        if not cached:
-            filtered.append(task)
-
-    return filtered
 
 
 def cmd_next(args: argparse.Namespace) -> int:
@@ -968,7 +927,24 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
 
 def cmd_unmerged(args: argparse.Namespace) -> int:
     """List tasks with unmerged work on branches."""
-    from gza.db import migrate_merge_status, needs_merge_status_migration
+    from gza.db import needs_merge_status_migration
+
+    def _is_readonly_snapshot_refresh_error(
+        exc: sqlite3.OperationalError,
+        *,
+        db_path: Path,
+        project_dir: Path,
+    ) -> bool:
+        if _is_readonly_snapshot_operational_error(exc):
+            return True
+        if "disk i/o error" not in str(exc).lower():
+            return False
+        try:
+            if db_path.resolve() != (project_dir / ".gza" / "gza.db").resolve():
+                return False
+            return (db_path.stat().st_mode & 0o222) == 0
+        except OSError:
+            return False
 
     config = Config.load(args.project_dir)
     git = Git(config.project_dir)
@@ -976,48 +952,99 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
     current_branch = git.current_branch()
     print(f"On branch {current_branch}")
     target_branch = current_branch if getattr(args, "into_current", False) else (getattr(args, "target", None) or default_branch)
-    allow_persistence = bool(getattr(args, "update", False) and not _is_branch_target_live(args))
-    store = get_store(config, open_mode="readwrite" if allow_persistence else "query_only")
+    live_target = _is_branch_target_live(args)
+    update_requested = bool(getattr(args, "update", False))
+    if update_requested:
+        if live_target:
+            print(
+                "Warning: `gza unmerged --update` is deprecated; it has no effect with "
+                "`--into-current` or `--target` and will be removed.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Warning: `gza unmerged --update` is deprecated; plain `uv run gza unmerged` "
+                "already refreshes canonical default-branch merge truth before listing.",
+                file=sys.stderr,
+            )
 
-    # Backfill merge_status only on explicit mutating refresh.
-    if allow_persistence and needs_merge_status_migration(store):
-        console.print(f"[{TASK_COLORS['task_id']}]Migrating merge status for existing tasks...[/{TASK_COLORS['task_id']}]")
-        migrate_merge_status(store, git)
+    store: SqliteTaskStore | None = None
+    try:
+        store = get_store(config, open_mode="query_only" if live_target else "readwrite")
+        if not live_target:
+            if needs_merge_status_migration(store):
+                console.print(
+                    f"[{TASK_COLORS['task_id']}]Migrating merge status for existing tasks..."
+                    f"[/{TASK_COLORS['task_id']}]"
+                )
 
-    if allow_persistence:
-        seen_branches: set[str] = set()
-        cohorts: list[BranchCohort] = []
-        for task in store.get_unmerged():
-            if not task.branch or task.branch in seen_branches:
-                continue
-            seen_branches.add(task.branch)
-            cohorts.append(BranchCohort(branch=task.branch, tasks=tuple(store.get_tasks_for_branch(task.branch))))
-        reconcile_results, _partial = sync_branch_cohorts(
-            store,
-            git,
-            cohorts,
-            include_git=True,
-            include_pr=False,
-            dry_run=False,
-            fetch_remote=False,
-        )
-        merged_count, refreshed_count = summarize_git_reconcile(reconcile_results)
-        console.print(
-            f"[{TASK_COLORS['task_id']}]Reconciled unmerged tasks: {merged_count} merged, "
-            f"{refreshed_count} refreshed[/{TASK_COLORS['task_id']}]"
-        )
+            reconcile_results, _partial = sync_branch_cohorts(
+                store,
+                git,
+                build_unmerged_branch_cohorts(store),
+                include_git=True,
+                include_pr=False,
+                dry_run=False,
+                fetch_remote=True,
+            )
+            if _partial:
+                errors = [
+                    error
+                    for result in reconcile_results
+                    for error in result.errors
+                ]
+                if errors:
+                    print(f"Error: failed to refresh canonical merge truth: {errors[0]}")
+                    return 1
+    except sqlite3.OperationalError as exc:
+        if _is_readonly_snapshot_refresh_error(
+            exc,
+            db_path=store.db_path if store is not None else config.db_path,
+            project_dir=config.project_dir,
+        ):
+            print(
+                "Error: `gza unmerged` refreshes canonical default-branch merge truth and "
+                "needs a writable task DB. This database is read-only."
+            )
+            return 1
+        raise
 
-    if _is_branch_target_live(args):
+    if live_target:
         history = store.get_history(limit=None)
-        all_unmerged = [
+        branch_candidates = [
             t for t in history
             if t.status == "completed"
             and t.branch
             and t.has_commits
-            and (t.task_type not in ("improve", "rebase") or t.based_on is None)
-            and not git.is_merged(t.branch, target_branch)
+            and (t.task_type not in ("improve", "rebase", "fix") or t.based_on is None)
         ]
-        unmerged = all_unmerged
+        live_results = reconcile_branch_merge_truth(
+            git,
+            build_branch_cohorts_for_tasks(store, branch_candidates),
+            target_branch=target_branch,
+            include_diff_stats=True,
+        )
+        first_live_error = next(
+            (
+                (result.branch, result.errors[0])
+                for result in live_results
+                if result.errors
+            ),
+            None,
+        )
+        if first_live_error is not None:
+            failing_branch, error_text = first_live_error
+            print(
+                "Error: failed to reconcile unmerged branches relative to "
+                f"{target_branch}: {failing_branch}: {error_text}"
+            )
+            return 1
+        live_unmerged_branches = {
+            result.branch
+            for result in live_results
+            if result.skipped_reason is None and result.merge_status != "merged"
+        }
+        unmerged = [task for task in branch_candidates if task.branch in live_unmerged_branches]
         console.print(
             f"[{TASK_COLORS['task_id']}]Showing tasks unmerged relative to {target_branch}"
             f"[/{TASK_COLORS['task_id']}]"
@@ -1027,7 +1054,6 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         # --commits-only and --all flags are kept for backwards compatibility but are no-ops
         all_unmerged = store.get_unmerged()
         unmerged = [t for t in all_unmerged if t.status == "completed"]
-        unmerged = _suppress_stale_merged_rows(unmerged, git, default_branch)
 
     if not unmerged:
         console.print("No unmerged tasks")

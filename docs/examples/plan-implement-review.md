@@ -229,7 +229,11 @@ PR created: https://github.com/myorg/myapp/pull/143
 $ uv run gza merge gza-2 --squash
 Merged: feature/implement-the-jwt-authentication → main (squashed)
 
-# Reconcile cached PR state and close stale open PRs if origin proves the merge landed
+# Daily merge-truth check: what still needs to be merged?
+$ uv run gza unmerged
+No unmerged tasks
+
+# Explicit PR reconciliation: refresh cached PR state and close stale open PRs if origin proves the merge landed
 $ uv run gza sync gza-2
 feature/implement-the-jwt-authentication | merge=merged | pr=#143:closed
 ```
@@ -243,3 +247,4 @@ The complete workflow:
 3. **Review** - `uv run gza review <impl_id>`
 4. **Improve** (if needed) - `uv run gza improve <task_id>` → `uv run gza review <task_id>` (accepts implement, improve, or review ID — auto-resolves)
 5. **Merge** - `uv run gza pr <impl_id>` → `uv run gza merge <impl_id> --squash` → `uv run gza sync <impl_id>`
+6. **Daily reconciliation** - `uv run gza unmerged` answers the default-branch merge-truth question; use `uv run gza sync` when you explicitly want broader branch and PR refresh

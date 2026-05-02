@@ -183,20 +183,328 @@ def build_branch_cohorts_for_task_ids(
     return cohorts, prelim_results
 
 
+def build_branch_cohorts_for_tasks(
+    store: SqliteTaskStore,
+    tasks: list[Task],
+) -> list[BranchCohort]:
+    """Collapse branch-bearing task rows into one cohort per branch."""
+    branch_names: set[str] = set()
+    cohorts: list[BranchCohort] = []
+    for task in tasks:
+        if not task.branch or task.branch in branch_names:
+            continue
+        branch_names.add(task.branch)
+        cohorts.append(BranchCohort(branch=task.branch, tasks=tuple(store.get_tasks_for_branch(task.branch))))
+    return cohorts
+
+
+def build_task_branch_cohort(
+    store: SqliteTaskStore,
+    task_id: str,
+) -> tuple[BranchCohort | None, BranchSyncResult | None]:
+    """Expand one task ID into its branch cohort for task-scoped callers."""
+    cohorts, preliminary = build_branch_cohorts_for_task_ids(store, [task_id])
+    if preliminary:
+        return None, preliminary[0]
+    if not cohorts:
+        return None, None
+    return cohorts[0], None
+
+
 def build_default_branch_cohorts(
     store: SqliteTaskStore,
     *,
     recent_days: int = 30,
 ) -> list[BranchCohort]:
     """Build the bounded default sync cohort set."""
-    branch_names: set[str] = set()
-    cohorts: list[BranchCohort] = []
-    for task in store.get_sync_candidates(recent_days=recent_days):
-        if not task.branch or task.branch in branch_names:
+    return build_branch_cohorts_for_tasks(store, store.get_sync_candidates(recent_days=recent_days))
+
+
+def build_unmerged_branch_cohorts(store: SqliteTaskStore) -> list[BranchCohort]:
+    """Build the canonical branch cohort set for daily default-branch unmerged reconciliation."""
+    return build_branch_cohorts_for_tasks(store, store.get_canonical_unmerged_candidates())
+
+
+def _remote_branch_ref_for_reconcile(
+    git: Git,
+    branch: str,
+    *,
+    remote_target_ref: str | None,
+) -> str | None:
+    """Return a surviving remote feature ref that can prove merge truth."""
+    if remote_target_ref is None or not remote_target_ref.startswith("origin/"):
+        return None
+    remote_branch_ref = f"origin/{branch}"
+    if git.ref_exists(remote_branch_ref):
+        return remote_branch_ref
+    return None
+
+
+def reconcile_branch_merge_truth(
+    git: Git,
+    cohorts: list[BranchCohort],
+    *,
+    target_branch: str,
+    include_diff_stats: bool,
+    remote_target_ref: str | None = None,
+) -> list[BranchSyncResult]:
+    """Compute branch-scoped merge truth and optional diff stats without persistence.
+
+    Missing local branches do not imply merged. Reconciliation requires explicit
+    target-branch proof from a surviving branch ref, typically the local feature
+    branch or a fetched ``origin/<feature>`` ref for canonical default-branch syncs.
+    """
+    results: list[BranchSyncResult] = []
+
+    for cohort in cohorts:
+        result = BranchSyncResult(
+            branch=cohort.branch,
+            task_ids=tuple(task.id for task in cohort.code_tasks if task.id is not None),
+            reconciled=True,
+        )
+        results.append(result)
+        code_tasks = cohort.code_tasks
+        if not code_tasks:
+            result.skipped_reason = "no code-bearing task rows"
             continue
-        branch_names.add(task.branch)
-        cohorts.append(BranchCohort(branch=task.branch, tasks=tuple(store.get_tasks_for_branch(task.branch))))
-    return cohorts
+
+        desired_merge_status = code_tasks[0].merge_status
+        try:
+            local_branch_exists = git.branch_exists(cohort.branch)
+            reconcile_ref = cohort.branch if local_branch_exists else _remote_branch_ref_for_reconcile(
+                git,
+                cohort.branch,
+                remote_target_ref=remote_target_ref,
+            )
+            if reconcile_ref is None:
+                remote_merged = None
+                target_merged = None
+            else:
+                remote_merged = (
+                    git.is_merged(reconcile_ref, into=remote_target_ref)
+                    if remote_target_ref is not None
+                    else None
+                )
+                target_merged = git.is_merged(reconcile_ref, into=target_branch)
+        except GitError as exc:
+            result.errors.append(str(exc))
+            result.merge_status = desired_merge_status
+            continue
+
+        if remote_merged is True or target_merged is True:
+            desired_merge_status = "merged"
+            _mark_merged(result)
+        elif reconcile_ref is None:
+            desired_merge_status = "unmerged"
+        else:
+            desired_merge_status = "unmerged"
+            if include_diff_stats:
+                try:
+                    diff_output = git.get_diff_numstat(f"{target_branch}...{reconcile_ref}")
+                except GitError as exc:
+                    result.errors.append(str(exc))
+                else:
+                    diff_stats = parse_diff_numstat(diff_output)
+                    result.diff_files_changed, result.diff_lines_added, result.diff_lines_removed = diff_stats
+                    result.actions.append("refreshed diff stats")
+
+        result.merge_status = desired_merge_status
+
+    return results
+
+
+@dataclass
+class _BranchPersistenceUpdate:
+    merge_status: str | None | object = _UNSET
+    diff_stats: tuple[int | None, int | None, int | None] | object = _UNSET
+    pr_number: int | None | object = _UNSET
+    pr_state: str | None | object = _UNSET
+    pr_last_synced_at: datetime | None | object = _UNSET
+
+
+def _git_reconcile_update(result: BranchSyncResult) -> _BranchPersistenceUpdate:
+    """Translate a git-reconcile result into branch-state persistence fields."""
+    update = _BranchPersistenceUpdate()
+    if result.merge_status is not None:
+        update.merge_status = result.merge_status
+    if "refreshed diff stats" in result.actions:
+        update.diff_stats = (
+            result.diff_files_changed,
+            result.diff_lines_added,
+            result.diff_lines_removed,
+        )
+    return update
+
+
+def _merge_persistence_update(
+    base: _BranchPersistenceUpdate,
+    overlay: _BranchPersistenceUpdate,
+) -> _BranchPersistenceUpdate:
+    """Overlay non-UNSET branch-state persistence fields."""
+    if overlay.merge_status is not _UNSET:
+        base.merge_status = overlay.merge_status
+    if overlay.diff_stats is not _UNSET:
+        base.diff_stats = overlay.diff_stats
+    if overlay.pr_number is not _UNSET:
+        base.pr_number = overlay.pr_number
+    if overlay.pr_state is not _UNSET:
+        base.pr_state = overlay.pr_state
+    if overlay.pr_last_synced_at is not _UNSET:
+        base.pr_last_synced_at = overlay.pr_last_synced_at
+    return base
+
+
+def _enrich_branch_pr_state(
+    git: Git,
+    cohort: BranchCohort,
+    result: BranchSyncResult,
+    *,
+    default_branch: str,
+    remote_default_ref: str | None,
+    gh: GitHub,
+    dry_run: bool,
+    fetched_this_run: bool,
+) -> _BranchPersistenceUpdate:
+    """Layer PR/GitHub reconciliation onto an existing branch result."""
+    code_tasks = cohort.code_tasks
+    if not code_tasks:
+        return _BranchPersistenceUpdate()
+
+    branch = cohort.branch
+    representative = cohort.representative_task
+    desired_merge_status = result.merge_status if result.merge_status is not None else code_tasks[0].merge_status
+    branch_exists = git.branch_exists(branch)
+    remote_merged = (
+        git.is_merged(branch, into=remote_default_ref)
+        if fetched_this_run and remote_default_ref is not None and branch_exists
+        else None
+    )
+    cached_numbers = tuple(
+        pr_number
+        for pr_number in (
+            task.pr_number
+            for task in sorted(
+                code_tasks,
+                key=lambda task: task.created_at or datetime.min.replace(tzinfo=UTC),
+                reverse=True,
+            )
+        )
+        if pr_number is not None
+    )
+    try:
+        resolved_pr = resolve_branch_pr(gh, branch, cached_pr_numbers=cached_numbers, allow_discovery=True)
+    except GitHubError as exc:
+        result.errors.append(str(exc))
+        return _BranchPersistenceUpdate()
+
+    pr_lookup_time = datetime.now(UTC)
+    if resolved_pr.details is not None:
+        details = resolved_pr.details
+        result.pr_number = details.number
+        result.pr_state = details.state
+        result.actions.append(f"{resolved_pr.source} PR #{details.number} ({details.state})")
+        if details.state == "merged" and details.base_ref_name == default_branch:
+            desired_merge_status = "merged"
+            _mark_merged(result)
+        if (
+            details.state == "open"
+            and fetched_this_run
+            and remote_default_ref is not None
+            and details.base_ref_name == default_branch
+            and branch_exists
+            and remote_merged is True
+        ):
+            desired_merge_status = "merged"
+            _mark_merged(result)
+            comment_body = (
+                f"Closing automatically via `gza sync`: the changes from task {representative.id} "
+                f"on branch `{branch}` are already present on `origin/{default_branch}`, "
+                "so this PR is stale after a manual or squash merge outside GitHub."
+            )
+            if dry_run:
+                result.actions.append(f"would comment and close PR #{details.number}")
+            else:
+                try:
+                    gh.add_pr_comment(details.number, comment_body)
+                except GitHubError as exc:
+                    result.errors.append(f"failed to comment on PR #{details.number}: {exc}")
+                else:
+                    try:
+                        gh.close_pr(details.number)
+                    except GitHubError as exc:
+                        result.errors.append(f"failed to close PR #{details.number}: {exc}")
+                    else:
+                        result.actions.append(f"closed stale PR #{details.number}")
+                        result.pr_state = "closed"
+    elif resolved_pr.clear_cached_number:
+        result.actions.append("cleared stale cached PR")
+
+    result.reconciled = True
+    result.merge_status = desired_merge_status
+    return _BranchPersistenceUpdate(
+        merge_status=(
+            desired_merge_status
+            if desired_merge_status != code_tasks[0].merge_status
+            else _UNSET
+        ),
+        pr_number=(
+            resolved_pr.details.number
+            if resolved_pr.details is not None
+            else None if resolved_pr.clear_cached_number else _UNSET
+        ),
+        pr_state=result.pr_state,
+        pr_last_synced_at=pr_lookup_time,
+    )
+
+
+def _persist_branch_updates(
+    store: SqliteTaskStore,
+    cohorts: list[BranchCohort],
+    results: list[BranchSyncResult],
+    updates: list[_BranchPersistenceUpdate],
+) -> None:
+    """Write combined branch-state updates once per error-free cohort."""
+    for cohort, result, update in zip(cohorts, results, updates, strict=True):
+        if not result.ok:
+            continue
+        if not cohort.code_tasks:
+            continue
+        _persist_branch_state(
+            store,
+            cohort.code_tasks,
+            merge_status=update.merge_status,
+            diff_stats=update.diff_stats,
+            pr_number=update.pr_number,
+            pr_state=update.pr_state,
+            pr_last_synced_at=update.pr_last_synced_at,
+        )
+
+
+def reconcile_task_branch_merge_truth(
+    store: SqliteTaskStore,
+    git: Git,
+    task_id: str,
+    *,
+    target_branch: str,
+    include_diff_stats: bool,
+    persist: bool = True,
+) -> BranchSyncResult:
+    """Task-scoped wrapper that expands to a cohort and reconciles git merge truth."""
+    cohort, preliminary = build_task_branch_cohort(store, task_id)
+    if preliminary is not None:
+        return preliminary
+    if cohort is None:
+        return BranchSyncResult(branch=f"<missing:{task_id}>", task_ids=(task_id,), skipped_reason="no branch cohort")
+
+    result = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch=target_branch,
+        include_diff_stats=include_diff_stats,
+    )[0]
+    if persist and result.skipped_reason is None:
+        _persist_branch_updates(store, [cohort], [result], [_git_reconcile_update(result)])
+    return result
 
 
 def sync_branch_cohorts(
@@ -210,33 +518,38 @@ def sync_branch_cohorts(
     fetch_remote: bool = True,
 ) -> tuple[list[BranchSyncResult], bool]:
     """Reconcile branch cohorts against git and optional GitHub state."""
-    results: list[BranchSyncResult] = []
     partial_failure = False
     default_branch = git.default_branch()
     remote_default_ref: str | None = None
     fetched_this_run = False
+    fetch_error: str | None = None
 
-    if fetch_remote:
-        for cohort in cohorts:
-            results.append(
-                BranchSyncResult(
-                    branch=cohort.branch,
-                    task_ids=tuple(task.id for task in cohort.code_tasks if task.id is not None),
-                    fetch_attempted=True,
-                )
-            )
+    has_origin_remote = True
+    remote_exists = getattr(git, "remote_exists", None)
+    if callable(remote_exists):
+        remote_present = remote_exists("origin")
+        if isinstance(remote_present, bool):
+            has_origin_remote = remote_present
+
+    if fetch_remote and has_origin_remote:
         try:
             git.fetch("origin")
             fetched_this_run = True
-            for result in results:
-                result.fetch_succeeded = True
             remote_default_candidate = f"origin/{default_branch}"
             if git.ref_exists(remote_default_candidate):
                 remote_default_ref = remote_default_candidate
         except GitError as exc:
             partial_failure = True
-            for result in results:
-                result.errors.append(f"git fetch origin failed: {exc}")
+            fetch_error = f"git fetch origin failed: {exc}"
+
+    if include_git:
+        results = reconcile_branch_merge_truth(
+            git,
+            cohorts,
+            target_branch=default_branch,
+            include_diff_stats=True,
+            remote_target_ref=remote_default_ref if fetched_this_run else None,
+        )
     else:
         results = [
             BranchSyncResult(
@@ -245,6 +558,17 @@ def sync_branch_cohorts(
             )
             for cohort in cohorts
         ]
+
+    for result in results:
+        result.fetch_attempted = fetch_remote and has_origin_remote
+        result.fetch_succeeded = fetched_this_run
+        if fetch_error is not None:
+            result.errors.append(fetch_error)
+
+    updates = [
+        _git_reconcile_update(result) if include_git else _BranchPersistenceUpdate()
+        for result in results
+    ]
 
     gh: GitHub | None = None
     gh_available = False
@@ -256,23 +580,26 @@ def sync_branch_cohorts(
             for result in results:
                 result.errors.append("GitHub CLI (gh) is not installed or not authenticated")
 
-    for cohort, result in zip(cohorts, results, strict=True):
-        if not cohort.code_tasks:
-            result.skipped_reason = "no code-bearing task rows"
-            continue
-        _sync_single_branch(
-            store,
-            git,
-            cohort,
-            result,
-            default_branch=default_branch,
-            remote_default_ref=remote_default_ref,
-            include_git=include_git,
-            include_pr=include_pr and gh_available,
-            dry_run=dry_run,
-            gh=gh,
-            fetched_this_run=fetched_this_run,
-        )
+    if include_pr and gh_available and gh is not None:
+        for idx, (cohort, result) in enumerate(zip(cohorts, results, strict=True)):
+            if result.skipped_reason is not None:
+                continue
+            pr_update = _enrich_branch_pr_state(
+                git,
+                cohort,
+                result,
+                default_branch=default_branch,
+                remote_default_ref=remote_default_ref,
+                gh=gh,
+                dry_run=dry_run,
+                fetched_this_run=fetched_this_run,
+            )
+            updates[idx] = _merge_persistence_update(updates[idx], pr_update)
+
+    if not dry_run:
+        _persist_branch_updates(store, cohorts, results, updates)
+
+    for result in results:
         partial_failure = partial_failure or not result.ok
 
     return results, partial_failure
@@ -347,135 +674,6 @@ def refresh_branch_diff_stats(
         results.append(result)
     skipped = sum(1 for result in results if result.skipped_reason is not None)
     return results, skipped
-
-
-def _sync_single_branch(
-    store: SqliteTaskStore,
-    git: Git,
-    cohort: BranchCohort,
-    result: BranchSyncResult,
-    *,
-    default_branch: str,
-    remote_default_ref: str | None,
-    include_git: bool,
-    include_pr: bool,
-    dry_run: bool,
-    gh: GitHub | None,
-    fetched_this_run: bool,
-) -> None:
-    branch = cohort.branch
-    code_tasks = cohort.code_tasks
-    representative = cohort.representative_task
-    branch_exists = git.branch_exists(branch)
-    result.reconciled = include_git or include_pr
-
-    desired_merge_status = code_tasks[0].merge_status
-    diff_stats: tuple[int | None, int | None, int | None] | None = None
-    remote_merged: bool | None = None
-    local_merged: bool | None = None
-
-    if include_git or include_pr:
-        if remote_default_ref is not None:
-            remote_merged = git.is_merged(branch, into=remote_default_ref)
-        if include_git:
-            local_merged = git.is_merged(branch, into=default_branch)
-
-    if include_git:
-        if remote_merged is True or local_merged is True:
-            desired_merge_status = "merged"
-            _mark_merged(result)
-        elif branch_exists:
-            desired_merge_status = "unmerged"
-            diff_output = git.get_diff_numstat(f"{default_branch}...{branch}")
-            diff_stats = parse_diff_numstat(diff_output)
-            result.actions.append("refreshed diff stats")
-
-    pr_lookup_time: datetime | None = None
-    resolved_pr: ResolvedBranchPr | None = None
-    if include_pr and gh is not None:
-        cached_numbers = tuple(
-            pr_number
-            for pr_number in (
-                task.pr_number for task in sorted(code_tasks, key=lambda task: task.created_at or datetime.min.replace(tzinfo=UTC), reverse=True)
-            )
-            if pr_number is not None
-        )
-        try:
-            resolved_pr = resolve_branch_pr(gh, branch, cached_pr_numbers=cached_numbers, allow_discovery=True)
-        except GitHubError as exc:
-            result.errors.append(str(exc))
-        else:
-            pr_lookup_time = datetime.now(UTC)
-        if resolved_pr is not None and resolved_pr.details is not None:
-            details = resolved_pr.details
-            result.pr_number = details.number
-            result.pr_state = details.state
-            result.actions.append(f"{resolved_pr.source} PR #{details.number} ({details.state})")
-            if details.state == "merged" and details.base_ref_name == default_branch:
-                desired_merge_status = "merged"
-                _mark_merged(result)
-            if (
-                details.state == "open"
-                and fetched_this_run
-                and remote_default_ref is not None
-                and details.base_ref_name == default_branch
-                and branch_exists
-                and remote_merged is True
-            ):
-                desired_merge_status = "merged"
-                _mark_merged(result)
-                comment_body = (
-                    f"Closing automatically via `gza sync`: the changes from task {representative.id} "
-                    f"on branch `{branch}` are already present on `origin/{default_branch}`, "
-                    "so this PR is stale after a manual or squash merge outside GitHub."
-                )
-                if dry_run:
-                    result.actions.append(f"would comment and close PR #{details.number}")
-                else:
-                    try:
-                        gh.add_pr_comment(details.number, comment_body)
-                    except GitHubError as exc:
-                        result.errors.append(f"failed to comment on PR #{details.number}: {exc}")
-                    else:
-                        try:
-                            gh.close_pr(details.number)
-                        except GitHubError as exc:
-                            result.errors.append(f"failed to close PR #{details.number}: {exc}")
-                        else:
-                            result.actions.append(f"closed stale PR #{details.number}")
-                            result.pr_state = "closed"
-        elif resolved_pr is not None and resolved_pr.clear_cached_number:
-            result.actions.append("cleared stale cached PR")
-
-    result.merge_status = desired_merge_status
-    if diff_stats is not None:
-        result.diff_files_changed, result.diff_lines_added, result.diff_lines_removed = diff_stats
-
-    if not dry_run:
-        persisted_merge_status: str | None | object = _UNSET
-        if include_git:
-            persisted_merge_status = desired_merge_status
-        elif include_pr and desired_merge_status != code_tasks[0].merge_status:
-            persisted_merge_status = desired_merge_status
-        _persist_branch_state(
-            store,
-            code_tasks,
-            merge_status=persisted_merge_status,
-            diff_stats=diff_stats if diff_stats is not None else _UNSET,
-            pr_number=(
-                resolved_pr.details.number
-                if resolved_pr is not None and resolved_pr.details is not None
-                else None if resolved_pr is not None and resolved_pr.clear_cached_number else _UNSET
-            ),
-            pr_state=(
-                result.pr_state
-                if pr_lookup_time is not None
-                else _UNSET
-            ),
-            pr_last_synced_at=pr_lookup_time if pr_lookup_time is not None else _UNSET,
-        )
-
-
 def _persist_branch_state(
     store: SqliteTaskStore,
     tasks: tuple[Task, ...],
