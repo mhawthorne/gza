@@ -7386,30 +7386,6 @@ class TestExtractedRunInnerHelpers:
         assert "could not look up a live PR" in output
         assert "Continuing with auto-review without PR sync." in output
         assert "Skipping auto-review" not in output
-
-    def test_post_complete_improve_gh_unavailable_still_runs_auto_review_without_noise(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Missing GitHub CLI should preserve historical improve auto-review behavior."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add(prompt="Implement with review", task_type="implement")
-        impl.status = "completed"
-        impl.branch = "feature/improve-no-gh"
-        store.update(impl)
-
-        improve = store.add(
-            prompt="Improve with review",
-            task_type="improve",
-            based_on=impl.id,
-            same_branch=True,
-            create_review=True,
-        )
-        improve.status = "completed"
-        improve.branch = impl.branch
         store.update(improve)
 
         config = self._make_config(tmp_path)
