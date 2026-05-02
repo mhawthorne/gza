@@ -1644,7 +1644,7 @@ def main() -> int:
     improve_parser.add_argument(
         "--review",
         action="store_true",
-        help="Auto-create review task on completion",
+        help="Auto-create review task on completion; if the branch already has an open PR, push same-branch improve commits first",
     )
     improve_parser.add_argument(
         "--pr",

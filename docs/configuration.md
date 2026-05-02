@@ -1167,7 +1167,7 @@ gza improve <impl_task_id> [options]
 |--------|-------------|
 | `impl_task_id` | Full prefixed task ID (implement, improve, review, or fix — auto-resolves to root implementation; e.g. `gza-1234`) |
 | `--review-id ID` | Explicit full prefixed review task ID to base the improve on (overrides auto-pick of most recent completed review; e.g. `gza-1234`) |
-| `--review` | Auto-create review task on completion |
+| `--review` | Auto-create review task on completion; if the branch already has an open PR, push same-branch improve commits first |
 | `--pr` | Auto-create/reuse a GitHub PR after successful code-task completion |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
@@ -1180,6 +1180,7 @@ gza improve <impl_task_id> [options]
 The improve command finds the most recent review for the implementation task and creates a new task that continues on the same branch to address the review feedback.
 When no completed review exists, improve can use unresolved task comments as feedback context.
 If no completed review exists, or a review exists but unresolved comments do, improve still runs using comments-only feedback.
+When an improve run completes with `--review`, gza performs one narrow PR check before the follow-up review: if GitHub can confirm that the branch already has an open PR, gza pushes any new same-branch commits first so the review sees the published code. If GitHub is unavailable, lookup fails, or no live PR exists, improve preserves the normal auto-review flow.
 
 ### fix
 
@@ -1460,11 +1461,13 @@ gza sync [task_id ...] [options]
 | `--pr-only` | Only reconcile PR metadata and stale-PR cleanup; skip git diff refresh |
 | `--no-fetch` | Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch |
 
-`gza sync` is the only command that performs GitHub-side reconciliation. It:
+`gza sync` is the canonical explicit command for full GitHub-side reconciliation. It:
 - dedupes work by branch and writes normalized state back to every same-branch task row that carries commits
 - refreshes cached `merge_status`, `diff_*` stats, `pr_number`, `pr_state`, and `pr_last_synced_at`
 - discovers PRs by branch for bounded candidates that need PR reconciliation
 - auto-closes stale open PRs only after posting a comment and only when a fresh `origin/<default-branch>` fetch proves the branch content is already present upstream
+
+The only GitHub-side exception outside `gza sync` is improve completion with `--review`: before auto-running the follow-up review, gza may do a narrow branch-scoped live-PR check and push for that same branch. It does not replace `gza sync` for broader cache refresh, merge-state reconciliation, or stale-PR cleanup.
 
 Default `gza sync` scope is intentionally bounded. It includes unresolved branches, tasks with known or unknown open-PR cache state, and recently touched PR-intended work. Pass explicit task IDs to force-sync specific branch cohorts outside that default window.
 

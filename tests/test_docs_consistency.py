@@ -101,7 +101,7 @@ def test_configuration_docs_describe_unimplemented_lineage_guidance() -> None:
 
 
 def test_configuration_docs_describe_sync_as_explicit_github_reconciliation_surface() -> None:
-    """Canonical docs should keep `gza sync` scoped as the explicit PR reconciliation command."""
+    """Canonical docs should describe `gza sync` as the full reconciliation surface with improve's narrow exception."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"
     config_content = (docs_root / "configuration.md").read_text()
     workflow_example = (docs_root / "examples" / "plan-implement-review.md").read_text()
@@ -109,7 +109,8 @@ def test_configuration_docs_describe_sync_as_explicit_github_reconciliation_surf
     required_snippets = [
         "### sync",
         "gza sync [task_id ...] [options]",
-        "`gza sync` is the only command that performs GitHub-side reconciliation.",
+        "`gza sync` is the canonical explicit command for full GitHub-side reconciliation.",
+        "The only GitHub-side exception outside `gza sync` is improve completion with `--review`",
         "`gza pr` does not reconcile or close stale GitHub PRs",
         "`gza merge` only performs the local git merge/rebase path",
         "`uv run gza sync <impl_id>`",

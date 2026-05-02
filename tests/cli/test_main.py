@@ -281,8 +281,24 @@ class TestHelpOutput:
 
         assert "### sync" in docs_text
         assert "gza sync [task_id ...] [options]" in docs_text
-        assert "`gza sync` is the only command that performs GitHub-side reconciliation." in docs_text
+        assert "`gza sync` is the canonical explicit command for full GitHub-side reconciliation." in docs_text
+        assert "The only GitHub-side exception outside `gza sync` is improve completion with `--review`" in docs_text
         assert "Run `gza sync` after those merges" in docs_text
+
+    def test_improve_help_and_docs_describe_narrow_pr_sync_before_auto_review(self, tmp_path):
+        """`improve --help` and docs should explain the same-branch push-before-review exception."""
+        setup_config(tmp_path)
+
+        improve_help = run_gza("improve", "--help", "--project", str(tmp_path))
+        assert improve_help.returncode == 0
+
+        help_text = " ".join(improve_help.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        expected = "if the branch already has an open PR, push same-branch improve commits first"
+        assert expected in help_text
+        assert expected in docs_text
+        assert "If GitHub is unavailable, lookup fails, or no live PR exists, improve preserves the normal auto-review flow." in docs_text
 
     def test_watch_and_queue_tag_help_point_to_same_scoped_pickup_preview(self, tmp_path):
         """Help/docs should make `queue --tag` the preview for `watch --tag`."""

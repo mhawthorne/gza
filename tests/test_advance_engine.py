@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from gza.advance_engine import (
@@ -217,6 +217,59 @@ def test_completed_fix_after_changes_requested_requires_fresh_review(tmp_path: P
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
     assert action["type"] == "create_review", action
+
+
+def test_completed_improve_without_review_clear_does_not_promote_to_review_actions(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """An unpublished completed improve must not advance into create/run review actions."""
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    impl.status = "completed"
+    review_time = datetime.now(UTC) - timedelta(hours=2)
+    impl.completed_at = review_time - timedelta(hours=1)
+    impl.branch = "feat/improve-publish-blocked"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add(f"Review {impl.id}", task_type="review", depends_on=impl.id)
+    review.status = "completed"
+    review.completed_at = review_time
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    improve = store.add(
+        f"Improve {impl.id}",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    improve.status = "completed"
+    improve.completed_at = review_time + timedelta(hours=1)
+    improve.branch = impl.branch
+    improve.has_commits = True
+    store.update(improve)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    assert action["type"] == "improve", action
+    assert action["type"] not in {"create_review", "run_review"}
 
 
 def test_unmerged_view_shows_fix_after_review_as_stale(tmp_path: Path):

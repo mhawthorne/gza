@@ -24,6 +24,15 @@ PrEnsureStatus = Literal[
     "push_failed",
     "create_failed",
 ]
+PrSyncStatus = Literal[
+    "no_branch",
+    "no_live_pr",
+    "already_synced",
+    "pushed",
+    "gh_unavailable",
+    "lookup_failed",
+    "push_failed",
+]
 PrLookupStatus = Literal["cached", "existing", "missing", "gh_unavailable"]
 PrContentBuilder = Callable[[], tuple[str, str]]
 
@@ -34,6 +43,17 @@ class EnsureTaskPrResult:
 
     ok: bool
     status: PrEnsureStatus
+    pr_url: str | None = None
+    pr_number: int | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class SyncTaskBranchResult:
+    """Result from syncing a task branch that already has a live PR."""
+
+    ok: bool
+    status: PrSyncStatus
     pr_url: str | None = None
     pr_number: int | None = None
     error: str | None = None
@@ -195,6 +215,27 @@ class LookupTaskPrResult:
     pr_number: int | None = None
 
 
+def _persist_branch_pr_state(
+    store: SqliteTaskStore,
+    branch_tasks: tuple[Task, ...],
+    *,
+    pr_number: int | None,
+    pr_state: str | None,
+    pr_last_synced_at: datetime | None,
+) -> None:
+    """Write resolved PR metadata to every task row on a shared branch."""
+    for original in branch_tasks:
+        if original.id is None:
+            continue
+        refreshed = store.get(original.id)
+        if refreshed is None:
+            continue
+        refreshed.pr_number = pr_number
+        refreshed.pr_state = pr_state
+        refreshed.pr_last_synced_at = pr_last_synced_at
+        store.update(refreshed)
+
+
 def lookup_task_pr(
     task: Task,
     *,
@@ -235,6 +276,92 @@ def lookup_task_pr(
         task.pr_number = pr_number
         store.update(task)
     return LookupTaskPrResult(found=True, status="existing", pr_url=pr_url, pr_number=pr_number)
+
+
+def sync_task_branch_if_live_pr(
+    task: Task,
+    store: SqliteTaskStore,
+    git: Git,
+) -> SyncTaskBranchResult:
+    """Push a task branch only when it already has an open pull request."""
+    if not task.branch:
+        return SyncTaskBranchResult(ok=True, status="no_branch")
+
+    gh = GitHub()
+    if not gh.is_available():
+        return SyncTaskBranchResult(ok=False, status="gh_unavailable", error="GitHub CLI not available")
+
+    branch_tasks = tuple(store.get_tasks_for_branch(task.branch))
+    cached_pr_numbers = tuple(
+        dict.fromkeys(
+            candidate.pr_number
+            for candidate in branch_tasks
+            if candidate.pr_number is not None
+        )
+    )
+    pr_lookup_time = datetime.now(UTC)
+    try:
+        resolved_pr = resolve_branch_pr(
+            gh,
+            task.branch,
+            cached_pr_numbers=cached_pr_numbers,
+            allow_discovery=True,
+        )
+    except GitHubError as e:
+        return SyncTaskBranchResult(ok=False, status="lookup_failed", error=str(e))
+
+    if resolved_pr.details is not None:
+        _persist_branch_pr_state(
+            store,
+            branch_tasks,
+            pr_number=resolved_pr.details.number,
+            pr_state=resolved_pr.details.state,
+            pr_last_synced_at=pr_lookup_time,
+        )
+        if resolved_pr.details.state != "open":
+            return SyncTaskBranchResult(
+                ok=True,
+                status="no_live_pr",
+                pr_url=resolved_pr.details.url,
+                pr_number=resolved_pr.details.number,
+            )
+    elif resolved_pr.clear_cached_number:
+        _persist_branch_pr_state(
+            store,
+            branch_tasks,
+            pr_number=None,
+            pr_state=None,
+            pr_last_synced_at=pr_lookup_time,
+        )
+        return SyncTaskBranchResult(ok=True, status="no_live_pr")
+    else:
+        return SyncTaskBranchResult(ok=True, status="no_live_pr")
+
+    try:
+        if not git.needs_push(task.branch):
+            return SyncTaskBranchResult(
+                ok=True,
+                status="already_synced",
+                pr_url=resolved_pr.details.url,
+                pr_number=resolved_pr.details.number,
+            )
+        print(f"Pushing branch '{task.branch}' to origin...")
+        git.push_branch(task.branch)
+    except GitError as e:
+        return SyncTaskBranchResult(
+            ok=False,
+            status="push_failed",
+            pr_url=resolved_pr.details.url,
+            pr_number=resolved_pr.details.number,
+            error=str(e),
+        )
+
+    return SyncTaskBranchResult(
+        ok=True,
+        status="pushed",
+        pr_url=resolved_pr.details.url,
+        pr_number=resolved_pr.details.number,
+    )
 
 
 def ensure_task_pr(

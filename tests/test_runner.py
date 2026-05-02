@@ -37,6 +37,7 @@ from gza.runner import (
     _ensure_work_pr_for_completed_code_task,
     _extract_review_verdict,
     _get_task_output,
+    _post_complete_code_task,
     _resolve_code_task_branch_name,
     _restore_wip_changes,
     _run_non_code_task,
@@ -6333,6 +6334,290 @@ class TestExtractedRunInnerHelpers:
 
         assert rc == 7
         assert call_order == ["pr", "review"]
+
+    def test_post_complete_improve_syncs_live_pr_before_auto_review(self, tmp_path: Path):
+        """Successful improve completion should sync a live PR before follow-up review work."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with review", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/improve-review-order"
+        store.update(impl)
+
+        improve = store.add(
+            prompt="Improve with review",
+            task_type="improve",
+            based_on=impl.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+        call_order: list[str] = []
+
+        def _sync_branch(*_args, **_kwargs):
+            call_order.append("sync")
+            return Mock(ok=True, status="pushed")
+
+        def _run_review(*_args, **_kwargs):
+            call_order.append("review")
+            return 11
+
+        with (
+            patch("gza.runner.sync_task_branch_if_live_pr", side_effect=_sync_branch),
+            patch("gza.runner._create_and_run_review_task", side_effect=_run_review),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 11
+        assert call_order == ["sync", "review"]
+
+    def test_post_complete_improve_sync_failure_skips_auto_review_without_failing_task(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Implicit improve PR sync failures should warn and skip auto-review without failing the task."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with review", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/improve-push-failure"
+        store.update(impl)
+        store.add_comment(impl.id, "Implementation feedback should remain unresolved.", source="direct")
+
+        review = store.add(
+            prompt="Review before improve",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        improve = store.add(
+            prompt="Improve with review",
+            task_type="improve",
+            based_on=impl.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+        sync_result = Mock(ok=False, status="push_failed", pr_number=77, error="push failed")
+
+        with (
+            patch("gza.runner.sync_task_branch_if_live_pr", return_value=sync_result),
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 0
+        run_review.assert_not_called()
+        output = capsys.readouterr().out
+        assert "could not be pushed to PR #77" in output
+        assert "Skipping auto-review" in output
+        refreshed = store.get(improve.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.review_cleared_at is None
+        unresolved_impl_comments = store.get_comments(impl.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved_impl_comments] == [
+            "Implementation feedback should remain unresolved."
+        ]
+
+    def test_post_complete_improve_without_review_skips_pr_sync_and_clears_review_state(
+        self,
+        tmp_path: Path,
+    ):
+        """Plain improve completion should preserve legacy cleanup without implicit GitHub sync."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with review", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/improve-no-review-sync"
+        store.update(impl)
+        store.add_comment(impl.id, "Resolved by plain improve.", source="direct")
+
+        review = store.add(
+            prompt="Review before improve",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        improve = store.add(
+            prompt="Improve without follow-up review",
+            task_type="improve",
+            based_on=impl.id,
+            same_branch=True,
+            create_review=False,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+
+        with (
+            patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 0
+        sync_branch.assert_not_called()
+        run_review.assert_not_called()
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.review_cleared_at is not None
+        unresolved_impl_comments = store.get_comments(impl.id, unresolved_only=True)
+        assert unresolved_impl_comments == []
+
+    def test_post_complete_improve_gh_unavailable_still_runs_auto_review_without_noise(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Missing GitHub CLI should preserve historical improve auto-review behavior."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with review", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/improve-no-gh"
+        store.update(impl)
+
+        improve = store.add(
+            prompt="Improve with review",
+            task_type="improve",
+            based_on=impl.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+
+        with (
+            patch("gza.runner.sync_task_branch_if_live_pr", return_value=Mock(ok=False, status="gh_unavailable")),
+            patch("gza.runner._create_and_run_review_task", return_value=9) as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 9
+        run_review.assert_called_once_with(improve, config, store)
+        output = capsys.readouterr().out
+        assert "GitHub CLI is not available" not in output
+        assert "Skipping auto-review" not in output
+
+    def test_post_complete_improve_lookup_failure_warns_but_still_runs_auto_review(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Unconfirmed PR lookup failures should no longer block improve follow-up review."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with review", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/improve-lookup-failure"
+        store.update(impl)
+
+        improve = store.add(
+            prompt="Improve with review",
+            task_type="improve",
+            based_on=impl.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+
+        with (
+            patch(
+                "gza.runner.sync_task_branch_if_live_pr",
+                return_value=Mock(ok=False, status="lookup_failed", error="auth failed"),
+            ),
+            patch("gza.runner._create_and_run_review_task", return_value=7) as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 7
+        run_review.assert_called_once_with(improve, config, store)
+        output = capsys.readouterr().out
+        assert "could not look up a live PR" in output
+        assert "Continuing with auto-review without PR sync." in output
+        assert "Skipping auto-review" not in output
 
     def test_run_uses_persisted_create_pr_intent_without_work_flag(self, tmp_path: Path):
         """Stored task create_pr intent should drive the runner even without `work --pr`."""

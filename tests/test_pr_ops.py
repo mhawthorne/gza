@@ -3,8 +3,9 @@
 from unittest.mock import Mock, patch
 
 from gza.db import SqliteTaskStore
+from gza.git import GitError
 from gza.github import GitHubError, PullRequestDetails
-from gza.pr_ops import ensure_task_pr, lookup_task_pr
+from gza.pr_ops import ensure_task_pr, lookup_task_pr, sync_task_branch_if_live_pr
 
 
 class TestEnsureTaskPr:
@@ -257,3 +258,142 @@ class TestLookupTaskPr:
         assert result.pr_url == "https://github.com/o/r/pull/55"
         assert result.pr_number is None
         gh.get_pr_number.assert_not_called()
+
+
+class TestSyncTaskBranchIfLivePr:
+    """Focused regressions for improve-time branch sync against existing PRs."""
+
+    def test_open_pr_pushes_branch_before_follow_up(self, tmp_path, capsys):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("Implement X", task_type="implement")
+        impl.branch = "feature/improve-open-pr"
+        impl.pr_number = 81
+        store.update(impl)
+
+        improve = store.add("Improve X", task_type="improve", based_on=impl.id, same_branch=True)
+        improve.branch = impl.branch
+        store.update(improve)
+
+        git = Mock()
+        git.needs_push.return_value = True
+
+        gh = Mock()
+        gh.is_available.return_value = True
+        gh.get_pr_details.return_value = PullRequestDetails(
+            url="https://github.com/o/r/pull/81",
+            number=81,
+            state="open",
+            base_ref_name="main",
+        )
+
+        with patch("gza.pr_ops.GitHub", return_value=gh):
+            result = sync_task_branch_if_live_pr(improve, store, git)
+
+        assert result.ok is True
+        assert result.status == "pushed"
+        git.push_branch.assert_called_once_with("feature/improve-open-pr")
+        output = capsys.readouterr().out
+        assert "Pushing branch 'feature/improve-open-pr' to origin..." in output
+        refreshed_impl = store.get(impl.id)
+        refreshed_improve = store.get(improve.id)
+        assert refreshed_impl is not None
+        assert refreshed_improve is not None
+        assert refreshed_impl.pr_number == 81
+        assert refreshed_improve.pr_number == 81
+        assert refreshed_impl.pr_state == "open"
+        assert refreshed_improve.pr_state == "open"
+
+    def test_no_live_pr_preserves_current_behavior(self, tmp_path, capsys):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Improve X", task_type="improve")
+        task.branch = "feature/improve-no-pr"
+        store.update(task)
+
+        git = Mock()
+
+        gh = Mock()
+        gh.is_available.return_value = True
+        gh.discover_pr_by_branch.return_value = None
+
+        with patch("gza.pr_ops.GitHub", return_value=gh):
+            result = sync_task_branch_if_live_pr(task, store, git)
+
+        assert result.ok is True
+        assert result.status == "no_live_pr"
+        git.needs_push.assert_not_called()
+        git.push_branch.assert_not_called()
+        assert capsys.readouterr().out == ""
+
+    def test_live_pr_already_synced_skips_push_without_noise(self, tmp_path, capsys):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Improve X", task_type="improve")
+        task.branch = "feature/improve-synced"
+        store.update(task)
+
+        git = Mock()
+        git.needs_push.return_value = False
+
+        gh = Mock()
+        gh.is_available.return_value = True
+        gh.discover_pr_by_branch.return_value = PullRequestDetails(
+            url="https://github.com/o/r/pull/91",
+            number=91,
+            state="open",
+            base_ref_name="main",
+        )
+
+        with patch("gza.pr_ops.GitHub", return_value=gh):
+            result = sync_task_branch_if_live_pr(task, store, git)
+
+        assert result.ok is True
+        assert result.status == "already_synced"
+        git.push_branch.assert_not_called()
+        assert capsys.readouterr().out == ""
+
+    def test_push_failure_warn_path_returns_nonfatal_error(self, tmp_path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Improve X", task_type="improve")
+        task.branch = "feature/improve-push-fails"
+        store.update(task)
+
+        git = Mock()
+        git.needs_push.return_value = True
+        git.push_branch.side_effect = GitError("no auth")
+
+        gh = Mock()
+        gh.is_available.return_value = True
+        gh.discover_pr_by_branch.return_value = PullRequestDetails(
+            url="https://github.com/o/r/pull/101",
+            number=101,
+            state="open",
+            base_ref_name="main",
+        )
+
+        with patch("gza.pr_ops.GitHub", return_value=gh):
+            result = sync_task_branch_if_live_pr(task, store, git)
+
+        assert result.ok is False
+        assert result.status == "push_failed"
+        assert result.pr_number == 101
+        assert result.error == "no auth"
+
+    def test_gh_unavailable_returns_without_output_or_git_activity(self, tmp_path, capsys):
+        """Missing GitHub CLI should remain a quiet, non-pushable lookup result."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Improve X", task_type="improve")
+        task.branch = "feature/improve-no-gh"
+        store.update(task)
+
+        git = Mock()
+
+        gh = Mock()
+        gh.is_available.return_value = False
+
+        with patch("gza.pr_ops.GitHub", return_value=gh):
+            result = sync_task_branch_if_live_pr(task, store, git)
+
+        assert result.ok is False
+        assert result.status == "gh_unavailable"
+        git.needs_push.assert_not_called()
+        git.push_branch.assert_not_called()
+        assert capsys.readouterr().out == ""

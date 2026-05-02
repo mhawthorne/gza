@@ -49,7 +49,7 @@ from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
 from .lineage import get_plan_for_task
-from .pr_ops import build_task_pr_content, ensure_task_pr
+from .pr_ops import build_task_pr_content, ensure_task_pr, sync_task_branch_if_live_pr
 from .prompt_sanitization import sanitize_provider_prompt
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
@@ -1833,9 +1833,20 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
     Returns:
         Exit code from running the review task.
     """
+    review_target = completed_task
+    if completed_task.task_type == "improve":
+        resolved_impl = _resolve_impl_ancestor(store, completed_task)
+        if resolved_impl is None:
+            console.print(
+                f"\n[yellow]Could not resolve the implementation ancestor for improve task {completed_task.id}; "
+                "skipping auto-review.[/yellow]"
+            )
+            return 0
+        review_target = resolved_impl
+
     try:
         review_task = create_review_task(
-            store, completed_task, prompt_mode="auto",
+            store, review_target, prompt_mode="auto",
             project_prefix=config.project_prefix or None,
         )
     except DuplicateReviewError as e:
@@ -1855,6 +1866,41 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
     # Run the review task immediately
     # Note: PR posting happens in _run_non_code_task, no need to do it here
     return run(config, task_id=review_task.id)
+
+
+def _sync_completed_improve_branch_for_live_pr(
+    task: Task,
+    store: SqliteTaskStore,
+    git: Git,
+) -> bool:
+    """Best-effort sync for improve branches that already have an open PR.
+
+    Returns False only when follow-up review should be held until the branch is
+    published. Lookup or `gh` availability gaps preserve the historical
+    improve-time review flow because no PR-facing action can be taken anyway.
+    """
+    result = sync_task_branch_if_live_pr(task, store, git)
+    if result.ok or result.status == "gh_unavailable":
+        return True
+
+    if result.status == "lookup_failed":
+        print(
+            f"Warning: Improve task {task.id} completed, but gza could not look up a live PR for "
+            f"branch '{task.branch}': {result.error}. Continuing with auto-review without PR sync."
+        )
+        return True
+    if result.status == "push_failed":
+        pr_ref = f"PR #{result.pr_number}" if result.pr_number is not None else "the live PR"
+        print(
+            f"Warning: Improve task {task.id} completed, but branch '{task.branch}' could not be "
+            f"pushed to {pr_ref}: {result.error}"
+        )
+    else:
+        print(
+            f"Warning: Improve task {task.id} completed, but branch '{task.branch}' could not be "
+            "synchronized for follow-up PR actions."
+        )
+    return False
 
 
 def _ensure_work_pr_for_completed_code_task(
@@ -2813,23 +2859,31 @@ def _post_complete_code_task(
 ) -> int:
     """Run shared post-completion side effects for completed code tasks."""
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
+    improve_follow_up_ready = True
+    impl_ancestor: Task | None = None
 
     # Clear review state on the root implementation task after improve completes.
     # Improve retries/resumes may chain based_on through previous improves, so
-    # resolve the implementation ancestor first.
+    # resolve the implementation ancestor first. Hold the review-clear handoff
+    # until live-PR publication is known safe so later lifecycle automation does
+    # not recreate PR-facing review work for unpublished code.
     if task.task_type == "improve":
         impl_ancestor = _resolve_impl_ancestor(store, task)
         if impl_ancestor and impl_ancestor.id is not None:
+            # If the implementation was already merged, flip it back to unmerged:
+            # improve writes add commits on the shared implementation branch even
+            # when publishing those commits still needs operator intervention.
+            refreshed_impl = store.get(impl_ancestor.id)
+            if refreshed_impl and refreshed_impl.id is not None and refreshed_impl.merge_status == "merged":
+                store.set_merge_status(refreshed_impl.id, "unmerged")
+        if task.create_review:
+            improve_follow_up_ready = _sync_completed_improve_branch_for_live_pr(task, store, worktree_git)
+        if improve_follow_up_ready and impl_ancestor and impl_ancestor.id is not None:
             store.clear_review_state(impl_ancestor.id)
             store.resolve_comments(
                 impl_ancestor.id,
                 created_on_or_before=task.created_at,
             )
-            # If the implementation was already merged, flip it back to unmerged:
-            # improve writes add commits on the shared implementation branch.
-            refreshed_impl = store.get(impl_ancestor.id)
-            if refreshed_impl and refreshed_impl.id is not None and refreshed_impl.merge_status == "merged":
-                store.set_merge_status(refreshed_impl.id, "unmerged")
 
     # Invalidate review state after rebase completes, since conflict resolution
     # may have introduced changes not covered by prior reviews.
@@ -2866,6 +2920,18 @@ def _post_complete_code_task(
 
     # Auto-create and run review task if requested
     if task.create_review:
+        if task.task_type == "improve" and not improve_follow_up_ready:
+            review_target = _resolve_impl_ancestor(store, task)
+            if review_target and review_target.id is not None:
+                print(
+                    "Warning: Skipping auto-review until the improve branch is safely published. "
+                    f"After resolving the PR sync issue, run `uv run gza review {review_target.id}`."
+                )
+            else:
+                print(
+                    "Warning: Skipping auto-review until the improve branch is safely published."
+                )
+            return 0
         return _create_and_run_review_task(task, config, store)
 
     return 0
