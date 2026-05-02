@@ -45,6 +45,22 @@ assert_file_not_contains() {
     fi
 }
 
+supported_codex_headless_exec_args() {
+    local work_dir="$1"
+
+    (
+        cd "$REPO_ROOT"
+        uv run python - "$work_dir" <<'PY'
+from pathlib import Path
+import sys
+
+from gza.providers.codex import build_headless_exec_args
+
+print(" ".join(build_headless_exec_args(Path(sys.argv[1]))))
+PY
+    )
+}
+
 create_mock_tools() {
     local case_dir="$1"
     local mock_bin="$case_dir/mock-bin"
@@ -380,7 +396,7 @@ test_conflict_loop_with_codex_uses_supported_headless_exec_flags() {
     local case_dir
     local expected_args
     case_dir=$(run_script_case "conflict_loop" "codex")
-    expected_args="-c check_for_update_on_startup=false exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C $REPO_ROOT -"
+    expected_args="$(supported_codex_headless_exec_args "$REPO_ROOT")"
 
     assert_eq "$(cat "$case_dir/exit_status")" "0" "codex conflict flow should succeed"
     assert_eq "$(cat "$case_dir/state/codex_count")" "2" "codex should resolve each conflict round"
@@ -388,6 +404,7 @@ test_conflict_loop_with_codex_uses_supported_headless_exec_flags() {
     assert_eq "$(cat "$case_dir/state/continue_index")" "2" "script should continue rebases after codex exits"
     assert_file_contains "$case_dir/state/codex_prompt_1.txt" "Do not run git push." "codex prompt should keep push in the shell script"
     assert_eq "$(cat "$case_dir/state/codex_args_1.txt")" "$expected_args" "codex should use the repo-supported headless exec contract"
+    assert_eq "$(cat "$case_dir/state/codex_args_2.txt")" "$expected_args" "codex should keep the same headless exec contract across conflict rounds"
     assert_file_not_contains "$case_dir/state/codex_args_1.txt" "--dangerously-work" "codex should not use the unsupported dangerously-work flag"
 }
 

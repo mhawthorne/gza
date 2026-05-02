@@ -35,6 +35,15 @@ CODEX_PRICING = {
     "default": (2.50, 10.00),
 }
 
+CODEX_HEADLESS_EXEC_BASE_ARGS = (
+    "-c",
+    "check_for_update_on_startup=false",
+    "exec",
+    "--json",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--skip-git-repo-check",
+)
+
 
 def _estimate_tokens_from_chars(char_count: int) -> int:
     """Estimate token count from character count using a simple 4-char heuristic."""
@@ -72,6 +81,16 @@ def calculate_cost(input_tokens: int, output_tokens: int, model: str = "") -> fl
         (output_tokens * output_price / 1_000_000)
     )
     return round(cost, 4)
+
+
+def build_headless_exec_args(work_dir: str | Path) -> list[str]:
+    """Build the shared non-resume Codex exec argv used across entry points."""
+    return [
+        *CODEX_HEADLESS_EXEC_BASE_ARGS,
+        "-C",
+        str(work_dir),
+        "-",
+    ]
 
 
 def _has_codex_oauth() -> bool:
@@ -317,12 +336,7 @@ class CodexProvider(Provider):
         else:
             cmd.extend([
                 "codex",
-                "-c", "check_for_update_on_startup=false",
-                "exec", "--json",
-                "--dangerously-bypass-approvals-and-sandbox",  # Bypass sandbox for headless operation
-                "--skip-git-repo-check",  # Worktree metadata may be unavailable inside containers
-                "-C", "/workspace",  # Set working directory explicitly
-                "-",  # Read prompt from stdin
+                *build_headless_exec_args("/workspace"),  # Worktree metadata may be unavailable inside containers
             ])
 
             # Add model if specified
@@ -370,12 +384,7 @@ class CodexProvider(Provider):
         else:
             cmd.extend([
                 "codex",
-                "-c", "check_for_update_on_startup=false",
-                "exec", "--json",
-                "--dangerously-bypass-approvals-and-sandbox",  # Bypass sandbox for headless operation
-                "--skip-git-repo-check",  # Worktree metadata may be unavailable in detached review contexts
-                "-C", str(work_dir),
-                "-",  # Read prompt from stdin
+                *build_headless_exec_args(work_dir),  # Worktree metadata may be unavailable in detached review contexts
             ])
 
             # Add model if specified

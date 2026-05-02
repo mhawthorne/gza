@@ -32,6 +32,7 @@ from gza.providers.base import (
     is_docker_running,
     verify_docker_credentials,
 )
+from gza.providers.codex import build_headless_exec_args
 from gza.providers.gemini import calculate_cost
 from gza.providers.output_formatter import (
     StreamOutputFormatter,
@@ -5837,3 +5838,17 @@ class TestPreflightLogging:
         codex_idx = captured_cmd.index("codex")
         assert captured_cmd[codex_idx + 1] == "-c"
         assert captured_cmd[codex_idx + 2] == "check_for_update_on_startup=false"
+
+    def test_codex_headless_exec_builder_matches_supported_contract(self, tmp_path: Path):
+        """Shared headless exec args should stay aligned with the supported Codex CLI contract."""
+        assert build_headless_exec_args(tmp_path) == [
+            "-c",
+            "check_for_update_on_startup=false",
+            "exec",
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--skip-git-repo-check",
+            "-C",
+            str(tmp_path),
+            "-",
+        ]
