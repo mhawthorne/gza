@@ -667,7 +667,7 @@ def main() -> int:
         type=int,
         metavar="SECS",
         dest="max_idle",
-        help="Exit after SECS of consecutive idle cycles (default: watch.max_idle)",
+        help="Exit after SECS of consecutive idle watch cycles (default: watch.max_idle)",
     )
     watch_parser.add_argument(
         "--max-iterations",

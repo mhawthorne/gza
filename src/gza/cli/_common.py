@@ -243,22 +243,20 @@ def _looks_like_task_id(arg: str) -> bool:
     return bool(_TASK_ID_RE.match(arg))
 
 
-NO_ACTIVITY_THRESHOLD_SECONDS = 60
-
-
 def _task_looks_stuck(config: Config, task: DbTask) -> bool:
-    """Return True if an in-progress task has not logged anything in NO_ACTIVITY_THRESHOLD_SECONDS.
+    """Return True if an in-progress task has not logged recently enough.
 
     A task is considered stuck when its process has been alive for more than
     the threshold and its log file is either missing, empty, or has not been
     written to within the threshold.  This catches preflight hangs such as a
     CLI blocking on an update/login prompt.
     """
+    threshold = config.watch.no_activity_timeout
     if task.started_at is None:
         return False
     now = datetime.now(UTC)
     age = (now - task.started_at).total_seconds()
-    if age <= NO_ACTIVITY_THRESHOLD_SECONDS:
+    if age <= threshold:
         return False
     if not task.log_file:
         return True
@@ -270,7 +268,7 @@ def _task_looks_stuck(config: Config, task: DbTask) -> bool:
     if stat.st_size == 0:
         return True
     mtime_age = now.timestamp() - stat.st_mtime
-    return mtime_age > NO_ACTIVITY_THRESHOLD_SECONDS
+    return mtime_age > threshold
 
 
 def _branch_has_commits(config: Config, branch: str | None) -> bool:

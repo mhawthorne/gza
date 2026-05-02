@@ -115,6 +115,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("watch.failure_backoff_max", "int", 3600, "Maximum cooldown after consecutive non-auto-resumable watch failures."),
     ConfigKeySpec("watch.failure_halt_after", "int | null", 10, "Exit `gza watch` after this many consecutive non-auto-resumable failures."),
     ConfigKeySpec("watch.max_idle", "int | null", None, "Idle timeout seconds for `gza watch` loop exit."),
+    ConfigKeySpec("watch.no_activity_timeout", "int", 60, "Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`."),
     ConfigKeySpec("watch.max_iterations", "int", 10, "Default review/improve loop cap in `gza watch`."),
     ConfigKeySpec("watch.poll", "int", 300, "Polling interval seconds for `gza watch`."),
     ConfigKeySpec(

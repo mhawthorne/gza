@@ -357,6 +357,22 @@ class TestHelpOutput:
         assert "--show-skipped" in failed_tasks_docs
         assert "`--max-resume-attempts` applies both to plain-watch auto-resume and to `--restart-failed` recovery decisions." in failed_tasks_docs
 
+    def test_watch_help_and_docs_distinguish_max_idle_from_no_activity_timeout(self, tmp_path):
+        """watch help/docs should distinguish loop idle exit from silent-worker reconciliation."""
+        setup_config(tmp_path)
+
+        help_result = run_gza("watch", "--help", "--project", str(tmp_path))
+        assert help_result.returncode == 0
+
+        help_text = " ".join(help_result.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        example_text = " ".join(Path("src/gza/gza.yaml.example").read_text().split())
+
+        assert "Exit after SECS of consecutive idle watch cycles" in help_text
+        assert "`watch.no_activity_timeout` controls when watch reconciliation marks a still-running worker `NO_ACTIVITY`" in docs_text
+        assert "`watch.max_idle` keeps its existing meaning: it exits the `gza watch` loop itself after consecutive idle cycles." in docs_text
+        assert "no_activity_timeout: 60" in example_text
+
     def test_internal_advance_workflow_docs_describe_watch_failed_recovery(self, tmp_path):
         """Internal workflow docs should stay aligned with watch failed-task recovery behavior."""
         setup_config(tmp_path)

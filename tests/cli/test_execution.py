@@ -2530,6 +2530,36 @@ class TestReconciliation:
         assert refreshed is not None
         assert refreshed.status == "in_progress"
 
+    def test_reconciliation_uses_configured_no_activity_timeout(self, tmp_path: Path):
+        """A non-default watch.no_activity_timeout should control silent-worker reconciliation."""
+        from datetime import UTC, datetime, timedelta
+
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "watch:\n"
+            "  no_activity_timeout: 120\n"
+        )
+        store = make_store(tmp_path)
+
+        task = store.add("Custom timeout task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = os.getpid()
+        task.started_at = datetime.now(UTC) - timedelta(seconds=90)
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "in_progress"
+
     def test_reconciliation_skips_live_task_with_recent_log_writes(self, tmp_path: Path):
         """A live task whose log was written recently should NOT be marked NO_ACTIVITY."""
         from datetime import UTC, datetime, timedelta

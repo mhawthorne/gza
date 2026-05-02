@@ -126,6 +126,7 @@ project_name: my-project
 # watch:
 #   batch: 5
 #   poll: 300
+#   no_activity_timeout: 60
 #   max_idle: null
 #   max_iterations: 10
 
