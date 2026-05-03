@@ -8,7 +8,7 @@ public: true
 
 # Rebase on Main
 
-Rebase the current branch onto the latest `origin/main`, resolving any merge conflicts interactively.
+Rebase the current branch onto a local target branch, resolving any merge conflicts interactively.
 
 ## Process
 
@@ -22,6 +22,7 @@ Rebase the current branch onto the latest `origin/main`, resolving any merge con
   - Do NOT use AskUserQuestion — resolve all conflicts autonomously using best judgment.
   - If a conflict is truly ambiguous and cannot be resolved confidently, abort the rebase and report failure.
   - Uncommitted changes may be present in the working tree (e.g. leftover from an interrupted run). Stash them before rebasing and restore with `git stash pop` afterwards.
+  - Do NOT use remote git operations. Do not run `git fetch`, `git ls-remote`, HTTPS fallback fetches, or modify git remotes/config. Use only local refs already present in the repo. If the required local target is missing, stop and report failure.
 
 ### Step 1: Pre-flight checks
 
@@ -33,14 +34,16 @@ Rebase the current branch onto the latest `origin/main`, resolving any merge con
 ### Step 2: Choose rebase target
 
 1. Prompt the user to choose between:
-   - `origin/main` (remote - default) - Use when you want to rebase against the latest remote changes
-   - `main` (local) - Use when you have local merged changes that haven't been pushed yet
+   - `main` (local - default) - Use the local branch already present in the repo
+   - `origin/main` (remote) - Only use this when the caller explicitly asked for a remote rebase
+2. In `--auto` mode, do not choose or synthesize a remote target. Rebase only onto the local target already provided by the caller.
 
 ### Step 3: Fetch and attempt rebase
 
-1. If rebasing against `origin/main`, run `git fetch origin main`
+1. If and only if the caller explicitly requested a remote rebase in non-`--auto` mode, run `git fetch origin main`
 2. Run `git rebase <chosen-target>`
 3. If rebase succeeds with no conflicts, report success and show the push command
+4. If the chosen local target does not exist, stop and report the missing ref. Do not try remote probes or alternate transports.
 
 ### Step 4: Resolve conflicts (if any)
 
@@ -50,7 +53,7 @@ For each conflicted file:
 2. **Read and understand** - Read each conflicted file to see the conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`)
 3. **Explain the conflict** - Tell the user what both sides are trying to do:
    - "HEAD (your branch) is adding/changing X"
-   - "origin/main is adding/changing Y"
+   - "the target branch is adding/changing Y"
 4. **Propose a resolution** - Suggest how to combine the changes (usually keeping both)
 5. **Ask for approval** - Use AskUserQuestion to confirm the resolution approach before editing
 6. **Apply the fix** - Edit the file to resolve the conflict, removing all conflict markers
@@ -84,3 +87,4 @@ Show:
 - **Always ask before resolving ambiguous conflicts** (unless in `--auto` mode) - if the intent isn't clear, ask
 - **Preserve both changes when possible** - most conflicts in this project are additive (both sides adding new code)
 - **Check Python syntax after each resolution** - catch errors early
+- **No remote creativity** - if remote access is unavailable or the local target ref is missing, stop and report instead of trying SSH workarounds, HTTPS fallbacks, or git-config changes
