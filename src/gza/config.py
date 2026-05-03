@@ -1577,7 +1577,6 @@ class Config:
                 "'project_id: default' is only valid with local DB mode (db_path: .gza/gza.db). "
                 "Set a unique project_id for shared DB mode or omit project_id to derive one."
             )
-
         if "project_prefix" in data and data["project_prefix"]:
             prefix_val = data["project_prefix"]
             if not isinstance(prefix_val, str):

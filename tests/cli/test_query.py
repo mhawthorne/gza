@@ -6665,8 +6665,11 @@ class TestUnmergedAllFlag:
         updated_task = store.get(task.id)
         assert updated_task.merge_status == "merged"
 
-    def test_unmerged_fetches_origin_default_branch_before_canonical_reconcile(self, tmp_path: Path):
-        """Plain canonical unmerged should use freshly fetched origin/default merge evidence."""
+    def test_unmerged_uses_existing_origin_default_branch_without_fetch_by_default(
+        self,
+        tmp_path: Path,
+    ):
+        """Plain canonical unmerged should reuse an existing origin/default ref without fetching."""
         from gza.git import Git
 
         store, task, git = setup_unmerged_env(
@@ -6691,7 +6694,46 @@ class TestUnmergedAllFlag:
         updater_git._run("merge", "--no-ff", "origin/feature/remote-only-merged-task", "-m", "Merge feature remotely")
         updater_git._run("push", "origin", "main")
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        git.fetch("origin")
+
+        with patch("gza.git.Git.fetch", side_effect=AssertionError("fetch should not be called")) as fetch_mock:
+            result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert fetch_mock.call_count == 0
+        assert result.returncode == 0
+        assert "Remote-only merged task" not in result.stdout
+        assert "No unmerged tasks" in result.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.merge_status == "merged"
+
+    def test_unmerged_fetch_flag_fetches_origin_default_branch_before_canonical_reconcile(self, tmp_path: Path):
+        """`--fetch` should refresh origin/default merge evidence before canonical reconcile."""
+        from gza.git import Git
+
+        store, task, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Remote-only merged task",
+            task_id="20260220-remote-only-merged-task",
+            branch="feature/remote-only-merged-task",
+        )
+
+        remote_dir = tmp_path / "origin.git"
+        git._run("init", "--bare", str(remote_dir))
+        git._run("remote", "add", "origin", str(remote_dir))
+        git._run("push", "-u", "origin", "main")
+        git._run("push", "-u", "origin", "feature/remote-only-merged-task")
+
+        updater_dir = tmp_path / "origin-updater"
+        git._run("clone", str(remote_dir), str(updater_dir))
+        updater_git = Git(updater_dir)
+        updater_git._run("config", "user.name", "Test User")
+        updater_git._run("config", "user.email", "test@example.com")
+        updater_git._run("checkout", "-b", "main", "origin/main")
+        updater_git._run("merge", "--no-ff", "origin/feature/remote-only-merged-task", "-m", "Merge feature remotely")
+        updater_git._run("push", "origin", "main")
+
+        result = run_gza("unmerged", "--fetch", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Remote-only merged task" not in result.stdout
@@ -6701,7 +6743,7 @@ class TestUnmergedAllFlag:
         assert refreshed.merge_status == "merged"
 
     def test_unmerged_fetch_failure_fails_closed_without_rendering_stale_rows(self, tmp_path: Path):
-        """Plain canonical unmerged should stop instead of showing stale rows after fetch failures."""
+        """`--fetch` should stop instead of showing stale rows after fetch failures."""
         store, task, _git = setup_unmerged_env(
             tmp_path,
             task_prompt="Fetch failure task",
@@ -6719,7 +6761,7 @@ class TestUnmergedAllFlag:
             patch("gza.git.Git.remote_exists", return_value=True),
             patch("gza.git.Git.fetch", side_effect=GitError("network down")),
         ):
-            result = run_gza("unmerged", "--project", str(tmp_path))
+            result = run_gza("unmerged", "--fetch", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "failed to refresh canonical merge truth" in result.stdout
@@ -6989,6 +7031,7 @@ class TestUnmergedImprovedDisplay:
             project_dir=tmp_path,
             into_current=False,
             target=None,
+            fetch=False,
             update=False,
             limit=5,
             commits_only=False,
@@ -7022,6 +7065,7 @@ class TestUnmergedImprovedDisplay:
             project_dir=tmp_path,
             into_current=False,
             target=None,
+            fetch=False,
             update=False,
             limit=5,
             commits_only=False,
@@ -7054,6 +7098,7 @@ class TestUnmergedImprovedDisplay:
             project_dir=tmp_path,
             into_current=False,
             target="integration",
+            fetch=False,
             update=False,
             limit=5,
             commits_only=False,
@@ -7096,6 +7141,7 @@ class TestUnmergedImprovedDisplay:
             project_dir=tmp_path,
             into_current=True,
             target=None,
+            fetch=False,
             update=False,
             limit=5,
             commits_only=False,

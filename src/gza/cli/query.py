@@ -985,7 +985,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 include_git=True,
                 include_pr=False,
                 dry_run=False,
-                fetch_remote=True,
+                fetch_remote=bool(getattr(args, "fetch", False)),
             )
             if _partial:
                 errors = [

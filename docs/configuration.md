@@ -977,13 +977,16 @@ gza unmerged [options]
 | `--commits-only` | Backwards-compatible no-op retained in the CLI surface |
 | `--all` | Backwards-compatible no-op retained in the CLI surface |
 | `-n N` | Show last N unmerged tasks (default: 5, `0` for all) |
+| `--fetch` | Fetch `origin` before the canonical default-branch refresh so `origin/<default>` merge evidence is current. Has no effect with `--into-current` or `--target` |
 | `--update` | Deprecated compatibility alias for the default default-branch refresh; plain `gza unmerged` already persists canonical merge truth before listing. Has no effect with `--into-current` or `--target` |
 | `--into-current` | Compare against the current branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 | `--target BRANCH` | Compare against the specified branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 
-`gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills legacy `merge_status` when needed, refreshes canonical branch-cohort merge truth from live git, persists normalized `merge_status` and diff stats, and then prints the reconciled default-branch unmerged list.
+`gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills legacy `merge_status` when needed, refreshes canonical branch-cohort merge truth from local git plus any already-present `origin/<default-branch>` remote-tracking ref, persists normalized `merge_status` and diff stats, and then prints the reconciled default-branch unmerged list.
 
 This is the deliberate narrow exception to the usual read-only query convention: only plain default-branch `gza unmerged` mutates, because its entire purpose is to answer the canonical question "what still needs to be merged?" without leaving stale cached rows behind.
+
+By default, plain `gza unmerged` does not initiate network I/O. It reuses any already-present `origin/<default-branch>` remote-tracking ref if one exists locally, but otherwise relies on local branch state. Pass `--fetch` to opt into the older fetch-then-reconcile behavior and refresh `origin/*` first.
 
 Deleted local feature branches are not treated as merge proof by themselves. Canonical reconciliation keeps them unmerged and visible until the target branch is explicitly proven to contain the changes, for example via a surviving `origin/<feature>` ref or merged PR metadata from `gza sync`.
 

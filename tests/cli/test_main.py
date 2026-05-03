@@ -397,8 +397,8 @@ class TestHelpOutput:
         assert "Those commands fail closed when the target task does not match the provided tag scope" in docs_text
         assert "within each task's current tag-set bucket" not in docs_text
 
-    def test_unmerged_help_and_docs_describe_daily_refresh_and_update_deprecation(self, tmp_path):
-        """unmerged help/docs should expose the daily mutating default and `--update` deprecation."""
+    def test_unmerged_help_and_docs_describe_fetch_opt_in_and_update_deprecation(self, tmp_path):
+        """unmerged help/docs should expose the no-fetch default, opt-in fetch, and `--update` deprecation."""
         setup_config(tmp_path)
 
         unmerged_help = run_gza("unmerged", "--help", "--project", str(tmp_path))
@@ -407,19 +407,23 @@ class TestHelpOutput:
         help_text = " ".join(unmerged_help.stdout.split())
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
+        assert "--fetch" in unmerged_help.stdout
         assert "--update" in unmerged_help.stdout
         assert "--into-current" in unmerged_help.stdout
         assert "--target BRANCH" in unmerged_help.stdout
         assert help_text.count("Retained compatibility no-op; has no effect on unmerged output") == 2
         assert "Show last N unmerged tasks (default: 5, 0 for all)" in help_text
+        assert "Fetch `origin` before the canonical default-branch refresh" in help_text
+        assert "Has no effect with `--into-current` or `--target`" in help_text
         assert "Deprecated compatibility alias for the default default-branch refresh" in help_text
         assert "plain `gza unmerged` already persists canonical merge truth before listing" in help_text
-        assert "Has no effect with `--into-current` or `--target`" in help_text
 
         assert "`gza unmerged` is the daily merge-truth command" in docs_text
         assert "`--commits-only` | Backwards-compatible no-op retained in the CLI surface" in docs_text
         assert "`--all` | Backwards-compatible no-op retained in the CLI surface" in docs_text
+        assert "`--fetch` | Fetch `origin` before the canonical default-branch refresh" in docs_text
         assert "opens the task store read/write" in docs_text
+        assert "By default, plain `gza unmerged` does not initiate network I/O" in docs_text
         assert "This is the deliberate narrow exception to the usual read-only query convention" in docs_text
         assert "If the canonical default-branch refresh cannot persist because the database is read-only" in docs_text
         assert "`--update` is deprecated because plain `gza unmerged` now does the canonical refresh automatically" in docs_text
