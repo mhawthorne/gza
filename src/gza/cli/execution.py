@@ -2323,20 +2323,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 print(f"  Created improve task {action_task.id} (resume of {failed_improve.id})")
             elif improve_action == "retry" and failed_improve is not None:
                 assert failed_improve.id is not None
-                retry_same_branch = failed_improve.same_branch
-                retry_base_branch: str | None = None
-                if failed_improve.same_branch and failed_improve.branch:
-                    retry_same_branch = False
-                    retry_base_branch = failed_improve.branch
-                action_task = store.add(
-                    prompt=failed_improve.prompt,
-                    task_type='improve',
-                    depends_on=failed_improve.depends_on,
-                    based_on=failed_improve.id,
-                    same_branch=retry_same_branch,
-                    tags=failed_improve.tags,
-                    base_branch=retry_base_branch,
-                )
+                action_task = _create_retry_task(store, failed_improve)
                 print(f"  Created improve task {action_task.id} (retry of {failed_improve.id})")
             else:
                 try:

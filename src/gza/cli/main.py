@@ -612,14 +612,14 @@ def main() -> int:
         "--no-resume-failed",
         action="store_true",
         dest="no_resume_failed",
-        help="Skip auto-resume of resumable failed tasks (for example MAX_STEPS, MAX_TURNS, TIMEOUT, TERMINATED)",
+        help="Skip automatic failed-task recovery decisions (resume/retry/manual-review)",
     )
     advance_parser.add_argument(
         "--max-resume-attempts",
         type=int,
         metavar="N",
         dest="max_resume_attempts",
-        help="Override max_resume_attempts config value for this run",
+        help="Override max_resume_attempts for shared automatic failed-task recovery decisions",
     )
     advance_parser.add_argument(
         "--max-review-cycles",

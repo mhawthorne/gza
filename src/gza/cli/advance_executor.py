@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from ..db import SqliteTaskStore, Task as DbTask
-from ._common import _create_improve_task, resolve_improve_action
+from ._common import _create_improve_task, _create_retry_task, resolve_improve_action
 
 
 class CreateReviewActionResult(Protocol):
@@ -248,20 +248,10 @@ def execute_advance_action(
             improve_task = context.create_resume_task(failed_improve)
         elif improve_mode == "retry" and failed_improve is not None:
             assert failed_improve.id is not None
-            retry_same_branch = failed_improve.same_branch
-            retry_base_branch: str | None = None
-            if failed_improve.same_branch and failed_improve.branch:
-                retry_same_branch = False
-                retry_base_branch = failed_improve.branch
-            improve_task = context.store.add(
-                prompt=failed_improve.prompt,
-                task_type="improve",
-                depends_on=failed_improve.depends_on,
-                based_on=failed_improve.id,
-                same_branch=retry_same_branch,
-                tags=failed_improve.tags,
-                base_branch=retry_base_branch,
-            )
+            if context.create_retry_task is not None:
+                improve_task = context.create_retry_task(failed_improve)
+            else:
+                improve_task = _create_retry_task(context.store, failed_improve)
         else:
             try:
                 improve_task = _create_improve_task(context.store, task, review_task)

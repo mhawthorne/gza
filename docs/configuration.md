@@ -1345,7 +1345,7 @@ gza extract SOURCE --files-from FILE [options]
 
 ### advance
 
-Intelligently progress unmerged tasks through their lifecycle. Handles review creation, improve tasks, merging, and resuming failed tasks.
+Intelligently progress unmerged tasks through their lifecycle. Handles review creation, improve tasks, merging, and shared automatic failed-task recovery (resume/retry).
 
 ```bash
 gza advance [task_id] [options]
@@ -1362,8 +1362,8 @@ gza advance [task_id] [options]
 | `--create` | With `--unimplemented`: queue implement tasks for the listed source rows |
 | `--auto`, `-y` | Skip confirmation and execute immediately |
 | `--batch B` | Stop after spawning B background workers |
-| `--no-resume-failed` | Skip auto-resume of failed tasks |
-| `--max-resume-attempts N` | Override max_resume_attempts config value |
+| `--no-resume-failed` | Skip automatic failed-task recovery decisions (resume/retry/manual-review) |
+| `--max-resume-attempts N` | Override max_resume_attempts for shared automatic failed-task recovery decisions |
 | `--max-review-cycles N` | Override max_review_cycles config value |
 | `--new` | Start new pending tasks to fill remaining `--batch` slots (requires `--batch`) |
 | `--type TYPE` | Only advance tasks of this type (`plan` or `implement`) |

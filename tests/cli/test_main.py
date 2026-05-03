@@ -152,6 +152,35 @@ class TestHelpOutput:
         assert "With --unimplemented: queue implement tasks for the listed source rows" in normalized_output
         assert "--plans" not in result.stdout
 
+    def test_advance_help_and_docs_describe_shared_failed_task_recovery_scope(self, tmp_path):
+        """advance help/docs/config-key surfaces should describe shared failed-task recovery, not resume-only."""
+        import json
+
+        setup_config(tmp_path)
+
+        help_result = run_gza("advance", "--help", "--project", str(tmp_path))
+        assert help_result.returncode == 0
+        help_text = " ".join(help_result.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "Skip automatic failed-task recovery decisions (resume/retry/manual-review)" in help_text
+        assert "Override max_resume_attempts for shared automatic failed-task recovery decisions" in help_text
+        assert "Skip auto-resume of resumable failed tasks" not in help_text
+
+        assert "shared automatic failed-task recovery (resume/retry)" in docs_text
+        assert "Skip automatic failed-task recovery decisions (resume/retry/manual-review)" in docs_text
+        assert "Override max_resume_attempts for shared automatic failed-task recovery decisions" in docs_text
+        assert "Skip auto-resume of failed tasks" not in docs_text
+
+        config_keys = run_gza("config", "keys", "--json", "--project", str(tmp_path))
+        assert config_keys.returncode == 0
+        payload = json.loads(config_keys.stdout)
+        keyed_entries = {entry["key"]: entry for entry in payload["keys"]}
+        assert (
+            keyed_entries["max_resume_attempts"]["description"]
+            == "Attempt cap for shared automatic failed-task recovery (resume/retry), including advance, iterate improve recovery, and watch decisions."
+        )
+
     def test_iterate_help_uses_lifecycle_wording_and_config_default(self, tmp_path):
         """iterate --help should keep lifecycle wording and describe config-backed max-iterations default."""
         setup_config(tmp_path)

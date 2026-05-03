@@ -609,7 +609,7 @@ class TestLocalConfigOverrides:
         assert "Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active." in result.stdout
         assert "Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`." in result.stdout
         assert (
-            "Retry cap for resume-based lifecycle automation, including watch auto-resume and --restart-failed recovery decisions."
+            "Attempt cap for shared automatic failed-task recovery (resume/retry), including advance, iterate improve recovery, and watch decisions."
             in result.stdout
         )
 
@@ -660,7 +660,7 @@ class TestLocalConfigOverrides:
         )
         assert (
             keyed_entries["max_resume_attempts"]["description"]
-            == "Retry cap for resume-based lifecycle automation, including watch auto-resume and --restart-failed recovery decisions."
+            == "Attempt cap for shared automatic failed-task recovery (resume/retry), including advance, iterate improve recovery, and watch decisions."
         )
 
 

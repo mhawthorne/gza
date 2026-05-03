@@ -7776,6 +7776,91 @@ class TestIterateCommand:
         # The improve-resume path must pass resume=True so _auto_rebase_before_resume fires.
         assert run_fg.call_args_list[0].kwargs.get("resume") is True
 
+    def test_iterate_improve_retry_preserves_review_backed_execution_settings(self, tmp_path: Path):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        failed_improve = store.add(
+            "Improve",
+            task_type="improve",
+            depends_on=review.id,
+            based_on=impl.id,
+            same_branch=True,
+        )
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed_improve.create_review = True
+        failed_improve.create_pr = True
+        failed_improve.model = "gpt-5.4"
+        failed_improve.provider = "codex"
+        failed_improve.provider_is_explicit = True
+        store.update(failed_improve)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=3,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        improve_action = {"type": "improve", "description": "Create improve", "review_task": review}
+        engine_actions = [{"type": "skip", "description": "initial unused"}, improve_action, {"type": "skip", "description": "done"}]
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.determine_next_action", side_effect=engine_actions),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+        ):
+            result = cmd_iterate(args)
+
+        assert result == 3
+        retry_tasks = [
+            task
+            for task in store.get_all()
+            if task.task_type == "improve" and task.based_on == failed_improve.id and task.id != failed_improve.id
+        ]
+        assert len(retry_tasks) == 1
+        retry_task = retry_tasks[0]
+        assert retry_task.create_review is True
+        assert retry_task.create_pr is True
+        assert retry_task.model == "gpt-5.4"
+        assert retry_task.provider == "codex"
+        assert retry_task.provider_is_explicit is True
+
     def test_iterate_default_resume_budget_is_one(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch
