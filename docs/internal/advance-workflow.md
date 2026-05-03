@@ -30,11 +30,11 @@ gza advance --squash-threshold N
 
 ## Task Collection
 
-Advance collects tasks from two sources:
+Advance collects tasks from three sources:
 
 1. **Unmerged tasks**: `store.get_unmerged()` — completed tasks with `merge_status='unmerged'`. Excludes improve and rebase tasks that have a parent (`based_on IS NOT NULL`) since they operate on the parent's branch.
 
-2. **Resumable failed tasks**: Tasks with `status='failed'`, `failure_reason IN ('MAX_STEPS', 'MAX_TURNS')`, and `session_id IS NOT NULL`. Disabled with `--no-resume-failed`.
+2. **Failed-task recovery candidates**: Tasks from `store.list_failed_tasks_for_recovery(...)` that are evaluated by `decide_failed_task_recovery(...)` under the shared bounded policy. This policy can classify candidates as `resume`, `retry`, or manual review required; `--no-resume-failed` disables this source.
 
 3. **Unimplemented plans**: Completed plan tasks with no implement child yet. Excluded when `--type implement`.
 

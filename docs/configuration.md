@@ -1280,7 +1280,7 @@ Those commands fail closed when the target task does not match the provided tag 
 When no tag scope is provided, queue-position edits keep existing exact tag-set bucket behavior.
 `gza queue` shows tasks that default worker pickup can run (internal and dependency-blocked pending tasks are excluded).
 By default, `gza queue` shows the first 10 runnable tasks. Use `-n 0`, `-n -1`, or `--all` to show everything.
-To treat a tag as a release slice, assign tasks with `gza add --tag release-1.2 ...` and inspect them with `gza queue --tag release-1.2`. That command is the canonical preview for what `gza watch --tag release-1.2` will consider and in what order.
+To treat a tag as a release slice, assign tasks with `uv run gza add --tag release-1.2 ...` and inspect them with `uv run gza queue --tag release-1.2`. That command is the canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order.
 Internally, queue-style task listing is routed through the unified task query layer so queue, next, and API consumers can share the same filter/order semantics.
 
 ### implement
@@ -1348,7 +1348,7 @@ gza extract SOURCE --files-from FILE [options]
 Intelligently progress unmerged tasks through their lifecycle. Handles review creation, improve tasks, merging, and shared automatic failed-task recovery (resume/retry).
 
 ```bash
-gza advance [task_id] [options]
+uv run gza advance [task_id] [options]
 ```
 
 | Option | Description |
@@ -1380,7 +1380,7 @@ for explore rows or incomplete source descendants.
 Run an automated implementation lifecycle loop (review/improve/resume/rebase).
 
 ```bash
-gza iterate <impl_task_id> [options]
+uv run gza iterate <impl_task_id> [options]
 ```
 
 | Option | Description |
@@ -1401,7 +1401,7 @@ When iterate stops with `max_cycles_reached`, it now prints review-cycle account
 Continuously maintain a target number of concurrent workers.
 
 ```bash
-gza watch [options]
+uv run gza watch [options]
 ```
 
 | Option | Description |
@@ -1417,7 +1417,7 @@ gza watch [options]
 | `--dry-run` | Show what watch would do without executing; with `--restart-failed`, print the full failed-recovery report and exit |
 | `--show-skipped` | With `--restart-failed`, include skipped failed tasks in the dry-run recovery report and live watch logs |
 | `--quiet` | Write events to `.gza/watch.log` only |
-| `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `gza queue --tag TAG` to preview the same scoped pickup order |
+| `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG` to preview the same scoped pickup order |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
 | `--group NAME` | Deprecated alias for `--tag NAME` |
 
@@ -1436,7 +1436,7 @@ watch:
 When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
 `INFO   scope: tags=<comma-separated-tags> mode=all|any`.
 
-`gza watch --restart-failed --dry-run` is the recovery inspection surface for this mode. It prints the failed-task decision report for the current scope oldest-created failed task first, showing actionable `resume` and `retry` decisions by default, then exits without entering the normal watch loop. Plain `gza watch` and `--restart-failed` both use the same bounded shared recovery policy; `--restart-failed` only changes selection order by draining actionable failed tasks before pending pickup. `max_resume_attempts` is a recovery toggle for this shared policy (`0` disables automatic recovery, any positive value enables the same fixed bounded policy). Skipped tasks are hidden by default; pass `--show-skipped` to include them with launch mode and attempt counts in both the dry-run report and live watch logs.
+`uv run gza watch --restart-failed --dry-run` is the recovery inspection surface for this mode. It prints the failed-task decision report for the current scope oldest-created failed task first, showing actionable `resume` and `retry` decisions by default, then exits without entering the normal watch loop. Plain `uv run gza watch` and `uv run gza watch --restart-failed` both use the same bounded shared recovery policy; `--restart-failed` only changes selection order by draining actionable failed tasks before pending pickup. `max_resume_attempts` is a recovery toggle for this shared policy (`0` disables automatic recovery, any positive value enables the same fixed bounded policy). Skipped tasks are hidden by default; pass `--show-skipped` to include them with launch mode and attempt counts in both the dry-run report and live watch logs.
 
 ### learnings
 
@@ -1624,9 +1624,9 @@ Any state can be manually set to `dropped` via `gza set-status`.
 
 **Recovering from failures:**
 
-- Use `gza resume <task_id>` to continue from where the task left off (preserves conversation context)
-- Use `gza retry <task_id>` to start completely fresh
-- `PREREQUISITE_UNMERGED`: the resolved completed dependency is not yet marked merged to the default branch (`main` in most repos). Merge the dependency (`gza merge <dependency_task_id>`); after that, `gza watch --restart-failed` can pick the task up automatically, or you can retry it manually with `gza retry <task_id>`. Use `--force` only when you intentionally want to bypass this guard.
+- Use `uv run gza resume <task_id>` to continue from where the task left off (preserves conversation context)
+- Use `uv run gza retry <task_id>` to start completely fresh
+- `PREREQUISITE_UNMERGED`: the resolved completed dependency is not yet marked merged to the default branch (`main` in most repos). Merge the dependency (`uv run gza merge <dependency_task_id>`); after that, `uv run gza watch --restart-failed` can pick the task up automatically, or you can retry it manually with `uv run gza retry <task_id>`. Use `--force` only when you intentionally want to bypass this guard.
 
 **Dependencies:**
 
@@ -1723,13 +1723,13 @@ If a worker crashed or was killed, tasks may be stuck in `in_progress` state:
 
 ```bash
 # Check for running workers
-gza ps
+uv run gza ps
 
 # If no workers are running but task shows in_progress, the worker crashed
 # Resume or retry the task:
-gza resume <task_id>
+uv run gza resume <task_id>
 # or
-gza retry <task_id>
+uv run gza retry <task_id>
 ```
 
 ### "No pending tasks" but tasks exist
@@ -1737,8 +1737,8 @@ gza retry <task_id>
 Tasks with unmet dependencies won't be picked up. Check:
 
 ```bash
-gza next          # Shows pending tasks and their dependencies
-gza search --tag <tag>  # Shows tasks with a tag slice
+uv run gza next          # Shows pending tasks and their dependencies
+uv run gza search --tag <tag>  # Shows tasks with a tag slice
 ```
 
 ### Claude Code not found

@@ -224,6 +224,53 @@ def test_plan_implement_review_example_uses_uv_run_gza_shell_snippets() -> None:
         assert not stripped.startswith("> $ gza ")
 
 
+def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
+    """Touched recovery docs should keep canonical `uv run gza ...` command wording."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    config_content = (docs_root / "configuration.md").read_text()
+    failed_tasks_content = (docs_root / "examples" / "failed-tasks.md").read_text()
+
+    advance_section = config_content.split("### advance", 1)[1].split("### iterate", 1)[0]
+    iterate_section = config_content.split("### iterate", 1)[1].split("### watch", 1)[0]
+    watch_section = config_content.split("### watch", 1)[1].split("### learnings", 1)[0]
+
+    assert "uv run gza advance [task_id] [options]" in advance_section
+    assert "uv run gza iterate <impl_task_id> [options]" in iterate_section
+    assert "uv run gza watch [options]" in watch_section
+    assert "`uv run gza watch --restart-failed --dry-run` is the recovery inspection surface" in watch_section
+    assert "Plain `uv run gza watch` and `uv run gza watch --restart-failed` both use the same bounded shared recovery policy" in watch_section
+    assert "use `uv run gza queue --tag TAG` to preview the same scoped pickup order" in watch_section
+
+    assert "\ngza advance [task_id] [options]\n" not in advance_section
+    assert "\ngza iterate <impl_task_id> [options]\n" not in iterate_section
+    assert "\ngza watch [options]\n" not in watch_section
+    assert "`gza watch --restart-failed --dry-run` is the recovery inspection surface" not in watch_section
+    assert "Plain `gza watch` and `--restart-failed` both use the same bounded shared recovery policy" not in watch_section
+
+    assert "| `uv run gza resume` | Continue from where it left off |" in failed_tasks_content
+    assert "| `uv run gza retry` | Start completely fresh |" in failed_tasks_content
+    assert "| `uv run gza watch --restart-failed` | Drain actionable failed tasks before pending queue work, choosing `resume` or `retry` per task |" in failed_tasks_content
+    assert "`uv run gza watch --restart-failed` adds an explicit recovery phase ahead of normal pending work." in failed_tasks_content
+
+    for line in failed_tasks_content.splitlines():
+        assert not line.lstrip().startswith("$ gza ")
+
+
+def test_internal_advance_workflow_task_collection_tracks_shared_recovery_policy() -> None:
+    """Internal advance workflow docs should describe shared failed-task recovery collection policy."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    internal_content = (docs_root / "internal" / "advance-workflow.md").read_text()
+    task_collection_section = internal_content.split("## Task Collection", 1)[1].split("## Configuration", 1)[0]
+
+    assert "Advance collects tasks from three sources" in task_collection_section
+    assert "store.list_failed_tasks_for_recovery(...)" in task_collection_section
+    assert "decide_failed_task_recovery(...)" in task_collection_section
+    assert "resume`, `retry`, or manual review required" in task_collection_section
+    assert "failure_reason IN ('MAX_STEPS', 'MAX_TURNS')" not in task_collection_section
+    assert "session_id IS NOT NULL" not in task_collection_section
+    assert "**Resumable failed tasks**" not in task_collection_section
+
+
 def test_docker_setup_command_docs_describe_prewarm_hook_and_race_avoidance() -> None:
     """Docker config docs should explain pre-warm semantics and why first-use lazy installs race."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"

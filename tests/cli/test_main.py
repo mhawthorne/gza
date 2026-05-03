@@ -345,8 +345,8 @@ class TestHelpOutput:
 
         assert "use 'gza queue --tag TAG' to preview scoped pickup order" in watch_text
         assert "same scoped pickup order used by 'gza watch --tag TAG'" in queue_text
-        assert "use `gza queue --tag TAG` to preview the same scoped pickup order" in docs_text
-        assert "canonical preview for what `gza watch --tag release-1.2` will consider and in what order" in docs_text
+        assert "use `uv run gza queue --tag TAG` to preview the same scoped pickup order" in docs_text
+        assert "canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order" in docs_text
 
     def test_watch_help_mentions_restart_failed_flags(self, tmp_path):
         """watch --help should advertise failed-recovery mode flags."""
@@ -375,13 +375,13 @@ class TestHelpOutput:
 
         assert "with `--restart-failed`, print the full failed-recovery report and exit" in docs_text
         assert "Override `max_resume_attempts` for this watch run: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared policy used by both plain watch and `--restart-failed`" in docs_text
-        assert "`gza watch --restart-failed --dry-run` is the recovery inspection surface" in docs_text
+        assert "`uv run gza watch --restart-failed --dry-run` is the recovery inspection surface" in docs_text
         assert "oldest-created failed task first" in docs_text
         assert "Skipped tasks are hidden by default" in docs_text
         assert "`--show-skipped` to include them" in docs_text
         assert "live watch logs" in docs_text
 
-        assert "`gza watch --restart-failed --dry-run`" in failed_tasks_docs
+        assert "`uv run gza watch --restart-failed --dry-run`" in failed_tasks_docs
         assert "Print the recovery decision report and exit" in failed_tasks_docs
         assert "--show-skipped" in failed_tasks_docs
         assert "`--max-resume-attempts` controls that shared policy as a toggle" in failed_tasks_docs
@@ -426,7 +426,7 @@ class TestHelpOutput:
 
         assert "Drain failed-task recovery before pending queue work" in help_text
         assert "only changes selection order by draining actionable failed tasks before pending pickup" in docs_text
-        assert "Plain `gza watch` and `gza watch --restart-failed` use the same bounded shared recovery policy; `--restart-failed` only changes queue priority." in failed_tasks_docs
+        assert "Plain `uv run gza watch` and `uv run gza watch --restart-failed` use the same bounded shared recovery policy; `--restart-failed` only changes queue priority." in failed_tasks_docs
         assert "Default `gza watch` uses the same bounded shared recovery policy as the explicit failed-task recovery queue. `gza watch --restart-failed` is opt-in only for recovery-first queue ordering." in internal_docs
 
     def test_queue_help_and_docs_describe_default_limit_and_all_overrides(self, tmp_path):
