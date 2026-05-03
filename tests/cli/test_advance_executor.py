@@ -167,6 +167,63 @@ def test_improve_manual_review_returns_skip_without_mutation(tmp_path: Path) -> 
     assert len(store.get_all()) == before_count
 
 
+def test_improve_give_up_reports_automatic_recovery_disabled(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/improve-disabled")
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    failed = store.add(
+        "Improve 0",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-0"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    before_count = len(store.get_all())
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=0,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={"type": "improve", "review_task": review},
+        context=context,
+    )
+
+    assert result.status == "skip"
+    assert result.attention_type == "automatic_recovery_disabled"
+    assert "automatic improve recovery is disabled" in result.message
+    assert len(store.get_all()) == before_count
+
+
 def test_create_review_skip_propagates_message_without_spawning(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

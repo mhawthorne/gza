@@ -192,7 +192,8 @@ def execute_advance_action(
         if improve_mode == "give_up" and failed_improve is not None:
             assert failed_improve.id is not None
             msg = (
-                f"SKIP: max improve attempts ({context.max_resume_attempts}) reached for "
+                "SKIP: automatic improve recovery is disabled "
+                f"(max_resume_attempts={context.max_resume_attempts}) for "
                 f"{task.id} + {review_task.id}; latest failed improve: {failed_improve.id}. "
                 f"Run uv run gza fix {task.id}"
             )
@@ -202,7 +203,7 @@ def execute_advance_action(
                 message=msg,
                 improve_mode=improve_mode,
                 failed_improve=failed_improve,
-                attention_type="max_improve_attempts",
+                attention_type="automatic_recovery_disabled",
             )
         if improve_mode == "manual_review" and failed_improve is not None:
             assert failed_improve.id is not None

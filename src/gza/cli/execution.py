@@ -1458,8 +1458,9 @@ def cmd_improve(args: argparse.Namespace) -> int:
         elif comments_action == "give_up":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
             print(
-                f"Error: Comments-only improve retries exceeded max_resume_attempts "
-                f"({config.max_resume_attempts}); latest failure: {existing_comments_improve.id}"
+                "Error: Comments-only improve automatic recovery is disabled "
+                f"(max_resume_attempts={config.max_resume_attempts}); "
+                f"latest failure: {existing_comments_improve.id}"
             )
             return 1
         elif comments_action == "manual_review":
@@ -2276,11 +2277,12 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             if improve_action == "give_up" and failed_improve is not None:
                 assert failed_improve.id is not None
                 print(
-                    f"  Improve for {review_task.id} has exceeded max_resume_attempts"
-                    f" ({max_resume_attempts}); latest failure: {failed_improve.id}"
+                    "  Improve automatic recovery is disabled "
+                    f"(max_resume_attempts={max_resume_attempts}); "
+                    f"latest failure: {failed_improve.id}"
                 )
                 final_status = "blocked"
-                final_stop_reason = "max_improve_attempts"
+                final_stop_reason = "automatic_recovery_disabled"
                 _append_summary_row(
                     summary_rows,
                     iteration_index=iteration,
@@ -2493,7 +2495,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         )
         print(f"Recommended next step: uv run gza fix {impl_task_key}")
         return 3
-    if final_stop_reason == "max_improve_attempts":
+    if final_stop_reason == "automatic_recovery_disabled":
         print(f"Iterate blocked: {final_stop_reason}.")
         print(f"Recommended next step: uv run gza fix {impl_task_key}")
         return 3

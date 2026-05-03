@@ -2798,14 +2798,6 @@ class SqliteTaskStore:
                 WHERE t.project_id = ?
                 AND t.status = 'pending'
                 AND t.task_type != 'internal'
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM tasks parent
-                    WHERE parent.project_id = t.project_id
-                      AND parent.id = t.based_on
-                      AND parent.status = 'failed'
-                      AND parent.task_type = t.task_type
-                )
                 AND (
                     t.depends_on IS NULL
                     OR t.depends_on IN (SELECT id FROM successful_ancestors)

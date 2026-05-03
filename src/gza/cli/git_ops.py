@@ -1646,7 +1646,13 @@ def _advance_action_color(action_type: str) -> str:
     ac = _colors.WORK_COLORS
     if action_type in {'merge', 'merge_with_followups'}:
         return ac.merge
-    if action_type in ('needs_rebase', 'needs_discussion', 'max_cycles_reached', 'max_improve_attempts'):
+    if action_type in (
+        'needs_rebase',
+        'needs_discussion',
+        'max_cycles_reached',
+        'max_improve_attempts',
+        'automatic_recovery_disabled',
+    ):
         return ac.error
     if action_type in ('skip', 'wait_review', 'wait_improve'):
         return ac.waiting
@@ -1990,7 +1996,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
     workers_started = 0
     # Track tasks skipped for actionable reasons (needs human attention)
     _ACTIONABLE_SKIP_TYPES = frozenset(
-        {'needs_discussion', 'max_cycles_reached', 'max_improve_attempts', 'manual_review_required'}
+        {
+            'needs_discussion',
+            'max_cycles_reached',
+            'max_improve_attempts',
+            'automatic_recovery_disabled',
+            'manual_review_required',
+        }
     )
     attention_tasks: list[tuple[DbTask, dict]] = []
     action_context = _build_action_context(dry_run_mode=False)
@@ -2004,7 +2016,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
         if exec_result.status == "skip":
             console.print(f"      [{_c_warn}]{exec_result.message}[/{_c_warn}]")
             skip_count += 1
-            if exec_result.attention_type in {"max_improve_attempts", "manual_review_required"}:
+            if exec_result.attention_type in {
+                "max_improve_attempts",
+                "automatic_recovery_disabled",
+                "manual_review_required",
+            }:
                 attention_tasks.append(
                     (
                         task,
@@ -2174,7 +2190,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
             _color = _advance_action_color(aaction['type'])
             console.print(f"  [{_c_tid}]{atask.id}[/{_c_tid}]  [{pink}]{prompt_display}[/{pink}]")
             console.print(f"       [{_color}]→ {desc}[/{_color}]")
-            if aaction['type'] in {'max_cycles_reached', 'max_improve_attempts'}:
+            if aaction['type'] in {
+                'max_cycles_reached',
+                'max_improve_attempts',
+                'automatic_recovery_disabled',
+            }:
                 console.print(f"       [{_color}]→ Recommended next step: uv run gza fix {atask.id}[/{_color}]")
 
     return 0 if error_count == 0 else 1

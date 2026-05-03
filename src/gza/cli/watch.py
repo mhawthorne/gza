@@ -357,6 +357,26 @@ def _run_with_optional_stdout_suppressed(quiet: bool, fn: Callable[[], T]) -> T:
         return fn()
 
 
+def _should_skip_pending_recovery_descendant(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    max_recovery_attempts: int,
+) -> bool:
+    """Guard pending descendants when shared policy says the failed parent must pause."""
+    if task.status != "pending" or not task.based_on or not task.task_type:
+        return False
+    parent = store.get(task.based_on)
+    if parent is None or parent.status != "failed" or parent.task_type != task.task_type:
+        return False
+    decision = decide_failed_task_recovery(
+        store,
+        parent,
+        max_recovery_attempts=max_recovery_attempts,
+    )
+    return decision.reason_code in {"manual_review_required", "recovery_already_running"}
+
+
 def _spawn_worker_with_failure_log(
     *,
     quiet: bool,
@@ -531,30 +551,6 @@ def _compute_failure_backoff_seconds(config: Config, streak: int) -> int:
     initial = config.watch.failure_backoff_initial
     maximum = config.watch.failure_backoff_max
     return min(initial * (2 ** (streak - 1)), maximum)
-
-
-def _is_default_watch_blocked_recovery_descendant(
-    store: SqliteTaskStore,
-    task: DbTask,
-    *,
-    max_recovery_attempts: int,
-) -> bool:
-    """Return whether a pending recovery child should stay on the recovery path."""
-    if task.status != "pending" or not task.based_on or not task.task_type:
-        return False
-    parent = store.get(task.based_on)
-    if parent is None or parent.status != "failed" or parent.task_type != task.task_type:
-        return False
-    decision = decide_failed_task_recovery(
-        store,
-        parent,
-        max_recovery_attempts=max_recovery_attempts,
-    )
-    return (
-        decision.action in {"resume", "retry"}
-        and decision.reuse_existing
-        and decision.recovery_task_id == str(task.id)
-    )
 
 
 def _run_cycle(
@@ -1165,7 +1161,7 @@ def _run_cycle(
                 continue
             if str(task.id) in step1_handled_child_task_ids:
                 continue
-            if not restart_failed and _is_default_watch_blocked_recovery_descendant(
+            if _should_skip_pending_recovery_descendant(
                 store,
                 task,
                 max_recovery_attempts=max_recovery_attempts,

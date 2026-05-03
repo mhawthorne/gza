@@ -422,7 +422,7 @@ def test_watch_cycle_default_mode_reuses_existing_pending_resume_child(tmp_path:
 
 
 def test_watch_cycle_default_mode_starts_queued_retry_child_as_pending_work(tmp_path: Path) -> None:
-    """Plain watch should not auto-pick pending recovery descendants from the normal pending queue."""
+    """Plain watch should run queued retry children through the normal pending queue."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -459,9 +459,11 @@ def test_watch_cycle_default_mode_starts_queued_retry_child_as_pending_work(tmp_
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert result.work_done is False
+    assert result.work_done is True
     assert spawn_resume.call_count == 0
-    assert spawn_iterate.call_count == 0
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == retry_child.id
+    assert spawn_iterate.call_args.args[0].resume is False
     assert [task.id for task in store.get_based_on_children(failed.id)] == [retry_child.id]
 
 
@@ -3354,7 +3356,7 @@ def test_watch_cycle_max_resume_attempts_zero_skips_failed_improve_recovery(tmp_
     assert spawn_worker.call_count == 0
     assert spawn_resume_worker.call_count == 0
     log_text = log_path.read_text()
-    assert "max improve attempts (0) reached" in log_text
+    assert "automatic improve recovery is disabled (max_resume_attempts=0)" in log_text
     assert str(failed_improve.id) in log_text
 
 

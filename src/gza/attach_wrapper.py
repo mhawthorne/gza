@@ -13,6 +13,7 @@ from .cli._common import _spawn_background_worker, get_store
 from .config import Config
 from .providers.base import build_docker_cmd, ensure_docker_image
 from .providers.claude import _get_docker_config, sync_keychain_credentials
+from .recovery_engine import decide_failed_task_recovery
 from .runner import load_dotenv, write_log_entry
 
 
@@ -110,8 +111,17 @@ def _run_interactive_claude(
         signal.signal(signal.SIGINT, original_sigint)
 
 
-def _should_auto_resume(task) -> bool:
-    return task.status in {"pending", "in_progress", "failed"}
+def _should_auto_resume(config: Config, store, task) -> bool:
+    if task.status in {"pending", "in_progress"}:
+        return True
+    if task.status != "failed":
+        return False
+    decision = decide_failed_task_recovery(
+        store,
+        task,
+        max_recovery_attempts=config.max_resume_attempts,
+    )
+    return decision.action == "resume"
 
 
 def main() -> int:
@@ -199,7 +209,7 @@ def main() -> int:
                 )
 
             should_resume = (
-                _should_auto_resume(refreshed)
+                _should_auto_resume(config, store, refreshed)
                 and (detach_signal in (signal.SIGTERM, signal.SIGHUP) or exit_code == 0)
             )
             if should_resume:

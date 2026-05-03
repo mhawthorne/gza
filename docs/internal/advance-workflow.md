@@ -114,11 +114,12 @@ When the engine emits `improve`, the caller (iterate) delegates to `resolve_impr
 | Condition | Sub-action |
 |-----------|-----------|
 | No prior failed improve for this (impl, review) | `new` — create a fresh improve |
-| Latest failed improve is resumable (`MAX_STEPS`/`MAX_TURNS`/`TIMEOUT`) AND prior attempts `<` cap | `resume` — reopen the failed improve's session |
-| Latest failed improve is not resumable AND prior attempts `<` cap | `retry` — fork a new branch from the previous improve |
-| Prior failed attempts `>=` `max_resume_attempts` | `give_up` — stop iterating; surface `max_improve_attempts` as the stop reason |
+| Shared failed-task recovery policy returns `resume` | `resume` — continue from the latest failed improve |
+| Shared failed-task recovery policy returns `retry` | `retry` — fork a fresh improve attempt |
+| `max_resume_attempts == 0` (automatic recovery disabled) | `give_up` — stop iterating; surface `automatic_recovery_disabled` as the stop reason |
+| Shared failed-task recovery policy returns `manual_review_required` (for example, failed resume descendants) | `manual_review` — stop iterating and require operator intervention |
 
-The cap counts **all** failed improves for this (impl, review) pair, including chained retries/resumes (see *Improve chain semantics* below), so it protects against unbounded loops when a fix on `main` is needed to break a persistent TIMEOUT.
+The improve flow now defers recovery edge selection to the shared recovery engine (`decide_failed_task_recovery`), so iterate/advance/watch enforce one consistent resume/retry/manual-review boundary.
 
 ### 6. No reviews / all cleared
 
