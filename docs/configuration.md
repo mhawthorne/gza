@@ -970,7 +970,7 @@ gza merge <task_id> [task_id...] [options]
 List tasks with branches that have not been merged to the default branch.
 
 ```bash
-gza unmerged [options]
+uv run gza unmerged [options]
 ```
 
 | Option | Description |
@@ -978,21 +978,24 @@ gza unmerged [options]
 | `--commits-only` | Backwards-compatible no-op retained in the CLI surface |
 | `--all` | Backwards-compatible no-op retained in the CLI surface |
 | `-n N` | Show last N unmerged tasks (default: 5, `0` for all) |
-| `--update` | Deprecated compatibility alias for the default default-branch refresh; plain `gza unmerged` already persists canonical merge truth before listing. Has no effect with `--into-current` or `--target` |
+| `--fetch` | Fetch `origin` before the canonical default-branch refresh so `origin/<default>` merge evidence is current. Has no effect with `--into-current` or `--target` |
+| `--update` | Deprecated compatibility alias for the default default-branch refresh; plain `uv run gza unmerged` already persists canonical merge truth before listing. Has no effect with `--into-current` or `--target` |
 | `--into-current` | Compare against the current branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 | `--target BRANCH` | Compare against the specified branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 
-`gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills legacy `merge_status` when needed, refreshes canonical branch-cohort merge truth from live git, persists normalized `merge_status` and diff stats, and then prints the reconciled default-branch unmerged list.
+`uv run gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills legacy `merge_status` when needed, refreshes canonical branch-cohort merge truth from local git plus any already-present `origin/<default-branch>` remote-tracking ref, persists normalized `merge_status` and diff stats, and then prints the reconciled default-branch unmerged list.
 
-This is the deliberate narrow exception to the usual read-only query convention: only plain default-branch `gza unmerged` mutates, because its entire purpose is to answer the canonical question "what still needs to be merged?" without leaving stale cached rows behind.
+This is the deliberate narrow exception to the usual read-only query convention: only plain default-branch `uv run gza unmerged` mutates, because its entire purpose is to answer the canonical question "what still needs to be merged?" without leaving stale cached rows behind.
+
+By default, plain `uv run gza unmerged` does not initiate network I/O. It reuses any already-present `origin/<default-branch>` remote-tracking ref if one exists locally, but otherwise relies on local branch state. Pass `--fetch` to opt into the older fetch-then-reconcile behavior and refresh `origin/*` first.
 
 Deleted local feature branches are not treated as merge proof by themselves. Canonical reconciliation keeps them unmerged and visible until the target branch is explicitly proven to contain the changes, for example via a surviving `origin/<feature>` ref or merged PR metadata from `gza sync`.
 
-If the canonical default-branch refresh cannot persist because the database is read-only, `gza unmerged` fails with a targeted error instead of silently falling back to stale split-brain behavior.
+If the canonical default-branch refresh cannot persist because the database is read-only, `uv run gza unmerged` fails with a targeted error instead of silently falling back to stale split-brain behavior.
 
-`--update` is deprecated because plain `gza unmerged` now does the canonical refresh automatically. During the compatibility window it behaves the same as plain `gza unmerged` for the default-branch view and prints a deprecation warning.
+`--update` is deprecated because plain `uv run gza unmerged` now does the canonical refresh automatically. During the compatibility window it behaves the same as plain `uv run gza unmerged` for the default-branch view and prints a deprecation warning.
 
-With `--into-current` or `--target`, `gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged. `--update` has no effect in those modes beyond the deprecation warning. If a live branch comparison or diff-stat refresh fails for any branch, the command exits non-zero and does not print a potentially stale unmerged list from fallback state.
+With `--into-current` or `--target`, `uv run gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged. `--update` has no effect in those modes beyond the deprecation warning. If a live branch comparison or diff-stat refresh fails for any branch, the command exits non-zero and does not print a potentially stale unmerged list from fallback state.
 
 For each unmerged implementation, output includes:
 - Branch diff/commit summary.
@@ -1480,7 +1483,7 @@ gza sync [task_id ...] [options]
 | `--pr-only` | Only reconcile PR metadata and stale-PR cleanup; skip git diff refresh |
 | `--no-fetch` | Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch |
 
-Use `gza unmerged` for the daily "what still needs to be merged?" check. `gza sync` remains the broader explicit branch and PR reconciliation command. It:
+Use `uv run gza unmerged` for the daily "what still needs to be merged?" check. `gza sync` remains the broader explicit branch and PR reconciliation command. It:
 - dedupes work by branch and writes normalized state back to every same-branch task row that carries commits
 - refreshes cached `merge_status`, `diff_*` stats, `pr_number`, `pr_state`, and `pr_last_synced_at`
 - discovers PRs by branch for bounded candidates that need PR reconciliation

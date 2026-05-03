@@ -516,11 +516,19 @@ def main() -> int:
         help="Show last N unmerged tasks (default: 5, 0 for all)",
     )
     unmerged_parser.add_argument(
+        "--fetch",
+        action="store_true",
+        help=(
+            "Fetch `origin` before the canonical default-branch refresh so `origin/<default>` "
+            "merge evidence is current. Has no effect with `--into-current` or `--target`."
+        ),
+    )
+    unmerged_parser.add_argument(
         "--update",
         action="store_true",
         help=(
             "Deprecated compatibility alias for the default default-branch refresh; "
-            "plain `gza unmerged` already persists canonical merge truth before listing. "
+            "plain `uv run gza unmerged` already persists canonical merge truth before listing. "
             "Has no effect with `--into-current` or `--target`."
         ),
     )

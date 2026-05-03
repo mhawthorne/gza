@@ -147,6 +147,43 @@ def test_sync_git_only_reports_merged_when_origin_default_ref_proves_remote_merg
     assert "marked merged" in output
 
 
+def test_sync_no_fetch_does_not_use_cached_origin_default_ref_as_merge_proof(tmp_path, capsys):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_branch_task(store, "Stale remote-tracking merge proof", "feature/stale-origin-proof")
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.ref_exists.return_value = True
+    git.branch_exists.return_value = True
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+    git.is_merged.side_effect = lambda branch, into: into == "origin/main"
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_ids=[task.id],
+        dry_run=False,
+        git_only=True,
+        pr_only=False,
+        no_fetch=True,
+    )
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        patch("gza.cli.git_ops.Git", return_value=git),
+    ):
+        rc = cmd_sync(args)
+
+    assert rc == 0
+    git.fetch.assert_not_called()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+    output = capsys.readouterr().out
+    assert "feature/stale-origin-proof | merge=unmerged" in output
+    assert "marked merged" not in output
+
+
 def test_sync_missing_explicit_task_id_returns_error(tmp_path, capsys):
     setup_config(tmp_path)
     store = make_store(tmp_path)

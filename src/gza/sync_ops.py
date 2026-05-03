@@ -534,12 +534,14 @@ def sync_branch_cohorts(
     include_pr: bool,
     dry_run: bool = False,
     fetch_remote: bool = True,
+    allow_cached_remote_target_ref_without_fetch: bool = False,
     progress: SyncProgressCallback | None = None,
 ) -> tuple[list[BranchSyncResult], bool]:
     """Reconcile branch cohorts against git and optional GitHub state."""
     partial_failure = False
     default_branch = git.default_branch()
     remote_default_ref: str | None = None
+    remote_default_candidate = f"origin/{default_branch}"
     fetched_this_run = False
     fetch_error: str | None = None
 
@@ -552,13 +554,15 @@ def sync_branch_cohorts(
         if isinstance(remote_present, bool):
             has_origin_remote = remote_present
 
+    if allow_cached_remote_target_ref_without_fetch and git.ref_exists(remote_default_candidate):
+        remote_default_ref = remote_default_candidate
+
     if fetch_remote and has_origin_remote:
         _emit_progress(progress, "Fetching origin")
         try:
             git.fetch("origin")
             fetched_this_run = True
             _emit_progress(progress, "Fetched origin")
-            remote_default_candidate = f"origin/{default_branch}"
             if git.ref_exists(remote_default_candidate):
                 remote_default_ref = remote_default_candidate
         except GitError as exc:
@@ -572,7 +576,7 @@ def sync_branch_cohorts(
             cohorts,
             target_branch=default_branch,
             include_diff_stats=True,
-            remote_target_ref=remote_default_ref if fetched_this_run else None,
+            remote_target_ref=remote_default_ref,
         )
     else:
         results = [

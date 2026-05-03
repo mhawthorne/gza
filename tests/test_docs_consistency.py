@@ -109,7 +109,7 @@ def test_configuration_docs_describe_sync_as_broader_explicit_reconciliation_sur
     required_snippets = [
         "### sync",
         "gza sync [task_id ...] [options]",
-        "Use `gza unmerged` for the daily \"what still needs to be merged?\" check.",
+        "Use `uv run gza unmerged` for the daily \"what still needs to be merged?\" check.",
         "`gza sync` remains the broader explicit branch and PR reconciliation command.",
         "The only GitHub-side exception outside `gza sync` is improve completion with `--review`",
         "`gza pr` does not reconcile or close stale GitHub PRs",

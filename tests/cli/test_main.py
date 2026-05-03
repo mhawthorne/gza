@@ -281,7 +281,7 @@ class TestHelpOutput:
 
         assert "### sync" in docs_text
         assert "gza sync [task_id ...] [options]" in docs_text
-        assert "Use `gza unmerged` for the daily \"what still needs to be merged?\" check." in docs_text
+        assert "Use `uv run gza unmerged` for the daily \"what still needs to be merged?\" check." in docs_text
         assert "`gza sync` remains the broader explicit branch and PR reconciliation command." in docs_text
         assert "The only GitHub-side exception outside `gza sync` is improve completion with `--review`" in docs_text
         assert "Run `gza sync` after those merges" in docs_text
@@ -413,33 +413,41 @@ class TestHelpOutput:
         assert "Those commands fail closed when the target task does not match the provided tag scope" in docs_text
         assert "within each task's current tag-set bucket" not in docs_text
 
-    def test_unmerged_help_and_docs_describe_daily_refresh_and_update_deprecation(self, tmp_path):
-        """unmerged help/docs should expose the daily mutating default and `--update` deprecation."""
+    def test_unmerged_help_and_docs_describe_fetch_opt_in_and_update_deprecation(self, tmp_path):
+        """unmerged help/docs should expose the no-fetch default, opt-in fetch, and `--update` deprecation."""
         setup_config(tmp_path)
 
         unmerged_help = run_gza("unmerged", "--help", "--project", str(tmp_path))
         assert unmerged_help.returncode == 0
 
         help_text = " ".join(unmerged_help.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        docs_raw = Path("docs/configuration.md").read_text()
+        docs_text = " ".join(docs_raw.split())
 
+        assert "--fetch" in unmerged_help.stdout
         assert "--update" in unmerged_help.stdout
         assert "--into-current" in unmerged_help.stdout
         assert "--target BRANCH" in unmerged_help.stdout
         assert help_text.count("Retained compatibility no-op; has no effect on unmerged output") == 2
         assert "Show last N unmerged tasks (default: 5, 0 for all)" in help_text
-        assert "Deprecated compatibility alias for the default default-branch refresh" in help_text
-        assert "plain `gza unmerged` already persists canonical merge truth before listing" in help_text
+        assert "Fetch `origin` before the canonical default-branch refresh" in help_text
         assert "Has no effect with `--into-current` or `--target`" in help_text
+        assert "Deprecated compatibility alias for the default default-branch refresh" in help_text
+        assert "plain `uv run gza unmerged` already persists canonical merge truth before listing" in help_text
+        assert "plain `gza unmerged` already persists canonical merge truth before listing" not in help_text
 
-        assert "`gza unmerged` is the daily merge-truth command" in docs_text
+        assert "uv run gza unmerged [options]" in docs_text
+        assert "\ngza unmerged [options]\n" not in docs_raw
+        assert "`uv run gza unmerged` is the daily merge-truth command" in docs_text
         assert "`--commits-only` | Backwards-compatible no-op retained in the CLI surface" in docs_text
         assert "`--all` | Backwards-compatible no-op retained in the CLI surface" in docs_text
+        assert "`--fetch` | Fetch `origin` before the canonical default-branch refresh" in docs_text
         assert "opens the task store read/write" in docs_text
+        assert "By default, plain `uv run gza unmerged` does not initiate network I/O" in docs_text
         assert "This is the deliberate narrow exception to the usual read-only query convention" in docs_text
         assert "If the canonical default-branch refresh cannot persist because the database is read-only" in docs_text
-        assert "`--update` is deprecated because plain `gza unmerged` now does the canonical refresh automatically" in docs_text
-        assert "With `--into-current` or `--target`, `gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged" in docs_text
+        assert "`--update` is deprecated because plain `uv run gza unmerged` now does the canonical refresh automatically" in docs_text
+        assert "With `--into-current` or `--target`, `uv run gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged" in docs_text
 
     def test_show_help_and_docs_describe_prompt_as_plain_text(self, tmp_path):
         """`show --prompt` should be documented as plain prompt-text output, not JSON."""
