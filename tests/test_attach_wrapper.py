@@ -226,8 +226,8 @@ def test_attach_wrapper_manual_review_failed_task_does_not_auto_resume(tmp_path:
     mock_spawn.assert_not_called()
 
 
-def test_attach_wrapper_timeout_failed_task_still_auto_resumes(tmp_path: Path) -> None:
-    """Eligible original timeout-style failures should still auto-resume through attach handoff."""
+def test_attach_wrapper_timeout_failed_task_creates_and_launches_resume_child(tmp_path: Path) -> None:
+    """Timeout failed handoff should create and launch the policy-selected resume descendant."""
     task_id, _ = _setup_task_with_log(tmp_path)
     config = Config.load(tmp_path)
     store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
@@ -253,6 +253,131 @@ def test_attach_wrapper_timeout_failed_task_still_auto_resumes(tmp_path: Path) -
 
     assert rc == 0
     mock_spawn.assert_called_once()
+    spawned_args = mock_spawn.call_args.args[0]
+    spawned_task_id = mock_spawn.call_args.kwargs["task_id"]
+    assert spawned_args.resume is True
+    assert spawned_task_id != task_id
+    resume_child = store.get(spawned_task_id)
+    assert resume_child is not None
+    assert resume_child.based_on == task_id
+    assert resume_child.session_id == failed.session_id
+
+
+def test_attach_wrapper_retryable_failed_task_creates_and_launches_retry_child(tmp_path: Path) -> None:
+    """Retryable failed handoff should create and launch a retry descendant (not resume original)."""
+    task_id, _ = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    failed = store.get(task_id)
+    assert failed is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    store.update(failed)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_spawn.assert_called_once()
+    spawned_args = mock_spawn.call_args.args[0]
+    spawned_task_id = mock_spawn.call_args.kwargs["task_id"]
+    assert spawned_args.resume is False
+    assert spawned_task_id != task_id
+    retry_child = store.get(spawned_task_id)
+    assert retry_child is not None
+    assert retry_child.based_on == task_id
+
+
+def test_attach_wrapper_failed_resume_descendant_does_not_auto_recover_further(tmp_path: Path) -> None:
+    """Failed resume descendants should not get another automatic handoff recovery run."""
+    task_id, _ = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    original = store.get(task_id)
+    assert original is not None
+    assert original.id is not None
+    original.status = "failed"
+    original.failure_reason = "MAX_TURNS"
+    original.session_id = "sess-123"
+    store.update(original)
+
+    failed_resume_descendant = store.add(
+        original.prompt,
+        task_type=original.task_type,
+        based_on=original.id,
+    )
+    assert failed_resume_descendant.id is not None
+    failed_resume_descendant.status = "failed"
+    failed_resume_descendant.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_resume_descendant.session_id = original.session_id
+    store.update(failed_resume_descendant)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", failed_resume_descendant.id,
+            "--session-id", original.session_id,
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_spawn.assert_not_called()
+
+
+def test_attach_wrapper_timeout_parent_with_failed_resume_descendant_stops_at_manual_review(tmp_path: Path) -> None:
+    """Repeated handoff after timeout budget consumption should not relaunch original task."""
+    task_id, _ = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    original = store.get(task_id)
+    assert original is not None
+    assert original.id is not None
+    original.status = "failed"
+    original.failure_reason = "MAX_TURNS"
+    original.session_id = "sess-123"
+    store.update(original)
+
+    failed_resume_descendant = store.add(
+        original.prompt,
+        task_type=original.task_type,
+        based_on=original.id,
+    )
+    assert failed_resume_descendant.id is not None
+    failed_resume_descendant.status = "failed"
+    failed_resume_descendant.failure_reason = "MAX_TURNS"
+    failed_resume_descendant.session_id = original.session_id
+    store.update(failed_resume_descendant)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", original.session_id,
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_spawn.assert_not_called()
 
 
 def test_attach_wrapper_passes_resume_overrides_to_background_worker(tmp_path: Path) -> None:

@@ -357,26 +357,6 @@ def _run_with_optional_stdout_suppressed(quiet: bool, fn: Callable[[], T]) -> T:
         return fn()
 
 
-def _should_skip_pending_recovery_descendant(
-    store: SqliteTaskStore,
-    task: DbTask,
-    *,
-    max_recovery_attempts: int,
-) -> bool:
-    """Guard pending descendants when shared policy says the failed parent must pause."""
-    if task.status != "pending" or not task.based_on or not task.task_type:
-        return False
-    parent = store.get(task.based_on)
-    if parent is None or parent.status != "failed" or parent.task_type != task.task_type:
-        return False
-    decision = decide_failed_task_recovery(
-        store,
-        parent,
-        max_recovery_attempts=max_recovery_attempts,
-    )
-    return decision.reason_code in {"manual_review_required", "recovery_already_running"}
-
-
 def _spawn_worker_with_failure_log(
     *,
     quiet: bool,
@@ -1160,12 +1140,6 @@ def _run_cycle(
             if str(task.id) in pending_recovery_task_ids:
                 continue
             if str(task.id) in step1_handled_child_task_ids:
-                continue
-            if _should_skip_pending_recovery_descendant(
-                store,
-                task,
-                max_recovery_attempts=max_recovery_attempts,
-            ):
                 continue
             task_type = task.task_type or "implement"
             if task_type == "implement":

@@ -27,6 +27,7 @@ from gza.cli.watch import (
 )
 from gza.config import Config
 from gza.git import Git, GitError
+from gza.recovery_engine import decide_failed_task_recovery
 from gza.workers import WorkerMetadata, WorkerRegistry
 
 from .conftest import make_store, run_gza, setup_config, setup_git_repo_with_task_branch
@@ -713,7 +714,7 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
 def test_watch_cycle_restart_failed_reuses_existing_deep_recovery_chain_without_creating_sibling(
     tmp_path: Path,
 ) -> None:
-    """Restart-failed should stop when a failed resume descendant already exists."""
+    """Restart-failed should preserve and launch a pending deep descendant without creating siblings."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -758,8 +759,13 @@ def test_watch_cycle_restart_failed_reuses_existing_deep_recovery_chain_without_
             max_recovery_attempts=3,
         )
 
-    assert result.work_done is False
-    assert spawn_iterate.call_count == 0
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    spawned_args = spawn_iterate.call_args.args[0]
+    spawned_task = spawn_iterate.call_args.args[2]
+    assert spawned_args.resume is False
+    assert spawned_args.retry is False
+    assert spawned_task.id == pending_grandchild.id
     assert [task.id for task in store.get_based_on_children(root.id)] == [failed_retry.id]
     assert [task.id for task in store.get_based_on_children(failed_retry.id)] == [pending_grandchild.id]
 
@@ -1170,6 +1176,171 @@ def test_watch_cycle_restart_failed_manual_failure_child_does_not_block_pending_
     assert result.work_done is True
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
+
+
+def test_watch_cycle_plain_mode_starts_manually_queued_pending_recovery_child(tmp_path: Path) -> None:
+    """Plain watch should pick pending manual recovery descendants from the normal pending queue."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Broken plan", task_type="plan")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "TEST_FAILURE"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    manual_child = store.add("Manual retry child", task_type="plan", based_on=failed.id)
+    assert manual_child.id is not None
+    manual_child.status = "pending"
+    store.update(manual_child)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == manual_child.id
+
+
+def test_watch_cycle_restart_failed_starts_manually_queued_child_after_recovery_exhaustion(tmp_path: Path) -> None:
+    """--restart-failed should start manual pending children after actionable recovery work is drained."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    actionable = store.add("Actionable failed plan", task_type="plan")
+    assert actionable.id is not None
+    actionable.status = "failed"
+    actionable.failure_reason = "INFRASTRUCTURE_ERROR"
+    actionable.completed_at = datetime.now(UTC)
+    store.update(actionable)
+
+    manual_parent = store.add("Manual-only failed plan", task_type="plan")
+    assert manual_parent.id is not None
+    manual_parent.status = "failed"
+    manual_parent.failure_reason = "TEST_FAILURE"
+    manual_parent.completed_at = datetime.now(UTC)
+    store.update(manual_parent)
+
+    manual_child = store.add("Manual pending retry", task_type="plan", based_on=manual_parent.id)
+    assert manual_child.id is not None
+    manual_child.status = "pending"
+    store.update(manual_child)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        first_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            restart_failed_batch=1,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        actionable_child = store.get_based_on_children(actionable.id)[0]
+        actionable_child.status = "failed"
+        actionable_child.failure_reason = "TEST_FAILURE"
+        store.update(actionable_child)
+        second_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            restart_failed_batch=1,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert first_result.work_done is True
+    assert second_result.work_done is True
+    assert spawn_worker.call_count == 2
+    assert spawn_worker.call_args_list[-1].kwargs["task_id"] == manual_child.id
+
+
+@pytest.mark.parametrize(
+    ("failure_reason", "session_id", "max_recovery_attempts", "expected_reason_code"),
+    [
+        ("MAX_TURNS", None, 1, "manual_review_required"),
+        ("MAX_TURNS", "sess-123", 0, "automatic_recovery_disabled"),
+    ],
+)
+def test_watch_cycle_pending_manual_recovery_child_not_suppressed_for_stop_reasons(
+    tmp_path: Path,
+    failure_reason: str,
+    session_id: str | None,
+    max_recovery_attempts: int,
+    expected_reason_code: str,
+) -> None:
+    """Pending manual recovery descendants remain runnable for manual-review and disabled-recovery stops."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed parent", task_type="plan")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = failure_reason
+    failed.session_id = session_id
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    manual_child = store.add("Manual pending recovery", task_type="plan", based_on=failed.id)
+    assert manual_child.id is not None
+    manual_child.status = "pending"
+    manual_child.session_id = session_id
+    store.update(manual_child)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
+    assert decision.reason_code == expected_reason_code
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=max_recovery_attempts,
+        )
+
+    assert result.work_done is True
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == manual_child.id
 
 
 def test_watch_cycle_restart_failed_hides_skipped_logs_by_default(tmp_path: Path) -> None:
