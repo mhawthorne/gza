@@ -132,7 +132,7 @@ Then run recovery mode for real:
 $ gza watch --restart-failed
 ```
 
-`--max-resume-attempts` applies to the shared bounded automatic recovery policy used by plain watch and by `--restart-failed`. Set it to `0` to disable unattended recovery entirely.
+`--max-resume-attempts` controls that shared policy as a toggle: set it to `0` to disable unattended recovery entirely; any positive value enables the same fixed bounded automatic recovery policy used by plain watch and by `--restart-failed`.
 
 ## Check history for failed tasks
 

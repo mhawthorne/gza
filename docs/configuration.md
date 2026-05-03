@@ -1363,7 +1363,7 @@ gza advance [task_id] [options]
 | `--auto`, `-y` | Skip confirmation and execute immediately |
 | `--batch B` | Stop after spawning B background workers |
 | `--no-resume-failed` | Skip automatic failed-task recovery decisions (resume/retry/manual-review) |
-| `--max-resume-attempts N` | Override max_resume_attempts for shared automatic failed-task recovery decisions |
+| `--max-resume-attempts N` | Override `max_resume_attempts`: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared resume/retry policy |
 | `--max-review-cycles N` | Override max_review_cycles config value |
 | `--new` | Start new pending tasks to fill remaining `--batch` slots (requires `--batch`) |
 | `--type TYPE` | Only advance tasks of this type (`plan` or `implement`) |
@@ -1413,7 +1413,7 @@ gza watch [options]
 | `--max-iterations N` | Iterate loop cap for implement tasks launched by watch (default: `watch.max_iterations` or `10`) |
 | `--restart-failed` | Drain failed-task recovery before pending queue work using the shared bounded recovery policy |
 | `--restart-failed-batch N` | Max concurrent failed-recovery launches (default: `watch.restart_failed_batch` or `1`) |
-| `--max-resume-attempts N` | Override `max_resume_attempts` for this watch run; applies to the shared automatic recovery policy watch uses for both plain mode and `--restart-failed` |
+| `--max-resume-attempts N` | Override `max_resume_attempts` for this watch run: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared policy used by both plain watch and `--restart-failed` |
 | `--dry-run` | Show what watch would do without executing; with `--restart-failed`, print the full failed-recovery report and exit |
 | `--show-skipped` | With `--restart-failed`, include skipped failed tasks in the dry-run recovery report and live watch logs |
 | `--quiet` | Write events to `.gza/watch.log` only |
@@ -1436,7 +1436,7 @@ watch:
 When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
 `INFO   scope: tags=<comma-separated-tags> mode=all|any`.
 
-`gza watch --restart-failed --dry-run` is the recovery inspection surface for this mode. It prints the failed-task decision report for the current scope oldest-created failed task first, showing actionable `resume` and `retry` decisions by default, then exits without entering the normal watch loop. Plain `gza watch` and `--restart-failed` both use the same bounded shared recovery policy; `--restart-failed` only changes selection order by draining actionable failed tasks before pending pickup. Skipped tasks are hidden by default; pass `--show-skipped` to include them with launch mode and attempt counts in both the dry-run report and live watch logs.
+`gza watch --restart-failed --dry-run` is the recovery inspection surface for this mode. It prints the failed-task decision report for the current scope oldest-created failed task first, showing actionable `resume` and `retry` decisions by default, then exits without entering the normal watch loop. Plain `gza watch` and `--restart-failed` both use the same bounded shared recovery policy; `--restart-failed` only changes selection order by draining actionable failed tasks before pending pickup. `max_resume_attempts` is a recovery toggle for this shared policy (`0` disables automatic recovery, any positive value enables the same fixed bounded policy). Skipped tasks are hidden by default; pass `--show-skipped` to include them with launch mode and attempt counts in both the dry-run report and live watch logs.
 
 ### learnings
 

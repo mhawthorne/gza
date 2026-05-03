@@ -6383,6 +6383,7 @@ class TestIterateCommand:
         store = make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
         impl.status = "failed"
+        impl.failure_reason = "MAX_TURNS"
         impl.session_id = "resume-session-1"
         store.update(impl)
 
@@ -6448,6 +6449,7 @@ class TestIterateCommand:
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
         impl.status = "failed"
+        impl.failure_reason = "MAX_TURNS"
         impl.session_id = "resume-session-1"
         store.update(impl)
 
@@ -6506,6 +6508,65 @@ class TestIterateCommand:
         assert [task.id for task in store.get_based_on_children(impl.id)] == [resume_child.id]
         assert "Resuming failed implementation" in output
         assert "Iterate complete: MERGE_READY" in output
+
+    def test_failed_task_resume_descendant_requires_manual_review(self, tmp_path: Path):
+        """iterate --resume should stop when shared policy marks a failed resume descendant manual-only."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Implement feature", task_type="implement")
+        assert root.id is not None
+        root.status = "failed"
+        root.failure_reason = "MAX_TURNS"
+        root.session_id = "resume-session-1"
+        store.update(root)
+
+        failed_resume_descendant = store.add(
+            "Failed resumed attempt",
+            task_type="implement",
+            based_on=root.id,
+        )
+        assert failed_resume_descendant.id is not None
+        failed_resume_descendant.status = "failed"
+        failed_resume_descendant.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed_resume_descendant.session_id = root.session_id
+        store.update(failed_resume_descendant)
+
+        result = run_gza("iterate", str(failed_resume_descendant.id), "--resume", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        output = result.stdout + (result.stderr or "")
+        assert "Cannot resume failed implementation" in output
+        assert "manual review required" in output
+
+    def test_failed_task_resume_does_not_reuse_pending_same_session_child_with_mismatched_role(self, tmp_path: Path):
+        """iterate --resume should not reuse pending children that violate shared recovery-edge classification."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dependency = store.add("Dependency", task_type="plan")
+        assert dependency.id is not None
+
+        root = store.add("Implement feature", task_type="implement")
+        assert root.id is not None
+        root.status = "failed"
+        root.failure_reason = "MAX_TURNS"
+        root.session_id = "resume-session-1"
+        store.update(root)
+
+        mismatched_child = store.add("Pending child", task_type="implement", based_on=root.id, depends_on=dependency.id)
+        assert mismatched_child.id is not None
+        mismatched_child.status = "pending"
+        mismatched_child.session_id = root.session_id
+        store.update(mismatched_child)
+
+        result = run_gza("iterate", str(root.id), "--resume", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        output = result.stdout + (result.stderr or "")
+        assert "Cannot resume failed implementation" in output
+        assert "recovery child already pending" in output
+        assert [task.id for task in store.get_based_on_children(root.id)] == [mismatched_child.id]
 
     def test_iterate_continue_flag_is_rejected(self, tmp_path: Path):
         setup_config(tmp_path)

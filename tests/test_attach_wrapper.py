@@ -265,7 +265,7 @@ def test_attach_wrapper_timeout_failed_implement_handoff_launches_iterate_resume
 
 def test_attach_wrapper_retryable_failed_implement_handoff_launches_iterate_retry(tmp_path: Path) -> None:
     """Retryable failed implement handoff should relaunch a retry child via iterate."""
-    task_id, _ = _setup_task_with_log(tmp_path)
+    task_id, log_path = _setup_task_with_log(tmp_path)
     config = Config.load(tmp_path)
     store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
 
@@ -298,6 +298,46 @@ def test_attach_wrapper_retryable_failed_implement_handoff_launches_iterate_retr
     assert retry_child.id is not None
     assert retry_child.id != task_id
     assert retry_child.based_on == task_id
+    events = _read_log_events(log_path)
+    lifecycle_events = [event for event in events if event.get("subtype") == "worker_lifecycle"]
+    event_names = [event["event"] for event in lifecycle_events]
+    assert "retry" in event_names
+    assert "resume" not in event_names
+
+
+def test_attach_wrapper_retry_handoff_failure_logs_retry_failed(tmp_path: Path) -> None:
+    """Retry handoff failures should emit retry_failed rather than resume_failed events."""
+    task_id, log_path = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    failed = store.get(task_id)
+    assert failed is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    store.update(failed)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_iterate", return_value=9),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0),
+    ):
+        rc = main()
+
+    assert rc == 0
+    events = _read_log_events(log_path)
+    lifecycle_events = [event for event in events if event.get("subtype") == "worker_lifecycle"]
+    event_names = [event["event"] for event in lifecycle_events]
+    assert "retry_failed" in event_names
+    assert "resume_failed" not in event_names
+    failure_event = [event for event in lifecycle_events if event["event"] == "retry_failed"][-1]
+    assert failure_event["handoff_exit_code"] == 9
 
 
 def test_attach_wrapper_retryable_failed_non_implement_handoff_uses_worker_path(tmp_path: Path) -> None:

@@ -619,7 +619,7 @@ def main() -> int:
         type=int,
         metavar="N",
         dest="max_resume_attempts",
-        help="Override max_resume_attempts for shared automatic failed-task recovery decisions",
+        help="Override max_resume_attempts (0 disables automatic failed-task recovery; any positive value enables the fixed bounded shared recovery policy)",
     )
     advance_parser.add_argument(
         "--max-review-cycles",
@@ -702,7 +702,7 @@ def main() -> int:
         type=int,
         metavar="N",
         dest="max_resume_attempts",
-        help="Override max_resume_attempts for shared automatic recovery decisions in watch",
+        help="Override max_resume_attempts in watch (0 disables automatic failed-task recovery; any positive value enables the fixed bounded shared recovery policy)",
     )
     watch_parser.add_argument(
         "--dry-run",

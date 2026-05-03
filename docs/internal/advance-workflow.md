@@ -46,7 +46,7 @@ Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
 |-------|---------|-------------|
 | `advance_requires_review` | `true` | Implement tasks must have a passing review before merge |
 | `advance_create_reviews` | `true` | Auto-create review tasks for implements (only when `advance_requires_review=true`) |
-| `max_resume_attempts` | `1` | Max times a failed task can be auto-resumed |
+| `max_resume_attempts` | `1` | Shared automatic failed-task recovery toggle (`0` disables; any positive value enables the fixed bounded resume/retry policy) |
 | `max_review_cycles` | `3` | Max review→improve cycles before flagging for manual intervention |
 | `merge_squash_threshold` | `0` | Auto-squash branches with >= N commits (0 = disabled) |
 
@@ -142,7 +142,7 @@ Failed task resume rules run in the same ordered rule engine.
 
 | Condition | Action |
 |-----------|--------|
-| Resume chain depth >= `max_resume_attempts` | `skip` |
+| Failure is outside the fixed bounded shared policy (for example failed resume descendants) | `skip` |
 | Otherwise | `resume` — create resume task and spawn worker |
 
 ## Improve chain semantics

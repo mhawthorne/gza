@@ -164,12 +164,12 @@ class TestHelpOutput:
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert "Skip automatic failed-task recovery decisions (resume/retry/manual-review)" in help_text
-        assert "Override max_resume_attempts for shared automatic failed-task recovery decisions" in help_text
+        assert "Override max_resume_attempts (0 disables automatic failed-task recovery; any positive value enables the fixed bounded shared recovery policy)" in help_text
         assert "Skip auto-resume of resumable failed tasks" not in help_text
 
         assert "shared automatic failed-task recovery (resume/retry)" in docs_text
         assert "Skip automatic failed-task recovery decisions (resume/retry/manual-review)" in docs_text
-        assert "Override max_resume_attempts for shared automatic failed-task recovery decisions" in docs_text
+        assert "Override `max_resume_attempts`: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared resume/retry policy" in docs_text
         assert "Skip auto-resume of failed tasks" not in docs_text
 
         config_keys = run_gza("config", "keys", "--json", "--project", str(tmp_path))
@@ -178,7 +178,7 @@ class TestHelpOutput:
         keyed_entries = {entry["key"]: entry for entry in payload["keys"]}
         assert (
             keyed_entries["max_resume_attempts"]["description"]
-            == "Attempt cap for shared automatic failed-task recovery (resume/retry), including advance, iterate improve recovery, and watch decisions."
+            == "Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed bounded resume/retry policy used by advance, iterate improve recovery, and watch."
         )
 
     def test_iterate_help_uses_lifecycle_wording_and_config_default(self, tmp_path):
@@ -370,11 +370,11 @@ class TestHelpOutput:
         failed_tasks_docs = " ".join(Path("docs/examples/failed-tasks.md").read_text().split())
 
         assert "with --restart-failed, print the failed-recovery report and exit" in help_text
-        assert "shared automatic recovery decisions in watch" in help_text
+        assert "0 disables automatic failed-task recovery; any positive value enables the fixed bounded shared recovery policy" in help_text
         assert "include skipped failed tasks in the dry-run recovery report and live watch logs" in help_text
 
         assert "with `--restart-failed`, print the full failed-recovery report and exit" in docs_text
-        assert "applies to the shared automatic recovery policy watch uses for both plain mode and `--restart-failed`" in docs_text
+        assert "Override `max_resume_attempts` for this watch run: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared policy used by both plain watch and `--restart-failed`" in docs_text
         assert "`gza watch --restart-failed --dry-run` is the recovery inspection surface" in docs_text
         assert "oldest-created failed task first" in docs_text
         assert "Skipped tasks are hidden by default" in docs_text
@@ -384,7 +384,7 @@ class TestHelpOutput:
         assert "`gza watch --restart-failed --dry-run`" in failed_tasks_docs
         assert "Print the recovery decision report and exit" in failed_tasks_docs
         assert "--show-skipped" in failed_tasks_docs
-        assert "`--max-resume-attempts` applies to the shared bounded automatic recovery policy used by plain watch and by `--restart-failed`." in failed_tasks_docs
+        assert "`--max-resume-attempts` controls that shared policy as a toggle" in failed_tasks_docs
 
     def test_watch_help_and_docs_distinguish_max_idle_from_no_activity_timeout(self, tmp_path):
         """watch help/docs should distinguish loop idle exit from silent-worker reconciliation."""

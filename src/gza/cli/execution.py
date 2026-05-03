@@ -38,6 +38,7 @@ from ..git import Git
 from ..lineage import resolve_impl_task
 from ..prompts import PromptBuilder
 from ..query import get_base_task_slug as _get_base_task_slug
+from ..recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from ..review_verdict import get_review_report
 from ..runner import RunInvocationContext, generate_slug, run
 from ..workers import WorkerMetadata, WorkerRegistry
@@ -1795,16 +1796,37 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         print(f"Error: Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
         return 1
 
-    def _matching_pending_resume_child(failed_task: DbTask) -> DbTask | None:
-        assert failed_task.id is not None
-        for child in store.get_based_on_children_by_type(str(failed_task.id), failed_task.task_type or ""):
-            if (
-                child.status == "pending"
-                and child.session_id
-                and child.session_id == failed_task.session_id
-            ):
-                return child
-        return None
+    effective_max_resume_attempts = _int_config(
+        getattr(config, "max_resume_attempts", None),
+        DEFAULT_MAX_RESUME_ATTEMPTS,
+    )
+
+    def _resolve_failed_iterate_resume_start(
+        failed_task: DbTask,
+    ) -> tuple[DbTask, FailedRecoveryDecision] | None:
+        decision = decide_failed_task_recovery(
+            store,
+            failed_task,
+            # Explicit iterate --resume is still manual intent, but the failed-start
+            # selector must use shared recovery edge classification/guardrails.
+            max_recovery_attempts=max(1, effective_max_resume_attempts),
+        )
+        if decision.action != "resume":
+            print(
+                f"Error: Cannot resume failed implementation {failed_task.id}: "
+                f"{decision.reason_text}."
+            )
+            return None
+        if decision.reuse_existing and decision.recovery_task_id is not None:
+            existing_resume = store.get(decision.recovery_task_id)
+            if existing_resume is None:
+                print(
+                    f"Error: pending resume child {decision.recovery_task_id} "
+                    "selected by recovery policy was not found."
+                )
+                return None
+            return existing_resume, decision
+        return _create_resume_task(store, failed_task), decision
 
     # Handle background mode: re-exec this command as a detached process.
     if background:
@@ -1853,10 +1875,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             store,
             task_to_run,
             run_task=_run_one,
-            max_resume_attempts=_int_config(
-                getattr(config, "max_resume_attempts", None),
-                DEFAULT_MAX_RESUME_ATTEMPTS,
-            ),
+            max_resume_attempts=effective_max_resume_attempts,
             on_recovery=_on_recovery,
         )
 
@@ -1882,7 +1901,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             if dry_run:
                 print(f"[dry-run] Would resume failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
                 return 0
-            run_start_task = _matching_pending_resume_child(impl_task) or _create_resume_task(store, impl_task)
+            resume_start = _resolve_failed_iterate_resume_start(impl_task)
+            if resume_start is None:
+                return 1
+            run_start_task, _decision = resume_start
             assert run_start_task.id is not None
             print(f"Resuming failed implementation {impl_task.id} as {run_start_task.id}...")
             impl_task, rc = _run_task_with_recovery(run_start_task, initial_resume=True)

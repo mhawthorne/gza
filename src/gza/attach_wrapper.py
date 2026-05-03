@@ -315,16 +315,18 @@ def main() -> int:
                             iterate_task,
                         )
                 if log_file is not None:
+                    handoff_event = "resume" if handoff_resume_mode else "retry"
+                    handoff_failed_event = "resume_failed" if handoff_resume_mode else "retry_failed"
+                    handoff_action_label = "resume" if handoff_resume_mode else "retry"
                     if spawn_rc == 0:
-                        handoff_action = "resumed" if handoff_resume_mode else "retried"
                         write_log_entry(
                             log_file,
                             {
                                 "type": "gza",
                                 "subtype": "worker_lifecycle",
-                                "event": "resume",
+                                "event": handoff_event,
                                 "message": (
-                                    f"Background worker {handoff_action} in "
+                                    f"Background worker {handoff_action_label} launched in "
                                     f"{handoff.launch_mode} mode"
                                 ),
                                 "handoff_task_id": handoff_task_id,
@@ -336,8 +338,11 @@ def main() -> int:
                             {
                                 "type": "gza",
                                 "subtype": "worker_lifecycle",
-                                "event": "resume_failed",
-                                "message": "Background worker resume failed after interactive session",
+                                "event": handoff_failed_event,
+                                "message": (
+                                    f"Background worker {handoff_action_label} failed "
+                                    "after interactive session"
+                                ),
                                 "handoff_exit_code": spawn_rc,
                                 "handoff_task_id": handoff_task_id,
                             },

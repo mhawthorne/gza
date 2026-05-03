@@ -68,7 +68,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "max_resume_attempts",
         "int",
         1,
-        "Attempt cap for shared automatic failed-task recovery (resume/retry), including advance, iterate improve recovery, and watch decisions.",
+        "Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed bounded resume/retry policy used by advance, iterate improve recovery, and watch.",
     ),
     ConfigKeySpec("max_review_cycles", "int", 3, "Cap for review/improve loops in lifecycle automation."),
     ConfigKeySpec("max_steps", "int", 50, "Global default step budget."),
