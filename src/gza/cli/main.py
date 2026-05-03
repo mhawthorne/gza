@@ -528,7 +528,7 @@ def main() -> int:
         action="store_true",
         help=(
             "Deprecated compatibility alias for the default default-branch refresh; "
-            "plain `gza unmerged` already persists canonical merge truth before listing. "
+            "plain `uv run gza unmerged` already persists canonical merge truth before listing. "
             "Has no effect with `--into-current` or `--target`."
         ),
     )

@@ -417,7 +417,8 @@ class TestHelpOutput:
         assert "Fetch `origin` before the canonical default-branch refresh" in help_text
         assert "Has no effect with `--into-current` or `--target`" in help_text
         assert "Deprecated compatibility alias for the default default-branch refresh" in help_text
-        assert "plain `gza unmerged` already persists canonical merge truth before listing" in help_text
+        assert "plain `uv run gza unmerged` already persists canonical merge truth before listing" in help_text
+        assert "plain `gza unmerged` already persists canonical merge truth before listing" not in help_text
 
         assert "uv run gza unmerged [options]" in docs_text
         assert "\ngza unmerged [options]\n" not in docs_raw
