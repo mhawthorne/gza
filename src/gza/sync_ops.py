@@ -534,6 +534,7 @@ def sync_branch_cohorts(
     include_pr: bool,
     dry_run: bool = False,
     fetch_remote: bool = True,
+    allow_cached_remote_target_ref_without_fetch: bool = False,
     progress: SyncProgressCallback | None = None,
 ) -> tuple[list[BranchSyncResult], bool]:
     """Reconcile branch cohorts against git and optional GitHub state."""
@@ -553,7 +554,7 @@ def sync_branch_cohorts(
         if isinstance(remote_present, bool):
             has_origin_remote = remote_present
 
-    if git.ref_exists(remote_default_candidate):
+    if allow_cached_remote_target_ref_without_fetch and git.ref_exists(remote_default_candidate):
         remote_default_ref = remote_default_candidate
 
     if fetch_remote and has_origin_remote:

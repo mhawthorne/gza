@@ -225,6 +225,39 @@ def test_sync_branch_cohorts_marks_merged_when_origin_default_ref_proves_remote_
     assert refreshed.merge_status == "merged"
 
 
+def test_sync_branch_cohorts_no_fetch_ignores_cached_origin_default_ref_by_default(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task with stale cached origin ref", "feature/stale-origin-proof")
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.ref_exists.return_value = True
+    git.branch_exists.return_value = True
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+    git.is_merged.side_effect = lambda branch, into: into == "origin/main"
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        [BranchCohort(branch="feature/stale-origin-proof", tasks=(task,))],
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=False,
+    )
+
+    assert partial is False
+    assert results[0].merge_status == "unmerged"
+    assert "marked merged" not in results[0].actions
+    assert not any(
+        call.kwargs.get("into") == "origin/main"
+        for call in git.is_merged.call_args_list
+    )
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+
+
 def test_sync_branch_cohorts_missing_local_branch_uses_remote_feature_ref_before_marking_merged(tmp_path):
     store = SqliteTaskStore(tmp_path / "test.db")
     task = _completed_branch_task(store, "Task with deleted local branch", "feature/remote-survivor")

@@ -986,6 +986,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 include_pr=False,
                 dry_run=False,
                 fetch_remote=bool(getattr(args, "fetch", False)),
+                allow_cached_remote_target_ref_without_fetch=True,
             )
             if _partial:
                 errors = [
