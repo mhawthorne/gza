@@ -769,6 +769,7 @@ def generate_slug(
     return new_id
 
 
+
 def _compute_slug_override(task: "Task", store: "SqliteTaskStore") -> str | None:
     """Compute a semantic slug override for review/implement/improve tasks."""
     if task.task_type not in {"review", "implement", "improve"}:

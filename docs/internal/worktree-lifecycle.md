@@ -3,6 +3,7 @@
 ## How tasks use worktrees
 
 Each task type creates a worktree at `config.worktree_path / task.slug`.
+
 ## Watch isolated merge checkout
 
 When `main_checkout_isolate: true`, `gza watch` maintains a dedicated integration checkout at `config.main_checkout_integration_path` (currently `.../main-integration`).
