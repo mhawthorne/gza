@@ -4584,6 +4584,63 @@ def test_cmd_watch_restart_failed_dry_run_show_skipped_includes_skipped_entries(
     assert "0 skipped" in stdout
 
 
+def test_cmd_watch_restart_failed_dry_run_saturates_retry_resume_attempt_display(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Exhausted retry->resume chains should display saturated attempt counters."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Root failed plan", task_type="plan")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "INFRASTRUCTURE_ERROR"
+    root.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(root)
+
+    retry_child = store.add(root.prompt, task_type="plan", based_on=root.id)
+    assert retry_child.id is not None
+    retry_child.status = "failed"
+    retry_child.failure_reason = "MAX_TURNS"
+    retry_child.session_id = "sess-retry"
+    retry_child.completed_at = datetime(2026, 4, 28, 11, 0, 0, tzinfo=UTC)
+    store.update(retry_child)
+
+    resumed_retry = store.add(retry_child.prompt, task_type="plan", based_on=retry_child.id)
+    assert resumed_retry.id is not None
+    resumed_retry.status = "failed"
+    resumed_retry.failure_reason = "TIMEOUT"
+    resumed_retry.session_id = retry_child.session_id
+    resumed_retry.completed_at = datetime(2026, 4, 28, 12, 0, 0, tzinfo=UTC)
+    store.update(resumed_retry)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert "attempt=3/2" not in stdout
+    resumed_retry_line = next(line for line in stdout.splitlines() if resumed_retry.id in line)
+    assert "attempt=2/2" in resumed_retry_line
+
+
 def test_collect_unhandled_failures_skips_actionable_recovery_failures(tmp_path: Path) -> None:
     """With restart-failed mode active, actionable failures are excluded from backoff accounting."""
     setup_config(tmp_path)

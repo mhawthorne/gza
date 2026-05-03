@@ -347,15 +347,6 @@ def main() -> int:
                                 "handoff_task_id": handoff_task_id,
                             },
                         )
-                if spawn_rc != 0:
-                    failed_handoff_task = store.get(handoff_task_id) or refreshed
-                    store.mark_failed(
-                        failed_handoff_task,
-                        log_file=failed_handoff_task.log_file,
-                        branch=failed_handoff_task.branch,
-                        has_commits=bool(failed_handoff_task.has_commits),
-                        failure_reason="WORKER_DIED",
-                    )
     return exit_code
 
 

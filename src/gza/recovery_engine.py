@@ -153,8 +153,10 @@ def _policy_attempt_counters(
 ) -> tuple[int, int]:
     if max_recovery_attempts <= 0:
         return (0, 0)
-    attempt_index = len(chain.steps) + 1
     attempt_limit = 2
+    # Display counters should reflect the bounded shared policy budget, not raw
+    # based_on depth, so exhausted chains saturate at N/N instead of N+1/N.
+    attempt_index = min(len(chain.steps) + 1, attempt_limit)
     return (attempt_index, attempt_limit)
 
 

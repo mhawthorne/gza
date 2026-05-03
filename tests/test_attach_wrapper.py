@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 from gza.attach_wrapper import main
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.recovery_engine import decide_failed_task_recovery
 
 
 def _setup_task_with_log(project_dir: Path, *, task_type: str = "implement") -> tuple[str, Path]:
@@ -123,8 +124,8 @@ def test_attach_wrapper_sigterm_detach_auto_resumes(tmp_path: Path) -> None:
     assert detach_events[-1]["reason"] == "detached"
 
 
-def test_attach_wrapper_resume_failure_marks_task_failed(tmp_path: Path) -> None:
-    """Failed detach/exit handoff should not emit resume success and must mark task failed."""
+def test_attach_wrapper_resume_failure_keeps_task_pending(tmp_path: Path) -> None:
+    """Failed detach/exit handoff should not emit resume success or rewrite task status."""
     task_id, log_path = _setup_task_with_log(tmp_path)
 
     with (
@@ -152,8 +153,8 @@ def test_attach_wrapper_resume_failure_marks_task_failed(tmp_path: Path) -> None
     store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
     refreshed = store.get(task_id)
     assert refreshed is not None
-    assert refreshed.status == "failed"
-    assert refreshed.failure_reason == "WORKER_DIED"
+    assert refreshed.status == "pending"
+    assert refreshed.failure_reason is None
 
 
 def test_attach_wrapper_failed_resume_descendant_does_not_auto_resume(tmp_path: Path) -> None:
@@ -338,6 +339,59 @@ def test_attach_wrapper_retry_handoff_failure_logs_retry_failed(tmp_path: Path) 
     assert "resume_failed" not in event_names
     failure_event = [event for event in lifecycle_events if event["event"] == "retry_failed"][-1]
     assert failure_event["handoff_exit_code"] == 9
+    retry_children = store.get_based_on_children(task_id)
+    assert len(retry_children) == 1
+    retry_child = retry_children[0]
+    assert retry_child.status == "pending"
+    refreshed_failed = store.get(task_id)
+    assert refreshed_failed is not None
+    decision = decide_failed_task_recovery(store, refreshed_failed, max_recovery_attempts=config.max_resume_attempts)
+    assert decision.action == "retry"
+    assert decision.reuse_existing is True
+    assert decision.recovery_task_id == retry_child.id
+
+
+def test_attach_wrapper_timeout_handoff_spawn_failure_keeps_resume_child_pending_for_shared_policy(tmp_path: Path) -> None:
+    """Timeout handoff spawn failures must keep resume descendants pending for shared recovery evaluation."""
+    task_id, log_path = _setup_task_with_log(tmp_path, task_type="plan")
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    failed = store.get(task_id)
+    assert failed is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    store.update(failed)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=7),
+    ):
+        rc = main()
+
+    assert rc == 0
+    events = _read_log_events(log_path)
+    lifecycle_events = [event for event in events if event.get("subtype") == "worker_lifecycle"]
+    assert "resume_failed" in [event["event"] for event in lifecycle_events]
+
+    resume_children = store.get_based_on_children(task_id)
+    assert len(resume_children) == 1
+    resume_child = resume_children[0]
+    assert resume_child.status == "pending"
+
+    refreshed_failed = store.get(task_id)
+    assert refreshed_failed is not None
+    decision = decide_failed_task_recovery(store, refreshed_failed, max_recovery_attempts=config.max_resume_attempts)
+    assert decision.action == "resume"
+    assert decision.reuse_existing is True
+    assert decision.recovery_task_id == resume_child.id
 
 
 def test_attach_wrapper_retryable_failed_non_implement_handoff_uses_worker_path(tmp_path: Path) -> None:
