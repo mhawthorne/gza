@@ -361,6 +361,14 @@ class TestPrCommand:
 
         assert rc == 0
 
+    def test_pr_module_does_not_keep_duplicate_pr_content_builders(self):
+        """`gza pr` should rely on shared PR helpers instead of a second code path."""
+        import gza.cli.git_ops as git_ops
+
+        assert not hasattr(git_ops, "_generate_pr_content")
+        assert not hasattr(git_ops, "_parse_pr_response")
+        assert not hasattr(git_ops, "_fallback_pr_content")
+
     def test_build_task_pr_content_title_override_preserves_existing_summary_body(self, tmp_path: Path):
         """Custom-title PR flows should keep the existing summary-body contract."""
         from gza.pr_ops import build_task_pr_content
