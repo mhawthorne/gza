@@ -188,6 +188,8 @@ def test_sync_branch_cohorts_normalizes_same_branch_rows(tmp_path):
     assert refreshed_child.diff_files_changed == 1
     assert refreshed_parent.merge_status == "unmerged"
     assert refreshed_child.merge_status == "unmerged"
+    assert refreshed_parent.sync_last_synced_at is not None
+    assert refreshed_child.sync_last_synced_at is not None
 
 
 def test_sync_branch_cohorts_marks_merged_when_origin_default_ref_proves_remote_merge(tmp_path):

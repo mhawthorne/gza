@@ -4710,7 +4710,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -4722,7 +4722,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -6569,6 +6569,30 @@ class TestSharedDbIsolationAndImportGating:
         assert reloaded is not None
         assert reloaded.pr_last_synced_at is not None
 
+    def test_open_current_db_repairs_missing_sync_last_synced_at_column(self, tmp_path: Path) -> None:
+        """Opening a current DB should repair missing tasks.sync_last_synced_at and preserve timestamps."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before sync_last_synced_at repair")
+        _drop_tasks_column(db_path, "sync_last_synced_at")
+
+        repaired_store = SqliteTaskStore(db_path, prefix="gza")
+        task = repaired_store.get(task.id)
+        assert task is not None
+        task.sync_last_synced_at = datetime.now(UTC)
+        repaired_store.update(task)
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        conn.close()
+
+        assert "sync_last_synced_at" in columns
+        reloaded = repaired_store.get(task.id)
+        assert reloaded is not None
+        assert reloaded.sync_last_synced_at is not None
+
     def test_open_current_v32_db_repairs_missing_task_comments_source_column(self, tmp_path: Path) -> None:
         """Opening an already-v32 DB should repair missing task_comments.source."""
         import sqlite3
@@ -6989,7 +7013,7 @@ class TestSharedDbIsolationAndImportGating:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
 
 
 class TestSyncCandidates:
@@ -7082,3 +7106,26 @@ class TestSyncCandidates:
         assert refreshed.merged_at == old
         candidate_ids = {candidate.id for candidate in store.get_sync_candidates(recent_days=30)}
         assert task.id not in candidate_ids
+
+    def test_get_sync_candidates_skips_recently_synced_branch_until_cooldown_expires(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+        now = datetime.now(UTC)
+
+        task = store.add("Recently synced task", task_type="implement")
+        task.status = "completed"
+        task.completed_at = now - timedelta(days=1)
+        task.branch = "feature/recent-sync"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        task.sync_last_synced_at = now
+        store.update(task)
+
+        cached_candidate_ids = {
+            candidate.id for candidate in store.get_sync_candidates(recent_days=30, cooldown_seconds=300)
+        }
+        uncached_candidate_ids = {
+            candidate.id for candidate in store.get_sync_candidates(recent_days=30, cooldown_seconds=0)
+        }
+
+        assert task.id not in cached_candidate_ids
+        assert task.id in uncached_candidate_ids

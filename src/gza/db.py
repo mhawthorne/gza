@@ -303,6 +303,7 @@ class Task:
     pr_number: int | None = None  # GitHub PR number
     pr_state: str | None = None  # Cached GitHub PR state: open, closed, merged
     pr_last_synced_at: datetime | None = None  # When PR metadata was last refreshed
+    sync_last_synced_at: datetime | None = None  # When branch-scoped `gza sync` last completed successfully
     model: str | None = None  # Per-task model override
     provider: str | None = None  # Per-task provider override
     provider_is_explicit: bool = False  # True when provider was explicitly set by user input
@@ -453,8 +454,13 @@ ALTER TABLE tasks ADD COLUMN pr_state TEXT;
 ALTER TABLE tasks ADD COLUMN pr_last_synced_at TEXT;
 """
 
+# Migration from v38 to v39: cached branch-sync timestamp
+MIGRATION_V38_TO_V39 = """
+ALTER TABLE tasks ADD COLUMN sync_last_synced_at TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 38
+SCHEMA_VERSION = 39
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -690,6 +696,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 pr_number INTEGER,
                 pr_state TEXT,
                 pr_last_synced_at TEXT,
+                sync_last_synced_at TEXT,
                 model TEXT,
                 provider TEXT,
                 provider_is_explicit INTEGER DEFAULT 0,
@@ -796,7 +803,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns", "num_turns_reported", "num_turns_computed",
             "attach_count", "attach_duration_seconds", "cost_usd", "created_at", "started_at", "running_pid", "completed_at",
             "group", "depends_on", "spec", "create_review", "create_pr", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
-            "pr_state", "pr_last_synced_at", "model", "provider", "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
+            "pr_state", "pr_last_synced_at", "sync_last_synced_at", "model", "provider", "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
             "merge_status", "merged_at", "failure_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
             "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
         )
@@ -836,7 +843,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 duration_seconds, num_steps_reported, num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                 attach_count, attach_duration_seconds, cost_usd, created_at, started_at, running_pid, completed_at,
                 "group", depends_on, spec, create_review, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
-                pr_state, pr_last_synced_at, model, provider, provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
+                pr_state, pr_last_synced_at, sync_last_synced_at, model, provider, provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
                 merge_status, merged_at, failure_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
                 review_cleared_at, review_score, log_schema_version, execution_mode, base_branch
             )
@@ -1074,6 +1081,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "pr_number",
     "pr_state",
     "pr_last_synced_at",
+    "sync_last_synced_at",
     "model",
     "provider",
     "provider_is_explicit",
@@ -1165,6 +1173,10 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
                 raise RuntimeError(
                     f"Auto-migration to v38 incomplete: missing required column tasks.{column}"
                 )
+    if target_version == 39 and not _table_has_column(conn, "tasks", "sync_last_synced_at"):
+        raise RuntimeError(
+            "Auto-migration to v39 incomplete: missing required column tasks.sync_last_synced_at"
+        )
 
     required_columns_by_version: dict[int, tuple[str, str]] = {
         30: ("tasks", "urgent_bumped_at"),
@@ -1238,6 +1250,7 @@ def _ensure_required_auto_migration_artifacts(
         (37, "tasks", "create_pr", "ALTER TABLE tasks ADD COLUMN create_pr INTEGER DEFAULT 0"),
         (38, "tasks", "pr_state", "ALTER TABLE tasks ADD COLUMN pr_state TEXT"),
         (38, "tasks", "pr_last_synced_at", "ALTER TABLE tasks ADD COLUMN pr_last_synced_at TEXT"),
+        (39, "tasks", "sync_last_synced_at", "ALTER TABLE tasks ADD COLUMN sync_last_synced_at TEXT"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -1346,6 +1359,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     pr_number INTEGER,
     pr_state TEXT,
     pr_last_synced_at TEXT,
+    sync_last_synced_at TEXT,
     model TEXT,
     provider TEXT,
     provider_is_explicit INTEGER DEFAULT 0,
@@ -1729,6 +1743,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (36, MIGRATION_V35_TO_V36),
     (37, MIGRATION_V36_TO_V37),
     (38, MIGRATION_V37_TO_V38),
+    (39, MIGRATION_V38_TO_V39),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -2314,6 +2329,7 @@ class SqliteTaskStore:
             pr_number=row["pr_number"] if "pr_number" in keys else None,
             pr_state=row["pr_state"] if "pr_state" in keys else None,
             pr_last_synced_at=_parse_db_timestamp(row["pr_last_synced_at"]) if "pr_last_synced_at" in keys else None,
+            sync_last_synced_at=_parse_db_timestamp(row["sync_last_synced_at"]) if "sync_last_synced_at" in keys else None,
             model=row["model"] if "model" in keys else None,
             provider=row["provider"] if "provider" in keys else None,
             provider_is_explicit=bool(row["provider_is_explicit"]) if "provider_is_explicit" in keys and row["provider_is_explicit"] is not None else False,
@@ -2645,6 +2661,7 @@ class SqliteTaskStore:
                     pr_number = ?,
                     pr_state = ?,
                     pr_last_synced_at = ?,
+                    sync_last_synced_at = ?,
                     model = ?,
                     provider = ?,
                     provider_is_explicit = ?,
@@ -2699,6 +2716,7 @@ class SqliteTaskStore:
                     task.pr_number,
                     task.pr_state,
                     task.pr_last_synced_at.isoformat() if task.pr_last_synced_at else None,
+                    task.sync_last_synced_at.isoformat() if task.sync_last_synced_at else None,
                     task.model,
                     task.provider,
                     1 if task.provider_is_explicit else 0,
@@ -3372,12 +3390,24 @@ class SqliteTaskStore:
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
-    def get_sync_candidates(self, recent_days: int = 30) -> list[Task]:
+    def get_sync_candidates(self, recent_days: int = 30, *, cooldown_seconds: int = 0) -> list[Task]:
         """Return a bounded set of branch-bearing task rows for `gza sync`."""
-        cutoff = (datetime.now(UTC) - timedelta(days=recent_days)).isoformat()
+        recent_cutoff = (datetime.now(UTC) - timedelta(days=recent_days)).isoformat()
+        sync_cutoff = (datetime.now(UTC) - timedelta(seconds=max(cooldown_seconds, 0))).isoformat()
+        cooldown_filter = ""
+        params: list[object] = [self._project_id, recent_cutoff]
+        if cooldown_seconds > 0:
+            cooldown_filter = """
+                  AND (
+                        sync_last_synced_at IS NULL
+                        OR sync_last_synced_at < ?
+                        OR COALESCE(merged_at, completed_at, created_at) > sync_last_synced_at
+                  )
+            """
+            params.append(sync_cutoff)
         with self._connect() as conn:
             cur = conn.execute(
-                """
+                f"""
                 SELECT * FROM tasks
                 WHERE project_id = ?
                   AND branch IS NOT NULL
@@ -3390,9 +3420,10 @@ class SqliteTaskStore:
                             AND (pr_number IS NOT NULL OR create_pr = 1)
                         )
                   )
+                  {cooldown_filter}
                 ORDER BY COALESCE(merged_at, completed_at, created_at) DESC, created_at DESC
                 """,
-                (self._project_id, cutoff),
+                tuple(params),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
@@ -4739,7 +4770,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "created_at", "started_at", "running_pid", "completed_at", "group", "depends_on", "spec", "create_review",
         "create_pr",
         "same_branch", "task_type_hint", "output_content", "session_id", "pr_number", "pr_state",
-        "pr_last_synced_at", "model", "provider",
+        "pr_last_synced_at", "sync_last_synced_at", "model", "provider",
         "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
         "merge_status", "merged_at", "failure_reason", "skip_learnings", "diff_files_changed", "diff_lines_added",
         "diff_lines_removed", "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
@@ -4749,6 +4780,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "create_pr": "0",
         "pr_state": "NULL",
         "pr_last_synced_at": "NULL",
+        "sync_last_synced_at": "NULL",
     }
     project_id, project_prefix = _project_identity_from_config(config)
 
@@ -5264,6 +5296,7 @@ def _task_to_dict(task: "Task") -> dict:
         "pr_number": task.pr_number,
         "pr_state": task.pr_state,
         "pr_last_synced_at": task.pr_last_synced_at.isoformat() if task.pr_last_synced_at else None,
+        "sync_last_synced_at": task.sync_last_synced_at.isoformat() if task.sync_last_synced_at else None,
         "model": task.model,
         "provider": task.provider,
         "provider_is_explicit": task.provider_is_explicit,

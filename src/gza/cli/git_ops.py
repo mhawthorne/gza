@@ -43,6 +43,7 @@ from ..runner import (
     write_log_entry,
 )
 from ..sync_ops import (
+    DEFAULT_SYNC_CACHE_SECONDS,
     build_branch_cohorts_for_task_ids,
     build_default_branch_cohorts,
     refresh_branch_diff_stats,
@@ -1257,12 +1258,19 @@ def cmd_sync(args: argparse.Namespace) -> int:
         cohorts = build_default_branch_cohorts(store)
 
     if not cohorts and not preliminary_results:
-        print("No sync candidates")
+        if not args.task_ids and store.get_sync_candidates(recent_days=30, cooldown_seconds=0):
+            cache_minutes = max(DEFAULT_SYNC_CACHE_SECONDS // 60, 1)
+            print(f"No sync candidates: default sync cache is still warm ({cache_minutes}m cooldown).")
+        else:
+            print("No sync candidates")
         return 0
 
     results = list(preliminary_results)
     partial_failure = False
     if cohorts:
+        def _progress(message: str) -> None:
+            print(f"[sync] {message}")
+
         cohort_results, partial_failure = sync_branch_cohorts(
             store,
             git,
@@ -1271,6 +1279,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             include_pr=include_pr,
             dry_run=bool(getattr(args, "dry_run", False)),
             fetch_remote=not bool(getattr(args, "no_fetch", False)),
+            progress=_progress,
         )
         results.extend(cohort_results)
 
@@ -1526,6 +1535,7 @@ class _MergeActionResult:
     rc: int
     created_followups: list[DbTask]
     reused_followups: list[DbTask]
+    status: str = "merged"
 
 
 @dataclass
@@ -1571,6 +1581,7 @@ def _execute_merge_action(
     current_branch: str,
     merge_git: Git | None = None,
     merge_current_branch: str | None = None,
+    already_merged_behavior: str = "error",
 ) -> _MergeActionResult:
     """Execute a merge-style advance action and materialize follow-up tasks if needed."""
     created_followups: list[DbTask] = []
@@ -1590,6 +1601,20 @@ def _execute_merge_action(
             )
 
     assert task.id is not None
+    if (
+        already_merged_behavior == "mark_merged"
+        and task.branch
+        and execution_git.branch_exists(task.branch)
+        and execution_git.is_merged(task.branch, execution_branch)
+    ):
+        store.set_merge_status(task.id, "merged")
+        return _MergeActionResult(
+            rc=0,
+            created_followups=created_followups,
+            reused_followups=reused_followups,
+            status="already_merged",
+        )
+
     merge_args = _build_auto_merge_args(config, execution_git, task, target_branch)
     rc = _merge_single_task(
         task.id,
