@@ -3,7 +3,7 @@
 #
 # Usage: bin/rebase-on-main.sh [claude|codex]
 
-set -e
+set -euo pipefail
 
 MAIN_BRANCH="main"
 REMOTE="origin"
@@ -21,7 +21,202 @@ usage() {
     echo "Rebases the current branch onto main and invokes the selected AI agent"
     echo "to resolve conflicts if the rebase stops."
     echo ""
+    echo "If conflicts occur, the agent resolves and stages the current conflict set,"
+    echo "then this script continues the rebase and offers the force-push prompt."
+    echo ""
     echo "Default agent: $DEFAULT_AGENT"
+}
+
+git_path() {
+    git rev-parse --git-path "$1"
+}
+
+rebase_in_progress() {
+    [[ -d "$(git_path rebase-merge)" || -d "$(git_path rebase-apply)" ]]
+}
+
+list_conflicted_files() {
+    git diff --name-only --diff-filter=U
+}
+
+show_conflicted_files() {
+    local conflicted_files
+
+    conflicted_files="$(list_conflicted_files)"
+    if [[ -z "$conflicted_files" ]]; then
+        echo "No conflicted files reported."
+        return
+    fi
+
+    echo "Conflicted files:"
+    printf '%s\n' "$conflicted_files"
+}
+
+build_resolution_prompt() {
+    cat <<EOF
+A git rebase is currently stopped on merge conflicts while rebasing branch '$CURRENT_BRANCH' onto '$REBASE_TARGET'.
+
+Resolve only the currently conflicted files reported by:
+  git diff --name-only --diff-filter=U
+
+For each conflicted file:
+1. Read the file to see the conflict markers.
+2. Understand what both sides are trying to add or change.
+3. Combine both changes appropriately (usually keeping both additions).
+4. Remove the conflict markers.
+5. Verify Python syntax with: uv run python -m py_compile <file>
+6. Stage the resolved file with: git add <file>
+
+Important:
+- Do not run git rebase --continue.
+- Do not run git push.
+- Do not start a new rebase.
+- Do not abort the current rebase.
+- Stop and exit after the current conflicted files are resolved and staged so the calling script can continue the rebase.
+EOF
+}
+
+build_codex_headless_exec_cmd() {
+    local work_dir="$1"
+    local args_output
+
+    # Keep the shell workflow on the same argv contract as the provider adapter.
+    args_output="$(uv run python - "$work_dir" <<'PY'
+from pathlib import Path
+import sys
+
+from gza.providers.codex import build_headless_exec_args
+
+for arg in build_headless_exec_args(Path(sys.argv[1])):
+    print(arg)
+PY
+)"
+
+    mapfile -t CODEX_HEADLESS_EXEC_CMD <<<"$args_output"
+}
+
+invoke_agent_for_conflicts() {
+    local resolution_prompt
+
+    resolution_prompt="$(build_resolution_prompt)"
+
+    echo "Invoking $SELECTED_AGENT to resolve and stage current conflicts..."
+
+    if [[ "$SELECTED_AGENT" == "claude" ]]; then
+        printf '%s\n' "$resolution_prompt" | claude \
+            -p - \
+            --allowedTools 'Bash(git add:*)' \
+            --allowedTools 'Bash(git diff:*)' \
+            --allowedTools 'Bash(uv run python -m py_compile:*)' \
+            --allowedTools 'Edit' \
+            --allowedTools 'Read' \
+            --allowedTools 'Glob' \
+            --allowedTools 'Grep'
+    else
+        local -a CODEX_HEADLESS_EXEC_CMD
+
+        build_codex_headless_exec_cmd "$(pwd)"
+        printf '%s\n' "$resolution_prompt" | codex "${CODEX_HEADLESS_EXEC_CMD[@]}"
+    fi
+}
+
+finish_rebase_success() {
+    local post_rebase_head
+
+    post_rebase_head=$(git rev-parse HEAD)
+
+    echo -e "${GREEN}Rebase completed successfully!${NC}"
+    if [[ "$PRE_REBASE_HEAD" == "$post_rebase_head" ]]; then
+        echo -e "${YELLOW}$CURRENT_BRANCH is already up to date with $REBASE_TARGET.${NC}"
+        echo "Rebase made no changes, so there is nothing new to push from this run."
+        exit 0
+    fi
+
+    echo "Rebased $CURRENT_BRANCH onto $REBASE_TARGET"
+    echo ""
+    read -p "Push with --force-with-lease? [y/N]: " PUSH_CHOICE
+    if [[ "$PUSH_CHOICE" =~ ^[Yy]$ ]]; then
+        git push --force-with-lease
+        echo -e "${GREEN}Pushed successfully!${NC}"
+    fi
+}
+
+report_rebase_state_cleared_without_completion() {
+    local post_agent_head
+
+    post_agent_head=$(git rev-parse HEAD)
+
+    echo ""
+    echo -e "${RED}$SELECTED_AGENT exited and the rebase is no longer in progress, but this script did not complete it.${NC}"
+    if [[ "$PRE_REBASE_HEAD" == "$post_agent_head" ]]; then
+        echo "HEAD is unchanged from before the rebase attempt."
+    fi
+    echo "The rebase may have been aborted or altered manually."
+    echo "Inspect the branch state and rerun the rebase if needed."
+    echo "To abort any partial state manually: git rebase --abort"
+}
+
+resolve_rebase_conflicts() {
+    local agent_exit_status=0
+    local rebase_completed_by_script=0
+
+    while rebase_in_progress; do
+        echo ""
+        echo -e "${YELLOW}=== Merge conflicts detected ===${NC}"
+        echo ""
+        show_conflicted_files
+        echo ""
+
+        if invoke_agent_for_conflicts; then
+            agent_exit_status=0
+        else
+            agent_exit_status=$?
+        fi
+
+        if ! rebase_in_progress; then
+            if [[ "$rebase_completed_by_script" -eq 1 ]]; then
+                return 0
+            fi
+
+            report_rebase_state_cleared_without_completion
+            return 1
+        fi
+
+        if [[ -n "$(list_conflicted_files)" ]]; then
+            echo ""
+            if [[ "$agent_exit_status" -ne 0 ]]; then
+                echo -e "${RED}$SELECTED_AGENT exited with status $agent_exit_status, and conflicts are still present.${NC}"
+            else
+                echo -e "${RED}$SELECTED_AGENT exited, but conflicts are still present.${NC}"
+            fi
+            echo "Resolve the remaining conflicts manually or abort with: git rebase --abort"
+            return 1
+        fi
+
+        if [[ "$agent_exit_status" -ne 0 ]]; then
+            echo ""
+            echo -e "${YELLOW}$SELECTED_AGENT exited with status $agent_exit_status after resolving the current conflict set.${NC}"
+            echo "Attempting scripted git rebase --continue anyway."
+        fi
+
+        echo ""
+        echo "Continuing rebase..."
+        if git -c core.editor=true rebase --continue; then
+            if ! rebase_in_progress; then
+                rebase_completed_by_script=1
+            fi
+            continue
+        fi
+
+        if [[ -n "$(list_conflicted_files)" ]]; then
+            continue
+        fi
+
+        echo ""
+        echo -e "${RED}git rebase --continue failed without leaving conflicted files.${NC}"
+        echo "Inspect the rebase state manually. To abort: git rebase --abort"
+        return 1
+    done
 }
 
 SELECTED_AGENT="${1:-$DEFAULT_AGENT}"
@@ -77,7 +272,7 @@ case "$CHOICE" in
     2)
         REBASE_TARGET="$REMOTE/$MAIN_BRANCH"
         echo "Fetching latest from $REMOTE..."
-        git fetch $REMOTE $MAIN_BRANCH
+        git fetch "$REMOTE" "$MAIN_BRANCH"
         ;;
     *)
         echo -e "${RED}Invalid choice. Exiting.${NC}"
@@ -90,62 +285,16 @@ echo "Rebasing $CURRENT_BRANCH onto $REBASE_TARGET..."
 PRE_REBASE_HEAD=$(git rev-parse HEAD)
 
 # Attempt rebase
-if git rebase $REBASE_TARGET; then
-    POST_REBASE_HEAD=$(git rev-parse HEAD)
-    echo -e "${GREEN}Rebase completed successfully!${NC}"
-    if [[ "$PRE_REBASE_HEAD" == "$POST_REBASE_HEAD" ]]; then
-        echo -e "${YELLOW}$CURRENT_BRANCH is already up to date with $REBASE_TARGET.${NC}"
-        echo "Rebase made no changes, so there is nothing new to push from this run."
-        exit 0
-    fi
-
-    echo "Rebased $CURRENT_BRANCH onto $REBASE_TARGET"
-    echo ""
-    read -p "Push with --force-with-lease? [y/N]: " PUSH_CHOICE
-    if [[ "$PUSH_CHOICE" =~ ^[Yy]$ ]]; then
-        git push --force-with-lease
-        echo -e "${GREEN}Pushed successfully!${NC}"
-    fi
+if git rebase "$REBASE_TARGET"; then
+    finish_rebase_success
     exit 0
 fi
 
-# Rebase failed - use selected agent to resolve conflicts
-echo ""
-echo -e "${YELLOW}=== Merge conflicts detected ===${NC}"
-echo ""
-echo "Conflicted files:"
-git diff --name-only --diff-filter=U
-echo ""
-
-RESOLUTION_PROMPT="Resolve the merge conflicts. For each conflicted file:
-1. Read the file to see the conflict markers
-2. Understand what both sides are trying to add
-3. Combine both changes appropriately (usually keeping both additions)
-4. Remove the conflict markers
-5. Verify Python syntax with: uv run python -m py_compile <file>
-6. Stage the resolved file with: git add <file>
-
-After resolving all conflicts, run: git rebase --continue"
-
-echo "Invoking $SELECTED_AGENT to resolve conflicts..."
-
-if [[ "$SELECTED_AGENT" == "claude" ]]; then
-    claude "$RESOLUTION_PROMPT" \
-        --allowedTools 'Bash(git add:*)' \
-        --allowedTools 'Bash(git rebase --continue:*)' \
-        --allowedTools 'Bash(uv run python -m py_compile:*)' \
-        --allowedTools 'Edit' \
-        --allowedTools 'Read' \
-        --allowedTools 'Glob' \
-        --allowedTools 'Grep'
-else
-    codex -C "$(pwd)" "$RESOLUTION_PROMPT"
+if ! rebase_in_progress; then
+    echo ""
+    echo -e "${RED}Rebase failed before entering conflict resolution.${NC}"
+    exit 1
 fi
 
-echo ""
-echo -e "${YELLOW}Review the changes, then:${NC}"
-echo "  git rebase --continue"
-echo "  git push --force-with-lease"
-echo ""
-echo -e "${RED}To abort:${NC}"
-echo "  git rebase --abort"
+resolve_rebase_conflicts
+finish_rebase_success

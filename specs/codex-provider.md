@@ -13,12 +13,12 @@ Codex is OpenAI's CLI coding agent (`@openai/codex`), similar to Claude Code. It
 | Aspect | Claude | Codex |
 |--------|--------|-------|
 | Package | `@anthropic-ai/claude-code` | `@openai/codex` |
-| CLI | `claude -p - --output-format stream-json` | `codex exec --json -` |
+| CLI | `claude -p - --output-format stream-json` | `codex -c check_for_update_on_startup=false exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <workdir> -` |
 | Event types | `assistant`, `result` | `turn.started`, `item.completed`, `turn.completed` |
 | Tool calls | `type: "tool_use"` in message content | `item.type: "command_execution"` |
 | Usage stats | In `message.usage` and `result` | In `turn.completed.usage` |
 | Resume | `--resume <session_id>` | `codex exec resume` subcommand |
-| Sandbox | N/A (uses allowed tools) | `--sandbox workspace-write` |
+| Sandbox | N/A (uses allowed tools) | `--dangerously-bypass-approvals-and-sandbox` |
 | Prompt input | stdin with `-p -` | stdin with `-` argument |
 | Max turns | `--max-turns N` | Not available - must track manually |
 | Credentials | `ANTHROPIC_API_KEY` or OAuth | `OPENAI_API_KEY` or OAuth |
@@ -67,8 +67,11 @@ class CodexProvider(Provider):
 ```python
 cmd = [
     "timeout", f"{config.timeout_minutes}m",
-    "codex", "exec", "--json",
-    "--sandbox", "workspace-write",
+    "codex",
+    "-c", "check_for_update_on_startup=false",
+    "exec", "--json",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--skip-git-repo-check",
     "-C", str(work_dir),
     "-",  # Read prompt from stdin
 ]
@@ -82,8 +85,11 @@ For resume:
 ```python
 cmd = [
     "timeout", f"{config.timeout_minutes}m",
-    "codex", "exec", "resume",
+    "codex",
+    "-c", "check_for_update_on_startup=false",
+    "exec", "resume",
     "--json",
+    "--dangerously-bypass-approvals-and-sandbox",
     "--last",  # or specific session ID
 ]
 ```

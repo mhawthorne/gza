@@ -32,6 +32,7 @@ from gza.providers.base import (
     is_docker_running,
     verify_docker_credentials,
 )
+from gza.providers.codex import build_headless_exec_args
 from gza.providers.gemini import calculate_cost
 from gza.providers.output_formatter import (
     StreamOutputFormatter,
@@ -5909,3 +5910,35 @@ class TestPreflightLogging:
         codex_idx = captured_cmd.index("codex")
         assert captured_cmd[codex_idx + 1] == "-c"
         assert captured_cmd[codex_idx + 2] == "check_for_update_on_startup=false"
+
+    def test_codex_headless_exec_builder_matches_supported_contract(self, tmp_path: Path):
+        """Shared headless exec args should stay aligned with the supported Codex CLI contract."""
+        assert build_headless_exec_args(tmp_path) == [
+            "-c",
+            "check_for_update_on_startup=false",
+            "exec",
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--skip-git-repo-check",
+            "-C",
+            str(tmp_path),
+            "-",
+        ]
+
+    def test_codex_provider_spec_examples_match_shared_headless_exec_contract(self):
+        """Spec examples should stay aligned with the shared Codex headless exec argv."""
+        repo_root = Path(__file__).resolve().parents[1]
+        spec_text = (repo_root / "specs" / "codex-provider.md").read_text()
+        expected_cli = f"`codex {' '.join(build_headless_exec_args('<workdir>'))}`"
+
+        assert expected_cli in spec_text
+        assert "--dangerously-work" not in spec_text
+
+    def test_codex_debug_doc_examples_match_shared_headless_exec_contract(self):
+        """Debug docs should reuse the supported Codex headless exec argv verbatim."""
+        repo_root = Path(__file__).resolve().parents[1]
+        debug_doc_text = (repo_root / "docs" / "debug" / "codex-docker-investigation.md").read_text()
+        expected_subcommand = f"codex {' '.join(build_headless_exec_args('/workspace'))}"
+
+        assert debug_doc_text.count(expected_subcommand) == 2
+        assert "--dangerously-work" not in debug_doc_text
