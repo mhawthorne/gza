@@ -226,7 +226,13 @@ class _WatchLog:
             self._skip_keys_this_cycle.add(dedupe_key)
             if dedupe_key in self._skip_keys_prev_cycle:
                 return
-        line = f"{_format_hms()} {event:<6} {message}".rstrip()
+        prefix = f"{_format_hms()} {event:<6} "
+        continuation_prefix = " " * len(prefix)
+        parts = message.splitlines() or [""]
+        line = "\n".join(
+            (prefix if idx == 0 else continuation_prefix) + part.rstrip()
+            for idx, part in enumerate(parts)
+        ).rstrip()
         with open(self.path, "a") as f:
             f.write(line + "\n")
         if not self.quiet:
@@ -269,11 +275,11 @@ def _emit_transition_events(
 
 
 def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
-    live_pids, _ = _collect_live_running_state(config, store)
+    live_pids, _, _ = _collect_live_running_state(config, store)
     return len(live_pids)
 
 
-def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple[set[int], list[str]]:
+def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple[set[int], list[str], int]:
     registry = WorkerRegistry(config.workers_path)
     live_pids: set[int] = set()
     live_task_ids: set[str] = set()
@@ -312,13 +318,28 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
         if task.id is not None:
             live_task_ids.add(str(task.id))
 
-    return live_pids, sorted(live_task_ids, key=lambda task_id: task_id_numeric_key(task_id))
+    running_task_ids = sorted(live_task_ids, key=lambda task_id: task_id_numeric_key(task_id))
+    anonymous_worker_count = max(0, len(live_pids) - len(running_task_ids))
+    return live_pids, running_task_ids, anonymous_worker_count
 
 
-def _format_wake_message(*, running: int, pending: int, slots: int, running_task_ids: list[str]) -> str:
+def _format_wake_message(
+    *,
+    running: int,
+    pending: int,
+    slots: int,
+    running_task_ids: list[str],
+    anonymous_worker_count: int = 0,
+) -> str:
     message = f"checking... ({running} running, {pending} pending, {slots} slots)"
-    if running_task_ids:
-        message += f" tasks: {', '.join(running_task_ids)}"
+    if running_task_ids or anonymous_worker_count > 0:
+        worker_lines = ["live workers:"]
+        worker_lines.extend(f"- {task_id}" for task_id in running_task_ids)
+        if anonymous_worker_count == 1:
+            worker_lines.append("- 1 worker without an active task id")
+        elif anonymous_worker_count > 1:
+            worker_lines.append(f"- {anonymous_worker_count} workers without active task ids")
+        message += "\n" + "\n".join(worker_lines)
     return message
 
 
@@ -641,7 +662,7 @@ def _run_cycle(
         reconcile_in_progress_tasks(config)
         prune_terminal_dead_workers(config)
 
-    live_pids, running_task_ids = _collect_live_running_state(config, store)
+    live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
     pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
     running = len(live_pids)
     slots = max(0, batch - running)
@@ -656,6 +677,7 @@ def _run_cycle(
             pending=pending_count,
             slots=slots,
             running_task_ids=running_task_ids,
+            anonymous_worker_count=anonymous_worker_count,
         ),
     )
     scope_message = _format_scope_message(tags, any_tag=any_tag)
@@ -859,6 +881,7 @@ def _run_cycle(
                         current_branch=current_branch,
                         merge_git=merge_execution_git,
                         merge_current_branch=merge_execution_branch,
+                        already_merged_behavior="mark_merged",
                     ),
                 )
                 rc = merge_result.rc
@@ -867,7 +890,10 @@ def _run_cycle(
                 for followup_task in merge_result.reused_followups:
                     log.emit("FOLLOW", f"{followup_task.id} reused from {task.id}")
                 if rc == 0:
-                    log.emit("MERGE", f"{task.id} -> {target_branch}")
+                    if getattr(merge_result, "status", "merged") == "already_merged":
+                        log.emit("INFO", f"{task.id} already merged into {target_branch}; marked merged")
+                    else:
+                        log.emit("MERGE", f"{task.id} -> {target_branch}")
                     work_done = True
                 else:
                     conflict_handled = False

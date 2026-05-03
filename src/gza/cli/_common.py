@@ -1077,8 +1077,12 @@ def _create_rebase_task(
     """
     return store.add(
         prompt=(
-            f"Rebase branch '{branch}' onto '{target_branch}' and resolve "
-            f"any conflicts. Use /gza-rebase --auto to perform the rebase."
+            f"Rebase branch '{branch}' onto the local branch '{target_branch}' and resolve "
+            f"any conflicts. Use /gza-rebase --auto to perform the rebase. "
+            "Do not fetch from origin or any other remote, do not run git ls-remote, "
+            "do not use HTTPS fallback, and do not modify git remotes or git config. "
+            "Use only local refs already present in this repository. "
+            "If the local target branch is missing, stop and report the failure."
         ),
         task_type="rebase",
         based_on=parent_task_id,

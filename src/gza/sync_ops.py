@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal, cast
@@ -11,8 +12,10 @@ from .git import Git, GitError, parse_diff_numstat
 from .github import GitHub, GitHubError, PullRequestDetails
 
 _UNSET = object()
+DEFAULT_SYNC_CACHE_SECONDS = 300
 
 PrLookupSource = Literal["cached", "discovered"]
+SyncProgressCallback = Callable[[str], None]
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,12 @@ def _merge_status_transition_time(
     return datetime.now(UTC)
 
 
+def _emit_progress(progress: SyncProgressCallback | None, message: str) -> None:
+    """Emit a sync progress message when a callback is configured."""
+    if progress is not None:
+        progress(message)
+
+
 def build_branch_cohorts_for_task_ids(
     store: SqliteTaskStore,
     task_ids: list[str],
@@ -215,9 +224,13 @@ def build_default_branch_cohorts(
     store: SqliteTaskStore,
     *,
     recent_days: int = 30,
+    cooldown_seconds: int = DEFAULT_SYNC_CACHE_SECONDS,
 ) -> list[BranchCohort]:
     """Build the bounded default sync cohort set."""
-    return build_branch_cohorts_for_tasks(store, store.get_sync_candidates(recent_days=recent_days))
+    return build_branch_cohorts_for_tasks(
+        store,
+        store.get_sync_candidates(recent_days=recent_days, cooldown_seconds=cooldown_seconds),
+    )
 
 
 def build_unmerged_branch_cohorts(store: SqliteTaskStore) -> list[BranchCohort]:
@@ -462,6 +475,8 @@ def _persist_branch_updates(
     cohorts: list[BranchCohort],
     results: list[BranchSyncResult],
     updates: list[_BranchPersistenceUpdate],
+    *,
+    sync_completed_at: datetime | None = None,
 ) -> None:
     """Write combined branch-state updates once per error-free cohort."""
     for cohort, result, update in zip(cohorts, results, updates, strict=True):
@@ -477,6 +492,9 @@ def _persist_branch_updates(
             pr_number=update.pr_number,
             pr_state=update.pr_state,
             pr_last_synced_at=update.pr_last_synced_at,
+            sync_last_synced_at=(
+                sync_completed_at if sync_completed_at is not None else _UNSET
+            ),
         )
 
 
@@ -516,6 +534,7 @@ def sync_branch_cohorts(
     include_pr: bool,
     dry_run: bool = False,
     fetch_remote: bool = True,
+    progress: SyncProgressCallback | None = None,
 ) -> tuple[list[BranchSyncResult], bool]:
     """Reconcile branch cohorts against git and optional GitHub state."""
     partial_failure = False
@@ -523,6 +542,8 @@ def sync_branch_cohorts(
     remote_default_ref: str | None = None
     fetched_this_run = False
     fetch_error: str | None = None
+
+    _emit_progress(progress, f"Syncing {len(cohorts)} branch cohort(s)")
 
     has_origin_remote = True
     remote_exists = getattr(git, "remote_exists", None)
@@ -532,15 +553,18 @@ def sync_branch_cohorts(
             has_origin_remote = remote_present
 
     if fetch_remote and has_origin_remote:
+        _emit_progress(progress, "Fetching origin")
         try:
             git.fetch("origin")
             fetched_this_run = True
+            _emit_progress(progress, "Fetched origin")
             remote_default_candidate = f"origin/{default_branch}"
             if git.ref_exists(remote_default_candidate):
                 remote_default_ref = remote_default_candidate
         except GitError as exc:
             partial_failure = True
             fetch_error = f"git fetch origin failed: {exc}"
+            _emit_progress(progress, f"Fetch failed: {exc}")
 
     if include_git:
         results = reconcile_branch_merge_truth(
@@ -573,15 +597,19 @@ def sync_branch_cohorts(
     gh: GitHub | None = None
     gh_available = False
     if include_pr:
+        _emit_progress(progress, "Checking GitHub CLI auth")
         gh = GitHub()
         gh_available = gh.is_available()
+        _emit_progress(progress, "GitHub CLI auth OK" if gh_available else "GitHub CLI unavailable")
         if not gh_available:
             partial_failure = True
             for result in results:
                 result.errors.append("GitHub CLI (gh) is not installed or not authenticated")
 
-    if include_pr and gh_available and gh is not None:
-        for idx, (cohort, result) in enumerate(zip(cohorts, results, strict=True)):
+    total = len(cohorts)
+    for idx, (cohort, result) in enumerate(zip(cohorts, results, strict=True)):
+        _emit_progress(progress, f"[{idx + 1}/{total}] {cohort.branch}")
+        if include_pr and gh_available and gh is not None:
             if result.skipped_reason is not None:
                 continue
             pr_update = _enrich_branch_pr_state(
@@ -597,7 +625,13 @@ def sync_branch_cohorts(
             updates[idx] = _merge_persistence_update(updates[idx], pr_update)
 
     if not dry_run:
-        _persist_branch_updates(store, cohorts, results, updates)
+        _persist_branch_updates(
+            store,
+            cohorts,
+            results,
+            updates,
+            sync_completed_at=datetime.now(UTC),
+        )
 
     for result in results:
         partial_failure = partial_failure or not result.ok
@@ -674,6 +708,8 @@ def refresh_branch_diff_stats(
         results.append(result)
     skipped = sum(1 for result in results if result.skipped_reason is not None)
     return results, skipped
+
+
 def _persist_branch_state(
     store: SqliteTaskStore,
     tasks: tuple[Task, ...],
@@ -683,6 +719,7 @@ def _persist_branch_state(
     pr_number: int | None | object = _UNSET,
     pr_state: str | None | object = _UNSET,
     pr_last_synced_at: datetime | None | object = _UNSET,
+    sync_last_synced_at: datetime | None | object = _UNSET,
 ) -> None:
     """Write normalized branch-scoped sync state back to every code-bearing row."""
     for original in tasks:
@@ -713,4 +750,6 @@ def _persist_branch_state(
             task.pr_state = cast("str | None", pr_state)
         if pr_last_synced_at is not _UNSET:
             task.pr_last_synced_at = cast("datetime | None", pr_last_synced_at)
+        if sync_last_synced_at is not _UNSET:
+            task.sync_last_synced_at = cast("datetime | None", sync_last_synced_at)
         store.update(task)

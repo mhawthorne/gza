@@ -1150,7 +1150,7 @@ def test_watch_cycle_restart_failed_manual_failure_child_does_not_block_pending_
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._collect_live_running_state", return_value=(set(), set())),
+        patch("gza.cli.watch._collect_live_running_state", return_value=(set(), [], 0)),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
         result = _run_cycle(
@@ -1284,7 +1284,7 @@ def test_watch_cycle_restart_failed_out_of_scope_failure_child_does_not_block_pe
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._collect_live_running_state", return_value=(set(), set())),
+        patch("gza.cli.watch._collect_live_running_state", return_value=(set(), [], 0)),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
         result = _run_cycle(
@@ -1505,10 +1505,11 @@ def test_collect_live_running_state_counts_live_worker_pid_even_for_terminal_tas
         patch("gza.cli.watch.WorkerRegistry", return_value=registry),
         patch("gza.cli.watch._pid_alive", side_effect=lambda pid: pid == 5252),
     ):
-        live_pids, running_task_ids = _collect_live_running_state(config, store)
+        live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
 
     assert live_pids == {4242, 4343, 5252}
     assert running_task_ids == [worker_task.id, pid_only_task.id]
+    assert anonymous_worker_count == 1
 
 
 def test_collect_live_running_state_counts_pending_task_with_live_worker(tmp_path: Path) -> None:
@@ -1527,10 +1528,11 @@ def test_collect_live_running_state_counts_pending_task_with_live_worker(tmp_pat
     registry.is_running.return_value = True
 
     with patch("gza.cli.watch.WorkerRegistry", return_value=registry):
-        live_pids, running_task_ids = _collect_live_running_state(config, store)
+        live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
 
     assert live_pids == {4242}
     assert running_task_ids == [pending_task.id]
+    assert anonymous_worker_count == 0
 
 
 def test_watch_cycle_does_not_oversubscribe_batch_when_terminal_task_worker_is_still_alive(
@@ -1579,10 +1581,39 @@ def test_watch_cycle_does_not_oversubscribe_batch_when_terminal_task_worker_is_s
 def test_format_wake_message_includes_running_task_ids() -> None:
     """WAKE line should append task IDs when tasks are actively running."""
     assert _format_wake_message(running=1, pending=3, slots=0, running_task_ids=["gza-42"]) == (
-        "checking... (1 running, 3 pending, 0 slots) tasks: gza-42"
+        "checking... (1 running, 3 pending, 0 slots)\n"
+        "live workers:\n"
+        "- gza-42"
     )
     assert _format_wake_message(running=0, pending=2, slots=2, running_task_ids=[]) == (
         "checking... (0 running, 2 pending, 2 slots)"
+    )
+    assert _format_wake_message(
+        running=2,
+        pending=3,
+        slots=0,
+        running_task_ids=["gza-42"],
+        anonymous_worker_count=1,
+    ) == (
+        "checking... (2 running, 3 pending, 0 slots)\n"
+        "live workers:\n"
+        "- gza-42\n"
+        "- 1 worker without an active task id"
+    )
+
+
+def test_watch_log_aligns_multiline_messages(tmp_path: Path) -> None:
+    """Multiline events should indent continuation lines under the event prefix."""
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with patch("gza.cli.watch._format_hms", return_value="18:08:47"):
+        log.emit("WAKE", "checking...\nlive workers:\n- gza-42")
+
+    assert log_path.read_text() == (
+        "18:08:47 WAKE   checking...\n"
+        "                live workers:\n"
+        "                - gza-42\n"
     )
 
 
@@ -2045,6 +2076,37 @@ def test_isolated_watch_merge_advances_primary_main_checkout_cleanly(tmp_path: P
     assert refreshed_task.merge_status == "merged"
 
 
+def test_execute_merge_action_marks_already_merged_task_without_error(tmp_path: Path) -> None:
+    """Watch-style merge execution should reconcile stale merged branches without surfacing an error."""
+    store, git, task, _wt = setup_git_repo_with_task_branch(
+        tmp_path,
+        "Already merged task",
+        "feature/watch-already-merged-success",
+    )
+    config = Config.load(tmp_path)
+
+    assert task.id is not None
+    git._run("merge", "--no-ff", task.branch)
+    store.set_merge_status(task.id, "unmerged")
+
+    merge_result = _execute_merge_action(
+        config,
+        store,
+        git,
+        task,
+        {"type": "merge"},
+        target_branch="main",
+        current_branch="main",
+        already_merged_behavior="mark_merged",
+    )
+
+    assert merge_result.rc == 0
+    assert merge_result.status == "already_merged"
+    refreshed_task = store.get(task.id)
+    assert refreshed_task is not None
+    assert refreshed_task.merge_status == "merged"
+
+
 def test_isolated_watch_merge_promotes_real_main_before_marking_sequential_merges(tmp_path: Path) -> None:
     """Sequential isolated merges must advance the real main ref before merge_status flips."""
     store, git, task1, _wt = setup_git_repo_with_task_branch(
@@ -2479,6 +2541,58 @@ def test_watch_cycle_with_isolation_enabled_already_merged_failure_does_not_rout
     log_text = log_path.read_text()
     assert "merge conflict routed to rebase" not in log_text
     assert f"{task.id}: marked merged after shared reconciliation against main" in log_text
+
+
+def test_watch_cycle_logs_already_merged_reconciliation_as_info(tmp_path: Path) -> None:
+    """Watch should log stale merge-state reconciliation as expected info, not a merge failure."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-stale-merged"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(
+                rc=0,
+                status="already_merged",
+                created_followups=[],
+                reused_followups=[],
+            ),
+        ) as execute_merge,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    execute_merge.assert_called_once()
+    log_text = log_path.read_text()
+    assert f"INFO   {task.id} already merged into main; marked merged" in log_text
+    assert f"MERGE  {task.id} -> main" not in log_text
 
 
 def test_watch_cycle_without_isolation_preserves_default_branch_merge_guard(tmp_path: Path) -> None:

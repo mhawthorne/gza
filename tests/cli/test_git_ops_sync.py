@@ -1,7 +1,7 @@
 """Tests for the `gza sync` command."""
 
 import argparse
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock, patch
 
 from gza.cli.git_ops import cmd_sync
@@ -210,3 +210,74 @@ def test_sync_mixed_valid_and_missing_explicit_task_ids_report_accurate_totals(t
     output = capsys.readouterr().out
     assert "Task testproject-999 not found" in output
     assert "Synced 1 branch(es), skipped 0, errors 1." in output
+
+
+def test_sync_reports_live_progress_messages(tmp_path, capsys):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_branch_task(store, "Valid task", "feature/progress")
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_ids=[task.id],
+        dry_run=False,
+        git_only=True,
+        pr_only=False,
+        no_fetch=False,
+    )
+
+    def _fake_sync(*_args, **kwargs):
+        progress = kwargs["progress"]
+        progress("Fetching origin")
+        progress("[1/1] feature/progress")
+        return (
+            [
+                BranchSyncResult(
+                    branch="feature/progress",
+                    task_ids=(task.id,),
+                    merge_status="unmerged",
+                    reconciled=True,
+                )
+            ],
+            False,
+        )
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        patch("gza.cli.git_ops.Git", return_value=Mock()),
+        patch("gza.cli.git_ops.sync_branch_cohorts", side_effect=_fake_sync),
+    ):
+        rc = cmd_sync(args)
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "[sync] Fetching origin" in output
+    assert "[sync] [1/1] feature/progress" in output
+
+
+def test_sync_reports_when_default_candidates_are_cache_filtered(tmp_path, capsys):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_branch_task(store, "Cached task", "feature/cached")
+    task.completed_at = datetime.now(UTC) - timedelta(minutes=10)
+    task.sync_last_synced_at = datetime.now(UTC) - timedelta(seconds=10)
+    store.update(task)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_ids=[],
+        dry_run=False,
+        git_only=True,
+        pr_only=False,
+        no_fetch=False,
+    )
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        patch("gza.cli.git_ops.Git", return_value=Mock()),
+    ):
+        rc = cmd_sync(args)
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "default sync cache is still warm" in output
