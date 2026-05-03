@@ -97,7 +97,7 @@ Retry creates a new task that reuses the same branch (if it exists) but starts a
 
 ## Recover failed tasks with watch
 
-`gza watch --restart-failed` adds an explicit recovery phase ahead of normal pending work. It is opt-in; plain `gza watch` keeps the narrower legacy auto-resume behavior.
+`gza watch --restart-failed` adds an explicit recovery phase ahead of normal pending work. Plain `gza watch` and `gza watch --restart-failed` use the same bounded shared recovery policy; `--restart-failed` only changes queue priority.
 
 Preview the recovery plan first:
 
@@ -105,10 +105,10 @@ Preview the recovery plan first:
 $ gza watch --restart-failed --dry-run
 Failed recovery plan (tags=*, mode=restart-failed)
 
-resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/1
-retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/1
+resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/2
+retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/2
 
-Summary: 2 actionable (1 resume, 1 retry), 1 skipped hidden
+Summary: 2 actionable (1 resume, 1 retry), 0 skipped hidden
 ```
 
 Include skipped tasks when you need the full picture:
@@ -117,9 +117,9 @@ Include skipped tasks when you need the full picture:
 $ gza watch --restart-failed --dry-run --show-skipped
 Failed recovery plan (tags=*, mode=restart-failed)
 
-resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/1
-skip   gza-103 review    via none    reason=task_type_out_of_scope attempt=1/1
-retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/1
+resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/2
+skip   gza-103 improve   via none    reason=manual_failure_reason attempt=2/2
+retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/2
 
 Summary: 2 actionable (1 resume, 1 retry), 1 skipped
 ```
@@ -132,7 +132,7 @@ Then run recovery mode for real:
 $ gza watch --restart-failed
 ```
 
-`--max-resume-attempts` applies both to plain-watch auto-resume and to `--restart-failed` recovery decisions.
+`--max-resume-attempts` applies to the shared bounded automatic recovery policy used by plain watch and by `--restart-failed`. Set it to `0` to disable unattended recovery entirely.
 
 ## Check history for failed tasks
 

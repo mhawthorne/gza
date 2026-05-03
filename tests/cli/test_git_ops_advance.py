@@ -1024,10 +1024,11 @@ class TestAdvanceCommand:
         result = run_gza("advance", "--max", "1", "--auto", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Resume (failed: MAX_STEPS" in result.stdout
+        assert "Resume failed task (MAX_STEPS)" in result.stdout
+        assert f"Started iterate resume for {failed_task.id}" in result.stdout
 
         children = store.get_based_on_children(failed_task.id)
-        assert len(children) == 1
+        assert len(children) == 0
 
     def test_advance_dry_run_max_still_plans_failed_resume(self, tmp_path: Path):
         """advance --dry-run --max should still include resumable failed tasks in the plan."""
@@ -1043,7 +1044,7 @@ class TestAdvanceCommand:
         assert result.returncode == 0
         assert "Would advance" in result.stdout
         assert str(failed_task.id) in result.stdout
-        assert "Resume (failed: MAX_STEPS" in result.stdout
+        assert "Resume failed task (MAX_STEPS)" in result.stdout
 
         children = store.get_based_on_children(failed_task.id)
         assert len(children) == 0
@@ -1142,8 +1143,8 @@ class TestAdvanceCommand:
         assert rc == 0
         assert captured_force == [True]
 
-    def test_advance_force_propagates_to_resume_worker(self, tmp_path: Path):
-        """advance --force forwards force override when spawning resume workers."""
+    def test_advance_force_propagates_to_iterate_resume_worker(self, tmp_path: Path):
+        """advance --force forwards force override when spawning iterate resume recovery."""
         import argparse
 
         from gza.cli import cmd_advance
@@ -1157,10 +1158,16 @@ class TestAdvanceCommand:
         failed_task.session_id = "ses_resume_123"
         store.update(failed_task)
 
-        captured_force: list[bool] = []
+        captured_calls: list[tuple[bool, bool, bool]] = []
 
-        def fake_spawn_resume(worker_args, _config, _task_id, **_kw):
-            captured_force.append(bool(getattr(worker_args, "force", False)))
+        def fake_spawn_iterate(worker_args, _config, _task, **kwargs):
+            captured_calls.append(
+                (
+                    bool(getattr(worker_args, "force", False)),
+                    bool(kwargs.get("resume", False)),
+                    bool(kwargs.get("retry", False)),
+                )
+            )
             return 0
 
         args = argparse.Namespace(
@@ -1175,12 +1182,12 @@ class TestAdvanceCommand:
 
         with (
             patch("gza.cli.Git", return_value=self._mock_git()),
-            patch("gza.cli._spawn_background_resume_worker", side_effect=fake_spawn_resume),
+            patch("gza.cli._spawn_background_iterate_worker", side_effect=fake_spawn_iterate),
         ):
             rc = cmd_advance(args)
 
         assert rc == 0
-        assert captured_force == [True]
+        assert captured_calls == [(True, True, False)]
 
     def test_advance_create_review_spawn_failure_reports_created_task_and_worker_error(self, tmp_path: Path):
         """advance should report created review tasks separately from review worker startup failures."""
@@ -1265,7 +1272,7 @@ class TestAdvanceCommand:
         assert f"✗ Created implement task {impl_task.id}" not in output
 
     def test_advance_resume_spawn_failure_reports_created_task_and_worker_error(self, tmp_path: Path):
-        """advance should report created resume tasks separately from resume worker startup failures."""
+        """advance should report iterate resume worker startup failures for implement tasks."""
         import argparse
 
         setup_config(tmp_path)
@@ -1292,18 +1299,16 @@ class TestAdvanceCommand:
         with (
             patch("gza.cli.Git", return_value=self._mock_git()),
             patch("gza.cli.determine_next_action", return_value={"type": "resume", "description": "Resume task"}),
-            patch("gza.cli._spawn_background_resume_worker", return_value=1),
+            patch("gza.cli._spawn_background_iterate_worker", return_value=1),
             patch("sys.stdout", new_callable=io.StringIO) as stdout,
         ):
             rc = cmd_advance(args)
             output = stdout.getvalue()
 
-        resume_task = next(t for t in store.get_based_on_children(failed_task.id) if t.task_type == "implement")
-        assert resume_task.id is not None
         assert rc == 1
-        assert f"Created resume task {resume_task.id}" in output
-        assert f"Failed to start resume worker for task {resume_task.id}" in output
-        assert f"✗ Created resume task {resume_task.id}" not in output
+        assert store.get_based_on_children(failed_task.id) == []
+        assert f"Started iterate resume for {failed_task.id}" in output
+        assert f"Failed to start iterate worker for task {failed_task.id}" in output
 
     def test_advance_needs_rebase_spawn_failure_reports_created_task_and_worker_error(self, tmp_path: Path):
         """advance should report created rebase tasks separately from rebase worker startup failures."""
@@ -2763,14 +2768,10 @@ class TestAdvanceCommand:
 
         assert result.returncode == 0
         assert "Resume" in result.stdout
-        assert "Created resume task" in result.stdout
+        assert f"Started iterate resume for {failed_task.id}" in result.stdout
 
-        # Verify a resume child task was created
         children = store.get_based_on_children(failed_task.id)
-        assert len(children) == 1
-        child = children[0]
-        assert child.based_on == failed_task.id
-        assert child.session_id == failed_task.session_id
+        assert len(children) == 0
 
     def test_advance_resumes_max_turns_failed_task(self, tmp_path: Path):
         """advance creates a resume child task and spawns worker for MAX_TURNS failed task."""
@@ -2784,10 +2785,10 @@ class TestAdvanceCommand:
 
         assert result.returncode == 0
         assert "Resume" in result.stdout
+        assert f"Started iterate resume for {failed_task.id}" in result.stdout
 
         children = store.get_based_on_children(failed_task.id)
-        assert len(children) == 1
-        assert children[0].session_id == "sess-xyz"
+        assert len(children) == 0
 
     def test_advance_skips_test_failure_failed_task(self, tmp_path: Path):
         """advance does not auto-resume TEST_FAILURE failed tasks."""
@@ -2816,9 +2817,10 @@ class TestAdvanceCommand:
         first_resume = store.add("Implement feature", task_type="implement")
         first_resume.status = "failed"
         first_resume.failure_reason = "MAX_STEPS"
-        first_resume.session_id = "sess-2"
+        first_resume.session_id = original.session_id
         first_resume.based_on = original.id
         first_resume.completed_at = datetime.now(UTC)
+        first_resume.branch = original.branch
         store.update(first_resume)
 
         # max_resume_attempts=1; original is skipped (already has a child),
@@ -2826,7 +2828,7 @@ class TestAdvanceCommand:
         result = run_gza("advance", "--auto", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "max resume attempts" in result.stdout
+        assert "manual review required" in result.stdout
 
         # Original should NOT get a new resume child (it already has first_resume)
         original_children = store.get_based_on_children(original.id)
@@ -2835,8 +2837,8 @@ class TestAdvanceCommand:
         first_resume_children = store.get_based_on_children(first_resume.id)
         assert len(first_resume_children) == 0
 
-    def test_advance_default_resume_budget_is_one(self, tmp_path: Path):
-        """advance default max_resume_attempts=1 skips failed task at depth 1."""
+    def test_advance_default_policy_resumes_retry_descendant_timeout_once(self, tmp_path: Path):
+        """advance auto-resumes a timeout-style retry descendant once."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -2853,12 +2855,13 @@ class TestAdvanceCommand:
         result = run_gza("advance", "--auto", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "max resume attempts (1)" in result.stdout
+        assert "a newer failed recovery descendant must be recovered first" in result.stdout
+        assert f"Started iterate resume for {first_resume.id}" in result.stdout
         first_resume_children = store.get_based_on_children(first_resume.id)
         assert len(first_resume_children) == 0
 
-    def test_evaluate_advance_rules_returns_skip_at_max_resume_attempts(self, tmp_path: Path):
-        """Action selection keeps max resume exhaustion on the skip contract."""
+    def test_evaluate_advance_rules_resumes_retry_descendant_timeout_once(self, tmp_path: Path):
+        """Action selection auto-resumes one timeout-style retry descendant."""
         (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
         store = make_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
@@ -2876,8 +2879,8 @@ class TestAdvanceCommand:
         config = Config.load(tmp_path)
         action = evaluate_advance_rules(config, store, git, first_resume, "main")
 
-        assert action["type"] == "skip"
-        assert action["description"] == "SKIP: max resume attempts (1) reached"
+        assert action["type"] == "resume"
+        assert action["description"] == "Resume failed task (MAX_STEPS)"
 
     def test_advance_skips_failed_task_with_existing_resume_child(self, tmp_path: Path):
         """advance skips a failed task that already has a pending/in_progress child."""
@@ -2936,16 +2939,16 @@ class TestAdvanceCommand:
         child.status = "failed"
         child.failure_reason = "MAX_STEPS"
         child.session_id = "sess-abc"
+        child.branch = original.branch
         store.update(child)
 
         result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        # The original should NOT appear in the plan — only the child should
-        # (and the child should be skipped due to max resume attempts)
-        assert f"{original.id}" not in result.stdout
-        assert "SKIP: max resume attempts" in result.stdout
-        assert "No eligible tasks to advance" in result.stdout
+        assert f"{original.id}" in result.stdout
+        assert f"{child.id}" in result.stdout
+        assert "a newer failed recovery descendant must be recovered first" in result.stdout
+        assert "automatic recovery stops here; manual review required" in result.stdout
 
     def test_advance_no_resume_failed_flag_skips(self, tmp_path: Path):
         """advance --no-resume-failed excludes failed tasks from processing."""
@@ -2990,9 +2993,10 @@ class TestAdvanceCommand:
 
         assert result.returncode == 0
         assert "Resume" in result.stdout
+        assert f"Started iterate resume for {failed_task.id}" in result.stdout
 
         children = store.get_based_on_children(failed_task.id)
-        assert len(children) == 1
+        assert len(children) == 0
 
     def test_advance_specific_failed_task_id_test_failure_is_not_resumable(self, tmp_path: Path):
         """advance rejects TEST_FAILURE tasks for explicit failed task IDs."""
@@ -3005,7 +3009,10 @@ class TestAdvanceCommand:
         result = run_gza("advance", str(failed_task.id), "--auto", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert f"Error: Task {failed_task.id} is not completed (status: failed)" in result.stdout
+        assert (
+            f"Error: Task {failed_task.id} is not automatically recoverable: "
+            "TEST_FAILURE requires manual intervention"
+        ) in result.stdout
 
         children = store.get_based_on_children(failed_task.id)
         assert len(children) == 0
@@ -3049,9 +3056,10 @@ class TestAdvanceCommand:
         # Original should NOT get a new child (already has first_resume)
         original_children = store.get_based_on_children(original.id)
         assert len(original_children) == 1  # only the pre-existing first_resume
-        # first_resume should get a new resume child (depth=1 < max=2)
+        assert f"Started iterate resume for {first_resume.id}" in result.stdout
+        # iterate-managed resumes do not pre-create the child in advance
         first_resume_children = store.get_based_on_children(first_resume.id)
-        assert len(first_resume_children) == 1
+        assert len(first_resume_children) == 0
 
     def test_advance_prefers_in_progress_review_over_pending_sibling(self, tmp_path: Path):
         setup_config(tmp_path)

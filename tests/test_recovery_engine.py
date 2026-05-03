@@ -35,10 +35,11 @@ def test_recovery_engine_infra_failure_chooses_retry(tmp_path: Path) -> None:
     assert decision.launch_mode == "worker"
 
 
-def test_recovery_engine_resumable_without_session_chooses_retry(tmp_path: Path) -> None:
+def test_recovery_engine_timeout_without_session_requires_manual_review(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="MAX_STEPS", session_id=None)
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
-    assert decision.action == "retry"
+    assert decision.action == "skip"
+    assert decision.reason_code == "manual_review_required"
 
 
 def test_recovery_engine_manual_reason_skips(tmp_path: Path) -> None:
@@ -48,11 +49,11 @@ def test_recovery_engine_manual_reason_skips(tmp_path: Path) -> None:
     assert decision.reason_code == "manual_failure_reason"
 
 
-def test_recovery_engine_scope_exclusions_skip(tmp_path: Path) -> None:
+def test_recovery_engine_review_timeout_chooses_resume(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, task_type="review", reason="MAX_TURNS")
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
-    assert decision.action == "skip"
-    assert decision.reason_code == "task_type_out_of_scope"
+    assert decision.action == "resume"
+    assert decision.launch_mode == "worker"
 
 
 def test_recovery_engine_existing_children_skip(tmp_path: Path) -> None:
@@ -70,10 +71,12 @@ def test_recovery_engine_existing_children_skip(tmp_path: Path) -> None:
 
 def test_recovery_engine_existing_pending_resume_child_reuses_resume_semantics(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="MAX_TURNS", session_id="sess-1")
-    child = store.add("Resume child", task_type=task.task_type, based_on=task.id)
+    child = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)
     assert child.id is not None
     child.status = "pending"
     child.session_id = task.session_id
+    child.spec = task.spec
+    child.branch = task.branch
     store.update(child)
 
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
@@ -152,7 +155,8 @@ def test_recovery_engine_only_terminal_failed_node_remains_actionable(tmp_path: 
     assert root_decision.reason_code == "recovery_has_newer_failed_descendant"
 
     child_decision = decide_failed_task_recovery(store, retry_child, max_recovery_attempts=3)
-    assert child_decision.action == "retry"
+    assert child_decision.action == "skip"
+    assert child_decision.reason_code == "manual_review_required"
 
 
 def test_recovery_engine_blocked_failed_task_with_pending_child_skips_until_dependency_ready(
@@ -174,7 +178,10 @@ def test_recovery_engine_blocked_failed_task_with_pending_child_skips_until_depe
     child = store.add("Pending recovery child", task_type=failed.task_type, based_on=failed.id, depends_on=dependency.id)
     assert child.id is not None
     child.status = "pending"
+    child.prompt = failed.prompt
     child.session_id = failed.session_id
+    child.spec = failed.spec
+    child.branch = failed.branch
     store.update(child)
 
     blocked_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
@@ -247,7 +254,98 @@ def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:
 
     decision = decide_failed_task_recovery(store, attempt, max_recovery_attempts=1)
     assert decision.action == "skip"
-    assert decision.reason_code == "attempt_cap_reached"
+    assert decision.reason_code == "manual_review_required"
+
+
+def test_recovery_engine_resume_child_failure_stops(tmp_path: Path) -> None:
+    store, root = _failed_task(tmp_path, reason="MAX_TURNS", session_id="sess-1")
+    child = store.add(root.prompt, task_type=root.task_type, based_on=root.id, depends_on=root.depends_on)
+    assert child.id is not None
+    child.status = "failed"
+    child.failure_reason = "INFRASTRUCTURE_ERROR"
+    child.session_id = root.session_id
+    child.spec = root.spec
+    child.branch = root.branch
+    child.completed_at = datetime.now(UTC)
+    store.update(child)
+
+    decision = decide_failed_task_recovery(store, child, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "manual_review_required"
+
+
+def test_recovery_engine_retry_child_timeout_gets_one_resume(tmp_path: Path) -> None:
+    store, root = _failed_task(tmp_path, task_type="plan", reason="INFRASTRUCTURE_ERROR", session_id=None)
+    retry_child = store.add(root.prompt, task_type=root.task_type, based_on=root.id, depends_on=root.depends_on)
+    assert retry_child.id is not None
+    retry_child.status = "failed"
+    retry_child.failure_reason = "MAX_TURNS"
+    retry_child.session_id = "sess-retry"
+    retry_child.completed_at = datetime.now(UTC)
+    store.update(retry_child)
+
+    decision = decide_failed_task_recovery(store, retry_child, max_recovery_attempts=1)
+    assert decision.action == "resume"
+    assert decision.launch_mode == "worker"
+
+
+def test_recovery_engine_retry_resume_child_failure_stops(tmp_path: Path) -> None:
+    store, root = _failed_task(tmp_path, task_type="plan", reason="INFRASTRUCTURE_ERROR", session_id=None)
+    retry_child = store.add(root.prompt, task_type=root.task_type, based_on=root.id, depends_on=root.depends_on)
+    assert retry_child.id is not None
+    retry_child.status = "failed"
+    retry_child.failure_reason = "MAX_TURNS"
+    retry_child.session_id = "sess-retry"
+    retry_child.completed_at = datetime.now(UTC)
+    store.update(retry_child)
+
+    resumed_retry = store.add(
+        retry_child.prompt,
+        task_type=retry_child.task_type,
+        based_on=retry_child.id,
+        depends_on=retry_child.depends_on,
+    )
+    assert resumed_retry.id is not None
+    resumed_retry.status = "failed"
+    resumed_retry.failure_reason = "TIMEOUT"
+    resumed_retry.session_id = retry_child.session_id
+    resumed_retry.spec = retry_child.spec
+    resumed_retry.branch = retry_child.branch
+    resumed_retry.completed_at = datetime.now(UTC)
+    store.update(resumed_retry)
+
+    decision = decide_failed_task_recovery(store, resumed_retry, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "manual_review_required"
+
+
+def test_recovery_engine_counts_only_based_on_chain_not_dependency_ancestry(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    upstream = store.add("Upstream plan", task_type="plan")
+    assert upstream.id is not None
+    upstream.status = "completed"
+    upstream.completed_at = datetime.now(UTC)
+    store.update(upstream)
+
+    upstream_retry = store.add(upstream.prompt, task_type="plan", based_on=upstream.id)
+    assert upstream_retry.id is not None
+    upstream_retry.status = "failed"
+    upstream_retry.failure_reason = "MAX_TURNS"
+    upstream_retry.session_id = "sess-upstream"
+    upstream_retry.completed_at = datetime.now(UTC)
+    store.update(upstream_retry)
+
+    downstream = store.add("Downstream plan", task_type="plan", depends_on=upstream.id)
+    assert downstream.id is not None
+    downstream.status = "failed"
+    downstream.failure_reason = "INFRASTRUCTURE_ERROR"
+    downstream.completed_at = datetime.now(UTC)
+    store.update(downstream)
+
+    decision = decide_failed_task_recovery(store, downstream, max_recovery_attempts=1)
+    assert decision.action == "retry"
 
 
 def test_list_failed_tasks_for_recovery_sorts_oldest_created_first(

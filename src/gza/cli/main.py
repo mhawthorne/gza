@@ -688,7 +688,7 @@ def main() -> int:
         "--restart-failed",
         action="store_true",
         dest="restart_failed",
-        help="Enable failed-task recovery mode (resume/retry failed tasks before pending queue work)",
+        help="Drain failed-task recovery before pending queue work using the shared bounded recovery policy",
     )
     watch_parser.add_argument(
         "--restart-failed-batch",
@@ -702,7 +702,7 @@ def main() -> int:
         type=int,
         metavar="N",
         dest="max_resume_attempts",
-        help="Override max_resume_attempts for watch auto-resume and --restart-failed recovery decisions",
+        help="Override max_resume_attempts for shared automatic recovery decisions in watch",
     )
     watch_parser.add_argument(
         "--dry-run",

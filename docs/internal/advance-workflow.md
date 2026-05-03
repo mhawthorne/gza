@@ -271,7 +271,7 @@ Advanced: 1 merged, 1 review started, 1 skipped
 
 When `main_checkout_isolate: true`, `gza watch` still plans against the repo default branch but executes merge attempts inside a dedicated detached integration checkout reset to the default-branch tip (`config.main_checkout_integration_path`). Successful isolated merges are then promoted onto the real default-branch ref before `merge_status` flips to `merged`; if the default branch is attached in another checkout, watch hard-resets that checkout to the new tip so it stays clean. Rebase/conflict-resolution ownership is unchanged: conflicts create rebase tasks on the task branch, and those tasks run through the normal rebase workflow.
 
-Default `gza watch` preserves the narrow legacy auto-resume path for resumable failed tasks. The broader failed-task recovery queue is opt-in via `gza watch --restart-failed`.
+Default `gza watch` uses the same bounded shared recovery policy as the explicit failed-task recovery queue. `gza watch --restart-failed` is opt-in only for recovery-first queue ordering.
 
 When `--restart-failed` is enabled:
 
@@ -279,4 +279,4 @@ When `--restart-failed` is enabled:
 - Recovery work is recovery-first: actionable failed tasks drain before pending queue pickup, and newly failed actionable tasks continue to outrank pending work for that session
 - Implement recovery launches through iterate-aware execution; non-implement recovery launches through plain worker execution
 - `gza watch --restart-failed --dry-run` prints the failed-task recovery decision report and exits
-- `--max-resume-attempts` applies to all unattended watch-managed resume/retry decisions for that run, including plain-watch auto-resume, failed-task recovery, and advance-driven improve recovery
+- `--max-resume-attempts` applies to all unattended watch-managed resume/retry decisions for that run, including plain watch, failed-task recovery, and advance-driven improve recovery

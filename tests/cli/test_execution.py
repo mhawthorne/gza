@@ -7071,10 +7071,10 @@ class TestIterateCommand:
         )
         assert "Iterate waiting: review_in_progress. Existing task is already in progress." in output
 
-    def test_changes_requested_with_failed_improve_retries_instead_of_blocking(
+    def test_changes_requested_with_retry_eligible_failed_improve_retries_instead_of_blocking(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
-        """When a failed improve exists, iterate creates a retry and runs it."""
+        """When a retry-eligible failed improve exists, iterate creates a retry and runs it."""
         from unittest.mock import MagicMock, patch
 
         from gza.cli.advance_engine import determine_next_action
@@ -7090,6 +7090,7 @@ class TestIterateCommand:
         store.update(review)
         failed_improve = store.add("Failed improve", task_type="improve", based_on=impl.id, depends_on=review.id)
         failed_improve.status = "failed"
+        failed_improve.failure_reason = "INFRASTRUCTURE_ERROR"
         store.update(failed_improve)
 
         mock_git = MagicMock()
@@ -7115,10 +7116,16 @@ class TestIterateCommand:
         # should detect the failed improve and recommend a retry
         assert action["type"] == "improve"
         from gza.cli._common import resolve_improve_action
-        improve_action, target = resolve_improve_action(store, impl.id, review.id)
+        improve_action, target, decision = resolve_improve_action(
+            store,
+            impl.id,
+            review.id,
+            max_resume_attempts=1,
+        )
         assert improve_action == "retry"
         assert target is not None
         assert target.id == failed_improve.id
+        assert decision is not None
 
     def test_resolve_improve_action_finds_chained_retry_improves(self, tmp_path: Path):
         """get_improve_tasks_for must find retries whose based_on points at a previous improve."""
@@ -7147,13 +7154,14 @@ class TestIterateCommand:
         store.update(retry)
 
         # With max_resume_attempts=3 (headroom), resume should win and target the latest.
-        action, target = resolve_improve_action(store, impl.id, review.id, max_resume_attempts=3)
+        action, target, decision = resolve_improve_action(store, impl.id, review.id, max_resume_attempts=3)
         assert action == "resume"
         assert target is not None
         assert target.id == retry.id
+        assert decision is not None
 
-    def test_resolve_improve_action_give_up_when_cap_exceeded(self, tmp_path: Path):
-        """After one resume already failed, max_resume_attempts=1 triggers give_up."""
+    def test_resolve_improve_action_stops_after_resume_descendant_failure(self, tmp_path: Path):
+        """A failed resume descendant stops automatic recovery and requires manual review."""
         from gza.cli._common import resolve_improve_action
 
         setup_config(tmp_path)
@@ -7169,17 +7177,18 @@ class TestIterateCommand:
         first.failure_reason = "TIMEOUT"
         first.session_id = "s1"
         store.update(first)
-        second = store.add("Improve 2", task_type="improve", based_on=first.id, depends_on=review.id)
+        second = store.add(first.prompt, task_type="improve", based_on=first.id, depends_on=review.id)
         second.status = "failed"
-        second.failure_reason = "TIMEOUT"
-        second.session_id = "s2"
+        second.failure_reason = "INFRASTRUCTURE_ERROR"
+        second.session_id = first.session_id
         store.update(second)
 
-        # Two failed attempts: 1 original + 1 resume → cap=1 is met, give up.
-        action, target = resolve_improve_action(store, impl.id, review.id, max_resume_attempts=1)
-        assert action == "give_up"
+        action, target, decision = resolve_improve_action(store, impl.id, review.id, max_resume_attempts=1)
+        assert action == "manual_review"
         assert target is not None
         assert target.id == second.id
+        assert decision is not None
+        assert decision.reason_code == "manual_review_required"
 
     def test_resolve_improve_action_still_resumes_within_cap(self, tmp_path: Path):
         """One failed attempt with max_resume_attempts=1 still resumes (cap not yet exceeded)."""
@@ -7199,10 +7208,11 @@ class TestIterateCommand:
         first.session_id = "s1"
         store.update(first)
 
-        action, target = resolve_improve_action(store, impl.id, review.id, max_resume_attempts=1)
+        action, target, decision = resolve_improve_action(store, impl.id, review.id, max_resume_attempts=1)
         assert action == "resume"
         assert target is not None
         assert target.id == first.id
+        assert decision is not None
 
     def test_changes_requested_with_dropped_improve_blocks_and_does_not_run_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

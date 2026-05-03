@@ -21,11 +21,11 @@ def _mark_completed(task: DbTask, *, branch: str | None = None) -> None:
 
 
 @pytest.mark.parametrize(
-    ("failure_reason", "session_id", "expected_mode"),
+    ("failure_reason", "session_id", "expected_mode", "expected_status"),
     [
-        (None, None, "new"),
-        ("MAX_STEPS", "sess-1", "resume"),
-        ("TEST_FAILURE", None, "retry"),
+        (None, None, "new", "dry_run"),
+        ("MAX_STEPS", "sess-1", "resume", "dry_run"),
+        ("TEST_FAILURE", None, "manual_review", "skip"),
     ],
 )
 def test_improve_dry_run_modes_do_not_mutate_db(
@@ -33,6 +33,7 @@ def test_improve_dry_run_modes_do_not_mutate_db(
     failure_reason: str | None,
     session_id: str | None,
     expected_mode: str,
+    expected_status: str,
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -85,14 +86,17 @@ def test_improve_dry_run_modes_do_not_mutate_db(
         context=context,
     )
 
-    assert result.status == "dry_run"
+    assert result.status == expected_status
     assert result.improve_mode == expected_mode
-    assert result.worker_consuming is True
-    assert result.work_done is True
+    if expected_status == "dry_run":
+        assert result.worker_consuming is True
+        assert result.work_done is True
+    else:
+        assert result.attention_type == "manual_review_required"
     assert len(store.get_all()) == before_count
 
 
-def test_improve_give_up_returns_skip_without_mutation(tmp_path: Path) -> None:
+def test_improve_manual_review_returns_skip_without_mutation(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -107,22 +111,33 @@ def test_improve_give_up_returns_skip_without_mutation(tmp_path: Path) -> None:
     _mark_completed(review)
     store.update(review)
 
-    prev_id = impl.id
-    for idx in range(2):
-        improve = store.add(
-            f"Improve {idx}",
-            task_type="improve",
-            depends_on=review.id,
-            based_on=prev_id,
-            same_branch=True,
-        )
-        assert improve.id is not None
-        improve.status = "failed"
-        improve.failure_reason = "MAX_STEPS"
-        improve.session_id = f"sess-{idx}"
-        improve.completed_at = datetime.now(UTC)
-        store.update(improve)
-        prev_id = improve.id
+    first = store.add(
+        "Improve 0",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert first.id is not None
+    first.status = "failed"
+    first.failure_reason = "MAX_STEPS"
+    first.session_id = "sess-0"
+    first.completed_at = datetime.now(UTC)
+    store.update(first)
+
+    second = store.add(
+        first.prompt,
+        task_type="improve",
+        depends_on=review.id,
+        based_on=first.id,
+        same_branch=True,
+    )
+    assert second.id is not None
+    second.status = "failed"
+    second.failure_reason = "INFRASTRUCTURE_ERROR"
+    second.session_id = first.session_id
+    second.completed_at = datetime.now(UTC)
+    store.update(second)
 
     before_count = len(store.get_all())
     context = AdvanceActionExecutionContext(
@@ -147,8 +162,8 @@ def test_improve_give_up_returns_skip_without_mutation(tmp_path: Path) -> None:
     )
 
     assert result.status == "skip"
-    assert result.attention_type == "max_improve_attempts"
-    assert "max improve attempts" in result.message
+    assert result.attention_type == "manual_review_required"
+    assert "requires manual review" in result.message
     assert len(store.get_all()) == before_count
 
 

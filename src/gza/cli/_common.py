@@ -39,7 +39,7 @@ from ..db import (
 )
 from ..failure_policy import is_resumable_failure_reason
 from ..prompts import PromptBuilder
-from ..resume_policy import is_resumable_failure
+from ..recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
     create_or_reuse_followup_task,
@@ -1288,56 +1288,50 @@ def resolve_improve_action(
     impl_task_id: str,
     review_task_id: str,
     max_resume_attempts: int | None = None,
-) -> tuple[str, DbTask | None]:
+) -> tuple[str, DbTask | None, FailedRecoveryDecision | None]:
     """Determine the right improve action for an impl+review pair.
 
     Returns:
-        ("new", None) — no existing improve, create fresh
-        ("resume", failed_task) — resumable failed improve exists
-        ("retry", failed_task) — non-resumable failed improve exists
-        ("give_up", failed_task) — retry/resume cap exceeded; stop and surface failure
-
-    The cap counts failed attempts for this (impl, review) pair. When the number
-    of prior failed attempts reaches ``max_resume_attempts``, further resume/retry
-    is suppressed to prevent unbounded loops (e.g. a stale branch that keeps
-    timing out on the same slow test).
+        ("new", None, None) — no existing improve, create fresh
+        ("resume", failed_task, decision) — shared policy chose resume
+        ("retry", failed_task, decision) — shared policy chose retry
+        ("give_up", failed_task, decision) — automatic recovery disabled
+        ("manual_review", failed_task, decision) — latest failure requires human review
     """
-    from ..resume_policy import is_resumable_failed_task
-
     existing = store.get_improve_tasks_for(impl_task_id, review_task_id)
     failed_improves = [t for t in existing if t.status == "failed"]
     if not failed_improves:
-        return ("new", None)
+        return ("new", None, None)
 
     latest_failed = max(failed_improves, key=lambda t: t.created_at or datetime.min)
-
-    # Count of resume/retry attempts so far = failures beyond the original one.
-    # If this already meets or exceeds the cap, don't spawn another attempt.
-    if max_resume_attempts is not None and (len(failed_improves) - 1) >= max_resume_attempts:
-        return ("give_up", latest_failed)
-
-    if is_resumable_failed_task(latest_failed):
-        return ("resume", latest_failed)
-    return ("retry", latest_failed)
+    decision = decide_failed_task_recovery(
+        store,
+        latest_failed,
+        max_recovery_attempts=0 if max_resume_attempts is None else max_resume_attempts,
+    )
+    if decision.action in {"resume", "retry"}:
+        return (decision.action, latest_failed, decision)
+    if decision.reason_code == "automatic_recovery_disabled":
+        return ("give_up", latest_failed, decision)
+    return ("manual_review", latest_failed, decision)
 
 
 def resolve_comments_improve_action(
     store: SqliteTaskStore,
     impl_task_id: str,
     max_resume_attempts: int | None = None,
-) -> tuple[str, DbTask | None]:
+) -> tuple[str, DbTask | None, FailedRecoveryDecision | None]:
     """Determine improve action for comments-only (no-review) improve flows.
 
     Returns:
-        ("new", None) — create a fresh comments-only improve
-        ("reuse_pending", pending_task) — reuse existing pending comments-only improve
-        ("wait_in_progress", in_progress_task) — existing in-progress comments-only improve is still running
-        ("resume", failed_task) — resumable failed comments-only improve exists
-        ("retry", failed_task) — non-resumable failed comments-only improve exists
-        ("give_up", failed_task) — retry/resume cap exceeded
+        ("new", None, None) — create a fresh comments-only improve
+        ("reuse_pending", pending_task, None) — reuse existing pending comments-only improve
+        ("wait_in_progress", in_progress_task, None) — existing in-progress comments-only improve is still running
+        ("resume", failed_task, decision) — shared policy chose resume
+        ("retry", failed_task, decision) — shared policy chose retry
+        ("give_up", failed_task, decision) — automatic recovery disabled
+        ("manual_review", failed_task, decision) — latest failure requires human review
     """
-    from ..resume_policy import is_resumable_failed_task
-
     def _normalize_time(value: datetime | None) -> datetime:
         if value is None:
             return datetime.min
@@ -1368,36 +1362,40 @@ def resolve_comments_improve_action(
         if task.depends_on is None
     ]
     if not existing:
-        return ("new", None)
+        return ("new", None, None)
 
     in_progress = [
         task for task in existing
         if task.status == "in_progress" and _candidate_is_fresh(task)
     ]
     if in_progress:
-        return ("wait_in_progress", max(in_progress, key=_time_key))
+        return ("wait_in_progress", max(in_progress, key=_time_key), None)
 
     pending = [
         task for task in existing
         if task.status == "pending" and _candidate_is_fresh(task)
     ]
     if pending:
-        return ("reuse_pending", max(pending, key=_time_key))
+        return ("reuse_pending", max(pending, key=_time_key), None)
 
     failed = [
         task for task in existing
         if task.status == "failed" and _candidate_is_fresh(task)
     ]
     if not failed:
-        return ("new", None)
+        return ("new", None, None)
 
     latest_failed = max(failed, key=_time_key)
-    if max_resume_attempts is not None and (len(failed) - 1) >= max_resume_attempts:
-        return ("give_up", latest_failed)
-
-    if is_resumable_failed_task(latest_failed):
-        return ("resume", latest_failed)
-    return ("retry", latest_failed)
+    decision = decide_failed_task_recovery(
+        store,
+        latest_failed,
+        max_recovery_attempts=0 if max_resume_attempts is None else max_resume_attempts,
+    )
+    if decision.action in {"resume", "retry"}:
+        return (decision.action, latest_failed, decision)
+    if decision.reason_code == "automatic_recovery_disabled":
+        return ("give_up", latest_failed, decision)
+    return ("manual_review", latest_failed, decision)
 
 
 def _create_improve_task(
@@ -1655,16 +1653,16 @@ def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
     )
 
 
-def run_with_resume(
+def run_with_recovery(
     config: Config,
     store: SqliteTaskStore,
     task: DbTask,
     *,
     run_task: Callable[[DbTask, bool], int],
     max_resume_attempts: int | None = None,
-    on_resume: Callable[[DbTask, DbTask, int, int], None] | None = None,
+    on_recovery: Callable[[DbTask, DbTask, FailedRecoveryDecision], None] | None = None,
 ) -> tuple[DbTask, int]:
-    """Execute a task and auto-resume eligible failed tasks.
+    """Execute a task and apply the shared automatic recovery policy.
 
     Args:
         config: Loaded project configuration.
@@ -1673,10 +1671,10 @@ def run_with_resume(
         run_task: Callback that executes a task and returns exit code.
             Signature: ``run_task(task, resume)`` where ``resume`` indicates
             whether this invocation is resuming an existing session.
-        max_resume_attempts: Maximum number of resume retries after the
-            initial run. Defaults to ``config.max_resume_attempts``.
-        on_resume: Optional callback invoked when a resume child is created.
-            Signature: ``on_resume(failed_task, resume_task, attempt, max_attempts)``.
+        max_resume_attempts: Recovery-policy override. ``0`` disables automatic
+            recovery. Any positive value enables the bounded shared policy.
+        on_recovery: Optional callback invoked when a recovery child is created.
+            Signature: ``on_recovery(failed_task, recovery_task, decision)``.
 
     Returns:
         Tuple of ``(final_task, exit_code)``.
@@ -1685,13 +1683,10 @@ def run_with_resume(
         return raw_rc if raw_rc != 0 else 1
 
     effective_limit = config.max_resume_attempts if max_resume_attempts is None else max_resume_attempts
-    if not isinstance(effective_limit, int):
-        effective_limit = 0
-    if effective_limit < 0:
+    if not isinstance(effective_limit, int) or effective_limit < 0:
         effective_limit = 0
 
     current_task = task
-    resume_attempt = 0
     resume_mode = False
 
     while True:
@@ -1707,23 +1702,70 @@ def run_with_resume(
         if refreshed.status != "failed":
             return refreshed, 0
 
-        resumable_failure = is_resumable_failure(
-            status=refreshed.status,
-            failure_reason=refreshed.failure_reason,
-            session_id=refreshed.session_id,
+        decision = decide_failed_task_recovery(
+            store,
+            refreshed,
+            max_recovery_attempts=effective_limit,
         )
-        if not resumable_failure:
+        if decision.action == "skip":
             return refreshed, _failure_exit_code(rc)
 
-        if resume_attempt >= effective_limit:
-            return refreshed, _failure_exit_code(rc)
+        if decision.action == "resume":
+            if decision.reuse_existing and decision.recovery_task_id is not None:
+                resume_task = store.get(decision.recovery_task_id)
+                assert resume_task is not None
+            else:
+                resume_task = _create_resume_task(store, refreshed)
+            if on_recovery is not None:
+                on_recovery(refreshed, resume_task, decision)
+            current_task = resume_task
+            resume_mode = True
+            continue
 
-        resume_attempt += 1
-        resume_task = _create_resume_task(store, refreshed)
-        if on_resume is not None:
-            on_resume(refreshed, resume_task, resume_attempt, effective_limit)
-        current_task = resume_task
-        resume_mode = True
+        if decision.reuse_existing and decision.recovery_task_id is not None:
+            retry_task = store.get(decision.recovery_task_id)
+            assert retry_task is not None
+        else:
+            retry_task = _create_retry_task(store, refreshed)
+        if on_recovery is not None:
+            on_recovery(refreshed, retry_task, decision)
+        current_task = retry_task
+        resume_mode = False
+
+
+def run_with_resume(
+    config: Config,
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    run_task: Callable[[DbTask, bool], int],
+    max_resume_attempts: int | None = None,
+    on_resume: Callable[[DbTask, DbTask, int, int], None] | None = None,
+) -> tuple[DbTask, int]:
+    """Backward-compatible wrapper for callers/tests using the older helper name."""
+
+    def _on_recovery(
+        failed_task: DbTask,
+        recovery_task: DbTask,
+        decision: FailedRecoveryDecision,
+    ) -> None:
+        if decision.action != "resume" or on_resume is None:
+            return
+        on_resume(
+            failed_task,
+            recovery_task,
+            decision.attempt_index,
+            decision.attempt_limit,
+        )
+
+    return run_with_recovery(
+        config,
+        store,
+        task,
+        run_task=run_task,
+        max_resume_attempts=max_resume_attempts,
+        on_recovery=_on_recovery if on_resume is not None else None,
+    )
 
 
 def _resolve_task_log_path(config: Config, task: DbTask) -> Path | None:

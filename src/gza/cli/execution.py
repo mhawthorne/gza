@@ -65,7 +65,7 @@ from ._common import (
     resolve_comments_improve_action,
     resolve_id,
     resolve_improve_action,
-    run_with_resume,
+    run_with_recovery,
     set_task_urgency,
 )
 from .advance_engine import determine_next_action
@@ -1439,7 +1439,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
         return task
 
     if review_task is None:
-        comments_action, existing_comments_improve = resolve_comments_improve_action(
+        comments_action, existing_comments_improve, comments_decision = resolve_comments_improve_action(
             store,
             impl_task.id,
             max_resume_attempts=config.max_resume_attempts,
@@ -1460,6 +1460,14 @@ def cmd_improve(args: argparse.Namespace) -> int:
             print(
                 f"Error: Comments-only improve retries exceeded max_resume_attempts "
                 f"({config.max_resume_attempts}); latest failure: {existing_comments_improve.id}"
+            )
+            return 1
+        elif comments_action == "manual_review":
+            assert existing_comments_improve is not None and existing_comments_improve.id is not None
+            assert comments_decision is not None
+            print(
+                f"Error: Latest comments-only improve failure {existing_comments_improve.id} "
+                f"requires manual review ({comments_decision.reason_text})"
             )
             return 1
         elif comments_action == "resume":
@@ -1807,7 +1815,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             dry_run=dry_run,
         )
 
-    def _run_task_with_resume(task_to_run: DbTask, *, initial_resume: bool = False) -> tuple[DbTask, int]:
+    def _run_task_with_recovery(task_to_run: DbTask, *, initial_resume: bool = False) -> tuple[DbTask, int]:
         def _run_one(t: DbTask, resume_flag: bool) -> int:
             assert t.id is not None
             force = getattr(args, "force", False)
@@ -1826,21 +1834,20 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 invocation=_foreground_command_invocation("iterate"),
             )
 
-        def _on_resume(
+        def _on_recovery(
             failed_task: DbTask,
-            resume_task: DbTask,
-            attempt: int,
-            max_attempts: int,
+            recovery_task: DbTask,
+            decision: Any,
         ) -> None:
             assert failed_task.id is not None
-            assert resume_task.id is not None
+            assert recovery_task.id is not None
             reason = failed_task.failure_reason or "UNKNOWN"
             print(
-                f"  Auto-resume: {failed_task.id} failed with {reason}; "
-                f"created {resume_task.id} (attempt {attempt}/{max_attempts})."
+                f"  Auto-{decision.action}: {failed_task.id} failed with {reason}; "
+                f"created {recovery_task.id} (attempt {decision.attempt_index}/{decision.attempt_limit})."
             )
 
-        return run_with_resume(
+        return run_with_recovery(
             config,
             store,
             task_to_run,
@@ -1849,7 +1856,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 getattr(config, "max_resume_attempts", None),
                 DEFAULT_MAX_RESUME_ATTEMPTS,
             ),
-            on_resume=_on_resume,
+            on_recovery=_on_recovery,
         )
 
     # If the task is pending, run it first before entering the loop.
@@ -1859,7 +1866,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             return 0
 
         print(f"Running pending implementation {impl_task.id}...")
-        impl_task, rc = _run_task_with_resume(impl_task)
+        impl_task, rc = _run_task_with_recovery(impl_task)
         if rc != 0:
             print(f"Implementation {impl_task.id} failed (exit code {rc})")
             return 1
@@ -1877,7 +1884,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             run_start_task = _matching_pending_resume_child(impl_task) or _create_resume_task(store, impl_task)
             assert run_start_task.id is not None
             print(f"Resuming failed implementation {impl_task.id} as {run_start_task.id}...")
-            impl_task, rc = _run_task_with_resume(run_start_task, initial_resume=True)
+            impl_task, rc = _run_task_with_recovery(run_start_task, initial_resume=True)
         else:
             # --retry
             if dry_run:
@@ -1886,7 +1893,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             run_start_task = _create_retry_task(store, impl_task)
             assert run_start_task.id is not None
             print(f"Retrying failed implementation {impl_task.id} as {run_start_task.id}...")
-            impl_task, rc = _run_task_with_resume(run_start_task)
+            impl_task, rc = _run_task_with_recovery(run_start_task)
 
         if rc != 0:
             action_label = "Resume" if use_resume else "Retry"
@@ -2263,7 +2270,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             assert review_task.id is not None
 
             # Use shared logic to decide resume/retry/new for this impl+review pair
-            improve_action, failed_improve = resolve_improve_action(
+            improve_action, failed_improve, improve_decision = resolve_improve_action(
                 store, impl_task.id, review_task.id, max_resume_attempts=max_resume_attempts
             )
             if improve_action == "give_up" and failed_improve is not None:
@@ -2274,6 +2281,31 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 )
                 final_status = "blocked"
                 final_stop_reason = "max_improve_attempts"
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type="improve",
+                    task=failed_improve,
+                    status="failed",
+                )
+                break
+            if improve_action == "manual_review" and failed_improve is not None:
+                assert failed_improve.id is not None
+                assert improve_decision is not None
+                print(
+                    f"  Latest failed improve {failed_improve.id} requires manual review "
+                    f"({improve_decision.reason_text})"
+                )
+                final_status = "blocked"
+                final_stop_reason = "manual_review_required"
+                if review_row_task is not None:
+                    _append_summary_row(
+                        summary_rows,
+                        iteration_index=iteration,
+                        task_type="review",
+                        task=review_row_task,
+                        verdict=review_row_verdict,
+                    )
                 _append_summary_row(
                     summary_rows,
                     iteration_index=iteration,
@@ -2355,7 +2387,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             )
 
         assert action_task is not None
-        action_task, rc = _run_task_with_resume(action_task, initial_resume=initial_resume)
+        action_task, rc = _run_task_with_recovery(action_task, initial_resume=initial_resume)
         if rc != 0:
             final_status = "blocked"
             final_stop_reason = f"{action_type}_failed"
