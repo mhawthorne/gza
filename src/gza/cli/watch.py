@@ -986,9 +986,26 @@ def _run_cycle(
                     dedupe_key=f"recovery-skip:{failed.id}:{decision.reason_code}",
                 )
             continue
+        if decision.recovery_task_id is not None:
+            pending_recovery_task_ids.add(decision.recovery_task_id)
         actionable_failed.append((failed, decision))
 
-    recovery_slots = max(0, min(slots, restart_failed_batch if restart_failed else slots))
+    pending_tasks = _pending_runnable_tasks(store, tags=tags, any_tag=any_tag)
+    pending_candidates = [
+        task
+        for task in pending_tasks
+        if task.id is not None
+        and str(task.id) not in started_task_ids
+        and str(task.id) not in pending_recovery_task_ids
+        and str(task.id) not in step1_handled_child_task_ids
+    ]
+    if restart_failed:
+        recovery_slots = max(0, min(slots, restart_failed_batch))
+    else:
+        # Plain watch keeps pending pickup ahead of failed recovery while still
+        # sharing the same bounded recovery policy with restart-failed mode.
+        reserved_for_pending = min(slots, len(pending_candidates))
+        recovery_slots = max(0, slots - reserved_for_pending)
     started_recovery_task_ids: set[str] = set()
     launched_recovery_count = 0
     for failed, decision in actionable_failed:
@@ -1127,7 +1144,6 @@ def _run_cycle(
         log.emit("PHASE", "recovery queue exhausted; switching to pending queue")
 
     # 3) Start new queued tasks (consumes slots)
-    pending_tasks = _pending_runnable_tasks(store, tags=tags, any_tag=any_tag)
     if not recovery_phase_active:
         log.emit("PHASE", "pending queue active")
     if slots > 0 and not recovery_phase_active:

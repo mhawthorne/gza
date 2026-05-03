@@ -412,6 +412,23 @@ class TestHelpOutput:
         assert "drains actionable failed-task recovery before pending queue work" in docs_text
         assert "plain watch, failed-task recovery, and advance-driven improve recovery" in docs_text
 
+    def test_watch_help_and_docs_lock_queue_priority_contract(self, tmp_path):
+        """Help/docs should keep queue-priority wording aligned for plain watch vs --restart-failed."""
+        setup_config(tmp_path)
+
+        help_result = run_gza("watch", "--help", "--project", str(tmp_path))
+        assert help_result.returncode == 0
+
+        help_text = " ".join(help_result.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        failed_tasks_docs = " ".join(Path("docs/examples/failed-tasks.md").read_text().split())
+        internal_docs = " ".join(Path("docs/internal/advance-workflow.md").read_text().split())
+
+        assert "Drain failed-task recovery before pending queue work" in help_text
+        assert "only changes selection order by draining actionable failed tasks before pending pickup" in docs_text
+        assert "Plain `gza watch` and `gza watch --restart-failed` use the same bounded shared recovery policy; `--restart-failed` only changes queue priority." in failed_tasks_docs
+        assert "Default `gza watch` uses the same bounded shared recovery policy as the explicit failed-task recovery queue. `gza watch --restart-failed` is opt-in only for recovery-first queue ordering." in internal_docs
+
     def test_queue_help_and_docs_describe_default_limit_and_all_overrides(self, tmp_path):
         """`queue --help` and docs should describe capped default output and all-task overrides."""
         setup_config(tmp_path)

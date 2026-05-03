@@ -11,7 +11,7 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 
 
-def _setup_task_with_log(project_dir: Path) -> tuple[str, Path]:
+def _setup_task_with_log(project_dir: Path, *, task_type: str = "implement") -> tuple[str, Path]:
     (project_dir / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
@@ -20,7 +20,7 @@ def _setup_task_with_log(project_dir: Path) -> tuple[str, Path]:
     (project_dir / ".gza" / "logs").mkdir(parents=True, exist_ok=True)
     config = Config.load(project_dir)
     store = SqliteTaskStore(project_dir / ".gza" / "gza.db", prefix=config.project_prefix)
-    task = store.add("Test attach wrapper")
+    task = store.add("Test attach wrapper", task_type=task_type)
     task.log_file = ".gza/logs/task.log"
     store.update(task)
     assert task.id is not None
@@ -226,8 +226,8 @@ def test_attach_wrapper_manual_review_failed_task_does_not_auto_resume(tmp_path:
     mock_spawn.assert_not_called()
 
 
-def test_attach_wrapper_timeout_failed_task_creates_and_launches_resume_child(tmp_path: Path) -> None:
-    """Timeout failed handoff should create and launch the policy-selected resume descendant."""
+def test_attach_wrapper_timeout_failed_implement_handoff_launches_iterate_resume(tmp_path: Path) -> None:
+    """Timeout failed implement handoff should relaunch through iterate resume, not a plain worker."""
     task_id, _ = _setup_task_with_log(tmp_path)
     config = Config.load(tmp_path)
     store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
@@ -247,24 +247,24 @@ def test_attach_wrapper_timeout_failed_task_creates_and_launches_resume_child(tm
             "--project", str(tmp_path),
         ]),
         patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
-        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
+        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
     ):
         rc = main()
 
     assert rc == 0
-    mock_spawn.assert_called_once()
-    spawned_args = mock_spawn.call_args.args[0]
-    spawned_task_id = mock_spawn.call_args.kwargs["task_id"]
+    mock_spawn_worker.assert_not_called()
+    mock_spawn_iterate.assert_called_once()
+    spawned_args = mock_spawn_iterate.call_args.args[0]
+    spawned_task = mock_spawn_iterate.call_args.args[2]
     assert spawned_args.resume is True
-    assert spawned_task_id != task_id
-    resume_child = store.get(spawned_task_id)
-    assert resume_child is not None
-    assert resume_child.based_on == task_id
-    assert resume_child.session_id == failed.session_id
+    assert spawned_args.retry is False
+    assert spawned_task.id == task_id
+    assert store.get_based_on_children(task_id) == []
 
 
-def test_attach_wrapper_retryable_failed_task_creates_and_launches_retry_child(tmp_path: Path) -> None:
-    """Retryable failed handoff should create and launch a retry descendant (not resume original)."""
+def test_attach_wrapper_retryable_failed_implement_handoff_launches_iterate_retry(tmp_path: Path) -> None:
+    """Retryable failed implement handoff should relaunch a retry child via iterate."""
     task_id, _ = _setup_task_with_log(tmp_path)
     config = Config.load(tmp_path)
     store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
@@ -283,19 +283,55 @@ def test_attach_wrapper_retryable_failed_task_creates_and_launches_retry_child(t
             "--project", str(tmp_path),
         ]),
         patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
-        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
+        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
     ):
         rc = main()
 
     assert rc == 0
-    mock_spawn.assert_called_once()
-    spawned_args = mock_spawn.call_args.args[0]
-    spawned_task_id = mock_spawn.call_args.kwargs["task_id"]
+    mock_spawn_worker.assert_not_called()
+    mock_spawn_iterate.assert_called_once()
+    spawned_args = mock_spawn_iterate.call_args.args[0]
+    retry_child = mock_spawn_iterate.call_args.args[2]
     assert spawned_args.resume is False
-    assert spawned_task_id != task_id
-    retry_child = store.get(spawned_task_id)
-    assert retry_child is not None
+    assert spawned_args.retry is False
+    assert retry_child.id is not None
+    assert retry_child.id != task_id
     assert retry_child.based_on == task_id
+
+
+def test_attach_wrapper_retryable_failed_non_implement_handoff_uses_worker_path(tmp_path: Path) -> None:
+    """Failed non-implement handoff should keep using plain worker execution."""
+    task_id, _ = _setup_task_with_log(tmp_path, task_type="plan")
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    failed = store.get(task_id)
+    assert failed is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    store.update(failed)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
+        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_spawn_iterate.assert_not_called()
+    mock_spawn_worker.assert_called_once()
+    spawned_task_id = mock_spawn_worker.call_args.kwargs["task_id"]
+    spawned_task = store.get(spawned_task_id)
+    assert spawned_task is not None
+    assert spawned_task.based_on == task_id
 
 
 def test_attach_wrapper_failed_resume_descendant_does_not_auto_recover_further(tmp_path: Path) -> None:

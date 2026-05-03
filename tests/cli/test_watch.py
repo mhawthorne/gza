@@ -317,10 +317,10 @@ def test_watch_cycle_default_auto_resume_prioritizes_oldest_created_failed_task(
 
 
 @pytest.mark.parametrize("task_type", ["implement", "review", "improve", "rebase"])
-def test_watch_cycle_default_mode_auto_resumes_resumable_failed_task(
+def test_watch_cycle_plain_mode_prioritizes_pending_over_actionable_failed_recovery(
     tmp_path: Path, task_type: str
 ) -> None:
-    """Plain watch should preserve legacy resume-worker behavior for resumable failures."""
+    """Plain watch should launch pending work first when slots are saturated."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -356,23 +356,14 @@ def test_watch_cycle_default_mode_auto_resumes_resumable_failed_task(
         )
 
     assert result.work_done is True
+    assert spawn_resume.call_count == 0
+    assert spawn_iterate.call_count == 1
+    spawned_args = spawn_iterate.call_args.args[0]
+    spawned_task = spawn_iterate.call_args.args[2]
+    assert spawned_args.resume is False
+    assert spawned_task.id == pending_impl.id
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
-    if task_type == "implement":
-        assert spawn_iterate.call_count == 1
-        assert spawn_resume.call_count == 0
-        spawned_args = spawn_iterate.call_args.args[0]
-        spawned_task = spawn_iterate.call_args.args[2]
-        assert spawned_args.resume is True
-        assert spawned_task.id == failed.id
-        assert f"RECOVR {failed.id} resume via iterate" in log_text
-    else:
-        assert spawn_iterate.call_count == 0
-        assert spawn_resume.call_count == 1
-        spawned_task = store.get(spawn_resume.call_args.args[2])
-        assert spawned_task is not None
-        assert spawned_task.based_on == failed.id
-        assert spawned_task.id != pending_impl.id
-        assert f"RECOVR {failed.id} resume via worker -> {spawned_task.id}" in log_text
+    assert f"RECOVR {failed.id} resume via" not in log_text
 
 
 def test_watch_cycle_default_mode_reuses_existing_pending_resume_child(tmp_path: Path) -> None:

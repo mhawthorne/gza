@@ -7,9 +7,12 @@ import os
 import signal
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from .cli._common import _create_resume_task, _create_retry_task, _spawn_background_worker, get_store
+from .cli.execution import _spawn_background_iterate
 from .config import Config
 from .providers.base import build_docker_cmd, ensure_docker_image
 from .providers.claude import _get_docker_config, sync_keychain_credentials
@@ -111,12 +114,24 @@ def _run_interactive_claude(
         signal.signal(signal.SIGINT, original_sigint)
 
 
-def _resolve_handoff_target(config: Config, store, task) -> tuple[str, bool] | None:
+@dataclass(frozen=True)
+class _AttachHandoffTarget:
+    task_id: str
+    resume_mode: bool
+    launch_mode: Literal["worker", "iterate"]
+    iterate_task_id: str | None = None
+
+
+def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget | None:
     """Resolve the task/flags to relaunch after interactive attach exits."""
     if task.id is None:
         return None
     if task.status in {"pending", "in_progress"}:
-        return (str(task.id), True)
+        return _AttachHandoffTarget(
+            task_id=str(task.id),
+            resume_mode=True,
+            launch_mode="worker",
+        )
     if task.status != "failed":
         return None
 
@@ -129,17 +144,54 @@ def _resolve_handoff_target(config: Config, store, task) -> tuple[str, bool] | N
         return None
 
     if decision.action == "resume":
+        if decision.launch_mode == "iterate":
+            return _AttachHandoffTarget(
+                task_id=decision.recovery_task_id or str(task.id),
+                resume_mode=True,
+                launch_mode="iterate",
+                iterate_task_id=str(task.id),
+            )
         if decision.reuse_existing and decision.recovery_task_id is not None:
-            return (decision.recovery_task_id, True)
+            return _AttachHandoffTarget(
+                task_id=decision.recovery_task_id,
+                resume_mode=True,
+                launch_mode="worker",
+            )
         resume_task = _create_resume_task(store, task)
         assert resume_task.id is not None
-        return (str(resume_task.id), True)
+        return _AttachHandoffTarget(
+            task_id=str(resume_task.id),
+            resume_mode=True,
+            launch_mode="worker",
+        )
+
+    if decision.launch_mode == "iterate":
+        if decision.reuse_existing and decision.recovery_task_id is not None:
+            retry_task_id = decision.recovery_task_id
+        else:
+            retry_task = _create_retry_task(store, task)
+            assert retry_task.id is not None
+            retry_task_id = str(retry_task.id)
+        return _AttachHandoffTarget(
+            task_id=retry_task_id,
+            resume_mode=False,
+            launch_mode="iterate",
+            iterate_task_id=retry_task_id,
+        )
 
     if decision.reuse_existing and decision.recovery_task_id is not None:
-        return (decision.recovery_task_id, False)
+        return _AttachHandoffTarget(
+            task_id=decision.recovery_task_id,
+            resume_mode=False,
+            launch_mode="worker",
+        )
     retry_task = _create_retry_task(store, task)
     assert retry_task.id is not None
-    return (str(retry_task.id), False)
+    return _AttachHandoffTarget(
+        task_id=str(retry_task.id),
+        resume_mode=False,
+        launch_mode="worker",
+    )
 
 
 def main() -> int:
@@ -229,19 +281,39 @@ def main() -> int:
             should_handoff = detach_signal in (signal.SIGTERM, signal.SIGHUP) or exit_code == 0
             handoff = _resolve_handoff_target(config, store, refreshed) if should_handoff else None
             if handoff is not None:
-                handoff_task_id, handoff_resume_mode = handoff
-                worker_args = argparse.Namespace(
-                    no_docker=args.no_docker,
-                    max_turns=args.max_turns,
-                    force=args.force,
-                    resume=handoff_resume_mode,
-                )
-                spawn_rc = _spawn_background_worker(
-                    worker_args,
-                    config,
-                    task_id=handoff_task_id,
-                    quiet=True,
-                )
+                handoff_task_id = handoff.task_id
+                handoff_resume_mode = handoff.resume_mode
+                if handoff.launch_mode == "worker":
+                    worker_args = argparse.Namespace(
+                        no_docker=args.no_docker,
+                        max_turns=args.max_turns,
+                        force=args.force,
+                        resume=handoff_resume_mode,
+                    )
+                    spawn_rc = _spawn_background_worker(
+                        worker_args,
+                        config,
+                        task_id=handoff_task_id,
+                        quiet=True,
+                    )
+                else:
+                    assert handoff.iterate_task_id is not None
+                    iterate_task = store.get(handoff.iterate_task_id)
+                    if iterate_task is None:
+                        spawn_rc = 1
+                    else:
+                        iterate_args = argparse.Namespace(
+                            no_docker=args.no_docker,
+                            force=args.force,
+                            max_iterations=config.iterate_max_iterations,
+                            resume=handoff_resume_mode,
+                            retry=False,
+                        )
+                        spawn_rc = _spawn_background_iterate(
+                            iterate_args,
+                            config,
+                            iterate_task,
+                        )
                 if log_file is not None:
                     if spawn_rc == 0:
                         handoff_action = "resumed" if handoff_resume_mode else "retried"
@@ -251,7 +323,10 @@ def main() -> int:
                                 "type": "gza",
                                 "subtype": "worker_lifecycle",
                                 "event": "resume",
-                                "message": f"Background worker {handoff_action} in pipe mode",
+                                "message": (
+                                    f"Background worker {handoff_action} in "
+                                    f"{handoff.launch_mode} mode"
+                                ),
                                 "handoff_task_id": handoff_task_id,
                             },
                         )
