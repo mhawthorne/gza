@@ -516,6 +516,27 @@ class TestLocalConfigOverrides:
         assert payload["effective"]["main_checkout_isolate"] is True
         assert payload["sources"]["main_checkout_isolate"] == "base"
 
+    def test_config_command_includes_watch_no_activity_timeout_json_and_source(self, tmp_path: Path):
+        """gza config --json should expose watch.no_activity_timeout with source attribution."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "watch:\n"
+            "  no_activity_timeout: 120\n"
+        )
+
+        result = run_gza(
+            "config",
+            "--json",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["watch"]["no_activity_timeout"] == 120
+        assert payload["sources"]["watch.no_activity_timeout"] == "base"
+
     def test_config_command_includes_main_checkout_isolate_text_and_source(self, tmp_path: Path):
         """gza config should render main_checkout_isolate rows with false values and sources."""
 
@@ -584,7 +605,9 @@ class TestLocalConfigOverrides:
 
         assert result.returncode == 0
         assert "watch.restart_failed_batch" in result.stdout
+        assert "watch.no_activity_timeout" in result.stdout
         assert "Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active." in result.stdout
+        assert "Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`." in result.stdout
         assert (
             "Retry cap for resume-based lifecycle automation, including watch auto-resume and --restart-failed recovery decisions."
             in result.stdout
@@ -626,9 +649,14 @@ class TestLocalConfigOverrides:
         payload = json.loads(result.stdout)
         keyed_entries = {entry["key"]: entry for entry in payload["keys"]}
         assert keyed_entries["watch.restart_failed_batch"]["default"] == 1
+        assert keyed_entries["watch.no_activity_timeout"]["default"] == 60
         assert (
             keyed_entries["watch.restart_failed_batch"]["description"]
             == "Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active."
+        )
+        assert (
+            keyed_entries["watch.no_activity_timeout"]["description"]
+            == "Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`."
         )
         assert (
             keyed_entries["max_resume_attempts"]["description"]
@@ -2561,6 +2589,7 @@ class TestWatchConfigValidation:
             ("failure_backoff_initial", "bad"),
             ("failure_backoff_max", "bad"),
             ("failure_halt_after", "bad"),
+            ("no_activity_timeout", "bad"),
             ("poll", "bad"),
             ("max_idle", "bad"),
             ("max_iterations", "bad"),
@@ -2581,6 +2610,7 @@ class TestWatchConfigValidation:
             "failure_backoff_initial",
             "failure_backoff_max",
             "failure_halt_after",
+            "no_activity_timeout",
             "poll",
             "max_idle",
             "max_iterations",
@@ -2605,6 +2635,7 @@ class TestWatchConfigValidation:
             "  failure_backoff_initial: 30\n"
             "  failure_backoff_max: 900\n"
             "  failure_halt_after: 6\n"
+            "  no_activity_timeout: 75\n"
             "  poll: 45\n"
             "  max_idle: 180\n"
             "  max_iterations: 9\n",
@@ -2614,9 +2645,18 @@ class TestWatchConfigValidation:
         assert config.watch.failure_backoff_initial == 30
         assert config.watch.failure_backoff_max == 900
         assert config.watch.failure_halt_after == 6
+        assert config.watch.no_activity_timeout == 75
         assert config.watch.poll == 45
         assert config.watch.max_idle == 180
         assert config.watch.max_iterations == 9
+
+    def test_config_watch_defaults_include_no_activity_timeout(self, tmp_path: Path) -> None:
+        """Config.load preserves the default watch no-activity timeout when unset."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "")
+        config = Config.load(tmp_path)
+        assert config.watch.no_activity_timeout == 60
 
     def test_config_main_checkout_isolate_defaults_false(self, tmp_path: Path) -> None:
         """Config.load defaults main_checkout_isolate to false."""
@@ -2683,6 +2723,7 @@ class TestWatchConfigValidation:
             ("failure_backoff_initial", "bad"),
             ("failure_backoff_max", "bad"),
             ("failure_halt_after", "bad"),
+            ("no_activity_timeout", "bad"),
             ("poll", "bad"),
             ("max_idle", "bad"),
             ("max_iterations", "bad"),
@@ -2704,6 +2745,7 @@ class TestWatchConfigValidation:
             "failure_backoff_initial",
             "failure_backoff_max",
             "failure_halt_after",
+            "no_activity_timeout",
             "poll",
             "max_idle",
             "max_iterations",

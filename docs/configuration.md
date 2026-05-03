@@ -46,7 +46,7 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
 | `main_checkout_isolate` | Boolean | `false` | When true, `gza watch` stages merges in a dedicated detached checkout, then fast-forwards the real default branch only after the isolated merge lands cleanly |
-| `watch` | Dict | `{batch: 5, poll: 300, max_idle: null, max_iterations: 10, restart_failed_batch: 1}` | Defaults for `gza watch` loop behavior |
+| `watch` | Dict | `{batch: 5, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, restart_failed_batch: 1}` | Defaults for `gza watch` loop behavior |
 | `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
 | `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
 | `theme` | String | *(none)* | Built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. Override with `gza.local.yaml`. |
@@ -834,6 +834,7 @@ watch.failure_backoff_initial
 watch.failure_backoff_max
 watch.failure_halt_after
 watch.max_idle
+watch.no_activity_timeout
 watch.max_iterations
 watch.poll
 watch.restart_failed_batch
@@ -1405,7 +1406,7 @@ gza watch [options]
 | `--batch N` | Target concurrent workers (default: `watch.batch` or `5`) |
 | failure backoff | After each newly observed non-auto-resumable failure, `gza watch` logs an exponential cooldown using `watch.failure_backoff_initial` and `watch.failure_backoff_max`, and exits when `watch.failure_halt_after` is reached |
 | `--poll SECS` | Poll interval in seconds (default: `watch.poll` or `300`) |
-| `--max-idle SECS` | Exit after consecutive idle time (default: `watch.max_idle`, no limit when unset) |
+| `--max-idle SECS` | Exit after consecutive idle watch-loop time (default: `watch.max_idle`, no limit when unset) |
 | `--max-iterations N` | Iterate loop cap for implement tasks launched by watch (default: `watch.max_iterations` or `10`) |
 | `--restart-failed` | Enable failed-task recovery mode: failed queue drains before pending queue using resume/retry decisions |
 | `--restart-failed-batch N` | Max concurrent failed-recovery launches (default: `watch.restart_failed_batch` or `1`) |
@@ -1418,6 +1419,16 @@ gza watch [options]
 | `--group NAME` | Deprecated alias for `--tag NAME` |
 
 When `main_checkout_isolate: true`, watch preflights a dedicated detached checkout reset to the default-branch tip and executes merge attempts there. If the isolated merge succeeds, watch then fast-forwards the real default-branch ref to that detached merge commit and syncs any attached default-branch checkout back to a clean state before marking the task merged. If the initial refresh fails because that checkout is stale or conflicted, watch rebuilds it once from scratch before giving up on merge actions for the cycle. The integration checkout does not directly check out the shared default-branch ref, so an operator checkout already on that branch stays clean. Conflict rebases still run on task branches via standard rebase tasks.
+
+Watch also has a separate worker-silence threshold:
+
+```yaml
+watch:
+  no_activity_timeout: 60
+  max_idle: null
+```
+
+`watch.no_activity_timeout` controls when watch reconciliation marks a still-running worker `NO_ACTIVITY` because its task log has stopped receiving writes. `watch.max_idle` keeps its existing meaning: it exits the `gza watch` loop itself after consecutive idle cycles. These settings are independent.
 
 When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
 `INFO   scope: tags=<comma-separated-tags> mode=all|any`.

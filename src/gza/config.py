@@ -65,6 +65,7 @@ DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
 DEFAULT_WATCH_BATCH = 5
 DEFAULT_WATCH_POLL = 300
+DEFAULT_WATCH_NO_ACTIVITY_TIMEOUT = 60
 DEFAULT_WATCH_MAX_IDLE: int | None = None
 DEFAULT_WATCH_MAX_ITERATIONS = 10
 DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL = 60
@@ -145,6 +146,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "watch": {
         "batch": None,
         "poll": None,
+        "no_activity_timeout": None,
         "max_idle": None,
         "max_iterations": None,
         "restart_failed_batch": None,
@@ -370,6 +372,7 @@ class WatchConfig:
     """Configuration for the `gza watch` loop."""
     batch: int = DEFAULT_WATCH_BATCH
     poll: int = DEFAULT_WATCH_POLL
+    no_activity_timeout: int = DEFAULT_WATCH_NO_ACTIVITY_TIMEOUT
     max_idle: int | None = DEFAULT_WATCH_MAX_IDLE
     max_iterations: int = DEFAULT_WATCH_MAX_ITERATIONS
     restart_failed_batch: int = DEFAULT_WATCH_RESTART_FAILED_BATCH
@@ -1212,6 +1215,14 @@ class Config:
             raise ConfigError("watch.poll must be a positive integer")
         if watch_poll < 1:
             raise ConfigError("watch.poll must be a positive integer")
+        try:
+            watch_no_activity_timeout = int(
+                watch_data.get("no_activity_timeout", DEFAULT_WATCH_NO_ACTIVITY_TIMEOUT)
+            )
+        except (TypeError, ValueError):
+            raise ConfigError("watch.no_activity_timeout must be a positive integer")
+        if watch_no_activity_timeout < 1:
+            raise ConfigError("watch.no_activity_timeout must be a positive integer")
         watch_max_idle_raw = watch_data.get("max_idle", DEFAULT_WATCH_MAX_IDLE)
         if watch_max_idle_raw is None:
             watch_max_idle = None
@@ -1270,6 +1281,7 @@ class Config:
         watch_config = WatchConfig(
             batch=watch_batch,
             poll=watch_poll,
+            no_activity_timeout=watch_no_activity_timeout,
             max_idle=watch_max_idle,
             max_iterations=watch_max_iterations,
             restart_failed_batch=watch_restart_failed_batch,
@@ -1667,6 +1679,12 @@ class Config:
                 if "poll" in watch_data:
                     if not isinstance(watch_data["poll"], int) or watch_data["poll"] < 1:
                         errors.append("watch.poll must be a positive integer")
+                if "no_activity_timeout" in watch_data:
+                    if (
+                        not isinstance(watch_data["no_activity_timeout"], int)
+                        or watch_data["no_activity_timeout"] < 1
+                    ):
+                        errors.append("watch.no_activity_timeout must be a positive integer")
                 if "max_idle" in watch_data and watch_data["max_idle"] is not None:
                     if not isinstance(watch_data["max_idle"], int) or watch_data["max_idle"] < 1:
                         errors.append("watch.max_idle must be null or a positive integer")
