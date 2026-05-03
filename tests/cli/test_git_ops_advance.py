@@ -398,7 +398,7 @@ class TestAdvanceCommand:
         assert rc == 0
         rebases = [t for t in store.get_all() if t.task_type == "rebase" and t.based_on == task.id]
         assert len(rebases) == 1
-        assert "onto 'agent-sessions'" in rebases[0].prompt
+        assert "onto the local branch 'agent-sessions'" in rebases[0].prompt
         assert store.get(task.id).merge_status == "unmerged"
 
     def test_advance_passes_current_branch_as_merge_target(self, tmp_path: Path):
@@ -492,7 +492,7 @@ class TestAdvanceCommand:
         assert mock_reset.called
         rebases = [t for t in store.get_all() if t.task_type == "rebase" and t.based_on == task.id]
         assert len(rebases) == 1
-        assert "onto 'main'" in rebases[0].prompt
+        assert "onto the local branch 'main'" in rebases[0].prompt
 
     def test_advance_merge_conflict_fallback_reports_rebase_worker_start_failure(self, tmp_path: Path):
         """Merge-conflict fallback must report child creation separately from rebase worker startup failure."""
