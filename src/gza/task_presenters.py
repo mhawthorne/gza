@@ -120,6 +120,8 @@ def _render_one_line(result: TaskQueryResult) -> str:
                 snippet = task.prompt
                 if task.status == "failed" and task.failure_reason and task.failure_reason != "UNKNOWN":
                     snippet = f"{snippet} ({task.failure_reason})"
+                elif task.status == "completed" and task.completion_reason:
+                    snippet = f"{snippet} ({task.completion_reason})"
                 elif task.status == "dropped":
                     snippet = f"{snippet} (dropped)"
                 unresolved_parts.append(snippet)

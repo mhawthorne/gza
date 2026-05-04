@@ -530,6 +530,10 @@ def cmd_history(args: argparse.Namespace) -> int:
                         f"[{c['task_id']}]{final_attempt.id}[/{c['task_id']}]"
                         f"{suffix}"
                     )
+        elif task.status == "completed" and task.completion_reason:
+            console.print(
+                f"{detail_prefix}    [{c['success']}]completion: {task.completion_reason}[/{c['success']}]"
+            )
 
         type_label = f"\\[{task.task_type}]"
         merge_label = " \\[merged]" if task.merge_status == "merged" else ""
@@ -1284,6 +1288,8 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
         # Append failure reason if present and not UNKNOWN
         if representative_task.status == "failed" and representative_task.failure_reason and representative_task.failure_reason != "UNKNOWN":
             suffix += f" [red]failed ({representative_task.failure_reason})[/red]"
+        elif representative_task.status == "completed" and representative_task.completion_reason:
+            suffix += f" [green]completed ({representative_task.completion_reason})[/green]"
 
         # Header line: task ID, completion time, prompt
         task_id_len = len(str(representative_task.id))
@@ -2146,6 +2152,8 @@ def cmd_lineage(args: argparse.Namespace) -> int:
             if t.failure_reason and t.failure_reason != "UNKNOWN":
                 return f"failed ({t.failure_reason})"
             return "failed"
+        if t.status == "completed" and t.completion_reason:
+            return f"completed ({t.completion_reason})"
         return t.status or "unknown"
 
     def _format_utc_timestamp(value: datetime) -> str:
@@ -2372,6 +2380,10 @@ def _cmd_show_output(
     console.print(f"[{c['heading']}]Task {task.id}[/{c['heading']}]")
     console.print(f"[{c['section']}]{'=' * 50}[/{c['section']}]")
     console.print(f"[{c['label']}]Status:[/{c['label']}] [{status_color}]{task.status}[/{status_color}]")
+    if task.failure_reason:
+        console.print(f"[{c['label']}]Failure Reason:[/{c['label']}] [{c['value']}]{task.failure_reason}[/{c['value']}]")
+    if task.completion_reason:
+        console.print(f"[{c['label']}]Completion Reason:[/{c['label']}] [{c['value']}]{task.completion_reason}[/{c['value']}]")
     if task.merge_status:
         console.print(f"[{c['label']}]Merge Status:[/{c['label']}] [{c['value']}]{task.merge_status}[/{c['value']}]")
     console.print(f"[{c['label']}]Type:[/{c['label']}] [{c['value']}]{task.task_type}[/{c['value']}]")
@@ -2657,6 +2669,7 @@ def _stop_worker_for_attach(task: DbTask, worker: WorkerMetadata, registry: Work
         task.status = "pending"
         task.completed_at = None
         task.failure_reason = None
+        task.completion_reason = None
     return True
 
 

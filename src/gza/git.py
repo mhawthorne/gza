@@ -532,13 +532,9 @@ class Git:
         result = self._run(*args, check=False)
         return result.stdout
 
-    def apply_patch_check(self, patch_file: Path) -> None:
-        """Validate patch application with ``git apply --check``."""
-        self._run("apply", "--check", str(patch_file))
-
     def apply_patch_file(self, patch_file: Path) -> None:
-        """Apply a patch file with ``git apply``."""
-        self._run("apply", str(patch_file))
+        """Apply a patch file with ``git apply --3way``."""
+        self._run("apply", "--3way", str(patch_file))
 
     def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
         """Check if a branch has been merged into another branch.

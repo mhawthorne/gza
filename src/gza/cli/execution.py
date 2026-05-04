@@ -1292,6 +1292,10 @@ def cmd_set_status(args: argparse.Namespace) -> int:
         task.failure_reason = args.reason
     elif args.status != "failed":
         task.failure_reason = None
+    if args.status == "completed":
+        task.completion_reason = args.reason
+    else:
+        task.completion_reason = None
 
     store.update(task)
     _cleanup_worker_registry(config, task_id)
@@ -1987,6 +1991,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         cost_usd: float | None
         status: str
         failure_reason: str | None
+        completion_reason: str | None
 
     def _format_compact_duration(seconds: float | None) -> str:
         if seconds is None:
@@ -1996,6 +2001,8 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     def _format_summary_status(row: IterateSummaryRow) -> str:
         if row.failure_reason:
             return f"{row.status} ({row.failure_reason})"
+        if row.completion_reason:
+            return f"{row.status} ({row.completion_reason})"
         return row.status
 
     def _append_summary_row(
@@ -2014,6 +2021,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
 
         row_status = status or (refreshed_task.status if refreshed_task else "failed")
         row_failure_reason = (refreshed_task.failure_reason if refreshed_task else None) or failure_reason
+        row_completion_reason = refreshed_task.completion_reason if refreshed_task else None
 
         rows.append(
             IterateSummaryRow(
@@ -2026,6 +2034,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 cost_usd=refreshed_task.cost_usd if refreshed_task else None,
                 status=row_status,
                 failure_reason=row_failure_reason,
+                completion_reason=row_completion_reason,
             )
         )
 

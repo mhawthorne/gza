@@ -1343,6 +1343,8 @@ gza extract SOURCE --files-from FILE [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when running the extracted implement task |
 
+At run time, extracted tasks re-derive their selected patch from the current `source_base_ref...source_branch` diff before seeding the worktree. If that refreshed diff is empty because the source work is already on the base branch, the task completes successfully without invoking the agent.
+
 ### advance
 
 Intelligently progress unmerged tasks through their lifecycle. Handles review creation, improve tasks, merging, and shared automatic failed-task recovery (resume/retry).

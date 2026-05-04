@@ -267,6 +267,23 @@ class TestMergeStatusTracking:
         assert result.returncode == 0
         assert "Merge Status: merged" in result.stdout
 
+    def test_cmd_show_displays_completion_reason(self, tmp_path: Path):
+        """gza show displays Completion Reason when completion_reason is set."""
+        from datetime import datetime
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Test show completion reason")
+        task.status = "completed"
+        task.completion_reason = "EXTRACTION_ALREADY_MERGED"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Completion Reason: EXTRACTION_ALREADY_MERGED" in result.stdout
+
     def test_cmd_show_no_merge_status_line_when_null(self, tmp_path: Path):
         """gza show does not display Merge Status when merge_status is None."""
         from datetime import datetime

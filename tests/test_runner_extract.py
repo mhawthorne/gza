@@ -6,9 +6,10 @@ from unittest.mock import Mock, patch
 
 from gza.config import Config
 from gza.db import SqliteTaskStore, TaskStats
-from gza.git import GitError
+from gza.git import Git, GitError
 from gza.providers import RunResult
 from gza.runner import (
+    EXTRACTION_ALREADY_MERGED_COMPLETION_REASON,
     EXTRACTION_PRECHECK_FAILURE_REASON,
     _complete_code_task,
     _seed_extraction_bundle_if_present,
@@ -47,6 +48,55 @@ def _build_config(tmp_path: Path, db_path: Path) -> Config:
     return config
 
 
+def _init_repo(tmp_path: Path, *, initial_content: str) -> Git:
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    target = tmp_path / "src" / "file.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(initial_content)
+    git._run("add", "src/file.py")
+    git._run("commit", "-m", "initial")
+    return git
+
+
+def _write_bundle(
+    project_dir: Path,
+    task_id: str,
+    task_slug: str,
+    *,
+    patch_text: str,
+    source_branch: str,
+    source_base_ref: str = "main",
+    selected_paths: list[str] | None = None,
+) -> None:
+    selected = selected_paths or ["src/file.py"]
+    bundle_dir = project_dir / ".gza" / "extractions" / task_slug
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    (bundle_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "source_branch": source_branch,
+                "source_base_ref": source_base_ref,
+                "target_task_id": task_id,
+                "target_slug": task_slug,
+                "selected_paths": selected,
+                "touched_paths": selected,
+                "patch_path": "selected.patch",
+            }
+        )
+    )
+    (bundle_dir / "selected.patch").write_text(patch_text)
+    (bundle_dir / "prompt.md").write_text("seed prompt\n")
+
+
+def _add_detached_worktree(git: Git, path: Path) -> Git:
+    git._run("worktree", "add", "--detach", str(path), "main")
+    return Git(path)
+
+
 def test_seed_extraction_bundle_applies_patch_and_returns_paths(tmp_path: Path) -> None:
     task_store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
     task = task_store.add("Extracted task", task_type="implement")
@@ -59,6 +109,8 @@ def test_seed_extraction_bundle_applies_patch_and_returns_paths(tmp_path: Path) 
         json.dumps(
             {
                 "version": 1,
+                "source_branch": "feature/source",
+                "source_base_ref": "main",
                 "target_task_id": task.id,
                 "target_slug": "20260427-target",
                 "selected_paths": ["src/file.py"],
@@ -86,6 +138,7 @@ def test_seed_extraction_bundle_applies_patch_and_returns_paths(tmp_path: Path) 
     config.project_dir = tmp_path
 
     worktree_git = Mock()
+    worktree_git.ref_exists.return_value = False
 
     seeded = _seed_extraction_bundle_if_present(
         task,
@@ -96,8 +149,8 @@ def test_seed_extraction_bundle_applies_patch_and_returns_paths(tmp_path: Path) 
         resume=False,
     )
 
-    assert seeded == {"src/file.py"}
-    worktree_git.apply_patch_check.assert_called_once()
+    assert seeded.seeded_paths == frozenset({"src/file.py"})
+    assert seeded.completion_reason is None
     worktree_git.apply_patch_file.assert_called_once()
 
 
@@ -113,6 +166,8 @@ def test_seed_extraction_bundle_accepts_quoted_diff_headers(tmp_path: Path) -> N
         json.dumps(
             {
                 "version": 1,
+                "source_branch": "feature/source",
+                "source_base_ref": "main",
                 "target_task_id": task.id,
                 "target_slug": task.slug,
                 "selected_paths": ["src/file with space.py"],
@@ -139,6 +194,7 @@ def test_seed_extraction_bundle_accepts_quoted_diff_headers(tmp_path: Path) -> N
     config = Mock(spec=Config)
     config.project_dir = tmp_path
     worktree_git = Mock()
+    worktree_git.ref_exists.return_value = False
 
     seeded = _seed_extraction_bundle_if_present(
         task,
@@ -149,9 +205,152 @@ def test_seed_extraction_bundle_accepts_quoted_diff_headers(tmp_path: Path) -> N
         resume=False,
     )
 
-    assert seeded == {"src/file with space.py"}
-    worktree_git.apply_patch_check.assert_called_once()
+    assert seeded.seeded_paths == frozenset({"src/file with space.py"})
+    assert seeded.completion_reason is None
     worktree_git.apply_patch_file.assert_called_once()
+
+
+def test_seed_extraction_bundle_marks_already_merged_when_rederived_diff_is_empty(tmp_path: Path) -> None:
+    git = _init_repo(tmp_path, initial_content="base\n")
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = store.add("Extracted task", task_type="implement")
+    task.slug = "20260427-already-merged"
+    store.update(task)
+
+    git._run("checkout", "-b", "feature/source")
+    target = tmp_path / "src" / "file.py"
+    target.write_text("feature\n")
+    git._run("add", "src/file.py")
+    git._run("commit", "-m", "feature change")
+    stored_patch = git.get_diff_patch_for_paths("main...feature/source", ("src/file.py",), binary=True)
+
+    git._run("checkout", "main")
+    git._run("merge", "--no-ff", "feature/source", "-m", "merge feature")
+
+    _write_bundle(
+        tmp_path,
+        task.id,
+        task.slug,
+        patch_text=stored_patch,
+        source_branch="feature/source",
+    )
+    worktree_path = tmp_path / "worktree-already-merged"
+    worktree_git = _add_detached_worktree(git, worktree_path)
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+    log_file = tmp_path / "logs" / "already-merged.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    seeded = _seed_extraction_bundle_if_present(
+        task,
+        config,
+        worktree_path,
+        worktree_git,
+        log_file,
+        resume=False,
+    )
+
+    assert seeded.seeded_paths == frozenset()
+    assert seeded.completion_reason == EXTRACTION_ALREADY_MERGED_COMPLETION_REASON
+    assert (worktree_path / "src" / "file.py").read_text() == "feature\n"
+    assert "re-derived hunks=0" in log_file.read_text()
+
+
+def test_seed_extraction_bundle_rederives_patch_and_applies_with_context_drift(tmp_path: Path) -> None:
+    git = _init_repo(tmp_path, initial_content="a\nb\nc\n")
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = store.add("Extracted task", task_type="implement")
+    task.slug = "20260427-drift"
+    store.update(task)
+
+    git._run("checkout", "-b", "feature/source")
+    target = tmp_path / "src" / "file.py"
+    target.write_text("a\nbranch\nc\n")
+    git._run("add", "src/file.py")
+    git._run("commit", "-m", "feature change")
+    stored_patch = git.get_diff_patch_for_paths("main...feature/source", ("src/file.py",), binary=True)
+
+    git._run("checkout", "main")
+    target.write_text("header\na\nb\nc\n")
+    git._run("add", "src/file.py")
+    git._run("commit", "-m", "main drift")
+
+    _write_bundle(
+        tmp_path,
+        task.id,
+        task.slug,
+        patch_text=stored_patch,
+        source_branch="feature/source",
+    )
+    worktree_path = tmp_path / "worktree-drift"
+    worktree_git = _add_detached_worktree(git, worktree_path)
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+    log_file = tmp_path / "logs" / "drift.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    seeded = _seed_extraction_bundle_if_present(
+        task,
+        config,
+        worktree_path,
+        worktree_git,
+        log_file,
+        resume=False,
+    )
+
+    assert seeded.seeded_paths == frozenset({"src/file.py"})
+    assert seeded.completion_reason is None
+    assert (worktree_path / "src" / "file.py").read_text() == "header\na\nbranch\nc\n"
+    assert "re-derived hunks=1" in log_file.read_text()
+
+
+def test_seed_extraction_bundle_falls_back_to_stored_patch_when_source_branch_is_unreachable(tmp_path: Path) -> None:
+    git = _init_repo(tmp_path, initial_content="base\n")
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = store.add("Extracted task", task_type="implement")
+    task.slug = "20260427-stored-fallback"
+    store.update(task)
+
+    git._run("checkout", "-b", "feature/source")
+    target = tmp_path / "src" / "file.py"
+    target.write_text("feature\n")
+    git._run("add", "src/file.py")
+    git._run("commit", "-m", "feature change")
+    stored_patch = git.get_diff_patch_for_paths("main...feature/source", ("src/file.py",), binary=True)
+
+    git._run("checkout", "main")
+    git._run("branch", "-D", "feature/source")
+
+    _write_bundle(
+        tmp_path,
+        task.id,
+        task.slug,
+        patch_text=stored_patch,
+        source_branch="feature/source",
+    )
+    worktree_path = tmp_path / "worktree-stored-fallback"
+    worktree_git = _add_detached_worktree(git, worktree_path)
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+    log_file = tmp_path / "logs" / "stored-fallback.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    seeded = _seed_extraction_bundle_if_present(
+        task,
+        config,
+        worktree_path,
+        worktree_git,
+        log_file,
+        resume=False,
+    )
+
+    assert seeded.seeded_paths == frozenset({"src/file.py"})
+    assert seeded.completion_reason is None
+    assert (worktree_path / "src" / "file.py").read_text() == "feature\n"
+    assert "source branch 'feature/source' unreachable" in log_file.read_text()
 
 
 def test_complete_code_task_stages_seeded_paths_even_without_provider_edits(tmp_path: Path) -> None:
@@ -313,6 +512,8 @@ def test_run_marks_failed_when_extraction_precheck_fails(tmp_path: Path) -> None
         json.dumps(
             {
                 "version": 1,
+                "source_branch": "feature/source",
+                "source_base_ref": "main",
                 "target_task_id": task.id,
                 "target_slug": task.slug,
                 "selected_paths": ["src/file.py"],
@@ -354,7 +555,8 @@ def test_run_marks_failed_when_extraction_precheck_fails(tmp_path: Path) -> None
 
     mock_worktree_git = Mock()
     mock_worktree_git.status_porcelain.return_value = set()
-    mock_worktree_git.apply_patch_check.side_effect = GitError("apply check failed")
+    mock_worktree_git.ref_exists.return_value = False
+    mock_worktree_git.apply_patch_file.side_effect = GitError("apply failed")
 
     with (
         patch("gza.runner.get_provider", return_value=mock_provider),
@@ -372,6 +574,74 @@ def test_run_marks_failed_when_extraction_precheck_fails(tmp_path: Path) -> None
     assert mock_provider.run.call_count == 0
 
 
+def test_run_completes_without_provider_when_extraction_diff_is_already_merged(tmp_path: Path) -> None:
+    db_path = tmp_path / "test.db"
+    store = SqliteTaskStore(db_path, prefix="testproject")
+    task = store.add("Extracted task", task_type="implement")
+    task.slug = "20260427-already-merged-run"
+    store.update(task)
+
+    project_bundle = tmp_path / ".gza" / "extractions" / task.slug
+    project_bundle.mkdir(parents=True, exist_ok=True)
+    (project_bundle / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "source_branch": "feature/source",
+                "source_base_ref": "main",
+                "target_task_id": task.id,
+                "target_slug": task.slug,
+                "selected_paths": ["src/file.py"],
+                "touched_paths": ["src/file.py"],
+                "patch_path": "selected.patch",
+            }
+        )
+    )
+    (project_bundle / "selected.patch").write_text(
+        "diff --git a/src/file.py b/src/file.py\n"
+        "index e69de29..8c7e5a6 100644\n"
+        "--- a/src/file.py\n"
+        "+++ b/src/file.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+print('boom')\n"
+    )
+    (project_bundle / "prompt.md").write_text("prompt\n")
+
+    config = _build_config(tmp_path, db_path)
+
+    mock_provider = Mock()
+    mock_provider.name = "TestProvider"
+    mock_provider.check_credentials.return_value = True
+    mock_provider.verify_credentials.return_value = True
+
+    mock_main_git = Mock()
+    mock_main_git.default_branch.return_value = "main"
+    mock_main_git.branch_exists.return_value = False
+    mock_main_git.worktree_list.return_value = []
+    mock_main_git.worktree_add.return_value = config.worktree_path / task.slug
+    mock_main_git.count_commits_ahead.return_value = 0
+    mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+    mock_worktree_git = Mock()
+    mock_worktree_git.ref_exists.side_effect = [True, True]
+    mock_worktree_git.get_diff_patch_for_paths.return_value = ""
+
+    with (
+        patch("gza.runner.get_provider", return_value=mock_provider),
+        patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
+        patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+        patch("gza.runner.load_dotenv"),
+    ):
+        rc = run(config, task_id=task.id)
+
+    assert rc == 0
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+    assert refreshed.completion_reason == EXTRACTION_ALREADY_MERGED_COMPLETION_REASON
+    assert mock_provider.run.call_count == 0
+
+
 def test_run_marks_failed_when_extraction_manifest_identity_mismatches_task(tmp_path: Path) -> None:
     db_path = tmp_path / "test.db"
     store = SqliteTaskStore(db_path, prefix="testproject")
@@ -385,6 +655,8 @@ def test_run_marks_failed_when_extraction_manifest_identity_mismatches_task(tmp_
         json.dumps(
             {
                 "version": 1,
+                "source_branch": "feature/source",
+                "source_base_ref": "main",
                 "target_task_id": "testproject-999",
                 "target_slug": task.slug,
                 "selected_paths": ["src/file.py"],
@@ -519,6 +791,8 @@ def test_run_marks_failed_when_extraction_manifest_touched_paths_is_null(tmp_pat
         json.dumps(
             {
                 "version": 1,
+                "source_branch": "feature/source",
+                "source_base_ref": "main",
                 "target_task_id": task.id,
                 "target_slug": task.slug,
                 "selected_paths": ["src/file.py"],
@@ -590,6 +864,8 @@ def test_run_marks_failed_when_extraction_manifest_patch_path_traverses_outside_
         json.dumps(
             {
                 "version": 1,
+                "source_branch": "feature/source",
+                "source_base_ref": "main",
                 "target_task_id": task.id,
                 "target_slug": task.slug,
                 "selected_paths": ["src/file.py"],
@@ -661,6 +937,8 @@ def test_run_marks_failed_when_extraction_manifest_patch_path_is_absolute(tmp_pa
         json.dumps(
             {
                 "version": 1,
+                "source_branch": "feature/source",
+                "source_base_ref": "main",
                 "target_task_id": task.id,
                 "target_slug": task.slug,
                 "selected_paths": ["src/file.py"],
@@ -732,6 +1010,8 @@ def test_run_marks_failed_when_extraction_patch_read_fails(tmp_path: Path) -> No
         json.dumps(
             {
                 "version": 1,
+                "source_branch": "feature/source",
+                "source_base_ref": "main",
                 "target_task_id": task.id,
                 "target_slug": task.slug,
                 "selected_paths": ["src/file.py"],

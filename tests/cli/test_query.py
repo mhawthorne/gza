@@ -7841,6 +7841,26 @@ class TestLineageCommand:
         normalized = " ".join(result.stdout.split())
         assert "Implement feature" in normalized
 
+    def test_lineage_shows_completed_task_with_completion_reason(self, tmp_path: Path):
+        """Lineage command shows completion_reason for completed tasks."""
+        from datetime import datetime
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Extraction already merged", task_type="implement")
+        task.status = "completed"
+        task.completion_reason = "EXTRACTION_ALREADY_MERGED"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("lineage", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "EXTRACTION_ALREADY_MERGED" in result.stdout
+        normalized = " ".join(result.stdout.split())
+        assert "Extraction already merged" in normalized
+
     def test_lineage_full_tree(self, tmp_path: Path):
         """Lineage command renders a multi-level tree with parent and children."""
         from datetime import datetime

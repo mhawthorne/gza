@@ -1434,7 +1434,7 @@ class TestExtractionGitHelpers:
                 check=False,
             )
 
-    def test_apply_patch_check_and_apply_patch_file(self, tmp_path: Path):
+    def test_apply_patch_file_uses_3way(self, tmp_path: Path):
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
         git = Git(repo_dir)
@@ -1442,8 +1442,5 @@ class TestExtractionGitHelpers:
         patch_file.write_text("diff --git a/a b/a\n")
 
         with patch.object(git, "_run") as mock_run:
-            git.apply_patch_check(patch_file)
             git.apply_patch_file(patch_file)
-
-            assert mock_run.call_args_list[0].args == ("apply", "--check", str(patch_file))
-            assert mock_run.call_args_list[1].args == ("apply", str(patch_file))
+            mock_run.assert_called_once_with("apply", "--3way", str(patch_file))

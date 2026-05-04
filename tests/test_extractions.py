@@ -11,6 +11,7 @@ from gza.extractions import (
     ExtractionError,
     _parse_file_summaries,
     copy_bundle_to_worktree,
+    load_manifest,
     infer_selected_paths,
     normalize_selected_paths,
     plan_extraction,
@@ -144,6 +145,10 @@ def test_plan_extraction_and_bundle_roundtrip(tmp_path: Path) -> None:
     assert (bundle_dir / "manifest.json").exists()
     assert (bundle_dir / "selected.patch").exists()
     assert (bundle_dir / "prompt.md").exists()
+    manifest = load_manifest(bundle_dir / "manifest.json")
+    assert manifest["source_branch"] == source_task.branch
+    assert manifest["source_base_ref"] == "main"
+    assert manifest["selected_paths"] == ["src/module.py"]
 
     worktree = tmp_path / "worktree"
     worktree.mkdir()
