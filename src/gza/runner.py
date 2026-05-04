@@ -116,6 +116,20 @@ def _interruption_metadata() -> dict[str, str]:
     return metadata
 
 
+def _resolve_failure_reason(
+    *,
+    error_type: str | None,
+    exit_code: int,
+    log_file: Path,
+) -> str | None:
+    """Return only structured failure reasons that are safe to branch on."""
+    if exit_code == 124:
+        return "TIMEOUT"
+    if error_type in ("max_turns", "max_steps"):
+        return "MAX_STEPS"
+    return None
+
+
 _TASK_EXECUTION_MODE_BY_INVOCATION_MODE: dict[str, str] = {
     "background_worker": "worker_background",
     "foreground_worker": "worker_foreground",
@@ -3570,25 +3584,14 @@ def _run_inner(
             task.session_id = result.session_id
             store.update(task)
 
-        # Handle failures - check error_type first, then exit codes
-        if result.error_type in ("max_turns", "max_steps"):
-            # Save WIP changes before marking failed
-            _save_wip_changes(task, worktree_git, config, branch_name)
-            task_footer(
-                task,
-                stats,
-                status=f"Failed: max steps of {task_config.max_steps} exceeded",
-                branch=branch_name,
-                store=store,
-            )
-            # Check log for agent-written marker; prefer MAX_STEPS for provider-detected over-budget failures.
-            detected = extract_failure_reason(log_file)
-            failure_reason = detected if detected != "UNKNOWN" else "MAX_STEPS"
-            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: failed (max_steps)", "exit_code": result.exit_code, "failure_reason": failure_reason})
-            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
-            return 0
-        elif exit_code == 124:
+        structured_failure_reason = _resolve_failure_reason(
+            error_type=result.error_type,
+            exit_code=exit_code,
+            log_file=log_file,
+        )
+
+        # Only structured host/provider signals select the dedicated failure branches.
+        if structured_failure_reason == "TIMEOUT":
             # Save WIP changes before marking failed
             _save_wip_changes(task, worktree_git, config, branch_name)
             task_footer(
@@ -3598,11 +3601,23 @@ def _run_inner(
                 branch=branch_name,
                 store=store,
             )
-            detected = extract_failure_reason(log_file)
-            failure_reason = detected if detected != "UNKNOWN" else "TIMEOUT"
-            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (timeout after {config.timeout_minutes}m)", "exit_code": exit_code, "failure_reason": failure_reason})
+            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (timeout after {config.timeout_minutes}m)", "exit_code": exit_code, "failure_reason": structured_failure_reason})
             write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=structured_failure_reason)
+            return 0
+        elif structured_failure_reason == "MAX_STEPS":
+            # Save WIP changes before marking failed
+            _save_wip_changes(task, worktree_git, config, branch_name)
+            task_footer(
+                task,
+                stats,
+                status=f"Failed: max steps of {task_config.max_steps} exceeded",
+                branch=branch_name,
+                store=store,
+            )
+            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: failed (max_steps)", "exit_code": result.exit_code, "failure_reason": structured_failure_reason})
+            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=structured_failure_reason)
             return 0
         elif exit_code != 0:
             # Save WIP changes before marking failed
@@ -3852,22 +3867,14 @@ def _run_non_code_task(
             task.session_id = result.session_id
             store.update(task)
 
-        # Handle failures - check error_type first, then exit codes
-        if result.error_type in ("max_turns", "max_steps"):
-            task_footer(
-                task,
-                stats,
-                status=f"Failed: max steps of {config.max_steps} exceeded",
-                worktree=worktree_path,
-                store=store,
-            )
-            detected = extract_failure_reason(log_file)
-            failure_reason = detected if detected != "UNKNOWN" else "MAX_STEPS"
-            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: failed (max_steps)", "exit_code": result.exit_code, "failure_reason": failure_reason})
-            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=failure_reason)
-            return 0
-        elif exit_code == 124:
+        structured_failure_reason = _resolve_failure_reason(
+            error_type=result.error_type,
+            exit_code=exit_code,
+            log_file=log_file,
+        )
+
+        # Only structured host/provider signals select the dedicated failure branches.
+        if structured_failure_reason == "TIMEOUT":
             task_footer(
                 task,
                 stats,
@@ -3875,10 +3882,21 @@ def _run_non_code_task(
                 worktree=worktree_path,
                 store=store,
             )
-            failure_reason = extract_failure_reason(log_file)
-            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (timeout after {config.timeout_minutes}m)", "exit_code": exit_code, "failure_reason": failure_reason})
+            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (timeout after {config.timeout_minutes}m)", "exit_code": exit_code, "failure_reason": structured_failure_reason})
             write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=failure_reason)
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=structured_failure_reason)
+            return 0
+        elif structured_failure_reason == "MAX_STEPS":
+            task_footer(
+                task,
+                stats,
+                status=f"Failed: max steps of {config.max_steps} exceeded",
+                worktree=worktree_path,
+                store=store,
+            )
+            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: failed (max_steps)", "exit_code": result.exit_code, "failure_reason": structured_failure_reason})
+            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
+            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=structured_failure_reason)
             return 0
         elif exit_code != 0:
             task_footer(
