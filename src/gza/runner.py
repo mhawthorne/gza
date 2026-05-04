@@ -45,7 +45,7 @@ from .extractions import (
     parse_patch_touched_paths,
     resolve_manifest_patch_path,
 )
-from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
+from .git import Git, GitApplyResult, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
 from .lineage import get_plan_for_task
@@ -1993,6 +1993,28 @@ def _write_runtime_patch_file(bundle_dir: Path, filename: str, patch_text: str) 
     return patch_path
 
 
+_UNMERGED_PORCELAIN_STATUSES = frozenset({"DD", "AU", "UD", "UA", "DU", "AA", "UU"})
+
+
+def _git_apply_failure_message(patch_path: Path, result: GitApplyResult) -> str:
+    """Format a consistent error message for failed patch applications."""
+    error_output = result.error_output
+    return f"git apply --3way {patch_path} failed:\n{error_output}"
+
+
+def _apply_left_relevant_conflicts(
+    worktree_git: Git,
+    touched_paths: set[str],
+) -> bool:
+    """Return True when `git apply --3way` left unmerged entries on seeded paths."""
+    for status, path in worktree_git.status_porcelain():
+        if path not in touched_paths:
+            continue
+        if status in _UNMERGED_PORCELAIN_STATUSES:
+            return True
+    return False
+
+
 def _seed_extraction_bundle_if_present(
     task: Task,
     config: Config,
@@ -2131,7 +2153,26 @@ def _seed_extraction_bundle_if_present(
             "selected.runtime.patch",
             current_patch_text,
         )
-        worktree_git.apply_patch_file(runtime_patch_path)
+        apply_result = worktree_git.apply_patch_file_result(runtime_patch_path)
+        if apply_result.returncode != 0:
+            if _apply_left_relevant_conflicts(worktree_git, set(current_touched_paths)):
+                write_log_entry(
+                    log_file,
+                    {
+                        "type": "gza",
+                        "subtype": "warning",
+                        "message": (
+                            f"Applied extraction seed bundle from {project_bundle_dir.relative_to(config.project_dir)} "
+                            f"using runtime re-derived patch with conflicts ({len(current_touched_paths)} files); "
+                            "provider must resolve conflict markers"
+                        ),
+                        "seeded_paths": sorted(current_touched_paths),
+                        "patch_source": "rederived",
+                        "apply_conflicts": True,
+                    },
+                )
+                return ExtractionSeedResult(seeded_paths=frozenset(current_touched_paths))
+            raise GitError(_git_apply_failure_message(runtime_patch_path, apply_result))
         write_log_entry(
             log_file,
             {
@@ -2162,7 +2203,9 @@ def _seed_extraction_bundle_if_present(
             "stored_hunk_count": stored_hunk_count,
         },
     )
-    worktree_git.apply_patch_file(patch_path)
+    apply_result = worktree_git.apply_patch_file_result(patch_path)
+    if apply_result.returncode != 0:
+        raise GitError(_git_apply_failure_message(patch_path, apply_result))
     write_log_entry(
         log_file,
         {

@@ -4778,11 +4778,13 @@ def _drop_tasks_column(db_path: Path, column_name: str) -> None:
     """Rebuild the tasks table without a specific column."""
     import sqlite3
 
+    def _quote(column: str) -> str:
+        return f'"{column}"' if column in ("group",) else column
+
     conn = sqlite3.connect(db_path)
     conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
     cols = [row[1] for row in conn.execute("PRAGMA table_info(tasks_old)")]
     kept_cols = [c for c in cols if c != column_name]
-    _quote = lambda c: f'"{c}"' if c in ("group",) else c
     cols_str = ", ".join(_quote(c) for c in kept_cols)
     col_defs = []
     pragma_rows = list(conn.execute("PRAGMA table_info(tasks_old)"))
@@ -5096,8 +5098,6 @@ class TestSharedDbIsolationAndImportGating:
         assert "Conflicting task IDs already exist" in conflict.stderr
 
     def test_import_local_db_conflicts_on_non_key_field_drift(self, tmp_path: Path) -> None:
-        from gza.config import Config
-
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
@@ -5570,6 +5570,39 @@ class TestSharedDbIsolationAndImportGating:
         assert row is not None
         assert row[0] == legacy_task.id
 
+    def test_import_local_db_dry_run_pre_v40_missing_completion_reason_defaults_null(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportdryrun05\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_task = legacy_store.add("legacy task before v40")
+        _drop_tasks_column(local_db, "completion_reason")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config, dry_run=True)
+
+        assert result["status"] == "dry_run"
+        assert result["local_task_count"] == 1
+        with sqlite3.connect(local_db) as conn:
+            row = conn.execute("SELECT id FROM tasks").fetchone()
+        assert row is not None
+        assert row[0] == legacy_task.id
+
     def test_import_local_db_pre_v37_missing_create_pr_imports_with_false(self, tmp_path: Path) -> None:
         from gza.config import Config
 
@@ -5598,6 +5631,38 @@ class TestSharedDbIsolationAndImportGating:
         imported = shared_store.get(legacy_task.id)
         assert imported is not None
         assert imported.create_pr is False
+
+    def test_import_local_db_pre_v40_missing_completion_reason_imports_with_null(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimport04\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_task = legacy_store.add("legacy task before v40")
+        _drop_tasks_column(local_db, "completion_reason")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config)
+        assert result["status"] == "imported"
+
+        shared_store = SqliteTaskStore.from_config(config)
+        imported = shared_store.get(legacy_task.id)
+        assert imported is not None
+        assert imported.completion_reason is None
 
     def test_import_local_db_dry_run_errors_cleanly_when_shared_db_uninitialized(self, tmp_path: Path) -> None:
         project_dir = tmp_path / "project"
@@ -6465,13 +6530,15 @@ class TestSharedDbIsolationAndImportGating:
         _run_v25_v26_v27_migrations(db_path, "gza")
 
         # Simulate a v27 DB where attach columns are missing by dropping them
+        def _quote(column: str) -> str:
+            return f'"{column}"' if column in ("group",) else column
+
         conn = sqlite3.connect(db_path)
         # SQLite doesn't support DROP COLUMN easily; recreate without the columns
         conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
         # Get existing columns minus attach ones
         cols = [row[1] for row in conn.execute("PRAGMA table_info(tasks_old)")]
         kept_cols = [c for c in cols if c not in ("attach_count", "attach_duration_seconds")]
-        _quote = lambda c: f'"{c}"' if c in ("group",) else c
         cols_str = ", ".join(_quote(c) for c in kept_cols)
         # Recreate with same columns minus attach
         col_defs = []

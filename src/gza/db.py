@@ -4801,6 +4801,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "pr_state": "NULL",
         "pr_last_synced_at": "NULL",
         "sync_last_synced_at": "NULL",
+        "completion_reason": "NULL",
     }
     project_id, project_prefix = _project_identity_from_config(config)
 

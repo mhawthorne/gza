@@ -2,12 +2,27 @@
 
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 
 class GitError(Exception):
     """Git operation failed."""
     pass
+
+
+@dataclass(frozen=True)
+class GitApplyResult:
+    """Outcome of ``git apply --3way`` without forcing exception control flow."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+
+    @property
+    def error_output(self) -> str:
+        """Best-effort human-readable command output for failures."""
+        return self.stderr or self.stdout
 
 
 def _unquote_c_style_path(path: str) -> str:
@@ -80,6 +95,8 @@ def _split_rename_paths(pathspec: str) -> tuple[str, str] | None:
             return pathspec[:i], pathspec[i + 4:]
 
     return None
+
+
 def parse_diff_numstat(numstat_output: str) -> tuple[int, int, int]:
     """Parse --numstat output into (files_changed, lines_added, lines_removed).
 
@@ -532,9 +549,23 @@ class Git:
         result = self._run(*args, check=False)
         return result.stdout
 
+    def apply_patch_file_result(self, patch_file: Path) -> GitApplyResult:
+        """Run ``git apply --3way`` and return the raw result."""
+        result = self._run("apply", "--3way", str(patch_file), check=False)
+        return GitApplyResult(
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+
     def apply_patch_file(self, patch_file: Path) -> None:
         """Apply a patch file with ``git apply --3way``."""
-        self._run("apply", "--3way", str(patch_file))
+        result = self.apply_patch_file_result(patch_file)
+        if result.returncode != 0:
+            error_output = result.error_output
+            raise GitError(
+                f"git apply --3way {patch_file} failed:\n{error_output}"
+            )
 
     def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
         """Check if a branch has been merged into another branch.
