@@ -4756,7 +4756,7 @@ def test_cmd_watch_restart_failed_dry_run_hides_skipped_by_default_and_sorts_old
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Recovery dry-run should show only actionable entries by default, oldest created first."""
+    """Recovery dry-run should print shared attention rows by default and hide ordinary skips."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -4767,13 +4767,46 @@ def test_cmd_watch_restart_failed_dry_run_hides_skipped_by_default_and_sorts_old
     older.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
     store.update(older)
 
-    skipped = store.add("Skipped failed review", task_type="review")
-    assert skipped.id is not None
-    skipped.status = "failed"
-    skipped.failure_reason = "MAX_TURNS"
-    skipped.session_id = "sess-skip"
-    skipped.completed_at = datetime(2026, 4, 28, 12, 0, 0, tzinfo=UTC)
-    store.update(skipped)
+    manual = store.add("Manual failed implement", task_type="implement")
+    assert manual.id is not None
+    manual.status = "failed"
+    manual.failure_reason = "TEST_FAILURE"
+    manual.completed_at = datetime(2026, 4, 28, 10, 30, 0, tzinfo=UTC)
+    store.update(manual)
+
+    exhausted_root = store.add("Failed resume root", task_type="implement")
+    assert exhausted_root.id is not None
+    exhausted_root.status = "failed"
+    exhausted_root.failure_reason = "MAX_TURNS"
+    exhausted_root.session_id = "sess-exhausted"
+    exhausted_root.branch = "feature/exhausted"
+    exhausted_root.completed_at = datetime(2026, 4, 28, 10, 45, 0, tzinfo=UTC)
+    store.update(exhausted_root)
+
+    exhausted_child = store.add("Failed resume attempt", task_type="implement", based_on=exhausted_root.id)
+    assert exhausted_child.id is not None
+    exhausted_child.status = "failed"
+    exhausted_child.failure_reason = "MAX_TURNS"
+    exhausted_child.session_id = exhausted_root.session_id
+    exhausted_child.branch = exhausted_root.branch
+    exhausted_child.completed_at = datetime(2026, 4, 28, 10, 50, 0, tzinfo=UTC)
+    store.update(exhausted_child)
+
+    hidden_skip = store.add("Pending retry already queued", task_type="implement")
+    assert hidden_skip.id is not None
+    hidden_skip.status = "failed"
+    hidden_skip.failure_reason = "MAX_TURNS"
+    hidden_skip.session_id = "sess-hidden"
+    hidden_skip.branch = "feature/hidden"
+    hidden_skip.completed_at = datetime(2026, 4, 28, 10, 55, 0, tzinfo=UTC)
+    store.update(hidden_skip)
+
+    pending_retry = store.add("Pending retry already queued", task_type="implement", based_on=hidden_skip.id)
+    assert pending_retry.id is not None
+    pending_retry.status = "pending"
+    pending_retry.completed_at = None
+    pending_retry.branch = "feature/hidden-retry"
+    store.update(pending_retry)
 
     newer = store.add("Newer failed plan", task_type="plan")
     assert newer.id is not None
@@ -4803,16 +4836,24 @@ def test_cmd_watch_restart_failed_dry_run_hides_skipped_by_default_and_sorts_old
 
     assert rc == 0
     stdout = capsys.readouterr().out
-    assert skipped.id in stdout
+    normalized = " ".join(stdout.split())
     assert stdout.index(older.id) < stdout.index(newer.id)
-    assert "0 skipped hidden" in stdout
+    assert "Needs attention" in stdout
+    assert hidden_skip.id not in stdout
+    assert f'{manual.id} implement "Manual failed implement" reason=manual-failure-reason' in normalized
+    assert "TEST_FAILURE requires manual intervention" in normalized
+    assert f'{exhausted_child.id} implement "Failed resume attempt" reason=max-resume-attempts-reached' in normalized
+    assert "automatic recovery stops here; manual review required" in normalized
+    assert f"{exhausted_root.id} implement" in normalized
+    assert "reason=newer-failed-recovery-descendant-needs-attention" in normalized
+    assert "2 actionable (0 resume, 2 retry), 3 needs attention, 1 skipped hidden" in normalized
 
 
 def test_cmd_watch_restart_failed_dry_run_show_skipped_includes_skipped_entries(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """--show-skipped should include skipped recovery decisions in the dry-run report."""
+    """--show-skipped should include ordinary skipped recovery decisions that are hidden by default."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -4823,13 +4864,20 @@ def test_cmd_watch_restart_failed_dry_run_show_skipped_includes_skipped_entries(
     actionable.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
     store.update(actionable)
 
-    skipped = store.add("Failed review", task_type="review")
+    skipped = store.add("Failed implement", task_type="implement")
     assert skipped.id is not None
     skipped.status = "failed"
     skipped.failure_reason = "MAX_TURNS"
     skipped.session_id = "sess-skip"
+    skipped.branch = "feature/skipped"
     skipped.completed_at = datetime(2026, 4, 28, 11, 0, 0, tzinfo=UTC)
     store.update(skipped)
+
+    pending_retry = store.add("Pending retry already queued", task_type="implement", based_on=skipped.id)
+    assert pending_retry.id is not None
+    pending_retry.status = "pending"
+    pending_retry.branch = "feature/skipped-retry"
+    store.update(pending_retry)
 
     args = argparse.Namespace(
         project_dir=tmp_path,
@@ -4854,7 +4902,8 @@ def test_cmd_watch_restart_failed_dry_run_show_skipped_includes_skipped_entries(
     stdout = capsys.readouterr().out
     assert skipped.id in stdout
     assert stdout.index(actionable.id) < stdout.index(skipped.id)
-    assert "0 skipped" in stdout
+    assert "reason=recovery_already_pending" in stdout
+    assert "1 skipped" in stdout
 
 
 def test_cmd_watch_restart_failed_dry_run_saturates_retry_resume_attempt_display(
@@ -4910,8 +4959,9 @@ def test_cmd_watch_restart_failed_dry_run_saturates_retry_resume_attempt_display
     assert rc == 0
     stdout = capsys.readouterr().out
     assert "attempt=3/2" not in stdout
-    resumed_retry_line = next(line for line in stdout.splitlines() if resumed_retry.id in line)
-    assert "attempt=2/2" in resumed_retry_line
+    normalized = " ".join(stdout.split())
+    assert f'{resumed_retry.id} plan "Root failed plan" reason=max-resume-attempts-reached' in normalized
+    assert "automatic recovery stops here; manual review required" in normalized
 
 
 def test_collect_unhandled_failures_skips_actionable_recovery_failures(tmp_path: Path) -> None:

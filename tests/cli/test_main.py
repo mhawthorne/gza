@@ -379,8 +379,8 @@ class TestHelpOutput:
         assert "Override `max_resume_attempts` for this watch run: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared policy used by both plain watch and `--restart-failed`" in docs_text
         assert "`uv run gza watch --restart-failed --dry-run` is the recovery inspection surface" in docs_text
         assert "oldest-created failed task first" in docs_text
-        assert "Skipped tasks are hidden by default" in docs_text
-        assert "`--show-skipped` to include them" in docs_text
+        assert "Ordinary skipped tasks stay hidden by default" in docs_text
+        assert "`--show-skipped` to include those non-attention skips" in docs_text
         assert "live watch logs" in docs_text
 
         assert "`uv run gza watch --restart-failed --dry-run`" in failed_tasks_docs

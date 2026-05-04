@@ -283,5 +283,5 @@ When `--restart-failed` is enabled:
 - Watch evaluates failed tasks through the shared recovery engine before starting fresh pending work
 - Recovery work is recovery-first: actionable failed tasks drain before pending queue pickup, and newly failed actionable tasks continue to outrank pending work for that session
 - Implement recovery launches through iterate-aware execution; non-implement recovery launches through plain worker execution
-- `gza watch --restart-failed --dry-run` prints the failed-task recovery decision report and exits
+- `gza watch --restart-failed --dry-run` prints the failed-task recovery decision report, including shared `Needs attention` rows by default, and exits
 - `--max-resume-attempts` applies to all unattended watch-managed resume/retry decisions for that run, including plain watch, failed-task recovery, and advance-driven improve recovery

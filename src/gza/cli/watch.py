@@ -47,6 +47,7 @@ from ._common import (
     set_task_urgency,
 )
 from .advance_engine import (
+    NEEDS_ATTENTION_LABEL,
     classify_advance_action,
     determine_next_action,
     failed_recovery_decision_to_action,
@@ -100,6 +101,29 @@ def _watch_skip_message(task: DbTask, action: dict) -> str:
 
 def _watch_needs_attention_message(task: DbTask, action: dict) -> str:
     return format_needs_attention_entry_for_display(task, action=action)
+
+
+def _failed_recovery_attention_action(
+    *,
+    store: SqliteTaskStore,
+    task: DbTask,
+    decision: FailedRecoveryDecision,
+    max_recovery_attempts: int,
+) -> dict[str, object] | None:
+    attention_reason = get_failed_recovery_needs_attention_reason(
+        store,
+        task,
+        decision=decision,
+        max_recovery_attempts=max_recovery_attempts,
+    )
+    failed_action = failed_recovery_decision_to_action(
+        task,
+        decision,
+        needs_attention_reason=attention_reason,
+    )
+    if classify_advance_action(failed_action) != "needs_attention":
+        return None
+    return failed_action
 
 
 @dataclass(frozen=True)
@@ -520,7 +544,9 @@ def _emit_recovery_dry_run_report(
     print(f"Failed recovery plan (tags={scope}, mode=restart-failed)")
     print()
     actionable = resume = retry = 0
+    attention_rows: list[tuple[DbTask, dict[str, object]]] = []
     skipped = 0
+    hidden_skipped = 0
     for task in failed_tasks:
         if task.id is None:
             continue
@@ -537,6 +563,15 @@ def _emit_recovery_dry_run_report(
             if decision.action == "retry":
                 retry += 1
             continue
+        attention_action = _failed_recovery_attention_action(
+            store=store,
+            task=task,
+            decision=decision,
+            max_recovery_attempts=max_recovery_attempts,
+        )
+        if attention_action is not None:
+            attention_rows.append((task, attention_action))
+            continue
         skipped += 1
         if show_skipped:
             launch = decision.launch_mode
@@ -544,13 +579,24 @@ def _emit_recovery_dry_run_report(
                 f"{decision.action:<6} {task.id} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
                 f"attempt={decision.attempt_index}/{decision.attempt_limit}"
             )
+        else:
+            hidden_skipped += 1
+    if attention_rows:
+        print()
+        print(f"{NEEDS_ATTENTION_LABEL} ({len(attention_rows)} task{'s' if len(attention_rows) != 1 else ''}):")
+        for task, action in attention_rows:
+            print(f"  {_watch_needs_attention_message(task, action)}")
     print()
+    skipped_summary = skipped if show_skipped else hidden_skipped
     if show_skipped:
-        print(f"Summary: {actionable} actionable ({resume} resume, {retry} retry), {skipped} skipped")
+        print(
+            f"Summary: {actionable} actionable ({resume} resume, {retry} retry), "
+            f"{len(attention_rows)} needs attention, {skipped_summary} skipped"
+        )
     else:
         print(
             f"Summary: {actionable} actionable ({resume} resume, {retry} retry), "
-            f"{skipped} skipped hidden"
+            f"{len(attention_rows)} needs attention, {skipped_summary} skipped hidden"
         )
     return _RecoveryReport(actionable_count=actionable, resume_count=resume, retry_count=retry)
 
@@ -1023,20 +1069,18 @@ def _run_cycle(
         decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
         failed_decisions.append((failed, decision))
         if decision.action == "skip":
-            attention_reason = get_failed_recovery_needs_attention_reason(
-                store,
-                failed,
+            failed_action = _failed_recovery_attention_action(
+                store=store,
+                task=failed,
                 decision=decision,
                 max_recovery_attempts=max_recovery_attempts,
             )
-            failed_action = failed_recovery_decision_to_action(
-                failed,
-                decision,
-                needs_attention_reason=attention_reason,
-            )
-            if classify_advance_action(failed_action) == "needs_attention":
+            if failed_action is not None:
                 log.emit_attention(
-                    attention_key=f"recovery-attention:{failed.id}:{attention_reason or decision.reason_code}",
+                    attention_key=(
+                        f"recovery-attention:{failed.id}:"
+                        f"{failed_action.get('needs_attention_reason') or decision.reason_code}"
+                    ),
                     message=_watch_needs_attention_message(failed, failed_action),
                 )
                 continue

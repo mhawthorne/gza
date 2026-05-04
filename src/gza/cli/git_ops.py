@@ -1931,11 +1931,6 @@ def cmd_advance(args: argparse.Namespace) -> int:
         for task, action in plan
         if classify_advance_action(action) == "needs_attention"
     ]
-    actionable_plan = [
-        (task, action)
-        for task, action in plan
-        if classify_advance_action(action) == "actionable"
-    ]
 
     def _print_needs_attention_section(items: list[tuple[DbTask, dict]]) -> None:
         if not items:
@@ -1947,16 +1942,38 @@ def cmd_advance(args: argparse.Namespace) -> int:
             _color = _advance_action_color(aaction["type"])
             console.print(f"  [{_color}]{_format_needs_attention_line(atask, aaction)}[/{_color}]")
 
+    preview_context = _build_action_context(dry_run_mode=True)
+    preview_attention_plan = list(attention_plan)
+    preview_actionable_rows: list[tuple[DbTask, dict[str, Any], str]] = []
+
+    for task, action in plan:
+        if classify_advance_action(action) != "actionable":
+            continue
+        description = action["description"]
+        if action["type"] in {"merge", "merge_with_followups"} and dry_run:
+            commit_count = _auto_squash_commit_count(config, git, task, target_branch)
+            if commit_count is not None:
+                description = f"{description} (auto-squash, {commit_count} commits)"
+        elif is_worker_consuming_advance_action(action["type"]):
+            preview_result = execute_advance_action(task=task, action=action, context=preview_context)
+            attention = resolve_execution_needs_attention(task, preview_result)
+            if attention is not None:
+                preview_attention_plan.append((attention.task, attention.action))
+                continue
+            if preview_result.status == "dry_run" and preview_result.message:
+                description = preview_result.message
+        preview_actionable_rows.append((task, action, description))
+
     # If the plan is empty or every item is a skip, there's nothing actionable
     # (unless --new is set, in which case we still want to start pending tasks).
-    if not actionable_plan:
+    if not preview_actionable_rows and not dry_run:
         if not new_mode:
             print("No eligible tasks to advance")
-            _print_needs_attention_section(attention_plan)
+            _print_needs_attention_section(preview_attention_plan)
             if plan:
                 print()
                 for task, action in plan:
-                    if classify_advance_action(action) == "needs_attention":
+                    if classify_advance_action(action) != "skip":
                         continue
                     prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
                     console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
@@ -1965,9 +1982,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print()
             return 0
         else:
-            # --new with no existing actions: skip straight to spawning new tasks
+            if preview_attention_plan:
+                _print_needs_attention_section(preview_attention_plan)
+                print()
             if plan:
                 for task, action in plan:
+                    if classify_advance_action(action) != "skip":
+                        continue
                     prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
                     console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action['type'])
@@ -1975,31 +1996,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print()
 
     if dry_run:
-        dry_run_context = _build_action_context(dry_run_mode=True)
-        dry_run_attention_plan = list(attention_plan)
-        dry_run_actionable_rows: list[tuple[DbTask, dict[str, Any], str]] = []
-
-        for task, action in plan:
-            if classify_advance_action(action) != "actionable":
-                continue
-            description = action['description']
-            if action['type'] in {'merge', 'merge_with_followups'}:
-                commit_count = _auto_squash_commit_count(config, git, task, target_branch)
-                if commit_count is not None:
-                    description = f"{description} (auto-squash, {commit_count} commits)"
-            elif is_worker_consuming_advance_action(action['type']):
-                dry_result = execute_advance_action(task=task, action=action, context=dry_run_context)
-                attention = resolve_execution_needs_attention(task, dry_result)
-                if attention is not None:
-                    dry_run_attention_plan.append((attention.task, attention.action))
-                    continue
-                if dry_result.status == "dry_run" and dry_result.message:
-                    description = dry_result.message
-            dry_run_actionable_rows.append((task, action, description))
-
-        if dry_run_actionable_rows:
-            print(f"Would advance {len(dry_run_actionable_rows)} task(s):\n")
-            for task, action, description in dry_run_actionable_rows:
+        if preview_actionable_rows:
+            print(f"Would advance {len(preview_actionable_rows)} task(s):\n")
+            for task, action, description in preview_actionable_rows:
                 prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
                 console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                 _color = _advance_action_color(action['type'])
@@ -2007,9 +2006,22 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print()
         else:
             print("No eligible tasks to advance")
-        _print_needs_attention_section(dry_run_attention_plan)
+        _print_needs_attention_section(preview_attention_plan)
+        if plan:
+            skip_rows_printed = False
+            for task, action in plan:
+                if classify_advance_action(action) != "skip":
+                    continue
+                if not skip_rows_printed:
+                    print()
+                    skip_rows_printed = True
+                prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
+                console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                _color = _advance_action_color(action['type'])
+                console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+                print()
         if new_mode and batch_limit is not None:
-            planned_workers = count_worker_consuming_actions([action for _, action, _ in dry_run_actionable_rows])
+            planned_workers = count_worker_consuming_actions([action for _, action, _ in preview_actionable_rows])
             remaining = max(0, batch_limit - planned_workers)
             if remaining > 0:
                 pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
@@ -2025,27 +2037,25 @@ def cmd_advance(args: argparse.Namespace) -> int:
         return 0
 
     # Show the plan and prompt for confirmation
-    if actionable_plan:
-        print(f"Will advance {len(actionable_plan)} task(s):\n")
-        for task, action in plan:
-            if classify_advance_action(action) != "actionable":
-                continue
+    if preview_actionable_rows:
+        print(f"Will advance {len(preview_actionable_rows)} task(s):\n")
+        for task, action, description in preview_actionable_rows:
             prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
             console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             _color = _advance_action_color(action['type'])
-            console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+            console.print(f"      [{_color}]→ {description}[/{_color}]")
             print()
-        if attention_plan:
-            _print_needs_attention_section(attention_plan)
+        if preview_attention_plan:
+            _print_needs_attention_section(preview_attention_plan)
             print()
-    elif attention_plan:
+    elif preview_attention_plan:
         print("No eligible tasks to advance")
-        _print_needs_attention_section(attention_plan)
+        _print_needs_attention_section(preview_attention_plan)
         print()
 
     new_pending_tasks: list = []
     if new_mode and batch_limit is not None:
-        planned_workers = count_worker_consuming_actions([action for _, action in plan])
+        planned_workers = count_worker_consuming_actions([action for _, action, _ in preview_actionable_rows])
         remaining = max(0, batch_limit - planned_workers)
         if remaining > 0:
             new_pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
@@ -2057,7 +2067,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     console.print(f"      [{_c_default}]→ Start new worker[/{_c_default}]")
                     print()
 
-    if not auto and (actionable_plan or new_mode):
+    if not auto and (preview_actionable_rows or new_mode):
         try:
             answer = input("Proceed? [Y/n] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
