@@ -2354,12 +2354,17 @@ class TestAdvanceCommand:
         action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'create_review'
 
-    def test_advance_failed_review_is_treated_as_unreviewed(self, tmp_path: Path):
-        """Failed review tasks should not block creating a required review."""
+    def test_advance_dry_run_failed_review_lineage_has_single_planned_action(self, tmp_path: Path):
+        """advance --dry-run should not plan failed review recovery separately from its root."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
-        git = self._setup_git_repo(tmp_path)
-        task = self._create_implement_task_with_branch(store, git, tmp_path)
+        task = store.add("Implement feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feat/failed-review-lineage"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
 
         failed_review = store.add(
             f"Review {task.id}",
@@ -2367,13 +2372,240 @@ class TestAdvanceCommand:
             depends_on=task.id,
         )
         failed_review.status = "failed"
+        failed_review.failure_reason = "MAX_TURNS"
+        failed_review.session_id = "sess-failed-review"
         failed_review.completed_at = datetime.now(UTC)
-        failed_review.output_content = "**Verdict: APPROVED**"
         store.update(failed_review)
 
-        config = Config.load(tmp_path)
-        action = evaluate_advance_rules(config, store, git, task, "main")
-        assert action['type'] == 'create_review'
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=True,
+            auto=False,
+            max=None,
+            no_docker=True,
+            batch=None,
+            force=False,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            new=False,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+
+        output = stdout.getvalue()
+        assert rc == 0
+        assert "Would advance 1 task(s)" in output
+        assert "Create review (required before merge)" in output
+        assert str(failed_review.id) not in output
+        assert "Resume failed task (MAX_TURNS)" not in output
+
+    def test_advance_auto_failed_improve_retry_creates_single_child(self, tmp_path: Path):
+        """advance --auto creates one retry child when root improve flow owns recovery."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feat/failed-improve-retry"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+        assert task.id is not None
+
+        review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(review)
+        assert review.id is not None
+
+        failed_improve = store.add(
+            f"Improve {task.id}",
+            task_type="improve",
+            based_on=task.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+        assert failed_improve.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            batch=None,
+            force=False,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            new=False,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)),
+            patch("gza.cli._spawn_background_worker", return_value=0) as spawn_worker,
+            patch("gza.cli._spawn_background_resume_worker", return_value=0),
+            patch("gza.cli._spawn_background_iterate_worker", return_value=0),
+        ):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        retry_children = [
+            child
+            for child in store.get_based_on_children(failed_improve.id)
+            if child.task_type == "improve"
+        ]
+        assert len(retry_children) == 1
+        assert spawn_worker.call_count == 1
+
+    def test_advance_dry_run_conflicted_root_with_failed_rebase_has_single_outcome(self, tmp_path: Path):
+        """advance --dry-run should not plan failed rebase recovery alongside root needs_discussion."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Conflicting feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feat/conflicted-with-failed-rebase"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+        failed_rebase = store.add(
+            "Rebase failed",
+            task_type="rebase",
+            based_on=task.id,
+            same_branch=True,
+        )
+        failed_rebase.status = "failed"
+        failed_rebase.failure_reason = "MAX_TURNS"
+        failed_rebase.session_id = "sess-failed-rebase"
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=True,
+            auto=False,
+            max=None,
+            no_docker=True,
+            batch=None,
+            force=False,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            new=False,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=False)),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+
+        output = stdout.getvalue()
+        assert rc == 0
+        assert "Would advance 1 task(s)" in output
+        assert "needs manual resolution" in output
+        assert "Resume failed task (MAX_TURNS)" not in output
+
+    def test_advance_dry_run_skips_all_failed_descendant_plan_rows_when_root_is_planned(self, tmp_path: Path):
+        """No failed descendant should appear as a second plan row when root already owns lifecycle."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feat/root-owned-lineage"
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+        assert task.id is not None
+
+        failed_review = store.add(
+            f"Review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        failed_review.status = "failed"
+        failed_review.failure_reason = "MAX_TURNS"
+        failed_review.session_id = "sess-root-owned-review"
+        failed_review.completed_at = datetime.now(UTC)
+        store.update(failed_review)
+
+        failed_improve = store.add(
+            f"Improve {task.id}",
+            task_type="improve",
+            based_on=task.id,
+            depends_on=failed_review.id,
+            same_branch=True,
+        )
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=True,
+            auto=False,
+            max=None,
+            no_docker=True,
+            batch=None,
+            force=False,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            new=False,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        with (
+            patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            rc = cmd_advance(args)
+
+        output = stdout.getvalue()
+        assert rc == 0
+        assert "Would advance 1 task(s)" in output
+        assert str(failed_review.id) not in output
+        assert str(failed_improve.id) not in output
 
     def _create_completed_improve(self, store, impl_task, review_task):
         """Create a completed improve task for the given impl and review tasks."""

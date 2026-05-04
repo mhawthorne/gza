@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import Any
 
 import gza.colors as _colors
-from gza.query import get_base_task_slug as _get_base_task_slug
+from gza.query import (
+    get_base_task_slug as _get_base_task_slug,
+    resolve_lineage_root as _resolve_lineage_root,
+)
 
 from ..colors import pink
 from ..commit_messages import build_task_commit_message
@@ -259,6 +262,14 @@ def _collect_advance_completed_tasks(
         tasks = [t for t in tasks if t.task_type == 'implement']
 
     return tasks, impl_based_on_ids
+
+
+def _lineage_root_task_id(store: SqliteTaskStore, task: DbTask) -> str | None:
+    """Return canonical lineage-root task id for a task."""
+    if task.id is None:
+        return None
+    root = _resolve_lineage_root(store, task)
+    return str(root.id) if root.id is not None else None
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
@@ -1801,6 +1812,22 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # Apply --max limit
     if max_tasks is not None:
         tasks = tasks[:max_tasks]
+
+    # Keep failed-task recovery on a single lineage owner. When a lineage root is
+    # already represented by a completed-task lifecycle action in this run, do not
+    # add failed descendants from that same lineage as separate recovery rows.
+    if failed_tasks and tasks:
+        root_ids_owned_by_completed = {
+            root_id
+            for task in tasks
+            if (root_id := _lineage_root_task_id(store, task)) is not None
+        }
+        if root_ids_owned_by_completed:
+            failed_tasks = [
+                failed_task
+                for failed_task in failed_tasks
+                if _lineage_root_task_id(store, failed_task) not in root_ids_owned_by_completed
+            ]
 
     # Use the currently checked-out branch as the target for conflict checks,
     # merge execution, and rebase task creation.

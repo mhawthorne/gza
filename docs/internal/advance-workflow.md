@@ -15,17 +15,17 @@ As a result, this change set includes iterate-facing contract alignment where ne
 ## Usage
 
 ```bash
-gza advance                        # Advance all eligible tasks
-gza advance <task-id>              # Advance a specific task
-gza advance --batch N              # Limit to N concurrent worker spawns
-gza advance --batch N --new        # Fill remaining batch slots with pending tasks
-gza advance --type plan            # Only advance plan tasks
-gza advance --type implement       # Only advance implement tasks
-gza advance --dry-run              # Show plan without executing
-gza advance --no-resume-failed     # Skip failed task resumption
-gza advance --max-resume-attempts N
-gza advance --max-review-cycles N
-gza advance --squash-threshold N
+uv run gza advance                        # Advance all eligible tasks
+uv run gza advance <task-id>              # Advance a specific task
+uv run gza advance --batch N              # Limit to N concurrent worker spawns
+uv run gza advance --batch N --new        # Fill remaining batch slots with pending tasks
+uv run gza advance --type plan            # Only advance plan tasks
+uv run gza advance --type implement       # Only advance implement tasks
+uv run gza advance --dry-run              # Show plan without executing
+uv run gza advance --no-resume-failed     # Skip failed task resumption
+uv run gza advance --max-resume-attempts N
+uv run gza advance --max-review-cycles N
+uv run gza advance --squash-threshold N
 ```
 
 ## Task Collection
@@ -34,7 +34,7 @@ Advance collects tasks from three sources:
 
 1. **Unmerged tasks**: `store.get_unmerged()` — completed tasks with `merge_status='unmerged'`. Excludes improve and rebase tasks that have a parent (`based_on IS NOT NULL`) since they operate on the parent's branch.
 
-2. **Failed-task recovery candidates**: Tasks from `store.list_failed_tasks_for_recovery(...)` that are evaluated by `decide_failed_task_recovery(...)` under the shared bounded policy. This policy can classify candidates as `resume`, `retry`, or manual review required; `--no-resume-failed` disables this source.
+2. **Failed-task recovery candidates**: Tasks from `store.list_failed_tasks_for_recovery(...)` that are evaluated by `decide_failed_task_recovery(...)` under the shared bounded policy. This policy can classify candidates as `resume`, `retry`, or manual review required; `--no-resume-failed` disables this source. When a completed lineage root is already being advanced in the same run, failed descendants from that lineage are excluded from this standalone sweep so one lineage gets one authoritative planned action.
 
 3. **Unimplemented plans**: Completed plan tasks with no implement child yet. Excluded when `--type implement`.
 
