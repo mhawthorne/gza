@@ -1915,6 +1915,35 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         )
         return final_task, rc, terminal_skip_decision
 
+    def _print_failed_recovery_attention_and_return(
+        failed_task: DbTask,
+        decision: FailedRecoveryDecision,
+        *,
+        fix_task_id: str,
+    ) -> int | None:
+        attention_result = build_failed_recovery_needs_attention_result(
+            store=store,
+            failed_task=failed_task,
+            recovery_decision=decision,
+            max_resume_attempts=effective_max_resume_attempts,
+        )
+        if attention_result is None:
+            return None
+        attention = resolve_execution_needs_attention(failed_task, attention_result)
+        if attention is None:
+            return None
+        print(
+            f"{NEEDS_ATTENTION_LABEL}: "
+            f"{format_needs_attention_entry_for_display(attention.task, action=attention.action, prefix=len(attention.task.id or '') + 4)}"
+        )
+        if attention.action.get("needs_attention_reason") in {
+            "review-max-cycles-reached",
+            "automatic-recovery-disabled",
+            "max-resume-attempts-reached",
+        }:
+            print(f"Recommended next step: uv run gza fix {fix_task_id}")
+        return 3
+
     # If the task is pending, run it first before entering the loop.
     if impl_task.status == "pending":
         if dry_run:
@@ -1922,8 +1951,16 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             return 0
 
         print(f"Running pending implementation {impl_task.id}...")
-        impl_task, rc, _terminal_skip_decision = _run_task_with_recovery(impl_task)
+        impl_task, rc, terminal_skip_decision = _run_task_with_recovery(impl_task)
         if rc != 0:
+            if terminal_skip_decision is not None:
+                exit_code = _print_failed_recovery_attention_and_return(
+                    impl_task,
+                    terminal_skip_decision,
+                    fix_task_id=impl_task_id,
+                )
+                if exit_code is not None:
+                    return exit_code
             print(f"Implementation {impl_task.id} failed (exit code {rc})")
             return 1
         assert impl_task.id is not None
@@ -1943,7 +1980,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             run_start_task, _decision = resume_start
             assert run_start_task.id is not None
             print(f"Resuming failed implementation {impl_task.id} as {run_start_task.id}...")
-            impl_task, rc, _terminal_skip_decision = _run_task_with_recovery(
+            impl_task, rc, terminal_skip_decision = _run_task_with_recovery(
                 run_start_task,
                 initial_resume=True,
             )
@@ -1955,9 +1992,17 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             run_start_task = _create_retry_task(store, impl_task)
             assert run_start_task.id is not None
             print(f"Retrying failed implementation {impl_task.id} as {run_start_task.id}...")
-            impl_task, rc, _terminal_skip_decision = _run_task_with_recovery(run_start_task)
+            impl_task, rc, terminal_skip_decision = _run_task_with_recovery(run_start_task)
 
         if rc != 0:
+            if terminal_skip_decision is not None:
+                exit_code = _print_failed_recovery_attention_and_return(
+                    impl_task,
+                    terminal_skip_decision,
+                    fix_task_id=impl_task_id,
+                )
+                if exit_code is not None:
+                    return exit_code
             action_label = "Resume" if use_resume else "Retry"
             print(f"{action_label} of {impl_task_id} failed (exit code {rc})")
             return 1

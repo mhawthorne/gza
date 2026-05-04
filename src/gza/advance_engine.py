@@ -160,6 +160,30 @@ def failed_recovery_decision_to_action(
     return action
 
 
+def failed_recovery_decision_to_attention_action(
+    store: SqliteTaskStore,
+    task: DbTask,
+    decision: FailedRecoveryDecision,
+    *,
+    max_recovery_attempts: int,
+) -> dict[str, Any] | None:
+    """Convert a terminal failed-task recovery stop into the shared attention action."""
+    attention_reason = get_failed_recovery_needs_attention_reason(
+        store,
+        task,
+        decision=decision,
+        max_recovery_attempts=max_recovery_attempts,
+    )
+    action = failed_recovery_decision_to_action(
+        task,
+        decision,
+        needs_attention_reason=attention_reason,
+    )
+    if classify_advance_action(action) != "needs_attention":
+        return None
+    return action
+
+
 def get_needs_attention_reason(action: Mapping[str, Any]) -> str | None:
     value = action.get("needs_attention_reason")
     if isinstance(value, str) and value:

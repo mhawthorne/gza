@@ -9,7 +9,10 @@ from typing import Any, Literal, Protocol
 from ..db import SqliteTaskStore, Task as DbTask
 from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_attention_reason
 from ._common import _create_improve_task, _create_retry_task, resolve_improve_action
-from .advance_engine import classify_advance_action
+from .advance_engine import (
+    classify_advance_action,
+    failed_recovery_decision_to_attention_action,
+)
 
 
 class CreateReviewActionResult(Protocol):
@@ -143,34 +146,28 @@ def build_failed_recovery_needs_attention_result(
     max_resume_attempts: int,
 ) -> AdvanceActionExecutionResult | None:
     """Build shared execution-time attention output for terminal recovery stops."""
-    attention_reason = get_failed_recovery_needs_attention_reason(
+    attention_action = failed_recovery_decision_to_attention_action(
         store,
         failed_task,
-        decision=recovery_decision,
+        recovery_decision,
         max_recovery_attempts=max_resume_attempts,
     )
-    if attention_reason is None:
+    if attention_action is None:
         return None
 
-    task_id = failed_task.id or "unknown"
-    task_type = failed_task.task_type or "task"
     if recovery_decision.reason_code == "automatic_recovery_disabled":
         attention_type = "automatic_recovery_disabled"
-        message = (
-            f"SKIP: automatic {task_type} recovery is disabled "
-            f"(max_resume_attempts={max_resume_attempts}); latest failed {task_type}: {task_id}"
-        )
     else:
         attention_type = "manual_review_required"
-        message = (
-            f"SKIP: {task_type} {task_id} requires manual review "
-            f"({recovery_decision.reason_text})"
-        )
+    attention_reason = attention_action.get("needs_attention_reason")
+    if not isinstance(attention_reason, str) or not attention_reason:
+        return None
+    task_type = failed_task.task_type or "task"
 
     return AdvanceActionExecutionResult(
         action_type=task_type,
         status="skip",
-        message=message,
+        message=str(attention_action.get("description", "")),
         failed_improve=failed_task if failed_task.task_type == "improve" else None,
         attention_type=attention_type,
         attention_reason=attention_reason,

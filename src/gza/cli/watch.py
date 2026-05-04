@@ -20,7 +20,6 @@ from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_act
 from ..recovery_engine import (
     FailedRecoveryDecision,
     decide_failed_task_recovery,
-    get_failed_recovery_needs_attention_reason,
     list_failed_tasks_for_recovery,
 )
 from ..sync_ops import reconcile_task_branch_merge_truth
@@ -50,7 +49,7 @@ from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
     classify_advance_action,
     determine_next_action,
-    failed_recovery_decision_to_action,
+    failed_recovery_decision_to_attention_action,
     format_needs_attention_entry_for_display,
 )
 from .advance_executor import (
@@ -110,20 +109,12 @@ def _failed_recovery_attention_action(
     decision: FailedRecoveryDecision,
     max_recovery_attempts: int,
 ) -> dict[str, object] | None:
-    attention_reason = get_failed_recovery_needs_attention_reason(
+    return failed_recovery_decision_to_attention_action(
         store,
         task,
-        decision=decision,
+        decision,
         max_recovery_attempts=max_recovery_attempts,
     )
-    failed_action = failed_recovery_decision_to_action(
-        task,
-        decision,
-        needs_attention_reason=attention_reason,
-    )
-    if classify_advance_action(failed_action) != "needs_attention":
-        return None
-    return failed_action
 
 
 @dataclass(frozen=True)
