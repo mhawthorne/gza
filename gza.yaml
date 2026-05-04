@@ -18,7 +18,7 @@ max_review_cycles: 10
 #provider: claude
 #model: claude-sonnet-4-6
 provider: codex
-model: gpt-5.3-codex
+model: gpt-5.4
 
 #task_types:
 #  plan:
