@@ -2305,7 +2305,7 @@ def main() -> int:
     set_status_parser.add_argument(
         "--reason",
         default=None,
-        help="Failure reason (only meaningful for failed status)",
+        help="Failure reason for failed status, or completion reason for completed status",
     )
     set_status_parser.add_argument(
         "--execution-mode",

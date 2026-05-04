@@ -45,7 +45,7 @@ from .extractions import (
     parse_patch_touched_paths,
     resolve_manifest_patch_path,
 )
-from .git import Git, GitError, cleanup_worktree_for_branch, parse_diff_numstat
+from .git import Git, GitApplyResult, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
 from .lineage import get_plan_for_task
@@ -71,6 +71,7 @@ from .task_slug import (
 logger = logging.getLogger(__name__)
 
 EXTRACTION_PRECHECK_FAILURE_REASON = "EXTRACTION_PRECHECK_FAILED"
+EXTRACTION_ALREADY_MERGED_COMPLETION_REASON = "EXTRACTION_ALREADY_MERGED"
 
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
 TERMINATED_FAILURE_REASON = "TERMINATED"
@@ -83,6 +84,14 @@ class RunInvocationContext:
     command: str
     execution_mode: str
     interaction_mode: str = "observe_only"
+
+
+@dataclass(frozen=True)
+class ExtractionSeedResult:
+    """Outcome of extraction bundle preflight/application."""
+
+    seeded_paths: frozenset[str] = frozenset()
+    completion_reason: str | None = None
 
 
 def _interruption_failure_reason() -> str:
@@ -1972,6 +1981,61 @@ def _copy_learnings_to_worktree(config: Config, worktree_path: Path) -> None:
     shutil.copy2(src, dst_dir / "learnings.md")
 
 
+def _count_patch_hunks(patch_text: str) -> int:
+    """Count unified-diff hunks in patch text."""
+    return sum(1 for line in patch_text.splitlines() if line.startswith("@@"))
+
+
+def _write_runtime_patch_file(bundle_dir: Path, filename: str, patch_text: str) -> Path:
+    """Persist a runtime-generated patch alongside the copied extraction bundle."""
+    patch_path = bundle_dir / filename
+    patch_path.write_text(patch_text)
+    return patch_path
+
+
+_UNMERGED_PORCELAIN_STATUSES = frozenset({"DD", "AU", "UD", "UA", "DU", "AA", "UU"})
+
+
+def _git_apply_failure_message(patch_path: Path, result: GitApplyResult) -> str:
+    """Format a consistent error message for failed patch applications."""
+    error_output = result.error_output
+    return f"git apply --3way {patch_path} failed:\n{error_output}"
+
+
+def _apply_left_relevant_conflicts(
+    worktree_git: Git,
+    touched_paths: set[str],
+) -> bool:
+    """Return True when `git apply --3way` left unmerged entries on seeded paths."""
+    for status, path in worktree_git.status_porcelain():
+        if path not in touched_paths:
+            continue
+        if status in _UNMERGED_PORCELAIN_STATUSES:
+            return True
+    return False
+
+
+def _already_merged_extraction_seed_result(
+    task: Task,
+    log_file: Path,
+    *,
+    message: str,
+) -> ExtractionSeedResult:
+    """Log and return the canonical extraction already-merged completion outcome."""
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "info",
+            "message": message,
+            "completion_reason": EXTRACTION_ALREADY_MERGED_COMPLETION_REASON,
+        },
+    )
+    return ExtractionSeedResult(
+        completion_reason=EXTRACTION_ALREADY_MERGED_COMPLETION_REASON,
+    )
+
+
 def _seed_extraction_bundle_if_present(
     task: Task,
     config: Config,
@@ -1980,14 +2044,14 @@ def _seed_extraction_bundle_if_present(
     log_file: Path,
     *,
     resume: bool,
-) -> set[str]:
+) -> ExtractionSeedResult:
     """Copy/apply extraction bundle before provider execution when configured for the task."""
     if resume or not task.slug:
-        return set()
+        return ExtractionSeedResult()
 
     project_bundle_dir = extraction_bundle_path(config.project_dir, task.slug)
     if not project_bundle_dir.exists():
-        return set()
+        return ExtractionSeedResult()
 
     worktree_bundle_dir = copy_bundle_to_worktree(project_bundle_dir, worktree_path)
     manifest = load_manifest(worktree_bundle_dir / MANIFEST_FILENAME)
@@ -2010,8 +2074,8 @@ def _seed_extraction_bundle_if_present(
     )
 
     patch_text = load_patch_text(patch_path)
-    touched_paths = parse_patch_touched_paths(patch_text)
-    if not touched_paths:
+    stored_touched_paths = parse_patch_touched_paths(patch_text)
+    if not stored_touched_paths:
         raise ExtractionError("Extraction patch has no touched file paths")
 
     declared_raw = manifest.get("touched_paths")
@@ -2030,14 +2094,164 @@ def _seed_extraction_bundle_if_present(
     if not declared_paths:
         raise ExtractionError("Extraction manifest is missing selected/touched path declarations")
 
-    unexpected = sorted(set(touched_paths) - declared_paths)
+    unexpected = sorted(set(stored_touched_paths) - declared_paths)
     if unexpected:
         raise ExtractionError(
             "Extraction patch touches undeclared paths: " + ", ".join(unexpected),
         )
 
-    worktree_git.apply_patch_check(patch_path)
-    worktree_git.apply_patch_file(patch_path)
+    selected_paths_raw = manifest.get("selected_paths")
+    if not isinstance(selected_paths_raw, (list, tuple)) or not selected_paths_raw:
+        raise ExtractionError("Extraction manifest selected_paths must be a non-empty list")
+    if any(not isinstance(path_value, str) or not path_value for path_value in selected_paths_raw):
+        raise ExtractionError("Extraction manifest selected_paths must contain non-empty strings")
+    selected_paths: tuple[str, ...] = tuple(selected_paths_raw)
+
+    source_branch = manifest.get("source_branch")
+    source_base_ref = manifest.get("source_base_ref")
+    if not isinstance(source_branch, str) or not source_branch:
+        raise ExtractionError("Extraction manifest missing required source_branch")
+    if not isinstance(source_base_ref, str) or not source_base_ref:
+        raise ExtractionError("Extraction manifest missing required source_base_ref")
+
+    stored_hunk_count = _count_patch_hunks(patch_text)
+    revision_range = f"{source_base_ref}...{source_branch}"
+
+    if worktree_git.ref_exists(source_branch):
+        if not worktree_git.ref_exists(source_base_ref):
+            raise ExtractionError(f"Extraction source base ref not found: {source_base_ref}")
+
+        current_patch_text = worktree_git.get_diff_patch_for_paths(
+            revision_range,
+            selected_paths,
+            binary=True,
+        )
+        current_hunk_count = _count_patch_hunks(current_patch_text)
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "info",
+                "message": (
+                    f"Extraction patch runtime refresh: re-derived hunks={current_hunk_count}, "
+                    f"stored hunks={stored_hunk_count}"
+                ),
+                "source_branch": source_branch,
+                "source_base_ref": source_base_ref,
+                "selected_paths": list(selected_paths),
+                "rederived_hunk_count": current_hunk_count,
+                "stored_hunk_count": stored_hunk_count,
+            },
+        )
+        if not current_patch_text.strip():
+            return _already_merged_extraction_seed_result(
+                task,
+                log_file,
+                message=(
+                    f"Extraction source diff is empty against current base; marking task {task.id} "
+                    f"{EXTRACTION_ALREADY_MERGED_COMPLETION_REASON}"
+                ),
+            )
+
+        current_base_delta = worktree_git.get_diff_patch_for_paths(
+            f"{source_base_ref}..{source_branch}",
+            selected_paths,
+            binary=True,
+        )
+        if not current_base_delta.strip():
+            return _already_merged_extraction_seed_result(
+                task,
+                log_file,
+                message=(
+                    "Extraction source branch adds nothing to the current base for selected paths; "
+                    f"marking task {task.id} {EXTRACTION_ALREADY_MERGED_COMPLETION_REASON}"
+                ),
+            )
+
+        current_touched_paths = parse_patch_touched_paths(current_patch_text)
+        if not current_touched_paths:
+            raise ExtractionError("Runtime re-derived extraction patch has no touched file paths")
+        unexpected_runtime = sorted(set(current_touched_paths) - declared_paths)
+        if unexpected_runtime:
+            raise ExtractionError(
+                "Runtime extraction patch touches undeclared paths: " + ", ".join(unexpected_runtime),
+            )
+
+        runtime_patch_path = _write_runtime_patch_file(
+            worktree_bundle_dir,
+            "selected.runtime.patch",
+            current_patch_text,
+        )
+        apply_result = worktree_git.apply_patch_file_result(runtime_patch_path)
+        if apply_result.returncode != 0:
+            if _apply_left_relevant_conflicts(worktree_git, set(current_touched_paths)):
+                write_log_entry(
+                    log_file,
+                    {
+                        "type": "gza",
+                        "subtype": "warning",
+                        "message": (
+                            f"Applied extraction seed bundle from {project_bundle_dir.relative_to(config.project_dir)} "
+                            f"using runtime re-derived patch with conflicts ({len(current_touched_paths)} files); "
+                            "provider must resolve conflict markers"
+                        ),
+                        "seeded_paths": sorted(current_touched_paths),
+                        "patch_source": "rederived",
+                        "apply_conflicts": True,
+                    },
+                )
+                return ExtractionSeedResult(seeded_paths=frozenset(current_touched_paths))
+            raise GitError(_git_apply_failure_message(runtime_patch_path, apply_result))
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "info",
+                "message": (
+                    f"Applied extraction seed bundle from {project_bundle_dir.relative_to(config.project_dir)} "
+                    f"using runtime re-derived patch ({len(current_touched_paths)} files)"
+                ),
+                "seeded_paths": sorted(current_touched_paths),
+                "patch_source": "rederived",
+            },
+        )
+        return ExtractionSeedResult(seeded_paths=frozenset(current_touched_paths))
+
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "info",
+            "message": (
+                f"Extraction patch runtime refresh: re-derived hunks=unavailable "
+                f"(source branch '{source_branch}' unreachable), stored hunks={stored_hunk_count}"
+            ),
+            "source_branch": source_branch,
+            "source_base_ref": source_base_ref,
+            "rederived_hunk_count": None,
+            "stored_hunk_count": stored_hunk_count,
+        },
+    )
+    apply_result = worktree_git.apply_patch_file_result(patch_path)
+    if apply_result.returncode != 0:
+        if _apply_left_relevant_conflicts(worktree_git, set(stored_touched_paths)):
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "warning",
+                    "message": (
+                        f"Applied extraction seed bundle from {project_bundle_dir.relative_to(config.project_dir)} "
+                        f"using stored patch fallback with conflicts ({len(stored_touched_paths)} files); "
+                        "provider must resolve conflict markers"
+                    ),
+                    "seeded_paths": sorted(stored_touched_paths),
+                    "patch_source": "stored_fallback",
+                    "apply_conflicts": True,
+                },
+            )
+            return ExtractionSeedResult(seeded_paths=frozenset(stored_touched_paths))
+        raise GitError(_git_apply_failure_message(patch_path, apply_result))
     write_log_entry(
         log_file,
         {
@@ -2045,12 +2259,13 @@ def _seed_extraction_bundle_if_present(
             "subtype": "info",
             "message": (
                 f"Applied extraction seed bundle from {project_bundle_dir.relative_to(config.project_dir)} "
-                f"({len(touched_paths)} files)"
+                f"using stored patch fallback ({len(stored_touched_paths)} files)"
             ),
-            "seeded_paths": sorted(touched_paths),
+            "seeded_paths": sorted(stored_touched_paths),
+            "patch_source": "stored_fallback",
         },
     )
-    return set(touched_paths)
+    return ExtractionSeedResult(seeded_paths=frozenset(stored_touched_paths))
 
 
 def _resolve_task_db_path(config: Config) -> Path:
@@ -2226,6 +2441,7 @@ def run(
                 task.started_at = datetime.now(UTC)
                 task.completed_at = None
                 task.failure_reason = None
+                task.completion_reason = None
                 task.running_pid = os.getpid()
                 task.execution_mode = task_execution_mode
                 store.update(task)
@@ -3035,6 +3251,7 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
     )
 
     task.failure_reason = None
+    task.completion_reason = None
     store.mark_completed(
         task,
         branch=task.branch,
@@ -3265,7 +3482,7 @@ def _run_inner(
 
     seeded_paths: set[str] = set()
     try:
-        seeded_paths = _seed_extraction_bundle_if_present(
+        extraction_seed = _seed_extraction_bundle_if_present(
             task,
             config,
             worktree_path,
@@ -3273,6 +3490,7 @@ def _run_inner(
             log_file,
             resume=resume,
         )
+        seeded_paths = set(extraction_seed.seeded_paths)
     except (ExtractionError, GitError) as exc:
         failure_message = f"Extraction preflight/apply failed: {exc}"
         error_message(f"Error: {failure_message}")
@@ -3292,6 +3510,25 @@ def _run_inner(
             failure_reason=EXTRACTION_PRECHECK_FAILURE_REASON,
         )
         return 1
+
+    if extraction_seed.completion_reason:
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "outcome",
+                "message": "Outcome: completed without provider execution",
+                "completion_reason": extraction_seed.completion_reason,
+            },
+        )
+        store.mark_completed(
+            task,
+            branch=branch_name,
+            log_file=str(log_file.relative_to(config.project_dir)),
+            has_commits=False,
+            completion_reason=extraction_seed.completion_reason,
+        )
+        return 0
 
     # Run provider in the worktree
     if resume:

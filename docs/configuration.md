@@ -1343,6 +1343,8 @@ gza extract SOURCE --files-from FILE [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when running the extracted implement task |
 
+At run time, extracted tasks re-derive their selected patch from the current `source_base_ref...source_branch` diff before seeding the worktree. If that refreshed diff is empty because the source work is already on the base branch, the task completes successfully without invoking the agent.
+
 ### advance
 
 Intelligently progress unmerged tasks through their lifecycle. Handles review creation, improve tasks, merging, and shared automatic failed-task recovery (resume/retry).
@@ -1542,12 +1544,15 @@ When shared DB mode is active (explicit `db_path`) and a legacy local `.gza/gza.
 Manually force a task's status.
 
 ```bash
-gza set-status <task_id> <status> [--reason <text>] [--execution-mode <mode>]
+uv run gza set-status <task_id> <status> [--reason <text>] [--execution-mode <mode>]
 ```
 
 `task_id` must be a full prefixed task ID (for example `gza-1234`).
 
 Valid statuses: `pending`, `in_progress`, `completed`, `failed`, `dropped`.
+
+`--reason` stores a failure reason for `failed` tasks and a completion reason for
+`completed` tasks. Other statuses ignore it and emit a warning.
 
 `--execution-mode` is only valid with `in_progress`, and accepts:
 `worker_background`, `worker_foreground`, `foreground_inline`, `foreground_attach_resume`, `manual`, `skill_inline`.

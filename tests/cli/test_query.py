@@ -80,6 +80,45 @@ def _drop_task_comments_column(db_path: Path, column_name: str) -> None:
     conn.close()
 
 
+def _drop_tasks_column(db_path: Path, column_name: str) -> None:
+    """Rebuild tasks without a specific column."""
+    import sqlite3
+
+    def _quote(column: str) -> str:
+        return f'"{column}"' if column in ("group",) else column
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(tasks_old)")]
+    kept_cols = [col for col in cols if col != column_name]
+    cols_str = ", ".join(_quote(col) for col in kept_cols)
+    col_defs = []
+    pragma_rows = list(conn.execute("PRAGMA table_info(tasks_old)"))
+    pk_cols = [(row[5], row[1]) for row in pragma_rows if row[1] != column_name and row[5]]
+    has_composite_pk = len(pk_cols) > 1
+    for row in pragma_rows:
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        quoted_name = _quote(name)
+        parts = [quoted_name, typ]
+        if pk and not has_composite_pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    if has_composite_pk:
+        ordered_pk = ", ".join(_quote(name) for _, name in sorted(pk_cols, key=lambda item: item[0]))
+        col_defs.append(f"PRIMARY KEY({ordered_pk})")
+    conn.execute(f"CREATE TABLE tasks ({', '.join(col_defs)})")
+    conn.execute(f"INSERT INTO tasks ({cols_str}) SELECT {cols_str} FROM tasks_old")
+    conn.execute("DROP TABLE tasks_old")
+    conn.commit()
+    conn.close()
+
+
 class TestHistoryCommand:
     """Tests for 'gza history' command."""
 
@@ -115,6 +154,36 @@ class TestHistoryCommand:
 
         assert result.returncode == 0
         assert "No completed or failed tasks" in result.stdout
+
+    def test_history_query_only_pre_v40_missing_completion_reason_reads_without_traceback(
+        self, tmp_path: Path
+    ):
+        """History should read a frozen v39 snapshot without forcing the v40 additive migration."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Completed before v40")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        _drop_tasks_column(db_path, "completion_reason")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 39")
+            conn.commit()
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("history", "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 0
+        assert "Completed before v40" in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
+        assert "tasks.completion_reason" in result.stderr
 
     def test_history_reads_frozen_snapshot_without_startup_write_error(self, tmp_path: Path):
         """History should inspect a read-only snapshot without triggering startup writes."""
@@ -2451,6 +2520,37 @@ class TestShowCommand:
         assert "Traceback" not in result.stdout
         assert "Traceback" not in result.stderr
         assert "Warning: Query-only DB open detected incomplete task_comments schema" in result.stderr
+
+    def test_show_query_only_pre_v40_missing_completion_reason_reads_without_traceback(
+        self, tmp_path: Path
+    ):
+        """Show should read a frozen v39 snapshot without forcing the v40 additive migration."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Completed before completion reasons")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        _drop_tasks_column(db_path, "completion_reason")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 39")
+            conn.commit()
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 0
+        assert "Completed before completion reasons" in result.stdout
+        assert "Completion Reason:" not in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
+        assert "tasks.completion_reason" in result.stderr
 
     def test_show_query_only_missing_tasks_project_id_surfaces_controlled_error_without_traceback(
         self,
@@ -7840,6 +7940,26 @@ class TestLineageCommand:
         assert "MAX_STEPS" in result.stdout
         normalized = " ".join(result.stdout.split())
         assert "Implement feature" in normalized
+
+    def test_lineage_shows_completed_task_with_completion_reason(self, tmp_path: Path):
+        """Lineage command shows completion_reason for completed tasks."""
+        from datetime import datetime
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Extraction already merged", task_type="implement")
+        task.status = "completed"
+        task.completion_reason = "EXTRACTION_ALREADY_MERGED"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("lineage", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "EXTRACTION_ALREADY_MERGED" in result.stdout
+        normalized = " ".join(result.stdout.split())
+        assert "Extraction already merged" in normalized
 
     def test_lineage_full_tree(self, tmp_path: Path):
         """Lineage command renders a multi-level tree with parent and children."""

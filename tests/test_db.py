@@ -2241,10 +2241,12 @@ class TestFailureReasonTracking:
 
         task = store.add(prompt="Test task")
         assert task.failure_reason is None
+        assert task.completion_reason is None
 
         retrieved = store.get(task.id)
         assert retrieved is not None
         assert retrieved.failure_reason is None
+        assert retrieved.completion_reason is None
 
     def test_mark_failed_sets_unknown_by_default(self, tmp_path: Path):
         """mark_failed sets failure_reason='UNKNOWN' when not specified."""
@@ -2282,6 +2284,36 @@ class TestFailureReasonTracking:
         retrieved = store.get(task.id)
         assert retrieved is not None
         assert retrieved.failure_reason == "TEST_FAILURE"
+
+    def test_mark_completed_stores_completion_reason(self, tmp_path: Path):
+        """mark_completed persists completion_reason and clears failure_reason."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        task.failure_reason = "MAX_TURNS"
+        store.mark_completed(task, has_commits=False, completion_reason="EXTRACTION_ALREADY_MERGED")
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.status == "completed"
+        assert retrieved.failure_reason is None
+        assert retrieved.completion_reason == "EXTRACTION_ALREADY_MERGED"
+
+    def test_mark_failed_clears_completion_reason(self, tmp_path: Path):
+        """mark_failed clears any prior completion_reason."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        store.mark_completed(task, has_commits=False, completion_reason="EXTRACTION_ALREADY_MERGED")
+        store.mark_failed(task, failure_reason="TEST_FAILURE")
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.status == "failed"
+        assert retrieved.failure_reason == "TEST_FAILURE"
+        assert retrieved.completion_reason is None
 
     def test_get_resumable_failed_tasks_excludes_test_failure(self, tmp_path: Path):
         """Auto-resume query includes MAX_* failures only, not TEST_FAILURE."""
@@ -2507,6 +2539,100 @@ class TestFailureReasonTracking:
         assert pending_task is not None
         assert pending_task.status == "pending"
         assert pending_task.failure_reason is None
+
+    def test_migration_v39_to_v40_adds_completion_reason_column(self, tmp_path: Path):
+        """Migration from v39 to v40 adds completion_reason column."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (39)")
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                project_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'implement',
+                slug TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on TEXT,
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_steps_reported INTEGER,
+                num_steps_computed INTEGER,
+                num_turns INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                attach_count INTEGER,
+                attach_duration_seconds REAL,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                running_pid INTEGER,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on TEXT,
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                create_pr INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                pr_state TEXT,
+                pr_last_synced_at TEXT,
+                sync_last_synced_at TEXT,
+                model TEXT,
+                provider TEXT,
+                provider_is_explicit INTEGER DEFAULT 0,
+                urgent INTEGER DEFAULT 0,
+                urgent_bumped_at TEXT,
+                queue_position INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                merge_status TEXT,
+                merged_at TEXT,
+                failure_reason TEXT,
+                skip_learnings INTEGER DEFAULT 0,
+                diff_files_changed INTEGER,
+                diff_lines_added INTEGER,
+                diff_lines_removed INTEGER,
+                review_cleared_at TEXT,
+                review_score INTEGER,
+                log_schema_version INTEGER DEFAULT 1,
+                execution_mode TEXT,
+                base_branch TEXT,
+                PRIMARY KEY(project_id, id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO tasks (project_id, id, prompt, status, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("default", "testproject-1", "Completed task", "completed", datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        store = SqliteTaskStore(db_path, prefix="testproject")
+        retrieved = store.get("testproject-1")
+        assert retrieved is not None
+        assert retrieved.completion_reason is None
+
+        with sqlite3.connect(db_path) as conn2:
+            columns = {row[1] for row in conn2.execute("PRAGMA table_info(tasks)").fetchall()}
+            version = conn2.execute("SELECT version FROM schema_version").fetchone()[0]
+
+        assert "completion_reason" in columns
+        assert version == SCHEMA_VERSION
 
     def test_known_failure_reasons_set(self):
         """KNOWN_FAILURE_REASONS contains expected values."""
@@ -4652,11 +4778,13 @@ def _drop_tasks_column(db_path: Path, column_name: str) -> None:
     """Rebuild the tasks table without a specific column."""
     import sqlite3
 
+    def _quote(column: str) -> str:
+        return f'"{column}"' if column in ("group",) else column
+
     conn = sqlite3.connect(db_path)
     conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
     cols = [row[1] for row in conn.execute("PRAGMA table_info(tasks_old)")]
     kept_cols = [c for c in cols if c != column_name]
-    _quote = lambda c: f'"{c}"' if c in ("group",) else c
     cols_str = ", ".join(_quote(c) for c in kept_cols)
     col_defs = []
     pragma_rows = list(conn.execute("PRAGMA table_info(tasks_old)"))
@@ -4757,7 +4885,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -4769,7 +4897,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -4970,8 +5098,6 @@ class TestSharedDbIsolationAndImportGating:
         assert "Conflicting task IDs already exist" in conflict.stderr
 
     def test_import_local_db_conflicts_on_non_key_field_drift(self, tmp_path: Path) -> None:
-        from gza.config import Config
-
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
@@ -5444,6 +5570,39 @@ class TestSharedDbIsolationAndImportGating:
         assert row is not None
         assert row[0] == legacy_task.id
 
+    def test_import_local_db_dry_run_pre_v40_missing_completion_reason_defaults_null(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimportdryrun05\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_task = legacy_store.add("legacy task before v40")
+        _drop_tasks_column(local_db, "completion_reason")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config, dry_run=True)
+
+        assert result["status"] == "dry_run"
+        assert result["local_task_count"] == 1
+        with sqlite3.connect(local_db) as conn:
+            row = conn.execute("SELECT id FROM tasks").fetchone()
+        assert row is not None
+        assert row[0] == legacy_task.id
+
     def test_import_local_db_pre_v37_missing_create_pr_imports_with_false(self, tmp_path: Path) -> None:
         from gza.config import Config
 
@@ -5472,6 +5631,38 @@ class TestSharedDbIsolationAndImportGating:
         imported = shared_store.get(legacy_task.id)
         assert imported is not None
         assert imported.create_pr is False
+
+    def test_import_local_db_pre_v40_missing_completion_reason_imports_with_null(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimport04\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        legacy_store = SqliteTaskStore(local_db, prefix="demo")
+        legacy_task = legacy_store.add("legacy task before v40")
+        _drop_tasks_column(local_db, "completion_reason")
+
+        config = Config.load(project_dir)
+        result = import_legacy_local_db(config)
+        assert result["status"] == "imported"
+
+        shared_store = SqliteTaskStore.from_config(config)
+        imported = shared_store.get(legacy_task.id)
+        assert imported is not None
+        assert imported.completion_reason is None
 
     def test_import_local_db_dry_run_errors_cleanly_when_shared_db_uninitialized(self, tmp_path: Path) -> None:
         project_dir = tmp_path / "project"
@@ -6339,13 +6530,15 @@ class TestSharedDbIsolationAndImportGating:
         _run_v25_v26_v27_migrations(db_path, "gza")
 
         # Simulate a v27 DB where attach columns are missing by dropping them
+        def _quote(column: str) -> str:
+            return f'"{column}"' if column in ("group",) else column
+
         conn = sqlite3.connect(db_path)
         # SQLite doesn't support DROP COLUMN easily; recreate without the columns
         conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
         # Get existing columns minus attach ones
         cols = [row[1] for row in conn.execute("PRAGMA table_info(tasks_old)")]
         kept_cols = [c for c in cols if c not in ("attach_count", "attach_duration_seconds")]
-        _quote = lambda c: f'"{c}"' if c in ("group",) else c
         cols_str = ", ".join(_quote(c) for c in kept_cols)
         # Recreate with same columns minus attach
         col_defs = []
@@ -6760,6 +6953,40 @@ class TestSharedDbIsolationAndImportGating:
         assert reloaded.prompt == "Task with query-only execution-mode damage"
         assert any("tasks.execution_mode" in warning for warning in query_store.startup_warnings())
 
+    def test_query_only_open_pre_v40_db_missing_completion_reason_reads_with_null(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should read v39 snapshots without forcing the v40 completion_reason migration."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before v40 completion_reason")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        _drop_tasks_column(db_path, "completion_reason")
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE schema_version SET version = 39")
+        conn.commit()
+        conn.close()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            reloaded = query_store.get(task.id)
+            history = query_store.get_history(limit=None)
+        finally:
+            db_path.chmod(0o644)
+
+        assert reloaded is not None
+        assert reloaded.prompt == "Task before v40 completion_reason"
+        assert reloaded.completion_reason is None
+        assert [row.id for row in history] == [task.id]
+        assert history[0].completion_reason is None
+        assert any("tasks.completion_reason" in warning for warning in query_store.startup_warnings())
+
     def test_query_only_open_current_db_missing_create_pr_fails_closed(
         self, tmp_path: Path
     ) -> None:
@@ -7060,7 +7287,7 @@ class TestSharedDbIsolationAndImportGating:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
 
 
 class TestSyncCandidates:

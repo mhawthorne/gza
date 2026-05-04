@@ -195,7 +195,7 @@ def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
     with store._connect() as conn:  # noqa: SLF001 - CLI internal polling helper
         cur = conn.execute(
             """
-            SELECT id, status, task_type, started_at, completed_at, failure_reason, depends_on
+            SELECT id, status, task_type, started_at, completed_at, failure_reason, completion_reason, depends_on
             FROM tasks
             """
         )
@@ -207,6 +207,7 @@ def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
                 "started_at": row["started_at"],
                 "completed_at": row["completed_at"],
                 "failure_reason": row["failure_reason"],
+                "completion_reason": row["completion_reason"],
                 "depends_on": row["depends_on"],
             }
     return snap
@@ -281,6 +282,8 @@ def _emit_transition_events(
         elapsed = _format_elapsed(new_row.get("started_at"), new_row.get("completed_at"))
         elapsed_suffix = f" ({elapsed})" if elapsed else ""
         if new_status == "completed":
+            completion_reason = new_row.get("completion_reason")
+            reason_suffix = f": {completion_reason}" if completion_reason else ""
             if task_type == "review":
                 task = store.get(task_id)
                 impl_id = new_row.get("depends_on") or "unknown"
@@ -289,9 +292,9 @@ def _emit_transition_events(
                     if task is not None
                     else "UNKNOWN"
                 )
-                log.emit("REVIEW", f"{task_id} for {impl_id}: {verdict}")
+                log.emit("REVIEW", f"{task_id} for {impl_id}: {verdict}{reason_suffix}")
             else:
-                log.emit("DONE", f"{task_id} {task_type}{elapsed_suffix}")
+                log.emit("DONE", f"{task_id} {task_type}{reason_suffix}{elapsed_suffix}")
         elif new_status == "failed":
             reason = new_row.get("failure_reason") or "UNKNOWN"
             log.emit("FAIL", f"{task_id} {task_type}: {reason}{elapsed_suffix}")

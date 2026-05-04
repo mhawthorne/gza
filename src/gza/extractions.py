@@ -20,6 +20,7 @@ EXTRACTIONS_DIR = Path(".gza") / "extractions"
 MANIFEST_FILENAME = "manifest.json"
 PATCH_FILENAME = "selected.patch"
 PROMPT_FILENAME = "prompt.md"
+RUNTIME_PATCH_FILENAMES = frozenset({"selected.runtime.patch"})
 
 _CODE_TASK_TYPES = {"task", "implement", "improve", "fix", "rebase"}
 _DIFF_RE = re.compile(r"^diff --git a/(.+) b/(.+)$")
@@ -437,12 +438,13 @@ def copy_bundle_to_worktree(project_bundle_dir: Path, worktree_path: Path) -> Pa
         raise ExtractionError(f"Extraction bundle not found: {project_bundle_dir}")
 
     expected = {MANIFEST_FILENAME, PATCH_FILENAME, PROMPT_FILENAME}
+    allowed_existing = expected | set(RUNTIME_PATCH_FILENAMES)
     worktree_bundle_dir = worktree_path / ".gza" / "extractions" / project_bundle_dir.name
     worktree_bundle_dir.parent.mkdir(parents=True, exist_ok=True)
 
     if worktree_bundle_dir.exists():
         existing = {entry.name for entry in worktree_bundle_dir.iterdir()}
-        unexpected = sorted(existing - expected)
+        unexpected = sorted(existing - allowed_existing)
         if unexpected:
             raise ExtractionError(
                 "Extraction bundle destination has unexpected files: " + ", ".join(unexpected),
