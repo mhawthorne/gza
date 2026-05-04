@@ -41,7 +41,6 @@ from ..query import get_base_task_slug as _get_base_task_slug
 from ..recovery_engine import (
     FailedRecoveryDecision,
     decide_failed_task_recovery,
-    get_failed_recovery_needs_attention_reason,
 )
 from ..review_verdict import get_review_report
 from ..runner import RunInvocationContext, generate_slug, run
@@ -77,9 +76,9 @@ from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
     classify_advance_action,
     determine_next_action,
-    format_needs_attention_entry,
+    format_needs_attention_entry_for_display,
 )
-from .advance_executor import AdvanceActionExecutionResult, resolve_execution_needs_attention
+from .advance_executor import build_improve_needs_attention_result, resolve_execution_needs_attention
 from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
 
@@ -2323,93 +2322,45 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             improve_action, failed_improve, improve_decision = resolve_improve_action(
                 store, impl_task.id, review_task.id, max_resume_attempts=max_resume_attempts
             )
-            if improve_action == "give_up" and failed_improve is not None:
-                assert failed_improve.id is not None
-                attention_reason = get_failed_recovery_needs_attention_reason(
-                    store,
-                    failed_improve,
-                    decision=improve_decision,
-                    max_recovery_attempts=max_resume_attempts,
-                )
-                attention_result = AdvanceActionExecutionResult(
-                    action_type="improve",
-                    status="skip",
-                    message=(
-                        "SKIP: automatic improve recovery is disabled "
-                        f"(max_resume_attempts={max_resume_attempts}) for "
-                        f"{impl_task.id} + {review_task.id}; latest failed improve: {failed_improve.id}. "
-                        f"Run uv run gza fix {impl_task.id}"
-                    ),
-                    improve_mode=improve_action,
-                    failed_improve=failed_improve,
-                    attention_type="automatic_recovery_disabled",
-                    attention_reason=attention_reason,
-                )
+            attention_result = build_improve_needs_attention_result(
+                store=store,
+                impl_task=impl_task,
+                review_task=review_task,
+                improve_mode=improve_action,
+                failed_improve=failed_improve,
+                improve_decision=improve_decision,
+                max_resume_attempts=max_resume_attempts,
+            )
+            if attention_result is not None:
                 attention = resolve_execution_needs_attention(impl_task, attention_result)
                 assert attention is not None
                 final_attention_action = attention.action
                 final_attention_task = attention.task
-                print(
-                    "  Improve automatic recovery is disabled "
-                    f"(max_resume_attempts={max_resume_attempts}); "
-                    f"latest failure: {failed_improve.id}"
-                )
-                final_status = "blocked"
-                final_stop_reason = "automatic_recovery_disabled"
-                _append_summary_row(
-                    summary_rows,
-                    iteration_index=iteration,
-                    task_type="improve",
-                    task=failed_improve,
-                    status="failed",
-                )
-                break
-            if improve_action == "manual_review" and failed_improve is not None:
-                assert failed_improve.id is not None
-                assert improve_decision is not None
-                attention_reason = get_failed_recovery_needs_attention_reason(
-                    store,
-                    failed_improve,
-                    decision=improve_decision,
-                    max_recovery_attempts=max_resume_attempts,
-                )
-                attention_result = AdvanceActionExecutionResult(
-                    action_type="improve",
-                    status="skip",
-                    message=(
-                        f"SKIP: latest failed improve {failed_improve.id} requires manual review "
-                        f"({improve_decision.reason_text})"
-                    ),
-                    improve_mode=improve_action,
-                    failed_improve=failed_improve,
-                    attention_type="manual_review_required",
-                    attention_reason=attention_reason,
-                )
-                attention = resolve_execution_needs_attention(impl_task, attention_result)
-                assert attention is not None
-                final_attention_action = attention.action
-                final_attention_task = attention.task
-                print(
-                    f"  Latest failed improve {failed_improve.id} requires manual review "
-                    f"({improve_decision.reason_text})"
-                )
-                final_status = "blocked"
-                final_stop_reason = "manual_review_required"
-                if review_row_task is not None:
-                    _append_summary_row(
-                        summary_rows,
-                        iteration_index=iteration,
-                        task_type="review",
-                        task=review_row_task,
-                        verdict=review_row_verdict,
+                assert failed_improve is not None
+                if attention_result.attention_type == "automatic_recovery_disabled":
+                    print(
+                        "  Improve automatic recovery is disabled "
+                        f"(max_resume_attempts={max_resume_attempts}); "
+                        f"latest failure: {failed_improve.id}"
                     )
-                _append_summary_row(
-                    summary_rows,
-                    iteration_index=iteration,
-                    task_type="improve",
-                    task=failed_improve,
-                    status="failed",
-                )
+                    final_stop_reason = "automatic_recovery_disabled"
+                else:
+                    assert improve_decision is not None
+                    print(
+                        f"  Latest failed improve {failed_improve.id} requires manual review "
+                        f"({improve_decision.reason_text})"
+                    )
+                    final_stop_reason = "manual_review_required"
+                    if review_row_task is not None:
+                        _append_summary_row(
+                            summary_rows,
+                            iteration_index=iteration,
+                            task_type="review",
+                            task=review_row_task,
+                            verdict=review_row_verdict,
+                        )
+                final_status = "blocked"
+                _append_summary_row(summary_rows, iteration_index=iteration, task_type="improve", task=failed_improve, status="failed")
                 break
             if improve_action == "resume" and failed_improve is not None:
                 assert failed_improve.id is not None
@@ -2571,7 +2522,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         if final_attention_action is not None and final_attention_task is not None:
             print(
                 f"{NEEDS_ATTENTION_LABEL}: "
-                f"{format_needs_attention_entry(final_attention_task, prompt=final_attention_task.prompt, action=final_attention_action)}"
+                f"{format_needs_attention_entry_for_display(final_attention_task, action=final_attention_action, prefix=len(final_attention_task.id or '') + 4)}"
             )
         else:
             print(f"Iterate blocked: {final_stop_reason}.")
@@ -2584,10 +2535,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         print(f"Recommended next step: uv run gza fix {impl_task_key}")
         return 3
     if final_attention_action is not None and final_attention_task is not None:
-        prompt_display = final_attention_task.prompt
         print(
             f"{NEEDS_ATTENTION_LABEL}: "
-            f"{format_needs_attention_entry(final_attention_task, prompt=prompt_display, action=final_attention_action)}"
+            f"{format_needs_attention_entry_for_display(final_attention_task, action=final_attention_action, prefix=len(final_attention_task.id or '') + 4)}"
         )
         if final_attention_action.get("needs_attention_reason") in {
             "review-max-cycles-reached",

@@ -71,7 +71,7 @@ from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
     classify_advance_action,
     determine_next_action,
-    format_needs_attention_entry,
+    format_needs_attention_entry_for_display,
 )
 from .advance_executor import (
     AdvanceActionExecutionContext,
@@ -83,11 +83,11 @@ logger = logging.getLogger(__name__)
 
 
 def _format_needs_attention_line(task: DbTask, action: dict[str, Any]) -> str:
-    prompt_display = shorten_prompt(
-        task.prompt,
-        prompt_available_width(prefix=len(task.id or "") + 4),
+    return format_needs_attention_entry_for_display(
+        task,
+        action=action,
+        prefix=len(task.id or "") + 4,
     )
-    return format_needs_attention_entry(task, prompt=prompt_display, action=action)
 
 
 def _paths_match(left: str | Path, right: Path) -> bool:

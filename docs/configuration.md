@@ -1400,7 +1400,7 @@ When iterate stops with `max_cycles_reached`, it now prints review-cycle account
 - configured `max_review_cycles`
 - `consumed_this_invocation` cycles
 
-When iterate stops on a shared human-required outcome, it also prints the same `Needs attention: <task> ... reason=...` line used by `uv run gza advance`, so operators can see the exact policy boundary that stopped automation.
+When iterate stops on a shared human-required outcome, it also prints the same `Needs attention: <task> ... reason=...` line used by `uv run gza advance`, including the same single-line shortened prompt formatting, so operators can see the exact policy boundary that stopped automation.
 
 ### watch
 

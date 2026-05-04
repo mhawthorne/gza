@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from gza.cli.advance_executor import AdvanceActionExecutionContext, execute_advance_action
+from gza.cli._common import resolve_improve_action
+from gza.cli.advance_executor import (
+    AdvanceActionExecutionContext,
+    build_improve_needs_attention_result,
+    execute_advance_action,
+)
 from gza.db import Task as DbTask
 
 from .conftest import make_store, setup_config
@@ -160,10 +165,24 @@ def test_improve_manual_review_returns_skip_without_mutation(tmp_path: Path) -> 
         action={"type": "improve", "review_task": review},
         context=context,
     )
+    improve_mode, failed_improve, improve_decision = resolve_improve_action(
+        store,
+        impl.id,
+        review.id,
+        max_resume_attempts=1,
+    )
+    expected = build_improve_needs_attention_result(
+        store=store,
+        impl_task=impl,
+        review_task=review,
+        improve_mode=improve_mode,
+        failed_improve=failed_improve,
+        improve_decision=improve_decision,
+        max_resume_attempts=1,
+    )
 
-    assert result.status == "skip"
-    assert result.attention_type == "manual_review_required"
-    assert "requires manual review" in result.message
+    assert expected is not None
+    assert result == expected
     assert len(store.get_all()) == before_count
 
 
@@ -217,10 +236,20 @@ def test_improve_give_up_reports_automatic_recovery_disabled(tmp_path: Path) -> 
         action={"type": "improve", "review_task": review},
         context=context,
     )
+    expected = build_improve_needs_attention_result(
+        store=store,
+        impl_task=impl,
+        review_task=review,
+        improve_mode="give_up",
+        failed_improve=failed,
+        improve_decision=None,
+        max_resume_attempts=0,
+    )
 
+    assert expected is not None
     assert result.status == "skip"
     assert result.attention_type == "automatic_recovery_disabled"
-    assert "automatic improve recovery is disabled" in result.message
+    assert result == expected
     assert len(store.get_all()) == before_count
 
 

@@ -50,7 +50,7 @@ from .advance_engine import (
     classify_advance_action,
     determine_next_action,
     failed_recovery_decision_to_action,
-    format_needs_attention_entry,
+    format_needs_attention_entry_for_display,
 )
 from .advance_executor import (
     AdvanceActionExecutionContext,
@@ -99,8 +99,7 @@ def _watch_skip_message(task: DbTask, action: dict) -> str:
 
 
 def _watch_needs_attention_message(task: DbTask, action: dict) -> str:
-    prompt_display = _format_prompt_for_width(task.prompt)
-    return format_needs_attention_entry(task, prompt=prompt_display, action=action)
+    return format_needs_attention_entry_for_display(task, action=action)
 
 
 @dataclass(frozen=True)

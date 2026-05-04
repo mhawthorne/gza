@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from gza.console import prompt_available_width, shorten_prompt
 from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from gza.query import get_code_changing_descendants_for_root, get_reviews_for_root
 from gza.recovery_engine import (
@@ -197,6 +198,21 @@ def format_needs_attention_entry(task: DbTask, *, prompt: str, action: Mapping[s
     task_id = task.id or "unknown"
     task_type = task.task_type or "task"
     return f'{task_id} {task_type} "{prompt}" reason={reason} {description}'
+
+
+def format_needs_attention_entry_for_display(
+    task: DbTask,
+    *,
+    action: Mapping[str, Any],
+    prefix: int = 0,
+    suffix: int = 0,
+) -> str:
+    """Render a needs-attention line with the shared single-line short prompt."""
+    prompt = shorten_prompt(
+        task.prompt or "",
+        prompt_available_width(prefix=prefix, suffix=suffix),
+    )
+    return format_needs_attention_entry(task, prompt=prompt, action=action)
 
 
 def _review_priority_sort_key(task: DbTask) -> tuple[datetime, int]:
