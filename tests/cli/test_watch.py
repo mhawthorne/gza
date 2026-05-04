@@ -4989,6 +4989,75 @@ def test_cmd_watch_restart_failed_dry_run_show_skipped_includes_skipped_entries(
     assert "1 skipped" in stdout
 
 
+def test_cmd_watch_restart_failed_dry_run_suppresses_fully_recovered_failed_ancestors(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recovery dry-run should silently omit failed ancestors whose recovery chain already completed."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    actionable = store.add("Still actionable failed plan", task_type="plan")
+    assert actionable.id is not None
+    actionable.status = "failed"
+    actionable.failure_reason = "INFRASTRUCTURE_ERROR"
+    actionable.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(actionable)
+
+    failed_root = store.add("Recovered failed implement", task_type="implement")
+    assert failed_root.id is not None
+    failed_root.status = "failed"
+    failed_root.failure_reason = "MAX_TURNS"
+    failed_root.session_id = "sess-root"
+    failed_root.branch = "feature/root"
+    failed_root.completed_at = datetime(2026, 4, 28, 10, 5, 0, tzinfo=UTC)
+    store.update(failed_root)
+
+    failed_resume = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "MAX_TURNS"
+    failed_resume.session_id = failed_root.session_id
+    failed_resume.branch = failed_root.branch
+    failed_resume.completed_at = datetime(2026, 4, 28, 10, 10, 0, tzinfo=UTC)
+    store.update(failed_resume)
+
+    completed_resume = store.add(failed_resume.prompt, task_type="implement", based_on=failed_resume.id)
+    assert completed_resume.id is not None
+    completed_resume.status = "completed"
+    completed_resume.session_id = failed_resume.session_id
+    completed_resume.branch = failed_resume.branch
+    completed_resume.completed_at = datetime(2026, 4, 28, 10, 15, 0, tzinfo=UTC)
+    store.update(completed_resume)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert actionable.id in stdout
+    assert failed_root.id not in stdout
+    assert failed_resume.id not in stdout
+    assert "recovery child already completed" not in stdout
+    assert "recovery descendant already completed" not in stdout
+
+
 def test_cmd_watch_restart_failed_dry_run_saturates_retry_resume_attempt_display(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

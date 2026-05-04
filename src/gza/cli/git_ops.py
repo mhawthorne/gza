@@ -35,7 +35,10 @@ from ..pickup import (
     is_worker_consuming_advance_action,
 )
 from ..pr_ops import build_task_pr_content, ensure_task_pr
-from ..recovery_engine import list_failed_tasks_for_recovery
+from ..recovery_engine import (
+    get_completed_recovery_descendant,
+    list_failed_tasks_for_recovery,
+)
 from ..runner import (
     TaskExecutionLogger,
     ensure_task_log_path,
@@ -277,24 +280,25 @@ def _collect_advance_completed_tasks(
 
     return tasks, impl_based_on_ids
 
-
-def _recovery_chain_root_task_id(store: SqliteTaskStore, task: DbTask) -> str | None:
-    """Return recovery ownership root by following based_on links only."""
-    if task.id is None:
-        return None
-
+def _has_based_on_ancestor_in_ids(
+    store: SqliteTaskStore,
+    task: DbTask,
+    ancestor_ids: set[str],
+) -> bool:
+    """Return whether any based_on ancestor is owned by a completed task in this plan."""
     current = task
     seen: set[str] = set()
     while current.id is not None and current.id not in seen:
         seen.add(current.id)
         if current.based_on is None:
-            break
+            return False
         parent = store.get(current.based_on)
-        if parent is None:
-            break
+        if parent is None or parent.id is None:
+            return False
+        if parent.id in ancestor_ids:
+            return True
         current = parent
-
-    return str(current.id) if current.id is not None else None
+    return False
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
@@ -1777,8 +1781,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if no_resume_failed:
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
                 return 1
-            tasks = []
-            failed_tasks = [task]
+            resolved_descendant = get_completed_recovery_descendant(store, task)
+            if resolved_descendant is not None:
+                tasks = [resolved_descendant] if resolved_descendant.merge_status != 'merged' else []
+                failed_tasks = []
+            else:
+                tasks = []
+                failed_tasks = [task]
         else:
             if task.status != 'completed':
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
@@ -1816,16 +1825,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # this run, do not add failed descendants from that same chain as separate
     # recovery rows.
     if failed_tasks and tasks:
-        root_ids_owned_by_completed = {
-            root_id
-            for task in tasks
-            if (root_id := _recovery_chain_root_task_id(store, task)) is not None
-        }
-        if root_ids_owned_by_completed:
+        completed_owner_ids = {task.id for task in tasks if task.id is not None}
+        if completed_owner_ids:
             failed_tasks = [
                 failed_task
                 for failed_task in failed_tasks
-                if _recovery_chain_root_task_id(store, failed_task) not in root_ids_owned_by_completed
+                if not _has_based_on_ancestor_in_ids(store, failed_task, completed_owner_ids)
             ]
 
     # Use the currently checked-out branch as the target for conflict checks,

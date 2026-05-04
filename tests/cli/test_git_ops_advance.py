@@ -3440,6 +3440,148 @@ class TestAdvanceCommand:
         children = store.get_based_on_children(failed_task.id)
         assert len(children) == 1  # only the pre-existing completed child
 
+    def test_advance_dry_run_suppresses_fully_recovered_failed_parent_and_plans_descendant(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A completed recovery descendant should replace its failed parent in the plan."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
+        )
+        store = make_store(tmp_path)
+        failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        completed_child = store.add(failed_task.prompt, task_type="implement", based_on=failed_task.id)
+        assert completed_child.id is not None
+        completed_child.status = "completed"
+        completed_child.session_id = failed_task.session_id
+        completed_child.branch = failed_task.branch
+        completed_child.has_commits = True
+        completed_child.merge_status = "unmerged"
+        completed_child.completed_at = datetime.now(UTC)
+        store.update(completed_child)
+
+        with patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Would advance 1 task(s)" in result.stdout
+        assert failed_task.id not in result.stdout
+        assert completed_child.id in result.stdout
+        assert "recovery child already completed" not in result.stdout
+        assert "Merge task (no review yet)" in result.stdout
+
+    def test_advance_dry_run_suppresses_every_failed_ancestor_in_multi_step_recovery_chain(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A failed -> failed -> completed recovery chain should surface only the completed tip."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
+        )
+        store = make_store(tmp_path)
+
+        failed_root = self._create_failed_task(store, session_id="sess-root", failure_reason="MAX_TURNS")
+
+        failed_resume = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+        assert failed_resume.id is not None
+        failed_resume.status = "failed"
+        failed_resume.failure_reason = "MAX_TURNS"
+        failed_resume.session_id = failed_root.session_id
+        failed_resume.branch = failed_root.branch
+        failed_resume.completed_at = datetime.now(UTC)
+        store.update(failed_resume)
+
+        completed_resume = store.add(failed_resume.prompt, task_type="implement", based_on=failed_resume.id)
+        assert completed_resume.id is not None
+        completed_resume.status = "completed"
+        completed_resume.session_id = failed_resume.session_id
+        completed_resume.branch = failed_resume.branch
+        completed_resume.has_commits = True
+        completed_resume.merge_status = "unmerged"
+        completed_resume.completed_at = datetime.now(UTC)
+        store.update(completed_resume)
+
+        with patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Would advance 1 task(s)" in result.stdout
+        assert failed_root.id not in result.stdout
+        assert failed_resume.id not in result.stdout
+        assert completed_resume.id in result.stdout
+        assert "recovery descendant already completed" not in result.stdout
+
+    def test_advance_dry_run_keeps_failed_parent_visible_when_completed_descendant_is_not_recovery(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A manual based_on follow-up must not suppress the original failed task."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
+        )
+        store = make_store(tmp_path)
+
+        failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        manual_follow_up = store.add("Fresh follow-up implement", task_type="implement", based_on=failed_task.id)
+        assert manual_follow_up.id is not None
+        manual_follow_up.status = "completed"
+        manual_follow_up.session_id = "sess-manual"
+        manual_follow_up.branch = "feature/manual"
+        manual_follow_up.has_commits = True
+        manual_follow_up.merge_status = "unmerged"
+        manual_follow_up.completed_at = datetime.now(UTC)
+        store.update(manual_follow_up)
+
+        with patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Would advance 2 task(s)" in result.stdout
+        assert failed_task.id in result.stdout
+        assert manual_follow_up.id in result.stdout
+        assert "Resume failed task (MAX_STEPS)" in result.stdout
+
+    def test_advance_specific_failed_task_id_uses_completed_recovery_descendant_when_chain_is_resolved(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """advance <failed-id> should target the completed recovery descendant, not print a permanent skip."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
+        )
+        store = make_store(tmp_path)
+
+        failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        completed_child = store.add(failed_task.prompt, task_type="implement", based_on=failed_task.id)
+        assert completed_child.id is not None
+        completed_child.status = "completed"
+        completed_child.session_id = failed_task.session_id
+        completed_child.branch = failed_task.branch
+        completed_child.has_commits = True
+        completed_child.merge_status = "unmerged"
+        completed_child.completed_at = datetime.now(UTC)
+        store.update(completed_child)
+
+        with patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)):
+            result = run_gza("advance", str(failed_task.id), "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Would advance 1 task(s)" in result.stdout
+        assert failed_task.id not in result.stdout
+        assert completed_child.id in result.stdout
+        assert "recovery child already completed" not in result.stdout
+
     def test_advance_skips_failed_task_with_failed_resume_child(self, tmp_path: Path):
         """advance skips a failed task whose resume child also failed (no double-resume of root)."""
         (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")

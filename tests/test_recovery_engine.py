@@ -3,7 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from gza.recovery_engine import decide_failed_task_recovery, list_failed_tasks_for_recovery
+from gza.recovery_engine import (
+    decide_failed_task_recovery,
+    get_completed_recovery_descendant,
+    get_recovery_chain_root_task_id,
+    is_chain_resolved_by_recovery,
+    list_failed_tasks_for_recovery,
+)
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -123,6 +129,120 @@ def test_recovery_engine_pending_match_does_not_override_completed_sibling(tmp_p
     assert decision.reason_code == "recovery_already_completed"
     assert decision.recovery_task_id is None
     assert decision.reuse_existing is False
+
+
+def test_recovery_engine_marks_multi_step_resume_chain_as_resolved(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="implement")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "MAX_TURNS"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type=root.task_type, based_on=root.id, depends_on=root.depends_on)
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "MAX_TURNS"
+    failed_resume.session_id = root.session_id
+    failed_resume.branch = root.branch
+    failed_resume.completed_at = datetime.now(UTC)
+    store.update(failed_resume)
+
+    completed_resume = store.add(
+        failed_resume.prompt,
+        task_type=failed_resume.task_type,
+        based_on=failed_resume.id,
+        depends_on=failed_resume.depends_on,
+    )
+    assert completed_resume.id is not None
+    completed_resume.status = "completed"
+    completed_resume.session_id = failed_resume.session_id
+    completed_resume.branch = failed_resume.branch
+    completed_resume.completed_at = datetime.now(UTC)
+    store.update(completed_resume)
+
+    assert is_chain_resolved_by_recovery(store, root) is True
+    assert is_chain_resolved_by_recovery(store, failed_resume) is True
+    assert get_completed_recovery_descendant(store, root).id == completed_resume.id
+    assert get_completed_recovery_descendant(store, failed_resume).id == completed_resume.id
+    assert get_recovery_chain_root_task_id(store, completed_resume) == root.id
+
+
+def test_recovery_engine_non_recovery_based_on_descendant_does_not_resolve_parent(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/failed"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    manual_follow_up = store.add("Fresh follow-up implement", task_type="implement", based_on=failed.id)
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "completed"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    manual_follow_up.completed_at = datetime.now(UTC)
+    store.update(manual_follow_up)
+
+    assert is_chain_resolved_by_recovery(store, failed) is False
+    assert get_completed_recovery_descendant(store, failed) is None
+    assert get_recovery_chain_root_task_id(store, manual_follow_up) == manual_follow_up.id
+
+
+def test_list_failed_tasks_for_recovery_hides_fully_recovered_ancestors(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="implement")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "MAX_TURNS"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type=root.task_type, based_on=root.id, depends_on=root.depends_on)
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "MAX_TURNS"
+    failed_resume.session_id = root.session_id
+    failed_resume.branch = root.branch
+    failed_resume.completed_at = datetime.now(UTC)
+    store.update(failed_resume)
+
+    completed_resume = store.add(
+        failed_resume.prompt,
+        task_type=failed_resume.task_type,
+        based_on=failed_resume.id,
+        depends_on=failed_resume.depends_on,
+    )
+    assert completed_resume.id is not None
+    completed_resume.status = "completed"
+    completed_resume.session_id = failed_resume.session_id
+    completed_resume.branch = failed_resume.branch
+    completed_resume.completed_at = datetime.now(UTC)
+    store.update(completed_resume)
+
+    unrelated = store.add("Still failed", task_type="plan")
+    assert unrelated.id is not None
+    unrelated.status = "failed"
+    unrelated.failure_reason = "INFRASTRUCTURE_ERROR"
+    unrelated.completed_at = datetime.now(UTC)
+    store.update(unrelated)
+
+    failed = list_failed_tasks_for_recovery(store)
+    assert [task.id for task in failed] == [unrelated.id]
 
 
 def test_recovery_engine_pending_match_stays_suppressed_by_newer_failed_descendant(tmp_path: Path) -> None:
