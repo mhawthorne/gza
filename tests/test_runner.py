@@ -3114,6 +3114,60 @@ class TestMaxStepsHandling:
         assert failed.status == "failed"
         assert failed.failure_reason == "TIMEOUT"
 
+    def test_non_code_task_prefers_timeout_ground_truth_over_provider_max_steps(self, tmp_path: Path):
+        """Combined timeout and provider max_steps signals should render and persist TIMEOUT."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.slug = "20260504-plan-timeout-over-max-steps"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+
+        def provider_run(_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            log_file.write_text("tool output\n[GZA_FAILURE:TEST_FAILURE]\n")
+            return RunResult(
+                exit_code=124,
+                duration_seconds=600.0,
+                num_steps_computed=21,
+                session_id="non-code-timeout-wins-session",
+                error_type="max_steps",
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.side_effect = provider_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.console"), patch("gza.runner.task_footer") as mock_task_footer:
+            exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git)
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "TIMEOUT"
+
+        assert mock_task_footer.call_count == 1
+        assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider timed out after 10 minutes"
+
+        assert failed.log_file is not None
+        log_contents = (tmp_path / failed.log_file).read_text()
+        assert "Outcome: failed (timeout after 10m)" in log_contents
+        assert "Outcome: failed (max_steps)" not in log_contents
+
     def test_non_code_task_marks_terminal_step_interrupted_on_max_steps(self, tmp_path: Path):
         """Persisted run steps should reflect interruption on max-steps failures."""
         db_path = tmp_path / "test.db"
@@ -3486,7 +3540,7 @@ class TestFailureReasonGroundTruth:
         error_type: str | None,
         session_id: str | None,
         slug: str,
-    ) -> tuple[int, SqliteTaskStore, Task]:
+    ) -> tuple[int, SqliteTaskStore, Task, MagicMock]:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -3537,14 +3591,15 @@ class TestFailureReasonGroundTruth:
             patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
             patch("gza.runner.load_dotenv"),
             patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner.task_footer") as mock_task_footer,
         ):
             exit_status = run(config, task_id=task.id)
 
-        return exit_status, store, task
+        return exit_status, store, task, mock_task_footer
 
     def test_code_task_uses_timeout_ground_truth_over_log_markers(self, tmp_path: Path):
         """Host timeout exit code should persist TIMEOUT even if logs contain markers."""
-        exit_code, store, task = self._run_code_task_failure(
+        exit_code, store, task, _ = self._run_code_task_failure(
             tmp_path,
             exit_code=124,
             error_type=None,
@@ -3565,7 +3620,7 @@ class TestFailureReasonGroundTruth:
 
     def test_code_task_uses_max_steps_ground_truth_over_log_markers(self, tmp_path: Path):
         """Provider max_steps should persist MAX_STEPS even if logs contain markers."""
-        exit_code, store, task = self._run_code_task_failure(
+        exit_code, store, task, _ = self._run_code_task_failure(
             tmp_path,
             exit_code=0,
             error_type="max_steps",
@@ -3578,6 +3633,35 @@ class TestFailureReasonGroundTruth:
         assert failed is not None
         assert failed.status == "failed"
         assert failed.failure_reason == "MAX_STEPS"
+
+    def test_code_task_prefers_timeout_ground_truth_over_provider_max_steps(self, tmp_path: Path):
+        """Combined timeout and provider max_steps signals should render and persist TIMEOUT."""
+        exit_code, store, task, mock_task_footer = self._run_code_task_failure(
+            tmp_path,
+            exit_code=124,
+            error_type="max_steps",
+            session_id="timeout-wins-session",
+            slug="20260504-implement-timeout-over-max-steps",
+        )
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "TIMEOUT"
+
+        assert mock_task_footer.call_count == 1
+        assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider timed out after 15 minutes"
+
+        assert failed.log_file is not None
+        log_contents = (tmp_path / failed.log_file).read_text()
+        assert "Outcome: failed (timeout after 15m)" in log_contents
+        assert "Outcome: failed (max_steps)" not in log_contents
+
+        decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+        assert decision.action == "resume"
+        assert decision.launch_mode == "iterate"
+        assert decision.reason_code == "TIMEOUT"
 
 
 class TestRunStepPersistenceIntegration:
