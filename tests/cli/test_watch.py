@@ -363,7 +363,7 @@ def test_watch_cycle_plain_mode_prioritizes_pending_over_actionable_failed_recov
     assert spawned_args.resume is False
     assert spawned_task.id == pending_impl.id
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
-    assert f"RECOVR {failed.id} resume via" not in log_text
+    assert not any("RECOVR" in line and f"{failed.id} resume via" in line for line in log_text.splitlines())
 
 
 def test_watch_cycle_default_mode_reuses_existing_pending_resume_child(tmp_path: Path) -> None:
@@ -751,8 +751,8 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
     assert spawned_args.retry is False
     assert spawned_task.based_on == failed.id
     log_text = log_path.read_text()
-    assert f"RECOVR {failed.id} retry via iterate -> {spawned_task.id}" in log_text
-    assert f"RECOVR {failed.id} resume via iterate -> {spawned_task.id}" not in log_text
+    assert any("RECOVR" in line and f"{failed.id} retry via iterate -> {spawned_task.id}" in line for line in log_text.splitlines())
+    assert not any("RECOVR" in line and f"{failed.id} resume via iterate -> {spawned_task.id}" in line for line in log_text.splitlines())
 
 
 def test_watch_cycle_restart_failed_reuses_existing_deep_recovery_chain_without_creating_sibling(
@@ -848,7 +848,7 @@ def test_watch_cycle_dry_run_recovery_mode_reports_actions_without_mutation(tmp_
 
     assert result.work_done is True
     log_text = log_path.read_text()
-    assert f"RECOVR {failed.id} resume via iterate -> (new task)" in log_text
+    assert any("RECOVR" in line and f"{failed.id} resume via iterate -> (new task)" in line for line in log_text.splitlines())
     assert len(store.get_based_on_children(failed.id)) == 0
 
 
@@ -1427,7 +1427,7 @@ def test_watch_cycle_restart_failed_hides_skipped_logs_by_default(tmp_path: Path
     assert spawn_resume.call_count == 1
     text = log_path.read_text()
     assert "recovery-skip" not in text
-    assert f"RECOVR {failed.id} resume via worker" in text
+    assert any("RECOVR" in line and f"{failed.id} resume via worker" in line for line in text.splitlines())
 
 
 def test_watch_cycle_restart_failed_show_skipped_emits_skipped_logs(tmp_path: Path) -> None:
@@ -1471,7 +1471,7 @@ def test_watch_cycle_restart_failed_show_skipped_emits_skipped_logs(tmp_path: Pa
     assert spawn_resume.call_count == 1
     text = log_path.read_text()
     assert "SKIP" not in text
-    assert f"RECOVR {failed.id} resume via worker" in text
+    assert any("RECOVR" in line and f"{failed.id} resume via worker" in line for line in text.splitlines())
 
 
 def test_watch_cycle_restart_failed_in_progress_recovery_child_blocks_pending_queue(tmp_path: Path) -> None:
@@ -1630,7 +1630,10 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
 
     log_lines = log_path.read_text().splitlines()
     assert any("START_FAILED" in line and child_id in line for line in log_lines)
-    assert not any(f"START  {child_id} {child_type}" in line for line in log_lines)
+    assert not any(
+        line.split(maxsplit=2)[1] == "START" and f"{child_id} {child_type}" in line
+        for line in log_lines
+    )
 
 
 def test_count_live_workers_dedupes_registry_and_in_progress_rows_by_pid(tmp_path: Path) -> None:
@@ -1828,9 +1831,9 @@ def test_watch_log_aligns_multiline_messages(tmp_path: Path) -> None:
         log.emit("WAKE", "checking...\nlive workers:\n- gza-42")
 
     assert log_path.read_text() == (
-        "18:08:47 WAKE   checking...\n"
-        "                live workers:\n"
-        "                - gza-42\n"
+        "18:08:47 WAKE      checking...\n"
+        "                   live workers:\n"
+        "                   - gza-42\n"
     )
 
 
@@ -1864,7 +1867,7 @@ def test_watch_cycle_logs_group_scoped_pending_count_in_wake_line(tmp_path: Path
             group="release-1",
         )
 
-    assert "WAKE   checking... (0 running, 2 pending, 1 slots)" in log_path.read_text()
+    assert "WAKE      checking... (0 running, 2 pending, 1 slots)" in log_path.read_text()
 
 
 def test_watch_cycle_logs_tag_scope_with_all_mode(tmp_path: Path) -> None:
@@ -1893,7 +1896,7 @@ def test_watch_cycle_logs_tag_scope_with_all_mode(tmp_path: Path) -> None:
             tags=("Release-1.2", "backend"),
         )
 
-    assert "INFO   scope: tags=backend,release-1.2 mode=all" in log_path.read_text()
+    assert "INFO      scope: tags=backend,release-1.2 mode=all" in log_path.read_text()
 
 
 def test_watch_cycle_logs_tag_scope_with_any_mode(tmp_path: Path) -> None:
@@ -1923,7 +1926,7 @@ def test_watch_cycle_logs_tag_scope_with_any_mode(tmp_path: Path) -> None:
             any_tag=True,
         )
 
-    assert "INFO   scope: tags=backend,release-1.2 mode=any" in log_path.read_text()
+    assert "INFO      scope: tags=backend,release-1.2 mode=any" in log_path.read_text()
 
 
 def test_watch_cycle_keeps_free_slot_when_iterate_child_task_shares_pid(tmp_path: Path) -> None:
@@ -2172,7 +2175,7 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_fa
     log_text = log_path.read_text()
     assert "isolated merge checkout refresh failed; rebuilding: stale checkout" in log_text
     assert "isolated merge checkout rebuilt" in log_text
-    assert f"MERGE  {task.id} -> main" in log_text
+    assert f"MERGE     {task.id} -> main" in log_text
 
 
 def test_watch_cycle_with_isolation_enabled_dry_run_does_not_mutate_checkout(tmp_path: Path) -> None:
@@ -2220,7 +2223,7 @@ def test_watch_cycle_with_isolation_enabled_dry_run_does_not_mutate_checkout(tmp
     assert result.work_done is True
     ensure_isolated.assert_not_called()
     execute_merge.assert_not_called()
-    assert f"MERGE  {task.id} -> main [dry-run]" in log_path.read_text()
+    assert f"MERGE     {task.id} -> main [dry-run]" in log_path.read_text()
 
 
 def test_ensure_watch_main_checkout_detaches_existing_shared_default_branch_worktree(tmp_path: Path) -> None:
@@ -2808,8 +2811,8 @@ def test_watch_cycle_logs_already_merged_reconciliation_as_info(tmp_path: Path) 
     assert result.work_done is True
     execute_merge.assert_called_once()
     log_text = log_path.read_text()
-    assert f"INFO   {task.id} already merged into main; marked merged" in log_text
-    assert f"MERGE  {task.id} -> main" not in log_text
+    assert f"INFO      {task.id} already merged into main; marked merged" in log_text
+    assert f"MERGE     {task.id} -> main" not in log_text
 
 
 def test_watch_cycle_without_isolation_preserves_default_branch_merge_guard(tmp_path: Path) -> None:
@@ -2978,7 +2981,7 @@ def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(
     stdout = capsys.readouterr().out
     assert "Merging 'feature/watch-quiet-merge' into 'main'..." not in stdout
     assert " MERGE " in log_path.read_text()
-    assert f"MERGE  {task.id} -> main" in log_path.read_text()
+    assert f"MERGE     {task.id} -> main" in log_path.read_text()
 
 
 def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_tasks(tmp_path: Path) -> None:
@@ -3053,8 +3056,11 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
     assert args[4]["followup_findings"] == (finding,)
     assert kwargs["target_branch"] == "main"
     assert kwargs["current_branch"] == "main"
-    assert f"MERGE  {task.id} -> main" in log_path.read_text()
-    assert "FOLLOW gza-999 created from" in log_path.read_text()
+    assert f"MERGE     {task.id} -> main" in log_path.read_text()
+    assert any(
+        line.split(maxsplit=2)[1] == "FOLLOW" and "gza-999 created from" in line
+        for line in log_path.read_text().splitlines()
+    )
 
 
 def test_watch_cycle_dry_run_merges_approved_with_followups_without_creating_followup_tasks(tmp_path: Path) -> None:
@@ -3116,7 +3122,7 @@ def test_watch_cycle_dry_run_merges_approved_with_followups_without_creating_fol
 
     assert result.work_done is True
     execute_merge.assert_not_called()
-    assert f"MERGE  {task.id} -> main [dry-run]" in log_path.read_text()
+    assert f"MERGE     {task.id} -> main [dry-run]" in log_path.read_text()
 
 
 def test_emit_transition_events_includes_followup_ids_for_review(tmp_path: Path) -> None:
@@ -3163,10 +3169,7 @@ def test_emit_transition_events_includes_followup_ids_for_review(tmp_path: Path)
         log=log,
     )
 
-    assert (
-        f"REVIEW {review.id} for {impl.id}: APPROVED_WITH_FOLLOWUPS [follow-ups: F1]"
-        in log_path.read_text()
-    )
+    assert f"{review.id} for {impl.id}: APPROVED_WITH_FOLLOWUPS [follow-ups: F1]" in log_path.read_text()
 
 
 def test_cmd_watch_logs_completed_review_before_same_cycle_merge(tmp_path: Path) -> None:
@@ -3273,7 +3276,7 @@ def test_watch_cycle_quiet_off_default_branch_suppresses_stdout_and_logs_skip(
     stdout = capsys.readouterr().out
     assert "`gza merge` must be run from the default branch" not in stdout
     assert merge_exec.call_count == 0
-    assert "SKIP   merge actions skipped: not on default branch" in log_path.read_text()
+    assert "SKIP      merge actions skipped: not on default branch" in log_path.read_text()
 
 
 def test_watch_cycle_starts_pending_review_with_plain_worker(tmp_path: Path) -> None:
@@ -3866,7 +3869,10 @@ def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == rebase_task.id
     lines = (tmp_path / ".gza" / "watch.log").read_text().splitlines()
-    assert any(f"START  {rebase_task.id} rebase" in line for line in lines)
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and f"{rebase_task.id} rebase" in line
+        for line in lines
+    )
     assert not any(" REBASE " in line for line in lines)
 
 
@@ -4117,8 +4123,6 @@ def test_run_cycle_dry_run_real_helpers_does_not_reconcile_or_prune(tmp_path: Pa
         ("skip", "SKIP: no review exists and advance_create_reviews=false"),
         ("wait_review", "SKIP: review test-review is in_progress"),
         ("wait_improve", "SKIP: improve task test-improve is in_progress"),
-        ("needs_discussion", "SKIP: review verdict is NEEDS_DISCUSSION, needs manual attention"),
-        ("max_cycles_reached", "SKIP: max review cycles (2) reached, needs manual intervention"),
     ],
 )
 def test_watch_cycle_logs_skip_events_for_non_actionable_advance_outcomes(
@@ -4164,6 +4168,111 @@ def test_watch_cycle_logs_skip_events_for_non_actionable_advance_outcomes(
     text = log_path.read_text()
     assert "SKIP" in text
     assert str(impl.id) in text
+    assert "ATTENTION" not in text
+
+
+@pytest.mark.parametrize(
+    ("action_type", "description"),
+    [
+        ("needs_discussion", "SKIP: review verdict is NEEDS_DISCUSSION, needs manual attention"),
+        ("max_cycles_reached", "SKIP: max review cycles (2) reached, needs manual intervention"),
+        ("max_improve_attempts", "SKIP: max improve attempts (2) reached, needs manual intervention"),
+    ],
+)
+def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(
+    tmp_path: Path,
+    action_type: str,
+    description: str,
+) -> None:
+    """Manual-attention advance outcomes should use ATTENTION instead of deduped SKIP."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/manual-attention"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": action_type, "description": description}),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    text = log_path.read_text()
+    assert text.count("ATTENTION") == 2
+    assert str(impl.id) in text
+    assert "SKIP" not in text
+
+
+def test_watch_cycle_clears_attention_reminder_when_next_action_changes(tmp_path: Path) -> None:
+    """Sticky ATTENTION reminders should stop once the task no longer resolves to a manual-attention action."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/manual-attention-clear"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.determine_next_action",
+            side_effect=[
+                {"type": "needs_discussion", "description": "SKIP: review verdict is NEEDS_DISCUSSION, needs manual attention"},
+                {"type": "wait_review", "description": "SKIP: review test-review is in_progress"},
+                {"type": "wait_review", "description": "SKIP: review test-review is in_progress"},
+            ],
+        ),
+    ):
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+
+    text = log_path.read_text()
+    assert text.count("ATTENTION") == 1
+    assert text.count("review test-review is in_progress") == 1
+    assert "SKIP" in text
 
 
 def test_watch_cycle_off_default_branch_still_runs_non_merge_advance_actions(tmp_path: Path, capsys) -> None:
@@ -4262,7 +4371,10 @@ def test_watch_review_spawn_logs_start_and_review_transition_logs_verdict(tmp_pa
         )
 
     log_lines = log_path.read_text().splitlines()
-    assert any(f"START  {review.id} review" in line for line in log_lines)
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and f"{review.id} review" in line
+        for line in log_lines
+    )
     assert not any(" REVIEW " in line for line in log_lines)
 
     before = _task_snapshot(store)
@@ -4277,7 +4389,7 @@ def test_watch_review_spawn_logs_start_and_review_transition_logs_verdict(tmp_pa
 
     review_lines = [line for line in log_path.read_text().splitlines() if " REVIEW " in line]
     assert len(review_lines) == 1
-    assert f"REVIEW {review.id} for {impl.id}: APPROVED" in review_lines[0]
+    assert f"{review.id} for {impl.id}: APPROVED" in review_lines[0]
 
 
 def test_watch_cycle_dedupes_merge_not_default_skip_across_cycles(tmp_path: Path) -> None:
@@ -4360,6 +4472,43 @@ def test_watch_cycle_dedupes_attempt_cap_skip_across_cycles(tmp_path: Path) -> N
     assert log_path.read_text().count(f"{failed.id} failed implement: automatic_recovery_disabled") == 1
 
 
+def test_watch_cycle_dedupes_wait_review_skip_across_cycles(tmp_path: Path) -> None:
+    """Ordinary advance wait states should keep existing SKIP dedupe behavior."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/wait-review-dedupe"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.determine_next_action",
+            return_value={"type": "wait_review", "description": "SKIP: review test-review is in_progress"},
+        ),
+    ):
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+
+    text = log_path.read_text()
+    assert text.count("SKIP") == 1
+    assert text.count("ATTENTION") == 0
+
+
 def test_watch_log_inserts_blank_line_between_cycles(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Each watch cycle should be visually separated in stdout and watch.log."""
     log_path = tmp_path / ".gza" / "watch.log"
@@ -4375,14 +4524,14 @@ def test_watch_log_inserts_blank_line_between_cycles(tmp_path: Path, capsys: pyt
         log.end_cycle()
 
     assert log_path.read_text() == (
-        "18:08:47 WAKE   checking... (0 running, 2 pending, 1 slots)\n"
+        "18:08:47 WAKE      checking... (0 running, 2 pending, 1 slots)\n"
         "\n"
-        "18:13:47 WAKE   checking... (1 running, 0 pending, 0 slots)\n"
+        "18:13:47 WAKE      checking... (1 running, 0 pending, 0 slots)\n"
     )
     assert capsys.readouterr().out == (
-        "18:08:47 WAKE   checking... (0 running, 2 pending, 1 slots)\n"
+        "18:08:47 WAKE      checking... (0 running, 2 pending, 1 slots)\n"
         "\n"
-        "18:13:47 WAKE   checking... (1 running, 0 pending, 0 slots)\n"
+        "18:13:47 WAKE      checking... (1 running, 0 pending, 0 slots)\n"
     )
 
 
@@ -5307,8 +5456,14 @@ def test_cmd_watch_quiet_suppresses_worker_stdout_and_still_logs_events(
     assert "Use 'gza ps' to view running workers" not in stdout
 
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
-    assert f"START  {impl.id} implement" in log_text
-    assert f"START  {plan.id} plan" in log_text
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and f"{impl.id} implement" in line
+        for line in log_text.splitlines()
+    )
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and f"{plan.id} plan" in line
+        for line in log_text.splitlines()
+    )
 
 
 def test_watch_cycle_quiet_logs_start_failed_when_iterate_spawn_fails(
@@ -5576,7 +5731,7 @@ def test_watch_cycle_run_review_spawn_failure_not_retried_in_step3(tmp_path: Pat
     log_lines = log_path.read_text().splitlines()
     review_id = str(review.id)
     assert any("START_FAILED" in line and review_id in line for line in log_lines)
-    assert not any(f"START  {review_id}" in line for line in log_lines)
+    assert not any(line.split(maxsplit=2)[1] == "START" and f"{review_id}" in line for line in log_lines)
 
 
 def test_watch_cycle_run_improve_spawn_failure_not_retried_in_step3(tmp_path: Path) -> None:
@@ -5642,4 +5797,4 @@ def test_watch_cycle_run_improve_spawn_failure_not_retried_in_step3(tmp_path: Pa
     log_lines = log_path.read_text().splitlines()
     improve_id = str(improve.id)
     assert any("START_FAILED" in line and improve_id in line for line in log_lines)
-    assert not any(f"START  {improve_id}" in line for line in log_lines)
+    assert not any(line.split(maxsplit=2)[1] == "START" and f"{improve_id}" in line for line in log_lines)
