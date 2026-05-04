@@ -630,7 +630,7 @@ gza pr <task_id> [options]
 
 `gza pr` reuses an open PR when the branch already has one. If the most recent associated PR is closed or merged while the branch is still unmerged, `gza pr` creates a new PR and updates the cached `pr_number`.
 
-`gza pr` does not reconcile or close stale GitHub PRs after manual or squash merges outside GitHub. Run `gza sync` after those merges to refresh cached PR state and close stale open PRs only when `origin/<default-branch>` proves the branch changes already landed.
+`gza pr` does not reconcile or close stale GitHub PRs after manual or squash merges outside GitHub. Run `uv run gza sync` after those merges to refresh cached PR state and close stale open PRs only when `origin/<default-branch>` proves the branch changes already landed.
 
 ### delete
 
@@ -963,7 +963,7 @@ gza merge <task_id> [task_id...] [options]
 | `--mark-only` | Mark branch as merged without performing actual merge (deletes branch) |
 | `--resolve` | Auto-resolve conflicts using AI when rebasing (requires --rebase) |
 
-`gza merge` only performs the local git merge/rebase path and updates local task `merge_status`. It does not reconcile GitHub PR state. After merge, run `gza sync` to refresh cached PR metadata and close any stale still-open PRs when remote default-branch state proves the changes already landed.
+`gza merge` only performs the local git merge/rebase path and updates local task `merge_status`. It does not reconcile GitHub PR state. After merge, run `uv run gza sync` to refresh cached PR metadata and close any stale still-open PRs when remote default-branch state proves the changes already landed.
 
 ### unmerged
 
@@ -1440,6 +1440,10 @@ When tag filters are active, watch emits an explicit scope line to console and `
 
 Manual-operator advance outcomes such as `needs_discussion`, `max_cycles_reached`, and improve-recovery stop reasons like `manual_review_required` or `automatic_recovery_disabled` are surfaced as `ATTENTION` lines in watch output instead of one-shot deduped `SKIP` lines. Watch repeats those reminders while the task still resolves to the same human-needed next action, and stops once that next action changes. Ordinary wait/skip states keep the existing `SKIP` dedupe behavior.
 
+Multiline watch log messages are rendered with continuation indentation so wake, repair, and recovery output stays readable in both stdout and `.gza/watch.log`. `WAKE` lines now include a `live workers:` block when running workers can be identified, listing active task IDs and any anonymous workers that do not currently map to a live task row.
+
+If a watch-time merge attempt fails only because the task branch is already merged into the target branch, watch runs the shared branch-truth reconciliation path, marks the task merged, and logs the repair as informational reconciliation instead of surfacing a misleading merge failure.
+
 `uv run gza watch --restart-failed --dry-run` is the recovery inspection surface for this mode. It prints the failed-task decision report for the current scope oldest-created failed task first, showing actionable `resume` and `retry` decisions by default, then exits without entering the normal watch loop. Plain `uv run gza watch` and `uv run gza watch --restart-failed` both use the same bounded shared recovery policy; `--restart-failed` only changes selection order by draining actionable failed tasks before pending pickup. `max_resume_attempts` is a recovery toggle for this shared policy (`0` disables automatic recovery, any positive value enables the same fixed bounded policy). Skipped tasks are hidden by default; pass `--show-skipped` to include them with launch mode and attempt counts in both the dry-run report and live watch logs.
 
 ### learnings
@@ -1476,7 +1480,7 @@ gza refresh [task_id] [options]
 Explicitly reconcile branch-scoped task state across local git, fetched remote default-branch git state, and GitHub PR metadata.
 
 ```bash
-gza sync [task_id ...] [options]
+uv run gza sync [task_id ...] [options]
 ```
 
 | Option | Description |
@@ -1487,15 +1491,17 @@ gza sync [task_id ...] [options]
 | `--pr-only` | Only reconcile PR metadata and stale-PR cleanup; skip git diff refresh |
 | `--no-fetch` | Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch |
 
-Use `uv run gza unmerged` for the daily "what still needs to be merged?" check. `gza sync` remains the broader explicit branch and PR reconciliation command. It:
+Use `uv run gza unmerged` for the daily "what still needs to be merged?" check. `uv run gza sync` remains the broader explicit branch and PR reconciliation command. It:
 - dedupes work by branch and writes normalized state back to every same-branch task row that carries commits
-- refreshes cached `merge_status`, `diff_*` stats, `pr_number`, `pr_state`, and `pr_last_synced_at`
+- refreshes cached `merge_status`, `diff_*` stats, `pr_number`, `pr_state`, `pr_last_synced_at`, and `sync_last_synced_at`
 - discovers PRs by branch for bounded candidates that need PR reconciliation
 - auto-closes stale open PRs only after posting a comment and only when a fresh `origin/<default-branch>` fetch proves the branch content is already present upstream
 
-The only GitHub-side exception outside `gza sync` is improve completion with `--review`: before auto-running the follow-up review, gza may do a narrow branch-scoped live-PR check and push for that same branch. It does not replace `gza sync` for broader cache refresh, merge-state reconciliation, or stale-PR cleanup.
+The only GitHub-side exception outside `uv run gza sync` is improve completion with `--review`: before auto-running the follow-up review, gza may do a narrow branch-scoped live-PR check and push for that same branch. It does not replace `uv run gza sync` for broader cache refresh, merge-state reconciliation, or stale-PR cleanup.
 
-Default `gza sync` scope is intentionally bounded. It includes unresolved branches, tasks with known or unknown open-PR cache state, and recently touched PR-intended work. Pass explicit task IDs to force-sync specific branch cohorts outside that default window. That bounded scope is acceptable because `gza sync` is no longer the primary daily merge-truth refresh surface.
+Default `uv run gza sync` scope is intentionally bounded. It includes unresolved branches, tasks with known or unknown open-PR cache state, and recently touched PR-intended work. Pass explicit task IDs to force-sync specific branch cohorts outside that default window. That bounded scope is acceptable because `uv run gza sync` is no longer the primary daily merge-truth refresh surface.
+
+Branch candidates selected by the default scope are cooldown-filtered by `sync_last_synced_at`. When the bounded candidate set is empty only because that cache is still warm, `uv run gza sync` prints an explicit cooldown message instead of a generic "No sync candidates". During active reconciliation it also emits concise `[sync] ...` progress lines for fetch/auth steps and per-branch cohort progress.
 
 ### tv
 

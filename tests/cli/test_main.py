@@ -309,11 +309,11 @@ class TestHelpOutput:
         assert "Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch" in help_text
 
         assert "### sync" in docs_text
-        assert "gza sync [task_id ...] [options]" in docs_text
+        assert "uv run gza sync [task_id ...] [options]" in docs_text
         assert "Use `uv run gza unmerged` for the daily \"what still needs to be merged?\" check." in docs_text
-        assert "`gza sync` remains the broader explicit branch and PR reconciliation command." in docs_text
-        assert "The only GitHub-side exception outside `gza sync` is improve completion with `--review`" in docs_text
-        assert "Run `gza sync` after those merges" in docs_text
+        assert "`uv run gza sync` remains the broader explicit branch and PR reconciliation command." in docs_text
+        assert "The only GitHub-side exception outside `uv run gza sync` is improve completion with `--review`" in docs_text
+        assert "Run `uv run gza sync` after those merges" in docs_text
 
     def test_improve_help_and_docs_describe_narrow_pr_sync_before_auto_review(self, tmp_path):
         """`improve --help` and docs should explain the same-branch push-before-review exception."""

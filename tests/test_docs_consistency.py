@@ -101,17 +101,17 @@ def test_configuration_docs_describe_unimplemented_lineage_guidance() -> None:
 
 
 def test_configuration_docs_describe_sync_as_broader_explicit_reconciliation_surface() -> None:
-    """Canonical docs should keep `gza sync` as the broader explicit branch and PR maintenance surface."""
+    """Canonical docs should keep `uv run gza sync` as the broader explicit branch and PR maintenance surface."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"
     config_content = (docs_root / "configuration.md").read_text()
     workflow_example = (docs_root / "examples" / "plan-implement-review.md").read_text()
 
     required_snippets = [
         "### sync",
-        "gza sync [task_id ...] [options]",
+        "uv run gza sync [task_id ...] [options]",
         "Use `uv run gza unmerged` for the daily \"what still needs to be merged?\" check.",
-        "`gza sync` remains the broader explicit branch and PR reconciliation command.",
-        "The only GitHub-side exception outside `gza sync` is improve completion with `--review`",
+        "`uv run gza sync` remains the broader explicit branch and PR reconciliation command.",
+        "The only GitHub-side exception outside `uv run gza sync` is improve completion with `--review`",
         "`gza pr` does not reconcile or close stale GitHub PRs",
         "`gza merge` only performs the local git merge/rebase path",
         "`uv run gza sync <impl_id>`",
