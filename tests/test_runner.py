@@ -17,6 +17,7 @@ from gza.git import Git, GitError
 from gza.github import GitHubError, PullRequestDetails
 from gza.lineage import get_plan_for_task
 from gza.providers import ClaudeProvider, RunResult
+from gza.recovery_engine import decide_failed_task_recovery
 from gza.providers.base import PreflightCheckResult
 from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.review_verdict import ReviewFinding, parse_review_report
@@ -3023,6 +3024,96 @@ class TestMaxStepsHandling:
         assert failed.status == "failed"
         assert failed.failure_reason == "MAX_STEPS"
 
+    def test_non_code_task_uses_max_steps_ground_truth_over_log_markers(self, tmp_path: Path):
+        """Provider max_steps should ignore contaminated failure markers in the log."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.slug = "20260504-plan-max-steps-ground-truth"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 2
+
+        def provider_run(_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            log_file.write_text("tool output\n[GZA_FAILURE:TEST_FAILURE]\n")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=4.2,
+                num_steps_computed=3,
+                error_type="max_steps",
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.side_effect = provider_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.console"):
+            exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git)
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "MAX_STEPS"
+
+    def test_non_code_task_uses_timeout_ground_truth_over_log_markers(self, tmp_path: Path):
+        """Host timeout exit code should ignore contaminated failure markers in the log."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.slug = "20260504-plan-timeout-ground-truth"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+
+        def provider_run(_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            log_file.write_text("tool output\n[GZA_FAILURE:TEST_FAILURE]\n")
+            return RunResult(
+                exit_code=124,
+                duration_seconds=600.0,
+                session_id="non-code-timeout-session",
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.side_effect = provider_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.console"):
+            exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git)
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "TIMEOUT"
+
     def test_non_code_task_marks_terminal_step_interrupted_on_max_steps(self, tmp_path: Path):
         """Persisted run steps should reflect interruption on max-steps failures."""
         db_path = tmp_path / "test.db"
@@ -3358,6 +3449,135 @@ class TestNonCodeWorktreeCleanup:
         # "Worktree preserved for inspection" phrasing is gone.
         assert "Worktree:" in all_output
         assert str(worktree_path) in all_output
+
+
+class TestFailureReasonGroundTruth:
+    """Code-task regressions for failure reason precedence."""
+
+    def _make_config(self, tmp_path: Path, db_path: Path) -> Mock:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.db_path = db_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.workers_path = tmp_path / ".gza" / "workers"
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 15
+        config.max_turns = 50
+        config.branch_mode = "multi"
+        config.project_name = "test"
+        config.project_prefix = "gza"
+        config.branch_strategy = Mock()
+        config.branch_strategy.pattern = "{project}/{task_id}"
+        config.branch_strategy.default_type = "feature"
+        config.get_reasoning_effort_for_task.return_value = ""
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        return config
+
+    def _run_code_task_failure(
+        self,
+        tmp_path: Path,
+        *,
+        exit_code: int,
+        error_type: str | None,
+        session_id: str | None,
+        slug: str,
+    ) -> tuple[int, SqliteTaskStore, Task]:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        task.slug = slug
+        store.update(task)
+
+        config = self._make_config(tmp_path, db_path)
+
+        def provider_run(_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            log_file.write_text(
+                "agent command output\n"
+                "[GZA_FAILURE:TEST_FAILURE]\n"
+                "[GZA_FAILURE:MAX_TURNS]\n"
+            )
+            return RunResult(
+                exit_code=exit_code,
+                duration_seconds=12.0,
+                num_steps_computed=51 if error_type == "max_steps" else None,
+                session_id=session_id,
+                error_type=error_type,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.check_credentials.return_value = True
+        mock_provider.verify_credentials.return_value = True
+        mock_provider.run.side_effect = provider_run
+
+        mock_main_git = Mock()
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.worktree_list.return_value = []
+        mock_main_git.worktree_add.return_value = config.worktree_path / task.slug
+        mock_main_git.branch_exists.return_value = False
+        mock_main_git.count_commits_ahead.return_value = 0
+        mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+        mock_worktree_git = Mock()
+        mock_worktree_git.status_porcelain.return_value = set()
+        mock_worktree_git.has_changes.return_value = False
+        mock_worktree_git.default_branch.return_value = "main"
+        mock_worktree_git.count_commits_ahead.return_value = 0
+        mock_worktree_git.get_diff_numstat.return_value = ""
+
+        with (
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
+            patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+        ):
+            exit_status = run(config, task_id=task.id)
+
+        return exit_status, store, task
+
+    def test_code_task_uses_timeout_ground_truth_over_log_markers(self, tmp_path: Path):
+        """Host timeout exit code should persist TIMEOUT even if logs contain markers."""
+        exit_code, store, task = self._run_code_task_failure(
+            tmp_path,
+            exit_code=124,
+            error_type=None,
+            session_id="timeout-session",
+            slug="20260504-implement-timeout-ground-truth",
+        )
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "TIMEOUT"
+
+        decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+        assert decision.action == "resume"
+        assert decision.launch_mode == "iterate"
+        assert decision.reason_code == "TIMEOUT"
+
+    def test_code_task_uses_max_steps_ground_truth_over_log_markers(self, tmp_path: Path):
+        """Provider max_steps should persist MAX_STEPS even if logs contain markers."""
+        exit_code, store, task = self._run_code_task_failure(
+            tmp_path,
+            exit_code=0,
+            error_type="max_steps",
+            session_id="max-steps-session",
+            slug="20260504-implement-max-steps-ground-truth",
+        )
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "MAX_STEPS"
 
 
 class TestRunStepPersistenceIntegration:
