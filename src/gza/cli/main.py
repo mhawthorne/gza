@@ -612,14 +612,14 @@ def main() -> int:
         "--no-resume-failed",
         action="store_true",
         dest="no_resume_failed",
-        help="Skip auto-resume of resumable failed tasks (for example MAX_STEPS, MAX_TURNS, TIMEOUT, TERMINATED)",
+        help="Skip automatic failed-task recovery decisions (resume/retry/manual-review)",
     )
     advance_parser.add_argument(
         "--max-resume-attempts",
         type=int,
         metavar="N",
         dest="max_resume_attempts",
-        help="Override max_resume_attempts config value for this run",
+        help="Override max_resume_attempts (0 disables automatic failed-task recovery; any positive value enables the fixed bounded shared recovery policy)",
     )
     advance_parser.add_argument(
         "--max-review-cycles",
@@ -688,7 +688,7 @@ def main() -> int:
         "--restart-failed",
         action="store_true",
         dest="restart_failed",
-        help="Enable failed-task recovery mode (resume/retry failed tasks before pending queue work)",
+        help="Drain failed-task recovery before pending queue work using the shared bounded recovery policy",
     )
     watch_parser.add_argument(
         "--restart-failed-batch",
@@ -702,7 +702,7 @@ def main() -> int:
         type=int,
         metavar="N",
         dest="max_resume_attempts",
-        help="Override max_resume_attempts for watch auto-resume and --restart-failed recovery decisions",
+        help="Override max_resume_attempts in watch (0 disables automatic failed-task recovery; any positive value enables the fixed bounded shared recovery policy)",
     )
     watch_parser.add_argument(
         "--dry-run",
@@ -736,7 +736,7 @@ def main() -> int:
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'gza queue --tag TAG' to preview scoped pickup order",
+        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview scoped pickup order",
     )
     watch_parser.add_argument(
         "--any-tag",
@@ -762,7 +762,7 @@ def main() -> int:
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only list runnable tasks matching tag filters (repeatable); same scoped pickup order used by 'gza watch --tag TAG'",
+        help="Only list runnable tasks matching tag filters (repeatable); same scoped pickup order used by 'uv run gza watch --tag TAG'",
     )
     queue_parser.add_argument(
         "--any-tag",

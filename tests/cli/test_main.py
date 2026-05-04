@@ -152,6 +152,35 @@ class TestHelpOutput:
         assert "With --unimplemented: queue implement tasks for the listed source rows" in normalized_output
         assert "--plans" not in result.stdout
 
+    def test_advance_help_and_docs_describe_shared_failed_task_recovery_scope(self, tmp_path):
+        """advance help/docs/config-key surfaces should describe shared failed-task recovery, not resume-only."""
+        import json
+
+        setup_config(tmp_path)
+
+        help_result = run_gza("advance", "--help", "--project", str(tmp_path))
+        assert help_result.returncode == 0
+        help_text = " ".join(help_result.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "Skip automatic failed-task recovery decisions (resume/retry/manual-review)" in help_text
+        assert "Override max_resume_attempts (0 disables automatic failed-task recovery; any positive value enables the fixed bounded shared recovery policy)" in help_text
+        assert "Skip auto-resume of resumable failed tasks" not in help_text
+
+        assert "shared automatic failed-task recovery (resume/retry)" in docs_text
+        assert "Skip automatic failed-task recovery decisions (resume/retry/manual-review)" in docs_text
+        assert "Override `max_resume_attempts`: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared resume/retry policy" in docs_text
+        assert "Skip auto-resume of failed tasks" not in docs_text
+
+        config_keys = run_gza("config", "keys", "--json", "--project", str(tmp_path))
+        assert config_keys.returncode == 0
+        payload = json.loads(config_keys.stdout)
+        keyed_entries = {entry["key"]: entry for entry in payload["keys"]}
+        assert (
+            keyed_entries["max_resume_attempts"]["description"]
+            == "Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed bounded resume/retry policy used by advance, iterate improve recovery, and watch."
+        )
+
     def test_iterate_help_uses_lifecycle_wording_and_config_default(self, tmp_path):
         """iterate --help should keep lifecycle wording and describe config-backed max-iterations default."""
         setup_config(tmp_path)
@@ -314,10 +343,12 @@ class TestHelpOutput:
         queue_text = " ".join(queue_help.stdout.split())
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
-        assert "use 'gza queue --tag TAG' to preview scoped pickup order" in watch_text
-        assert "same scoped pickup order used by 'gza watch --tag TAG'" in queue_text
-        assert "use `gza queue --tag TAG` to preview the same scoped pickup order" in docs_text
-        assert "canonical preview for what `gza watch --tag release-1.2` will consider and in what order" in docs_text
+        assert "use 'uv run gza queue --tag TAG' to preview scoped pickup order" in watch_text
+        assert "same scoped pickup order used by 'uv run gza watch --tag TAG'" in queue_text
+        assert "use 'gza queue --tag TAG' to preview scoped pickup order" not in watch_text
+        assert "same scoped pickup order used by 'gza watch --tag TAG'" not in queue_text
+        assert "use `uv run gza queue --tag TAG` to preview the same scoped pickup order" in docs_text
+        assert "canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order" in docs_text
 
     def test_watch_help_mentions_restart_failed_flags(self, tmp_path):
         """watch --help should advertise failed-recovery mode flags."""
@@ -341,21 +372,21 @@ class TestHelpOutput:
         failed_tasks_docs = " ".join(Path("docs/examples/failed-tasks.md").read_text().split())
 
         assert "with --restart-failed, print the failed-recovery report and exit" in help_text
-        assert "auto-resume and --restart-failed recovery decisions" in help_text
+        assert "0 disables automatic failed-task recovery; any positive value enables the fixed bounded shared recovery policy" in help_text
         assert "include skipped failed tasks in the dry-run recovery report and live watch logs" in help_text
 
         assert "with `--restart-failed`, print the full failed-recovery report and exit" in docs_text
-        assert "applies to plain-watch auto-resume and to `--restart-failed` resume/retry decisions" in docs_text
-        assert "`gza watch --restart-failed --dry-run` is the recovery inspection surface" in docs_text
+        assert "Override `max_resume_attempts` for this watch run: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared policy used by both plain watch and `--restart-failed`" in docs_text
+        assert "`uv run gza watch --restart-failed --dry-run` is the recovery inspection surface" in docs_text
         assert "oldest-created failed task first" in docs_text
         assert "Skipped tasks are hidden by default" in docs_text
         assert "`--show-skipped` to include them" in docs_text
         assert "live watch logs" in docs_text
 
-        assert "`gza watch --restart-failed --dry-run`" in failed_tasks_docs
+        assert "`uv run gza watch --restart-failed --dry-run`" in failed_tasks_docs
         assert "Print the recovery decision report and exit" in failed_tasks_docs
         assert "--show-skipped" in failed_tasks_docs
-        assert "`--max-resume-attempts` applies both to plain-watch auto-resume and to `--restart-failed` recovery decisions." in failed_tasks_docs
+        assert "`--max-resume-attempts` controls that shared policy as a toggle" in failed_tasks_docs
 
     def test_watch_help_and_docs_distinguish_max_idle_from_no_activity_timeout(self, tmp_path):
         """watch help/docs should distinguish loop idle exit from silent-worker reconciliation."""
@@ -381,7 +412,24 @@ class TestHelpOutput:
 
         assert "`--restart-failed`" in docs_text
         assert "drains actionable failed-task recovery before pending queue work" in docs_text
-        assert "advance-driven improve recovery" in docs_text
+        assert "plain watch, failed-task recovery, and advance-driven improve recovery" in docs_text
+
+    def test_watch_help_and_docs_lock_queue_priority_contract(self, tmp_path):
+        """Help/docs should keep queue-priority wording aligned for plain watch vs --restart-failed."""
+        setup_config(tmp_path)
+
+        help_result = run_gza("watch", "--help", "--project", str(tmp_path))
+        assert help_result.returncode == 0
+
+        help_text = " ".join(help_result.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        failed_tasks_docs = " ".join(Path("docs/examples/failed-tasks.md").read_text().split())
+        internal_docs = " ".join(Path("docs/internal/advance-workflow.md").read_text().split())
+
+        assert "Drain failed-task recovery before pending queue work" in help_text
+        assert "only changes selection order by draining actionable failed tasks before pending pickup" in docs_text
+        assert "Plain `uv run gza watch` and `uv run gza watch --restart-failed` use the same bounded shared recovery policy; `--restart-failed` only changes queue priority." in failed_tasks_docs
+        assert "Default `gza watch` uses the same bounded shared recovery policy as the explicit failed-task recovery queue. `gza watch --restart-failed` is opt-in only for recovery-first queue ordering." in internal_docs
 
     def test_queue_help_and_docs_describe_default_limit_and_all_overrides(self, tmp_path):
         """`queue --help` and docs should describe capped default output and all-task overrides."""

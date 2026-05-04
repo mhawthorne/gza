@@ -133,7 +133,7 @@ def test_evaluate_runs_pending_review_when_no_in_progress_exists(tmp_path: Path)
     assert action["review_task"].id == pending.id
 
 
-def test_evaluate_returns_skip_when_resume_budget_exhausted(tmp_path: Path):
+def test_evaluate_resumes_timeout_retry_descendant_once(tmp_path: Path):
     (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
     config = Config.load(tmp_path)
     db_path = tmp_path / ".gza" / "gza.db"
@@ -165,8 +165,8 @@ def test_evaluate_returns_skip_when_resume_budget_exhausted(tmp_path: Path):
         "main",
     )
 
-    assert action["type"] == "skip"
-    assert action["description"] == "SKIP: max resume attempts (1) reached"
+    assert action["type"] == "resume"
+    assert action["description"] == "Resume failed task (MAX_STEPS)"
 
 
 def test_completed_fix_after_changes_requested_requires_fresh_review(tmp_path: Path, monkeypatch):

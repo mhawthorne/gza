@@ -10,10 +10,8 @@ from typing import Any
 
 from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from gza.query import get_code_changing_descendants_for_root, get_reviews_for_root
-from gza.resume_policy import (
-    is_resumable_failed_task,
-    is_resumable_failure_reason as _is_resumable_failure_reason,
-)
+from gza.recovery_engine import FailedRecoveryDecision, classify_failure_reason, decide_failed_task_recovery
+from gza.resume_policy import is_resumable_failed_task as _is_resumable_failed_task
 from gza.review_verdict import ParsedReviewReport, ReviewFinding, get_review_report
 
 WORKER_CONSUMING_ACTIONS = frozenset(
@@ -25,6 +23,7 @@ WORKER_CONSUMING_ACTIONS = frozenset(
         "improve",
         "run_improve",
         "resume",
+        "retry",
     }
 )
 
@@ -63,6 +62,7 @@ class AdvanceContext:
     has_improve_after_review: bool = False
     has_fresh_unresolved_comments_since_latest_review: bool = False
 
+    failed_recovery_decision: FailedRecoveryDecision | None = None
     is_resumable_failed_task: bool = False
     has_resume_children: bool = False
     resume_chain_depth: int = 0
@@ -80,7 +80,12 @@ class AdvanceRule:
 
 def is_resumable_failure_reason(failure_reason: str | None) -> bool:
     """Return True when a failure reason is auto-resumable by advance."""
-    return _is_resumable_failure_reason(failure_reason)
+    return classify_failure_reason(failure_reason) == "timeout"
+
+
+def is_resumable_failed_task(task: Any) -> bool:
+    """Backward-compatible export for callers that still import this helper here."""
+    return _is_resumable_failed_task(task)
 
 
 def count_completed_review_cycles(store: SqliteTaskStore, impl_task_id: str) -> int:
@@ -93,6 +98,14 @@ def _task_id(task: DbTask | None) -> str:
     if task is None or task.id is None:
         return "unknown"
     return task.id
+
+
+def _failed_task_skip_action(ctx: AdvanceContext) -> dict[str, Any]:
+    assert ctx.failed_recovery_decision is not None
+    return {
+        "type": "skip",
+        "description": f"SKIP: {ctx.failed_recovery_decision.reason_text}",
+    }
 
 
 def _review_priority_sort_key(task: DbTask) -> tuple[datetime, int]:
@@ -243,13 +256,19 @@ def resolve_advance_context(
 
     effective_max_resume = max_resume_attempts if max_resume_attempts is not None else config.max_resume_attempts
 
-    is_resumable_failed = is_resumable_failed_task(task)
+    failed_recovery_decision: FailedRecoveryDecision | None = None
+    if task.status == "failed":
+        failed_recovery_decision = decide_failed_task_recovery(
+            store,
+            task,
+            max_recovery_attempts=effective_max_resume,
+        )
+    is_resumable_failed = (
+        failed_recovery_decision is not None
+        and failed_recovery_decision.action in {"resume", "retry"}
+    )
     has_resume_children = False
     resume_chain_depth = 0
-    if is_resumable_failed:
-        children = store.get_based_on_children(task.id)
-        has_resume_children = bool(children)
-        resume_chain_depth = store.count_resume_chain_depth(task.id)
 
     if task.task_type == "plan":
         if impl_based_on_ids is None:
@@ -262,6 +281,7 @@ def resolve_advance_context(
             create_reviews=config.advance_create_reviews,
             max_review_cycles=config.max_review_cycles,
             max_resume_attempts=effective_max_resume,
+            failed_recovery_decision=failed_recovery_decision,
             has_implement_child=task.id in impl_based_on_ids,
             is_resumable_failed_task=is_resumable_failed,
             has_resume_children=has_resume_children,
@@ -278,6 +298,7 @@ def resolve_advance_context(
             create_reviews=config.advance_create_reviews,
             max_review_cycles=config.max_review_cycles,
             max_resume_attempts=effective_max_resume,
+            failed_recovery_decision=failed_recovery_decision,
             is_resumable_failed_task=is_resumable_failed,
             has_resume_children=has_resume_children,
             resume_chain_depth=resume_chain_depth,
@@ -330,6 +351,7 @@ def resolve_advance_context(
         create_reviews=config.advance_create_reviews,
         max_review_cycles=config.max_review_cycles,
         max_resume_attempts=effective_max_resume,
+        failed_recovery_decision=failed_recovery_decision,
         can_merge=can_merge,
         rebase_pending_or_running=rebase_pending_or_running,
         rebase_failed=rebase_failed,
@@ -355,28 +377,25 @@ def resolve_advance_context(
 
 ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
-        name="resume_has_children",
-        matches=lambda ctx: ctx.is_resumable_failed_task and ctx.has_resume_children,
-        action=lambda ctx: {"type": "skip", "description": "SKIP: resume child already exists"},
-    ),
-    AdvanceRule(
-        name="resume_max_attempts",
-        matches=lambda ctx: ctx.is_resumable_failed_task and ctx.resume_chain_depth >= ctx.max_resume_attempts,
+        name="failed_task_retry",
+        matches=lambda ctx: ctx.failed_recovery_decision is not None and ctx.failed_recovery_decision.action == "retry",
         action=lambda ctx: {
-            "type": "skip",
-            "description": f"SKIP: max resume attempts ({ctx.max_resume_attempts}) reached",
+            "type": "retry",
+            "description": f"Retry failed task ({ctx.failure_reason or 'UNKNOWN'})",
         },
     ),
     AdvanceRule(
-        name="resume_task",
-        matches=lambda ctx: ctx.is_resumable_failed_task,
+        name="failed_task_resume",
+        matches=lambda ctx: ctx.failed_recovery_decision is not None and ctx.failed_recovery_decision.action == "resume",
         action=lambda ctx: {
             "type": "resume",
-            "description": (
-                f"Resume (failed: {ctx.failure_reason or 'UNKNOWN'}, "
-                f"attempt {ctx.resume_chain_depth + 1}/{ctx.max_resume_attempts})"
-            ),
+            "description": f"Resume failed task ({ctx.failure_reason or 'UNKNOWN'})",
         },
+    ),
+    AdvanceRule(
+        name="failed_task_skip",
+        matches=lambda ctx: ctx.failed_recovery_decision is not None,
+        action=_failed_task_skip_action,
     ),
     AdvanceRule(
         name="plan_needs_implement",

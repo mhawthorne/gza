@@ -15,26 +15,26 @@ As a result, this change set includes iterate-facing contract alignment where ne
 ## Usage
 
 ```bash
-gza advance                        # Advance all eligible tasks
-gza advance <task-id>              # Advance a specific task
-gza advance --batch N              # Limit to N concurrent worker spawns
-gza advance --batch N --new        # Fill remaining batch slots with pending tasks
-gza advance --type plan            # Only advance plan tasks
-gza advance --type implement       # Only advance implement tasks
-gza advance --dry-run              # Show plan without executing
-gza advance --no-resume-failed     # Skip failed task resumption
-gza advance --max-resume-attempts N
-gza advance --max-review-cycles N
-gza advance --squash-threshold N
+uv run gza advance                        # Advance all eligible tasks
+uv run gza advance <task-id>              # Advance a specific task
+uv run gza advance --batch N              # Limit to N concurrent worker spawns
+uv run gza advance --batch N --new        # Fill remaining batch slots with pending tasks
+uv run gza advance --type plan            # Only advance plan tasks
+uv run gza advance --type implement       # Only advance implement tasks
+uv run gza advance --dry-run              # Show plan without executing
+uv run gza advance --no-resume-failed     # Skip failed task resumption
+uv run gza advance --max-resume-attempts N
+uv run gza advance --max-review-cycles N
+uv run gza advance --squash-threshold N
 ```
 
 ## Task Collection
 
-Advance collects tasks from two sources:
+Advance collects tasks from three sources:
 
 1. **Unmerged tasks**: `store.get_unmerged()` — completed tasks with `merge_status='unmerged'`. Excludes improve and rebase tasks that have a parent (`based_on IS NOT NULL`) since they operate on the parent's branch.
 
-2. **Resumable failed tasks**: Tasks with `status='failed'`, `failure_reason IN ('MAX_STEPS', 'MAX_TURNS')`, and `session_id IS NOT NULL`. Disabled with `--no-resume-failed`.
+2. **Failed-task recovery candidates**: Tasks from `store.list_failed_tasks_for_recovery(...)` that are evaluated by `decide_failed_task_recovery(...)` under the shared bounded policy. This policy can classify candidates as `resume`, `retry`, or manual review required; `--no-resume-failed` disables this source. When a completed task already owns a `based_on` recovery chain in the same run, failed descendants from that same `based_on` chain are excluded from the standalone failed-task sweep so one recovery chain gets one authoritative planned action. Dependency-only (`depends_on`) ancestry does not suppress independent failed-task recovery rows.
 
 3. **Unimplemented plans**: Completed plan tasks with no implement child yet. Excluded when `--type implement`.
 
@@ -46,7 +46,7 @@ Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
 |-------|---------|-------------|
 | `advance_requires_review` | `true` | Implement tasks must have a passing review before merge |
 | `advance_create_reviews` | `true` | Auto-create review tasks for implements (only when `advance_requires_review=true`) |
-| `max_resume_attempts` | `1` | Max times a failed task can be auto-resumed |
+| `max_resume_attempts` | `1` | Shared automatic failed-task recovery toggle (`0` disables; any positive value enables the fixed bounded resume/retry policy) |
 | `max_review_cycles` | `3` | Max review→improve cycles before flagging for manual intervention |
 | `merge_squash_threshold` | `0` | Auto-squash branches with >= N commits (0 = disabled) |
 
@@ -114,11 +114,12 @@ When the engine emits `improve`, the caller (iterate) delegates to `resolve_impr
 | Condition | Sub-action |
 |-----------|-----------|
 | No prior failed improve for this (impl, review) | `new` — create a fresh improve |
-| Latest failed improve is resumable (`MAX_STEPS`/`MAX_TURNS`/`TIMEOUT`) AND prior attempts `<` cap | `resume` — reopen the failed improve's session |
-| Latest failed improve is not resumable AND prior attempts `<` cap | `retry` — fork a new branch from the previous improve |
-| Prior failed attempts `>=` `max_resume_attempts` | `give_up` — stop iterating; surface `max_improve_attempts` as the stop reason |
+| Shared failed-task recovery policy returns `resume` | `resume` — continue from the latest failed improve |
+| Shared failed-task recovery policy returns `retry` | `retry` — fork a fresh improve attempt |
+| `max_resume_attempts == 0` (automatic recovery disabled) | `give_up` — stop iterating; surface `automatic_recovery_disabled` as the stop reason |
+| Shared failed-task recovery policy returns `manual_review_required` (for example, failed resume descendants) | `manual_review` — stop iterating and require operator intervention |
 
-The cap counts **all** failed improves for this (impl, review) pair, including chained retries/resumes (see *Improve chain semantics* below), so it protects against unbounded loops when a fix on `main` is needed to break a persistent TIMEOUT.
+The improve flow now defers recovery edge selection to the shared recovery engine (`decide_failed_task_recovery`), so iterate/advance/watch enforce one consistent resume/retry/manual-review boundary.
 
 ### 6. No reviews / all cleared
 
@@ -141,7 +142,7 @@ Failed task resume rules run in the same ordered rule engine.
 
 | Condition | Action |
 |-----------|--------|
-| Resume chain depth >= `max_resume_attempts` | `skip` |
+| Failure is outside the fixed bounded shared policy (for example failed resume descendants) | `skip` |
 | Otherwise | `resume` — create resume task and spawn worker |
 
 ## Improve chain semantics
@@ -271,7 +272,7 @@ Advanced: 1 merged, 1 review started, 1 skipped
 
 When `main_checkout_isolate: true`, `gza watch` still plans against the repo default branch but executes merge attempts inside a dedicated detached integration checkout reset to the default-branch tip (`config.main_checkout_integration_path`). Successful isolated merges are then promoted onto the real default-branch ref before `merge_status` flips to `merged`; if the default branch is attached in another checkout, watch hard-resets that checkout to the new tip so it stays clean. Rebase/conflict-resolution ownership is unchanged: conflicts create rebase tasks on the task branch, and those tasks run through the normal rebase workflow.
 
-Default `gza watch` preserves the narrow legacy auto-resume path for resumable failed tasks. The broader failed-task recovery queue is opt-in via `gza watch --restart-failed`.
+Default `gza watch` uses the same bounded shared recovery policy as the explicit failed-task recovery queue. `gza watch --restart-failed` is opt-in only for recovery-first queue ordering.
 
 When `--restart-failed` is enabled:
 
@@ -279,4 +280,4 @@ When `--restart-failed` is enabled:
 - Recovery work is recovery-first: actionable failed tasks drain before pending queue pickup, and newly failed actionable tasks continue to outrank pending work for that session
 - Implement recovery launches through iterate-aware execution; non-implement recovery launches through plain worker execution
 - `gza watch --restart-failed --dry-run` prints the failed-task recovery decision report and exits
-- `--max-resume-attempts` applies to all unattended watch-managed resume/retry decisions for that run, including plain-watch auto-resume, failed-task recovery, and advance-driven improve recovery
+- `--max-resume-attempts` applies to all unattended watch-managed resume/retry decisions for that run, including plain watch, failed-task recovery, and advance-driven improve recovery

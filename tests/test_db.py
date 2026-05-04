@@ -401,6 +401,53 @@ class TestTaskChaining:
         assert blocked.id not in pickup_ids
         assert all(task.task_type != "internal" for task in pickup)
 
+    def test_get_pending_pickup_includes_pending_retry_child_of_failed_parent(self, tmp_path: Path):
+        """Queued retry children of failed parents must remain visible to normal pickup."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        failed_parent = store.add("Failed parent", task_type="implement")
+        assert failed_parent.id is not None
+        failed_parent.status = "failed"
+        failed_parent.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed_parent.completed_at = datetime.now(UTC)
+        store.update(failed_parent)
+
+        queued_retry = store.add(
+            "Failed parent",
+            task_type="implement",
+            based_on=failed_parent.id,
+        )
+        assert queued_retry.id is not None
+
+        pickup_ids = {task.id for task in store.get_pending_pickup()}
+        assert queued_retry.id in pickup_ids
+
+    def test_get_pending_pickup_includes_pending_resume_child_of_failed_parent(self, tmp_path: Path):
+        """Queued resume children of failed parents must remain visible to normal pickup."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        failed_parent = store.add("Failed parent", task_type="implement")
+        assert failed_parent.id is not None
+        failed_parent.status = "failed"
+        failed_parent.failure_reason = "TIMEOUT"
+        failed_parent.session_id = "sess-123"
+        failed_parent.completed_at = datetime.now(UTC)
+        store.update(failed_parent)
+
+        queued_resume = store.add(
+            "Failed parent",
+            task_type="implement",
+            based_on=failed_parent.id,
+        )
+        queued_resume.session_id = failed_parent.session_id
+        store.update(queued_resume)
+        assert queued_resume.id is not None
+
+        pickup_ids = {task.id for task in store.get_pending_pickup()}
+        assert queued_resume.id in pickup_ids
+
     def test_get_in_progress_returns_only_in_progress_tasks(self, tmp_path: Path):
         """Test get_in_progress returns only in-progress tasks."""
         db_path = tmp_path / "test.db"

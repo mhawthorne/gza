@@ -11,6 +11,7 @@ WORKER_CONSUMING_ADVANCE_ACTION_TYPES: frozenset[str] = frozenset(
         "create_implement",
         "improve",
         "resume",
+        "retry",
     }
 )
 

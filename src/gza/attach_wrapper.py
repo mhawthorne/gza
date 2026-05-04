@@ -7,12 +7,16 @@ import os
 import signal
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
-from .cli._common import _spawn_background_worker, get_store
+from .cli._common import _create_resume_task, _create_retry_task, _spawn_background_worker, get_store
+from .cli.execution import _spawn_background_iterate
 from .config import Config
 from .providers.base import build_docker_cmd, ensure_docker_image
 from .providers.claude import _get_docker_config, sync_keychain_credentials
+from .recovery_engine import decide_failed_task_recovery
 from .runner import load_dotenv, write_log_entry
 
 
@@ -110,8 +114,84 @@ def _run_interactive_claude(
         signal.signal(signal.SIGINT, original_sigint)
 
 
-def _should_auto_resume(task) -> bool:
-    return task.status in {"pending", "in_progress", "failed"}
+@dataclass(frozen=True)
+class _AttachHandoffTarget:
+    task_id: str
+    resume_mode: bool
+    launch_mode: Literal["worker", "iterate"]
+    iterate_task_id: str | None = None
+
+
+def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget | None:
+    """Resolve the task/flags to relaunch after interactive attach exits."""
+    if task.id is None:
+        return None
+    if task.status in {"pending", "in_progress"}:
+        return _AttachHandoffTarget(
+            task_id=str(task.id),
+            resume_mode=True,
+            launch_mode="worker",
+        )
+    if task.status != "failed":
+        return None
+
+    decision = decide_failed_task_recovery(
+        store,
+        task,
+        max_recovery_attempts=config.max_resume_attempts,
+    )
+    if decision.action == "skip":
+        return None
+
+    if decision.action == "resume":
+        if decision.launch_mode == "iterate":
+            return _AttachHandoffTarget(
+                task_id=decision.recovery_task_id or str(task.id),
+                resume_mode=True,
+                launch_mode="iterate",
+                iterate_task_id=str(task.id),
+            )
+        if decision.reuse_existing and decision.recovery_task_id is not None:
+            return _AttachHandoffTarget(
+                task_id=decision.recovery_task_id,
+                resume_mode=True,
+                launch_mode="worker",
+            )
+        resume_task = _create_resume_task(store, task)
+        assert resume_task.id is not None
+        return _AttachHandoffTarget(
+            task_id=str(resume_task.id),
+            resume_mode=True,
+            launch_mode="worker",
+        )
+
+    if decision.launch_mode == "iterate":
+        if decision.reuse_existing and decision.recovery_task_id is not None:
+            retry_task_id = decision.recovery_task_id
+        else:
+            retry_task = _create_retry_task(store, task)
+            assert retry_task.id is not None
+            retry_task_id = str(retry_task.id)
+        return _AttachHandoffTarget(
+            task_id=retry_task_id,
+            resume_mode=False,
+            launch_mode="iterate",
+            iterate_task_id=retry_task_id,
+        )
+
+    if decision.reuse_existing and decision.recovery_task_id is not None:
+        return _AttachHandoffTarget(
+            task_id=decision.recovery_task_id,
+            resume_mode=False,
+            launch_mode="worker",
+        )
+    retry_task = _create_retry_task(store, task)
+    assert retry_task.id is not None
+    return _AttachHandoffTarget(
+        task_id=str(retry_task.id),
+        resume_mode=False,
+        launch_mode="worker",
+    )
 
 
 def main() -> int:
@@ -198,32 +278,58 @@ def main() -> int:
                     },
                 )
 
-            should_resume = (
-                _should_auto_resume(refreshed)
-                and (detach_signal in (signal.SIGTERM, signal.SIGHUP) or exit_code == 0)
-            )
-            if should_resume:
-                worker_args = argparse.Namespace(
-                    no_docker=args.no_docker,
-                    max_turns=args.max_turns,
-                    force=args.force,
-                    resume=True,
-                )
-                spawn_rc = _spawn_background_worker(
-                    worker_args,
-                    config,
-                    task_id=args.task_id,
-                    quiet=True,
-                )
+            should_handoff = detach_signal in (signal.SIGTERM, signal.SIGHUP) or exit_code == 0
+            handoff = _resolve_handoff_target(config, store, refreshed) if should_handoff else None
+            if handoff is not None:
+                handoff_task_id = handoff.task_id
+                handoff_resume_mode = handoff.resume_mode
+                if handoff.launch_mode == "worker":
+                    worker_args = argparse.Namespace(
+                        no_docker=args.no_docker,
+                        max_turns=args.max_turns,
+                        force=args.force,
+                        resume=handoff_resume_mode,
+                    )
+                    spawn_rc = _spawn_background_worker(
+                        worker_args,
+                        config,
+                        task_id=handoff_task_id,
+                        quiet=True,
+                    )
+                else:
+                    assert handoff.iterate_task_id is not None
+                    iterate_task = store.get(handoff.iterate_task_id)
+                    if iterate_task is None:
+                        spawn_rc = 1
+                    else:
+                        iterate_args = argparse.Namespace(
+                            no_docker=args.no_docker,
+                            force=args.force,
+                            max_iterations=config.iterate_max_iterations,
+                            resume=handoff_resume_mode,
+                            retry=False,
+                        )
+                        spawn_rc = _spawn_background_iterate(
+                            iterate_args,
+                            config,
+                            iterate_task,
+                        )
                 if log_file is not None:
+                    handoff_event = "resume" if handoff_resume_mode else "retry"
+                    handoff_failed_event = "resume_failed" if handoff_resume_mode else "retry_failed"
+                    handoff_action_label = "resume" if handoff_resume_mode else "retry"
                     if spawn_rc == 0:
                         write_log_entry(
                             log_file,
                             {
                                 "type": "gza",
                                 "subtype": "worker_lifecycle",
-                                "event": "resume",
-                                "message": "Background worker resumed in pipe mode",
+                                "event": handoff_event,
+                                "message": (
+                                    f"Background worker {handoff_action_label} launched in "
+                                    f"{handoff.launch_mode} mode"
+                                ),
+                                "handoff_task_id": handoff_task_id,
                             },
                         )
                     else:
@@ -232,19 +338,15 @@ def main() -> int:
                             {
                                 "type": "gza",
                                 "subtype": "worker_lifecycle",
-                                "event": "resume_failed",
-                                "message": "Background worker resume failed after interactive session",
+                                "event": handoff_failed_event,
+                                "message": (
+                                    f"Background worker {handoff_action_label} failed "
+                                    "after interactive session"
+                                ),
                                 "handoff_exit_code": spawn_rc,
+                                "handoff_task_id": handoff_task_id,
                             },
                         )
-                if spawn_rc != 0:
-                    store.mark_failed(
-                        refreshed,
-                        log_file=refreshed.log_file,
-                        branch=refreshed.branch,
-                        has_commits=bool(refreshed.has_commits),
-                        failure_reason="WORKER_DIED",
-                    )
     return exit_code
 
 

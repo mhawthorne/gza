@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from ..db import SqliteTaskStore, Task as DbTask
-from ._common import _create_improve_task, resolve_improve_action
+from ._common import _create_improve_task, _create_retry_task, resolve_improve_action
 
 
 class CreateReviewActionResult(Protocol):
@@ -34,6 +34,8 @@ class AdvanceActionExecutionContext:
     spawn_worker: Callable[[str, str], int]
     spawn_resume_worker: Callable[[str, str], int]
     spawn_iterate_worker: Callable[[DbTask, str], int]
+    spawn_iterate_recovery: Callable[[DbTask, Literal["resume", "retry"]], int] | None = None
+    create_retry_task: Callable[[DbTask], DbTask] | None = None
 
 
 @dataclass
@@ -63,6 +65,7 @@ _WORKER_ACTIONS = frozenset(
         "improve",
         "run_improve",
         "resume",
+        "retry",
         "create_implement",
         "needs_rebase",
     }
@@ -179,7 +182,7 @@ def execute_advance_action(
         if not isinstance(review_task, DbTask) or review_task.id is None or task.id is None:
             return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing improve inputs")
 
-        improve_mode, failed_improve = resolve_improve_action(
+        improve_mode, failed_improve, improve_decision = resolve_improve_action(
             context.store,
             task.id,
             review_task.id,
@@ -189,7 +192,8 @@ def execute_advance_action(
         if improve_mode == "give_up" and failed_improve is not None:
             assert failed_improve.id is not None
             msg = (
-                f"SKIP: max improve attempts ({context.max_resume_attempts}) reached for "
+                "SKIP: automatic improve recovery is disabled "
+                f"(max_resume_attempts={context.max_resume_attempts}) for "
                 f"{task.id} + {review_task.id}; latest failed improve: {failed_improve.id}. "
                 f"Run uv run gza fix {task.id}"
             )
@@ -199,7 +203,22 @@ def execute_advance_action(
                 message=msg,
                 improve_mode=improve_mode,
                 failed_improve=failed_improve,
-                attention_type="max_improve_attempts",
+                attention_type="automatic_recovery_disabled",
+            )
+        if improve_mode == "manual_review" and failed_improve is not None:
+            assert failed_improve.id is not None
+            assert improve_decision is not None
+            msg = (
+                f"SKIP: latest failed improve {failed_improve.id} requires manual review "
+                f"({improve_decision.reason_text})"
+            )
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message=msg,
+                improve_mode=improve_mode,
+                failed_improve=failed_improve,
+                attention_type="manual_review_required",
             )
 
         if context.dry_run:
@@ -229,20 +248,10 @@ def execute_advance_action(
             improve_task = context.create_resume_task(failed_improve)
         elif improve_mode == "retry" and failed_improve is not None:
             assert failed_improve.id is not None
-            retry_same_branch = failed_improve.same_branch
-            retry_base_branch: str | None = None
-            if failed_improve.same_branch and failed_improve.branch:
-                retry_same_branch = False
-                retry_base_branch = failed_improve.branch
-            improve_task = context.store.add(
-                prompt=failed_improve.prompt,
-                task_type="improve",
-                depends_on=failed_improve.depends_on,
-                based_on=failed_improve.id,
-                same_branch=retry_same_branch,
-                tags=failed_improve.tags,
-                base_branch=retry_base_branch,
-            )
+            if context.create_retry_task is not None:
+                improve_task = context.create_retry_task(failed_improve)
+            else:
+                improve_task = _create_retry_task(context.store, failed_improve)
         else:
             try:
                 improve_task = _create_improve_task(context.store, task, review_task)
@@ -308,7 +317,36 @@ def execute_advance_action(
                 work_done=True,
             )
 
-        resume_task = context.create_resume_task(task)
+        launch_mode = str(action.get("launch_mode", "worker"))
+        if launch_mode == "iterate":
+            if context.spawn_iterate_recovery is None:
+                return AdvanceActionExecutionResult(
+                    action_type=action_type,
+                    status="error",
+                    message="missing iterate recovery launcher",
+                )
+            rc = context.spawn_iterate_recovery(task, "resume")
+            result = _spawn_result(
+                action_type=action_type,
+                rc=rc,
+                handled_task_id=task.id,
+                worker_label="iterate",
+            )
+            result.success_message = f"Started iterate resume for {task.id}"
+            return result
+
+        resume_task_id = action.get("recovery_task_id")
+        reuse_existing = bool(action.get("reuse_existing", False))
+        if reuse_existing and isinstance(resume_task_id, str):
+            resume_task = context.store.get(resume_task_id)
+            if resume_task is None:
+                return AdvanceActionExecutionResult(
+                    action_type=action_type,
+                    status="error",
+                    message=f"missing existing resume task {resume_task_id}",
+                )
+        else:
+            resume_task = context.create_resume_task(task)
         assert resume_task.id is not None
         rc = context.spawn_resume_worker(resume_task.id, task.task_type or "task")
         result = _spawn_result(
@@ -318,7 +356,61 @@ def execute_advance_action(
             worker_label="resume",
             created_task=resume_task,
         )
-        result.success_message = f"Created resume task {resume_task.id}"
+        if reuse_existing:
+            result.success_message = f"Reused pending resume task {resume_task.id}"
+        else:
+            result.success_message = f"Created resume task {resume_task.id}"
+        return result
+
+    if action_type == "retry":
+        if task.id is None:
+            return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing task id")
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=action.get("description", "Retry failed task"),
+                worker_consuming=True,
+                work_done=True,
+            )
+
+        launch_mode = str(action.get("launch_mode", "worker"))
+        retry_task_id = action.get("recovery_task_id")
+        reuse_existing = bool(action.get("reuse_existing", False))
+        if reuse_existing and isinstance(retry_task_id, str):
+            retry_task = context.store.get(retry_task_id)
+            if retry_task is None:
+                return AdvanceActionExecutionResult(
+                    action_type=action_type,
+                    status="error",
+                    message=f"missing existing retry task {retry_task_id}",
+                )
+        else:
+            if context.create_retry_task is None:
+                return AdvanceActionExecutionResult(
+                    action_type=action_type,
+                    status="error",
+                    message="missing retry task factory",
+                )
+            retry_task = context.create_retry_task(task)
+        assert retry_task.id is not None
+        if launch_mode == "iterate":
+            rc = context.spawn_iterate_worker(retry_task, task.task_type or "task")
+            worker_label = "iterate"
+        else:
+            rc = context.spawn_worker(retry_task.id, task.task_type or "task")
+            worker_label = "retry"
+        result = _spawn_result(
+            action_type=action_type,
+            rc=rc,
+            handled_task_id=retry_task.id,
+            worker_label=worker_label,
+            created_task=retry_task,
+        )
+        if reuse_existing:
+            result.success_message = f"Reused pending retry task {retry_task.id}"
+        else:
+            result.success_message = f"Created retry task {retry_task.id}"
         return result
 
     if action_type == "create_implement":

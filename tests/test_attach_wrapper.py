@@ -9,9 +9,10 @@ from unittest.mock import MagicMock, patch
 from gza.attach_wrapper import main
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.recovery_engine import decide_failed_task_recovery
 
 
-def _setup_task_with_log(project_dir: Path) -> tuple[str, Path]:
+def _setup_task_with_log(project_dir: Path, *, task_type: str = "implement") -> tuple[str, Path]:
     (project_dir / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
@@ -20,7 +21,7 @@ def _setup_task_with_log(project_dir: Path) -> tuple[str, Path]:
     (project_dir / ".gza" / "logs").mkdir(parents=True, exist_ok=True)
     config = Config.load(project_dir)
     store = SqliteTaskStore(project_dir / ".gza" / "gza.db", prefix=config.project_prefix)
-    task = store.add("Test attach wrapper")
+    task = store.add("Test attach wrapper", task_type=task_type)
     task.log_file = ".gza/logs/task.log"
     store.update(task)
     assert task.id is not None
@@ -123,8 +124,8 @@ def test_attach_wrapper_sigterm_detach_auto_resumes(tmp_path: Path) -> None:
     assert detach_events[-1]["reason"] == "detached"
 
 
-def test_attach_wrapper_resume_failure_marks_task_failed(tmp_path: Path) -> None:
-    """Failed detach/exit handoff should not emit resume success and must mark task failed."""
+def test_attach_wrapper_resume_failure_keeps_task_pending(tmp_path: Path) -> None:
+    """Failed detach/exit handoff should not emit resume success or rewrite task status."""
     task_id, log_path = _setup_task_with_log(tmp_path)
 
     with (
@@ -152,8 +153,361 @@ def test_attach_wrapper_resume_failure_marks_task_failed(tmp_path: Path) -> None
     store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
     refreshed = store.get(task_id)
     assert refreshed is not None
-    assert refreshed.status == "failed"
-    assert refreshed.failure_reason == "WORKER_DIED"
+    assert refreshed.status == "pending"
+    assert refreshed.failure_reason is None
+
+
+def test_attach_wrapper_failed_resume_descendant_does_not_auto_resume(tmp_path: Path) -> None:
+    """Failed resume descendants should not bypass shared recovery policy via attach handoff."""
+    task_id, _ = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    original = store.get(task_id)
+    assert original is not None
+    assert original.id is not None
+    original.status = "failed"
+    original.failure_reason = "MAX_TURNS"
+    original.session_id = "sess-123"
+    store.update(original)
+
+    failed_resume_descendant = store.add(
+        original.prompt,
+        task_type=original.task_type,
+        based_on=original.id,
+    )
+    assert failed_resume_descendant.id is not None
+    failed_resume_descendant.status = "failed"
+    failed_resume_descendant.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_resume_descendant.session_id = original.session_id
+    store.update(failed_resume_descendant)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", failed_resume_descendant.id,
+            "--session-id", original.session_id,
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_spawn.assert_not_called()
+
+
+def test_attach_wrapper_manual_review_failed_task_does_not_auto_resume(tmp_path: Path) -> None:
+    """Manual-review-only failed reasons should not auto-resume after interactive attach exit."""
+    task_id, _ = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    failed = store.get(task_id)
+    assert failed is not None
+    failed.status = "failed"
+    failed.failure_reason = "TEST_FAILURE"
+    failed.session_id = "sess-123"
+    store.update(failed)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_spawn.assert_not_called()
+
+
+def test_attach_wrapper_timeout_failed_implement_handoff_launches_iterate_resume(tmp_path: Path) -> None:
+    """Timeout failed implement handoff should relaunch through iterate resume, not a plain worker."""
+    task_id, _ = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    failed = store.get(task_id)
+    assert failed is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    store.update(failed)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
+        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_spawn_worker.assert_not_called()
+    mock_spawn_iterate.assert_called_once()
+    spawned_args = mock_spawn_iterate.call_args.args[0]
+    spawned_task = mock_spawn_iterate.call_args.args[2]
+    assert spawned_args.resume is True
+    assert spawned_args.retry is False
+    assert spawned_task.id == task_id
+    assert store.get_based_on_children(task_id) == []
+
+
+def test_attach_wrapper_retryable_failed_implement_handoff_launches_iterate_retry(tmp_path: Path) -> None:
+    """Retryable failed implement handoff should relaunch a retry child via iterate."""
+    task_id, log_path = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    failed = store.get(task_id)
+    assert failed is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    store.update(failed)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
+        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_spawn_worker.assert_not_called()
+    mock_spawn_iterate.assert_called_once()
+    spawned_args = mock_spawn_iterate.call_args.args[0]
+    retry_child = mock_spawn_iterate.call_args.args[2]
+    assert spawned_args.resume is False
+    assert spawned_args.retry is False
+    assert retry_child.id is not None
+    assert retry_child.id != task_id
+    assert retry_child.based_on == task_id
+    events = _read_log_events(log_path)
+    lifecycle_events = [event for event in events if event.get("subtype") == "worker_lifecycle"]
+    event_names = [event["event"] for event in lifecycle_events]
+    assert "retry" in event_names
+    assert "resume" not in event_names
+
+
+def test_attach_wrapper_retry_handoff_failure_logs_retry_failed(tmp_path: Path) -> None:
+    """Retry handoff failures should emit retry_failed rather than resume_failed events."""
+    task_id, log_path = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    failed = store.get(task_id)
+    assert failed is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    store.update(failed)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_iterate", return_value=9),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0),
+    ):
+        rc = main()
+
+    assert rc == 0
+    events = _read_log_events(log_path)
+    lifecycle_events = [event for event in events if event.get("subtype") == "worker_lifecycle"]
+    event_names = [event["event"] for event in lifecycle_events]
+    assert "retry_failed" in event_names
+    assert "resume_failed" not in event_names
+    failure_event = [event for event in lifecycle_events if event["event"] == "retry_failed"][-1]
+    assert failure_event["handoff_exit_code"] == 9
+    retry_children = store.get_based_on_children(task_id)
+    assert len(retry_children) == 1
+    retry_child = retry_children[0]
+    assert retry_child.status == "pending"
+    refreshed_failed = store.get(task_id)
+    assert refreshed_failed is not None
+    decision = decide_failed_task_recovery(store, refreshed_failed, max_recovery_attempts=config.max_resume_attempts)
+    assert decision.action == "retry"
+    assert decision.reuse_existing is True
+    assert decision.recovery_task_id == retry_child.id
+
+
+def test_attach_wrapper_timeout_handoff_spawn_failure_keeps_resume_child_pending_for_shared_policy(tmp_path: Path) -> None:
+    """Timeout handoff spawn failures must keep resume descendants pending for shared recovery evaluation."""
+    task_id, log_path = _setup_task_with_log(tmp_path, task_type="plan")
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    failed = store.get(task_id)
+    assert failed is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    store.update(failed)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=7),
+    ):
+        rc = main()
+
+    assert rc == 0
+    events = _read_log_events(log_path)
+    lifecycle_events = [event for event in events if event.get("subtype") == "worker_lifecycle"]
+    assert "resume_failed" in [event["event"] for event in lifecycle_events]
+
+    resume_children = store.get_based_on_children(task_id)
+    assert len(resume_children) == 1
+    resume_child = resume_children[0]
+    assert resume_child.status == "pending"
+
+    refreshed_failed = store.get(task_id)
+    assert refreshed_failed is not None
+    decision = decide_failed_task_recovery(store, refreshed_failed, max_recovery_attempts=config.max_resume_attempts)
+    assert decision.action == "resume"
+    assert decision.reuse_existing is True
+    assert decision.recovery_task_id == resume_child.id
+
+
+def test_attach_wrapper_retryable_failed_non_implement_handoff_uses_worker_path(tmp_path: Path) -> None:
+    """Failed non-implement handoff should keep using plain worker execution."""
+    task_id, _ = _setup_task_with_log(tmp_path, task_type="plan")
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    failed = store.get(task_id)
+    assert failed is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    store.update(failed)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
+        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_spawn_iterate.assert_not_called()
+    mock_spawn_worker.assert_called_once()
+    spawned_task_id = mock_spawn_worker.call_args.kwargs["task_id"]
+    spawned_task = store.get(spawned_task_id)
+    assert spawned_task is not None
+    assert spawned_task.based_on == task_id
+
+
+def test_attach_wrapper_failed_resume_descendant_does_not_auto_recover_further(tmp_path: Path) -> None:
+    """Failed resume descendants should not get another automatic handoff recovery run."""
+    task_id, _ = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    original = store.get(task_id)
+    assert original is not None
+    assert original.id is not None
+    original.status = "failed"
+    original.failure_reason = "MAX_TURNS"
+    original.session_id = "sess-123"
+    store.update(original)
+
+    failed_resume_descendant = store.add(
+        original.prompt,
+        task_type=original.task_type,
+        based_on=original.id,
+    )
+    assert failed_resume_descendant.id is not None
+    failed_resume_descendant.status = "failed"
+    failed_resume_descendant.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_resume_descendant.session_id = original.session_id
+    store.update(failed_resume_descendant)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", failed_resume_descendant.id,
+            "--session-id", original.session_id,
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_spawn.assert_not_called()
+
+
+def test_attach_wrapper_timeout_parent_with_failed_resume_descendant_stops_at_manual_review(tmp_path: Path) -> None:
+    """Repeated handoff after timeout budget consumption should not relaunch original task."""
+    task_id, _ = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    original = store.get(task_id)
+    assert original is not None
+    assert original.id is not None
+    original.status = "failed"
+    original.failure_reason = "MAX_TURNS"
+    original.session_id = "sess-123"
+    store.update(original)
+
+    failed_resume_descendant = store.add(
+        original.prompt,
+        task_type=original.task_type,
+        based_on=original.id,
+    )
+    assert failed_resume_descendant.id is not None
+    failed_resume_descendant.status = "failed"
+    failed_resume_descendant.failure_reason = "MAX_TURNS"
+    failed_resume_descendant.session_id = original.session_id
+    store.update(failed_resume_descendant)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", original.session_id,
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
+    ):
+        rc = main()
+
+    assert rc == 0
+    mock_spawn.assert_not_called()
 
 
 def test_attach_wrapper_passes_resume_overrides_to_background_worker(tmp_path: Path) -> None:

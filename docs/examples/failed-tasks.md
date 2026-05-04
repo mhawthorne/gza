@@ -14,7 +14,7 @@ Tasks can fail for several reasons:
 ## Check the failure
 
 ```bash
-$ gza show gza-5
+$ uv run gza show gza-5
 Task gza-5: 20260108-add-user-auth
 Status: failed
 Branch: feature/20260108-add-user-auth
@@ -26,12 +26,12 @@ Cost: $0.89
 Error: max turns of 50 exceeded
 ```
 
-If git worktree metadata is unavailable, `gza show` prints a warning so lookup failures are distinct from "no active worktree".
+If git worktree metadata is unavailable, `uv run gza show` prints a warning so lookup failures are distinct from "no active worktree".
 
 View the conversation to understand what happened:
 
 ```bash
-$ gza log gza-5 --steps
+$ uv run gza log gza-5 --steps
 ```
 
 ## Resume vs Retry
@@ -40,26 +40,26 @@ You have two options for recovering:
 
 | Command | Behavior | Use when |
 |---------|----------|----------|
-| `gza resume` | Continue from where it left off | Task was making progress, just needs more turns |
-| `gza retry` | Start completely fresh | Task went down a wrong path, needs a fresh start |
+| `uv run gza resume` | Continue from where it left off | Task was making progress, just needs more turns |
+| `uv run gza retry` | Start completely fresh | Task went down a wrong path, needs a fresh start |
 
 For bulk unattended recovery after fixing an environment issue, use watch recovery mode:
 
 | Command | Behavior | Use when |
 |---------|----------|----------|
-| `gza watch --restart-failed` | Drain actionable failed tasks before pending queue work, choosing `resume` or `retry` per task | You want watch to recover the failed queue first, then continue normal processing |
-| `gza watch --restart-failed --dry-run` | Print the recovery decision report and exit | You want to inspect which failed tasks would `resume`, `retry`, or `skip` before starting recovery |
-| `gza watch --restart-failed --dry-run --show-skipped` | Include skipped failed tasks in the recovery decision report | You want to inspect why some failed tasks would be skipped |
-| `gza watch --restart-failed --show-skipped` | Include skipped failed tasks in live watch logs | You want restart-failed watch logs to explain why some failed tasks are being skipped |
+| `uv run gza watch --restart-failed` | Drain actionable failed tasks before pending queue work, choosing `resume` or `retry` per task | You want watch to recover the failed queue first, then continue normal processing |
+| `uv run gza watch --restart-failed --dry-run` | Print the recovery decision report and exit | You want to inspect which failed tasks would `resume`, `retry`, or `skip` before starting recovery |
+| `uv run gza watch --restart-failed --dry-run --show-skipped` | Include skipped failed tasks in the recovery decision report | You want to inspect why some failed tasks would be skipped |
+| `uv run gza watch --restart-failed --show-skipped` | Include skipped failed tasks in live watch logs | You want restart-failed watch logs to explain why some failed tasks are being skipped |
 
 ## Resume a task
 
 Resume continues the existing conversation. The AI picks up where it left off with full context of what it already did.
 
-`gza resume` runs the new task immediately by default. Use `--queue` to add to queue without executing:
+`uv run gza resume` runs the new task immediately by default. Use `--queue` to add to queue without executing:
 
 ```bash
-$ gza resume gza-5
+$ uv run gza resume gza-5
 === Resuming Task gza-5: 20260108-add-user-auth ===
 ...
 === Done ===
@@ -69,23 +69,23 @@ Stats: Runtime: 5m 23s | Turns: 15 | Cost: $0.34
 Increase the turn limit if the original was too low:
 
 ```bash
-$ gza resume gza-5 --max-turns 100
+$ uv run gza resume gza-5 --max-turns 100
 ```
 
 Add to queue without running immediately:
 
 ```bash
-$ gza resume gza-5 --queue
+$ uv run gza resume gza-5 --queue
 ```
 
 ## Retry a task
 
 Retry creates a fresh attempt. Use this when the AI went down a wrong path and you want it to start over.
 
-`gza retry` runs the new task immediately by default. Use `--queue` to add to queue without executing:
+`uv run gza retry` runs the new task immediately by default. Use `--queue` to add to queue without executing:
 
 ```bash
-$ gza retry gza-5
+$ uv run gza retry gza-5
 Created task gza-6 (retry of gza-5)
 === Task gza-6: 20260108-add-user-auth ===
 ...
@@ -97,47 +97,47 @@ Retry creates a new task that reuses the same branch (if it exists) but starts a
 
 ## Recover failed tasks with watch
 
-`gza watch --restart-failed` adds an explicit recovery phase ahead of normal pending work. It is opt-in; plain `gza watch` keeps the narrower legacy auto-resume behavior.
+`uv run gza watch --restart-failed` adds an explicit recovery phase ahead of normal pending work. Plain `uv run gza watch` and `uv run gza watch --restart-failed` use the same bounded shared recovery policy; `--restart-failed` only changes queue priority.
 
 Preview the recovery plan first:
 
 ```bash
-$ gza watch --restart-failed --dry-run
+$ uv run gza watch --restart-failed --dry-run
 Failed recovery plan (tags=*, mode=restart-failed)
 
-resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/1
-retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/1
+resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/2
+retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/2
 
-Summary: 2 actionable (1 resume, 1 retry), 1 skipped hidden
+Summary: 2 actionable (1 resume, 1 retry), 0 skipped hidden
 ```
 
 Include skipped tasks when you need the full picture:
 
 ```bash
-$ gza watch --restart-failed --dry-run --show-skipped
+$ uv run gza watch --restart-failed --dry-run --show-skipped
 Failed recovery plan (tags=*, mode=restart-failed)
 
-resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/1
-skip   gza-103 review    via none    reason=task_type_out_of_scope attempt=1/1
-retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/1
+resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/2
+skip   gza-103 improve   via none    reason=manual_failure_reason attempt=2/2
+retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/2
 
 Summary: 2 actionable (1 resume, 1 retry), 1 skipped
 ```
 
-The same `--show-skipped` flag also controls live `gza watch --restart-failed` logging. Without it, skipped recovery decisions stay silent in the watch log; with it, skipped items are emitted as `SKIP` events while watch runs.
+The same `--show-skipped` flag also controls live `uv run gza watch --restart-failed` logging. Without it, skipped recovery decisions stay silent in the watch log; with it, skipped items are emitted as `SKIP` events while watch runs.
 
 Then run recovery mode for real:
 
 ```bash
-$ gza watch --restart-failed
+$ uv run gza watch --restart-failed
 ```
 
-`--max-resume-attempts` applies both to plain-watch auto-resume and to `--restart-failed` recovery decisions.
+`--max-resume-attempts` controls that shared policy as a toggle: set it to `0` to disable unattended recovery entirely; any positive value enables the same fixed bounded automatic recovery policy used by plain watch and by `--restart-failed`.
 
 ## Check history for failed tasks
 
 ```bash
-$ gza history --status failed
+$ uv run gza history --status failed
 Recent failed tasks:
 
 failed    gza-5 (2026-01-08 14:12) add user auth
@@ -165,10 +165,10 @@ failed    gza-3 (2026-01-07 09:44) refactor api
 
 3. **Use `--max-turns` for one-off increases:**
    ```bash
-   $ gza work gza-5 --max-turns 100
+   $ uv run gza work gza-5 --max-turns 100
    ```
 
 4. **Check progress mid-task:**
    ```bash
-   $ gza log gza-5 --steps
+   $ uv run gza log gza-5 --steps
    ```

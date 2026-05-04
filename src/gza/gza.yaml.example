@@ -113,7 +113,8 @@ project_name: my-project
 
 # --- Advance/Iterate ---
 
-# Auto-resume budget for resumable failures such as MAX_STEPS/MAX_TURNS/TIMEOUT/TERMINATED (default: 1)
+# Automatic failed-task recovery toggle:
+#   0 disables resume/retry recovery; any positive value enables the fixed bounded policy (default: 1)
 # max_resume_attempts: 1
 
 # Default iterate iteration budget when --max-iterations is omitted

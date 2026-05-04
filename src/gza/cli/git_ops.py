@@ -9,6 +9,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import gza.colors as _colors
 from gza.query import get_base_task_slug as _get_base_task_slug
@@ -34,6 +35,7 @@ from ..pickup import (
     is_worker_consuming_advance_action,
 )
 from ..pr_ops import build_task_pr_content, ensure_task_pr
+from ..recovery_engine import decide_failed_task_recovery, list_failed_tasks_for_recovery
 from ..runner import (
     TaskExecutionLogger,
     ensure_task_log_path,
@@ -54,6 +56,7 @@ from ._common import (
     _create_or_reuse_followup_tasks,
     _create_rebase_task,
     _create_resume_task,
+    _create_retry_task,
     _create_review_task,
     _get_pager,
     _looks_like_task_id,
@@ -64,7 +67,7 @@ from ._common import (
     get_store,
     resolve_id,
 )
-from .advance_engine import determine_next_action, is_resumable_failed_task
+from .advance_engine import determine_next_action
 from .advance_executor import AdvanceActionExecutionContext, execute_advance_action
 
 logger = logging.getLogger(__name__)
@@ -256,6 +259,25 @@ def _collect_advance_completed_tasks(
         tasks = [t for t in tasks if t.task_type == 'implement']
 
     return tasks, impl_based_on_ids
+
+
+def _recovery_chain_root_task_id(store: SqliteTaskStore, task: DbTask) -> str | None:
+    """Return recovery ownership root by following based_on links only."""
+    if task.id is None:
+        return None
+
+    current = task
+    seen: set[str] = set()
+    while current.id is not None and current.id not in seen:
+        seen.add(current.id)
+        if current.based_on is None:
+            break
+        parent = store.get(current.based_on)
+        if parent is None:
+            break
+        current = parent
+
+    return str(current.id) if current.id is not None else None
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
@@ -1643,7 +1665,13 @@ def _advance_action_color(action_type: str) -> str:
     ac = _colors.WORK_COLORS
     if action_type in {'merge', 'merge_with_followups'}:
         return ac.merge
-    if action_type in ('needs_rebase', 'needs_discussion', 'max_cycles_reached', 'max_improve_attempts'):
+    if action_type in (
+        'needs_rebase',
+        'needs_discussion',
+        'max_cycles_reached',
+        'max_improve_attempts',
+        'automatic_recovery_disabled',
+    ):
         return ac.error
     if action_type in ('skip', 'wait_review', 'wait_improve'):
         return ac.waiting
@@ -1721,6 +1749,27 @@ def cmd_advance(args: argparse.Namespace) -> int:
     impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
 
     failed_tasks: list[DbTask] = []
+
+    def _failed_recovery_action(task: DbTask) -> dict[str, Any]:
+        decision = decide_failed_task_recovery(
+            store,
+            task,
+            max_recovery_attempts=max_resume_attempts,
+        )
+        description = f"SKIP: {decision.reason_text}"
+        if decision.action == "resume":
+            description = f"Resume failed task ({decision.reason_code})"
+        elif decision.action == "retry":
+            description = f"Retry failed task ({decision.reason_code})"
+        return {
+            "type": decision.action,
+            "description": description,
+            "recovery_task_id": decision.recovery_task_id,
+            "reuse_existing": decision.reuse_existing,
+            "launch_mode": decision.launch_mode,
+            "decision": decision,
+        }
+
     # Determine which tasks to advance
     if task_id is not None:
         task = store.get(task_id)
@@ -1728,10 +1777,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
             print(f"Error: Task {task_id} not found")
             return 1
         if task.status == 'failed':
-            # Allow a specific failed task if it's resumable
-            is_resumable = is_resumable_failed_task(task) and not no_resume_failed
-            if not is_resumable:
+            if no_resume_failed:
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
+                return 1
+            failed_decision = decide_failed_task_recovery(
+                store,
+                task,
+                max_recovery_attempts=max_resume_attempts,
+            )
+            if failed_decision.action == "skip":
+                print(f"Error: Task {task_id} is not automatically recoverable: {failed_decision.reason_text}")
                 return 1
             tasks = [task]
         else:
@@ -1751,12 +1806,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
         elif advance_type == 'implement':
             tasks = [t for t in tasks if t.task_type == 'implement']
 
-        # Collect resumable failed tasks separately so --max applies only
-        # to completed/unmerged candidates, preserving legacy behavior.
         if not no_resume_failed:
-            failed_tasks = store.get_resumable_failed_tasks()
+            failed_tasks = list_failed_tasks_for_recovery(store)
             if advance_type == 'plan':
-                failed_tasks = []
+                failed_tasks = [t for t in failed_tasks if t.task_type == 'plan']
             elif advance_type == 'implement':
                 failed_tasks = [t for t in failed_tasks if t.task_type == 'implement']
 
@@ -1767,6 +1820,23 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # Apply --max limit
     if max_tasks is not None:
         tasks = tasks[:max_tasks]
+
+    # Keep failed-task recovery on a single based_on-chain owner. When a
+    # completed-task lifecycle action already owns a based_on recovery chain in
+    # this run, do not add failed descendants from that same chain as separate
+    # recovery rows.
+    if failed_tasks and tasks:
+        root_ids_owned_by_completed = {
+            root_id
+            for task in tasks
+            if (root_id := _recovery_chain_root_task_id(store, task)) is not None
+        }
+        if root_ids_owned_by_completed:
+            failed_tasks = [
+                failed_task
+                for failed_task in failed_tasks
+                if _recovery_chain_root_task_id(store, failed_task) not in root_ids_owned_by_completed
+            ]
 
     # Use the currently checked-out branch as the target for conflict checks,
     # merge execution, and rebase task creation.
@@ -1803,6 +1873,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             use_iterate_for_needs_rebase=use_iterate_mode,
             prepare_create_review=lambda t: _prepare_create_review_action(store, t),
             create_resume_task=lambda t: _create_resume_task(store, t),
+            create_retry_task=lambda t: _create_retry_task(store, t),
             create_rebase_task=_create_rebase_from_task,
             create_implement_task=_create_implement_from_task,
             spawn_worker=lambda task_id, _kind: _spawn_background_worker(
@@ -1821,39 +1892,39 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 max_iterations=config.iterate_max_iterations,
                 quiet=True,
             ),
+            spawn_iterate_recovery=lambda task_obj, mode: _spawn_background_iterate_worker(
+                argparse.Namespace(
+                    no_docker=getattr(args, 'no_docker', False),
+                    force=force,
+                ),
+                config,
+                task_obj,
+                max_iterations=config.iterate_max_iterations,
+                resume=mode == "resume",
+                retry=mode == "retry",
+                quiet=True,
+            ),
         )
 
     # Analyze each task to determine the next action
     plan: list[tuple[DbTask, dict]] = []
     for task in tasks:
-        action = determine_next_action(
-            config,
-            store,
-            git,
-            task,
-            target_branch,
-            impl_based_on_ids=impl_based_on_ids,
-            max_resume_attempts=max_resume_attempts,
+        action = (
+            _failed_recovery_action(task)
+            if task.status == "failed"
+            else determine_next_action(
+                config,
+                store,
+                git,
+                task,
+                target_branch,
+                impl_based_on_ids=impl_based_on_ids,
+                max_resume_attempts=max_resume_attempts,
+            )
         )
-        if (
-            task.status == "failed"
-            and action.get("type") == "skip"
-            and action.get("description") == "SKIP: resume child already exists"
-        ):
-            continue
         plan.append((task, action))
     for failed_task in failed_tasks:
-        action = determine_next_action(
-            config,
-            store,
-            git,
-            failed_task,
-            target_branch,
-            impl_based_on_ids=impl_based_on_ids,
-            max_resume_attempts=max_resume_attempts,
-        )
-        if action.get("type") == "skip" and action.get("description") == "SKIP: resume child already exists":
-            continue
+        action = _failed_recovery_action(failed_task)
         plan.append((failed_task, action))
 
     # Sort so merges execute before worker spawns. See _ADVANCE_ACTION_ORDER for
@@ -1960,7 +2031,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
     error_count = 0
     workers_started = 0
     # Track tasks skipped for actionable reasons (needs human attention)
-    _ACTIONABLE_SKIP_TYPES = frozenset({'needs_discussion', 'max_cycles_reached', 'max_improve_attempts'})
+    _ACTIONABLE_SKIP_TYPES = frozenset(
+        {
+            'needs_discussion',
+            'max_cycles_reached',
+            'max_improve_attempts',
+            'automatic_recovery_disabled',
+            'manual_review_required',
+        }
+    )
     attention_tasks: list[tuple[DbTask, dict]] = []
     action_context = _build_action_context(dry_run_mode=False)
 
@@ -1973,12 +2052,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
         if exec_result.status == "skip":
             console.print(f"      [{_c_warn}]{exec_result.message}[/{_c_warn}]")
             skip_count += 1
-            if exec_result.attention_type == "max_improve_attempts":
+            if exec_result.attention_type in {
+                "max_improve_attempts",
+                "automatic_recovery_disabled",
+                "manual_review_required",
+            }:
                 attention_tasks.append(
                     (
                         task,
                         {
-                            "type": "max_improve_attempts",
+                            "type": exec_result.attention_type,
                             "description": exec_result.message,
                         },
                     )
@@ -2143,7 +2226,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
             _color = _advance_action_color(aaction['type'])
             console.print(f"  [{_c_tid}]{atask.id}[/{_c_tid}]  [{pink}]{prompt_display}[/{pink}]")
             console.print(f"       [{_color}]→ {desc}[/{_color}]")
-            if aaction['type'] in {'max_cycles_reached', 'max_improve_attempts'}:
+            if aaction['type'] in {
+                'max_cycles_reached',
+                'max_improve_attempts',
+                'automatic_recovery_disabled',
+            }:
                 console.print(f"       [{_color}]→ Recommended next step: uv run gza fix {atask.id}[/{_color}]")
 
     return 0 if error_count == 0 else 1

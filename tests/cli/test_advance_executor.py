@@ -21,11 +21,11 @@ def _mark_completed(task: DbTask, *, branch: str | None = None) -> None:
 
 
 @pytest.mark.parametrize(
-    ("failure_reason", "session_id", "expected_mode"),
+    ("failure_reason", "session_id", "expected_mode", "expected_status"),
     [
-        (None, None, "new"),
-        ("MAX_STEPS", "sess-1", "resume"),
-        ("TEST_FAILURE", None, "retry"),
+        (None, None, "new", "dry_run"),
+        ("MAX_STEPS", "sess-1", "resume", "dry_run"),
+        ("TEST_FAILURE", None, "manual_review", "skip"),
     ],
 )
 def test_improve_dry_run_modes_do_not_mutate_db(
@@ -33,6 +33,7 @@ def test_improve_dry_run_modes_do_not_mutate_db(
     failure_reason: str | None,
     session_id: str | None,
     expected_mode: str,
+    expected_status: str,
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -85,14 +86,17 @@ def test_improve_dry_run_modes_do_not_mutate_db(
         context=context,
     )
 
-    assert result.status == "dry_run"
+    assert result.status == expected_status
     assert result.improve_mode == expected_mode
-    assert result.worker_consuming is True
-    assert result.work_done is True
+    if expected_status == "dry_run":
+        assert result.worker_consuming is True
+        assert result.work_done is True
+    else:
+        assert result.attention_type == "manual_review_required"
     assert len(store.get_all()) == before_count
 
 
-def test_improve_give_up_returns_skip_without_mutation(tmp_path: Path) -> None:
+def test_improve_manual_review_returns_skip_without_mutation(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -107,22 +111,33 @@ def test_improve_give_up_returns_skip_without_mutation(tmp_path: Path) -> None:
     _mark_completed(review)
     store.update(review)
 
-    prev_id = impl.id
-    for idx in range(2):
-        improve = store.add(
-            f"Improve {idx}",
-            task_type="improve",
-            depends_on=review.id,
-            based_on=prev_id,
-            same_branch=True,
-        )
-        assert improve.id is not None
-        improve.status = "failed"
-        improve.failure_reason = "MAX_STEPS"
-        improve.session_id = f"sess-{idx}"
-        improve.completed_at = datetime.now(UTC)
-        store.update(improve)
-        prev_id = improve.id
+    first = store.add(
+        "Improve 0",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert first.id is not None
+    first.status = "failed"
+    first.failure_reason = "MAX_STEPS"
+    first.session_id = "sess-0"
+    first.completed_at = datetime.now(UTC)
+    store.update(first)
+
+    second = store.add(
+        first.prompt,
+        task_type="improve",
+        depends_on=review.id,
+        based_on=first.id,
+        same_branch=True,
+    )
+    assert second.id is not None
+    second.status = "failed"
+    second.failure_reason = "INFRASTRUCTURE_ERROR"
+    second.session_id = first.session_id
+    second.completed_at = datetime.now(UTC)
+    store.update(second)
 
     before_count = len(store.get_all())
     context = AdvanceActionExecutionContext(
@@ -147,9 +162,136 @@ def test_improve_give_up_returns_skip_without_mutation(tmp_path: Path) -> None:
     )
 
     assert result.status == "skip"
-    assert result.attention_type == "max_improve_attempts"
-    assert "max improve attempts" in result.message
+    assert result.attention_type == "manual_review_required"
+    assert "requires manual review" in result.message
     assert len(store.get_all()) == before_count
+
+
+def test_improve_give_up_reports_automatic_recovery_disabled(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/improve-disabled")
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    failed = store.add(
+        "Improve 0",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-0"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    before_count = len(store.get_all())
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=0,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={"type": "improve", "review_task": review},
+        context=context,
+    )
+
+    assert result.status == "skip"
+    assert result.attention_type == "automatic_recovery_disabled"
+    assert "automatic improve recovery is disabled" in result.message
+    assert len(store.get_all()) == before_count
+
+
+def test_improve_retry_preserves_review_backed_execution_settings(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/improve-retry-preserve")
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    failed = store.add(
+        "Improve attempt",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.create_review = True
+    failed.create_pr = True
+    failed.model = "gpt-5.4"
+    failed.provider = "codex"
+    failed.provider_is_explicit = True
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    spawned: list[tuple[str, str]] = []
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda task_id, kind: spawned.append((task_id, kind)) or 0,
+        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={"type": "improve", "review_task": review},
+        context=context,
+    )
+
+    assert result.status == "success"
+    assert result.improve_mode == "retry"
+    assert result.created_task is not None
+    assert result.created_task.id is not None
+    assert result.created_task.id != failed.id
+    assert result.created_task.based_on == failed.id
+    assert result.created_task.create_review is True
+    assert result.created_task.create_pr is True
+    assert result.created_task.model == "gpt-5.4"
+    assert result.created_task.provider == "codex"
+    assert result.created_task.provider_is_explicit is True
+    assert spawned == [(result.created_task.id, "improve")]
 
 
 def test_create_review_skip_propagates_message_without_spawning(tmp_path: Path) -> None:
@@ -184,6 +326,75 @@ def test_create_review_skip_propagates_message_without_spawning(tmp_path: Path) 
 
     assert result.status == "skip"
     assert result.message == "SKIP: review already pending"
+
+
+@pytest.mark.parametrize(
+    ("action_type", "expected_message"),
+    [
+        ("resume", "Reused pending resume task"),
+        ("retry", "Reused pending retry task"),
+    ],
+)
+def test_reused_failed_task_recovery_reports_reuse_message(
+    tmp_path: Path,
+    action_type: str,
+    expected_message: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed task", task_type="plan")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS" if action_type == "resume" else "INFRASTRUCTURE_ERROR"
+    failed.session_id = "sess-1" if action_type == "resume" else None
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    reused = store.add("Pending recovery task", task_type=failed.task_type, based_on=failed.id)
+    assert reused.id is not None
+    reused.status = "pending"
+    if action_type == "resume":
+        reused.depends_on = failed.depends_on
+        reused.session_id = failed.session_id
+        reused.spec = failed.spec
+        reused.branch = failed.branch
+    store.update(reused)
+
+    spawned: list[tuple[str, str]] = []
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("should reuse existing task"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda task_id, kind: spawned.append((task_id, kind)) or 0,
+        spawn_resume_worker=lambda task_id, kind: spawned.append((task_id, kind)) or 0,
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        create_retry_task=lambda _task: pytest.fail("should reuse existing task"),
+    )
+
+    result = execute_advance_action(
+        task=failed,
+        action={
+            "type": action_type,
+            "launch_mode": "worker",
+            "recovery_task_id": reused.id,
+            "reuse_existing": True,
+        },
+        context=context,
+    )
+
+    assert result.status == "success"
+    assert result.success_message == f"{expected_message} {reused.id}"
+    assert result.created_task is not None
+    assert result.created_task.id == reused.id
+    expected_kind = failed.task_type or "task"
+    assert spawned == [(reused.id, expected_kind)]
 
 
 def test_create_implement_uses_shared_lineage_and_selected_spawn_path(tmp_path: Path) -> None:
