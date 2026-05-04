@@ -5035,6 +5035,30 @@ class TestIterateCommand:
         assert attention is not None
         return self._format_expected_attention_line(attention.task, attention.action)
 
+    def _expected_failed_recovery_attention_line(
+        self,
+        *,
+        store,
+        failed_task,
+        decision,
+        max_resume_attempts: int,
+    ) -> str:
+        from gza.cli.advance_executor import (
+            build_failed_recovery_needs_attention_result,
+            resolve_execution_needs_attention,
+        )
+
+        result = build_failed_recovery_needs_attention_result(
+            store=store,
+            failed_task=failed_task,
+            recovery_decision=decision,
+            max_resume_attempts=max_resume_attempts,
+        )
+        assert result is not None
+        attention = resolve_execution_needs_attention(failed_task, result)
+        assert attention is not None
+        return self._format_expected_attention_line(attention.task, attention.action)
+
     def _init_git_repo(self, tmp_path: Path) -> None:
         from gza.git import Git
 
@@ -7348,6 +7372,191 @@ class TestIterateCommand:
         assert output.count("Needs attention:") == 1
         assert expected_line.count("\n") == 0
         assert "Prior improve with a long first line that should not spill\nSecond line" not in output
+
+    def test_iterate_in_loop_failed_improve_recovery_exhaustion_uses_shared_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+        from gza.recovery_engine import decide_failed_task_recovery
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "failed"
+            task.failure_reason = "MAX_STEPS"
+            task.session_id = "improve-session"
+            store.update(task)
+            return 1
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.advance_engine.prompt_available_width", return_value=40),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={"type": "improve", "description": "Create improve task", "review_task": review},
+            ),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        improves = [
+            task
+            for task in store.get_all()
+            if task.task_type == "improve" and task.depends_on == review.id
+        ]
+        assert len(improves) == 2
+        terminal_improve = next(task for task in improves if task.based_on != impl.id)
+        terminal_decision = decide_failed_task_recovery(
+            store,
+            terminal_improve,
+            max_recovery_attempts=1,
+        )
+        with patch("gza.advance_engine.prompt_available_width", return_value=40):
+            expected_line = self._expected_failed_recovery_attention_line(
+                store=store,
+                failed_task=terminal_improve,
+                decision=terminal_decision,
+                max_resume_attempts=1,
+            )
+
+        assert result == 3
+        assert run_foreground.call_count == 2
+        assert run_foreground.call_args_list[0].kwargs.get("resume", False) is False
+        assert run_foreground.call_args_list[1].kwargs.get("resume") is True
+        assert terminal_decision.reason_code == "manual_review_required"
+        assert expected_line in output
+        assert "reason=max-resume-attempts-reached" in output
+        assert output.count("Needs attention:") == 1
+        assert "Iterate blocked: improve_failed. Manual review required." not in output
+
+    def test_iterate_in_loop_manual_failure_uses_shared_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+        from gza.recovery_engine import decide_failed_task_recovery
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "failed"
+            task.failure_reason = "TEST_FAILURE"
+            store.update(task)
+            return 1
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.advance_engine.prompt_available_width", return_value=40),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={"type": "improve", "description": "Create improve task", "review_task": review},
+            ),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        improves = [
+            task
+            for task in store.get_all()
+            if task.task_type == "improve" and task.depends_on == review.id
+        ]
+        assert len(improves) == 1
+        failed_improve = improves[0]
+        decision = decide_failed_task_recovery(store, failed_improve, max_recovery_attempts=1)
+        with patch("gza.advance_engine.prompt_available_width", return_value=40):
+            expected_line = self._expected_failed_recovery_attention_line(
+                store=store,
+                failed_task=failed_improve,
+                decision=decision,
+                max_resume_attempts=1,
+            )
+
+        assert result == 3
+        assert run_foreground.call_count == 1
+        assert decision.reason_code == "manual_failure_reason"
+        assert expected_line in output
+        assert "reason=manual-failure-reason" in output
+        assert output.count("Needs attention:") == 1
+        assert "Iterate blocked: improve_failed. Manual review required." not in output
 
     def test_in_progress_improve_is_prioritized_over_newer_pending_improve(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

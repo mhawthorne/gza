@@ -135,6 +135,48 @@ def build_improve_needs_attention_result(
     )
 
 
+def build_failed_recovery_needs_attention_result(
+    *,
+    store: SqliteTaskStore,
+    failed_task: DbTask,
+    recovery_decision: FailedRecoveryDecision,
+    max_resume_attempts: int,
+) -> AdvanceActionExecutionResult | None:
+    """Build shared execution-time attention output for terminal recovery stops."""
+    attention_reason = get_failed_recovery_needs_attention_reason(
+        store,
+        failed_task,
+        decision=recovery_decision,
+        max_recovery_attempts=max_resume_attempts,
+    )
+    if attention_reason is None:
+        return None
+
+    task_id = failed_task.id or "unknown"
+    task_type = failed_task.task_type or "task"
+    if recovery_decision.reason_code == "automatic_recovery_disabled":
+        attention_type = "automatic_recovery_disabled"
+        message = (
+            f"SKIP: automatic {task_type} recovery is disabled "
+            f"(max_resume_attempts={max_resume_attempts}); latest failed {task_type}: {task_id}"
+        )
+    else:
+        attention_type = "manual_review_required"
+        message = (
+            f"SKIP: {task_type} {task_id} requires manual review "
+            f"({recovery_decision.reason_text})"
+        )
+
+    return AdvanceActionExecutionResult(
+        action_type=task_type,
+        status="skip",
+        message=message,
+        failed_improve=failed_task if failed_task.task_type == "improve" else None,
+        attention_type=attention_type,
+        attention_reason=attention_reason,
+    )
+
+
 def resolve_execution_needs_attention(
     task: DbTask,
     result: AdvanceActionExecutionResult,
