@@ -186,16 +186,9 @@ class ClaudeProvider(Provider):
         if config.claude.fetch_auth_token_from_keychain:
             sync_keychain_credentials()
         docker_config = _get_docker_config(f"{config.docker_image}-claude")
-        if not ensure_docker_image(docker_config, config.project_dir):
-            write_preflight_entry(
-                log_file,
-                event="docker_image_build_failed",
-                command=["docker", "build", "-t", docker_config.image_name],
-                returncode=None,
-                stdout_tail="",
-                stderr_tail="",
-                message="Failed to build Claude Docker image",
-            )
+        if not ensure_docker_image(
+            docker_config, config.project_dir, log_file=log_file, provider_label="Claude"
+        ):
             print("Error: Failed to build Docker image")
             return PreflightCheckResult.failure(
                 failure_reason="INFRASTRUCTURE_ERROR",

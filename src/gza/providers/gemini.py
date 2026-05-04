@@ -111,16 +111,9 @@ class GeminiProvider(Provider):
         """Verify credentials work in Docker."""
         image_name = f"{config.docker_image}-gemini"
         docker_config = _get_docker_config(image_name)
-        if not ensure_docker_image(docker_config, config.project_dir):
-            write_preflight_entry(
-                log_file,
-                event="docker_image_build_failed",
-                command=["docker", "build", "-t", docker_config.image_name],
-                returncode=None,
-                stdout_tail="",
-                stderr_tail="",
-                message="Failed to build Gemini Docker image",
-            )
+        if not ensure_docker_image(
+            docker_config, config.project_dir, log_file=log_file, provider_label="Gemini"
+        ):
             print("Error: Failed to build Docker image")
             return PreflightCheckResult.failure(
                 failure_reason="INFRASTRUCTURE_ERROR",
