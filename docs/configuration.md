@@ -1377,7 +1377,7 @@ keeping sibling branches as separate source rows. It never shows `implement` tas
 Only completed plan rows are directly runnable with `uv run gza implement <id>`; use `uv run gza advance --unimplemented --create` to queue implement tasks
 for explore rows or incomplete source descendants.
 
-When the shared advance/recovery engine decides a task must be skipped for human intervention, `uv run gza advance` prints a dedicated `Needs attention` section. Each entry includes the task id, task type, short prompt, a stable `reason=...` policy slug, and the underlying skip text. This section is shown in normal and `--dry-run` output, including when there is otherwise no actionable work to advance.
+When the shared advance/recovery engine decides a task must be skipped for human intervention, `uv run gza advance` prints a dedicated `Needs attention` section. Each entry includes the task id, task type, short prompt, a stable `reason=...` policy slug, and the underlying skip text. This section is shown in the normal pre-confirmation preview and in `--dry-run` output, including when there is otherwise no actionable work to advance.
 
 ### iterate
 

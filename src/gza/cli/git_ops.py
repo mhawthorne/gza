@@ -2035,6 +2035,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
             _color = _advance_action_color(action['type'])
             console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
             print()
+        if attention_plan:
+            _print_needs_attention_section(attention_plan)
+            print()
     elif attention_plan:
         print("No eligible tasks to advance")
         _print_needs_attention_section(attention_plan)

@@ -247,6 +247,8 @@ Needs attention:
   gza-27 implement "Update deps" reason=review-max-cycles-reached max review cycles (3) reached, needs manual intervention
 ```
 
+In interactive mode, the same `Needs attention` section is part of the plan preview before the `Proceed?` prompt, even when actionable rows are also present.
+
 ## Idempotency
 
 `gza advance` is safe to run repeatedly:

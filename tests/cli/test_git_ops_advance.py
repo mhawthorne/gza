@@ -2108,6 +2108,83 @@ class TestAdvanceCommand:
 
         assert rc == 0
 
+    def test_advance_interactive_preview_shows_attention_before_prompt_for_mixed_plan(self, tmp_path: Path):
+        """advance prints attention rows in the pre-confirmation preview even with actionable work."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        merge_task = self._create_implement_task_with_branch(store, git, tmp_path, prompt="Merge-ready task")
+        attention_task = self._create_implement_task_with_branch(
+            store,
+            git,
+            tmp_path,
+            prompt="Task blocked on human review after repeated changes",
+        )
+
+        approved_review = store.add(f"Review {merge_task.id}", task_type="review", depends_on=merge_task.id)
+        approved_review.status = "completed"
+        approved_review.completed_at = datetime.now(UTC)
+        approved_review.output_content = "**Verdict: APPROVED**"
+        store.update(approved_review)
+
+        requested_review = store.add(
+            f"Review {attention_task.id}",
+            task_type="review",
+            depends_on=attention_task.id,
+        )
+        requested_review.status = "completed"
+        requested_review.completed_at = datetime.now(UTC)
+        requested_review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(requested_review)
+        self._create_completed_improve(store, attention_task, requested_review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=False,
+            max=None,
+            no_docker=True,
+            batch=None,
+            force=False,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            new=False,
+            max_review_cycles=1,
+            squash_threshold=None,
+        )
+
+        def fake_input(prompt: str) -> str:
+            print(prompt, end="")
+            return "n"
+
+        with (
+            patch("sys.stdout", new_callable=io.StringIO) as mock_stdout,
+            patch("builtins.input", side_effect=fake_input),
+            patch("gza.cli._execute_merge_action") as merge_action,
+            patch("gza.cli._spawn_background_worker") as spawn_worker,
+        ):
+            rc = cmd_advance(args)
+            output = mock_stdout.getvalue()
+
+        assert rc == 0
+        assert "Will advance 1 task(s):" in output
+        assert str(merge_task.id) in output
+        assert "Needs attention" in output
+        assert str(attention_task.id) in output
+        assert "reason=review-max-cycles-reached" in output
+        assert "Proceed? [Y/n]" in output
+        assert output.index("Needs attention") < output.index("Proceed? [Y/n]")
+        assert "Aborted." in output
+        merge_action.assert_not_called()
+        spawn_worker.assert_not_called()
+        assert store.get(merge_task.id).merge_status == "unmerged"
+
     def test_advance_auto_flag_skips_prompt(self, tmp_path: Path):
         """advance --auto executes without prompting."""
         setup_config(tmp_path)
