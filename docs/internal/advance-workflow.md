@@ -34,7 +34,7 @@ Advance collects tasks from three sources:
 
 1. **Unmerged tasks**: `store.get_unmerged()` — completed tasks with `merge_status='unmerged'`. Excludes improve and rebase tasks that have a parent (`based_on IS NOT NULL`) since they operate on the parent's branch.
 
-2. **Failed-task recovery candidates**: Tasks from `store.list_failed_tasks_for_recovery(...)` that are evaluated by `decide_failed_task_recovery(...)` under the shared bounded policy. This policy can classify candidates as `resume`, `retry`, or manual review required; `--no-resume-failed` disables this source. When a completed lineage root is already being advanced in the same run, failed descendants from that lineage are excluded from this standalone sweep so one lineage gets one authoritative planned action.
+2. **Failed-task recovery candidates**: Tasks from `store.list_failed_tasks_for_recovery(...)` that are evaluated by `decide_failed_task_recovery(...)` under the shared bounded policy. This policy can classify candidates as `resume`, `retry`, or manual review required; `--no-resume-failed` disables this source. When a completed task already owns a `based_on` recovery chain in the same run, failed descendants from that same `based_on` chain are excluded from the standalone failed-task sweep so one recovery chain gets one authoritative planned action. Dependency-only (`depends_on`) ancestry does not suppress independent failed-task recovery rows.
 
 3. **Unimplemented plans**: Completed plan tasks with no implement child yet. Excluded when `--type implement`.
 

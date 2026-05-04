@@ -1153,7 +1153,7 @@ def _run_cycle(
             assert task.id is not None
             if str(task.id) in started_task_ids:
                 continue
-            if str(task.id) in pending_recovery_task_ids:
+            if restart_failed and str(task.id) in pending_recovery_task_ids:
                 continue
             if str(task.id) in step1_handled_child_task_ids:
                 continue

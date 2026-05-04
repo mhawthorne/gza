@@ -2354,8 +2354,8 @@ class TestAdvanceCommand:
         action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'create_review'
 
-    def test_advance_dry_run_failed_review_lineage_has_single_planned_action(self, tmp_path: Path):
-        """advance --dry-run should not plan failed review recovery separately from its root."""
+    def test_advance_dry_run_failed_dependency_descendant_plans_independent_recovery(self, tmp_path: Path):
+        """Failed tasks linked only by depends_on ancestry stay independently recoverable."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
         task = store.add("Implement feature", task_type="implement")
@@ -2405,10 +2405,10 @@ class TestAdvanceCommand:
 
         output = stdout.getvalue()
         assert rc == 0
-        assert "Would advance 1 task(s)" in output
+        assert "Would advance 2 task(s)" in output
         assert "Create review (required before merge)" in output
-        assert str(failed_review.id) not in output
-        assert "Resume failed task (MAX_TURNS)" not in output
+        assert str(failed_review.id) in output
+        assert "Resume failed task (MAX_TURNS)" in output
 
     def test_advance_auto_failed_improve_retry_creates_single_child(self, tmp_path: Path):
         """advance --auto creates one retry child when root improve flow owns recovery."""
@@ -2538,8 +2538,8 @@ class TestAdvanceCommand:
         assert "needs manual resolution" in output
         assert "Resume failed task (MAX_TURNS)" not in output
 
-    def test_advance_dry_run_skips_all_failed_descendant_plan_rows_when_root_is_planned(self, tmp_path: Path):
-        """No failed descendant should appear as a second plan row when root already owns lifecycle."""
+    def test_advance_dry_run_suppresses_based_on_failed_descendant_only(self, tmp_path: Path):
+        """Only based_on failed descendants are suppressed when root already owns lifecycle."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -2603,8 +2603,9 @@ class TestAdvanceCommand:
 
         output = stdout.getvalue()
         assert rc == 0
-        assert "Would advance 1 task(s)" in output
-        assert str(failed_review.id) not in output
+        assert "Would advance 2 task(s)" in output
+        assert str(failed_review.id) in output
+        assert "Resume failed task (MAX_TURNS)" in output
         assert str(failed_improve.id) not in output
 
     def _create_completed_improve(self, store, impl_task, review_task):
