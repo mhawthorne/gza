@@ -217,6 +217,36 @@ def get_recovery_chain_root_task_id(store: SqliteTaskStore, task: DbTask) -> str
     return current.id
 
 
+def has_recovery_chain_ancestor_in_ids(
+    store: SqliteTaskStore,
+    task: DbTask,
+    ancestor_ids: set[str],
+) -> bool:
+    """Return whether this failed task is owned by a completed task already in the plan."""
+    current = task
+    seen: set[str] = set()
+
+    while current.id is not None and current.id not in seen:
+        seen.add(current.id)
+        if current.based_on is None:
+            return False
+        parent = store.get(current.based_on)
+        if parent is None or parent.id is None:
+            return False
+        # Implement roots own their improve lineage through the shared improve
+        # planner, even though the improve chain itself is cross-type.
+        if current.task_type in {"improve", "rebase"} and parent.task_type == "implement":
+            return parent.id in ancestor_ids
+        if parent.task_type != current.task_type:
+            return False
+        if _classify_recovery_edge(parent, current) is None:
+            return False
+        if parent.id in ancestor_ids:
+            return True
+        current = parent
+    return False
+
+
 def get_completed_recovery_descendant(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
     """Return the terminal completed recovery descendant when a failed chain is fully resolved."""
     if task.id is None or task.status != "failed":
@@ -252,6 +282,13 @@ def get_completed_recovery_descendant(store: SqliteTaskStore, task: DbTask) -> D
         terminal_descendants,
         key=_descendant_sort_key,
     )
+
+
+def resolve_recovery_planning_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    """Return the task that should own normal lifecycle planning for this lineage."""
+    if task.status != "failed":
+        return task
+    return get_completed_recovery_descendant(store, task) or task
 
 
 def is_chain_resolved_by_recovery(store: SqliteTaskStore, task: DbTask) -> bool:

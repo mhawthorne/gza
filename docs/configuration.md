@@ -1395,6 +1395,8 @@ uv run gza iterate <impl_task_id> [options]
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--force` | Skip dependency merge precondition checks when iterate starts workers |
 
+If `impl_task_id` names a failed implementation whose recovery-only lineage already ends in a completed retry/resume descendant, iterate plans from that completed descendant instead of surfacing a stale `recovery child already completed` skip. If that descendant is already merged, iterate reports that no remaining lifecycle action is needed.
+
 When iterate stops with `max_cycles_reached`, it now prints review-cycle accounting with:
 - task `completed` review-cycle count
 - configured `max_review_cycles`

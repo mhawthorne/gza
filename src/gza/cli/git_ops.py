@@ -36,8 +36,9 @@ from ..pickup import (
 )
 from ..pr_ops import build_task_pr_content, ensure_task_pr
 from ..recovery_engine import (
-    get_completed_recovery_descendant,
+    has_recovery_chain_ancestor_in_ids,
     list_failed_tasks_for_recovery,
+    resolve_recovery_planning_task,
 )
 from ..runner import (
     TaskExecutionLogger,
@@ -279,26 +280,6 @@ def _collect_advance_completed_tasks(
         tasks = [t for t in tasks if t.task_type == 'implement']
 
     return tasks, impl_based_on_ids
-
-def _has_based_on_ancestor_in_ids(
-    store: SqliteTaskStore,
-    task: DbTask,
-    ancestor_ids: set[str],
-) -> bool:
-    """Return whether any based_on ancestor is owned by a completed task in this plan."""
-    current = task
-    seen: set[str] = set()
-    while current.id is not None and current.id not in seen:
-        seen.add(current.id)
-        if current.based_on is None:
-            return False
-        parent = store.get(current.based_on)
-        if parent is None or parent.id is None:
-            return False
-        if parent.id in ancestor_ids:
-            return True
-        current = parent
-    return False
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
@@ -1781,9 +1762,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if no_resume_failed:
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
                 return 1
-            resolved_descendant = get_completed_recovery_descendant(store, task)
-            if resolved_descendant is not None:
-                tasks = [resolved_descendant] if resolved_descendant.merge_status != 'merged' else []
+            planning_task = resolve_recovery_planning_task(store, task)
+            if planning_task is not task:
+                tasks = [planning_task] if planning_task.merge_status != 'merged' else []
                 failed_tasks = []
             else:
                 tasks = []
@@ -1830,7 +1811,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             failed_tasks = [
                 failed_task
                 for failed_task in failed_tasks
-                if not _has_based_on_ancestor_in_ids(store, failed_task, completed_owner_ids)
+                if not has_recovery_chain_ancestor_in_ids(store, failed_task, completed_owner_ids)
             ]
 
     # Use the currently checked-out branch as the target for conflict checks,

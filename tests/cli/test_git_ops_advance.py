@@ -3582,6 +3582,100 @@ class TestAdvanceCommand:
         assert completed_child.id in result.stdout
         assert "recovery child already completed" not in result.stdout
 
+    def test_advance_dry_run_keeps_failed_descendant_visible_under_completed_non_recovery_ancestor(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A completed non-recovery ancestor must not suppress a failed descendant below it."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
+        )
+        store = make_store(tmp_path)
+
+        root = self._create_implement_task_with_branch(
+            store,
+            self._setup_git_repo(tmp_path),
+            tmp_path,
+            prompt="Completed root implement",
+        )
+        assert root.id is not None
+        root.session_id = "sess-root"
+        store.update(root)
+
+        manual_follow_up = store.add("Manual follow-up implement", task_type="implement", based_on=root.id)
+        assert manual_follow_up.id is not None
+        manual_follow_up.status = "completed"
+        manual_follow_up.session_id = "sess-manual"
+        manual_follow_up.branch = "feature/manual"
+        manual_follow_up.merge_status = "merged"
+        manual_follow_up.completed_at = datetime.now(UTC)
+        store.update(manual_follow_up)
+
+        failed_descendant = store.add(manual_follow_up.prompt, task_type="implement", based_on=manual_follow_up.id)
+        assert failed_descendant.id is not None
+        failed_descendant.status = "failed"
+        failed_descendant.failure_reason = "MAX_TURNS"
+        failed_descendant.session_id = manual_follow_up.session_id
+        failed_descendant.branch = manual_follow_up.branch
+        failed_descendant.completed_at = datetime.now(UTC)
+        store.update(failed_descendant)
+
+        with patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert root.id in result.stdout
+        assert failed_descendant.id in result.stdout
+        assert "Needs attention" in result.stdout
+
+    def test_advance_dry_run_keeps_failed_fix_visible_under_completed_implement_ancestor(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A cross-type completed ancestor must not suppress an independent failed fix descendant."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
+        )
+        store = make_store(tmp_path)
+
+        root = self._create_implement_task_with_branch(
+            store,
+            self._setup_git_repo(tmp_path),
+            tmp_path,
+            prompt="Completed root implement",
+        )
+        assert root.id is not None
+
+        completed_fix = store.add("Completed fix", task_type="fix", based_on=root.id, same_branch=True)
+        assert completed_fix.id is not None
+        completed_fix.status = "completed"
+        completed_fix.session_id = "sess-fix"
+        completed_fix.branch = root.branch
+        completed_fix.merge_status = "merged"
+        completed_fix.completed_at = datetime.now(UTC)
+        store.update(completed_fix)
+
+        failed_fix = store.add(completed_fix.prompt, task_type="fix", based_on=completed_fix.id, same_branch=True)
+        assert failed_fix.id is not None
+        failed_fix.status = "failed"
+        failed_fix.failure_reason = "MAX_TURNS"
+        failed_fix.session_id = completed_fix.session_id
+        failed_fix.branch = completed_fix.branch
+        failed_fix.completed_at = datetime.now(UTC)
+        store.update(failed_fix)
+
+        with patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert root.id in result.stdout
+        assert failed_fix.id in result.stdout
+        assert "Needs attention" in result.stdout
+
     def test_advance_skips_failed_task_with_failed_resume_child(self, tmp_path: Path):
         """advance skips a failed task whose resume child also failed (no double-resume of root)."""
         (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")

@@ -6101,6 +6101,136 @@ class TestIterateCommand:
         assert "[dry-run] First next action: merge" in output
         assert "[dry-run] First iteration 1/1 action: merge" not in output
 
+    def test_iterate_dry_run_resolves_completed_recovery_child_before_planning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_root = store.add("Implement feature", task_type="implement")
+        assert failed_root.id is not None
+        failed_root.status = "failed"
+        failed_root.failure_reason = "MAX_TURNS"
+        failed_root.session_id = "sess-root"
+        failed_root.branch = "feature/root"
+        failed_root.completed_at = datetime.now(UTC)
+        store.update(failed_root)
+
+        completed_resume = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+        assert completed_resume.id is not None
+        completed_resume.status = "completed"
+        completed_resume.session_id = failed_root.session_id
+        completed_resume.branch = failed_root.branch
+        completed_resume.has_commits = True
+        completed_resume.merge_status = "unmerged"
+        completed_resume.completed_at = datetime.now(UTC)
+        store.update(completed_resume)
+
+        review = store.add("Review", task_type="review", depends_on=completed_resume.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: APPROVED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        args = argparse.Namespace(
+            impl_task_id=failed_root.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert f"[dry-run] Would iterate implementation {completed_resume.id}" in output
+        assert "[dry-run] First next action: merge" in output
+        assert "recovery child already completed" not in output
+
+    def test_iterate_dry_run_resolves_multi_step_completed_recovery_descendant_before_planning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_root = store.add("Implement feature", task_type="implement")
+        assert failed_root.id is not None
+        failed_root.status = "failed"
+        failed_root.failure_reason = "MAX_TURNS"
+        failed_root.session_id = "sess-root"
+        failed_root.branch = "feature/root"
+        failed_root.completed_at = datetime.now(UTC)
+        store.update(failed_root)
+
+        failed_resume = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+        assert failed_resume.id is not None
+        failed_resume.status = "failed"
+        failed_resume.failure_reason = "MAX_TURNS"
+        failed_resume.session_id = failed_root.session_id
+        failed_resume.branch = failed_root.branch
+        failed_resume.completed_at = datetime.now(UTC)
+        store.update(failed_resume)
+
+        completed_resume = store.add(failed_resume.prompt, task_type="implement", based_on=failed_resume.id)
+        assert completed_resume.id is not None
+        completed_resume.status = "completed"
+        completed_resume.session_id = failed_resume.session_id
+        completed_resume.branch = failed_resume.branch
+        completed_resume.has_commits = True
+        completed_resume.merge_status = "unmerged"
+        completed_resume.completed_at = datetime.now(UTC)
+        store.update(completed_resume)
+
+        review = store.add("Review", task_type="review", depends_on=completed_resume.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: APPROVED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        args = argparse.Namespace(
+            impl_task_id=failed_root.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert f"[dry-run] Would iterate implementation {completed_resume.id}" in output
+        assert "[dry-run] First next action: merge" in output
+        assert "recovery child already completed" not in output
+        assert "recovery descendant already completed" not in output
+
     def test_iterate_dry_run_approved_with_newer_unresolved_comments_prefers_run_improve(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):

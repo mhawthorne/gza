@@ -34,7 +34,7 @@ Advance collects tasks from three sources:
 
 1. **Unmerged tasks**: `store.get_unmerged()` — completed tasks with `merge_status='unmerged'`. Excludes improve and rebase tasks that have a parent (`based_on IS NOT NULL`) since they operate on the parent's branch.
 
-2. **Failed-task recovery candidates**: Tasks from `store.list_failed_tasks_for_recovery(...)` that are evaluated by `decide_failed_task_recovery(...)` under the shared bounded policy. This policy can classify candidates as `resume`, `retry`, or manual review required; `--no-resume-failed` disables this source. Failed ancestors whose recovery-only `based_on` chain already terminates in a completed retry/resume descendant are omitted silently; the completed descendant is then handled through the ordinary completed-task rules (merge, rebase, review, or dependency wait) instead of re-printing a permanent `SKIP: recovery child/descendant already completed` row. When a completed task already owns a recovery-only `based_on` chain in the same run, failed descendants from that same recovery chain are excluded from the standalone failed-task sweep so one recovery chain gets one authoritative planned action. Dependency-only ancestry and non-recovery `based_on` follow-ups do not suppress independent failed-task recovery rows.
+2. **Failed-task recovery candidates**: Tasks from `store.list_failed_tasks_for_recovery(...)` that are evaluated by `decide_failed_task_recovery(...)` under the shared bounded policy. This policy can classify candidates as `resume`, `retry`, or manual review required; `--no-resume-failed` disables this source. Failed ancestors whose recovery-only `based_on` chain already terminates in a completed retry/resume descendant are omitted silently; the completed descendant is then handled through the ordinary completed-task rules (merge, rebase, review, or dependency wait) instead of re-printing a permanent `SKIP: recovery child/descendant already completed` row. When a completed task already owns the same same-type recovery-only `based_on` chain in the same run, failed descendants from that same recovery chain are excluded from the standalone failed-task sweep so one recovery chain gets one authoritative planned action. Dependency-only ancestry, cross-type `based_on` edges, and non-recovery `based_on` follow-ups do not suppress independent failed-task recovery rows.
 
 3. **Unimplemented plans**: Completed plan tasks with no implement child yet. Excluded when `--type implement`.
 
@@ -119,7 +119,7 @@ When the engine emits `improve`, the caller (iterate) delegates to `resolve_impr
 | `max_resume_attempts == 0` (automatic recovery disabled) | `give_up` — stop iterating; surface `automatic_recovery_disabled` as the stop reason |
 | Shared failed-task recovery policy returns `manual_review_required` (for example, failed resume descendants) | `manual_review` — stop iterating and require operator intervention |
 
-The improve flow now defers recovery edge selection to the shared recovery engine (`decide_failed_task_recovery`), so iterate/advance/watch enforce one consistent resume/retry/manual-review boundary.
+The improve flow now defers recovery edge selection to the shared recovery engine (`decide_failed_task_recovery`), and iterate also resolves fully recovered failed implement IDs through the same completed-descendant planner handoff used by advance/watch. That keeps iterate/advance/watch on one consistent resume/retry/manual-review boundary and avoids stale completed-recovery skip output on recovered ancestors.
 
 ### 6. No reviews / all cleared
 

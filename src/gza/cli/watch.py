@@ -20,6 +20,7 @@ from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_act
 from ..recovery_engine import (
     FailedRecoveryDecision,
     decide_failed_task_recovery,
+    has_recovery_chain_ancestor_in_ids,
     list_failed_tasks_for_recovery,
 )
 from ..sync_ops import reconcile_task_branch_merge_truth
@@ -61,7 +62,6 @@ from .execution import _spawn_background_iterate
 from .git_ops import (
     _collect_advance_completed_tasks,
     _execute_merge_action,
-    _has_based_on_ancestor_in_ids,
     _merge_single_task as _git_ops_merge_single_task,
     _prepare_create_review_action,
     _require_default_branch,
@@ -1051,7 +1051,7 @@ def _run_cycle(
     for failed in failed_tasks:
         if failed.id is None:
             continue
-        if _has_based_on_ancestor_in_ids(store, failed, completed_owner_ids):
+        if has_recovery_chain_ancestor_in_ids(store, failed, completed_owner_ids):
             continue
         decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
         failed_decisions.append((failed, decision))
