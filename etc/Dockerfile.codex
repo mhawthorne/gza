@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN cp /root/.local/bin/uv /usr/local/bin/uv
 
-RUN npm install -g @openai/codex
+RUN npm install -g @openai/codex@0.128.0
 
 # Run optional setup command from env var, then exec the CLI
 RUN printf '#!/bin/bash\nset -e\nif [ -n "$GZA_DOCKER_SETUP_COMMAND" ]; then\n    eval "$GZA_DOCKER_SETUP_COMMAND"\nfi\nexec "$@"\n' > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
