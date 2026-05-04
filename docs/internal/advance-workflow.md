@@ -243,9 +243,11 @@ Will advance N task(s):
 
 Advanced: 1 merged, 1 review started, 1 skipped
 
-⚠ Tasks needing attention:
-  gza-27 Update deps — SKIP: max review cycles (3) reached, needs manual intervention
+Needs attention:
+  gza-27 implement "Update deps" reason=review-max-cycles-reached max review cycles (3) reached, needs manual intervention
 ```
+
+In interactive mode, the same `Needs attention` section is part of the plan preview before the `Proceed?` prompt, even when actionable rows are also present.
 
 ## Idempotency
 
@@ -270,7 +272,7 @@ Advanced: 1 merged, 1 review started, 1 skipped
 
 `gza watch` reuses the same advance executor and improve-resolution helpers described above; it does not maintain a separate improve retry policy.
 
-Watch renders human-needed advance outcomes (`needs_discussion`, `max_cycles_reached`, and improve-recovery stop reasons such as `manual_review_required` / `automatic_recovery_disabled`) as sticky `ATTENTION` log lines instead of deduped `SKIP` lines. The reminder repeats while the task still resolves to that manual-attention next action, then disappears once the next action changes. Ordinary watch skip/wait lines remain deduped across cycles.
+Watch renders human-needed advance outcomes (`needs_discussion`, `max_cycles_reached`, failed-task recovery states that now require an operator decision, and improve-recovery stop reasons) as sticky `ATTENTION` log lines instead of deduped `SKIP` lines. The reminder reuses the same formatted task line as the `advance` needs-attention section, including the stable `reason=...` policy slug and the shared single-line shortened prompt. It repeats while the task still resolves to that manual-attention next action, then disappears once the next action changes. Ordinary watch skip/wait lines remain deduped across cycles.
 
 When `main_checkout_isolate: true`, `gza watch` still plans against the repo default branch but executes merge attempts inside a dedicated detached integration checkout reset to the default-branch tip (`config.main_checkout_integration_path`). Successful isolated merges are then promoted onto the real default-branch ref before `merge_status` flips to `merged`; if the default branch is attached in another checkout, watch hard-resets that checkout to the new tip so it stays clean. Rebase/conflict-resolution ownership is unchanged: conflicts create rebase tasks on the task branch, and those tasks run through the normal rebase workflow.
 
@@ -281,5 +283,5 @@ When `--restart-failed` is enabled:
 - Watch evaluates failed tasks through the shared recovery engine before starting fresh pending work
 - Recovery work is recovery-first: actionable failed tasks drain before pending queue pickup, and newly failed actionable tasks continue to outrank pending work for that session
 - Implement recovery launches through iterate-aware execution; non-implement recovery launches through plain worker execution
-- `gza watch --restart-failed --dry-run` prints the failed-task recovery decision report and exits
+- `gza watch --restart-failed --dry-run` prints the failed-task recovery decision report, including shared `Needs attention` rows by default, and exits
 - `--max-resume-attempts` applies to all unattended watch-managed resume/retry decisions for that run, including plain watch, failed-task recovery, and advance-driven improve recovery

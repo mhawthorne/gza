@@ -1661,6 +1661,7 @@ def run_with_recovery(
     run_task: Callable[[DbTask, bool], int],
     max_resume_attempts: int | None = None,
     on_recovery: Callable[[DbTask, DbTask, FailedRecoveryDecision], None] | None = None,
+    on_terminal_skip: Callable[[DbTask, FailedRecoveryDecision, int], None] | None = None,
 ) -> tuple[DbTask, int]:
     """Execute a task and apply the shared automatic recovery policy.
 
@@ -1675,6 +1676,9 @@ def run_with_recovery(
             recovery. Any positive value enables the bounded shared policy.
         on_recovery: Optional callback invoked when a recovery child is created.
             Signature: ``on_recovery(failed_task, recovery_task, decision)``.
+        on_terminal_skip: Optional callback invoked when recovery stops without
+            creating a child. Signature:
+            ``on_terminal_skip(failed_task, decision, exit_code)``.
 
     Returns:
         Tuple of ``(final_task, exit_code)``.
@@ -1708,6 +1712,8 @@ def run_with_recovery(
             max_recovery_attempts=effective_limit,
         )
         if decision.action == "skip":
+            if on_terminal_skip is not None:
+                on_terminal_skip(refreshed, decision, _failure_exit_code(rc))
             return refreshed, _failure_exit_code(rc)
 
         if decision.action == "resume":

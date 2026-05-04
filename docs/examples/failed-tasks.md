@@ -48,8 +48,8 @@ For bulk unattended recovery after fixing an environment issue, use watch recove
 | Command | Behavior | Use when |
 |---------|----------|----------|
 | `uv run gza watch --restart-failed` | Drain actionable failed tasks before pending queue work, choosing `resume` or `retry` per task | You want watch to recover the failed queue first, then continue normal processing |
-| `uv run gza watch --restart-failed --dry-run` | Print the recovery decision report and exit | You want to inspect which failed tasks would `resume`, `retry`, or `skip` before starting recovery |
-| `uv run gza watch --restart-failed --dry-run --show-skipped` | Include skipped failed tasks in the recovery decision report | You want to inspect why some failed tasks would be skipped |
+| `uv run gza watch --restart-failed --dry-run` | Print the recovery decision report and exit | You want to inspect which failed tasks would `resume`, `retry`, or need operator attention before starting recovery |
+| `uv run gza watch --restart-failed --dry-run --show-skipped` | Include ordinary skipped failed tasks in the recovery decision report | You want to inspect why some non-attention failed tasks would still be skipped |
 | `uv run gza watch --restart-failed --show-skipped` | Include skipped failed tasks in live watch logs | You want restart-failed watch logs to explain why some failed tasks are being skipped |
 
 ## Resume a task
@@ -108,23 +108,29 @@ Failed recovery plan (tags=*, mode=restart-failed)
 resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/2
 retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/2
 
-Summary: 2 actionable (1 resume, 1 retry), 0 skipped hidden
+Needs attention (1 task):
+  gza-103 improve "Improve feature" reason=manual-failure-reason TEST_FAILURE requires manual intervention
+
+Summary: 2 actionable (1 resume, 1 retry), 1 needs attention, 0 skipped hidden
 ```
 
-Include skipped tasks when you need the full picture:
+Include ordinary skipped tasks when you need the full picture:
 
 ```bash
 $ uv run gza watch --restart-failed --dry-run --show-skipped
 Failed recovery plan (tags=*, mode=restart-failed)
 
 resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/2
-skip   gza-103 improve   via none    reason=manual_failure_reason attempt=2/2
 retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/2
+skip   gza-104 implement via none    reason=recovery_already_pending attempt=1/2
 
-Summary: 2 actionable (1 resume, 1 retry), 1 skipped
+Needs attention (1 task):
+  gza-103 improve "Improve feature" reason=manual-failure-reason TEST_FAILURE requires manual intervention
+
+Summary: 2 actionable (1 resume, 1 retry), 1 needs attention, 1 skipped
 ```
 
-The same `--show-skipped` flag also controls live `uv run gza watch --restart-failed` logging. Without it, skipped recovery decisions stay silent in the watch log; with it, skipped items are emitted as `SKIP` events while watch runs.
+The same `--show-skipped` flag also controls live `uv run gza watch --restart-failed` logging. Shared needs-attention recovery rows are shown by default; without `--show-skipped`, only ordinary non-attention skip decisions stay silent in the watch log.
 
 Then run recovery mode for real:
 

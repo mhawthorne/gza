@@ -7,8 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from gza.cli.advance_executor import AdvanceActionExecutionContext, execute_advance_action
+from gza.cli._common import resolve_improve_action
+from gza.cli.advance_executor import (
+    AdvanceActionExecutionContext,
+    build_improve_needs_attention_result,
+    execute_advance_action,
+    resolve_execution_needs_attention,
+)
 from gza.db import Task as DbTask
+from gza.recovery_engine import decide_failed_task_recovery
 
 from .conftest import make_store, setup_config
 
@@ -160,11 +167,120 @@ def test_improve_manual_review_returns_skip_without_mutation(tmp_path: Path) -> 
         action={"type": "improve", "review_task": review},
         context=context,
     )
+    improve_mode, failed_improve, improve_decision = resolve_improve_action(
+        store,
+        impl.id,
+        review.id,
+        max_resume_attempts=1,
+    )
+    expected = build_improve_needs_attention_result(
+        store=store,
+        impl_task=impl,
+        review_task=review,
+        improve_mode=improve_mode,
+        failed_improve=failed_improve,
+        improve_decision=improve_decision,
+        max_resume_attempts=1,
+    )
 
-    assert result.status == "skip"
-    assert result.attention_type == "manual_review_required"
-    assert "requires manual review" in result.message
+    assert expected is not None
+    assert result == expected
     assert len(store.get_all()) == before_count
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "reason_text"),
+    [
+        ("dependency_not_ready", "dependency precondition not satisfied"),
+        ("recovery_already_running", "recovery child already in progress"),
+    ],
+)
+def test_improve_skip_without_attention_for_shared_non_attention_recovery_reasons(
+    tmp_path: Path,
+    reason_code: str,
+    reason_text: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/improve-shared-skip")
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    if reason_code == "dependency_not_ready":
+        dependency = store.add("Dependency", task_type="implement")
+        assert dependency.id is not None
+        _mark_completed(dependency, branch="feature/dependency")
+        dependency.merge_status = "unmerged"
+        store.update(dependency)
+
+        failed_improve = store.add(
+            "Improve attempt",
+            task_type="improve",
+            depends_on=dependency.id,
+            based_on=impl.id,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "PREREQUISITE_UNMERGED"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+    else:
+        failed_improve = store.add(
+            "Improve attempt",
+            task_type="improve",
+            depends_on=review.id,
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_TURNS"
+        failed_improve.session_id = "sess-improve"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        running_child = store.add(
+            "Running child",
+            task_type="improve",
+            based_on=failed_improve.id,
+            depends_on=impl.id,
+        )
+        assert running_child.id is not None
+        running_child.status = "in_progress"
+        running_child.session_id = failed_improve.session_id
+        store.update(running_child)
+
+    improve_decision = decide_failed_task_recovery(
+        store,
+        failed_improve,
+        max_recovery_attempts=1,
+    )
+    assert improve_decision.reason_code == reason_code
+
+    result = build_improve_needs_attention_result(
+        store=store,
+        impl_task=impl,
+        review_task=review,
+        improve_mode="manual_review",
+        failed_improve=failed_improve,
+        improve_decision=improve_decision,
+        max_resume_attempts=1,
+    )
+
+    assert result is not None
+    assert result.status == "skip"
+    assert result.attention_type is None
+    assert result.attention_reason is None
+    assert reason_text in result.message
+    assert resolve_execution_needs_attention(impl, result) is None
 
 
 def test_improve_give_up_reports_automatic_recovery_disabled(tmp_path: Path) -> None:
@@ -217,10 +333,20 @@ def test_improve_give_up_reports_automatic_recovery_disabled(tmp_path: Path) -> 
         action={"type": "improve", "review_task": review},
         context=context,
     )
+    expected = build_improve_needs_attention_result(
+        store=store,
+        impl_task=impl,
+        review_task=review,
+        improve_mode="give_up",
+        failed_improve=failed,
+        improve_decision=None,
+        max_resume_attempts=0,
+    )
 
+    assert expected is not None
     assert result.status == "skip"
     assert result.attention_type == "automatic_recovery_disabled"
-    assert "automatic improve recovery is disabled" in result.message
+    assert result == expected
     assert len(store.get_all()) == before_count
 
 

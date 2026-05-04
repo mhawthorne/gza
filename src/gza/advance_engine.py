@@ -2,17 +2,25 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from gza.console import prompt_available_width, shorten_prompt
 from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from gza.query import get_code_changing_descendants_for_root, get_reviews_for_root
-from gza.recovery_engine import FailedRecoveryDecision, classify_failure_reason, decide_failed_task_recovery
+from gza.recovery_engine import (
+    FailedRecoveryDecision,
+    classify_failure_reason,
+    decide_failed_task_recovery,
+    get_failed_recovery_needs_attention_reason,
+)
 from gza.resume_policy import is_resumable_failed_task as _is_resumable_failed_task
 from gza.review_verdict import ParsedReviewReport, ReviewFinding, get_review_report
+
+NEEDS_ATTENTION_LABEL = "Needs attention"
 
 WORKER_CONSUMING_ACTIONS = frozenset(
     {
@@ -63,6 +71,7 @@ class AdvanceContext:
     has_fresh_unresolved_comments_since_latest_review: bool = False
 
     failed_recovery_decision: FailedRecoveryDecision | None = None
+    failed_recovery_attention_reason: str | None = None
     is_resumable_failed_task: bool = False
     has_resume_children: bool = False
     resume_chain_depth: int = 0
@@ -102,10 +111,132 @@ def _task_id(task: DbTask | None) -> str:
 
 def _failed_task_skip_action(ctx: AdvanceContext) -> dict[str, Any]:
     assert ctx.failed_recovery_decision is not None
-    return {
-        "type": "skip",
-        "description": f"SKIP: {ctx.failed_recovery_decision.reason_text}",
+    return failed_recovery_decision_to_action(
+        ctx.task,
+        ctx.failed_recovery_decision,
+        needs_attention_reason=ctx.failed_recovery_attention_reason,
+    )
+
+
+def _failed_task_resume_or_retry_action(ctx: AdvanceContext) -> dict[str, Any]:
+    assert ctx.failed_recovery_decision is not None
+    return failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
+
+
+def with_needs_attention(
+    action: Mapping[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    """Attach shared needs-attention metadata to an advance action."""
+    annotated = dict(action)
+    annotated["needs_attention_reason"] = reason
+    return annotated
+
+
+def failed_recovery_decision_to_action(
+    task: DbTask,
+    decision: FailedRecoveryDecision,
+    *,
+    needs_attention_reason: str | None = None,
+) -> dict[str, Any]:
+    """Convert a shared failed-task recovery decision into an advance action dict."""
+    description = f"SKIP: {decision.reason_text}"
+    failure_reason = task.failure_reason or "UNKNOWN"
+    if decision.action == "resume":
+        description = f"Resume failed task ({failure_reason})"
+    elif decision.action == "retry":
+        description = f"Retry failed task ({failure_reason})"
+    action: dict[str, Any] = {
+        "type": decision.action,
+        "description": description,
+        "recovery_task_id": decision.recovery_task_id,
+        "reuse_existing": decision.reuse_existing,
+        "launch_mode": decision.launch_mode,
+        "decision": decision,
     }
+    if needs_attention_reason is not None:
+        action["needs_attention_reason"] = needs_attention_reason
+    return action
+
+
+def failed_recovery_decision_to_attention_action(
+    store: SqliteTaskStore,
+    task: DbTask,
+    decision: FailedRecoveryDecision,
+    *,
+    max_recovery_attempts: int,
+) -> dict[str, Any] | None:
+    """Convert a terminal failed-task recovery stop into the shared attention action."""
+    attention_reason = get_failed_recovery_needs_attention_reason(
+        store,
+        task,
+        decision=decision,
+        max_recovery_attempts=max_recovery_attempts,
+    )
+    action = failed_recovery_decision_to_action(
+        task,
+        decision,
+        needs_attention_reason=attention_reason,
+    )
+    if classify_advance_action(action) != "needs_attention":
+        return None
+    return action
+
+
+def get_needs_attention_reason(action: Mapping[str, Any]) -> str | None:
+    value = action.get("needs_attention_reason")
+    if isinstance(value, str) and value:
+        return value
+    action_type = str(action.get("type", ""))
+    legacy_reasons = {
+        "needs_discussion": "needs-discussion",
+        "max_cycles_reached": "review-max-cycles-reached",
+        "max_improve_attempts": "max-improve-attempts-reached",
+        "automatic_recovery_disabled": "automatic-recovery-disabled",
+        "manual_review_required": "manual-review-required",
+    }
+    return legacy_reasons.get(action_type)
+
+
+def is_needs_attention_action(action: Mapping[str, Any]) -> bool:
+    return get_needs_attention_reason(action) is not None
+
+
+def classify_advance_action(action: Mapping[str, Any]) -> str:
+    """Bucket advance outcomes into actionable, needs_attention, or skip."""
+    if is_needs_attention_action(action):
+        return "needs_attention"
+    action_type = str(action.get("type", "skip"))
+    if action_type in {"skip", "wait_review", "wait_improve"}:
+        return "skip"
+    return "actionable"
+
+
+def format_needs_attention_entry(task: DbTask, *, prompt: str, action: Mapping[str, Any]) -> str:
+    """Render a stable needs-attention line shared by advance/watch/iterate."""
+    description = str(action.get("description", "")).strip()
+    if description.startswith("SKIP: "):
+        description = description[len("SKIP: ") :]
+    reason = get_needs_attention_reason(action) or "needs-attention"
+    task_id = task.id or "unknown"
+    task_type = task.task_type or "task"
+    return f'{task_id} {task_type} "{prompt}" reason={reason} {description}'
+
+
+def format_needs_attention_entry_for_display(
+    task: DbTask,
+    *,
+    action: Mapping[str, Any],
+    prefix: int = 0,
+    suffix: int = 0,
+) -> str:
+    """Render a needs-attention line with the shared single-line short prompt."""
+    prompt = shorten_prompt(
+        task.prompt or "",
+        prompt_available_width(prefix=prefix, suffix=suffix),
+    )
+    return format_needs_attention_entry(task, prompt=prompt, action=action)
 
 
 def _review_priority_sort_key(task: DbTask) -> tuple[datetime, int]:
@@ -257,10 +388,17 @@ def resolve_advance_context(
     effective_max_resume = max_resume_attempts if max_resume_attempts is not None else config.max_resume_attempts
 
     failed_recovery_decision: FailedRecoveryDecision | None = None
+    failed_recovery_attention_reason: str | None = None
     if task.status == "failed":
         failed_recovery_decision = decide_failed_task_recovery(
             store,
             task,
+            max_recovery_attempts=effective_max_resume,
+        )
+        failed_recovery_attention_reason = get_failed_recovery_needs_attention_reason(
+            store,
+            task,
+            decision=failed_recovery_decision,
             max_recovery_attempts=effective_max_resume,
         )
     is_resumable_failed = (
@@ -282,6 +420,7 @@ def resolve_advance_context(
             max_review_cycles=config.max_review_cycles,
             max_resume_attempts=effective_max_resume,
             failed_recovery_decision=failed_recovery_decision,
+            failed_recovery_attention_reason=failed_recovery_attention_reason,
             has_implement_child=task.id in impl_based_on_ids,
             is_resumable_failed_task=is_resumable_failed,
             has_resume_children=has_resume_children,
@@ -299,6 +438,7 @@ def resolve_advance_context(
             max_review_cycles=config.max_review_cycles,
             max_resume_attempts=effective_max_resume,
             failed_recovery_decision=failed_recovery_decision,
+            failed_recovery_attention_reason=failed_recovery_attention_reason,
             is_resumable_failed_task=is_resumable_failed,
             has_resume_children=has_resume_children,
             resume_chain_depth=resume_chain_depth,
@@ -352,6 +492,7 @@ def resolve_advance_context(
         max_review_cycles=config.max_review_cycles,
         max_resume_attempts=effective_max_resume,
         failed_recovery_decision=failed_recovery_decision,
+        failed_recovery_attention_reason=failed_recovery_attention_reason,
         can_merge=can_merge,
         rebase_pending_or_running=rebase_pending_or_running,
         rebase_failed=rebase_failed,
@@ -379,18 +520,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="failed_task_retry",
         matches=lambda ctx: ctx.failed_recovery_decision is not None and ctx.failed_recovery_decision.action == "retry",
-        action=lambda ctx: {
-            "type": "retry",
-            "description": f"Retry failed task ({ctx.failure_reason or 'UNKNOWN'})",
-        },
+        action=_failed_task_resume_or_retry_action,
     ),
     AdvanceRule(
         name="failed_task_resume",
         matches=lambda ctx: ctx.failed_recovery_decision is not None and ctx.failed_recovery_decision.action == "resume",
-        action=lambda ctx: {
-            "type": "resume",
-            "description": f"Resume failed task ({ctx.failure_reason or 'UNKNOWN'})",
-        },
+        action=_failed_task_resume_or_retry_action,
     ),
     AdvanceRule(
         name="failed_task_skip",
@@ -423,10 +558,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="conflict_rebase_failed",
         matches=lambda ctx: not ctx.can_merge and ctx.rebase_failed is not None,
-        action=lambda ctx: {
-            "type": "needs_discussion",
-            "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
-        },
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
+            },
+            reason="rebase-failed-needs-manual-resolution",
+        ),
     ),
     AdvanceRule(
         name="conflict_needs_rebase",
@@ -571,12 +709,15 @@ ADVANCE_RULES: list[AdvanceRule] = [
         matches=lambda ctx: (not ctx.review_cleared)
         and ctx.review_verdict == "CHANGES_REQUESTED"
         and ctx.completed_review_cycles >= ctx.max_review_cycles,
-        action=lambda ctx: {
-            "type": "max_cycles_reached",
-            "description": (
-                f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"
-            ),
-        },
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "max_cycles_reached",
+                "description": (
+                    f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"
+                ),
+            },
+            reason="review-max-cycles-reached",
+        ),
     ),
     AdvanceRule(
         name="review_wait_improve",
@@ -611,11 +752,14 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_unknown_verdict",
         matches=lambda ctx: (not ctx.review_cleared) and ctx.latest_completed_review is not None,
-        action=lambda ctx: {
-            "type": "needs_discussion",
-            "description": f"SKIP: review verdict is {ctx.review_verdict or 'unknown'}, needs manual attention",
-            "review_task": ctx.latest_completed_review,
-        },
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": f"SKIP: review verdict is {ctx.review_verdict or 'unknown'}, needs manual attention",
+                "review_task": ctx.latest_completed_review,
+            },
+            reason="review-verdict-needs-manual-attention",
+        ),
     ),
     AdvanceRule(
         name="reviews_all_cleared",

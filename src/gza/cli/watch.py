@@ -45,14 +45,25 @@ from ._common import (
     set_task_queue_position_scoped,
     set_task_urgency,
 )
-from .advance_engine import determine_next_action
-from .advance_executor import AdvanceActionExecutionContext, execute_advance_action
+from .advance_engine import (
+    NEEDS_ATTENTION_LABEL,
+    classify_advance_action,
+    determine_next_action,
+    failed_recovery_decision_to_attention_action,
+    format_needs_attention_entry_for_display,
+)
+from .advance_executor import (
+    AdvanceActionExecutionContext,
+    execute_advance_action,
+    resolve_execution_needs_attention,
+)
 from .execution import _spawn_background_iterate
 from .git_ops import (
     _collect_advance_completed_tasks,
     _execute_merge_action,
     _merge_single_task as _git_ops_merge_single_task,
     _prepare_create_review_action,
+    _recovery_chain_root_task_id,
     _require_default_branch,
     _unimplemented_implement_prompt,
     cleanup_failed_merge_checkout,
@@ -61,19 +72,6 @@ from .git_ops import (
 
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
-_WATCH_STICKY_ATTENTION_ACTION_TYPES = frozenset(
-    {
-        "needs_discussion",
-        "max_cycles_reached",
-        "max_improve_attempts",
-    }
-)
-_WATCH_STICKY_ATTENTION_EXECUTION_TYPES = frozenset(
-    {
-        "automatic_recovery_disabled",
-        "manual_review_required",
-    }
-)
 T = TypeVar("T")
 
 
@@ -98,6 +96,25 @@ def _watch_skip_message(task: DbTask, action: dict) -> str:
     if not description:
         description = action_type.replace("_", " ")
     return f"{task.id}: {description}"
+
+
+def _watch_needs_attention_message(task: DbTask, action: dict) -> str:
+    return format_needs_attention_entry_for_display(task, action=action)
+
+
+def _failed_recovery_attention_action(
+    *,
+    store: SqliteTaskStore,
+    task: DbTask,
+    decision: FailedRecoveryDecision,
+    max_recovery_attempts: int,
+) -> dict[str, object] | None:
+    return failed_recovery_decision_to_attention_action(
+        store,
+        task,
+        decision,
+        max_recovery_attempts=max_recovery_attempts,
+    )
 
 
 @dataclass(frozen=True)
@@ -518,7 +535,9 @@ def _emit_recovery_dry_run_report(
     print(f"Failed recovery plan (tags={scope}, mode=restart-failed)")
     print()
     actionable = resume = retry = 0
+    attention_rows: list[tuple[DbTask, dict[str, object]]] = []
     skipped = 0
+    hidden_skipped = 0
     for task in failed_tasks:
         if task.id is None:
             continue
@@ -535,6 +554,15 @@ def _emit_recovery_dry_run_report(
             if decision.action == "retry":
                 retry += 1
             continue
+        attention_action = _failed_recovery_attention_action(
+            store=store,
+            task=task,
+            decision=decision,
+            max_recovery_attempts=max_recovery_attempts,
+        )
+        if attention_action is not None:
+            attention_rows.append((task, attention_action))
+            continue
         skipped += 1
         if show_skipped:
             launch = decision.launch_mode
@@ -542,13 +570,24 @@ def _emit_recovery_dry_run_report(
                 f"{decision.action:<6} {task.id} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
                 f"attempt={decision.attempt_index}/{decision.attempt_limit}"
             )
+        else:
+            hidden_skipped += 1
+    if attention_rows:
+        print()
+        print(f"{NEEDS_ATTENTION_LABEL} ({len(attention_rows)} task{'s' if len(attention_rows) != 1 else ''}):")
+        for task, action in attention_rows:
+            print(f"  {_watch_needs_attention_message(task, action)}")
     print()
+    skipped_summary = skipped if show_skipped else hidden_skipped
     if show_skipped:
-        print(f"Summary: {actionable} actionable ({resume} resume, {retry} retry), {skipped} skipped")
+        print(
+            f"Summary: {actionable} actionable ({resume} resume, {retry} retry), "
+            f"{len(attention_rows)} needs attention, {skipped_summary} skipped"
+        )
     else:
         print(
             f"Summary: {actionable} actionable ({resume} resume, {retry} retry), "
-            f"{skipped} skipped hidden"
+            f"{len(attention_rows)} needs attention, {skipped_summary} skipped hidden"
         )
     return _RecoveryReport(actionable_count=actionable, resume_count=resume, retry_count=retry)
 
@@ -762,14 +801,14 @@ def _run_cycle(
 
         for task, action in action_plan:
             action_type = action.get("type")
-            if action_type in _WATCH_STICKY_ATTENTION_ACTION_TYPES:
+            if classify_advance_action(action) == "needs_attention":
                 log.emit_attention(
                     attention_key=f"advance-attention:{task.id}:{action_type}",
-                    message=_watch_skip_message(task, action),
+                    message=_watch_needs_attention_message(task, action),
                 )
                 continue
 
-            if action_type in {"skip", "wait_review", "wait_improve"}:
+            if classify_advance_action(action) == "skip":
                 log.emit(
                     "SKIP",
                     _watch_skip_message(task, action),
@@ -928,10 +967,11 @@ def _run_cycle(
                 message = exec_result.message
                 if action_type == "improve" and task.id is not None:
                     message = f"{task.id}: {message}"
-                if exec_result.attention_type in _WATCH_STICKY_ATTENTION_EXECUTION_TYPES and task.id is not None:
+                attention = resolve_execution_needs_attention(task, exec_result)
+                if attention is not None and attention.task.id is not None:
                     log.emit_attention(
-                        attention_key=f"advance-attention:{task.id}:{exec_result.attention_type}",
-                        message=message,
+                        attention_key=f"advance-attention:{attention.task.id}:{attention.action['type']}",
+                        message=_watch_needs_attention_message(attention.task, attention.action),
                     )
                     continue
                 log.emit(
@@ -1006,13 +1046,35 @@ def _run_cycle(
         log.emit("PHASE", "recovery queue enabled (--restart-failed)")
     failed_decisions: list[tuple[DbTask, FailedRecoveryDecision]] = []
     actionable_failed: list[tuple[DbTask, FailedRecoveryDecision]] = []
+    completed_owner_root_ids = {
+        root_id
+        for task in merge_candidates
+        if (root_id := _recovery_chain_root_task_id(store, task)) is not None
+    }
     failed_tasks = list_failed_tasks_for_recovery(store, tags=tags, any_tag=any_tag)
     for failed in failed_tasks:
         if failed.id is None:
             continue
+        if _recovery_chain_root_task_id(store, failed) in completed_owner_root_ids:
+            continue
         decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
         failed_decisions.append((failed, decision))
         if decision.action == "skip":
+            failed_action = _failed_recovery_attention_action(
+                store=store,
+                task=failed,
+                decision=decision,
+                max_recovery_attempts=max_recovery_attempts,
+            )
+            if failed_action is not None:
+                log.emit_attention(
+                    attention_key=(
+                        f"recovery-attention:{failed.id}:"
+                        f"{failed_action.get('needs_attention_reason') or decision.reason_code}"
+                    ),
+                    message=_watch_needs_attention_message(failed, failed_action),
+                )
+                continue
             if restart_failed and show_skipped:
                 log.emit(
                     "SKIP",

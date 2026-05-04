@@ -347,6 +347,8 @@ class TestAdvanceCommand:
             result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
+        assert "Needs attention" in result.stdout
+        assert "reason=review-verdict-needs-manual-attention" in result.stdout
         assert "needs manual attention" in result.stdout
         assert "Merge (review APPROVED_WITH_FOLLOWUPS)" not in result.stdout
 
@@ -2106,6 +2108,83 @@ class TestAdvanceCommand:
 
         assert rc == 0
 
+    def test_advance_interactive_preview_shows_attention_before_prompt_for_mixed_plan(self, tmp_path: Path):
+        """advance prints attention rows in the pre-confirmation preview even with actionable work."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        merge_task = self._create_implement_task_with_branch(store, git, tmp_path, prompt="Merge-ready task")
+        attention_task = self._create_implement_task_with_branch(
+            store,
+            git,
+            tmp_path,
+            prompt="Task blocked on human review after repeated changes",
+        )
+
+        approved_review = store.add(f"Review {merge_task.id}", task_type="review", depends_on=merge_task.id)
+        approved_review.status = "completed"
+        approved_review.completed_at = datetime.now(UTC)
+        approved_review.output_content = "**Verdict: APPROVED**"
+        store.update(approved_review)
+
+        requested_review = store.add(
+            f"Review {attention_task.id}",
+            task_type="review",
+            depends_on=attention_task.id,
+        )
+        requested_review.status = "completed"
+        requested_review.completed_at = datetime.now(UTC)
+        requested_review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(requested_review)
+        self._create_completed_improve(store, attention_task, requested_review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=None,
+            dry_run=False,
+            auto=False,
+            max=None,
+            no_docker=True,
+            batch=None,
+            force=False,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            new=False,
+            max_review_cycles=1,
+            squash_threshold=None,
+        )
+
+        def fake_input(prompt: str) -> str:
+            print(prompt, end="")
+            return "n"
+
+        with (
+            patch("sys.stdout", new_callable=io.StringIO) as mock_stdout,
+            patch("builtins.input", side_effect=fake_input),
+            patch("gza.cli._execute_merge_action") as merge_action,
+            patch("gza.cli._spawn_background_worker") as spawn_worker,
+        ):
+            rc = cmd_advance(args)
+            output = mock_stdout.getvalue()
+
+        assert rc == 0
+        assert "Will advance 1 task(s):" in output
+        assert str(merge_task.id) in output
+        assert "Needs attention" in output
+        assert str(attention_task.id) in output
+        assert "reason=review-max-cycles-reached" in output
+        assert "Proceed? [Y/n]" in output
+        assert output.index("Needs attention") < output.index("Proceed? [Y/n]")
+        assert "Aborted." in output
+        merge_action.assert_not_called()
+        spawn_worker.assert_not_called()
+        assert store.get(merge_task.id).merge_status == "unmerged"
+
     def test_advance_auto_flag_skips_prompt(self, tmp_path: Path):
         """advance --auto executes without prompting."""
         setup_config(tmp_path)
@@ -2534,8 +2613,10 @@ class TestAdvanceCommand:
 
         output = stdout.getvalue()
         assert rc == 0
-        assert "Would advance 1 task(s)" in output
-        assert "needs manual resolution" in output
+        assert "No eligible tasks to advance" in output
+        assert "Needs attention" in output
+        assert "reason=rebase-failed-needs-manual-resolution" in output
+        assert "manual resolution" in output
         assert "Resume failed task (MAX_TURNS)" not in output
 
     def test_advance_dry_run_suppresses_based_on_failed_descendant_only(self, tmp_path: Path):
@@ -2974,8 +3055,210 @@ class TestAdvanceCommand:
 
         result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "Would advance" in result.stdout
+        assert "No eligible tasks to advance" in result.stdout
+        assert "Needs attention" in result.stdout
+        assert "reason=review-max-cycles-reached" in result.stdout
         assert "max review cycles" in result.stdout
+
+    def test_advance_dry_run_moves_manual_review_failed_improve_to_needs_attention(self, tmp_path: Path):
+        """advance --dry-run should move manual-review improve recovery stops out of actionable output."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        review_task = store.add(
+            f"Review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        assert review_task.id is not None
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(review_task)
+
+        failed_improve = store.add(
+            "Prior improve",
+            task_type="improve",
+            depends_on=review_task.id,
+            based_on=task.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "TEST_FAILURE"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+        output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "No eligible tasks to advance" in output
+        assert "Would advance" not in output
+        assert "Create improve" not in output
+        assert "Needs attention" in output
+        assert f'{failed_improve.id} improve "Prior improve" reason=manual-failure-reason' in output
+        assert f"latest failed improve {failed_improve.id} requires manual review" in output
+        assert "TEST_FAILURE requires manual intervention" in output
+
+    def test_advance_interactive_preview_moves_manual_review_failed_improve_to_needs_attention(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Plain interactive advance should resolve failed improve manual-review stops before previewing actions."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        review_task = store.add(
+            f"Review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        assert review_task.id is not None
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(review_task)
+
+        failed_improve = store.add(
+            "Prior improve",
+            task_type="improve",
+            depends_on=review_task.id,
+            based_on=task.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "TEST_FAILURE"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        result = run_gza("advance", "--project", str(tmp_path), stdin_input="n\n")
+        output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "No eligible tasks to advance" in output
+        assert "Needs attention" in output
+        assert "Will advance" not in output
+        assert "Proceed? [Y/n]" not in output
+        assert "Create improve" not in output
+        assert f'{failed_improve.id} improve "Prior improve" reason=manual-failure-reason' in output
+        assert f"latest failed improve {failed_improve.id} requires manual review" in output
+        assert "TEST_FAILURE requires manual intervention" in output
+
+    def test_advance_interactive_preview_moves_disabled_improve_recovery_to_needs_attention(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Plain interactive advance should surface disabled improve recovery as needs attention before prompting."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "worktree_dir: .gza-test-worktrees\n"
+            "max_resume_attempts: 0\n"
+        )
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        review_task = store.add(
+            f"Review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        assert review_task.id is not None
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(review_task)
+
+        failed_improve = store.add(
+            "Prior improve",
+            task_type="improve",
+            depends_on=review_task.id,
+            based_on=task.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_TURNS"
+        failed_improve.session_id = "sess-improve"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        result = run_gza("advance", "--project", str(tmp_path), stdin_input="n\n")
+        output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "No eligible tasks to advance" in output
+        assert "Needs attention" in output
+        assert "Will advance" not in output
+        assert "Proceed? [Y/n]" not in output
+        assert "Create improve" not in output
+        assert f'{failed_improve.id} improve "Prior improve" reason=automatic-recovery-disabled' in output
+        assert "automatic improve recovery is disabled (max_resume_attempts=0)" in output
+
+    def test_advance_failed_improve_non_attention_skip_stays_out_of_needs_attention(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        review_task = store.add(
+            f"Review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        assert review_task.id is not None
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(review_task)
+
+        failed_improve = store.add(
+            "Prior improve",
+            task_type="improve",
+            depends_on=review_task.id,
+            based_on=task.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_TURNS"
+        failed_improve.session_id = "sess-improve"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        dependency = store.add("Mismatched dependency", task_type="plan")
+        assert dependency.id is not None
+
+        running_child = store.add(
+            "Running resumed improve",
+            task_type="improve",
+            based_on=failed_improve.id,
+            depends_on=dependency.id,
+        )
+        assert running_child.id is not None
+        running_child.status = "in_progress"
+        running_child.session_id = failed_improve.session_id
+        store.update(running_child)
+
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
+        output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "Needs attention" not in output
+        assert "recovery child already in progress" in output
+        assert "Started improve" not in output
+        assert [child.id for child in store.get_based_on_children(failed_improve.id)] == [running_child.id]
 
 
     def _create_failed_task(self, store, session_id="sess-abc", failure_reason="MAX_STEPS", prompt="Implement feature"):
@@ -3178,10 +3461,12 @@ class TestAdvanceCommand:
         result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
+        assert "Needs attention" in result.stdout
         assert f"{original.id}" in result.stdout
         assert f"{child.id}" in result.stdout
-        assert "a newer failed recovery descendant must be recovered first" in result.stdout
         assert "automatic recovery stops here; manual review required" in result.stdout
+        assert "reason=newer-failed-recovery-descendant-needs-attention" in result.stdout
+        assert "reason=max-resume-attempts-reached" in result.stdout
 
     def test_advance_no_resume_failed_flag_skips(self, tmp_path: Path):
         """advance --no-resume-failed excludes failed tasks from processing."""
@@ -3232,7 +3517,7 @@ class TestAdvanceCommand:
         assert len(children) == 0
 
     def test_advance_specific_failed_task_id_test_failure_is_not_resumable(self, tmp_path: Path):
-        """advance rejects TEST_FAILURE tasks for explicit failed task IDs."""
+        """advance shows shared needs-attention output for manual-only explicit failed task IDs."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -3240,15 +3525,45 @@ class TestAdvanceCommand:
         failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="TEST_FAILURE")
 
         result = run_gza("advance", str(failed_task.id), "--auto", "--project", str(tmp_path))
+        output = " ".join(result.stdout.split())
 
-        assert result.returncode == 1
-        assert (
-            f"Error: Task {failed_task.id} is not automatically recoverable: "
-            "TEST_FAILURE requires manual intervention"
-        ) in result.stdout
+        assert result.returncode == 0
+        assert "No eligible tasks to advance" in output
+        assert "Needs attention" in output
+        assert f'{failed_task.id} implement "Implement feature" reason=manual-failure-reason' in output
+        assert "TEST_FAILURE requires manual intervention" in output
+        assert "not automatically recoverable" not in output
 
         children = store.get_based_on_children(failed_task.id)
         assert len(children) == 0
+
+    def test_advance_specific_failed_task_id_dry_run_surfaces_exhausted_resume_chain_attention(self, tmp_path: Path):
+        """advance <failed-id> --dry-run should format exhausted recovery children under Needs attention."""
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        original = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        child = store.add("Implement feature", task_type="implement")
+        assert child.id is not None
+        child.based_on = original.id
+        child.status = "failed"
+        child.failure_reason = "MAX_STEPS"
+        child.session_id = original.session_id
+        child.branch = original.branch
+        child.completed_at = datetime.now(UTC)
+        store.update(child)
+
+        result = run_gza("advance", str(child.id), "--dry-run", "--project", str(tmp_path))
+        output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "No eligible tasks to advance" in output
+        assert "Needs attention" in output
+        assert "Would advance" not in output
+        assert f'{child.id} implement "Implement feature" reason=max-resume-attempts-reached' in output
+        assert "automatic recovery stops here; manual review required" in output
 
     def test_advance_skips_failed_task_without_session_id(self, tmp_path: Path):
         """advance skips failed tasks without session_id (not resumable)."""

@@ -38,7 +38,10 @@ from ..git import Git
 from ..lineage import resolve_impl_task
 from ..prompts import PromptBuilder
 from ..query import get_base_task_slug as _get_base_task_slug
-from ..recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
+from ..recovery_engine import (
+    FailedRecoveryDecision,
+    decide_failed_task_recovery,
+)
 from ..review_verdict import get_review_report
 from ..runner import RunInvocationContext, generate_slug, run
 from ..workers import WorkerMetadata, WorkerRegistry
@@ -69,7 +72,17 @@ from ._common import (
     run_with_recovery,
     set_task_urgency,
 )
-from .advance_engine import determine_next_action
+from .advance_engine import (
+    NEEDS_ATTENTION_LABEL,
+    classify_advance_action,
+    determine_next_action,
+    format_needs_attention_entry_for_display,
+)
+from .advance_executor import (
+    build_failed_recovery_needs_attention_result,
+    build_improve_needs_attention_result,
+    resolve_execution_needs_attention,
+)
 from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
 
@@ -1810,7 +1823,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
 
     def _resolve_failed_iterate_resume_start(
         failed_task: DbTask,
-    ) -> tuple[DbTask, FailedRecoveryDecision] | None:
+    ) -> tuple[tuple[DbTask, FailedRecoveryDecision] | None, FailedRecoveryDecision | None]:
         decision = decide_failed_task_recovery(
             store,
             failed_task,
@@ -1819,11 +1832,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             max_recovery_attempts=max(1, effective_max_resume_attempts),
         )
         if decision.action != "resume":
-            print(
-                f"Error: Cannot resume failed implementation {failed_task.id}: "
-                f"{decision.reason_text}."
-            )
-            return None
+            return None, decision
         if decision.reuse_existing and decision.recovery_task_id is not None:
             existing_resume = store.get(decision.recovery_task_id)
             if existing_resume is None:
@@ -1831,9 +1840,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                     f"Error: pending resume child {decision.recovery_task_id} "
                     "selected by recovery policy was not found."
                 )
-                return None
-            return existing_resume, decision
-        return _create_resume_task(store, failed_task), decision
+                return None, None
+            return (existing_resume, decision), None
+        return (_create_resume_task(store, failed_task), decision), None
 
     # Handle background mode: re-exec this command as a detached process.
     if background:
@@ -1845,7 +1854,13 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             dry_run=dry_run,
         )
 
-    def _run_task_with_recovery(task_to_run: DbTask, *, initial_resume: bool = False) -> tuple[DbTask, int]:
+    def _run_task_with_recovery(
+        task_to_run: DbTask,
+        *,
+        initial_resume: bool = False,
+    ) -> tuple[DbTask, int, FailedRecoveryDecision | None]:
+        terminal_skip_decision: FailedRecoveryDecision | None = None
+
         def _run_one(t: DbTask, resume_flag: bool) -> int:
             assert t.id is not None
             force = getattr(args, "force", False)
@@ -1877,14 +1892,53 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                 f"created {recovery_task.id} (attempt {decision.attempt_index}/{decision.attempt_limit})."
             )
 
-        return run_with_recovery(
+        def _on_terminal_skip(
+            failed_task: DbTask,
+            decision: FailedRecoveryDecision,
+            _failure_rc: int,
+        ) -> None:
+            nonlocal terminal_skip_decision
+            terminal_skip_decision = decision
+
+        final_task, rc = run_with_recovery(
             config,
             store,
             task_to_run,
             run_task=_run_one,
             max_resume_attempts=effective_max_resume_attempts,
             on_recovery=_on_recovery,
+            on_terminal_skip=_on_terminal_skip,
         )
+        return final_task, rc, terminal_skip_decision
+
+    def _print_failed_recovery_attention_and_return(
+        failed_task: DbTask,
+        decision: FailedRecoveryDecision,
+        *,
+        fix_task_id: str,
+    ) -> int | None:
+        attention_result = build_failed_recovery_needs_attention_result(
+            store=store,
+            failed_task=failed_task,
+            recovery_decision=decision,
+            max_resume_attempts=effective_max_resume_attempts,
+        )
+        if attention_result is None:
+            return None
+        attention = resolve_execution_needs_attention(failed_task, attention_result)
+        if attention is None:
+            return None
+        print(
+            f"{NEEDS_ATTENTION_LABEL}: "
+            f"{format_needs_attention_entry_for_display(attention.task, action=attention.action, prefix=len(attention.task.id or '') + 4)}"
+        )
+        if attention.action.get("needs_attention_reason") in {
+            "review-max-cycles-reached",
+            "automatic-recovery-disabled",
+            "max-resume-attempts-reached",
+        }:
+            print(f"Recommended next step: uv run gza fix {fix_task_id}")
+        return 3
 
     # If the task is pending, run it first before entering the loop.
     if impl_task.status == "pending":
@@ -1893,8 +1947,16 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             return 0
 
         print(f"Running pending implementation {impl_task.id}...")
-        impl_task, rc = _run_task_with_recovery(impl_task)
+        impl_task, rc, terminal_skip_decision = _run_task_with_recovery(impl_task)
         if rc != 0:
+            if terminal_skip_decision is not None:
+                exit_code = _print_failed_recovery_attention_and_return(
+                    impl_task,
+                    terminal_skip_decision,
+                    fix_task_id=impl_task_id,
+                )
+                if exit_code is not None:
+                    return exit_code
             print(f"Implementation {impl_task.id} failed (exit code {rc})")
             return 1
         assert impl_task.id is not None
@@ -1908,13 +1970,28 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             if dry_run:
                 print(f"[dry-run] Would resume failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
                 return 0
-            resume_start = _resolve_failed_iterate_resume_start(impl_task)
+            resume_start, resume_blocked_decision = _resolve_failed_iterate_resume_start(impl_task)
             if resume_start is None:
+                if resume_blocked_decision is not None:
+                    exit_code = _print_failed_recovery_attention_and_return(
+                        impl_task,
+                        resume_blocked_decision,
+                        fix_task_id=impl_task_id,
+                    )
+                    if exit_code is not None:
+                        return exit_code
+                    print(
+                        f"Error: Cannot resume failed implementation {impl_task.id}: "
+                        f"{resume_blocked_decision.reason_text}."
+                    )
                 return 1
             run_start_task, _decision = resume_start
             assert run_start_task.id is not None
             print(f"Resuming failed implementation {impl_task.id} as {run_start_task.id}...")
-            impl_task, rc = _run_task_with_recovery(run_start_task, initial_resume=True)
+            impl_task, rc, terminal_skip_decision = _run_task_with_recovery(
+                run_start_task,
+                initial_resume=True,
+            )
         else:
             # --retry
             if dry_run:
@@ -1923,9 +2000,17 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             run_start_task = _create_retry_task(store, impl_task)
             assert run_start_task.id is not None
             print(f"Retrying failed implementation {impl_task.id} as {run_start_task.id}...")
-            impl_task, rc = _run_task_with_recovery(run_start_task)
+            impl_task, rc, terminal_skip_decision = _run_task_with_recovery(run_start_task)
 
         if rc != 0:
+            if terminal_skip_decision is not None:
+                exit_code = _print_failed_recovery_attention_and_return(
+                    impl_task,
+                    terminal_skip_decision,
+                    fix_task_id=impl_task_id,
+                )
+                if exit_code is not None:
+                    return exit_code
             action_label = "Resume" if use_resume else "Retry"
             print(f"{action_label} of {impl_task_id} failed (exit code {rc})")
             return 1
@@ -2107,6 +2192,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     summary_rows: list[IterateSummaryRow] = []
     final_status = "maxed_out"
     final_stop_reason = "max_iterations"
+    final_attention_action: dict[str, Any] | None = None
+    final_attention_task: DbTask | None = None
+    final_non_attention_stop_message: str | None = None
     iteration = 0
     starting_completed_review_cycles = count_completed_review_cycles(store, impl_task_key)
     max_resume_attempts = _int_config(
@@ -2181,6 +2269,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         if action_type in {"needs_discussion", "max_cycles_reached", "skip"}:
             final_status = "blocked"
             final_stop_reason = action_type
+            if classify_advance_action(action) == "needs_attention":
+                final_attention_action = action
+                final_attention_task = impl_task
             maybe_review = action.get("review_task")
             if isinstance(maybe_review, DbTask):
                 maybe_verdict = get_review_verdict(config, maybe_review) if maybe_review.status == "completed" else None
@@ -2308,47 +2399,58 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             improve_action, failed_improve, improve_decision = resolve_improve_action(
                 store, impl_task.id, review_task.id, max_resume_attempts=max_resume_attempts
             )
-            if improve_action == "give_up" and failed_improve is not None:
-                assert failed_improve.id is not None
-                print(
-                    "  Improve automatic recovery is disabled "
-                    f"(max_resume_attempts={max_resume_attempts}); "
-                    f"latest failure: {failed_improve.id}"
-                )
+            attention_result = build_improve_needs_attention_result(
+                store=store,
+                impl_task=impl_task,
+                review_task=review_task,
+                improve_mode=improve_action,
+                failed_improve=failed_improve,
+                improve_decision=improve_decision,
+                max_resume_attempts=max_resume_attempts,
+            )
+            if attention_result is not None:
+                attention = resolve_execution_needs_attention(impl_task, attention_result)
+                assert failed_improve is not None
+                if attention is not None:
+                    final_attention_action = attention.action
+                    final_attention_task = attention.task
+                    if attention_result.attention_type == "automatic_recovery_disabled":
+                        print(
+                            "  Improve automatic recovery is disabled "
+                            f"(max_resume_attempts={max_resume_attempts}); "
+                            f"latest failure: {failed_improve.id}"
+                        )
+                        final_stop_reason = "automatic_recovery_disabled"
+                    else:
+                        assert improve_decision is not None
+                        print(
+                            f"  Latest failed improve {failed_improve.id} requires manual review "
+                            f"({improve_decision.reason_text})"
+                        )
+                        final_stop_reason = "manual_review_required"
+                        if review_row_task is not None:
+                            _append_summary_row(
+                                summary_rows,
+                                iteration_index=iteration,
+                                task_type="review",
+                                task=review_row_task,
+                                verdict=review_row_verdict,
+                            )
+                else:
+                    assert improve_decision is not None
+                    final_non_attention_stop_message = attention_result.message.removeprefix("SKIP: ")
+                    print(f"  {final_non_attention_stop_message}")
+                    final_stop_reason = improve_decision.reason_code
+                    if review_row_task is not None:
+                        _append_summary_row(
+                            summary_rows,
+                            iteration_index=iteration,
+                            task_type="review",
+                            task=review_row_task,
+                            verdict=review_row_verdict,
+                        )
                 final_status = "blocked"
-                final_stop_reason = "automatic_recovery_disabled"
-                _append_summary_row(
-                    summary_rows,
-                    iteration_index=iteration,
-                    task_type="improve",
-                    task=failed_improve,
-                    status="failed",
-                )
-                break
-            if improve_action == "manual_review" and failed_improve is not None:
-                assert failed_improve.id is not None
-                assert improve_decision is not None
-                print(
-                    f"  Latest failed improve {failed_improve.id} requires manual review "
-                    f"({improve_decision.reason_text})"
-                )
-                final_status = "blocked"
-                final_stop_reason = "manual_review_required"
-                if review_row_task is not None:
-                    _append_summary_row(
-                        summary_rows,
-                        iteration_index=iteration,
-                        task_type="review",
-                        task=review_row_task,
-                        verdict=review_row_verdict,
-                    )
-                _append_summary_row(
-                    summary_rows,
-                    iteration_index=iteration,
-                    task_type="improve",
-                    task=failed_improve,
-                    status="failed",
-                )
+                _append_summary_row(summary_rows, iteration_index=iteration, task_type="improve", task=failed_improve, status="failed")
                 break
             if improve_action == "resume" and failed_improve is not None:
                 assert failed_improve.id is not None
@@ -2410,11 +2512,33 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             )
 
         assert action_task is not None
-        action_task, rc = _run_task_with_recovery(action_task, initial_resume=initial_resume)
+        action_task, rc, terminal_skip_decision = _run_task_with_recovery(
+            action_task,
+            initial_resume=initial_resume,
+        )
         if rc != 0:
             final_status = "blocked"
-            final_stop_reason = f"{action_type}_failed"
             task_type = "review" if action_type in {"create_review", "run_review"} else "improve" if action_type in {"improve", "run_improve"} else action_type
+            attention_result = None
+            if terminal_skip_decision is not None:
+                attention_result = build_failed_recovery_needs_attention_result(
+                    store=store,
+                    failed_task=action_task,
+                    recovery_decision=terminal_skip_decision,
+                    max_resume_attempts=effective_max_resume_attempts,
+                )
+            if attention_result is not None:
+                attention = resolve_execution_needs_attention(action_task, attention_result)
+                if attention is not None:
+                    final_attention_action = attention.action
+                    final_attention_task = attention.task
+                    assert terminal_skip_decision is not None
+                    terminal_reason_code = terminal_skip_decision.reason_code
+                    final_stop_reason = attention_result.attention_reason or terminal_reason_code
+                else:
+                    final_stop_reason = f"{action_type}_failed"
+            else:
+                final_stop_reason = f"{action_type}_failed"
             _append_summary_row(
                 summary_rows,
                 iteration_index=iteration,
@@ -2507,7 +2631,13 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     if final_stop_reason == "max_cycles_reached":
         completed_review_cycles = count_completed_review_cycles(store, impl_task_key)
         consumed_this_invocation = max(0, completed_review_cycles - starting_completed_review_cycles)
-        print(f"Iterate blocked: {final_stop_reason}.")
+        if final_attention_action is not None and final_attention_task is not None:
+            print(
+                f"{NEEDS_ATTENTION_LABEL}: "
+                f"{format_needs_attention_entry_for_display(final_attention_task, action=final_attention_action, prefix=len(final_attention_task.id or '') + 4)}"
+            )
+        else:
+            print(f"Iterate blocked: {final_stop_reason}.")
         print(
             "Review-cycle accounting: "
             f"completed={completed_review_cycles}, "
@@ -2516,9 +2646,20 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         )
         print(f"Recommended next step: uv run gza fix {impl_task_key}")
         return 3
-    if final_stop_reason == "automatic_recovery_disabled":
-        print(f"Iterate blocked: {final_stop_reason}.")
-        print(f"Recommended next step: uv run gza fix {impl_task_key}")
+    if final_attention_action is not None and final_attention_task is not None:
+        print(
+            f"{NEEDS_ATTENTION_LABEL}: "
+            f"{format_needs_attention_entry_for_display(final_attention_task, action=final_attention_action, prefix=len(final_attention_task.id or '') + 4)}"
+        )
+        if final_attention_action.get("needs_attention_reason") in {
+            "review-max-cycles-reached",
+            "automatic-recovery-disabled",
+            "max-resume-attempts-reached",
+        }:
+            print(f"Recommended next step: uv run gza fix {impl_task_key}")
+        return 3
+    if final_non_attention_stop_message is not None:
+        print(f"Iterate blocked: {final_non_attention_stop_message}")
         return 3
     print(f"Iterate blocked: {final_stop_reason}. Manual review required.")
     return 3

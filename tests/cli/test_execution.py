@@ -3757,8 +3757,6 @@ class TestImproveCommand:
         """
         import time
 
-        from gza.db import SqliteTaskStore
-
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3798,8 +3796,6 @@ class TestImproveCommand:
         """Auto-pick must also ignore failed reviews — same reasoning as dropped."""
         import time
 
-        from gza.db import SqliteTaskStore
-
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3829,8 +3825,6 @@ class TestImproveCommand:
 
     def test_improve_errors_when_all_reviews_are_dropped(self, tmp_path: Path):
         """When every review is dropped/failed, surface a clear error."""
-        from gza.db import SqliteTaskStore
-
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3882,7 +3876,7 @@ class TestImproveCommand:
         assert "no completed review" in result.stdout
         assert "continuing from unresolved comments only" in result.stdout
         # Must not have bound to the pending review.
-        assert f"is pending" not in result.stdout
+        assert "is pending" not in result.stdout
         assert "blocked until it completes" not in result.stdout
 
         improves = [t for t in store.get_all() if t.task_type == "improve"]
@@ -4032,8 +4026,6 @@ class TestImproveCommand:
         """--review-id overrides auto-pick and uses the specified review."""
         import time
 
-        from gza.db import SqliteTaskStore
-
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4111,8 +4103,6 @@ class TestImproveCommand:
 
     def test_improve_review_id_flag_rejects_review_of_different_impl(self, tmp_path: Path):
         """--review-id must belong to the same implementation task."""
-        from gza.db import SqliteTaskStore
-
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4146,8 +4136,6 @@ class TestImproveCommand:
 
     def test_improve_review_id_flag_rejects_non_review_task(self, tmp_path: Path):
         """--review-id must point at a review task, not an implement/improve task."""
-        from gza.db import SqliteTaskStore
-
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4992,6 +4980,120 @@ class TestIterateCommand:
         impl.completed_at = datetime.now(UTC)
         store.update(impl)
         return impl
+
+    def _format_expected_attention_line(self, task, action: dict[str, object]) -> str:
+        from gza.advance_engine import format_needs_attention_entry_for_display
+
+        return (
+            "Needs attention: "
+            + format_needs_attention_entry_for_display(
+                task,
+                action=action,
+                prefix=len(task.id or "") + 4,
+            )
+        )
+
+    def _expected_improve_attention_line(self, *, store, impl, review, max_resume_attempts: int) -> str:
+        from gza.cli.advance_executor import (
+            AdvanceActionExecutionContext,
+            execute_advance_action,
+            resolve_execution_needs_attention,
+        )
+
+        context = AdvanceActionExecutionContext(
+            store=store,
+            dry_run=False,
+            max_resume_attempts=max_resume_attempts,
+            use_iterate_for_create_implement=False,
+            use_iterate_for_needs_rebase=False,
+            prepare_create_review=lambda _task: pytest.fail("unused"),
+            create_resume_task=lambda _task: pytest.fail("unused"),
+            create_rebase_task=lambda _task: pytest.fail("unused"),
+            create_implement_task=lambda _task: pytest.fail("unused"),
+            spawn_worker=lambda _task_id, _kind: pytest.fail("unused"),
+            spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+            spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        )
+        result = execute_advance_action(
+            task=impl,
+            action={"type": "improve", "review_task": review},
+            context=context,
+        )
+        attention = resolve_execution_needs_attention(impl, result)
+        assert attention is not None
+        return self._format_expected_attention_line(attention.task, attention.action)
+
+    def _expected_failed_recovery_attention_line(
+        self,
+        *,
+        store,
+        failed_task,
+        decision,
+        max_resume_attempts: int,
+    ) -> str:
+        from gza.cli.advance_executor import (
+            build_failed_recovery_needs_attention_result,
+            resolve_execution_needs_attention,
+        )
+
+        result = build_failed_recovery_needs_attention_result(
+            store=store,
+            failed_task=failed_task,
+            recovery_decision=decision,
+            max_resume_attempts=max_resume_attempts,
+        )
+        assert result is not None
+        attention = resolve_execution_needs_attention(failed_task, result)
+        assert attention is not None
+        return self._format_expected_attention_line(attention.task, attention.action)
+
+    def _shared_failed_recovery_attention_lines(
+        self,
+        *,
+        store,
+        failed_task,
+        decision,
+        max_resume_attempts: int,
+    ) -> tuple[str, str, str]:
+        from gza.advance_engine import failed_recovery_decision_to_attention_action
+        from gza.cli.advance_executor import (
+            build_failed_recovery_needs_attention_result,
+            resolve_execution_needs_attention,
+        )
+        from gza.cli.git_ops import _format_needs_attention_line
+        from gza.cli.watch import (
+            _failed_recovery_attention_action,
+            _watch_needs_attention_message,
+        )
+
+        advance_action = failed_recovery_decision_to_attention_action(
+            store,
+            failed_task,
+            decision,
+            max_recovery_attempts=max_resume_attempts,
+        )
+        assert advance_action is not None
+        watch_action = _failed_recovery_attention_action(
+            store=store,
+            task=failed_task,
+            decision=decision,
+            max_recovery_attempts=max_resume_attempts,
+        )
+        assert watch_action is not None
+        iterate_result = build_failed_recovery_needs_attention_result(
+            store=store,
+            failed_task=failed_task,
+            recovery_decision=decision,
+            max_resume_attempts=max_resume_attempts,
+        )
+        assert iterate_result is not None
+        iterate_attention = resolve_execution_needs_attention(failed_task, iterate_result)
+        assert iterate_attention is not None
+        return (
+            _format_needs_attention_line(failed_task, advance_action),
+            _watch_needs_attention_message(failed_task, watch_action),
+            _format_needs_attention_line(iterate_attention.task, iterate_attention.action),
+        )
 
     def _init_git_repo(self, tmp_path: Path) -> None:
         from gza.git import Git
@@ -6298,8 +6400,8 @@ class TestIterateCommand:
     def test_failed_task_retry_runs_then_iterates(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """gza iterate --retry on a failed task retries it then enters the loop via real engine transitions."""
         import argparse
-        from unittest.mock import MagicMock, patch
         from datetime import datetime
+        from unittest.mock import MagicMock, patch
 
         from gza.cli import cmd_iterate
 
@@ -6310,7 +6412,6 @@ class TestIterateCommand:
         impl.same_branch = True
         impl.branch = "feature/existing-impl-branch"
         store.update(impl)
-        review = store.add("Review", task_type="review")
 
         def fake_run_foreground(config, task_id, **kwargs):
             task = store.get(task_id)
@@ -6374,8 +6475,8 @@ class TestIterateCommand:
     def test_failed_task_resume_runs_then_iterates(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """gza iterate --resume on a failed task resumes then enters the loop via real engine transitions."""
         import argparse
-        from unittest.mock import MagicMock, patch
         from datetime import datetime
+        from unittest.mock import MagicMock, patch
 
         from gza.cli import cmd_iterate
 
@@ -6439,8 +6540,8 @@ class TestIterateCommand:
     def test_failed_task_resume_reuses_matching_pending_resume_child(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """gza iterate --resume should reuse an existing pending resume child for the failed root task."""
         import argparse
-        from unittest.mock import MagicMock, patch
         from datetime import datetime
+        from unittest.mock import MagicMock, patch
 
         from gza.cli import cmd_iterate
 
@@ -6534,10 +6635,42 @@ class TestIterateCommand:
 
         result = run_gza("iterate", str(failed_resume_descendant.id), "--resume", "--project", str(tmp_path))
 
-        assert result.returncode == 1
+        assert result.returncode == 3
         output = result.stdout + (result.stderr or "")
-        assert "Cannot resume failed implementation" in output
-        assert "manual review required" in output
+        assert output.count("Needs attention:") == 1
+        assert "reason=max-resume-attempts-reached" in output
+        assert "Cannot resume failed implementation" not in output
+
+    def test_failed_root_resume_with_existing_failed_resume_child_uses_shared_attention(self, tmp_path: Path):
+        """iterate --resume should use the shared attention line when a newer failed resume child already exists."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Implement feature", task_type="implement")
+        assert root.id is not None
+        root.status = "failed"
+        root.failure_reason = "MAX_TURNS"
+        root.session_id = "resume-session-1"
+        store.update(root)
+
+        failed_resume_child = store.add(
+            "Failed resumed attempt",
+            task_type="implement",
+            based_on=root.id,
+        )
+        assert failed_resume_child.id is not None
+        failed_resume_child.status = "failed"
+        failed_resume_child.failure_reason = "MAX_TURNS"
+        failed_resume_child.session_id = root.session_id
+        store.update(failed_resume_child)
+
+        result = run_gza("iterate", str(root.id), "--resume", "--project", str(tmp_path))
+
+        assert result.returncode == 3
+        output = result.stdout + (result.stderr or "")
+        assert output.count("Needs attention:") == 1
+        assert "reason=newer-failed-recovery-descendant-needs-attention" in output
+        assert "Cannot resume failed implementation" not in output
 
     def test_failed_task_resume_does_not_reuse_pending_same_session_child_with_mismatched_role(self, tmp_path: Path):
         """iterate --resume should not reuse pending children that violate shared recovery-edge classification."""
@@ -6992,7 +7125,81 @@ class TestIterateCommand:
         assert result == 3
         run_foreground.assert_not_called()
         assert "Improve automatic recovery is disabled (max_resume_attempts=0)" in output
-        assert "Iterate blocked: automatic_recovery_disabled." in output
+        assert self._expected_improve_attention_line(
+            store=store,
+            impl=impl,
+            review=review,
+            max_resume_attempts=0,
+        ) in output
+        assert "reason=automatic-recovery-disabled" in output
+
+    def test_iterate_reports_manual_review_failed_improve_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        failed_improve = store.add("Prior improve", task_type="improve", based_on=impl.id, depends_on=review.id)
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "TEST_FAILURE"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+        assert failed_improve.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground") as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        run_foreground.assert_not_called()
+        assert self._expected_improve_attention_line(
+            store=store,
+            impl=impl,
+            review=review,
+            max_resume_attempts=1,
+        ) in output
+        assert "Latest failed improve" in output
 
     def test_iterate_max_cycles_reached_reports_cycle_accounting(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -7082,9 +7289,646 @@ class TestIterateCommand:
         output = capsys.readouterr().out
 
         assert result == 3
-        assert "Iterate blocked: max_cycles_reached." in output
+        expected_line = self._format_expected_attention_line(
+            impl,
+            {"type": "max_cycles_reached", "description": "Reached max review cycles"},
+        )
+        assert expected_line in output
         assert "Review-cycle accounting: completed=7, max_review_cycles=7, consumed_this_invocation=2" in output
         assert f"Recommended next step: uv run gza fix {impl.id}" in output
+
+    def test_iterate_max_cycles_attention_uses_shortened_single_line_prompt(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(
+            store,
+            prompt=(
+                "Implement feature with a very long opening line that should be shortened\n"
+                "Second line should be flattened into the final signal\n"
+                "Third line keeps going to force truncation"
+            ),
+        )
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.advance_engine.prompt_available_width", return_value=40),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={"type": "max_cycles_reached", "description": "Reached max review cycles"},
+            ),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        with patch("gza.advance_engine.prompt_available_width", return_value=40):
+            expected_line = self._format_expected_attention_line(
+                impl,
+                {"type": "max_cycles_reached", "description": "Reached max review cycles"},
+            )
+        assert result == 3
+        assert expected_line in output
+        assert output.count("Needs attention:") == 1
+        assert expected_line.count("\n") == 0
+        assert "Implement feature with a very long opening line that should be shortened\nSecond line" not in output
+
+    def test_iterate_failed_improve_attention_uses_shortened_single_line_prompt(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        failed_improve = store.add(
+            "Prior improve with a long first line that should not spill\nSecond line should not become its own output line\nThird line pads the width",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+        )
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "TEST_FAILURE"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.advance_engine.prompt_available_width", return_value=40),
+            patch("gza.cli._run_foreground") as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        with patch("gza.advance_engine.prompt_available_width", return_value=40):
+            expected_line = self._expected_improve_attention_line(
+                store=store,
+                impl=impl,
+                review=review,
+                max_resume_attempts=1,
+            )
+        assert result == 3
+        run_foreground.assert_not_called()
+        assert expected_line in output
+        assert output.count("Needs attention:") == 1
+        assert expected_line.count("\n") == 0
+        assert "Prior improve with a long first line that should not spill\nSecond line" not in output
+
+    def test_iterate_failed_improve_non_attention_skip_does_not_emit_needs_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        failed_improve = store.add(
+            "Prior improve",
+            task_type="improve",
+            depends_on=review.id,
+            based_on=impl.id,
+            same_branch=True,
+        )
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_TURNS"
+        failed_improve.session_id = "sess-improve"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        dependency = store.add("Mismatched dependency", task_type="plan")
+        assert dependency.id is not None
+
+        running_child = store.add(
+            "Running resumed improve",
+            task_type="improve",
+            based_on=failed_improve.id,
+            depends_on=dependency.id,
+        )
+        running_child.status = "in_progress"
+        running_child.session_id = failed_improve.session_id
+        store.update(running_child)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground") as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        run_foreground.assert_not_called()
+        assert "Needs attention:" not in output
+        assert "recovery child already in progress" in output
+        assert "Manual review required." not in output
+
+    def test_iterate_pending_implementation_recovery_exhaustion_uses_shared_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+        from gza.recovery_engine import decide_failed_task_recovery
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Pending implementation", task_type="implement")
+        assert impl.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "failed"
+            task.failure_reason = "MAX_STEPS"
+            task.session_id = "impl-session"
+            store.update(task)
+            return 1
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.advance_engine.prompt_available_width", return_value=40),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        recovery_children = store.get_based_on_children(impl.id)
+        assert len(recovery_children) == 1
+        failed_resume = recovery_children[0]
+        terminal_decision = decide_failed_task_recovery(
+            store,
+            failed_resume,
+            max_recovery_attempts=1,
+        )
+        with patch("gza.advance_engine.prompt_available_width", return_value=40):
+            expected_line = self._expected_failed_recovery_attention_line(
+                store=store,
+                failed_task=failed_resume,
+                decision=terminal_decision,
+                max_resume_attempts=1,
+            )
+
+        assert result == 3
+        assert run_foreground.call_count == 2
+        assert run_foreground.call_args_list[0].kwargs.get("resume", False) is False
+        assert run_foreground.call_args_list[1].kwargs.get("resume") is True
+        assert terminal_decision.reason_code == "manual_review_required"
+        assert expected_line in output
+        assert "reason=max-resume-attempts-reached" in output
+        assert output.count("Needs attention:") == 1
+        assert f"Implementation {failed_resume.id} failed (exit code 1)" not in output
+        assert f"Recommended next step: uv run gza fix {impl.id}" in output
+
+    def test_iterate_resume_start_recovery_exhaustion_uses_shared_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+        from gza.recovery_engine import decide_failed_task_recovery
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Failed implementation", task_type="implement")
+        assert impl.id is not None
+        impl.status = "failed"
+        impl.failure_reason = "MAX_STEPS"
+        impl.session_id = "impl-session"
+        store.update(impl)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=True,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "failed"
+            task.failure_reason = "MAX_STEPS"
+            task.session_id = "impl-session"
+            store.update(task)
+            return 1
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.advance_engine.prompt_available_width", return_value=40),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        recovery_children = store.get_based_on_children(impl.id)
+        assert len(recovery_children) == 1
+        failed_resume = recovery_children[0]
+        terminal_decision = decide_failed_task_recovery(
+            store,
+            failed_resume,
+            max_recovery_attempts=1,
+        )
+        with patch("gza.advance_engine.prompt_available_width", return_value=40):
+            expected_line = self._expected_failed_recovery_attention_line(
+                store=store,
+                failed_task=failed_resume,
+                decision=terminal_decision,
+                max_resume_attempts=1,
+            )
+
+        assert result == 3
+        assert run_foreground.call_count == 1
+        assert run_foreground.call_args.kwargs.get("resume") is True
+        assert terminal_decision.reason_code == "manual_review_required"
+        assert expected_line in output
+        assert "reason=max-resume-attempts-reached" in output
+        assert output.count("Needs attention:") == 1
+        assert f"Resume of {impl.id} failed" not in output
+        assert f"Recommended next step: uv run gza fix {impl.id}" in output
+
+    @pytest.mark.parametrize(
+        ("failure_reason", "seed_chain"),
+        [
+            ("TEST_FAILURE", False),
+            ("MAX_STEPS", True),
+        ],
+    )
+    def test_failed_recovery_attention_format_matches_advance_watch_and_iterate(
+        self,
+        tmp_path: Path,
+        failure_reason: str,
+        seed_chain: bool,
+    ) -> None:
+        from unittest.mock import patch
+
+        from gza.recovery_engine import decide_failed_task_recovery
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_task = store.add(
+            "Shared recovery prompt",
+            task_type="implement",
+        )
+        assert failed_task.id is not None
+        failed_task.status = "failed"
+        failed_task.failure_reason = failure_reason
+        failed_task.completed_at = datetime.now(UTC)
+        if seed_chain:
+            failed_task.session_id = "resume-session"
+            store.update(failed_task)
+            chained = store.add(
+                "Shared recovery prompt",
+                task_type="implement",
+                based_on=failed_task.id,
+            )
+            assert chained.id is not None
+            chained.status = "failed"
+            chained.failure_reason = failure_reason
+            chained.session_id = failed_task.session_id
+            chained.completed_at = datetime.now(UTC)
+            store.update(chained)
+            failed_task = chained
+        else:
+            store.update(failed_task)
+
+        decision = decide_failed_task_recovery(store, failed_task, max_recovery_attempts=1)
+        with patch("gza.advance_engine.prompt_available_width", return_value=80):
+            advance_line, watch_line, iterate_line = self._shared_failed_recovery_attention_lines(
+                store=store,
+                failed_task=failed_task,
+                decision=decision,
+                max_resume_attempts=1,
+            )
+
+        assert decision.action == "skip"
+        assert advance_line == iterate_line
+        assert watch_line == iterate_line
+
+    def test_iterate_in_loop_failed_improve_recovery_exhaustion_uses_shared_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+        from gza.recovery_engine import decide_failed_task_recovery
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "failed"
+            task.failure_reason = "MAX_STEPS"
+            task.session_id = "improve-session"
+            store.update(task)
+            return 1
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.advance_engine.prompt_available_width", return_value=40),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={"type": "improve", "description": "Create improve task", "review_task": review},
+            ),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        improves = [
+            task
+            for task in store.get_all()
+            if task.task_type == "improve" and task.depends_on == review.id
+        ]
+        assert len(improves) == 2
+        terminal_improve = next(task for task in improves if task.based_on != impl.id)
+        terminal_decision = decide_failed_task_recovery(
+            store,
+            terminal_improve,
+            max_recovery_attempts=1,
+        )
+        with patch("gza.advance_engine.prompt_available_width", return_value=40):
+            expected_line = self._expected_failed_recovery_attention_line(
+                store=store,
+                failed_task=terminal_improve,
+                decision=terminal_decision,
+                max_resume_attempts=1,
+            )
+
+        assert result == 3
+        assert run_foreground.call_count == 2
+        assert run_foreground.call_args_list[0].kwargs.get("resume", False) is False
+        assert run_foreground.call_args_list[1].kwargs.get("resume") is True
+        assert terminal_decision.reason_code == "manual_review_required"
+        assert expected_line in output
+        assert "reason=max-resume-attempts-reached" in output
+        assert output.count("Needs attention:") == 1
+        assert "Iterate blocked: improve_failed. Manual review required." not in output
+
+    def test_iterate_in_loop_manual_failure_uses_shared_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+        from gza.recovery_engine import decide_failed_task_recovery
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "failed"
+            task.failure_reason = "TEST_FAILURE"
+            store.update(task)
+            return 1
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.advance_engine.prompt_available_width", return_value=40),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={"type": "improve", "description": "Create improve task", "review_task": review},
+            ),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        improves = [
+            task
+            for task in store.get_all()
+            if task.task_type == "improve" and task.depends_on == review.id
+        ]
+        assert len(improves) == 1
+        failed_improve = improves[0]
+        decision = decide_failed_task_recovery(store, failed_improve, max_recovery_attempts=1)
+        with patch("gza.advance_engine.prompt_available_width", return_value=40):
+            expected_line = self._expected_failed_recovery_attention_line(
+                store=store,
+                failed_task=failed_improve,
+                decision=decision,
+                max_resume_attempts=1,
+            )
+
+        assert result == 3
+        assert run_foreground.call_count == 1
+        assert decision.reason_code == "manual_failure_reason"
+        assert expected_line in output
+        assert "reason=manual-failure-reason" in output
+        assert output.count("Needs attention:") == 1
+        assert "Iterate blocked: improve_failed. Manual review required." not in output
 
     def test_in_progress_improve_is_prioritized_over_newer_pending_improve(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -7337,7 +8181,7 @@ class TestIterateCommand:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         """When a retry-eligible failed improve exists, iterate creates a retry and runs it."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
 
         from gza.cli.advance_engine import determine_next_action
         from gza.cli.execution import _AdvanceEngineConfigAdapter
