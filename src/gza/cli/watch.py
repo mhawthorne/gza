@@ -68,6 +68,12 @@ _WATCH_STICKY_ATTENTION_ACTION_TYPES = frozenset(
         "max_improve_attempts",
     }
 )
+_WATCH_STICKY_ATTENTION_EXECUTION_TYPES = frozenset(
+    {
+        "automatic_recovery_disabled",
+        "manual_review_required",
+    }
+)
 T = TypeVar("T")
 
 
@@ -919,6 +925,12 @@ def _run_cycle(
                 message = exec_result.message
                 if action_type == "improve" and task.id is not None:
                     message = f"{task.id}: {message}"
+                if exec_result.attention_type in _WATCH_STICKY_ATTENTION_EXECUTION_TYPES and task.id is not None:
+                    log.emit_attention(
+                        attention_key=f"advance-attention:{task.id}:{exec_result.attention_type}",
+                        message=message,
+                    )
+                    continue
                 log.emit(
                     "SKIP",
                     message,

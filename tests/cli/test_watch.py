@@ -3511,8 +3511,8 @@ def test_watch_cycle_advances_run_improve_action(tmp_path: Path) -> None:
     assert spawn_worker.call_args.kwargs["task_id"] == improve.id
 
 
-def test_watch_cycle_max_resume_attempts_zero_skips_failed_improve_recovery(tmp_path: Path) -> None:
-    """Watch should honor the per-run attempt cap for advance-driven improve recovery."""
+def test_watch_cycle_max_resume_attempts_zero_logs_sticky_attention(tmp_path: Path) -> None:
+    """Disabled automatic improve recovery should repeat as ATTENTION in watch."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -3569,11 +3569,22 @@ def test_watch_cycle_max_resume_attempts_zero_skips_failed_improve_recovery(tmp_
             log=log,
             max_recovery_attempts=0,
         )
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            max_recovery_attempts=0,
+        )
 
     assert result.work_done is False
     assert spawn_worker.call_count == 0
     assert spawn_resume_worker.call_count == 0
     log_text = log_path.read_text()
+    assert log_text.count("ATTENTION") == 2
+    assert "SKIP      " not in log_text
     assert "automatic improve recovery is disabled (max_resume_attempts=0)" in log_text
     assert str(failed_improve.id) in log_text
 
@@ -3757,8 +3768,8 @@ def test_watch_cycle_improve_action_stops_manual_review_failures(tmp_path: Path)
     assert "requires manual review" in log.path.read_text()
 
 
-def test_watch_cycle_improve_action_respects_manual_review_stop(tmp_path: Path) -> None:
-    """When the latest failed improve is no longer automatically recoverable, watch logs a manual-review stop."""
+def test_watch_cycle_improve_action_repeats_attention_for_attempt_cap_manual_stop(tmp_path: Path) -> None:
+    """Attempt-cap improve stops should repeat as ATTENTION while the failed chain remains unrecoverable."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -3816,12 +3827,22 @@ def test_watch_cycle_improve_action_respects_manual_review_stop(tmp_path: Path) 
             dry_run=False,
             log=log,
         )
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
 
     assert result.work_done is False
     assert _task_count(store) == before_count
     assert spawn_worker.call_count == 0
     assert spawn_resume_worker.call_count == 0
     text = log_path.read_text()
+    assert text.count("ATTENTION") == 2
+    assert "SKIP      " not in text
     assert "requires manual review" in text
 
 
@@ -4176,7 +4197,6 @@ def test_watch_cycle_logs_skip_events_for_non_actionable_advance_outcomes(
     [
         ("needs_discussion", "SKIP: review verdict is NEEDS_DISCUSSION, needs manual attention"),
         ("max_cycles_reached", "SKIP: max review cycles (2) reached, needs manual intervention"),
-        ("max_improve_attempts", "SKIP: max improve attempts (2) reached, needs manual intervention"),
     ],
 )
 def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(
@@ -4184,7 +4204,7 @@ def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(
     action_type: str,
     description: str,
 ) -> None:
-    """Manual-attention advance outcomes should use ATTENTION instead of deduped SKIP."""
+    """Pre-execution manual-attention advance outcomes should use ATTENTION instead of deduped SKIP."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -4230,6 +4250,44 @@ def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(
     assert text.count("ATTENTION") == 2
     assert str(impl.id) in text
     assert "SKIP" not in text
+
+
+def test_watch_cycle_dedupes_non_human_execution_skip_across_cycles(tmp_path: Path) -> None:
+    """Execution skips without a human-attention type should keep ordinary SKIP dedupe behavior."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Plan feature", task_type="plan")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/create-review-skip-dedupe"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.determine_next_action",
+            return_value={"type": "create_review", "description": "Create review (required before merge)"},
+        ),
+    ):
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+
+    text = log_path.read_text()
+    assert text.count("SKIP      ") == 1
+    assert "ATTENTION" not in text
+    assert f"SKIP: Task {task.id} is a plan task. Expected an implementation task." in text
 
 
 def test_watch_cycle_clears_attention_reminder_when_next_action_changes(tmp_path: Path) -> None:
