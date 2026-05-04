@@ -60,6 +60,20 @@ from .git_ops import (
 )
 
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
+_WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
+_WATCH_STICKY_ATTENTION_ACTION_TYPES = frozenset(
+    {
+        "needs_discussion",
+        "max_cycles_reached",
+        "max_improve_attempts",
+    }
+)
+_WATCH_STICKY_ATTENTION_EXECUTION_TYPES = frozenset(
+    {
+        "automatic_recovery_disabled",
+        "manual_review_required",
+    }
+)
 T = TypeVar("T")
 
 
@@ -206,6 +220,8 @@ class _WatchLog:
         self._has_emitted_cycle = False
         self._skip_keys_prev_cycle: set[str] = set()
         self._skip_keys_this_cycle: set[str] = set()
+        self._sticky_attention_prev_cycle: dict[str, str] = {}
+        self._sticky_attention_this_cycle: dict[str, str] = {}
 
     def begin_cycle(self) -> None:
         if self._has_emitted_cycle:
@@ -214,17 +230,26 @@ class _WatchLog:
             if not self.quiet:
                 print()
         self._skip_keys_this_cycle.clear()
+        self._sticky_attention_this_cycle.clear()
         self._has_emitted_cycle = True
 
     def end_cycle(self) -> None:
         self._skip_keys_prev_cycle = set(self._skip_keys_this_cycle)
+        self._sticky_attention_prev_cycle = dict(self._sticky_attention_this_cycle)
+
+    def emit_attention(self, *, attention_key: str, message: str) -> None:
+        previous_message = self._sticky_attention_this_cycle.get(attention_key)
+        if previous_message == message:
+            return
+        self._sticky_attention_this_cycle[attention_key] = message
+        self.emit("ATTENTION", message)
 
     def emit(self, event: str, message: str, *, dedupe_key: str | None = None) -> None:
         if event == "SKIP" and dedupe_key is not None:
             self._skip_keys_this_cycle.add(dedupe_key)
             if dedupe_key in self._skip_keys_prev_cycle:
                 return
-        prefix = f"{_format_hms()} {event:<6} "
+        prefix = f"{_format_hms()} {event:<{_WATCH_EVENT_LABEL_WIDTH}} "
         continuation_prefix = " " * len(prefix)
         parts = message.splitlines() or [""]
         line = "\n".join(
@@ -734,14 +759,14 @@ def _run_cycle(
 
         for task, action in action_plan:
             action_type = action.get("type")
-            if action_type in {
-                "skip",
-                "wait_review",
-                "wait_improve",
-                "needs_discussion",
-                "max_cycles_reached",
-                "max_improve_attempts",
-            }:
+            if action_type in _WATCH_STICKY_ATTENTION_ACTION_TYPES:
+                log.emit_attention(
+                    attention_key=f"advance-attention:{task.id}:{action_type}",
+                    message=_watch_skip_message(task, action),
+                )
+                continue
+
+            if action_type in {"skip", "wait_review", "wait_improve"}:
                 log.emit(
                     "SKIP",
                     _watch_skip_message(task, action),
@@ -900,6 +925,12 @@ def _run_cycle(
                 message = exec_result.message
                 if action_type == "improve" and task.id is not None:
                     message = f"{task.id}: {message}"
+                if exec_result.attention_type in _WATCH_STICKY_ATTENTION_EXECUTION_TYPES and task.id is not None:
+                    log.emit_attention(
+                        attention_key=f"advance-attention:{task.id}:{exec_result.attention_type}",
+                        message=message,
+                    )
+                    continue
                 log.emit(
                     "SKIP",
                     message,
