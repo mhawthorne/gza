@@ -3205,6 +3205,61 @@ class TestAdvanceCommand:
         assert f'{failed_improve.id} improve "Prior improve" reason=automatic-recovery-disabled' in output
         assert "automatic improve recovery is disabled (max_resume_attempts=0)" in output
 
+    def test_advance_failed_improve_non_attention_skip_stays_out_of_needs_attention(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        review_task = store.add(
+            f"Review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        assert review_task.id is not None
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(review_task)
+
+        failed_improve = store.add(
+            "Prior improve",
+            task_type="improve",
+            depends_on=review_task.id,
+            based_on=task.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_TURNS"
+        failed_improve.session_id = "sess-improve"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        dependency = store.add("Mismatched dependency", task_type="plan")
+        assert dependency.id is not None
+
+        running_child = store.add(
+            "Running resumed improve",
+            task_type="improve",
+            based_on=failed_improve.id,
+            depends_on=dependency.id,
+        )
+        assert running_child.id is not None
+        running_child.status = "in_progress"
+        running_child.session_id = failed_improve.session_id
+        store.update(running_child)
+
+        result = run_gza("advance", "--auto", "--project", str(tmp_path))
+        output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "Needs attention" not in output
+        assert "recovery child already in progress" in output
+        assert "Started improve" not in output
+        assert [child.id for child in store.get_based_on_children(failed_improve.id)] == [running_child.id]
+
 
     def _create_failed_task(self, store, session_id="sess-abc", failure_reason="MAX_STEPS", prompt="Implement feature"):
         """Create a failed task with given failure_reason and session_id."""

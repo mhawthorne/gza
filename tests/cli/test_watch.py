@@ -3594,6 +3594,89 @@ def test_watch_cycle_max_resume_attempts_zero_logs_sticky_attention(tmp_path: Pa
     ) in log_text
 
 
+def test_watch_cycle_failed_improve_non_attention_skip_stays_out_of_attention_log(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/watch-improve-skip"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+    store.update(review)
+
+    failed_improve = store.add(
+        "Improve feature",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "MAX_TURNS"
+    failed_improve.session_id = "sess-improve"
+    failed_improve.completed_at = datetime.now(UTC)
+    store.update(failed_improve)
+
+    dependency = store.add("Mismatched dependency", task_type="plan")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    running_child = store.add(
+        "Running resumed improve",
+        task_type="improve",
+        based_on=failed_improve.id,
+        depends_on=dependency.id,
+    )
+    assert running_child.id is not None
+    running_child.status = "in_progress"
+    running_child.session_id = failed_improve.session_id
+    store.update(running_child)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            max_recovery_attempts=1,
+        )
+    assert spawn_worker.call_count == 0
+    assert spawn_resume_worker.call_count == 0
+    log_text = log_path.read_text()
+    assert "ATTENTION" not in log_text
+    assert "recovery child already in progress" in log_text
+
+
 def test_watch_cycle_improve_creation_includes_unresolved_comments_in_prompt(tmp_path: Path) -> None:
     """Watch-created improve prompts should include unresolved comments when present."""
     setup_config(tmp_path)

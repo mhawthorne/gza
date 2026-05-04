@@ -100,6 +100,12 @@ def build_improve_needs_attention_result(
     if failed_improve is None:
         return None
 
+    attention_reason = get_failed_recovery_needs_attention_reason(
+        store,
+        failed_improve,
+        decision=improve_decision,
+        max_recovery_attempts=max_resume_attempts,
+    )
     attention_type: str | None = None
     message = ""
     if improve_mode == "give_up":
@@ -113,20 +119,20 @@ def build_improve_needs_attention_result(
     elif improve_mode == "manual_review":
         if improve_decision is None:
             return None
-        attention_type = "manual_review_required"
-        message = (
-            f"SKIP: latest failed improve {failed_improve.id} requires manual review "
-            f"({improve_decision.reason_text})"
-        )
+        if attention_reason is None:
+            message = (
+                f"SKIP: latest failed improve {failed_improve.id}: "
+                f"{improve_decision.reason_text}"
+            )
+        else:
+            attention_type = "manual_review_required"
+            message = (
+                f"SKIP: latest failed improve {failed_improve.id} requires manual review "
+                f"({improve_decision.reason_text})"
+            )
     else:
         return None
 
-    attention_reason = get_failed_recovery_needs_attention_reason(
-        store,
-        failed_improve,
-        decision=improve_decision,
-        max_recovery_attempts=max_resume_attempts,
-    )
     return AdvanceActionExecutionResult(
         action_type="improve",
         status="skip",

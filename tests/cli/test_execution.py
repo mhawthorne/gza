@@ -6635,10 +6635,42 @@ class TestIterateCommand:
 
         result = run_gza("iterate", str(failed_resume_descendant.id), "--resume", "--project", str(tmp_path))
 
-        assert result.returncode == 1
+        assert result.returncode == 3
         output = result.stdout + (result.stderr or "")
-        assert "Cannot resume failed implementation" in output
-        assert "manual review required" in output
+        assert output.count("Needs attention:") == 1
+        assert "reason=max-resume-attempts-reached" in output
+        assert "Cannot resume failed implementation" not in output
+
+    def test_failed_root_resume_with_existing_failed_resume_child_uses_shared_attention(self, tmp_path: Path):
+        """iterate --resume should use the shared attention line when a newer failed resume child already exists."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Implement feature", task_type="implement")
+        assert root.id is not None
+        root.status = "failed"
+        root.failure_reason = "MAX_TURNS"
+        root.session_id = "resume-session-1"
+        store.update(root)
+
+        failed_resume_child = store.add(
+            "Failed resumed attempt",
+            task_type="implement",
+            based_on=root.id,
+        )
+        assert failed_resume_child.id is not None
+        failed_resume_child.status = "failed"
+        failed_resume_child.failure_reason = "MAX_TURNS"
+        failed_resume_child.session_id = root.session_id
+        store.update(failed_resume_child)
+
+        result = run_gza("iterate", str(root.id), "--resume", "--project", str(tmp_path))
+
+        assert result.returncode == 3
+        output = result.stdout + (result.stderr or "")
+        assert output.count("Needs attention:") == 1
+        assert "reason=newer-failed-recovery-descendant-needs-attention" in output
+        assert "Cannot resume failed implementation" not in output
 
     def test_failed_task_resume_does_not_reuse_pending_same_session_child_with_mismatched_role(self, tmp_path: Path):
         """iterate --resume should not reuse pending children that violate shared recovery-edge classification."""
@@ -7407,6 +7439,89 @@ class TestIterateCommand:
         assert output.count("Needs attention:") == 1
         assert expected_line.count("\n") == 0
         assert "Prior improve with a long first line that should not spill\nSecond line" not in output
+
+    def test_iterate_failed_improve_non_attention_skip_does_not_emit_needs_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        failed_improve = store.add(
+            "Prior improve",
+            task_type="improve",
+            depends_on=review.id,
+            based_on=impl.id,
+            same_branch=True,
+        )
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_TURNS"
+        failed_improve.session_id = "sess-improve"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        dependency = store.add("Mismatched dependency", task_type="plan")
+        assert dependency.id is not None
+
+        running_child = store.add(
+            "Running resumed improve",
+            task_type="improve",
+            based_on=failed_improve.id,
+            depends_on=dependency.id,
+        )
+        running_child.status = "in_progress"
+        running_child.session_id = failed_improve.session_id
+        store.update(running_child)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground") as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        run_foreground.assert_not_called()
+        assert "Needs attention:" not in output
+        assert "recovery child already in progress" in output
+        assert "Manual review required." not in output
 
     def test_iterate_pending_implementation_recovery_exhaustion_uses_shared_attention(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
