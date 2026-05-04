@@ -356,7 +356,10 @@ def execute_advance_action(
             worker_label="resume",
             created_task=resume_task,
         )
-        result.success_message = f"Created resume task {resume_task.id}"
+        if reuse_existing:
+            result.success_message = f"Reused pending resume task {resume_task.id}"
+        else:
+            result.success_message = f"Created resume task {resume_task.id}"
         return result
 
     if action_type == "retry":
@@ -404,7 +407,10 @@ def execute_advance_action(
             worker_label=worker_label,
             created_task=retry_task,
         )
-        result.success_message = f"Created retry task {retry_task.id}"
+        if reuse_existing:
+            result.success_message = f"Reused pending retry task {retry_task.id}"
+        else:
+            result.success_message = f"Created retry task {retry_task.id}"
         return result
 
     if action_type == "create_implement":

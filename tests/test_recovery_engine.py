@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 from gza.recovery_engine import decide_failed_task_recovery, list_failed_tasks_for_recovery
-
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -83,6 +82,85 @@ def test_recovery_engine_existing_pending_resume_child_reuses_resume_semantics(t
     assert decision.action == "resume"
     assert decision.recovery_task_id == child.id
     assert decision.reuse_existing is True
+
+
+def test_recovery_engine_pending_match_does_not_override_running_sibling(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
+
+    reusable_pending = store.add("Pending retry child", task_type=task.task_type, based_on=task.id)
+    assert reusable_pending.id is not None
+    reusable_pending.status = "pending"
+    store.update(reusable_pending)
+
+    running_sibling = store.add("Running retry child", task_type=task.task_type, based_on=task.id)
+    assert running_sibling.id is not None
+    running_sibling.status = "in_progress"
+    store.update(running_sibling)
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "recovery_already_running"
+    assert decision.recovery_task_id is None
+    assert decision.reuse_existing is False
+
+
+def test_recovery_engine_pending_match_does_not_override_completed_sibling(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
+
+    reusable_pending = store.add("Pending retry child", task_type=task.task_type, based_on=task.id)
+    assert reusable_pending.id is not None
+    reusable_pending.status = "pending"
+    store.update(reusable_pending)
+
+    completed_sibling = store.add("Completed retry child", task_type=task.task_type, based_on=task.id)
+    assert completed_sibling.id is not None
+    completed_sibling.status = "completed"
+    completed_sibling.completed_at = datetime.now(UTC)
+    store.update(completed_sibling)
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "recovery_already_completed"
+    assert decision.recovery_task_id is None
+    assert decision.reuse_existing is False
+
+
+def test_recovery_engine_pending_match_stays_suppressed_by_newer_failed_descendant(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="plan")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "INFRASTRUCTURE_ERROR"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    reusable_pending = store.add("Pending retry child", task_type=root.task_type, based_on=root.id)
+    assert reusable_pending.id is not None
+    reusable_pending.status = "pending"
+    store.update(reusable_pending)
+
+    failed_sibling = store.add("Failed retry child", task_type=root.task_type, based_on=root.id)
+    assert failed_sibling.id is not None
+    failed_sibling.status = "failed"
+    failed_sibling.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_sibling.completed_at = datetime.now(UTC)
+    store.update(failed_sibling)
+
+    failed_grandchild = store.add("Failed retry grandchild", task_type=root.task_type, based_on=failed_sibling.id)
+    assert failed_grandchild.id is not None
+    failed_grandchild.status = "failed"
+    failed_grandchild.failure_reason = "MAX_TURNS"
+    failed_grandchild.session_id = "sess-grandchild"
+    failed_grandchild.completed_at = datetime.now(UTC)
+    store.update(failed_grandchild)
+
+    decision = decide_failed_task_recovery(store, root, max_recovery_attempts=3)
+    assert decision.action == "skip"
+    assert decision.reason_code == "recovery_has_newer_failed_descendant"
+    assert decision.recovery_task_id is None
+    assert decision.reuse_existing is False
 
 
 @pytest.mark.parametrize(
@@ -377,6 +455,25 @@ def test_recovery_engine_counts_only_based_on_chain_not_dependency_ancestry(tmp_
 
     decision = decide_failed_task_recovery(store, downstream, max_recovery_attempts=1)
     assert decision.action == "retry"
+
+
+def test_recovery_engine_multiple_pending_children_require_manual_review(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
+
+    first_pending = store.add("Pending retry child 1", task_type=task.task_type, based_on=task.id)
+    second_pending = store.add("Pending retry child 2", task_type=task.task_type, based_on=task.id)
+    assert first_pending.id is not None
+    assert second_pending.id is not None
+    first_pending.status = "pending"
+    second_pending.status = "pending"
+    store.update(first_pending)
+    store.update(second_pending)
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "manual_review_required"
+    assert decision.reason_text == "multiple pending recovery children require manual review"
+    assert decision.recovery_task_id is None
 
 
 def test_list_failed_tasks_for_recovery_sorts_oldest_created_first(

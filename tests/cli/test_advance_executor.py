@@ -328,6 +328,75 @@ def test_create_review_skip_propagates_message_without_spawning(tmp_path: Path) 
     assert result.message == "SKIP: review already pending"
 
 
+@pytest.mark.parametrize(
+    ("action_type", "expected_message"),
+    [
+        ("resume", "Reused pending resume task"),
+        ("retry", "Reused pending retry task"),
+    ],
+)
+def test_reused_failed_task_recovery_reports_reuse_message(
+    tmp_path: Path,
+    action_type: str,
+    expected_message: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed task", task_type="plan")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS" if action_type == "resume" else "INFRASTRUCTURE_ERROR"
+    failed.session_id = "sess-1" if action_type == "resume" else None
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    reused = store.add("Pending recovery task", task_type=failed.task_type, based_on=failed.id)
+    assert reused.id is not None
+    reused.status = "pending"
+    if action_type == "resume":
+        reused.depends_on = failed.depends_on
+        reused.session_id = failed.session_id
+        reused.spec = failed.spec
+        reused.branch = failed.branch
+    store.update(reused)
+
+    spawned: list[tuple[str, str]] = []
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("should reuse existing task"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda task_id, kind: spawned.append((task_id, kind)) or 0,
+        spawn_resume_worker=lambda task_id, kind: spawned.append((task_id, kind)) or 0,
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        create_retry_task=lambda _task: pytest.fail("should reuse existing task"),
+    )
+
+    result = execute_advance_action(
+        task=failed,
+        action={
+            "type": action_type,
+            "launch_mode": "worker",
+            "recovery_task_id": reused.id,
+            "reuse_existing": True,
+        },
+        context=context,
+    )
+
+    assert result.status == "success"
+    assert result.success_message == f"{expected_message} {reused.id}"
+    assert result.created_task is not None
+    assert result.created_task.id == reused.id
+    expected_kind = failed.task_type or "task"
+    assert spawned == [(reused.id, expected_kind)]
+
+
 def test_create_implement_uses_shared_lineage_and_selected_spawn_path(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

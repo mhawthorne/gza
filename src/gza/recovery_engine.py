@@ -33,6 +33,10 @@ _DESCENDANT_SUPERSEDED_REASONS: tuple[tuple[str, str, str], ...] = (
     ("in_progress", "recovery_already_running", "recovery descendant already in progress"),
     ("pending", "recovery_already_pending", "recovery descendant already pending"),
 )
+_DIRECT_CHILD_SUPERSEDED_REASONS: tuple[tuple[str, str, str], ...] = (
+    ("completed", "recovery_already_completed", "recovery child already completed"),
+    ("in_progress", "recovery_already_running", "recovery child already in progress"),
+)
 
 RecoveryAction = Literal["resume", "retry", "skip"]
 RecoveryRole = Literal["original", "resume", "retry"]
@@ -304,48 +308,21 @@ def decide_failed_task_recovery(
         child for child in children
         if _classify_recovery_edge(task, child) == expected_action
     ]
-    pending_children = [child for child in matching_children if child.status == "pending" and child.id is not None]
-    if pending_children:
-        reuse_child = pending_children[0]
-        return FailedRecoveryDecision(
-            task_id=task_id,
-            action=expected_action,
-            reason_code=reason,
-            reason_text=f"reusing pending {expected_action} child {reuse_child.id}",
-            launch_mode=launch_mode,
-            attempt_index=attempt_index,
-            attempt_limit=attempt_limit,
-            recovery_task_id=str(reuse_child.id),
-            reuse_existing=True,
-        )
-    if any(child.status == "in_progress" for child in children):
-        return _skip_decision(
-            task_id=task_id,
-            reason_code="recovery_already_running",
-            reason_text="recovery child already in progress",
-            attempt_index=attempt_index,
-            attempt_limit=attempt_limit,
-        )
-    if any(child.status == "pending" for child in children):
-        return _skip_decision(
-            task_id=task_id,
-            reason_code="recovery_already_pending",
-            reason_text="recovery child already pending",
-            attempt_index=attempt_index,
-            attempt_limit=attempt_limit,
-        )
-    if any(child.status == "completed" for child in children):
-        return _skip_decision(
-            task_id=task_id,
-            reason_code="recovery_already_completed",
-            reason_text="recovery child already completed",
-            attempt_index=attempt_index,
-            attempt_limit=attempt_limit,
-        )
-
     descendants = _same_type_recovery_descendants(store, task)
     direct_child_ids = {child.id for child in children if child.id is not None}
     deeper_descendants = [child for child in descendants if child.id not in direct_child_ids]
+    pending_children = [child for child in matching_children if child.status == "pending" and child.id is not None]
+    all_pending_children = [child for child in children if child.status == "pending" and child.id is not None]
+
+    for status, reason_code, reason_text in _DIRECT_CHILD_SUPERSEDED_REASONS:
+        if any(child.status == status for child in children):
+            return _skip_decision(
+                task_id=task_id,
+                reason_code=reason_code,
+                reason_text=reason_text,
+                attempt_index=attempt_index,
+                attempt_limit=attempt_limit,
+            )
     for status, reason_code, reason_text in _DESCENDANT_SUPERSEDED_REASONS:
         if any(child.status == status for child in deeper_descendants):
             return _skip_decision(
@@ -360,6 +337,35 @@ def decide_failed_task_recovery(
             task_id=task_id,
             reason_code="recovery_has_newer_failed_descendant",
             reason_text="a newer failed recovery descendant must be recovered first",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
+    if len(all_pending_children) > 1:
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="manual_review_required",
+            reason_text="multiple pending recovery children require manual review",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
+    if pending_children:
+        reuse_child = pending_children[0]
+        return FailedRecoveryDecision(
+            task_id=task_id,
+            action=expected_action,
+            reason_code=reason,
+            reason_text=f"reusing pending {expected_action} child {reuse_child.id}",
+            launch_mode=launch_mode,
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+            recovery_task_id=str(reuse_child.id),
+            reuse_existing=True,
+        )
+    if all_pending_children:
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="recovery_already_pending",
+            reason_text="recovery child already pending",
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,
         )

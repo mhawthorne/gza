@@ -736,7 +736,7 @@ def main() -> int:
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'gza queue --tag TAG' to preview scoped pickup order",
+        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview scoped pickup order",
     )
     watch_parser.add_argument(
         "--any-tag",
@@ -762,7 +762,7 @@ def main() -> int:
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only list runnable tasks matching tag filters (repeatable); same scoped pickup order used by 'gza watch --tag TAG'",
+        help="Only list runnable tasks matching tag filters (repeatable); same scoped pickup order used by 'uv run gza watch --tag TAG'",
     )
     queue_parser.add_argument(
         "--any-tag",

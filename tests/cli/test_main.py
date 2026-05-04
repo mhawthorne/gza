@@ -343,8 +343,10 @@ class TestHelpOutput:
         queue_text = " ".join(queue_help.stdout.split())
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
-        assert "use 'gza queue --tag TAG' to preview scoped pickup order" in watch_text
-        assert "same scoped pickup order used by 'gza watch --tag TAG'" in queue_text
+        assert "use 'uv run gza queue --tag TAG' to preview scoped pickup order" in watch_text
+        assert "same scoped pickup order used by 'uv run gza watch --tag TAG'" in queue_text
+        assert "use 'gza queue --tag TAG' to preview scoped pickup order" not in watch_text
+        assert "same scoped pickup order used by 'gza watch --tag TAG'" not in queue_text
         assert "use `uv run gza queue --tag TAG` to preview the same scoped pickup order" in docs_text
         assert "canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order" in docs_text
 
