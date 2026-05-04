@@ -7,9 +7,12 @@ from pathlib import Path
 
 from gza.advance_engine import (
     WORKER_CONSUMING_ACTIONS,
+    classify_advance_action,
     evaluate_advance_rules,
+    failed_recovery_decision_to_action,
     resolve_advance_context,
 )
+from gza.recovery_engine import decide_failed_task_recovery
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.review_verdict import ParsedReviewReport
@@ -167,6 +170,23 @@ def test_evaluate_resumes_timeout_retry_descendant_once(tmp_path: Path):
 
     assert action["type"] == "resume"
     assert action["description"] == "Resume failed task (MAX_STEPS)"
+
+
+def test_actionable_failed_recovery_actions_are_not_needs_attention(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    failed = store.add("Implement feature", task_type="implement")
+    failed.status = "failed"
+    failed.failure_reason = "MAX_STEPS"
+    failed.session_id = "sess-1"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    action = failed_recovery_decision_to_action(failed, decision)
+
+    assert decision.action == "resume"
+    assert classify_advance_action(action) == "actionable"
 
 
 def test_completed_fix_after_changes_requested_requires_fresh_review(tmp_path: Path, monkeypatch):

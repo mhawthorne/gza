@@ -385,3 +385,77 @@ def decide_failed_task_recovery(
         attempt_index=attempt_index,
         attempt_limit=attempt_limit,
     )
+
+
+def get_failed_recovery_needs_attention_reason(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    decision: FailedRecoveryDecision | None = None,
+    max_recovery_attempts: int,
+) -> str | None:
+    """Return a shared needs-attention reason slug for failed-task skip decisions."""
+    if task.id is None:
+        return None
+    resolved_decision = decision or decide_failed_task_recovery(
+        store,
+        task,
+        max_recovery_attempts=max_recovery_attempts,
+    )
+    return _get_failed_recovery_needs_attention_reason(
+        store,
+        task,
+        decision=resolved_decision,
+        max_recovery_attempts=max_recovery_attempts,
+        seen_task_ids=set(),
+    )
+
+
+def _get_failed_recovery_needs_attention_reason(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    decision: FailedRecoveryDecision,
+    max_recovery_attempts: int,
+    seen_task_ids: set[str],
+) -> str | None:
+    if task.id is None or decision.action != "skip":
+        return None
+
+    task_id = str(task.id)
+    if task_id in seen_task_ids:
+        return None
+    seen_task_ids.add(task_id)
+
+    if decision.reason_code == "automatic_recovery_disabled":
+        return "automatic-recovery-disabled"
+    if decision.reason_code == "manual_failure_reason":
+        return "manual-failure-reason"
+    if decision.reason_code == "manual_review_required":
+        if decision.attempt_limit > 0 and decision.attempt_index >= decision.attempt_limit:
+            return "max-resume-attempts-reached"
+        return "manual-review-required"
+    if decision.reason_code != "recovery_has_newer_failed_descendant":
+        return None
+
+    failed_descendants = [
+        descendant
+        for descendant in _same_type_recovery_descendants(store, task)
+        if descendant.status == "failed" and descendant.id is not None
+    ]
+    for descendant in sort_failed_tasks(failed_descendants):
+        descendant_decision = decide_failed_task_recovery(
+            store,
+            descendant,
+            max_recovery_attempts=max_recovery_attempts,
+        )
+        descendant_reason = _get_failed_recovery_needs_attention_reason(
+            store,
+            descendant,
+            decision=descendant_decision,
+            max_recovery_attempts=max_recovery_attempts,
+            seen_task_ids=seen_task_ids,
+        )
+        if descendant_reason is not None:
+            return "newer-failed-recovery-descendant-needs-attention"
+    return None

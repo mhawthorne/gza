@@ -6,12 +6,19 @@ from typing import Any
 
 from gza.advance_engine import (
     ADVANCE_RULES,
+    NEEDS_ATTENTION_LABEL,
     WORKER_CONSUMING_ACTIONS,
     AdvanceContext,
     AdvanceRule,
+    classify_advance_action,
     evaluate_advance_rules,
+    failed_recovery_decision_to_action,
+    format_needs_attention_entry,
+    get_needs_attention_reason,
+    is_needs_attention_action,
     is_resumable_failed_task,
     resolve_advance_context,
+    with_needs_attention,
 )
 from gza.db import SqliteTaskStore, Task as DbTask
 
@@ -40,10 +47,17 @@ def determine_next_action(
 
 __all__ = [
     "ADVANCE_RULES",
+    "NEEDS_ATTENTION_LABEL",
     "WORKER_CONSUMING_ACTIONS",
     "AdvanceContext",
     "AdvanceRule",
+    "classify_advance_action",
     "determine_next_action",
     "is_resumable_failed_task",
+    "failed_recovery_decision_to_action",
+    "format_needs_attention_entry",
+    "get_needs_attention_reason",
+    "is_needs_attention_action",
     "resolve_advance_context",
+    "with_needs_attention",
 ]

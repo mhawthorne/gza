@@ -38,7 +38,11 @@ from ..git import Git
 from ..lineage import resolve_impl_task
 from ..prompts import PromptBuilder
 from ..query import get_base_task_slug as _get_base_task_slug
-from ..recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
+from ..recovery_engine import (
+    FailedRecoveryDecision,
+    decide_failed_task_recovery,
+    get_failed_recovery_needs_attention_reason,
+)
 from ..review_verdict import get_review_report
 from ..runner import RunInvocationContext, generate_slug, run
 from ..workers import WorkerMetadata, WorkerRegistry
@@ -69,7 +73,13 @@ from ._common import (
     run_with_recovery,
     set_task_urgency,
 )
-from .advance_engine import determine_next_action
+from .advance_engine import (
+    NEEDS_ATTENTION_LABEL,
+    classify_advance_action,
+    determine_next_action,
+    format_needs_attention_entry,
+)
+from .advance_executor import AdvanceActionExecutionResult, resolve_execution_needs_attention
 from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
 
@@ -2107,6 +2117,8 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     summary_rows: list[IterateSummaryRow] = []
     final_status = "maxed_out"
     final_stop_reason = "max_iterations"
+    final_attention_action: dict[str, Any] | None = None
+    final_attention_task: DbTask | None = None
     iteration = 0
     starting_completed_review_cycles = count_completed_review_cycles(store, impl_task_key)
     max_resume_attempts = _int_config(
@@ -2181,6 +2193,9 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         if action_type in {"needs_discussion", "max_cycles_reached", "skip"}:
             final_status = "blocked"
             final_stop_reason = action_type
+            if classify_advance_action(action) == "needs_attention":
+                final_attention_action = action
+                final_attention_task = impl_task
             maybe_review = action.get("review_task")
             if isinstance(maybe_review, DbTask):
                 maybe_verdict = get_review_verdict(config, maybe_review) if maybe_review.status == "completed" else None
@@ -2310,6 +2325,30 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             )
             if improve_action == "give_up" and failed_improve is not None:
                 assert failed_improve.id is not None
+                attention_reason = get_failed_recovery_needs_attention_reason(
+                    store,
+                    failed_improve,
+                    decision=improve_decision,
+                    max_recovery_attempts=max_resume_attempts,
+                )
+                attention_result = AdvanceActionExecutionResult(
+                    action_type="improve",
+                    status="skip",
+                    message=(
+                        "SKIP: automatic improve recovery is disabled "
+                        f"(max_resume_attempts={max_resume_attempts}) for "
+                        f"{impl_task.id} + {review_task.id}; latest failed improve: {failed_improve.id}. "
+                        f"Run uv run gza fix {impl_task.id}"
+                    ),
+                    improve_mode=improve_action,
+                    failed_improve=failed_improve,
+                    attention_type="automatic_recovery_disabled",
+                    attention_reason=attention_reason,
+                )
+                attention = resolve_execution_needs_attention(impl_task, attention_result)
+                assert attention is not None
+                final_attention_action = attention.action
+                final_attention_task = attention.task
                 print(
                     "  Improve automatic recovery is disabled "
                     f"(max_resume_attempts={max_resume_attempts}); "
@@ -2328,6 +2367,28 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             if improve_action == "manual_review" and failed_improve is not None:
                 assert failed_improve.id is not None
                 assert improve_decision is not None
+                attention_reason = get_failed_recovery_needs_attention_reason(
+                    store,
+                    failed_improve,
+                    decision=improve_decision,
+                    max_recovery_attempts=max_resume_attempts,
+                )
+                attention_result = AdvanceActionExecutionResult(
+                    action_type="improve",
+                    status="skip",
+                    message=(
+                        f"SKIP: latest failed improve {failed_improve.id} requires manual review "
+                        f"({improve_decision.reason_text})"
+                    ),
+                    improve_mode=improve_action,
+                    failed_improve=failed_improve,
+                    attention_type="manual_review_required",
+                    attention_reason=attention_reason,
+                )
+                attention = resolve_execution_needs_attention(impl_task, attention_result)
+                assert attention is not None
+                final_attention_action = attention.action
+                final_attention_task = attention.task
                 print(
                     f"  Latest failed improve {failed_improve.id} requires manual review "
                     f"({improve_decision.reason_text})"
@@ -2507,7 +2568,13 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     if final_stop_reason == "max_cycles_reached":
         completed_review_cycles = count_completed_review_cycles(store, impl_task_key)
         consumed_this_invocation = max(0, completed_review_cycles - starting_completed_review_cycles)
-        print(f"Iterate blocked: {final_stop_reason}.")
+        if final_attention_action is not None and final_attention_task is not None:
+            print(
+                f"{NEEDS_ATTENTION_LABEL}: "
+                f"{format_needs_attention_entry(final_attention_task, prompt=final_attention_task.prompt, action=final_attention_action)}"
+            )
+        else:
+            print(f"Iterate blocked: {final_stop_reason}.")
         print(
             "Review-cycle accounting: "
             f"completed={completed_review_cycles}, "
@@ -2516,9 +2583,18 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         )
         print(f"Recommended next step: uv run gza fix {impl_task_key}")
         return 3
-    if final_stop_reason == "automatic_recovery_disabled":
-        print(f"Iterate blocked: {final_stop_reason}.")
-        print(f"Recommended next step: uv run gza fix {impl_task_key}")
+    if final_attention_action is not None and final_attention_task is not None:
+        prompt_display = final_attention_task.prompt
+        print(
+            f"{NEEDS_ATTENTION_LABEL}: "
+            f"{format_needs_attention_entry(final_attention_task, prompt=prompt_display, action=final_attention_action)}"
+        )
+        if final_attention_action.get("needs_attention_reason") in {
+            "review-max-cycles-reached",
+            "automatic-recovery-disabled",
+            "max-resume-attempts-reached",
+        }:
+            print(f"Recommended next step: uv run gza fix {impl_task_key}")
         return 3
     print(f"Iterate blocked: {final_stop_reason}. Manual review required.")
     return 3

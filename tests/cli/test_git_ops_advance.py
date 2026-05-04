@@ -347,6 +347,8 @@ class TestAdvanceCommand:
             result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
+        assert "Needs attention" in result.stdout
+        assert "reason=review-verdict-needs-manual-attention" in result.stdout
         assert "needs manual attention" in result.stdout
         assert "Merge (review APPROVED_WITH_FOLLOWUPS)" not in result.stdout
 
@@ -2534,8 +2536,10 @@ class TestAdvanceCommand:
 
         output = stdout.getvalue()
         assert rc == 0
-        assert "Would advance 1 task(s)" in output
-        assert "needs manual resolution" in output
+        assert "No eligible tasks to advance" in output
+        assert "Needs attention" in output
+        assert "reason=rebase-failed-needs-manual-resolution" in output
+        assert "manual resolution" in output
         assert "Resume failed task (MAX_TURNS)" not in output
 
     def test_advance_dry_run_suppresses_based_on_failed_descendant_only(self, tmp_path: Path):
@@ -2974,8 +2978,54 @@ class TestAdvanceCommand:
 
         result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "Would advance" in result.stdout
+        assert "No eligible tasks to advance" in result.stdout
+        assert "Needs attention" in result.stdout
+        assert "reason=review-max-cycles-reached" in result.stdout
         assert "max review cycles" in result.stdout
+
+    def test_advance_dry_run_moves_manual_review_failed_improve_to_needs_attention(self, tmp_path: Path):
+        """advance --dry-run should move manual-review improve recovery stops out of actionable output."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        review_task = store.add(
+            f"Review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        assert review_task.id is not None
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+        store.update(review_task)
+
+        failed_improve = store.add(
+            "Prior improve",
+            task_type="improve",
+            depends_on=review_task.id,
+            based_on=task.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "TEST_FAILURE"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+        output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "No eligible tasks to advance" in output
+        assert "Would advance" not in output
+        assert "Create improve" not in output
+        assert "Needs attention" in output
+        assert f'{failed_improve.id} improve "Prior improve" reason=manual-failure-reason' in output
+        assert f"latest failed improve {failed_improve.id} requires manual review" in output
+        assert "TEST_FAILURE requires manual intervention" in output
 
 
     def _create_failed_task(self, store, session_id="sess-abc", failure_reason="MAX_STEPS", prompt="Implement feature"):
@@ -3178,10 +3228,12 @@ class TestAdvanceCommand:
         result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
+        assert "Needs attention" in result.stdout
         assert f"{original.id}" in result.stdout
         assert f"{child.id}" in result.stdout
-        assert "a newer failed recovery descendant must be recovered first" in result.stdout
         assert "automatic recovery stops here; manual review required" in result.stdout
+        assert "reason=newer-failed-recovery-descendant-needs-attention" in result.stdout
+        assert "reason=max-resume-attempts-reached" in result.stdout
 
     def test_advance_no_resume_failed_flag_skips(self, tmp_path: Path):
         """advance --no-resume-failed excludes failed tasks from processing."""
@@ -3232,7 +3284,7 @@ class TestAdvanceCommand:
         assert len(children) == 0
 
     def test_advance_specific_failed_task_id_test_failure_is_not_resumable(self, tmp_path: Path):
-        """advance rejects TEST_FAILURE tasks for explicit failed task IDs."""
+        """advance shows shared needs-attention output for manual-only explicit failed task IDs."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -3240,15 +3292,45 @@ class TestAdvanceCommand:
         failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="TEST_FAILURE")
 
         result = run_gza("advance", str(failed_task.id), "--auto", "--project", str(tmp_path))
+        output = " ".join(result.stdout.split())
 
-        assert result.returncode == 1
-        assert (
-            f"Error: Task {failed_task.id} is not automatically recoverable: "
-            "TEST_FAILURE requires manual intervention"
-        ) in result.stdout
+        assert result.returncode == 0
+        assert "No eligible tasks to advance" in output
+        assert "Needs attention" in output
+        assert f'{failed_task.id} implement "Implement feature" reason=manual-failure-reason' in output
+        assert "TEST_FAILURE requires manual intervention" in output
+        assert "not automatically recoverable" not in output
 
         children = store.get_based_on_children(failed_task.id)
         assert len(children) == 0
+
+    def test_advance_specific_failed_task_id_dry_run_surfaces_exhausted_resume_chain_attention(self, tmp_path: Path):
+        """advance <failed-id> --dry-run should format exhausted recovery children under Needs attention."""
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        original = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        child = store.add("Implement feature", task_type="implement")
+        assert child.id is not None
+        child.based_on = original.id
+        child.status = "failed"
+        child.failure_reason = "MAX_STEPS"
+        child.session_id = original.session_id
+        child.branch = original.branch
+        child.completed_at = datetime.now(UTC)
+        store.update(child)
+
+        result = run_gza("advance", str(child.id), "--dry-run", "--project", str(tmp_path))
+        output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "No eligible tasks to advance" in output
+        assert "Needs attention" in output
+        assert "Would advance" not in output
+        assert f'{child.id} implement "Implement feature" reason=max-resume-attempts-reached' in output
+        assert "automatic recovery stops here; manual review required" in output
 
     def test_advance_skips_failed_task_without_session_id(self, tmp_path: Path):
         """advance skips failed tasks without session_id (not resumable)."""

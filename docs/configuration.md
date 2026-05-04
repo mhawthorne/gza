@@ -1377,6 +1377,8 @@ keeping sibling branches as separate source rows. It never shows `implement` tas
 Only completed plan rows are directly runnable with `uv run gza implement <id>`; use `uv run gza advance --unimplemented --create` to queue implement tasks
 for explore rows or incomplete source descendants.
 
+When the shared advance/recovery engine decides a task must be skipped for human intervention, `uv run gza advance` prints a dedicated `Needs attention` section. Each entry includes the task id, task type, short prompt, a stable `reason=...` policy slug, and the underlying skip text. This section is shown in normal and `--dry-run` output, including when there is otherwise no actionable work to advance.
+
 ### iterate
 
 Run an automated implementation lifecycle loop (review/improve/resume/rebase).
@@ -1397,6 +1399,8 @@ When iterate stops with `max_cycles_reached`, it now prints review-cycle account
 - task `completed` review-cycle count
 - configured `max_review_cycles`
 - `consumed_this_invocation` cycles
+
+When iterate stops on a shared human-required outcome, it also prints the same `Needs attention: <task> ... reason=...` line used by `uv run gza advance`, so operators can see the exact policy boundary that stopped automation.
 
 ### watch
 
@@ -1438,7 +1442,7 @@ watch:
 When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
 `INFO      scope: tags=<comma-separated-tags> mode=all|any`.
 
-Manual-operator advance outcomes such as `needs_discussion`, `max_cycles_reached`, and improve-recovery stop reasons like `manual_review_required` or `automatic_recovery_disabled` are surfaced as `ATTENTION` lines in watch output instead of one-shot deduped `SKIP` lines. Watch repeats those reminders while the task still resolves to the same human-needed next action, and stops once that next action changes. Ordinary wait/skip states keep the existing `SKIP` dedupe behavior.
+Manual-operator advance outcomes such as `needs_discussion`, `max_cycles_reached`, exhausted failed-task recovery, and improve-recovery stop reasons are surfaced as `ATTENTION` lines in watch output instead of one-shot deduped `SKIP` lines. Watch reuses the same formatted task line as `uv run gza advance`, including the stable `reason=...` policy slug, and repeats those reminders while the task still resolves to the same human-needed next action. Ordinary wait/skip states keep the existing `SKIP` dedupe behavior.
 
 Multiline watch log messages are rendered with continuation indentation so wake, repair, and recovery output stays readable in both stdout and `.gza/watch.log`. `WAKE` lines now include a `live workers:` block when running workers can be identified, listing active task IDs and any anonymous workers that do not currently map to a live task row.
 

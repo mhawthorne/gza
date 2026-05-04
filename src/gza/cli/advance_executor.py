@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from ..db import SqliteTaskStore, Task as DbTask
+from ..recovery_engine import get_failed_recovery_needs_attention_reason
 from ._common import _create_improve_task, _create_retry_task, resolve_improve_action
+from .advance_engine import classify_advance_action
 
 
 class CreateReviewActionResult(Protocol):
@@ -56,6 +58,15 @@ class AdvanceActionExecutionResult:
     improve_mode: str | None = None
     failed_improve: DbTask | None = None
     attention_type: str | None = None
+    attention_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class AdvanceExecutionNeedsAttention:
+    """Normalized execution-time needs-attention payload for shared renderers."""
+
+    task: DbTask
+    action: dict[str, Any]
 
 
 _WORKER_ACTIONS = frozenset(
@@ -70,6 +81,24 @@ _WORKER_ACTIONS = frozenset(
         "needs_rebase",
     }
 )
+
+
+def resolve_execution_needs_attention(
+    task: DbTask,
+    result: AdvanceActionExecutionResult,
+) -> AdvanceExecutionNeedsAttention | None:
+    """Convert execution-time skip outcomes into shared needs-attention rows."""
+    action = {
+        "type": result.attention_type or "skip",
+        "description": result.message,
+        "needs_attention_reason": result.attention_reason,
+    }
+    if classify_advance_action(action) != "needs_attention":
+        return None
+    return AdvanceExecutionNeedsAttention(
+        task=result.failed_improve or task,
+        action=action,
+    )
 
 
 def _spawn_result(
@@ -197,6 +226,12 @@ def execute_advance_action(
                 f"{task.id} + {review_task.id}; latest failed improve: {failed_improve.id}. "
                 f"Run uv run gza fix {task.id}"
             )
+            attention_reason = get_failed_recovery_needs_attention_reason(
+                context.store,
+                failed_improve,
+                decision=improve_decision,
+                max_recovery_attempts=context.max_resume_attempts,
+            )
             return AdvanceActionExecutionResult(
                 action_type=action_type,
                 status="skip",
@@ -204,6 +239,7 @@ def execute_advance_action(
                 improve_mode=improve_mode,
                 failed_improve=failed_improve,
                 attention_type="automatic_recovery_disabled",
+                attention_reason=attention_reason,
             )
         if improve_mode == "manual_review" and failed_improve is not None:
             assert failed_improve.id is not None
@@ -212,6 +248,12 @@ def execute_advance_action(
                 f"SKIP: latest failed improve {failed_improve.id} requires manual review "
                 f"({improve_decision.reason_text})"
             )
+            attention_reason = get_failed_recovery_needs_attention_reason(
+                context.store,
+                failed_improve,
+                decision=improve_decision,
+                max_recovery_attempts=context.max_resume_attempts,
+            )
             return AdvanceActionExecutionResult(
                 action_type=action_type,
                 status="skip",
@@ -219,6 +261,7 @@ def execute_advance_action(
                 improve_mode=improve_mode,
                 failed_improve=failed_improve,
                 attention_type="manual_review_required",
+                attention_reason=attention_reason,
             )
 
         if context.dry_run:
@@ -317,7 +360,7 @@ def execute_advance_action(
                 work_done=True,
             )
 
-        launch_mode = str(action.get("launch_mode", "worker"))
+        launch_mode = str(action.get("launch_mode") or ("iterate" if task.task_type == "implement" else "worker"))
         if launch_mode == "iterate":
             if context.spawn_iterate_recovery is None:
                 return AdvanceActionExecutionResult(
@@ -374,7 +417,7 @@ def execute_advance_action(
                 work_done=True,
             )
 
-        launch_mode = str(action.get("launch_mode", "worker"))
+        launch_mode = str(action.get("launch_mode") or ("iterate" if task.task_type == "implement" else "worker"))
         retry_task_id = action.get("recovery_task_id")
         reuse_existing = bool(action.get("reuse_existing", False))
         if reuse_existing and isinstance(retry_task_id, str):

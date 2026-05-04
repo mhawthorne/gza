@@ -3586,7 +3586,12 @@ def test_watch_cycle_max_resume_attempts_zero_logs_sticky_attention(tmp_path: Pa
     assert log_text.count("ATTENTION") == 2
     assert "SKIP      " not in log_text
     assert "automatic improve recovery is disabled (max_resume_attempts=0)" in log_text
-    assert str(failed_improve.id) in log_text
+    assert (
+        f'{failed_improve.id} improve "Improve feature" reason=automatic-recovery-disabled '
+        f"automatic improve recovery is disabled (max_resume_attempts=0) for "
+        f"{impl.id} + {review.id}; latest failed improve: {failed_improve.id}. "
+        f"Run uv run gza fix {impl.id}"
+    ) in log_text
 
 
 def test_watch_cycle_improve_creation_includes_unresolved_comments_in_prompt(tmp_path: Path) -> None:
@@ -3765,7 +3770,13 @@ def test_watch_cycle_improve_action_stops_manual_review_failures(tmp_path: Path)
     assert result.work_done is False
     assert spawn_worker.call_count == 0
     assert spawn_resume_worker.call_count == 0
-    assert "requires manual review" in log.path.read_text()
+    log_text = log.path.read_text()
+    assert "requires manual review" in log_text
+    assert (
+        f'{failed_improve.id} improve "Improve attempt" reason=manual-failure-reason '
+        f"latest failed improve {failed_improve.id} requires manual review "
+        "(TEST_FAILURE requires manual intervention)"
+    ) in log_text
 
 
 def test_watch_cycle_improve_action_repeats_attention_for_attempt_cap_manual_stop(tmp_path: Path) -> None:
@@ -4527,7 +4538,9 @@ def test_watch_cycle_dedupes_attempt_cap_skip_across_cycles(tmp_path: Path) -> N
             show_skipped=True,
         )
 
-    assert log_path.read_text().count(f"{failed.id} failed implement: automatic_recovery_disabled") == 1
+    text = log_path.read_text()
+    assert text.count("ATTENTION") == 2
+    assert f'{failed.id} implement "Failed resume attempt" reason=automatic-recovery-disabled automatic recovery is disabled' in text
 
 
 def test_watch_cycle_dedupes_wait_review_skip_across_cycles(tmp_path: Path) -> None:

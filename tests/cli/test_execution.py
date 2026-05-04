@@ -6992,7 +6992,83 @@ class TestIterateCommand:
         assert result == 3
         run_foreground.assert_not_called()
         assert "Improve automatic recovery is disabled (max_resume_attempts=0)" in output
-        assert "Iterate blocked: automatic_recovery_disabled." in output
+        assert "Needs attention:" in output
+        assert (
+            f'Needs attention: {failed_improve.id} improve "Prior improve" '
+            "reason=automatic-recovery-disabled "
+            f"automatic improve recovery is disabled (max_resume_attempts=0) for "
+            f"{impl.id} + {review.id}; latest failed improve: {failed_improve.id}. "
+            f"Run uv run gza fix {impl.id}"
+        ) in output
+        assert "reason=automatic-recovery-disabled" in output
+
+    def test_iterate_reports_manual_review_failed_improve_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        failed_improve = store.add("Prior improve", task_type="improve", based_on=impl.id, depends_on=review.id)
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "TEST_FAILURE"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+        assert failed_improve.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground") as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        run_foreground.assert_not_called()
+        assert (
+            f'Needs attention: {failed_improve.id} improve "Prior improve" '
+            "reason=manual-failure-reason "
+            f"latest failed improve {failed_improve.id} requires manual review "
+            "(TEST_FAILURE requires manual intervention)"
+        ) in output
+        assert "Latest failed improve" in output
 
     def test_iterate_max_cycles_reached_reports_cycle_accounting(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -7082,7 +7158,8 @@ class TestIterateCommand:
         output = capsys.readouterr().out
 
         assert result == 3
-        assert "Iterate blocked: max_cycles_reached." in output
+        assert "Needs attention:" in output
+        assert "reason=review-max-cycles-reached" in output
         assert "Review-cycle accounting: completed=7, max_review_cycles=7, consumed_this_invocation=2" in output
         assert f"Recommended next step: uv run gza fix {impl.id}" in output
 
