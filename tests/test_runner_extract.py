@@ -267,6 +267,57 @@ def test_seed_extraction_bundle_marks_already_merged_when_rederived_diff_is_empt
     assert "re-derived hunks=0" in log_file.read_text()
 
 
+def test_seed_extraction_bundle_marks_already_merged_when_selected_paths_are_equivalent_on_base(
+    tmp_path: Path,
+) -> None:
+    git = _init_repo(tmp_path, initial_content="base\n")
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = store.add("Extracted task", task_type="implement")
+    task.slug = "20260427-already-merged-cherry-pick"
+    store.update(task)
+
+    git._run("checkout", "-b", "feature/source")
+    target = tmp_path / "src" / "file.py"
+    target.write_text("feature\n")
+    git._run("add", "src/file.py")
+    git._run("commit", "-m", "feature change")
+    stored_patch = git.get_diff_patch_for_paths("main...feature/source", ("src/file.py",), binary=True)
+
+    git._run("checkout", "main")
+    target.write_text("feature\n")
+    git._run("add", "src/file.py")
+    git._run("commit", "-m", "equivalent change on main")
+
+    _write_bundle(
+        tmp_path,
+        task.id,
+        task.slug,
+        patch_text=stored_patch,
+        source_branch="feature/source",
+    )
+    worktree_path = tmp_path / "worktree-already-merged-equivalent"
+    worktree_git = _add_detached_worktree(git, worktree_path)
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+    log_file = tmp_path / "logs" / "already-merged-equivalent.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    seeded = _seed_extraction_bundle_if_present(
+        task,
+        config,
+        worktree_path,
+        worktree_git,
+        log_file,
+        resume=False,
+    )
+
+    assert seeded.seeded_paths == frozenset()
+    assert seeded.completion_reason == EXTRACTION_ALREADY_MERGED_COMPLETION_REASON
+    assert (worktree_path / "src" / "file.py").read_text() == "feature\n"
+    assert "adds nothing to the current base for selected paths" in log_file.read_text()
+
+
 def test_seed_extraction_bundle_rederives_patch_and_applies_with_context_drift(tmp_path: Path) -> None:
     git = _init_repo(tmp_path, initial_content="a\nb\nc\n")
     store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
@@ -444,7 +495,7 @@ def test_seed_extraction_bundle_retries_after_runtime_patch_artifact_left_by_fai
 
     assert second_error is not None
     assert "unexpected files" not in str(second_error)
-    assert worktree_git.get_diff_patch_for_paths.call_count == 2
+    assert worktree_git.get_diff_patch_for_paths.call_count == 4
     assert worktree_git.apply_patch_file_result.call_count == 2
 
 
@@ -747,6 +798,80 @@ def test_run_continues_when_runtime_rederived_patch_applies_with_conflicts(tmp_p
     assert "runtime re-derived patch with conflicts" in log_file.read_text()
 
 
+def test_run_continues_when_stored_fallback_patch_applies_with_conflicts(tmp_path: Path) -> None:
+    db_path = tmp_path / "test.db"
+    store = SqliteTaskStore(db_path, prefix="testproject")
+    task = store.add("Extracted task", task_type="implement")
+    task.slug = "20260427-conflicted-stored-fallback"
+    store.update(task)
+
+    patch_text = (
+        "diff --git a/src/file.py b/src/file.py\n"
+        "--- a/src/file.py\n"
+        "+++ b/src/file.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+print('boom')\n"
+    )
+    _write_bundle(
+        tmp_path,
+        task.id,
+        task.slug,
+        patch_text=patch_text,
+        source_branch="feature/source",
+    )
+
+    config = _build_config(tmp_path, db_path)
+
+    mock_provider = Mock()
+    mock_provider.name = "TestProvider"
+    mock_provider.check_credentials.return_value = True
+    mock_provider.verify_credentials.return_value = True
+    mock_provider.run.return_value = RunResult(
+        exit_code=1,
+        duration_seconds=1.0,
+        num_turns_reported=1,
+        cost_usd=0.01,
+        error_type=None,
+    )
+
+    mock_main_git = Mock()
+    mock_main_git.default_branch.return_value = "main"
+    mock_main_git.branch_exists.return_value = False
+    mock_main_git.worktree_list.return_value = []
+    mock_main_git.worktree_add.return_value = config.worktree_path / task.slug
+    mock_main_git.count_commits_ahead.return_value = 0
+    mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+    mock_worktree_git = Mock()
+    mock_worktree_git.has_changes.return_value = False
+    mock_worktree_git.ref_exists.return_value = False
+    mock_worktree_git.apply_patch_file_result.return_value = GitApplyResult(
+        returncode=1,
+        stdout="",
+        stderr="with conflicts",
+    )
+    mock_worktree_git.status_porcelain.return_value = {("UU", "src/file.py")}
+
+    with (
+        patch("gza.runner.get_provider", return_value=mock_provider),
+        patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
+        patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+        patch("gza.runner.load_dotenv"),
+        patch("gza.runner.build_prompt", return_value="prompt"),
+        patch("gza.runner.extract_failure_reason", return_value="UNKNOWN"),
+    ):
+        rc = run(config, task_id=task.id)
+
+    assert rc == 0
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.failure_reason == "UNKNOWN"
+    assert refreshed.failure_reason != EXTRACTION_PRECHECK_FAILURE_REASON
+    assert mock_provider.run.call_count == 1
+    log_file = config.log_path / f"{task.slug}.log"
+    assert "stored patch fallback with conflicts" in log_file.read_text()
+
+
 def test_run_completes_without_provider_when_extraction_diff_is_already_merged(tmp_path: Path) -> None:
     db_path = tmp_path / "test.db"
     store = SqliteTaskStore(db_path, prefix="testproject")
@@ -798,6 +923,66 @@ def test_run_completes_without_provider_when_extraction_diff_is_already_merged(t
     mock_worktree_git = Mock()
     mock_worktree_git.ref_exists.side_effect = [True, True]
     mock_worktree_git.get_diff_patch_for_paths.return_value = ""
+
+    with (
+        patch("gza.runner.get_provider", return_value=mock_provider),
+        patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
+        patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+        patch("gza.runner.load_dotenv"),
+    ):
+        rc = run(config, task_id=task.id)
+
+    assert rc == 0
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+    assert refreshed.completion_reason == EXTRACTION_ALREADY_MERGED_COMPLETION_REASON
+    assert mock_provider.run.call_count == 0
+
+
+def test_run_completes_without_provider_when_selected_extraction_scope_is_already_merged(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "test.db"
+    store = SqliteTaskStore(db_path, prefix="testproject")
+    task = store.add("Extracted task", task_type="implement")
+    task.slug = "20260427-already-merged-selected-scope"
+    store.update(task)
+
+    patch_text = (
+        "diff --git a/src/file.py b/src/file.py\n"
+        "index e69de29..8c7e5a6 100644\n"
+        "--- a/src/file.py\n"
+        "+++ b/src/file.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+print('boom')\n"
+    )
+    _write_bundle(
+        tmp_path,
+        task.id,
+        task.slug,
+        patch_text=patch_text,
+        source_branch="feature/source",
+    )
+
+    config = _build_config(tmp_path, db_path)
+
+    mock_provider = Mock()
+    mock_provider.name = "TestProvider"
+    mock_provider.check_credentials.return_value = True
+    mock_provider.verify_credentials.return_value = True
+
+    mock_main_git = Mock()
+    mock_main_git.default_branch.return_value = "main"
+    mock_main_git.branch_exists.return_value = False
+    mock_main_git.worktree_list.return_value = []
+    mock_main_git.worktree_add.return_value = config.worktree_path / task.slug
+    mock_main_git.count_commits_ahead.return_value = 0
+    mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+    mock_worktree_git = Mock()
+    mock_worktree_git.ref_exists.side_effect = [True, True]
+    mock_worktree_git.get_diff_patch_for_paths.side_effect = [patch_text, ""]
 
     with (
         patch("gza.runner.get_provider", return_value=mock_provider),

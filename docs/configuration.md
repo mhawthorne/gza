@@ -1544,12 +1544,15 @@ When shared DB mode is active (explicit `db_path`) and a legacy local `.gza/gza.
 Manually force a task's status.
 
 ```bash
-gza set-status <task_id> <status> [--reason <text>] [--execution-mode <mode>]
+uv run gza set-status <task_id> <status> [--reason <text>] [--execution-mode <mode>]
 ```
 
 `task_id` must be a full prefixed task ID (for example `gza-1234`).
 
 Valid statuses: `pending`, `in_progress`, `completed`, `failed`, `dropped`.
+
+`--reason` stores a failure reason for `failed` tasks and a completion reason for
+`completed` tasks. Other statuses ignore it and emit a warning.
 
 `--execution-mode` is only valid with `in_progress`, and accepts:
 `worker_background`, `worker_foreground`, `foreground_inline`, `foreground_attach_resume`, `manual`, `skill_inline`.

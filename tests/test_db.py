@@ -6953,6 +6953,40 @@ class TestSharedDbIsolationAndImportGating:
         assert reloaded.prompt == "Task with query-only execution-mode damage"
         assert any("tasks.execution_mode" in warning for warning in query_store.startup_warnings())
 
+    def test_query_only_open_pre_v40_db_missing_completion_reason_reads_with_null(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should read v39 snapshots without forcing the v40 completion_reason migration."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before v40 completion_reason")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        _drop_tasks_column(db_path, "completion_reason")
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE schema_version SET version = 39")
+        conn.commit()
+        conn.close()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            reloaded = query_store.get(task.id)
+            history = query_store.get_history(limit=None)
+        finally:
+            db_path.chmod(0o644)
+
+        assert reloaded is not None
+        assert reloaded.prompt == "Task before v40 completion_reason"
+        assert reloaded.completion_reason is None
+        assert [row.id for row in history] == [task.id]
+        assert history[0].completion_reason is None
+        assert any("tasks.completion_reason" in warning for warning in query_store.startup_warnings())
+
     def test_query_only_open_current_db_missing_create_pr_fails_closed(
         self, tmp_path: Path
     ) -> None:

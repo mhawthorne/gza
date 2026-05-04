@@ -1260,8 +1260,11 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
 
 def cmd_set_status(args: argparse.Namespace) -> int:
     """Manually force a task's status to any valid value."""
-    if args.reason and args.status != "failed":
-        print(f"Warning: --reason is only meaningful for 'failed' status (current target: '{args.status}')")
+    if args.reason and args.status not in {"failed", "completed"}:
+        print(
+            "Warning: --reason is only meaningful for 'failed' or 'completed' status "
+            f"(current target: '{args.status}')"
+        )
     if args.execution_mode and args.status != "in_progress":
         print("Error: --execution-mode is only valid when setting status to 'in_progress'")
         return 1

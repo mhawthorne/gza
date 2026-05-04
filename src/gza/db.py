@@ -1098,7 +1098,6 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "merge_status",
     "merged_at",
     "failure_reason",
-    "completion_reason",
     "skip_learnings",
     "diff_files_changed",
     "diff_lines_added",
@@ -1108,6 +1107,8 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "log_schema_version",
     "base_branch",
 )
+
+_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset({40})
 
 
 def _missing_required_columns(conn: sqlite3.Connection, table: str, required_columns: tuple[str, ...]) -> list[str]:
@@ -2064,6 +2065,8 @@ class SqliteTaskStore:
                 if target_version in _MANUAL_MIGRATION_VERSIONS:
                     pending_manual.append(target_version)
                     break
+                if target_version in _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS:
+                    continue
                 raise SchemaIntegrityError(
                     f"Database is at schema v{current_version}; query-only mode does not run "
                     f"automatic migrations to v{SCHEMA_VERSION}. Use a writable database to "
@@ -2109,6 +2112,11 @@ class SqliteTaskStore:
             self._startup_warnings.append(
                 "Query-only DB open detected missing required column tasks.queue_position; "
                 "explicit queue ordering will be unavailable."
+            )
+        if not self._query_only_has_column("tasks", "completion_reason"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing optional column tasks.completion_reason; "
+                "completion metadata will be unavailable."
             )
         if not self._query_only_supports_tags():
             self._startup_warnings.append(

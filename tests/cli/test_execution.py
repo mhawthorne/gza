@@ -8767,6 +8767,35 @@ class TestSetStatusCommand:
         assert updated.status == "failed"
         assert updated.failure_reason == "Process killed"
 
+    def test_set_status_with_reason_for_completed(self, tmp_path: Path):
+        """set-status --reason sets completion_reason for completed status without a false warning."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "in_progress"},
+        ])
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+
+        result = run_gza(
+            "set-status",
+            str(task.id),
+            "completed",
+            "--reason",
+            "EXTRACTION_ALREADY_MERGED",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "Warning" not in result.stdout
+        assert "Warning" not in result.stderr
+
+        store = make_store(tmp_path)
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.status == "completed"
+        assert updated.failure_reason is None
+        assert updated.completion_reason == "EXTRACTION_ALREADY_MERGED"
+
     def test_set_status_in_progress_defaults_execution_mode_to_manual(self, tmp_path: Path):
         """Manual in-progress transitions should stamp execution_mode=manual."""
         setup_db_with_tasks(tmp_path, [
@@ -8905,8 +8934,8 @@ class TestSetStatusCommand:
         assert result.returncode == 1
         assert "--execution-mode is only valid" in result.stdout
 
-    def test_set_status_reason_warns_for_non_failed(self, tmp_path: Path):
-        """set-status warns when --reason is used with a non-failed status."""
+    def test_set_status_reason_warns_for_statuses_without_reason_support(self, tmp_path: Path):
+        """set-status warns when --reason is used outside failed/completed transitions."""
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "in_progress"},
         ])
@@ -8914,11 +8943,16 @@ class TestSetStatusCommand:
         store = make_store(tmp_path)
         task = store.get_all()[0]
         result = run_gza(
-            "set-status", str(task.id), "completed", "--reason", "Ignored reason", "--project", str(tmp_path)
+            "set-status", str(task.id), "dropped", "--reason", "Ignored reason", "--project", str(tmp_path)
         )
 
         assert result.returncode == 0
         assert "Warning" in result.stdout or "warning" in result.stdout.lower()
+
+        updated = make_store(tmp_path).get(task.id)
+        assert updated is not None
+        assert updated.failure_reason is None
+        assert updated.completion_reason is None
 
     def test_set_status_invalid_status_rejected(self, tmp_path: Path):
         """set-status rejects unknown status values."""

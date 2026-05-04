@@ -2015,6 +2015,27 @@ def _apply_left_relevant_conflicts(
     return False
 
 
+def _already_merged_extraction_seed_result(
+    task: Task,
+    log_file: Path,
+    *,
+    message: str,
+) -> ExtractionSeedResult:
+    """Log and return the canonical extraction already-merged completion outcome."""
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "info",
+            "message": message,
+            "completion_reason": EXTRACTION_ALREADY_MERGED_COMPLETION_REASON,
+        },
+    )
+    return ExtractionSeedResult(
+        completion_reason=EXTRACTION_ALREADY_MERGED_COMPLETION_REASON,
+    )
+
+
 def _seed_extraction_bundle_if_present(
     task: Task,
     config: Config,
@@ -2123,20 +2144,28 @@ def _seed_extraction_bundle_if_present(
             },
         )
         if not current_patch_text.strip():
-            write_log_entry(
+            return _already_merged_extraction_seed_result(
+                task,
                 log_file,
-                {
-                    "type": "gza",
-                    "subtype": "info",
-                    "message": (
-                        f"Extraction source diff is empty against current base; marking task {task.id} "
-                        f"{EXTRACTION_ALREADY_MERGED_COMPLETION_REASON}"
-                    ),
-                    "completion_reason": EXTRACTION_ALREADY_MERGED_COMPLETION_REASON,
-                },
+                message=(
+                    f"Extraction source diff is empty against current base; marking task {task.id} "
+                    f"{EXTRACTION_ALREADY_MERGED_COMPLETION_REASON}"
+                ),
             )
-            return ExtractionSeedResult(
-                completion_reason=EXTRACTION_ALREADY_MERGED_COMPLETION_REASON,
+
+        current_base_delta = worktree_git.get_diff_patch_for_paths(
+            f"{source_base_ref}..{source_branch}",
+            selected_paths,
+            binary=True,
+        )
+        if not current_base_delta.strip():
+            return _already_merged_extraction_seed_result(
+                task,
+                log_file,
+                message=(
+                    "Extraction source branch adds nothing to the current base for selected paths; "
+                    f"marking task {task.id} {EXTRACTION_ALREADY_MERGED_COMPLETION_REASON}"
+                ),
             )
 
         current_touched_paths = parse_patch_touched_paths(current_patch_text)
@@ -2205,6 +2234,23 @@ def _seed_extraction_bundle_if_present(
     )
     apply_result = worktree_git.apply_patch_file_result(patch_path)
     if apply_result.returncode != 0:
+        if _apply_left_relevant_conflicts(worktree_git, set(stored_touched_paths)):
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "warning",
+                    "message": (
+                        f"Applied extraction seed bundle from {project_bundle_dir.relative_to(config.project_dir)} "
+                        f"using stored patch fallback with conflicts ({len(stored_touched_paths)} files); "
+                        "provider must resolve conflict markers"
+                    ),
+                    "seeded_paths": sorted(stored_touched_paths),
+                    "patch_source": "stored_fallback",
+                    "apply_conflicts": True,
+                },
+            )
+            return ExtractionSeedResult(seeded_paths=frozenset(stored_touched_paths))
         raise GitError(_git_apply_failure_message(patch_path, apply_result))
     write_log_entry(
         log_file,
