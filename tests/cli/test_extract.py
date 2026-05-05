@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from gza.db import SqliteTaskStore
 from gza.db import Task
 from gza.extractions import ExtractionError
 from gza.git import Git
@@ -519,6 +520,51 @@ def test_extract_bundle_write_failure_does_not_leave_pending_task(
     no_pending = run_gza("work", "--no-docker", "--project", str(tmp_path))
     assert no_pending.returncode == 0
     assert "No pending tasks found" in no_pending.stdout
+
+
+def test_extract_bundle_write_failure_marks_failed_via_shared_helper_when_delete_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza.failure_reasons import mark_task_failed_from_cause
+
+    setup_config(tmp_path)
+    git = _init_repo(tmp_path)
+    source_task = _create_completed_source_task(tmp_path, git)
+    store = make_store(tmp_path)
+
+    def _raise_bundle_error(*, project_dir: Path, task: Task, draft: object) -> Path:
+        raise ExtractionError("bundle write failed")
+
+    def _refuse_delete(self, task_id: str) -> bool:
+        del task_id
+        return False
+
+    monkeypatch.setattr("gza.cli.execution.write_extraction_bundle", _raise_bundle_error)
+    monkeypatch.setattr(SqliteTaskStore, "delete", _refuse_delete)
+
+    with patch(
+        "gza.cli.execution.mark_task_failed_from_cause",
+        wraps=mark_task_failed_from_cause,
+    ) as mock_mark_failed:
+        result = run_gza(
+            "extract",
+            str(source_task.id),
+            "src/extracted.py",
+            "--queue",
+            "--project",
+            str(tmp_path),
+        )
+
+    assert result.returncode == 1
+
+    failed_task = get_latest_task(store, task_type="implement")
+    assert failed_task is not None
+    assert failed_task.status == "failed"
+    assert failed_task.failure_reason == "EXTRACTION_BUNDLE_WRITE_FAILED"
+    assert mock_mark_failed.call_count == 1
+    assert mock_mark_failed.call_args.kwargs["task"].id == failed_task.id
+    assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "EXTRACTION_BUNDLE_WRITE_FAILED"
 
 
 def test_extract_queued_duplicates_get_distinct_slugs_and_bundle_dirs(tmp_path: Path) -> None:

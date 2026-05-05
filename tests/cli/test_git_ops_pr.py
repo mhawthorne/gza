@@ -477,6 +477,7 @@ class TestPrCommand:
     ):
         """Runner exceptions should not leave PR internal tasks in pending/in_progress."""
         from gza.pr_ops import build_task_pr_content
+        from gza.failure_reasons import mark_task_failed_from_cause
 
         setup_config(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
@@ -490,9 +491,15 @@ class TestPrCommand:
         git.get_log.return_value = "abc123 Add auth"
         git.get_diff_stat.return_value = "1 file changed"
 
-        with patch(
-            "gza.runner.run",
-            side_effect=RuntimeError("runner exploded"),
+        with (
+            patch(
+                "gza.pr_ops.mark_task_failed_from_cause",
+                wraps=mark_task_failed_from_cause,
+            ) as mock_mark_failed,
+            patch(
+                "gza.runner.run",
+                side_effect=RuntimeError("runner exploded"),
+            ),
         ):
             title, body = build_task_pr_content(
                 source_task,
@@ -508,6 +515,9 @@ class TestPrCommand:
         assert len(internal_tasks) == 1
         assert internal_tasks[0].status == "failed"
         assert internal_tasks[0].failure_reason == "UNKNOWN"
+        assert mock_mark_failed.call_count == 1
+        assert mock_mark_failed.call_args.kwargs["task"].id == internal_tasks[0].id
+        assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "UNKNOWN"
 
         captured = capsys.readouterr()
         assert f"internal task {internal_tasks[0].id} failed" in captured.err

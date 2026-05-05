@@ -34,6 +34,7 @@ from ..extractions import (
     resolve_source_selection,
     write_extraction_bundle,
 )
+from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git
 from ..lineage import resolve_impl_task
 from ..prompts import PromptBuilder
@@ -636,9 +637,12 @@ def cmd_extract(args: argparse.Namespace) -> int:
         if impl_task.id and not store.delete(impl_task.id):
             created_task = store.get(impl_task.id)
             if created_task is not None:
-                store.mark_failed(
-                    created_task,
-                    failure_reason="EXTRACTION_BUNDLE_WRITE_FAILED",
+                mark_task_failed_from_cause(
+                    task=created_task,
+                    config=config,
+                    store=store,
+                    log_file=None,
+                    explicit_reason="EXTRACTION_BUNDLE_WRITE_FAILED",
                 )
         print(f"Error: {exc}")
         return 1

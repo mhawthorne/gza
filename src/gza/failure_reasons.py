@@ -32,14 +32,12 @@ __all__ = [
 ]
 
 
-def _observed_limit_usage(primary: int | None, fallback: int | None) -> int | None:
-    """Return the best available observed usage count for a limit."""
-    return primary if primary is not None else fallback
-
-
-def _limit_reached(used: int | None, limit: int | None) -> bool:
-    """Return whether the observed usage reached the configured limit."""
-    return used is not None and isinstance(limit, int) and used >= limit
+def _limit_reached(limit: int | None, *observed_counts: int | None) -> bool:
+    """Return whether any observed usage count reached the configured limit."""
+    return isinstance(limit, int) and any(
+        count is not None and count >= limit
+        for count in observed_counts
+    )
 
 
 def _extract_log_fallback_failure_reason(log_file: Path) -> str:
@@ -70,17 +68,21 @@ def resolve_failure_reason(
         return TERMINATED_FAILURE_REASON if interrupt_signal == "SIGTERM" else "INTERRUPTED"
     if exit_code == 124:
         return "TIMEOUT"
-    observed_steps = _observed_limit_usage(
-        stats.num_steps_computed if stats is not None else None,
-        stats.num_steps_reported if stats is not None else None,
-    )
-    observed_turns = _observed_limit_usage(
-        stats.num_turns_computed if stats is not None else None,
-        stats.num_turns_reported if stats is not None else None,
-    )
-    if error_type == "max_turns" and _limit_reached(observed_turns, turn_limit):
+    observed_steps_computed = stats.num_steps_computed if stats is not None else None
+    observed_steps_reported = stats.num_steps_reported if stats is not None else None
+    observed_turns_computed = stats.num_turns_computed if stats is not None else None
+    observed_turns_reported = stats.num_turns_reported if stats is not None else None
+    if error_type == "max_turns" and _limit_reached(
+        turn_limit,
+        observed_turns_computed,
+        observed_turns_reported,
+    ):
         return "MAX_TURNS"
-    if error_type == "max_steps" and _limit_reached(observed_steps, step_limit):
+    if error_type == "max_steps" and _limit_reached(
+        step_limit,
+        observed_steps_computed,
+        observed_steps_reported,
+    ):
         return "MAX_STEPS"
     if fallback_to_log and log_file is not None:
         return _extract_log_fallback_failure_reason(log_file)
