@@ -22,6 +22,7 @@ from ..recovery_engine import (
     decide_failed_task_recovery,
     has_recovery_chain_ancestor_in_ids,
     list_failed_tasks_for_recovery,
+    should_hide_failed_recovery_decision,
 )
 from ..sync_ops import reconcile_task_branch_merge_truth
 from ..task_query import (
@@ -287,6 +288,8 @@ def _emit_transition_events(
     store: SqliteTaskStore,
     config: Config,
     log: _WatchLog,
+    restart_failed_mode: bool = False,
+    max_recovery_attempts: int = 1,
 ) -> None:
     for task_id in sorted(new.keys()):
         old_status = (old.get(task_id) or {}).get("status")
@@ -314,6 +317,15 @@ def _emit_transition_events(
                 log.emit("DONE", f"{task_id} {task_type}{reason_suffix}{elapsed_suffix}")
         elif new_status == "failed":
             reason = new_row.get("failure_reason") or "UNKNOWN"
+            task = store.get(task_id)
+            if restart_failed_mode and task is not None:
+                decision = decide_failed_task_recovery(
+                    store,
+                    task,
+                    max_recovery_attempts=max_recovery_attempts,
+                )
+                if should_hide_failed_recovery_decision(decision):
+                    continue
             log.emit("FAIL", f"{task_id} {task_type}: {reason}{elapsed_suffix}")
 
 
@@ -510,7 +522,7 @@ def _collect_unhandled_failures(
                 task,
                 max_recovery_attempts=max_recovery_attempts,
             )
-            if decision.action in {"resume", "retry"}:
+            if decision.action in {"resume", "retry"} or should_hide_failed_recovery_decision(decision):
                 continue
         failures.append(
             _ObservedFailure(
@@ -1451,6 +1463,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 store=store,
                 config=config,
                 log=log,
+                restart_failed_mode=restart_failed,
+                max_recovery_attempts=max_recovery_attempts,
             )
             previous_snapshot = pre_cycle_snapshot
 
@@ -1477,6 +1491,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 store=store,
                 config=config,
                 log=log,
+                restart_failed_mode=restart_failed,
+                max_recovery_attempts=max_recovery_attempts,
             )
             completed_ids = _collect_completed_transition_ids(
                 previous_snapshot,

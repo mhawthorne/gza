@@ -3663,7 +3663,7 @@ def test_watch_cycle_failed_improve_non_attention_skip_stays_out_of_attention_lo
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
     ):
-        result = _run_cycle(
+        _ = _run_cycle(
             config=config,
             store=store,
             batch=1,
@@ -5060,6 +5060,90 @@ def test_cmd_watch_restart_failed_dry_run_suppresses_fully_recovered_failed_ance
     assert "recovery descendant already completed" not in stdout
 
 
+def test_cmd_watch_restart_failed_dry_run_suppresses_failed_sidequests_with_merged_target_impl(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Merged implementation targets should silently suppress failed review/improve/rebase rows in watch recovery output."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merged_impl = store.add("Merged implementation", task_type="implement")
+    assert merged_impl.id is not None
+    merged_impl.status = "completed"
+    merged_impl.has_commits = True
+    merged_impl.merge_status = "merged"
+    merged_impl.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(merged_impl)
+
+    visible_impl = store.add("Visible implementation", task_type="implement")
+    assert visible_impl.id is not None
+    visible_impl.status = "completed"
+    visible_impl.has_commits = True
+    visible_impl.merge_status = "unmerged"
+    visible_impl.completed_at = datetime(2026, 4, 28, 10, 1, 0, tzinfo=UTC)
+    store.update(visible_impl)
+
+    failed_review = store.add("Failed review", task_type="review", depends_on=merged_impl.id, based_on=merged_impl.id)
+    failed_review.status = "failed"
+    failed_review.failure_reason = "MISSING_REPORT_ARTIFACT"
+    failed_review.completed_at = datetime(2026, 4, 28, 10, 2, 0, tzinfo=UTC)
+    store.update(failed_review)
+
+    review_for_improve = store.add("Review for improve", task_type="review", depends_on=merged_impl.id, based_on=merged_impl.id)
+    assert review_for_improve.id is not None
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        depends_on=review_for_improve.id,
+        based_on=merged_impl.id,
+    )
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "GIT_ERROR"
+    failed_improve.completed_at = datetime(2026, 4, 28, 10, 3, 0, tzinfo=UTC)
+    store.update(failed_improve)
+
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=merged_impl.id)
+    failed_rebase.status = "failed"
+    failed_rebase.failure_reason = "INTERRUPTED"
+    failed_rebase.completed_at = datetime(2026, 4, 28, 10, 4, 0, tzinfo=UTC)
+    store.update(failed_rebase)
+
+    visible_failed = store.add("Visible failed review", task_type="review", depends_on=visible_impl.id, based_on=visible_impl.id)
+    assert visible_failed.id is not None
+    visible_failed.status = "failed"
+    visible_failed.failure_reason = "MISSING_REPORT_ARTIFACT"
+    visible_failed.completed_at = datetime(2026, 4, 28, 10, 5, 0, tzinfo=UTC)
+    store.update(visible_failed)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    stdout = capsys.readouterr().out
+    assert rc == 0
+    assert visible_failed.id in stdout
+    assert failed_review.id not in stdout
+    assert failed_improve.id not in stdout
+    assert failed_rebase.id not in stdout
+    assert "resolved_by_merged_target" not in stdout
+
+
 def test_cmd_watch_restart_failed_dry_run_keeps_failed_descendant_visible_under_completed_non_recovery_ancestor(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -5677,6 +5761,84 @@ def test_collect_unhandled_failures_restart_failed_counts_skipped_resumable_out_
     assert failures == []
 
 
+def test_collect_unhandled_failures_restart_failed_suppresses_merged_target_sidequests(
+    tmp_path: Path,
+) -> None:
+    """Restart-failed should hide merged-target sidequest failures from backoff accounting."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merged_impl = store.add("Merged implementation", task_type="implement")
+    assert merged_impl.id is not None
+    merged_impl.status = "completed"
+    merged_impl.has_commits = True
+    merged_impl.merge_status = "merged"
+    merged_impl.completed_at = datetime.now(UTC)
+    store.update(merged_impl)
+
+    visible_impl = store.add("Visible implementation", task_type="implement")
+    assert visible_impl.id is not None
+    visible_impl.status = "completed"
+    visible_impl.has_commits = True
+    visible_impl.merge_status = "unmerged"
+    visible_impl.completed_at = datetime.now(UTC)
+    store.update(visible_impl)
+
+    hidden_review = store.add(
+        "Hidden failed review",
+        task_type="review",
+        depends_on=merged_impl.id,
+        based_on=merged_impl.id,
+    )
+    assert hidden_review.id is not None
+    hidden_review.status = "failed"
+    hidden_review.failure_reason = "MISSING_REPORT_ARTIFACT"
+    hidden_review.completed_at = datetime.now(UTC)
+    store.update(hidden_review)
+
+    visible_review = store.add(
+        "Visible failed review",
+        task_type="review",
+        depends_on=visible_impl.id,
+        based_on=visible_impl.id,
+    )
+    assert visible_review.id is not None
+    visible_review.status = "failed"
+    visible_review.failure_reason = "MISSING_REPORT_ARTIFACT"
+    visible_review.completed_at = datetime.now(UTC)
+    store.update(visible_review)
+
+    config = Config.load(tmp_path)
+    old = {
+        str(hidden_review.id): {"status": "in_progress"},
+        str(visible_review.id): {"status": "in_progress"},
+    }
+    new = {
+        str(hidden_review.id): {
+            "status": "failed",
+            "task_type": "review",
+            "failure_reason": "MISSING_REPORT_ARTIFACT",
+        },
+        str(visible_review.id): {
+            "status": "failed",
+            "task_type": "review",
+            "failure_reason": "MISSING_REPORT_ARTIFACT",
+        },
+    }
+
+    failures = _collect_unhandled_failures(
+        old,
+        new,
+        store=store,
+        config=config,
+        restart_failed_mode=True,
+        max_recovery_attempts=config.max_resume_attempts,
+    )
+    assert [(failure.task_id, failure.reason) for failure in failures] == [
+        (str(visible_review.id), "MISSING_REPORT_ARTIFACT")
+    ]
+
+
 @pytest.mark.parametrize("task_type", ["implement", "review", "improve", "rebase"])
 def test_collect_unhandled_failures_default_mode_skips_auto_resumable_failures(
     tmp_path: Path, task_type: str
@@ -5981,6 +6143,198 @@ def test_cmd_watch_restart_failed_does_not_backoff_for_actionable_review_recover
     assert sleeps == []
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
     assert "BACKOFF" not in log_text
+
+
+def test_cmd_watch_restart_failed_suppresses_merged_target_sidequest_failure(tmp_path: Path) -> None:
+    """Restart-failed should fully suppress merged-target sidequest failure transitions."""
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        f"worktree_dir: {worktree_dir}\n"
+        "watch:\n"
+        "  failure_backoff_initial: 60\n"
+        "  failure_backoff_max: 240\n"
+        "  failure_halt_after: 1\n"
+    )
+    store = make_store(tmp_path)
+
+    merged_impl = store.add("Merged implementation", task_type="implement")
+    assert merged_impl.id is not None
+    merged_impl.status = "completed"
+    merged_impl.has_commits = True
+    merged_impl.merge_status = "merged"
+    merged_impl.completed_at = datetime.now(UTC)
+    store.update(merged_impl)
+
+    failed_review = store.add(
+        "Failed review",
+        task_type="review",
+        depends_on=merged_impl.id,
+        based_on=merged_impl.id,
+    )
+    assert failed_review.id is not None
+    failed_review.status = "failed"
+    failed_review.failure_reason = "MISSING_REPORT_ARTIFACT"
+    failed_review.completed_at = datetime.now(UTC)
+    store.update(failed_review)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    snapshots = [
+        {str(failed_review.id): {"status": "in_progress", "task_type": "review", "failure_reason": None}},
+        {str(failed_review.id): {"status": "in_progress", "task_type": "review", "failure_reason": None}},
+        {
+            str(failed_review.id): {
+                "status": "failed",
+                "task_type": "review",
+                "failure_reason": "MISSING_REPORT_ARTIFACT",
+            }
+        },
+        {
+            str(failed_review.id): {
+                "status": "failed",
+                "task_type": "review",
+                "failure_reason": "MISSING_REPORT_ARTIFACT",
+            }
+        },
+        {
+            str(failed_review.id): {
+                "status": "failed",
+                "task_type": "review",
+                "failure_reason": "MISSING_REPORT_ARTIFACT",
+            }
+        },
+    ]
+    cycle_results = [_CycleResult(False, 0, 0), _CycleResult(False, 0, 0)]
+    sleeps: list[int] = []
+
+    def fake_sleep(seconds: int, _stop_requested) -> None:
+        sleeps.append(seconds)
+
+    with (
+        patch("gza.cli.watch._task_snapshot", side_effect=snapshots),
+        patch("gza.cli.watch._run_cycle", side_effect=cycle_results),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert sleeps == []
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "BACKOFF" not in log_text
+    assert "failure halt threshold reached" not in log_text
+    assert str(failed_review.id) not in log_text
+
+
+def test_cmd_watch_restart_failed_backoffs_for_unmerged_target_sidequest_failure(tmp_path: Path) -> None:
+    """Restart-failed should keep visible sidequest failures in backoff accounting when the target is unmerged."""
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        f"worktree_dir: {worktree_dir}\n"
+        "watch:\n"
+        "  failure_backoff_initial: 60\n"
+        "  failure_backoff_max: 240\n"
+        "  failure_halt_after: 1\n"
+    )
+    store = make_store(tmp_path)
+
+    unmerged_impl = store.add("Unmerged implementation", task_type="implement")
+    assert unmerged_impl.id is not None
+    unmerged_impl.status = "completed"
+    unmerged_impl.has_commits = True
+    unmerged_impl.merge_status = "unmerged"
+    unmerged_impl.completed_at = datetime.now(UTC)
+    store.update(unmerged_impl)
+
+    failed_review = store.add(
+        "Failed review",
+        task_type="review",
+        depends_on=unmerged_impl.id,
+        based_on=unmerged_impl.id,
+    )
+    assert failed_review.id is not None
+    failed_review.status = "failed"
+    failed_review.failure_reason = "MISSING_REPORT_ARTIFACT"
+    failed_review.completed_at = datetime.now(UTC)
+    store.update(failed_review)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    snapshots = [
+        {str(failed_review.id): {"status": "in_progress", "task_type": "review", "failure_reason": None}},
+        {str(failed_review.id): {"status": "in_progress", "task_type": "review", "failure_reason": None}},
+        {
+            str(failed_review.id): {
+                "status": "failed",
+                "task_type": "review",
+                "failure_reason": "MISSING_REPORT_ARTIFACT",
+            }
+        },
+        {
+            str(failed_review.id): {
+                "status": "failed",
+                "task_type": "review",
+                "failure_reason": "MISSING_REPORT_ARTIFACT",
+            }
+        },
+        {
+            str(failed_review.id): {
+                "status": "failed",
+                "task_type": "review",
+                "failure_reason": "MISSING_REPORT_ARTIFACT",
+            }
+        },
+    ]
+    cycle_results = [_CycleResult(False, 0, 0), _CycleResult(False, 0, 0)]
+    sleeps: list[int] = []
+
+    def fake_sleep(seconds: int, _stop_requested) -> None:
+        sleeps.append(seconds)
+
+    with (
+        patch("gza.cli.watch._task_snapshot", side_effect=snapshots),
+        patch("gza.cli.watch._run_cycle", side_effect=cycle_results),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert sleeps == []
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "BACKOFF" in log_text
+    assert "failure halt threshold reached" in log_text
+    assert str(failed_review.id) in log_text
 
 
 def test_cmd_watch_max_resume_attempts_zero_disables_default_auto_resume(tmp_path: Path) -> None:

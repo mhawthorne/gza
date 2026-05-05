@@ -37,6 +37,7 @@ from ..pickup import (
 from ..pr_ops import build_task_pr_content, ensure_task_pr
 from ..recovery_engine import (
     has_recovery_chain_ancestor_in_ids,
+    is_resolved_by_merged_target,
     list_failed_tasks_for_recovery,
     resolve_recovery_planning_task,
 )
@@ -1762,13 +1763,17 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if no_resume_failed:
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
                 return 1
-            planning_task = resolve_recovery_planning_task(store, task)
-            if planning_task is not task:
-                tasks = [planning_task] if planning_task.merge_status != 'merged' else []
+            if is_resolved_by_merged_target(store, task):
+                tasks = []
                 failed_tasks = []
             else:
-                tasks = []
-                failed_tasks = [task]
+                planning_task = resolve_recovery_planning_task(store, task)
+                if planning_task is not task:
+                    tasks = [planning_task] if planning_task.merge_status != 'merged' else []
+                    failed_tasks = []
+                else:
+                    tasks = []
+                    failed_tasks = [task]
         else:
             if task.status != 'completed':
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")

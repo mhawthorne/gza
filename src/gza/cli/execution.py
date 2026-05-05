@@ -1839,6 +1839,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if impl_task.merge_status == "merged":
+        print(f"No remaining iterate action: implementation {impl_task.id} is already merged.")
+        return 0
+
     effective_max_resume_attempts = _int_config(
         getattr(config, "max_resume_attempts", None),
         DEFAULT_MAX_RESUME_ATTEMPTS,

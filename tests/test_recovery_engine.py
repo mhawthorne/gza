@@ -7,9 +7,10 @@ from gza.recovery_engine import (
     decide_failed_task_recovery,
     get_completed_recovery_descendant,
     get_failed_recovery_needs_attention_reason,
-    get_recovery_chain_state,
     get_recovery_chain_root_task_id,
+    get_recovery_chain_state,
     is_chain_resolved_by_recovery,
+    is_resolved_by_merged_target,
     list_failed_tasks_for_recovery,
 )
 from tests.cli.conftest import make_store, setup_config
@@ -26,6 +27,98 @@ def _failed_task(tmp_path: Path, *, task_type: str = "implement", reason: str = 
     task.completed_at = datetime.now(UTC)
     store.update(task)
     return store, task
+
+
+def _completed_impl(store, *, merge_status: str):
+    task = store.add("Implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.has_commits = True
+    task.merge_status = merge_status
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+    return task
+
+
+def _failed_sidequest(store, *, task_type: str, impl_id: str, reason: str):
+    depends_on = None
+    based_on = None
+    if task_type == "review":
+        depends_on = impl_id
+        based_on = impl_id
+    elif task_type == "improve":
+        review = store.add("Review", task_type="review", depends_on=impl_id, based_on=impl_id)
+        assert review.id is not None
+        depends_on = review.id
+        based_on = impl_id
+    elif task_type == "rebase":
+        based_on = impl_id
+    else:
+        raise AssertionError(f"unsupported task_type: {task_type}")
+
+    task = store.add(
+        f"Failed {task_type}",
+        task_type=task_type,
+        depends_on=depends_on,
+        based_on=based_on,
+    )
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = reason
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+    return task
+
+
+@pytest.mark.parametrize(
+    ("task_type", "reason"),
+    [
+        ("review", "MISSING_REPORT_ARTIFACT"),
+        ("review", "needs-improvement"),
+        ("improve", "GIT_ERROR"),
+        ("improve", "WORKER_DIED"),
+        ("rebase", "INTERRUPTED"),
+    ],
+)
+def test_recovery_engine_suppresses_failed_sidequests_when_target_impl_is_merged(
+    tmp_path: Path,
+    task_type: str,
+    reason: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl = _completed_impl(store, merge_status="merged")
+    assert impl.id is not None
+
+    failed = _failed_sidequest(store, task_type=task_type, impl_id=impl.id, reason=reason)
+
+    assert is_resolved_by_merged_target(store, failed) is True
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "resolved_by_merged_target"
+    assert decision.reason_text == "target implementation already merged"
+    assert get_failed_recovery_needs_attention_reason(store, failed, decision=decision, max_recovery_attempts=1) is None
+    assert list_failed_tasks_for_recovery(store) == []
+
+
+@pytest.mark.parametrize("task_type", ["review", "improve", "rebase"])
+def test_recovery_engine_keeps_failed_sidequests_visible_when_target_impl_is_not_merged(
+    tmp_path: Path,
+    task_type: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl = _completed_impl(store, merge_status="unmerged")
+    assert impl.id is not None
+
+    failed = _failed_sidequest(store, task_type=task_type, impl_id=impl.id, reason="MISSING_REPORT_ARTIFACT")
+
+    assert is_resolved_by_merged_target(store, failed) is False
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.reason_code != "resolved_by_merged_target"
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
 
 def test_recovery_engine_resumable_with_session_chooses_resume(tmp_path: Path) -> None:
