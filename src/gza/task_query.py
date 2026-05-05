@@ -5,13 +5,14 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from gza.db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
 
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
 PresentationMode = Literal["flat", "grouped", "lineage", "tree", "one_line", "json"]
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -110,6 +111,7 @@ class TaskQueryResult:
 
     query: TaskQuery
     rows: tuple[TaskRow | LineageRow, ...]
+    total_count: int | None = None
 
     def render(self, mode: PresentationMode | None = None) -> str:
         """Render using the configured (or overridden) presentation mode."""
@@ -303,7 +305,8 @@ class TaskQueryService:
     ) -> TaskQueryResult:
         """Execute a query and return projected rows."""
         if query.scope == "lineages":
-            lineages = self._collect_lineages(query)
+            all_lineages = self._collect_lineages_unlimited(query)
+            lineages = self._apply_limit(all_lineages, query.limit)
             lineage_rows = tuple(
                 self._project_lineage_row(
                     row,
@@ -314,19 +317,21 @@ class TaskQueryService:
                 )
                 for row in lineages
             )
-            return TaskQueryResult(query=query, rows=lineage_rows)
+            return TaskQueryResult(query=query, rows=lineage_rows, total_count=len(all_lineages))
 
-        tasks = self._collect_tasks(query)
+        all_tasks = self._collect_tasks_unlimited(query)
+        tasks = self._apply_limit(all_tasks, query.limit)
         task_rows = tuple(self._project_task_row(task, query) for task in tasks)
-        return TaskQueryResult(query=query, rows=task_rows)
+        return TaskQueryResult(query=query, rows=task_rows, total_count=len(all_tasks))
 
     def _collect_tasks(self, query: TaskQuery) -> list[DbTask]:
+        return self._apply_limit(self._collect_tasks_unlimited(query), query.limit)
+
+    def _collect_tasks_unlimited(self, query: TaskQuery) -> list[DbTask]:
         tasks = self._base_task_candidates(query)
         tasks = self._apply_task_filters(tasks, query)
         if query.sort.field != "pickup_order":
             tasks.sort(key=lambda task: self._sort_key(task, query.sort), reverse=query.sort.descending)
-        if query.limit is not None:
-            tasks = tasks[: query.limit]
         return tasks
 
     def _base_task_candidates(self, query: TaskQuery) -> list[DbTask]:
@@ -341,6 +346,9 @@ class TaskQueryService:
         return list(self._store.get_all())
 
     def _collect_lineages(self, query: TaskQuery) -> list[LineageRow]:
+        return self._apply_limit(self._collect_lineages_unlimited(query), query.limit)
+
+    def _collect_lineages_unlimited(self, query: TaskQuery) -> list[LineageRow]:
         use_incomplete_rollup = bool(
             query.lifecycle_state and "incomplete" in query.lifecycle_state
         )
@@ -490,9 +498,12 @@ class TaskQueryService:
             key=lambda row: self._sort_key(row.owner_task, query.sort),
             reverse=query.sort.descending,
         )
-        if query.limit is not None:
-            rows = rows[: query.limit]
         return rows
+
+    def _apply_limit(self, rows: list[_T], limit: int | None) -> list[_T]:
+        if limit is None:
+            return rows
+        return rows[:limit]
 
     def _apply_task_filters(self, tasks: Sequence[DbTask], query: TaskQuery) -> list[DbTask]:
         filtered = list(tasks)

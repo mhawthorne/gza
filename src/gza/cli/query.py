@@ -788,8 +788,15 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(json.dumps(result.to_json(), indent=2, default=str))
         return 0
 
+    total_matches = result.total_count or 0
+    displayed_count = len(matches)
+    displayed_start = 1 if displayed_count else 0
+    displayed_end = displayed_count
+    summary = f"Showing results {displayed_start}-{displayed_end} out of {total_matches}"
+
     if not matches:
         console.print(f"No tasks found matching '{term}'")
+        console.print(summary)
         return 0
 
     c = TASK_COLORS
@@ -834,6 +841,7 @@ def cmd_search(args: argparse.Namespace) -> int:
             console.print(f"    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
         print()
 
+    console.print(summary)
     return 0
 
 
