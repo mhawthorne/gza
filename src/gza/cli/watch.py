@@ -20,6 +20,7 @@ from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_act
 from ..recovery_engine import (
     FailedRecoveryDecision,
     decide_failed_task_recovery,
+    has_recovery_chain_ancestor_in_ids,
     list_failed_tasks_for_recovery,
 )
 from ..sync_ops import reconcile_task_branch_merge_truth
@@ -63,7 +64,6 @@ from .git_ops import (
     _execute_merge_action,
     _merge_single_task as _git_ops_merge_single_task,
     _prepare_create_review_action,
-    _recovery_chain_root_task_id,
     _require_default_branch,
     _unimplemented_implement_prompt,
     cleanup_failed_merge_checkout,
@@ -1046,16 +1046,12 @@ def _run_cycle(
         log.emit("PHASE", "recovery queue enabled (--restart-failed)")
     failed_decisions: list[tuple[DbTask, FailedRecoveryDecision]] = []
     actionable_failed: list[tuple[DbTask, FailedRecoveryDecision]] = []
-    completed_owner_root_ids = {
-        root_id
-        for task in merge_candidates
-        if (root_id := _recovery_chain_root_task_id(store, task)) is not None
-    }
+    completed_owner_ids = {task.id for task in merge_candidates if task.id is not None}
     failed_tasks = list_failed_tasks_for_recovery(store, tags=tags, any_tag=any_tag)
     for failed in failed_tasks:
         if failed.id is None:
             continue
-        if _recovery_chain_root_task_id(store, failed) in completed_owner_root_ids:
+        if has_recovery_chain_ancestor_in_ids(store, failed, completed_owner_ids):
             continue
         decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
         failed_decisions.append((failed, decision))

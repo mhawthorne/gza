@@ -479,7 +479,7 @@ def test_watch_cycle_default_mode_starts_queued_retry_child_as_pending_work(tmp_
     failed.completed_at = datetime.now(UTC)
     store.update(failed)
 
-    retry_child = store.add("Pending retry child", task_type="implement", based_on=failed.id)
+    retry_child = store.add(failed.prompt, task_type="implement", based_on=failed.id, depends_on=failed.depends_on)
     assert retry_child.id is not None
     retry_child.status = "pending"
     store.update(retry_child)
@@ -584,7 +584,7 @@ def test_watch_cycle_default_mode_does_not_treat_unrelated_in_progress_child_as_
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -597,8 +597,10 @@ def test_watch_cycle_default_mode_does_not_treat_unrelated_in_progress_child_as_
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert result.work_done is False
-    assert spawn_resume.call_count == 0
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == failed.id
+    assert spawn_iterate.call_args.args[0].resume is True
     assert [task.id for task in store.get_based_on_children(failed.id)] == [unrelated_child.id]
 
 
@@ -3674,7 +3676,7 @@ def test_watch_cycle_failed_improve_non_attention_skip_stays_out_of_attention_lo
     assert spawn_resume_worker.call_count == 0
     log_text = log_path.read_text()
     assert "ATTENTION" not in log_text
-    assert "recovery child already in progress" in log_text
+    assert "START     (resume) improve" in log_text
 
 
 def test_watch_cycle_improve_creation_includes_unresolved_comments_in_prompt(tmp_path: Path) -> None:
@@ -3891,7 +3893,7 @@ def test_watch_cycle_improve_action_repeats_attention_for_attempt_cap_manual_sto
     previous_id = impl.id
     for attempt in range(config.max_resume_attempts + 1):
         task = store.add(
-            f"Improve attempt {attempt}",
+            "Improve attempt",
             task_type="improve",
             depends_on=review.id,
             based_on=previous_id,
@@ -4928,7 +4930,7 @@ def test_cmd_watch_restart_failed_dry_run_hides_skipped_by_default_and_sorts_old
     assert f'{exhausted_child.id} implement "Failed resume attempt" reason=max-resume-attempts-reached' in normalized
     assert "automatic recovery stops here; manual review required" in normalized
     assert f"{exhausted_root.id} implement" in normalized
-    assert "reason=newer-failed-recovery-descendant-needs-attention" in normalized
+    assert "reason=newer-recovery-descendant-needs-attention" in normalized
     assert "2 actionable (0 resume, 2 retry), 3 needs attention, 1 skipped hidden" in normalized
 
 
@@ -4956,7 +4958,7 @@ def test_cmd_watch_restart_failed_dry_run_show_skipped_includes_skipped_entries(
     skipped.completed_at = datetime(2026, 4, 28, 11, 0, 0, tzinfo=UTC)
     store.update(skipped)
 
-    pending_retry = store.add("Pending retry already queued", task_type="implement", based_on=skipped.id)
+    pending_retry = store.add(skipped.prompt, task_type="implement", based_on=skipped.id, depends_on=skipped.depends_on)
     assert pending_retry.id is not None
     pending_retry.status = "pending"
     pending_retry.branch = "feature/skipped-retry"
@@ -4987,6 +4989,524 @@ def test_cmd_watch_restart_failed_dry_run_show_skipped_includes_skipped_entries(
     assert stdout.index(actionable.id) < stdout.index(skipped.id)
     assert "reason=recovery_already_pending" in stdout
     assert "1 skipped" in stdout
+
+
+def test_cmd_watch_restart_failed_dry_run_suppresses_fully_recovered_failed_ancestors(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recovery dry-run should silently omit failed ancestors whose recovery chain already completed."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    actionable = store.add("Still actionable failed plan", task_type="plan")
+    assert actionable.id is not None
+    actionable.status = "failed"
+    actionable.failure_reason = "INFRASTRUCTURE_ERROR"
+    actionable.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(actionable)
+
+    failed_root = store.add("Recovered failed implement", task_type="implement")
+    assert failed_root.id is not None
+    failed_root.status = "failed"
+    failed_root.failure_reason = "MAX_TURNS"
+    failed_root.session_id = "sess-root"
+    failed_root.branch = "feature/root"
+    failed_root.completed_at = datetime(2026, 4, 28, 10, 5, 0, tzinfo=UTC)
+    store.update(failed_root)
+
+    failed_resume = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "MAX_TURNS"
+    failed_resume.session_id = failed_root.session_id
+    failed_resume.branch = failed_root.branch
+    failed_resume.completed_at = datetime(2026, 4, 28, 10, 10, 0, tzinfo=UTC)
+    store.update(failed_resume)
+
+    completed_resume = store.add(failed_resume.prompt, task_type="implement", based_on=failed_resume.id)
+    assert completed_resume.id is not None
+    completed_resume.status = "completed"
+    completed_resume.session_id = failed_resume.session_id
+    completed_resume.branch = failed_resume.branch
+    completed_resume.completed_at = datetime(2026, 4, 28, 10, 15, 0, tzinfo=UTC)
+    store.update(completed_resume)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert actionable.id in stdout
+    assert failed_root.id not in stdout
+    assert failed_resume.id not in stdout
+    assert "recovery child already completed" not in stdout
+    assert "recovery descendant already completed" not in stdout
+
+
+def test_cmd_watch_restart_failed_dry_run_keeps_failed_descendant_visible_under_completed_non_recovery_ancestor(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A completed non-recovery ancestor must not hide a failed descendant in watch recovery output."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "advance_requires_review: false\n"
+    )
+    store = make_store(tmp_path)
+
+    root = store.add("Completed root implement", task_type="implement")
+    assert root.id is not None
+    root.status = "completed"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.merge_status = "unmerged"
+    root.has_commits = True
+    root.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(root)
+
+    manual_follow_up = store.add("Manual follow-up implement", task_type="implement", based_on=root.id)
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "completed"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    manual_follow_up.merge_status = "merged"
+    manual_follow_up.completed_at = datetime(2026, 4, 28, 10, 5, 0, tzinfo=UTC)
+    store.update(manual_follow_up)
+
+    failed_descendant = store.add(manual_follow_up.prompt, task_type="implement", based_on=manual_follow_up.id)
+    assert failed_descendant.id is not None
+    failed_descendant.status = "failed"
+    failed_descendant.failure_reason = "MAX_TURNS"
+    failed_descendant.session_id = manual_follow_up.session_id
+    failed_descendant.branch = manual_follow_up.branch
+    failed_descendant.completed_at = datetime(2026, 4, 28, 10, 10, 0, tzinfo=UTC)
+    store.update(failed_descendant)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert failed_descendant.id in stdout
+    assert "Needs attention" in stdout
+
+
+def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_pending_manual_follow_up(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A pending manual based_on follow-up must not supersede the failed parent."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "advance_requires_review: false\n"
+    )
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/failed"
+    failed.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(failed)
+
+    manual_follow_up = store.add("Fresh follow-up implement", task_type="implement", based_on=failed.id)
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "pending"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    store.update(manual_follow_up)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert failed.id in stdout
+    assert f"resume {failed.id}" in stdout
+    assert "reason=recovery_already_pending" not in stdout
+    assert "recovery child already pending" not in stdout
+
+
+def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_failed_manual_follow_up(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failed manual based_on follow-up must not supersede the failed parent."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "advance_requires_review: false\n"
+    )
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed plan", task_type="plan")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(failed)
+
+    manual_follow_up = store.add("Fresh follow-up plan", task_type="plan", based_on=failed.id)
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "failed"
+    manual_follow_up.failure_reason = "MAX_TURNS"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    manual_follow_up.completed_at = datetime(2026, 4, 28, 10, 5, 0, tzinfo=UTC)
+    store.update(manual_follow_up)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert failed.id in stdout
+    assert manual_follow_up.id in stdout
+    assert "retry  " in stdout
+    assert "reason=recovery_has_newer_unresolved_descendant" not in stdout
+    assert "newer recovery descendant" not in stdout
+
+
+def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_completed_same_payload_manual_follow_up(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A completed same-payload manual follow-up on a different session/branch must not resolve the failed parent."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "advance_requires_review: false\n"
+    )
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="plan")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.completed_at = datetime(2026, 4, 28, 9, 55, 0, tzinfo=UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed implement", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/failed"
+    failed.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(failed)
+
+    manual_follow_up = store.add(
+        failed.prompt,
+        task_type="implement",
+        based_on=failed.id,
+        depends_on=failed.depends_on,
+        recovery_origin="manual",
+    )
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "completed"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    manual_follow_up.merge_status = "unmerged"
+    manual_follow_up.has_commits = True
+    manual_follow_up.completed_at = datetime(2026, 4, 28, 10, 5, 0, tzinfo=UTC)
+    store.update(manual_follow_up)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert failed.id in stdout
+    assert f"resume {failed.id}" in stdout
+    assert "recovery child already completed" not in stdout
+
+
+def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_completed_same_payload_legacy_manual_follow_up(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A legacy same-payload manual follow-up on a different session/branch must not resolve the failed parent."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "advance_requires_review: false\n"
+    )
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="plan")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.completed_at = datetime(2026, 4, 28, 9, 55, 0, tzinfo=UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed implement", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/failed"
+    failed.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(failed)
+
+    manual_follow_up = store.add(
+        failed.prompt,
+        task_type="implement",
+        based_on=failed.id,
+        depends_on=failed.depends_on,
+    )
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "completed"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    manual_follow_up.merge_status = "unmerged"
+    manual_follow_up.has_commits = True
+    manual_follow_up.completed_at = datetime(2026, 4, 28, 10, 5, 0, tzinfo=UTC)
+    store.update(manual_follow_up)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert failed.id in stdout
+    assert f"resume {failed.id}" in stdout
+    assert "recovery child already completed" not in stdout
+
+
+def test_cmd_watch_restart_failed_dry_run_keeps_failed_root_visible_across_non_recovery_break_with_resolved_grandchild(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A resolved recovery grandchild below a manual break must not hide the original failed root."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "advance_requires_review: false\n"
+    )
+    store = make_store(tmp_path)
+
+    failed_root = store.add("Failed implement", task_type="implement")
+    assert failed_root.id is not None
+    failed_root.status = "failed"
+    failed_root.failure_reason = "MAX_TURNS"
+    failed_root.session_id = "sess-root"
+    failed_root.branch = "feature/root"
+    failed_root.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(failed_root)
+
+    manual_follow_up = store.add(
+        failed_root.prompt,
+        task_type="implement",
+        based_on=failed_root.id,
+        recovery_origin="manual",
+    )
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "failed"
+    manual_follow_up.failure_reason = "MAX_TURNS"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    manual_follow_up.completed_at = datetime(2026, 4, 28, 10, 5, 0, tzinfo=UTC)
+    store.update(manual_follow_up)
+
+    completed_resume = store.add(manual_follow_up.prompt, task_type="implement", based_on=manual_follow_up.id)
+    assert completed_resume.id is not None
+    completed_resume.status = "completed"
+    completed_resume.session_id = manual_follow_up.session_id
+    completed_resume.branch = manual_follow_up.branch
+    completed_resume.merge_status = "unmerged"
+    completed_resume.has_commits = True
+    completed_resume.completed_at = datetime(2026, 4, 28, 10, 10, 0, tzinfo=UTC)
+    store.update(completed_resume)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert failed_root.id in stdout
+    assert f"resume {failed_root.id}" in stdout
+    assert "recovery child already completed" not in stdout
+    assert "recovery descendant already completed" not in stdout
+
+
+def test_cmd_watch_restart_failed_dry_run_keeps_failed_fix_visible_under_completed_implement_ancestor(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A cross-type completed ancestor must not hide an independent failed fix in watch recovery output."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "advance_requires_review: false\n"
+    )
+    store = make_store(tmp_path)
+
+    root = store.add("Completed root implement", task_type="implement")
+    assert root.id is not None
+    root.status = "completed"
+    root.branch = "feature/root"
+    root.merge_status = "unmerged"
+    root.has_commits = True
+    root.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(root)
+
+    completed_fix = store.add("Completed fix", task_type="fix", based_on=root.id, same_branch=True)
+    assert completed_fix.id is not None
+    completed_fix.status = "completed"
+    completed_fix.session_id = "sess-fix"
+    completed_fix.branch = root.branch
+    completed_fix.merge_status = "merged"
+    completed_fix.completed_at = datetime(2026, 4, 28, 10, 5, 0, tzinfo=UTC)
+    store.update(completed_fix)
+
+    failed_fix = store.add(completed_fix.prompt, task_type="fix", based_on=completed_fix.id, same_branch=True)
+    assert failed_fix.id is not None
+    failed_fix.status = "failed"
+    failed_fix.failure_reason = "MAX_TURNS"
+    failed_fix.session_id = completed_fix.session_id
+    failed_fix.branch = completed_fix.branch
+    failed_fix.completed_at = datetime(2026, 4, 28, 10, 10, 0, tzinfo=UTC)
+    store.update(failed_fix)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert failed_fix.id in stdout
+    assert "Needs attention" in stdout
 
 
 def test_cmd_watch_restart_failed_dry_run_saturates_retry_resume_attempt_display(

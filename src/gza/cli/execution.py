@@ -41,6 +41,7 @@ from ..query import get_base_task_slug as _get_base_task_slug
 from ..recovery_engine import (
     FailedRecoveryDecision,
     decide_failed_task_recovery,
+    resolve_recovery_planning_task,
 )
 from ..review_verdict import get_review_report
 from ..runner import RunInvocationContext, generate_slug, run
@@ -706,6 +707,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     provider = args.provider if hasattr(args, 'provider') and args.provider else None
     skip_learnings = args.skip_learnings if hasattr(args, 'skip_learnings') and args.skip_learnings else False
     mark_next = bool(getattr(args, "next", False))
+    recovery_origin = "manual" if based_on else None
 
     # Validation: --spec must reference an existing file
     if spec:
@@ -765,6 +767,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type_hint=branch_type,
             model=model,
             provider=provider,
+            recovery_origin=recovery_origin,
             skip_learnings=skip_learnings,
         )
         if mark_next:
@@ -788,6 +791,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type_hint=branch_type,
             model=model,
             provider=provider,
+            recovery_origin=recovery_origin,
             skip_learnings=skip_learnings,
         )
         if not new_task:
@@ -812,6 +816,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type_hint=branch_type,
             model=model,
             provider=provider,
+            recovery_origin=recovery_origin,
             skip_learnings=skip_learnings,
         )
         if mark_next:
@@ -980,6 +985,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     # Handle --based-on flag (lineage/parent relationship)
     if based_on_id is not None:
         task.based_on = based_on_id
+        task.recovery_origin = "manual"
         update_messages.append(f"✓ Set task {task.id} based_on task {based_on_id}")
         changed = True
 
@@ -1796,6 +1802,12 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         print(f"Error: Task {impl_task.id} is a {impl_task.task_type} task. Expected an implement task.")
         return 1
 
+    requested_impl_task = impl_task
+    resolved_impl_task = resolve_recovery_planning_task(store, impl_task)
+    resolved_from_failed_ancestor = requested_impl_task is not resolved_impl_task
+    if resolved_from_failed_ancestor:
+        impl_task = resolved_impl_task
+
     allowed_statuses = {"completed", "pending", "failed"}
     if impl_task.status not in allowed_statuses:
         print(f"Error: Task {impl_task.id} is {impl_task.status}. Can only iterate completed, pending, or failed tasks.")
@@ -1806,15 +1818,26 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         return 1
 
     if (use_resume or use_retry) and impl_task.status != "failed":
-        flag = "--resume" if use_resume else "--retry"
-        print(f"Error: {flag} is only valid for failed tasks (task {impl_task.id} is {impl_task.status}).")
-        return 1
+        if resolved_from_failed_ancestor and requested_impl_task.status == "failed":
+            use_resume = False
+            use_retry = False
+        else:
+            flag = "--resume" if use_resume else "--retry"
+            print(f"Error: {flag} is only valid for failed tasks (task {impl_task.id} is {impl_task.status}).")
+            return 1
 
     assert impl_task.id is not None
 
     if impl_task.status == "failed" and use_resume and not impl_task.session_id:
         print(f"Error: Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
         return 1
+
+    if resolved_from_failed_ancestor and impl_task.merge_status == "merged":
+        print(
+            "No remaining iterate action: "
+            f"failed implementation {requested_impl_task.id} was fully recovered by merged descendant {impl_task.id}."
+        )
+        return 0
 
     effective_max_resume_attempts = _int_config(
         getattr(config, "max_resume_attempts", None),

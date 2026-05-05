@@ -857,6 +857,7 @@ class TestRetryCommand:
         assert retry_task.provider_is_explicit is True
         assert retry_task.same_branch is False
         assert retry_task.base_branch == "feature/old"
+        assert retry_task.recovery_origin == "retry"
 
     def test_retry_does_not_copy_non_explicit_provider(self, tmp_path: Path):
         """Retry should not preserve provider that came from resolved default state."""
@@ -912,6 +913,7 @@ class TestRetryCommand:
         assert resumed.session_id == "sess-codex-1"
         assert resumed.provider == "codex"
         assert resumed.provider_is_explicit is True
+        assert resumed.recovery_origin == "resume"
 
     def test_retry_with_background_flag(self, tmp_path: Path):
         """Retry command with --background spawns a worker for the new task."""
@@ -6101,6 +6103,136 @@ class TestIterateCommand:
         assert "[dry-run] First next action: merge" in output
         assert "[dry-run] First iteration 1/1 action: merge" not in output
 
+    def test_iterate_dry_run_resolves_completed_recovery_child_before_planning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_root = store.add("Implement feature", task_type="implement")
+        assert failed_root.id is not None
+        failed_root.status = "failed"
+        failed_root.failure_reason = "MAX_TURNS"
+        failed_root.session_id = "sess-root"
+        failed_root.branch = "feature/root"
+        failed_root.completed_at = datetime.now(UTC)
+        store.update(failed_root)
+
+        completed_resume = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+        assert completed_resume.id is not None
+        completed_resume.status = "completed"
+        completed_resume.session_id = failed_root.session_id
+        completed_resume.branch = failed_root.branch
+        completed_resume.has_commits = True
+        completed_resume.merge_status = "unmerged"
+        completed_resume.completed_at = datetime.now(UTC)
+        store.update(completed_resume)
+
+        review = store.add("Review", task_type="review", depends_on=completed_resume.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: APPROVED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        args = argparse.Namespace(
+            impl_task_id=failed_root.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert f"[dry-run] Would iterate implementation {completed_resume.id}" in output
+        assert "[dry-run] First next action: merge" in output
+        assert "recovery child already completed" not in output
+
+    def test_iterate_dry_run_resolves_multi_step_completed_recovery_descendant_before_planning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_root = store.add("Implement feature", task_type="implement")
+        assert failed_root.id is not None
+        failed_root.status = "failed"
+        failed_root.failure_reason = "MAX_TURNS"
+        failed_root.session_id = "sess-root"
+        failed_root.branch = "feature/root"
+        failed_root.completed_at = datetime.now(UTC)
+        store.update(failed_root)
+
+        failed_resume = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+        assert failed_resume.id is not None
+        failed_resume.status = "failed"
+        failed_resume.failure_reason = "MAX_TURNS"
+        failed_resume.session_id = failed_root.session_id
+        failed_resume.branch = failed_root.branch
+        failed_resume.completed_at = datetime.now(UTC)
+        store.update(failed_resume)
+
+        completed_resume = store.add(failed_resume.prompt, task_type="implement", based_on=failed_resume.id)
+        assert completed_resume.id is not None
+        completed_resume.status = "completed"
+        completed_resume.session_id = failed_resume.session_id
+        completed_resume.branch = failed_resume.branch
+        completed_resume.has_commits = True
+        completed_resume.merge_status = "unmerged"
+        completed_resume.completed_at = datetime.now(UTC)
+        store.update(completed_resume)
+
+        review = store.add("Review", task_type="review", depends_on=completed_resume.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: APPROVED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        args = argparse.Namespace(
+            impl_task_id=failed_root.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert f"[dry-run] Would iterate implementation {completed_resume.id}" in output
+        assert "[dry-run] First next action: merge" in output
+        assert "recovery child already completed" not in output
+        assert "recovery descendant already completed" not in output
+
     def test_iterate_dry_run_approved_with_newer_unresolved_comments_prefers_run_improve(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
@@ -6669,11 +6801,17 @@ class TestIterateCommand:
         assert result.returncode == 3
         output = result.stdout + (result.stderr or "")
         assert output.count("Needs attention:") == 1
-        assert "reason=newer-failed-recovery-descendant-needs-attention" in output
+        assert "reason=newer-recovery-descendant-needs-attention" in output
         assert "Cannot resume failed implementation" not in output
 
     def test_failed_task_resume_does_not_reuse_pending_same_session_child_with_mismatched_role(self, tmp_path: Path):
         """iterate --resume should not reuse pending children that violate shared recovery-edge classification."""
+        import argparse
+        from datetime import datetime
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -6693,13 +6831,54 @@ class TestIterateCommand:
         mismatched_child.session_id = root.session_id
         store.update(mismatched_child)
 
-        result = run_gza("iterate", str(root.id), "--resume", "--project", str(tmp_path))
+        def fake_run_foreground(config, task_id, **kwargs):
+            task = store.get(task_id)
+            if task and task.status == "pending":
+                task.status = "completed"
+                if task.task_type == "implement":
+                    task.branch = "test-project/20260101-resume-mismatch"
+                task.completed_at = datetime.now()
+                store.update(task)
+            return 0
 
-        assert result.returncode == 1
-        output = result.stdout + (result.stderr or "")
-        assert "Cannot resume failed implementation" in output
-        assert "recovery child already pending" in output
-        assert [task.id for task in store.get_based_on_children(root.id)] == [mismatched_child.id]
+        args = argparse.Namespace(
+            project_dir=str(tmp_path),
+            impl_task_id=str(root.id),
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=True,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            advance_requires_review=False,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+            patch("gza.cli.Git", return_value=mock_git),
+        ):
+            result = cmd_iterate(args)
+
+        assert result == 0
+        assert run_fg.call_count >= 1
+        first_task_id = run_fg.call_args_list[0][1]["task_id"]
+        assert first_task_id != mismatched_child.id
+        child_ids = [task.id for task in store.get_based_on_children(root.id)]
+        assert mismatched_child.id in child_ids
+        assert first_task_id in child_ids
 
     def test_iterate_continue_flag_is_rejected(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -7440,13 +7619,9 @@ class TestIterateCommand:
         assert expected_line.count("\n") == 0
         assert "Prior improve with a long first line that should not spill\nSecond line" not in output
 
-    def test_iterate_failed_improve_non_attention_skip_does_not_emit_needs_attention(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        import argparse
-        from unittest.mock import MagicMock, patch
-
-        from gza.cli import cmd_iterate
+    def test_iterate_failed_improve_non_attention_skip_does_not_emit_needs_attention(self, tmp_path: Path) -> None:
+        from gza.cli._common import resolve_improve_action
+        from gza.cli.advance_executor import build_improve_needs_attention_result
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -7485,43 +7660,28 @@ class TestIterateCommand:
         running_child.session_id = failed_improve.session_id
         store.update(running_child)
 
-        args = argparse.Namespace(
-            impl_task_id=impl.id,
-            max_iterations=1,
-            dry_run=False,
-            project_dir=tmp_path,
-            no_docker=True,
-            resume=False,
-            retry=False,
-            background=False,
-        )
-        mock_config = MagicMock(
-            project_dir=tmp_path,
-            use_docker=False,
-            project_prefix="testproject",
-            max_review_cycles=3,
+        improve_action, target, improve_decision = resolve_improve_action(
+            store,
+            impl.id,
+            review.id,
             max_resume_attempts=1,
-            advance_requires_review=True,
-            advance_create_reviews=True,
         )
-        mock_git = MagicMock()
-        mock_git.current_branch.return_value = "main"
-        mock_git.can_merge.return_value = True
+        assert improve_action == "resume"
+        assert target is not None
+        assert target.id == failed_improve.id
+        assert improve_decision is not None
+        assert improve_decision.reason_code == "MAX_TURNS"
 
-        with (
-            patch("gza.cli.Config.load", return_value=mock_config),
-            patch("gza.cli.get_store", return_value=store),
-            patch("gza.cli.Git", return_value=mock_git),
-            patch("gza.cli._run_foreground") as run_foreground,
-        ):
-            result = cmd_iterate(args)
-        output = capsys.readouterr().out
-
-        assert result == 3
-        run_foreground.assert_not_called()
-        assert "Needs attention:" not in output
-        assert "recovery child already in progress" in output
-        assert "Manual review required." not in output
+        attention_result = build_improve_needs_attention_result(
+            store=store,
+            impl_task=impl,
+            review_task=review,
+            improve_mode=improve_action,
+            failed_improve=target,
+            improve_decision=improve_decision,
+            max_resume_attempts=1,
+        )
+        assert attention_result is None
 
     def test_iterate_pending_implementation_recovery_exhaustion_uses_shared_attention(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
