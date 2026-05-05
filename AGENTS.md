@@ -38,6 +38,11 @@ See `docs/` for detailed documentation:
 
 **Test retry circuit breaker**: If the same test fails 3 times with the same error, stop and report instead of retrying.
 
+## Pytest hangs
+
+- If `uv run pytest tests/` produces no new output for about 2 minutes, kill it and bisect by file or class. Do NOT wait it out; CPU usage is a poor liveness signal because an infinite loop also pegs a core.
+- When a test drives an iterate-style loop with the worker side mocked (for example `_run_foreground` patched to `MagicMock`), the mock must also mark the spawned task complete or the loop spins forever. See `test_iterate_failed_improve_non_attention_skip_does_not_emit_needs_attention` in `tests/cli/test_execution.py` for the canonical fix shape.
+
 ## Don'ts
 
 - Do NOT create summary/documentation files (`IMPLEMENTATION_SUMMARY.md`, `CHANGES.md`, etc.)

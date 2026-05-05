@@ -22,6 +22,22 @@ def test_docs_task_type_use_internal_not_learn() -> None:
         assert "A `learn` task is created" not in content
 
 
+def test_agents_document_pytest_hang_triage_rules() -> None:
+    """AGENTS.md should tell operators to treat silent pytest runs as suspect."""
+    repo_root = Path(__file__).resolve().parents[1]
+    agents_content = (repo_root / "AGENTS.md").read_text()
+
+    required_snippets = [
+        "## Pytest hangs",
+        "If `uv run pytest tests/` produces no new output for about 2 minutes, kill it and bisect by file or class.",
+        "CPU usage is a poor liveness signal because an infinite loop also pegs a core.",
+        "the mock must also mark the spawned task complete or the loop spins forever",
+        "test_iterate_failed_improve_non_attention_skip_does_not_emit_needs_attention",
+    ]
+    for snippet in required_snippets:
+        assert snippet in agents_content
+
+
 def test_configuration_docs_require_full_prefixed_ids_for_strict_commands() -> None:
     """Strict-ID command reference entries should consistently require full prefixed IDs."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"
