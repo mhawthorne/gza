@@ -3107,12 +3107,13 @@ class TestShowCommand:
         assert "Failure Summary: Stopped due to max turns limit." in result.stdout
         assert "Agent Explanation:" in result.stdout
         assert "Blocked by ordering prerequisite; implementation not started." in result.stdout
-        assert "Step Limit:" not in result.stdout
+        assert "Step Limit: 55 / 50" in result.stdout
+        assert "Legacy Turns: 55" in result.stdout
         assert "Last Verify Failure:" in result.stdout
         assert "uv run pytest tests/ -q" in result.stdout
         assert "Last Result Context: error_max_turns" in result.stdout
         assert f"gza retry {task.id}" in result.stdout
-        assert f"gza resume {task.id}" not in result.stdout
+        assert f"gza resume {task.id}" in result.stdout
         assert "Run Context: background (w-20260227-000001)" in result.stdout
 
     def test_show_failed_task_renders_termination_source(self, tmp_path: Path):
