@@ -3,13 +3,17 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from gza.db import SqliteTaskStore
 
-from .conftest import (
+from tests.cli.conftest import (
     make_store,
     run_gza,
     setup_config,
 )
+
+pytestmark = pytest.mark.integration
 
 
 def _set_task_times(

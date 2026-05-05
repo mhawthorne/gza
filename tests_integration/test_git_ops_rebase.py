@@ -8,10 +8,14 @@ from unittest.mock import patch
 from gza.config import Config
 from gza.db import SqliteTaskStore
 
-from .conftest import (
+import pytest
+
+from tests.cli.conftest import (
     run_gza,
     setup_git_repo_with_task_branch,
 )
+
+pytestmark = pytest.mark.integration
 
 
 class TestRebaseCommand:

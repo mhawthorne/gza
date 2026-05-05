@@ -12,12 +12,15 @@ from gza.cli import cmd_advance
 from gza.config import Config
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
 from tests.helpers.cli import capture_background_worker_spawns
+import pytest
 
-from .conftest import (
+from tests.cli.conftest import (
     make_store,
     run_gza,
     setup_config,
 )
+
+pytestmark = pytest.mark.integration
 
 
 class TestAdvanceCommand:
