@@ -25,4 +25,4 @@ model: gpt-5.4
 #    model: claude-opus-4-6
 #  review:
 #    model: claude-haiku-4-5-20251001
-project_id: gzarepo01
+project_id: gza
