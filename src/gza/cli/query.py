@@ -2508,6 +2508,7 @@ def _cmd_show_output(
     if task.status == "failed":
         log_path = _resolve_task_log_path(config, task)
         diagnostics = _build_failure_diagnostics(task, log_path, config.verify_command)
+        guidance_reason = diagnostics.marker_reason or diagnostics.reason
         _render_failure_diagnostics(
             diagnostics,
             label_color=c["label"],
@@ -2516,7 +2517,7 @@ def _cmd_show_output(
             include_explanation=bool(log_path and log_path.exists()),
         )
 
-        if diagnostics.reason in {"MAX_STEPS", "MAX_TURNS"}:
+        if guidance_reason in {"MAX_STEPS", "MAX_TURNS"}:
             _, _, effective_max_steps = get_effective_config_for_task(task, config)
             steps_used = task.num_steps_reported if task.num_steps_reported is not None else task.num_steps_computed
             if steps_used is not None:
@@ -2531,7 +2532,7 @@ def _cmd_show_output(
                     f"[{c['value']}]{turns_used}[/{c['value']}]"
                 )
 
-        next_step_commands = _failure_next_steps(task, diagnostics.reason, config=config)
+        next_step_commands = _failure_next_steps(task, guidance_reason, config=config)
         if next_step_commands:
             console.print(f"[{c['label']}]Next Steps:[/{c['label']}]")
             for command in next_step_commands:

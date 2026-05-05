@@ -3012,7 +3012,7 @@ class TestShowCommand:
         assert "Worktree:" not in output
 
     def test_show_failed_task_displays_failure_diagnostics(self, tmp_path: Path):
-        """Failed task output includes reason, limits, context, and next-step commands."""
+        """Failed task output keeps AGENT_FORFEIT guidance even with MAX_TURNS fallback state."""
         import json
 
         from gza.workers import WorkerMetadata, WorkerRegistry
@@ -3030,8 +3030,8 @@ class TestShowCommand:
         assert task.id is not None
         task.status = "failed"
         task.failure_reason = "MAX_TURNS"
+        task.session_id = "sess-show-failed"
         task.log_file = ".gza/logs/fail.log"
-        task.session_id = "session-123"
         task.num_steps_reported = 55
         task.num_turns_reported = 55
         store.update(task)
@@ -3107,13 +3107,13 @@ class TestShowCommand:
         assert "Failure Summary: Stopped due to max turns limit." in result.stdout
         assert "Agent Explanation:" in result.stdout
         assert "Blocked by ordering prerequisite; implementation not started." in result.stdout
-        assert "Step Limit:" not in result.stdout
         assert "Last Verify Failure:" in result.stdout
         assert "uv run pytest tests/ -q" in result.stdout
         assert "Last Result Context: error_max_turns" in result.stdout
+        assert "Run Context: background (w-20260227-000001)" in result.stdout
+        assert "Step Limit:" not in result.stdout
         assert f"gza retry {task.id}" in result.stdout
         assert f"gza resume {task.id}" not in result.stdout
-        assert "Run Context: background (w-20260227-000001)" in result.stdout
 
     def test_show_failed_task_renders_termination_source(self, tmp_path: Path):
         """Failed-task diagnostics should include structured termination source metadata."""

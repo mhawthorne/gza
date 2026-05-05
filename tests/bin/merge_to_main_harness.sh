@@ -242,6 +242,49 @@ run_merge() {
     RUN_OUTPUT="$(cat "$RUN_OUTPUT_FILE")"
 }
 
+run_merge_without_input() {
+    RUN_OUTPUT_FILE="$CASE_DIR/output.txt"
+    set +e
+    bash "$MERGE_SCRIPT" "$@" >"$RUN_OUTPUT_FILE" 2>&1
+    RUN_STATUS=$?
+    set -e
+    RUN_OUTPUT="$(cat "$RUN_OUTPUT_FILE")"
+}
+
+test_help_prints_usage_and_current_branch_agent_semantics() {
+    setup_case
+
+    run_merge_without_input --help
+
+    [[ "$RUN_STATUS" -eq 0 ]] || fail "--help should exit 0, got $RUN_STATUS"
+    assert_contains "$RUN_OUTPUT" "Usage: $MERGE_SCRIPT [branch-name] [claude|codex]" "help should print the usage line"
+    assert_contains "$RUN_OUTPUT" "If only one argument is provided and it is 'claude' or 'codex'," "help should document the single-argument agent shorthand"
+    assert_contains "$RUN_OUTPUT" "the current branch is merged using that agent." "help should describe current-branch agent semantics"
+    [[ ! -s "$FAKE_GIT_LOG" ]] || fail "--help should exit before invoking git"
+}
+
+test_invalid_agent_prints_usage_error() {
+    setup_case
+
+    run_merge_without_input topic bad-agent
+
+    [[ "$RUN_STATUS" -eq 1 ]] || fail "invalid agent should exit 1, got $RUN_STATUS"
+    assert_contains "$RUN_OUTPUT" "Error: Invalid agent 'bad-agent'. Use 'claude' or 'codex'." "invalid agent should print a specific error"
+    assert_contains "$RUN_OUTPUT" "Usage: $MERGE_SCRIPT [branch-name] [claude|codex]" "invalid agent should print usage guidance"
+    [[ ! -s "$FAKE_GIT_LOG" ]] || fail "invalid agent should fail before invoking git"
+}
+
+test_too_many_arguments_prints_usage_error() {
+    setup_case
+
+    run_merge_without_input a b c
+
+    [[ "$RUN_STATUS" -eq 1 ]] || fail "too many arguments should exit 1, got $RUN_STATUS"
+    assert_contains "$RUN_OUTPUT" "Error: Too many arguments." "too many arguments should print a specific error"
+    assert_contains "$RUN_OUTPUT" "Usage: $MERGE_SCRIPT [branch-name] [claude|codex]" "too many arguments should print usage guidance"
+    [[ ! -s "$FAKE_GIT_LOG" ]] || fail "too many arguments should fail before invoking git"
+}
+
 test_bootstrap_failure_reports_builder_error() {
     setup_case
     export FAKE_GIT_CURRENT_BRANCH="feature/bootstrap"
@@ -369,6 +412,9 @@ test_non_conflict_merge_failure_does_not_require_agent_cli() {
     [[ ! -s "$FAKE_AGENT_LOG" ]] || fail "pre-conflict merge failure should not launch an agent"
 }
 
+test_help_prints_usage_and_current_branch_agent_semantics
+test_invalid_agent_prints_usage_error
+test_too_many_arguments_prints_usage_error
 test_bootstrap_failure_reports_builder_error
 test_missing_launcher_reports_distinct_error
 test_single_argument_agent_uses_current_branch
