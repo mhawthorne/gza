@@ -10,12 +10,14 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.github import PullRequestDetails
 
-from .conftest import (
+from tests.cli.conftest import (
     make_store,
     run_gza,
     setup_config,
     setup_db_with_tasks,
 )
+
+pytestmark = pytest.mark.integration
 
 
 class TestPrCommand:
