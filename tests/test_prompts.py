@@ -85,6 +85,8 @@ class TestPromptBuilderBuild:
         assert "Re-read AGENTS.md for repository-specific rules and conventions." in result
         assert "Add or update targeted tests for each changed behavior" in result
         assert "Inspect the final diff for accidental scope creep" in result
+        assert "where REASON is one of: AGENT_FORFEIT, TEST_FAILURE" in result
+        assert "where REASON is one of: MAX_STEPS, MAX_TURNS, TEST_FAILURE" not in result
 
     def test_build_task_type_without_summary(self, tmp_path: Path):
         """Test that task type without summary includes fallback message."""
@@ -103,6 +105,8 @@ class TestPromptBuilderBuild:
         assert ".gza/learnings.md" not in result
         assert "Add or update targeted tests for each changed behavior" in result
         assert "Inspect the final diff for accidental scope creep" in result
+        assert "where REASON is one of: AGENT_FORFEIT, TEST_FAILURE" in result
+        assert "where REASON is one of: MAX_STEPS, MAX_TURNS, TEST_FAILURE" not in result
 
     def test_build_implement_type_with_summary(self, tmp_path: Path):
         """Test that implement type includes summary instructions."""

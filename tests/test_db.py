@@ -2388,6 +2388,16 @@ class TestFailureReasonTracking:
         result = extract_failure_reason(log_file)
         assert result == "TEST_FAILURE"
 
+    def test_extract_failure_reason_detects_agent_forfeit(self, tmp_path: Path):
+        """extract_failure_reason detects AGENT_FORFEIT marker."""
+        from gza.db import extract_failure_reason
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("Some output\n[GZA_FAILURE:AGENT_FORFEIT]\nFinal message")
+
+        result = extract_failure_reason(log_file)
+        assert result == "AGENT_FORFEIT"
+
     def test_extract_failure_reason_detects_max_steps(self, tmp_path: Path):
         """extract_failure_reason detects MAX_STEPS marker."""
         from gza.db import extract_failure_reason
@@ -2746,6 +2756,7 @@ class TestFailureReasonTracking:
         """KNOWN_FAILURE_REASONS contains expected values."""
         from gza.db import KNOWN_FAILURE_REASONS
 
+        assert "AGENT_FORFEIT" in KNOWN_FAILURE_REASONS
         assert "INFRASTRUCTURE_ERROR" in KNOWN_FAILURE_REASONS
         assert "MAX_STEPS" in KNOWN_FAILURE_REASONS
         assert "MAX_TURNS" in KNOWN_FAILURE_REASONS
