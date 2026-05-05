@@ -23,6 +23,7 @@ from ..console import (
     shorten_prompt,
 )
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from ..failure_reasons import mark_task_failed_from_cause
 from ..git import (
     Git,
     GitError,
@@ -860,7 +861,14 @@ def _run_task_backed_rebase(
             git.fetch("origin")
         except GitError as e:
             logger.error(f"Error fetching from origin: {e}")
-            store.mark_failed(rebase_task, log_file=log_file_storage, branch=branch, failure_reason="GIT_ERROR")
+            mark_task_failed_from_cause(
+                task=rebase_task,
+                config=config,
+                store=store,
+                log_file=log_file,
+                branch=branch,
+                explicit_reason="GIT_ERROR",
+            )
             return 1
         logger.info("✓ Fetched from origin")
         rebase_target = f"origin/{target_branch}"
@@ -882,7 +890,14 @@ def _run_task_backed_rebase(
         git._run("worktree", "add", str(worktree_path), branch)
     except GitError as e:
         logger.error(f"Error setting up worktree: {e}")
-        store.mark_failed(rebase_task, log_file=log_file_storage, branch=branch, failure_reason="GIT_ERROR")
+        mark_task_failed_from_cause(
+            task=rebase_task,
+            config=config,
+            store=store,
+            log_file=log_file,
+            branch=branch,
+            explicit_reason="GIT_ERROR",
+        )
         return 1
 
     worktree_git = Git(worktree_path)
@@ -916,11 +931,13 @@ def _run_task_backed_rebase(
                 if failure_hint_lines:
                     for line in failure_hint_lines:
                         logger.error(line)
-                store.mark_failed(
-                    rebase_task,
-                    log_file=log_file_storage,
+                mark_task_failed_from_cause(
+                    task=rebase_task,
+                    config=config,
+                    store=store,
+                    log_file=log_file,
                     branch=branch,
-                    failure_reason="TEST_FAILURE",
+                    explicit_reason="TEST_FAILURE",
                 )
                 print()
                 return 1
@@ -956,7 +973,14 @@ def _run_task_backed_rebase(
 
     except GitError as e:
         logger.error(f"Error during rebase: {e}")
-        store.mark_failed(rebase_task, log_file=log_file_storage, branch=branch, failure_reason="GIT_ERROR")
+        mark_task_failed_from_cause(
+            task=rebase_task,
+            config=config,
+            store=store,
+            log_file=log_file,
+            branch=branch,
+            explicit_reason="GIT_ERROR",
+        )
         print()
         return 1
     finally:

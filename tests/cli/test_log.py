@@ -151,7 +151,7 @@ class TestLogCommand:
         task = store.add("Failed task for failure view")
         assert task.id is not None
         task.status = "failed"
-        task.failure_reason = "AGENT_FORFEIT"
+        task.failure_reason = "MAX_TURNS"
         task.log_file = ".gza/logs/failed.log"
         store.update(task)
 
@@ -198,8 +198,8 @@ class TestLogCommand:
         result = run_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Failure Reason: AGENT_FORFEIT" in result.stdout
-        assert "Failure Summary: Agent forfeited: could not complete the task." in result.stdout
+        assert "Failure Reason: MAX_TURNS" in result.stdout
+        assert "Failure Summary: Stopped due to max turns limit." in result.stdout
         assert "Agent Explanation:" in result.stdout
         assert "Blocked by ordering prerequisite." in result.stdout
         assert "[GZA_FAILURE:AGENT_FORFEIT]" in result.stdout
@@ -223,7 +223,7 @@ class TestLogCommand:
         task = store.add("Parity failure diagnostics task")
         assert task.id is not None
         task.status = "failed"
-        task.failure_reason = "AGENT_FORFEIT"
+        task.failure_reason = "MAX_TURNS"
         task.log_file = ".gza/logs/parity-failure.log"
         store.update(task)
 
@@ -274,8 +274,8 @@ class TestLogCommand:
         assert log_result.returncode == 0
 
         expected_fragments = [
-            "Failure Reason: AGENT_FORFEIT",
-            "Failure Summary: Agent forfeited: could not complete the task.",
+            "Failure Reason: MAX_TURNS",
+            "Failure Summary: Stopped due to max turns limit.",
             "[GZA_FAILURE:AGENT_FORFEIT]",
             "Agent Explanation:",
             "Blocked by ordering prerequisite.",
@@ -296,7 +296,7 @@ class TestLogCommand:
         task = store.add("Marker stripping parity task")
         assert task.id is not None
         task.status = "failed"
-        task.failure_reason = "AGENT_FORFEIT"
+        task.failure_reason = "MAX_TURNS"
         task.log_file = ".gza/logs/marker-strip.log"
         store.update(task)
 

@@ -189,3 +189,89 @@ class TestRebaseCommand:
         assert log_path.exists()
         log_text = log_path.read_text()
         assert "Rebasing task" in log_text
+
+    def test_rebase_fetch_failure_marks_git_error_via_shared_helper(self, tmp_path: Path):
+        """Remote fetch failures should persist GIT_ERROR through the shared helper."""
+        from gza.cli.git_ops import cmd_rebase
+        from gza.failure_reasons import mark_task_failed_from_cause
+        from gza.git import GitError
+
+        _store, _git, task, _wt = setup_git_repo_with_task_branch(
+            tmp_path, "Test rebase fetch failure", "feature/test-rebase-fetch-fail",
+        )
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=task.id,
+            background=False,
+            onto=None,
+            remote=True,
+            force=False,
+            resolve=False,
+        )
+
+        with (
+            patch(
+                "gza.cli.git_ops.mark_task_failed_from_cause",
+                wraps=mark_task_failed_from_cause,
+            ) as mock_mark_failed,
+            patch("gza.git.Git.fetch", side_effect=GitError("fetch failed")),
+        ):
+            rc = cmd_rebase(args)
+
+        assert rc == 1
+
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        rebases = [child for child in store.get_based_on_children(task.id) if child.task_type == "rebase"]
+        assert len(rebases) == 1
+        rebase_task = rebases[0]
+        assert rebase_task.status == "failed"
+        assert rebase_task.failure_reason == "GIT_ERROR"
+        assert mock_mark_failed.call_count == 1
+        assert mock_mark_failed.call_args.kwargs["task"].id == rebase_task.id
+        assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "GIT_ERROR"
+
+    def test_rebase_provider_resolution_failure_marks_test_failure_via_shared_helper(self, tmp_path: Path):
+        """Unresolved provider conflict fallback should persist TEST_FAILURE through the helper."""
+        from gza.cli.git_ops import cmd_rebase
+        from gza.failure_reasons import mark_task_failed_from_cause
+        from gza.git import GitError
+
+        _store, _git, task, _wt = setup_git_repo_with_task_branch(
+            tmp_path, "Test rebase provider failure", "feature/test-rebase-provider-fail",
+        )
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=task.id,
+            background=False,
+            onto=None,
+            remote=False,
+            force=False,
+            resolve=False,
+        )
+
+        with (
+            patch(
+                "gza.cli.git_ops.mark_task_failed_from_cause",
+                wraps=mark_task_failed_from_cause,
+            ) as mock_mark_failed,
+            patch("gza.cli.git_ops.invoke_provider_resolve", return_value=False),
+            patch("gza.git.Git.rebase", side_effect=GitError("conflict")),
+            patch("gza.git.Git.rebase_abort"),
+        ):
+            rc = cmd_rebase(args)
+
+        assert rc == 1
+
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        rebases = [child for child in store.get_based_on_children(task.id) if child.task_type == "rebase"]
+        assert len(rebases) == 1
+        rebase_task = rebases[0]
+        assert rebase_task.status == "failed"
+        assert rebase_task.failure_reason == "TEST_FAILURE"
+        assert mock_mark_failed.call_count == 1
+        assert mock_mark_failed.call_args.kwargs["task"].id == rebase_task.id
+        assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "TEST_FAILURE"

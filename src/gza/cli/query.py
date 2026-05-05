@@ -45,6 +45,7 @@ from ..db import (
     _is_readonly_snapshot_operational_error,
     task_id_numeric_key as _task_id_numeric_key,
 )
+from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git, GitError, active_worktree_path_for_branch
 from ..github import GitHub
 from ..pr_ops import lookup_task_pr
@@ -1975,6 +1976,7 @@ def _format_started(started: datetime | None) -> str:
 
 def _kill_task(
     task: DbTask,
+    config: Config,
     registry: WorkerRegistry,
     store: SqliteTaskStore,
     force: bool,
@@ -2041,12 +2043,16 @@ def _kill_task(
             pass  # Already dead after SIGTERM
 
     # Mark the task as failed with KILLED reason
-    store.mark_failed(
-        task,
+    mark_task_failed_from_cause(
+        task=task,
+        config=config,
+        store=store,
         log_file=task.log_file,
         branch=task.branch,
         has_commits=task.has_commits or False,
-        failure_reason="KILLED",
+        explicit_reason="KILLED",
+        error_type=None,
+        exit_code=None,
     )
 
     # Clean up worker record if present
@@ -2071,7 +2077,7 @@ def cmd_kill(args: argparse.Namespace) -> int:
             return 0
         # Pre-fetch worker list once to avoid O(N) registry scans.
         workers = registry.list_all(include_completed=False)
-        results = [_kill_task(task, registry, store, force, workers) for task in tasks]
+        results = [_kill_task(task, config, registry, store, force, workers) for task in tasks]
         return 0 if all(results) else 1
 
     if not args.task_id:
@@ -2088,7 +2094,7 @@ def cmd_kill(args: argparse.Namespace) -> int:
         print(f"Error: Task {task_id} is not running (status: {maybe_task.status})")
         return 1
 
-    return 0 if _kill_task(maybe_task, registry, store, force) else 1
+    return 0 if _kill_task(maybe_task, config, registry, store, force) else 1
 
 
 def cmd_delete(args: argparse.Namespace) -> int:
@@ -2847,12 +2853,16 @@ def cmd_attach(args: argparse.Namespace) -> int:
             return 1
 
         print("Recovery failed: unable to restart the background worker.")
-        store.mark_failed(
-            task,
+        mark_task_failed_from_cause(
+            task=task,
+            config=config,
+            store=store,
             log_file=task.log_file,
             branch=task.branch,
             has_commits=bool(task.has_commits),
-            failure_reason="WORKER_DIED",
+            explicit_reason="WORKER_DIED",
+            error_type=None,
+            exit_code=None,
         )
         if log_path is not None:
             write_log_entry(

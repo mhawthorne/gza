@@ -1462,7 +1462,7 @@ class TestClaudeErrorTypeExtraction:
     """Tests for Claude provider extracting error_type from result."""
 
     def test_extracts_max_turns_error_from_result(self, tmp_path):
-        """Should set error_type='max_steps' when result has subtype error_max_turns."""
+        """Should set error_type='max_turns' when result has subtype error_max_turns."""
         import json
 
         from gza.providers.claude import ClaudeProvider
@@ -1494,7 +1494,7 @@ class TestClaudeErrorTypeExtraction:
                 timeout_minutes=30,
             )
 
-        assert result.error_type == "max_steps"
+        assert result.error_type == "max_turns"
         assert result.num_turns_reported == 60
         assert result.cost_usd == 1.35
         assert result.exit_code == 0  # Preserves actual exit code

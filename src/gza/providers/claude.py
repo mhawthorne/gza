@@ -1105,7 +1105,7 @@ class ClaudeProvider(Provider):
             # Check for error subtypes (e.g., error_max_turns)
             subtype = result_data.get("subtype", "")
             if subtype == "error_max_turns":
-                result.error_type = "max_steps"
+                result.error_type = "max_turns"
 
         # Expose accumulated session_id (captured from system/init or result event)
         if "session_id" in accumulated_data:

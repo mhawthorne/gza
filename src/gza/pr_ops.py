@@ -9,6 +9,7 @@ from typing import Literal
 from .config import Config
 from .console import MAX_PR_BODY_LENGTH, MAX_PR_TITLE_LENGTH, truncate
 from .db import SqliteTaskStore, Task
+from .failure_reasons import mark_task_failed_from_cause
 from .git import Git, GitError
 from .github import GitHub, GitHubError
 from .prompts import PromptBuilder
@@ -111,7 +112,13 @@ def _generate_pr_content(
         if refreshed is None:
             return
         if refreshed.status in {"pending", "in_progress"}:
-            store.mark_failed(refreshed, failure_reason="UNKNOWN")
+            mark_task_failed_from_cause(
+                task=refreshed,
+                config=config,
+                store=store,
+                log_file=None,
+                explicit_reason="UNKNOWN",
+            )
 
     try:
         from . import runner as runner_mod
