@@ -3288,6 +3288,32 @@ class TestMaxStepsHandling:
         assert "Outcome: failed (timeout after 10m)" not in log_contents
         assert "Outcome: failed (max_steps)" not in log_contents
 
+    def test_non_code_nonzero_exit_persists_agent_forfeit_marker(self, tmp_path: Path):
+        """Generic nonzero failures should persist AGENT_FORFEIT from the final marker."""
+        exit_code, store, task, mock_task_footer, _ = self._run_non_code_task_with_log_markers(
+            tmp_path,
+            exit_code=1,
+            error_type=None,
+            slug="20260505-plan-exit-code-agent-forfeit",
+            log_markers=("MAX_TURNS", "AGENT_FORFEIT"),
+            include_report_result=False,
+        )
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "AGENT_FORFEIT"
+
+        assert mock_task_footer.call_count == 1
+        assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider exited with code 1"
+
+        assert failed.log_file is not None
+        log_contents = (tmp_path / failed.log_file).read_text()
+        assert "Outcome: failed (exit_code=1)" in log_contents
+        assert "Outcome: failed (timeout after 10m)" not in log_contents
+        assert "Outcome: failed (max_steps)" not in log_contents
+
     def test_non_code_task_marks_terminal_step_interrupted_on_max_steps(self, tmp_path: Path):
         """Persisted run steps should reflect interruption on max-steps failures."""
         db_path = tmp_path / "test.db"
@@ -3828,6 +3854,32 @@ class TestFailureReasonGroundTruth:
         assert failed is not None
         assert failed.status == "failed"
         assert failed.failure_reason == marker
+
+        assert mock_task_footer.call_count == 1
+        assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider exited with code 1"
+
+        assert failed.log_file is not None
+        log_contents = (tmp_path / failed.log_file).read_text()
+        assert "Outcome: failed (exit_code=1)" in log_contents
+        assert "Outcome: failed (timeout after 15m)" not in log_contents
+        assert "Outcome: failed (max_steps)" not in log_contents
+
+    def test_code_task_nonzero_exit_persists_agent_forfeit_marker(self, tmp_path: Path):
+        """Generic nonzero code-task failures should persist AGENT_FORFEIT from the final marker."""
+        exit_code, store, task, mock_task_footer = self._run_code_task_failure(
+            tmp_path,
+            exit_code=1,
+            error_type=None,
+            session_id="exit-code-agent-forfeit-session",
+            slug="20260505-implement-exit-code-agent-forfeit",
+            log_markers=("MAX_TURNS", "AGENT_FORFEIT"),
+        )
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "AGENT_FORFEIT"
 
         assert mock_task_footer.call_count == 1
         assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider exited with code 1"

@@ -53,6 +53,7 @@ StoreOpenMode = Literal["readwrite", "query_only"]
 
 # Known failure reason categories
 KNOWN_FAILURE_REASONS = {
+    "AGENT_FORFEIT",
     "INFRASTRUCTURE_ERROR",
     "MAX_STEPS",
     "MAX_TURNS",

@@ -1955,6 +1955,7 @@ def _extract_failure_log_context(log_path: Path, verify_command: str | None) -> 
 def _failure_summary(reason: str) -> str:
     """Build short human-readable failure summary."""
     summaries = {
+        "AGENT_FORFEIT": "Agent forfeited: could not complete the task.",
         "MAX_STEPS": "Stopped due to max steps limit.",
         "MAX_TURNS": "Stopped due to max steps limit.",
         "TERMINATED": "Stopped by an external termination signal.",
@@ -2168,6 +2169,9 @@ def _failure_next_steps(task: DbTask, reason: str, *, config: Config | None = No
         return []
 
     steps = [f"gza log -t {task.id} --steps-verbose"]
+    if reason == "AGENT_FORFEIT":
+        steps.append(f"gza retry {task.id}")
+        return steps
     if reason == "PREREQUISITE_UNMERGED":
         blocking_dep_id = _precondition_blocking_dependency_id(task, config) or task.depends_on
         if blocking_dep_id:

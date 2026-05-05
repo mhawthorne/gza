@@ -151,7 +151,7 @@ class TestLogCommand:
         task = store.add("Failed task for failure view")
         assert task.id is not None
         task.status = "failed"
-        task.failure_reason = "MAX_STEPS"
+        task.failure_reason = "AGENT_FORFEIT"
         task.log_file = ".gza/logs/failed.log"
         store.update(task)
 
@@ -164,7 +164,7 @@ class TestLogCommand:
                         "type": "item.completed",
                         "item": {
                             "type": "agent_message",
-                            "text": "[GZA_FAILURE:MAX_STEPS]\nBlocked by ordering prerequisite.",
+                            "text": "[GZA_FAILURE:AGENT_FORFEIT]\nBlocked by ordering prerequisite.",
                         },
                     },
                     {
@@ -198,12 +198,12 @@ class TestLogCommand:
         result = run_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Failure Reason: MAX_STEPS" in result.stdout
-        assert "Failure Summary: Stopped due to max steps limit." in result.stdout
+        assert "Failure Reason: AGENT_FORFEIT" in result.stdout
+        assert "Failure Summary: Agent forfeited: could not complete the task." in result.stdout
         assert "Agent Explanation:" in result.stdout
         assert "Blocked by ordering prerequisite." in result.stdout
-        assert "[GZA_FAILURE:MAX_STEPS]" in result.stdout
-        assert result.stdout.count("[GZA_FAILURE:MAX_STEPS]") == 1
+        assert "[GZA_FAILURE:AGENT_FORFEIT]" in result.stdout
+        assert result.stdout.count("[GZA_FAILURE:AGENT_FORFEIT]") == 1
         assert "Last Verify Failure:" in result.stdout
         assert "uv run pytest tests/ -q" in result.stdout
         assert "Last Result Context: error_max_turns" in result.stdout
@@ -223,7 +223,7 @@ class TestLogCommand:
         task = store.add("Parity failure diagnostics task")
         assert task.id is not None
         task.status = "failed"
-        task.failure_reason = "MAX_STEPS"
+        task.failure_reason = "AGENT_FORFEIT"
         task.log_file = ".gza/logs/parity-failure.log"
         store.update(task)
 
@@ -236,7 +236,7 @@ class TestLogCommand:
                         "type": "item.completed",
                         "item": {
                             "type": "agent_message",
-                            "text": "[GZA_FAILURE:MAX_STEPS]\nBlocked by ordering prerequisite.",
+                            "text": "[GZA_FAILURE:AGENT_FORFEIT]\nBlocked by ordering prerequisite.",
                         },
                     },
                     {
@@ -274,9 +274,9 @@ class TestLogCommand:
         assert log_result.returncode == 0
 
         expected_fragments = [
-            "Failure Reason: MAX_STEPS",
-            "Failure Summary: Stopped due to max steps limit.",
-            "[GZA_FAILURE:MAX_STEPS]",
+            "Failure Reason: AGENT_FORFEIT",
+            "Failure Summary: Agent forfeited: could not complete the task.",
+            "[GZA_FAILURE:AGENT_FORFEIT]",
             "Agent Explanation:",
             "Blocked by ordering prerequisite.",
             "Last Verify Failure:",
@@ -296,7 +296,7 @@ class TestLogCommand:
         task = store.add("Marker stripping parity task")
         assert task.id is not None
         task.status = "failed"
-        task.failure_reason = "MAX_STEPS"
+        task.failure_reason = "AGENT_FORFEIT"
         task.log_file = ".gza/logs/marker-strip.log"
         store.update(task)
 
@@ -309,7 +309,7 @@ class TestLogCommand:
                         "type": "item.completed",
                         "item": {
                             "type": "agent_message",
-                            "text": "[GZA_FAILURE:MAX_STEPS]\nOnly body text remains",
+                            "text": "[GZA_FAILURE:AGENT_FORFEIT]\nOnly body text remains",
                         },
                     },
                     {"type": "result", "subtype": "error_max_turns", "result": "Stopped at limit"},
@@ -323,8 +323,8 @@ class TestLogCommand:
         assert show_result.returncode == 0
         assert log_result.returncode == 0
 
-        assert show_result.stdout.count("[GZA_FAILURE:MAX_STEPS]") == 1
-        assert log_result.stdout.count("[GZA_FAILURE:MAX_STEPS]") == 1
+        assert show_result.stdout.count("[GZA_FAILURE:AGENT_FORFEIT]") == 1
+        assert log_result.stdout.count("[GZA_FAILURE:AGENT_FORFEIT]") == 1
         assert "Only body text remains" in show_result.stdout
         assert "Only body text remains" in log_result.stdout
 

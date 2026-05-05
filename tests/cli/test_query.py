@@ -3029,7 +3029,7 @@ class TestShowCommand:
         task = store.add("Failed task for show diagnostics")
         assert task.id is not None
         task.status = "failed"
-        task.failure_reason = "MAX_STEPS"
+        task.failure_reason = "AGENT_FORFEIT"
         task.log_file = ".gza/logs/fail.log"
         task.session_id = "session-123"
         task.num_steps_reported = 55
@@ -3067,7 +3067,7 @@ class TestShowCommand:
                 "type": "item.completed",
                 "item": {
                     "type": "agent_message",
-                    "text": "[GZA_FAILURE:MAX_STEPS]\nBlocked by ordering prerequisite; implementation not started.",
+                    "text": "[GZA_FAILURE:AGENT_FORFEIT]\nBlocked by ordering prerequisite; implementation not started.",
                 },
             },
             {
@@ -3101,18 +3101,18 @@ class TestShowCommand:
         result = run_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Failure Reason: MAX_STEPS" in result.stdout
-        assert "[GZA_FAILURE:MAX_STEPS]" in result.stdout
-        assert result.stdout.count("[GZA_FAILURE:MAX_STEPS]") == 1
-        assert "Failure Summary: Stopped due to max steps limit." in result.stdout
+        assert "Failure Reason: AGENT_FORFEIT" in result.stdout
+        assert "[GZA_FAILURE:AGENT_FORFEIT]" in result.stdout
+        assert result.stdout.count("[GZA_FAILURE:AGENT_FORFEIT]") == 1
+        assert "Failure Summary: Agent forfeited: could not complete the task." in result.stdout
         assert "Agent Explanation:" in result.stdout
         assert "Blocked by ordering prerequisite; implementation not started." in result.stdout
-        assert "Step Limit: 55 / 50" in result.stdout
+        assert "Step Limit:" not in result.stdout
         assert "Last Verify Failure:" in result.stdout
         assert "uv run pytest tests/ -q" in result.stdout
         assert "Last Result Context: error_max_turns" in result.stdout
-        assert f"gza resume {task.id}" in result.stdout
         assert f"gza retry {task.id}" in result.stdout
+        assert f"gza resume {task.id}" not in result.stdout
         assert "Run Context: background (w-20260227-000001)" in result.stdout
 
     def test_show_failed_task_renders_termination_source(self, tmp_path: Path):
