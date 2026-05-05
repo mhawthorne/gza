@@ -3471,6 +3471,103 @@ class TestAdvanceCommand:
         assert "recovery child already completed" not in result.stdout
         assert "Merge task (no review yet)" in result.stdout
 
+    def test_advance_dry_run_suppresses_failed_sidequests_with_merged_target_impl(self, tmp_path: Path) -> None:
+        """Merged implementation targets should silently suppress failed review/improve/rebase rows."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        merged_impl = store.add("Merged implementation", task_type="implement")
+        assert merged_impl.id is not None
+        merged_impl.status = "completed"
+        merged_impl.completed_at = datetime.now(UTC)
+        merged_impl.branch = "feat/merged"
+        merged_impl.merge_status = "merged"
+        merged_impl.has_commits = True
+        store.update(merged_impl)
+
+        visible_impl = store.add("Visible implementation", task_type="implement")
+        assert visible_impl.id is not None
+        visible_impl.status = "completed"
+        visible_impl.completed_at = datetime.now(UTC)
+        visible_impl.branch = "feat/visible"
+        visible_impl.merge_status = "unmerged"
+        visible_impl.has_commits = True
+        store.update(visible_impl)
+
+        failed_review = store.add("Failed review", task_type="review", depends_on=merged_impl.id, based_on=merged_impl.id)
+        failed_review.status = "failed"
+        failed_review.failure_reason = "MISSING_REPORT_ARTIFACT"
+        failed_review.completed_at = datetime.now(UTC)
+        store.update(failed_review)
+
+        review_for_improve = store.add("Review for improve", task_type="review", depends_on=merged_impl.id, based_on=merged_impl.id)
+        assert review_for_improve.id is not None
+        failed_improve = store.add(
+            "Failed improve",
+            task_type="improve",
+            depends_on=review_for_improve.id,
+            based_on=merged_impl.id,
+        )
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "GIT_ERROR"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=merged_impl.id)
+        failed_rebase.status = "failed"
+        failed_rebase.failure_reason = "WORKER_DIED"
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        visible_failed = store.add("Visible failed review", task_type="review", depends_on=visible_impl.id, based_on=visible_impl.id)
+        assert visible_failed.id is not None
+        visible_failed.status = "failed"
+        visible_failed.failure_reason = "MISSING_REPORT_ARTIFACT"
+        visible_failed.completed_at = datetime.now(UTC)
+        store.update(visible_failed)
+
+        with patch("gza.cli.Git", return_value=self._mock_git()):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert visible_impl.id in result.stdout
+        assert visible_failed.id in result.stdout
+        assert failed_review.id not in result.stdout
+        assert failed_improve.id not in result.stdout
+        assert failed_rebase.id not in result.stdout
+        assert "resolved_by_merged_target" not in result.stdout
+
+    def test_advance_specific_failed_sidequest_with_merged_target_leaves_db_unchanged(self, tmp_path: Path) -> None:
+        """Direct advance of a merged-target failed sidequest should no-op without mutating the failed row."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        merged_impl = store.add("Merged implementation", task_type="implement")
+        assert merged_impl.id is not None
+        merged_impl.status = "completed"
+        merged_impl.completed_at = datetime.now(UTC)
+        merged_impl.branch = "feat/merged"
+        merged_impl.merge_status = "merged"
+        merged_impl.has_commits = True
+        store.update(merged_impl)
+
+        failed_review = store.add("Failed review", task_type="review", depends_on=merged_impl.id, based_on=merged_impl.id)
+        assert failed_review.id is not None
+        failed_review.status = "failed"
+        failed_review.failure_reason = "MISSING_REPORT_ARTIFACT"
+        failed_review.completed_at = datetime.now(UTC)
+        store.update(failed_review)
+
+        with patch("gza.cli.Git", return_value=self._mock_git()):
+            result = run_gza("advance", failed_review.id, "--project", str(tmp_path))
+
+        refreshed = store.get(failed_review.id)
+        assert refreshed is not None
+        assert result.returncode == 0
+        assert "No eligible tasks to advance" in result.stdout
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "MISSING_REPORT_ARTIFACT"
+
     def test_advance_dry_run_suppresses_every_failed_ancestor_in_multi_step_recovery_chain(
         self,
         tmp_path: Path,

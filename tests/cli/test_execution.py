@@ -6233,6 +6233,76 @@ class TestIterateCommand:
         assert "recovery child already completed" not in output
         assert "recovery descendant already completed" not in output
 
+    def test_iterate_on_already_merged_impl_suppresses_historical_failed_improve_attention(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Iterate should no-op on merged implementations instead of resurfacing failed improve attention."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Merged implementation", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.has_commits = True
+        impl.merge_status = "merged"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        failed_improve = store.add("Failed improve", task_type="improve", depends_on=review.id, based_on=impl.id)
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "TEST_FAILURE"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+            iterate_max_iterations=1,
+        )
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli._run_foreground") as run_foreground,
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 0
+        run_foreground.assert_not_called()
+        assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
+        assert "Needs attention:" not in output
+        assert failed_improve.id not in output
+
     def test_iterate_dry_run_approved_with_newer_unresolved_comments_prefers_run_improve(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):

@@ -30,6 +30,7 @@ _RETRY_REASONS = {
 _TIMEOUT_STYLE_REASONS = frozenset({"MAX_STEPS", "MAX_TURNS", "TIMEOUT", "TERMINATED"})
 _UNRESOLVED_RECOVERY_TERMINAL_STATUSES = frozenset({"failed", "dropped"})
 _UNRESOLVED_RECOVERY_ATTENTION_REASON = "newer-recovery-descendant-needs-attention"
+_MERGED_TARGET_RESOLUTION_TYPES = frozenset({"review", "improve", "rebase"})
 _DESCENDANT_SUPERSEDED_REASONS: tuple[tuple[str, str, str], ...] = (
     ("completed", "recovery_already_completed", "recovery descendant already completed"),
     ("in_progress", "recovery_already_running", "recovery descendant already in progress"),
@@ -315,6 +316,65 @@ def get_completed_recovery_descendant(store: SqliteTaskStore, task: DbTask) -> D
     return _build_recovery_chain_snapshot(store, task).completed_terminal_descendant
 
 
+def _resolve_impl_ancestor_by_based_on(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+    """Resolve the implementation ancestor by walking structured based_on edges."""
+    visited: set[str] = set()
+    current: DbTask | None = task
+    while current is not None:
+        if current.id is not None:
+            if current.id in visited:
+                return None
+            visited.add(current.id)
+        if current.task_type == "implement":
+            return current
+        if current.based_on is None:
+            return None
+        current = store.get(current.based_on)
+    return None
+
+
+def _resolve_review_target_implement(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+    """Resolve the implementation task a review was created to evaluate."""
+    candidate_ids = tuple(target_id for target_id in (task.depends_on, task.based_on) if target_id is not None)
+    if not candidate_ids:
+        return None
+
+    candidates: list[DbTask] = []
+    seen_ids: set[str] = set()
+    for candidate_id in candidate_ids:
+        if candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+        candidate = store.get(candidate_id)
+        if candidate is None or candidate.task_type != "implement":
+            continue
+        candidates.append(candidate)
+
+    if not candidates:
+        return None
+    unique_ids = {candidate.id for candidate in candidates}
+    if len(unique_ids) != 1:
+        return None
+    return candidates[0]
+
+
+def _resolve_merged_target_task(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+    """Return the structured implementation target for review/improve/rebase tasks."""
+    if task.task_type == "review":
+        return _resolve_review_target_implement(store, task)
+    if task.task_type in {"improve", "rebase"}:
+        return _resolve_impl_ancestor_by_based_on(store, task)
+    return None
+
+
+def is_resolved_by_merged_target(store: SqliteTaskStore, task: DbTask) -> bool:
+    """Return whether a failed side-quest task is obsolete because its target impl merged."""
+    if task.id is None or task.status != "failed" or task.task_type not in _MERGED_TARGET_RESOLUTION_TYPES:
+        return False
+    target_task = _resolve_merged_target_task(store, task)
+    return target_task is not None and target_task.merge_status == "merged"
+
+
 def resolve_recovery_planning_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
     """Return the task that should own normal lifecycle planning for this lineage."""
     if task.status != "failed":
@@ -346,6 +406,7 @@ def list_failed_tasks_for_recovery(
             if task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag)
         ]
     failed = [task for task in failed if not is_chain_resolved_by_recovery(store, task)]
+    failed = [task for task in failed if not is_resolved_by_merged_target(store, task)]
     return sort_failed_tasks(failed)
 
 
@@ -452,6 +513,15 @@ def decide_failed_task_recovery(
             task_id=task_id,
             reason_code="task_type_out_of_scope",
             reason_text=f"task type {task.task_type} is out of scope",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
+
+    if is_resolved_by_merged_target(store, task):
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="resolved_by_merged_target",
+            reason_text="target implementation already merged",
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,
         )

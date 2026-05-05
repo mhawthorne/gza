@@ -3663,7 +3663,7 @@ def test_watch_cycle_failed_improve_non_attention_skip_stays_out_of_attention_lo
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
     ):
-        result = _run_cycle(
+        _ = _run_cycle(
             config=config,
             store=store,
             batch=1,
@@ -5058,6 +5058,90 @@ def test_cmd_watch_restart_failed_dry_run_suppresses_fully_recovered_failed_ance
     assert failed_resume.id not in stdout
     assert "recovery child already completed" not in stdout
     assert "recovery descendant already completed" not in stdout
+
+
+def test_cmd_watch_restart_failed_dry_run_suppresses_failed_sidequests_with_merged_target_impl(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Merged implementation targets should silently suppress failed review/improve/rebase rows in watch recovery output."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merged_impl = store.add("Merged implementation", task_type="implement")
+    assert merged_impl.id is not None
+    merged_impl.status = "completed"
+    merged_impl.has_commits = True
+    merged_impl.merge_status = "merged"
+    merged_impl.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(merged_impl)
+
+    visible_impl = store.add("Visible implementation", task_type="implement")
+    assert visible_impl.id is not None
+    visible_impl.status = "completed"
+    visible_impl.has_commits = True
+    visible_impl.merge_status = "unmerged"
+    visible_impl.completed_at = datetime(2026, 4, 28, 10, 1, 0, tzinfo=UTC)
+    store.update(visible_impl)
+
+    failed_review = store.add("Failed review", task_type="review", depends_on=merged_impl.id, based_on=merged_impl.id)
+    failed_review.status = "failed"
+    failed_review.failure_reason = "MISSING_REPORT_ARTIFACT"
+    failed_review.completed_at = datetime(2026, 4, 28, 10, 2, 0, tzinfo=UTC)
+    store.update(failed_review)
+
+    review_for_improve = store.add("Review for improve", task_type="review", depends_on=merged_impl.id, based_on=merged_impl.id)
+    assert review_for_improve.id is not None
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        depends_on=review_for_improve.id,
+        based_on=merged_impl.id,
+    )
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "GIT_ERROR"
+    failed_improve.completed_at = datetime(2026, 4, 28, 10, 3, 0, tzinfo=UTC)
+    store.update(failed_improve)
+
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=merged_impl.id)
+    failed_rebase.status = "failed"
+    failed_rebase.failure_reason = "INTERRUPTED"
+    failed_rebase.completed_at = datetime(2026, 4, 28, 10, 4, 0, tzinfo=UTC)
+    store.update(failed_rebase)
+
+    visible_failed = store.add("Visible failed review", task_type="review", depends_on=visible_impl.id, based_on=visible_impl.id)
+    assert visible_failed.id is not None
+    visible_failed.status = "failed"
+    visible_failed.failure_reason = "MISSING_REPORT_ARTIFACT"
+    visible_failed.completed_at = datetime(2026, 4, 28, 10, 5, 0, tzinfo=UTC)
+    store.update(visible_failed)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        rc = cmd_watch(args)
+
+    stdout = capsys.readouterr().out
+    assert rc == 0
+    assert visible_failed.id in stdout
+    assert failed_review.id not in stdout
+    assert failed_improve.id not in stdout
+    assert failed_rebase.id not in stdout
+    assert "resolved_by_merged_target" not in stdout
 
 
 def test_cmd_watch_restart_failed_dry_run_keeps_failed_descendant_visible_under_completed_non_recovery_ancestor(
