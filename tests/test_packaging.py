@@ -15,14 +15,11 @@ def test_hatch_vcs_does_not_write_source_version_file() -> None:
 
 
 def test_pytest_timeout_watchdog_is_enabled_by_default() -> None:
-    """Pytest should fail hung tests quickly unless they opt into a higher limit."""
+    """Pytest should fail hung unit tests quickly under the default watchdog."""
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     pyproject_text = pyproject.read_text()
     config = tomllib.loads(pyproject_text)
-    watchdog_comment = (
-        "# Watchdog for infinite loops. Tests that legitimately exceed 5s should declare it via "
-        "@pytest.mark.timeout(N); a long list of overrides is intentional — it is the speedup backlog."
-    )
+    watchdog_comment = "# Watchdog for infinite loops in the default unit-test suite."
 
     dependency_groups = config.get("dependency-groups", {})
     dev_deps = dependency_groups.get("dev", [])
@@ -34,30 +31,25 @@ def test_pytest_timeout_watchdog_is_enabled_by_default() -> None:
     assert watchdog_comment in pyproject_text
 
 
-def test_explicit_pytest_timeout_overrides_are_bounded_when_present() -> None:
-    """Per-test timeout overrides must keep the watchdog enabled instead of disabling it."""
+def test_unit_tests_do_not_carry_pytest_timeout_overrides() -> None:
+    """Unit tests should not rely on per-test timeout overrides."""
     tests_root = Path(__file__).resolve().parents[1] / "tests"
+    timeout_overrides: list[str] = []
 
     for test_file in tests_root.rglob("test_*.py"):
         module = ast.parse(test_file.read_text(), filename=str(test_file))
         for node in ast.walk(module):
-            if not isinstance(node, ast.FunctionDef):
+            if not isinstance(node, ast.Call):
                 continue
-            for decorator in node.decorator_list:
-                if not isinstance(decorator, ast.Call):
-                    continue
-                if not (
-                    isinstance(decorator.func, ast.Attribute)
-                    and decorator.func.attr == "timeout"
-                    and isinstance(decorator.func.value, ast.Attribute)
-                    and decorator.func.value.attr == "mark"
-                    and isinstance(decorator.func.value.value, ast.Name)
-                    and decorator.func.value.value.id == "pytest"
-                ):
-                    continue
-                assert decorator.args, f"{test_file}:{node.lineno} timeout override must pass a bounded value"
-                value = decorator.args[0]
-                assert isinstance(value, ast.Constant) and isinstance(value.value, (int, float)), (
-                    f"{test_file}:{node.lineno} timeout override must use a numeric bound"
-                )
-                assert value.value > 0, f"{test_file}:{node.lineno} timeout override must be > 0"
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "timeout"
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "mark"
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "pytest"
+            ):
+                continue
+            timeout_overrides.append(f"{test_file}:{node.lineno}")
+
+    assert not timeout_overrides, f"Found timeout overrides in tests/: {timeout_overrides}"
