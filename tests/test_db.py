@@ -2248,6 +2248,19 @@ class TestFailureReasonTracking:
         assert retrieved.failure_reason is None
         assert retrieved.completion_reason is None
 
+    def test_based_on_tasks_persist_explicit_recovery_origin(self, tmp_path: Path) -> None:
+        """based_on tasks should persist explicit recovery provenance when provided."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        parent = store.add(prompt="Parent task")
+        assert parent.id is not None
+
+        child = store.add(prompt="Manual follow-up", based_on=parent.id, recovery_origin="manual")
+        assert child.recovery_origin == "manual"
+
+        reloaded = store.get(child.id)
+        assert reloaded is not None
+        assert reloaded.recovery_origin == "manual"
+
     def test_mark_failed_sets_unknown_by_default(self, tmp_path: Path):
         """mark_failed sets failure_reason='UNKNOWN' when not specified."""
         db_path = tmp_path / "test.db"
@@ -2632,6 +2645,101 @@ class TestFailureReasonTracking:
             version = conn2.execute("SELECT version FROM schema_version").fetchone()[0]
 
         assert "completion_reason" in columns
+        assert version == SCHEMA_VERSION
+
+    def test_migration_v40_to_v41_adds_recovery_origin_column(self, tmp_path: Path):
+        """Migration from v40 to v41 adds recovery_origin column."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (40)")
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                project_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'implement',
+                slug TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on TEXT,
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_steps_reported INTEGER,
+                num_steps_computed INTEGER,
+                num_turns INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                attach_count INTEGER,
+                attach_duration_seconds REAL,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                running_pid INTEGER,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on TEXT,
+                spec TEXT,
+                create_review INTEGER DEFAULT 0,
+                create_pr INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                pr_state TEXT,
+                pr_last_synced_at TEXT,
+                sync_last_synced_at TEXT,
+                model TEXT,
+                provider TEXT,
+                provider_is_explicit INTEGER DEFAULT 0,
+                urgent INTEGER DEFAULT 0,
+                urgent_bumped_at TEXT,
+                queue_position INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                merge_status TEXT,
+                merged_at TEXT,
+                failure_reason TEXT,
+                completion_reason TEXT,
+                skip_learnings INTEGER DEFAULT 0,
+                diff_files_changed INTEGER,
+                diff_lines_added INTEGER,
+                diff_lines_removed INTEGER,
+                review_cleared_at TEXT,
+                review_score INTEGER,
+                log_schema_version INTEGER DEFAULT 1,
+                execution_mode TEXT,
+                base_branch TEXT,
+                PRIMARY KEY(project_id, id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO tasks (project_id, id, prompt, status, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("default", "testproject-1", "Task before recovery origin", "pending", datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        store = SqliteTaskStore(db_path, prefix="testproject")
+        retrieved = store.get("testproject-1")
+        assert retrieved is not None
+        assert retrieved.recovery_origin is None
+
+        with sqlite3.connect(db_path) as conn2:
+            columns = {row[1] for row in conn2.execute("PRAGMA table_info(tasks)").fetchall()}
+            version = conn2.execute("SELECT version FROM schema_version").fetchone()[0]
+
+        assert "recovery_origin" in columns
         assert version == SCHEMA_VERSION
 
     def test_known_failure_reasons_set(self):
@@ -4885,7 +4993,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -4897,7 +5005,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -6987,6 +7095,40 @@ class TestSharedDbIsolationAndImportGating:
         assert history[0].completion_reason is None
         assert any("tasks.completion_reason" in warning for warning in query_store.startup_warnings())
 
+    def test_query_only_open_pre_v41_db_missing_recovery_origin_reads_with_null(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should read v40 snapshots without forcing the v41 recovery_origin migration."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before v41 recovery_origin")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        _drop_tasks_column(db_path, "recovery_origin")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 40")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            reloaded = query_store.get(task.id)
+            history = query_store.get_history(limit=None)
+        finally:
+            db_path.chmod(0o644)
+
+        assert reloaded is not None
+        assert reloaded.prompt == "Task before v41 recovery_origin"
+        assert reloaded.recovery_origin is None
+        assert [row.id for row in history] == [task.id]
+        assert history[0].recovery_origin is None
+        assert any("tasks.recovery_origin" in warning for warning in query_store.startup_warnings())
+
     def test_query_only_open_current_db_missing_create_pr_fails_closed(
         self, tmp_path: Path
     ) -> None:
@@ -7287,7 +7429,7 @@ class TestSharedDbIsolationAndImportGating:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
 
 
 class TestSyncCandidates:

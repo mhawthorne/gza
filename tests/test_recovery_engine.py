@@ -6,6 +6,7 @@ import pytest
 from gza.recovery_engine import (
     decide_failed_task_recovery,
     get_completed_recovery_descendant,
+    get_recovery_chain_state,
     get_recovery_chain_root_task_id,
     is_chain_resolved_by_recovery,
     list_failed_tasks_for_recovery,
@@ -63,7 +64,7 @@ def test_recovery_engine_review_timeout_chooses_resume(tmp_path: Path) -> None:
 
 def test_recovery_engine_existing_children_skip(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
-    child = store.add("Retry child", task_type=task.task_type, based_on=task.id)
+    child = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)
     assert child.id is not None
     child.status = "pending"
     store.update(child)
@@ -93,12 +94,12 @@ def test_recovery_engine_existing_pending_resume_child_reuses_resume_semantics(t
 def test_recovery_engine_pending_match_does_not_override_running_sibling(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
 
-    reusable_pending = store.add("Pending retry child", task_type=task.task_type, based_on=task.id)
+    reusable_pending = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)
     assert reusable_pending.id is not None
     reusable_pending.status = "pending"
     store.update(reusable_pending)
 
-    running_sibling = store.add("Running retry child", task_type=task.task_type, based_on=task.id)
+    running_sibling = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)
     assert running_sibling.id is not None
     running_sibling.status = "in_progress"
     store.update(running_sibling)
@@ -113,12 +114,12 @@ def test_recovery_engine_pending_match_does_not_override_running_sibling(tmp_pat
 def test_recovery_engine_pending_match_does_not_override_completed_sibling(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
 
-    reusable_pending = store.add("Pending retry child", task_type=task.task_type, based_on=task.id)
+    reusable_pending = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)
     assert reusable_pending.id is not None
     reusable_pending.status = "pending"
     store.update(reusable_pending)
 
-    completed_sibling = store.add("Completed retry child", task_type=task.task_type, based_on=task.id)
+    completed_sibling = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)
     assert completed_sibling.id is not None
     completed_sibling.status = "completed"
     completed_sibling.completed_at = datetime.now(UTC)
@@ -256,19 +257,24 @@ def test_recovery_engine_pending_match_stays_suppressed_by_newer_failed_descenda
     root.completed_at = datetime.now(UTC)
     store.update(root)
 
-    reusable_pending = store.add("Pending retry child", task_type=root.task_type, based_on=root.id)
+    reusable_pending = store.add(root.prompt, task_type=root.task_type, based_on=root.id, depends_on=root.depends_on)
     assert reusable_pending.id is not None
     reusable_pending.status = "pending"
     store.update(reusable_pending)
 
-    failed_sibling = store.add("Failed retry child", task_type=root.task_type, based_on=root.id)
+    failed_sibling = store.add(root.prompt, task_type=root.task_type, based_on=root.id, depends_on=root.depends_on)
     assert failed_sibling.id is not None
     failed_sibling.status = "failed"
     failed_sibling.failure_reason = "INFRASTRUCTURE_ERROR"
     failed_sibling.completed_at = datetime.now(UTC)
     store.update(failed_sibling)
 
-    failed_grandchild = store.add("Failed retry grandchild", task_type=root.task_type, based_on=failed_sibling.id)
+    failed_grandchild = store.add(
+        failed_sibling.prompt,
+        task_type=root.task_type,
+        based_on=failed_sibling.id,
+        depends_on=failed_sibling.depends_on,
+    )
     assert failed_grandchild.id is not None
     failed_grandchild.status = "failed"
     failed_grandchild.failure_reason = "MAX_TURNS"
@@ -307,7 +313,7 @@ def test_recovery_engine_skips_failed_ancestor_when_deeper_descendant_supersedes
     root.completed_at = datetime.now(UTC)
     store.update(root)
 
-    retry_child = store.add("Failed retry child", task_type="implement", based_on=root.id)
+    retry_child = store.add(root.prompt, task_type="implement", based_on=root.id, depends_on=root.depends_on)
     assert retry_child.id is not None
     retry_child.status = "failed"
     retry_child.failure_reason = "MAX_TURNS"
@@ -315,7 +321,12 @@ def test_recovery_engine_skips_failed_ancestor_when_deeper_descendant_supersedes
     retry_child.completed_at = datetime.now(UTC)
     store.update(retry_child)
 
-    grandchild = store.add("Recovery grandchild", task_type="implement", based_on=retry_child.id)
+    grandchild = store.add(
+        retry_child.prompt,
+        task_type="implement",
+        based_on=retry_child.id,
+        depends_on=retry_child.depends_on,
+    )
     assert grandchild.id is not None
     grandchild.status = descendant_status
     grandchild.session_id = root.session_id
@@ -341,7 +352,7 @@ def test_recovery_engine_only_terminal_failed_node_remains_actionable(tmp_path: 
     root.completed_at = datetime.now(UTC)
     store.update(root)
 
-    retry_child = store.add("Failed retry child", task_type="plan", based_on=root.id)
+    retry_child = store.add(root.prompt, task_type="plan", based_on=root.id, depends_on=root.depends_on)
     assert retry_child.id is not None
     retry_child.status = "failed"
     retry_child.failure_reason = "INFRASTRUCTURE_ERROR"
@@ -400,7 +411,7 @@ def test_recovery_engine_blocked_failed_task_with_pending_child_skips_until_depe
 
 def test_recovery_engine_manual_reason_with_pending_child_still_skips(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, task_type="plan", reason="TEST_FAILURE", session_id=None)
-    child = store.add("Pending retry child", task_type=task.task_type, based_on=task.id)
+    child = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)
     assert child.id is not None
     child.status = "pending"
     store.update(child)
@@ -443,7 +454,7 @@ def test_recovery_engine_prerequisite_unmerged_retries_after_dependency_merge(tm
 
 def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
-    attempt = store.add("Attempt", task_type=task.task_type, based_on=task.id)
+    attempt = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)
     assert attempt.id is not None
     attempt.status = "failed"
     attempt.failure_reason = "INFRASTRUCTURE_ERROR"
@@ -580,8 +591,8 @@ def test_recovery_engine_counts_only_based_on_chain_not_dependency_ancestry(tmp_
 def test_recovery_engine_multiple_pending_children_require_manual_review(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
 
-    first_pending = store.add("Pending retry child 1", task_type=task.task_type, based_on=task.id)
-    second_pending = store.add("Pending retry child 2", task_type=task.task_type, based_on=task.id)
+    first_pending = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)
+    second_pending = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)
     assert first_pending.id is not None
     assert second_pending.id is not None
     first_pending.status = "pending"
@@ -594,6 +605,216 @@ def test_recovery_engine_multiple_pending_children_require_manual_review(tmp_pat
     assert decision.reason_code == "manual_review_required"
     assert decision.reason_text == "multiple pending recovery children require manual review"
     assert decision.recovery_task_id is None
+
+
+def test_recovery_engine_pending_manual_follow_up_does_not_suppress_failed_parent(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/failed"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    manual_follow_up = store.add("Fresh follow-up implement", task_type="implement", based_on=failed.id)
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "pending"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    store.update(manual_follow_up)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "resume"
+    assert decision.reason_code == "MAX_TURNS"
+    assert decision.reason_text == "MAX_TURNS with preserved session"
+    assert decision.recovery_task_id is None
+    assert decision.reuse_existing is False
+
+
+def test_recovery_engine_failed_manual_follow_up_does_not_supersede_failed_parent(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed plan", task_type="plan")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    manual_follow_up = store.add("Fresh follow-up plan", task_type="plan", based_on=failed.id)
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "failed"
+    manual_follow_up.failure_reason = "MAX_TURNS"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    manual_follow_up.completed_at = datetime.now(UTC)
+    store.update(manual_follow_up)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "retry"
+    assert decision.reason_code == "INFRASTRUCTURE_ERROR"
+    assert decision.reason_text == "INFRASTRUCTURE_ERROR restart with fresh attempt"
+    assert decision.recovery_task_id is None
+    assert decision.reuse_existing is False
+
+
+def test_recovery_engine_completed_same_payload_manual_follow_up_different_session_branch_stays_non_recovery(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="plan")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed implement", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/failed"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    manual_follow_up = store.add(
+        failed.prompt,
+        task_type="implement",
+        based_on=failed.id,
+        depends_on=failed.depends_on,
+        recovery_origin="manual",
+    )
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "completed"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    manual_follow_up.completed_at = datetime.now(UTC)
+    store.update(manual_follow_up)
+
+    chain = get_recovery_chain_state(store, failed)
+    assert chain.role == "original"
+    assert chain.steps == ()
+    assert chain.root_task_id == failed.id
+    assert chain.resolved_task_id is None
+    assert is_chain_resolved_by_recovery(store, failed) is False
+    assert get_completed_recovery_descendant(store, failed) is None
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "resume"
+    assert decision.reason_code == "MAX_TURNS"
+    assert decision.recovery_task_id is None
+    assert decision.reuse_existing is False
+
+
+def test_recovery_engine_completed_same_payload_legacy_manual_follow_up_different_session_branch_stays_non_recovery(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="plan")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed implement", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/failed"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    manual_follow_up = store.add(
+        failed.prompt,
+        task_type="implement",
+        based_on=failed.id,
+        depends_on=failed.depends_on,
+    )
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "completed"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    manual_follow_up.completed_at = datetime.now(UTC)
+    store.update(manual_follow_up)
+
+    chain = get_recovery_chain_state(store, failed)
+    assert chain.role == "original"
+    assert chain.steps == ()
+    assert chain.root_task_id == failed.id
+    assert chain.resolved_task_id is None
+    assert is_chain_resolved_by_recovery(store, failed) is False
+    assert get_completed_recovery_descendant(store, failed) is None
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "resume"
+    assert decision.reason_code == "MAX_TURNS"
+    assert decision.recovery_task_id is None
+    assert decision.reuse_existing is False
+
+
+def test_recovery_engine_non_recovery_break_blocks_deeper_recovery_resolution_for_root(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed_root = store.add("Failed implement", task_type="implement")
+    assert failed_root.id is not None
+    failed_root.status = "failed"
+    failed_root.failure_reason = "MAX_TURNS"
+    failed_root.session_id = "sess-root"
+    failed_root.branch = "feature/root"
+    failed_root.completed_at = datetime.now(UTC)
+    store.update(failed_root)
+
+    manual_follow_up = store.add(
+        failed_root.prompt,
+        task_type="implement",
+        based_on=failed_root.id,
+        recovery_origin="manual",
+    )
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "failed"
+    manual_follow_up.failure_reason = "MAX_TURNS"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    manual_follow_up.completed_at = datetime.now(UTC)
+    store.update(manual_follow_up)
+
+    completed_resume = store.add(
+        manual_follow_up.prompt,
+        task_type="implement",
+        based_on=manual_follow_up.id,
+        depends_on=manual_follow_up.depends_on,
+    )
+    assert completed_resume.id is not None
+    completed_resume.status = "completed"
+    completed_resume.session_id = manual_follow_up.session_id
+    completed_resume.branch = manual_follow_up.branch
+    completed_resume.completed_at = datetime.now(UTC)
+    store.update(completed_resume)
+
+    root_chain = get_recovery_chain_state(store, failed_root)
+    assert root_chain.role == "original"
+    assert root_chain.steps == ()
+    assert root_chain.root_task_id == failed_root.id
+    assert root_chain.resolved_task_id is None
+    assert is_chain_resolved_by_recovery(store, failed_root) is False
+    assert get_completed_recovery_descendant(store, failed_root) is None
+
+    manual_chain = get_recovery_chain_state(store, manual_follow_up)
+    assert manual_chain.role == "original"
+    assert manual_chain.root_task_id == manual_follow_up.id
+    assert manual_chain.resolved_task_id == completed_resume.id
+    assert is_chain_resolved_by_recovery(store, manual_follow_up) is True
 
 
 def test_list_failed_tasks_for_recovery_sorts_oldest_created_first(

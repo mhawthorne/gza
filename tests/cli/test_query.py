@@ -185,6 +185,36 @@ class TestHistoryCommand:
         assert "Traceback" not in result.stderr
         assert "tasks.completion_reason" in result.stderr
 
+    def test_history_query_only_pre_v41_missing_recovery_origin_reads_without_traceback(
+        self, tmp_path: Path
+    ):
+        """History should read a frozen v40 snapshot without forcing the v41 additive migration."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Completed before v41")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        _drop_tasks_column(db_path, "recovery_origin")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 40")
+            conn.commit()
+
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+        try:
+            result = run_gza("history", "--project", str(tmp_path))
+        finally:
+            os.chmod(db_path, original_mode)
+
+        assert result.returncode == 0
+        assert "Completed before v41" in result.stdout
+        assert "Traceback" not in result.stdout
+        assert "Traceback" not in result.stderr
+        assert "tasks.recovery_origin" in result.stderr
+
     def test_history_reads_frozen_snapshot_without_startup_write_error(self, tmp_path: Path):
         """History should inspect a read-only snapshot without triggering startup writes."""
         setup_config(tmp_path)

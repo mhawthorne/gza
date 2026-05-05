@@ -3256,9 +3256,8 @@ class TestAdvanceCommand:
 
         assert result.returncode == 0
         assert "Needs attention" not in output
-        assert "recovery child already in progress" in output
-        assert "Started improve" not in output
-        assert [child.id for child in store.get_based_on_children(failed_improve.id)] == [running_child.id]
+        assert "Resume improve" in output
+        assert "recovery child already in progress" not in output
 
 
     def _create_failed_task(self, store, session_id="sess-abc", failure_reason="MAX_STEPS", prompt="Implement feature"):
@@ -3548,6 +3547,211 @@ class TestAdvanceCommand:
         assert failed_task.id in result.stdout
         assert manual_follow_up.id in result.stdout
         assert "Resume failed task (MAX_STEPS)" in result.stdout
+        assert "recovery child already completed" not in result.stdout
+
+    def test_advance_dry_run_keeps_failed_parent_visible_with_pending_manual_follow_up(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A pending manual based_on follow-up must not supersede the failed parent."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
+        )
+        store = make_store(tmp_path)
+
+        failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        manual_follow_up = store.add("Fresh follow-up implement", task_type="implement", based_on=failed_task.id)
+        assert manual_follow_up.id is not None
+        manual_follow_up.status = "pending"
+        manual_follow_up.session_id = "sess-manual"
+        manual_follow_up.branch = "feature/manual"
+        store.update(manual_follow_up)
+
+        with patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert failed_task.id in result.stdout
+        assert "Resume failed task (MAX_STEPS)" in result.stdout
+        assert "reason=recovery-already-pending" not in result.stdout
+        assert "recovery child already pending" not in result.stdout
+
+    def test_advance_dry_run_keeps_failed_parent_visible_with_failed_manual_follow_up(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A failed manual based_on follow-up must not supersede the failed parent."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
+        )
+        store = make_store(tmp_path)
+
+        failed_task = self._create_failed_task(store, failure_reason="INFRASTRUCTURE_ERROR", session_id=None)
+
+        manual_follow_up = store.add("Fresh follow-up implement", task_type="implement", based_on=failed_task.id)
+        assert manual_follow_up.id is not None
+        manual_follow_up.status = "failed"
+        manual_follow_up.failure_reason = "MAX_TURNS"
+        manual_follow_up.session_id = "sess-manual"
+        manual_follow_up.branch = "feature/manual"
+        manual_follow_up.completed_at = datetime.now(UTC)
+        store.update(manual_follow_up)
+
+        with patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert failed_task.id in result.stdout
+        assert manual_follow_up.id in result.stdout
+        assert "Retry failed task (INFRASTRUCTURE_ERROR)" in result.stdout
+        assert "reason=recovery-has-newer-failed-descendant" not in result.stdout
+        assert "newer failed recovery descendant" not in result.stdout
+
+    def test_advance_dry_run_keeps_failed_parent_visible_with_completed_same_payload_manual_follow_up(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A completed same-payload manual follow-up on a different session/branch must not resolve the failed parent."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
+        )
+        store = make_store(tmp_path)
+
+        dependency = store.add("Dependency", task_type="plan")
+        assert dependency.id is not None
+        dependency.status = "completed"
+        dependency.completed_at = datetime.now(UTC)
+        store.update(dependency)
+
+        failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+        failed_task.depends_on = dependency.id
+        store.update(failed_task)
+
+        manual_follow_up = store.add(
+            failed_task.prompt,
+            task_type="implement",
+            based_on=failed_task.id,
+            depends_on=failed_task.depends_on,
+            recovery_origin="manual",
+        )
+        assert manual_follow_up.id is not None
+        manual_follow_up.status = "completed"
+        manual_follow_up.session_id = "sess-manual"
+        manual_follow_up.branch = "feature/manual"
+        manual_follow_up.has_commits = True
+        manual_follow_up.merge_status = "unmerged"
+        manual_follow_up.completed_at = datetime.now(UTC)
+        store.update(manual_follow_up)
+
+        with patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert failed_task.id in result.stdout
+        assert manual_follow_up.id in result.stdout
+        assert "Resume failed task (MAX_STEPS)" in result.stdout
+        assert "recovery child already completed" not in result.stdout
+
+    def test_advance_dry_run_keeps_failed_parent_visible_with_completed_same_payload_legacy_manual_follow_up(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A legacy same-payload manual follow-up on a different session/branch must not resolve the failed parent."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
+        )
+        store = make_store(tmp_path)
+
+        dependency = store.add("Dependency", task_type="plan")
+        assert dependency.id is not None
+        dependency.status = "completed"
+        dependency.completed_at = datetime.now(UTC)
+        store.update(dependency)
+
+        failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+        failed_task.depends_on = dependency.id
+        store.update(failed_task)
+
+        manual_follow_up = store.add(
+            failed_task.prompt,
+            task_type="implement",
+            based_on=failed_task.id,
+            depends_on=failed_task.depends_on,
+        )
+        assert manual_follow_up.id is not None
+        manual_follow_up.status = "completed"
+        manual_follow_up.session_id = "sess-manual"
+        manual_follow_up.branch = "feature/manual"
+        manual_follow_up.has_commits = True
+        manual_follow_up.merge_status = "unmerged"
+        manual_follow_up.completed_at = datetime.now(UTC)
+        store.update(manual_follow_up)
+
+        with patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert failed_task.id in result.stdout
+        assert manual_follow_up.id in result.stdout
+        assert "Resume failed task (MAX_STEPS)" in result.stdout
+        assert "recovery child already completed" not in result.stdout
+
+    def test_advance_dry_run_keeps_failed_root_visible_across_non_recovery_break_with_resolved_grandchild(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A deeper resolved chain below a non-recovery break must not suppress the original failed root."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "advance_requires_review: false\n"
+        )
+        store = make_store(tmp_path)
+
+        failed_root = self._create_failed_task(store, session_id="sess-root", failure_reason="MAX_TURNS")
+
+        manual_follow_up = store.add(
+            failed_root.prompt,
+            task_type="implement",
+            based_on=failed_root.id,
+            recovery_origin="manual",
+        )
+        assert manual_follow_up.id is not None
+        manual_follow_up.status = "failed"
+        manual_follow_up.failure_reason = "MAX_TURNS"
+        manual_follow_up.session_id = "sess-manual"
+        manual_follow_up.branch = "feature/manual"
+        manual_follow_up.completed_at = datetime.now(UTC)
+        store.update(manual_follow_up)
+
+        completed_resume = store.add(manual_follow_up.prompt, task_type="implement", based_on=manual_follow_up.id)
+        assert completed_resume.id is not None
+        completed_resume.status = "completed"
+        completed_resume.session_id = manual_follow_up.session_id
+        completed_resume.branch = manual_follow_up.branch
+        completed_resume.has_commits = True
+        completed_resume.merge_status = "unmerged"
+        completed_resume.completed_at = datetime.now(UTC)
+        store.update(completed_resume)
+
+        with patch("gza.cli.Git", return_value=self._mock_git(current_branch="main", can_merge=True)):
+            result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert failed_root.id in result.stdout
+        assert completed_resume.id in result.stdout
+        assert "Resume failed task (MAX_TURNS)" in result.stdout
+        assert "recovery child already completed" not in result.stdout
+        assert "recovery descendant already completed" not in result.stdout
 
     def test_advance_specific_failed_task_id_uses_completed_recovery_descendant_when_chain_is_resolved(
         self,

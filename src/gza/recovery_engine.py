@@ -60,6 +60,8 @@ class FailedRecoveryDecision:
 class RecoveryChainState:
     role: RecoveryRole
     steps: tuple[RecoveryRole, ...]
+    root_task_id: str | None = None
+    resolved_task_id: str | None = None
 
     @property
     def has_retry(self) -> bool:
@@ -70,68 +72,48 @@ class RecoveryChainState:
         return "resume" in self.steps
 
 
+@dataclass(frozen=True)
+class _RecoveryChainSnapshot:
+    root_task: DbTask
+    ancestor_ids: tuple[str, ...]
+    steps: tuple[RecoveryRole, ...]
+    descendants: tuple[DbTask, ...]
+    direct_children: tuple[DbTask, ...]
+    deeper_descendants: tuple[DbTask, ...]
+    terminal_descendants: tuple[DbTask, ...]
+    completed_terminal_descendant: DbTask | None
+
+
+def _matches_shared_recovery_payload(parent: DbTask, child: DbTask) -> bool:
+    """Return whether the child still matches the payload copied by recovery helpers."""
+    return (
+        child.prompt == parent.prompt
+        and child.depends_on == parent.depends_on
+        and child.tags == parent.tags
+        and child.spec == parent.spec
+        and child.create_review == parent.create_review
+        and child.create_pr == parent.create_pr
+        and child.task_type_hint == parent.task_type_hint
+    )
+
+
+def _matches_retry_recovery_invariants(parent: DbTask, child: DbTask) -> bool:
+    """Return whether the child still looks like a retry created by shared helpers."""
+    if not _matches_shared_recovery_payload(parent, child):
+        return False
+    if child.same_branch == parent.same_branch:
+        return True
+    return bool(parent.same_branch and parent.branch and not child.same_branch and child.base_branch == parent.branch)
+
+
 def _is_manual_non_recovery_follow_up_edge(parent: DbTask, child: DbTask) -> bool:
     """Return whether a same-type based_on edge looks like an explicit follow-up, not recovery."""
-    return (
-        child.status == "completed"
-        and parent.session_id is not None
-        and child.session_id is not None
-        and parent.session_id != child.session_id
-        and parent.branch is not None
-        and child.branch is not None
-        and parent.branch != child.branch
-        and child.prompt != parent.prompt
-    )
+    return not _matches_retry_recovery_invariants(parent, child)
 
 
 def _is_retry_recovery_edge(parent: DbTask, child: DbTask) -> bool:
     """Return whether a based_on edge should count as a fresh retry attempt."""
     return not _is_manual_non_recovery_follow_up_edge(parent, child)
-
-
-def list_failed_tasks_for_recovery(
-    store: SqliteTaskStore,
-    *,
-    tags: tuple[str, ...] | None = None,
-    any_tag: bool = False,
-) -> list[DbTask]:
-    failed = [task for task in store.get_all() if task.status == "failed"]
-    if tags:
-        from .task_query import normalize_tag_filters, task_matches_tag_filters
-
-        normalized = normalize_tag_filters(tags)
-        failed = [
-            task
-            for task in failed
-            if task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag)
-        ]
-    failed = [task for task in failed if not is_chain_resolved_by_recovery(store, task)]
-    return sort_failed_tasks(failed)
-
-
-def _same_type_recovery_descendants(store: SqliteTaskStore, task: DbTask) -> list[DbTask]:
-    if task.id is None:
-        return []
-
-    descendants: list[DbTask] = []
-    queue: list[DbTask] = [task]
-    seen: set[str] = set()
-
-    while queue:
-        parent = queue.pop(0)
-        if parent.id is None:
-            continue
-        for child in store.get_based_on_children_by_type(parent.id, task.task_type):
-            child_id = child.id
-            if child_id is None or child_id in seen:
-                continue
-            if _classify_recovery_edge(parent, child) is None:
-                continue
-            seen.add(child_id)
-            descendants.append(child)
-            queue.append(child)
-
-    return descendants
 
 
 def classify_failure_reason(reason: str | None) -> FailureCategory:
@@ -165,25 +147,69 @@ def _is_resume_recovery_edge(parent: DbTask, child: DbTask) -> bool:
     return True
 
 
-def _classify_recovery_edge(parent: DbTask, child: DbTask) -> RecoveryRole | None:
+def _is_legacy_ambiguous_manual_follow_up(parent: DbTask, child: DbTask) -> bool:
+    """Return whether a legacy same-payload edge lacks enough evidence to count as recovery.
+
+    Pre-v41 rows do not persist recovery provenance. When both the session and
+    branch changed across a same-payload based_on edge, and the child lacks the
+    retry helper's same-branch fork signature, treat the edge as a manual
+    follow-up instead of silently suppressing the failed parent.
+    """
+    if not _matches_shared_recovery_payload(parent, child):
+        return False
+    if parent.session_id is None or child.session_id is None:
+        return False
+    if parent.branch is None or child.branch is None:
+        return False
+    if parent.session_id == child.session_id or parent.branch == child.branch:
+        return False
+    if parent.same_branch and child.base_branch == parent.branch and not child.same_branch:
+        return False
+    return True
+
+
+def _classify_legacy_recovery_edge(parent: DbTask, child: DbTask) -> RecoveryRole | None:
     if _is_resume_recovery_edge(parent, child):
         return "resume"
+    if _is_legacy_ambiguous_manual_follow_up(parent, child):
+        return None
     if _is_retry_recovery_edge(parent, child):
         return "retry"
     return None
 
 
-def get_recovery_chain_state(store: SqliteTaskStore, task: DbTask) -> RecoveryChainState:
-    steps_reversed: list[RecoveryRole] = []
-    current = task
-    seen: set[str] = set()
+def _classify_recovery_edge(parent: DbTask, child: DbTask) -> RecoveryRole | None:
+    if parent.task_type != child.task_type:
+        return None
+    if child.recovery_origin == "manual":
+        return None
+    if child.recovery_origin == "resume":
+        return "resume" if _is_resume_recovery_edge(parent, child) else None
+    if child.recovery_origin == "retry":
+        return "retry" if _matches_retry_recovery_invariants(parent, child) else None
+    return _classify_legacy_recovery_edge(parent, child)
 
-    while current.id is not None and current.id not in seen:
-        seen.add(current.id)
+
+def _descendant_sort_key(descendant: DbTask) -> tuple[datetime, int]:
+    when = descendant.completed_at or descendant.created_at or datetime.min
+    if when.tzinfo is not None:
+        when = when.astimezone(UTC).replace(tzinfo=None)
+    return (when, task_id_numeric_key(descendant.id))
+
+
+def _build_recovery_chain_snapshot(store: SqliteTaskStore, task: DbTask) -> _RecoveryChainSnapshot:
+    steps_reversed: list[RecoveryRole] = []
+    ancestor_ids_reversed: list[str] = []
+    current = task
+    seen_ancestors: set[str] = set()
+
+    while current.id is not None and current.id not in seen_ancestors:
+        seen_ancestors.add(current.id)
+        ancestor_ids_reversed.append(current.id)
         if not current.based_on:
             break
         parent = store.get(current.based_on)
-        if parent is None or parent.task_type != current.task_type or parent.id is None:
+        if parent is None or parent.id is None:
             break
         edge = _classify_recovery_edge(parent, current)
         if edge is None:
@@ -191,30 +217,78 @@ def get_recovery_chain_state(store: SqliteTaskStore, task: DbTask) -> RecoveryCh
         steps_reversed.append(edge)
         current = parent
 
-    steps = tuple(reversed(steps_reversed))
+    descendants: list[DbTask] = []
+    direct_children: list[DbTask] = []
+    queue: list[DbTask] = [task]
+    seen_descendants: set[str] = set()
+
+    while queue:
+        parent = queue.pop(0)
+        if parent.id is None:
+            continue
+        for child in store.get_based_on_children_by_type(parent.id, task.task_type):
+            child_id = child.id
+            if child_id is None or child_id in seen_descendants:
+                continue
+            if _classify_recovery_edge(parent, child) is None:
+                continue
+            seen_descendants.add(child_id)
+            if parent.id == task.id:
+                direct_children.append(child)
+            descendants.append(child)
+            queue.append(child)
+
+    descendant_ids = {descendant.id for descendant in descendants if descendant.id is not None}
+    direct_child_ids = {child.id for child in direct_children if child.id is not None}
+    parent_ids_with_recovery_children = {
+        descendant.based_on
+        for descendant in descendants
+        if descendant.based_on is not None and descendant.based_on in descendant_ids
+    }
+    terminal_descendants = [
+        descendant
+        for descendant in descendants
+        if descendant.id is not None and descendant.id not in parent_ids_with_recovery_children
+    ]
+    completed_terminal_descendant: DbTask | None = None
+    if terminal_descendants and all(descendant.status == "completed" for descendant in terminal_descendants):
+        completed_terminal_descendant = max(terminal_descendants, key=_descendant_sort_key)
+
+    return _RecoveryChainSnapshot(
+        root_task=current,
+        ancestor_ids=tuple(reversed(ancestor_ids_reversed)),
+        steps=tuple(reversed(steps_reversed)),
+        descendants=tuple(descendants),
+        direct_children=tuple(direct_children),
+        deeper_descendants=tuple(
+            descendant for descendant in descendants if descendant.id is not None and descendant.id not in direct_child_ids
+        ),
+        terminal_descendants=tuple(terminal_descendants),
+        completed_terminal_descendant=completed_terminal_descendant,
+    )
+
+
+def get_recovery_chain_state(store: SqliteTaskStore, task: DbTask) -> RecoveryChainState:
+    snapshot = _build_recovery_chain_snapshot(store, task)
+    steps = snapshot.steps
     if not steps:
-        return RecoveryChainState(role="original", steps=())
-    return RecoveryChainState(role=steps[-1], steps=steps)
+        return RecoveryChainState(
+            role="original",
+            steps=(),
+            root_task_id=snapshot.root_task.id,
+            resolved_task_id=snapshot.completed_terminal_descendant.id if snapshot.completed_terminal_descendant else None,
+        )
+    return RecoveryChainState(
+        role=steps[-1],
+        steps=steps,
+        root_task_id=snapshot.root_task.id,
+        resolved_task_id=snapshot.completed_terminal_descendant.id if snapshot.completed_terminal_descendant else None,
+    )
 
 
 def get_recovery_chain_root_task_id(store: SqliteTaskStore, task: DbTask) -> str | None:
     """Return the recovery-only lineage root for a task."""
-    if task.id is None:
-        return None
-
-    current = task
-    seen: set[str] = set()
-    while current.id is not None and current.id not in seen:
-        seen.add(current.id)
-        if current.based_on is None:
-            break
-        parent = store.get(current.based_on)
-        if parent is None or parent.task_type != current.task_type or parent.id is None:
-            break
-        if _classify_recovery_edge(parent, current) is None:
-            break
-        current = parent
-    return current.id
+    return _build_recovery_chain_snapshot(store, task).root_task.id
 
 
 def has_recovery_chain_ancestor_in_ids(
@@ -223,27 +297,12 @@ def has_recovery_chain_ancestor_in_ids(
     ancestor_ids: set[str],
 ) -> bool:
     """Return whether this failed task is owned by a completed task already in the plan."""
-    current = task
-    seen: set[str] = set()
-
-    while current.id is not None and current.id not in seen:
-        seen.add(current.id)
-        if current.based_on is None:
-            return False
-        parent = store.get(current.based_on)
-        if parent is None or parent.id is None:
-            return False
-        # Implement roots own their improve lineage through the shared improve
-        # planner, even though the improve chain itself is cross-type.
-        if current.task_type in {"improve", "rebase"} and parent.task_type == "implement":
-            return parent.id in ancestor_ids
-        if parent.task_type != current.task_type:
-            return False
-        if _classify_recovery_edge(parent, current) is None:
-            return False
-        if parent.id in ancestor_ids:
-            return True
-        current = parent
+    snapshot = _build_recovery_chain_snapshot(store, task)
+    if any(task_id in ancestor_ids for task_id in snapshot.ancestor_ids[:-1]):
+        return True
+    parent = store.get(snapshot.root_task.based_on) if snapshot.root_task.based_on else None
+    if parent and parent.id and snapshot.root_task.task_type in {"improve", "rebase"} and parent.task_type == "implement":
+        return parent.id in ancestor_ids
     return False
 
 
@@ -251,37 +310,7 @@ def get_completed_recovery_descendant(store: SqliteTaskStore, task: DbTask) -> D
     """Return the terminal completed recovery descendant when a failed chain is fully resolved."""
     if task.id is None or task.status != "failed":
         return None
-
-    descendants = _same_type_recovery_descendants(store, task)
-    if not descendants:
-        return None
-
-    descendant_ids = {descendant.id for descendant in descendants if descendant.id is not None}
-    parent_ids_with_recovery_children = {
-        descendant.based_on
-        for descendant in descendants
-        if descendant.based_on is not None and descendant.based_on != task.id and descendant.based_on in descendant_ids
-    }
-    terminal_descendants = [
-        descendant
-        for descendant in descendants
-        if descendant.id is not None and descendant.id not in parent_ids_with_recovery_children
-    ]
-    if not terminal_descendants:
-        return None
-    if any(descendant.status != "completed" for descendant in terminal_descendants):
-        return None
-
-    def _descendant_sort_key(descendant: DbTask) -> tuple[datetime, int]:
-        when = descendant.completed_at or descendant.created_at or datetime.min
-        if when.tzinfo is not None:
-            when = when.astimezone(UTC).replace(tzinfo=None)
-        return (when, task_id_numeric_key(descendant.id))
-
-    return max(
-        terminal_descendants,
-        key=_descendant_sort_key,
-    )
+    return _build_recovery_chain_snapshot(store, task).completed_terminal_descendant
 
 
 def resolve_recovery_planning_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
@@ -293,7 +322,29 @@ def resolve_recovery_planning_task(store: SqliteTaskStore, task: DbTask) -> DbTa
 
 def is_chain_resolved_by_recovery(store: SqliteTaskStore, task: DbTask) -> bool:
     """Return whether a failed task's recovery-only chain ends in a completed task."""
-    return get_completed_recovery_descendant(store, task) is not None
+    if task.id is None or task.status != "failed":
+        return False
+    return _build_recovery_chain_snapshot(store, task).completed_terminal_descendant is not None
+
+
+def list_failed_tasks_for_recovery(
+    store: SqliteTaskStore,
+    *,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = False,
+) -> list[DbTask]:
+    failed = [task for task in store.get_all() if task.status == "failed"]
+    if tags:
+        from .task_query import normalize_tag_filters, task_matches_tag_filters
+
+        normalized = normalize_tag_filters(tags)
+        failed = [
+            task
+            for task in failed
+            if task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag)
+        ]
+    failed = [task for task in failed if not is_chain_resolved_by_recovery(store, task)]
+    return sort_failed_tasks(failed)
 
 
 def _policy_attempt_counters(
@@ -370,6 +421,7 @@ def decide_failed_task_recovery(
     task_id = str(task.id)
     launch_mode: Literal["iterate", "worker", "none"] = "iterate" if task.task_type == "implement" else "worker"
     chain = get_recovery_chain_state(store, task)
+    snapshot = _build_recovery_chain_snapshot(store, task)
     attempt_index, attempt_limit = _policy_attempt_counters(
         chain,
         max_recovery_attempts=max_recovery_attempts,
@@ -458,9 +510,8 @@ def decide_failed_task_recovery(
         child for child in recovery_children
         if _classify_recovery_edge(task, child) == expected_action
     ]
-    descendants = _same_type_recovery_descendants(store, task)
-    direct_child_ids = {child.id for child in recovery_children if child.id is not None}
-    deeper_descendants = [child for child in descendants if child.id not in direct_child_ids]
+    descendants = list(snapshot.descendants)
+    deeper_descendants = list(snapshot.deeper_descendants)
     pending_children = [child for child in matching_children if child.status == "pending" and child.id is not None]
     all_pending_children = [child for child in recovery_children if child.status == "pending" and child.id is not None]
 
@@ -590,7 +641,7 @@ def _get_failed_recovery_needs_attention_reason(
 
     failed_descendants = [
         descendant
-        for descendant in _same_type_recovery_descendants(store, task)
+        for descendant in _build_recovery_chain_snapshot(store, task).descendants
         if descendant.status == "failed" and descendant.id is not None
     ]
     for descendant in sort_failed_tasks(failed_descendants):

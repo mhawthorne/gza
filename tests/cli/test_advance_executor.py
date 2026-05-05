@@ -248,10 +248,11 @@ def test_improve_skip_without_attention_for_shared_non_attention_recovery_reason
         store.update(failed_improve)
 
         running_child = store.add(
-            "Running child",
+            failed_improve.prompt,
             task_type="improve",
             based_on=failed_improve.id,
-            depends_on=impl.id,
+            depends_on=failed_improve.depends_on,
+            same_branch=failed_improve.same_branch,
         )
         assert running_child.id is not None
         running_child.status = "in_progress"

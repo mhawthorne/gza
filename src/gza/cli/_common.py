@@ -1580,6 +1580,7 @@ def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask
         model=original_task.model,
         provider=original_task.provider if preserve_provider else None,
         provider_is_explicit=preserve_provider,
+        recovery_origin="resume",
     )
     # Copy session_id and branch from original task so the resumed run
     # continues the Claude Code session and uses the same branch.
@@ -1618,6 +1619,7 @@ def _create_retry_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask:
         provider=original_task.provider if original_task.provider_is_explicit else None,
         provider_is_explicit=original_task.provider_is_explicit,
         base_branch=retry_base_branch,
+        recovery_origin="retry",
     )
 
 

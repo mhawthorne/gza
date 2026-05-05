@@ -707,6 +707,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     provider = args.provider if hasattr(args, 'provider') and args.provider else None
     skip_learnings = args.skip_learnings if hasattr(args, 'skip_learnings') and args.skip_learnings else False
     mark_next = bool(getattr(args, "next", False))
+    recovery_origin = "manual" if based_on else None
 
     # Validation: --spec must reference an existing file
     if spec:
@@ -766,6 +767,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type_hint=branch_type,
             model=model,
             provider=provider,
+            recovery_origin=recovery_origin,
             skip_learnings=skip_learnings,
         )
         if mark_next:
@@ -789,6 +791,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type_hint=branch_type,
             model=model,
             provider=provider,
+            recovery_origin=recovery_origin,
             skip_learnings=skip_learnings,
         )
         if not new_task:
@@ -813,6 +816,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             task_type_hint=branch_type,
             model=model,
             provider=provider,
+            recovery_origin=recovery_origin,
             skip_learnings=skip_learnings,
         )
         if mark_next:
@@ -981,6 +985,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     # Handle --based-on flag (lineage/parent relationship)
     if based_on_id is not None:
         task.based_on = based_on_id
+        task.recovery_origin = "manual"
         update_messages.append(f"✓ Set task {task.id} based_on task {based_on_id}")
         changed = True
 
