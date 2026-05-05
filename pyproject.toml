@@ -60,8 +60,7 @@ fallback-version = "0.1.0.dev0"
 testpaths = ["tests"]
 addopts = ""
 pythonpath = ["."]
-# Watchdog for infinite loops. If discovery finds a legitimately slow test, annotate it with a bounded
-# @pytest.mark.timeout(N) override rather than weakening the suite-wide 5s default.
+# Watchdog for infinite loops. Tests that legitimately exceed 5s should declare it via @pytest.mark.timeout(N); a long list of overrides is intentional — it is the speedup backlog.
 timeout = 5
 timeout_method = "thread"
 markers = [

@@ -19,6 +19,10 @@ def test_pytest_timeout_watchdog_is_enabled_by_default() -> None:
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     pyproject_text = pyproject.read_text()
     config = tomllib.loads(pyproject_text)
+    watchdog_comment = (
+        "# Watchdog for infinite loops. Tests that legitimately exceed 5s should declare it via "
+        "@pytest.mark.timeout(N); a long list of overrides is intentional — it is the speedup backlog."
+    )
 
     dependency_groups = config.get("dependency-groups", {})
     dev_deps = dependency_groups.get("dev", [])
@@ -27,8 +31,7 @@ def test_pytest_timeout_watchdog_is_enabled_by_default() -> None:
     pytest_options = config.get("tool", {}).get("pytest", {}).get("ini_options", {})
     assert pytest_options.get("timeout") == 5
     assert pytest_options.get("timeout_method") == "thread"
-    assert "bounded" in pyproject_text
-    assert "rather than weakening the suite-wide 5s default" in pyproject_text
+    assert watchdog_comment in pyproject_text
 
 
 def test_explicit_pytest_timeout_overrides_are_bounded_when_present() -> None:
