@@ -2516,7 +2516,9 @@ def _cmd_show_output(
             include_explanation=bool(log_path and log_path.exists()),
         )
 
-        if diagnostics.reason in {"MAX_STEPS", "MAX_TURNS"}:
+        guidance_reason = "AGENT_FORFEIT" if diagnostics.marker_reason == "AGENT_FORFEIT" else diagnostics.reason
+
+        if diagnostics.reason in {"MAX_STEPS", "MAX_TURNS"} and guidance_reason != "AGENT_FORFEIT":
             _, _, effective_max_steps = get_effective_config_for_task(task, config)
             steps_used = task.num_steps_reported if task.num_steps_reported is not None else task.num_steps_computed
             if steps_used is not None:
@@ -2531,7 +2533,7 @@ def _cmd_show_output(
                     f"[{c['value']}]{turns_used}[/{c['value']}]"
                 )
 
-        next_step_commands = _failure_next_steps(task, diagnostics.reason, config=config)
+        next_step_commands = _failure_next_steps(task, guidance_reason, config=config)
         if next_step_commands:
             console.print(f"[{c['label']}]Next Steps:[/{c['label']}]")
             for command in next_step_commands:
