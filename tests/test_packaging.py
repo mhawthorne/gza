@@ -27,7 +27,7 @@ def test_pytest_timeout_watchdog_is_enabled_by_default() -> None:
 
     pytest_options = config.get("tool", {}).get("pytest", {}).get("ini_options", {})
     assert pytest_options.get("timeout") == 5
-    assert pytest_options.get("timeout_method") == "thread"
+    assert pytest_options.get("timeout_method") == "signal"
     assert watchdog_comment in pyproject_text
 
 
