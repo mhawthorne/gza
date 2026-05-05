@@ -6801,7 +6801,7 @@ class TestIterateCommand:
         assert result.returncode == 3
         output = result.stdout + (result.stderr or "")
         assert output.count("Needs attention:") == 1
-        assert "reason=newer-failed-recovery-descendant-needs-attention" in output
+        assert "reason=newer-recovery-descendant-needs-attention" in output
         assert "Cannot resume failed implementation" not in output
 
     def test_failed_task_resume_does_not_reuse_pending_same_session_child_with_mismatched_role(self, tmp_path: Path):

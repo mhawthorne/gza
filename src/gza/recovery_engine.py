@@ -28,6 +28,8 @@ _RETRY_REASONS = {
     "NO_ACTIVITY",
 }
 _TIMEOUT_STYLE_REASONS = frozenset({"MAX_STEPS", "MAX_TURNS", "TIMEOUT", "TERMINATED"})
+_UNRESOLVED_RECOVERY_TERMINAL_STATUSES = frozenset({"failed", "dropped"})
+_UNRESOLVED_RECOVERY_ATTENTION_REASON = "newer-recovery-descendant-needs-attention"
 _DESCENDANT_SUPERSEDED_REASONS: tuple[tuple[str, str, str], ...] = (
     ("completed", "recovery_already_completed", "recovery descendant already completed"),
     ("in_progress", "recovery_already_running", "recovery descendant already in progress"),
@@ -361,6 +363,15 @@ def _policy_attempt_counters(
     return (attempt_index, attempt_limit)
 
 
+def _list_unresolved_recovery_terminal_descendants(snapshot: _RecoveryChainSnapshot) -> list[DbTask]:
+    """Return terminal recovery descendants that leave the chain unresolved."""
+    return [
+        descendant
+        for descendant in snapshot.terminal_descendants
+        if descendant.status in _UNRESOLVED_RECOVERY_TERMINAL_STATUSES and descendant.id is not None
+    ]
+
+
 def _expected_recovery_action(
     task: DbTask,
     *,
@@ -510,7 +521,6 @@ def decide_failed_task_recovery(
         child for child in recovery_children
         if _classify_recovery_edge(task, child) == expected_action
     ]
-    descendants = list(snapshot.descendants)
     deeper_descendants = list(snapshot.deeper_descendants)
     pending_children = [child for child in matching_children if child.status == "pending" and child.id is not None]
     all_pending_children = [child for child in recovery_children if child.status == "pending" and child.id is not None]
@@ -533,11 +543,11 @@ def decide_failed_task_recovery(
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,
             )
-    if any(child.status == "failed" for child in descendants):
+    if _list_unresolved_recovery_terminal_descendants(snapshot):
         return _skip_decision(
             task_id=task_id,
-            reason_code="recovery_has_newer_failed_descendant",
-            reason_text="a newer failed recovery descendant must be recovered first",
+            reason_code="recovery_has_newer_unresolved_descendant",
+            reason_text="a newer recovery descendant requires manual attention first",
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,
         )
@@ -636,15 +646,15 @@ def _get_failed_recovery_needs_attention_reason(
         if decision.attempt_limit > 0 and decision.attempt_index >= decision.attempt_limit:
             return "max-resume-attempts-reached"
         return "manual-review-required"
-    if decision.reason_code != "recovery_has_newer_failed_descendant":
+    if decision.reason_code != "recovery_has_newer_unresolved_descendant":
         return None
 
-    failed_descendants = [
-        descendant
-        for descendant in _build_recovery_chain_snapshot(store, task).descendants
-        if descendant.status == "failed" and descendant.id is not None
-    ]
-    for descendant in sort_failed_tasks(failed_descendants):
+    unresolved_descendants = sort_failed_tasks(
+        _list_unresolved_recovery_terminal_descendants(_build_recovery_chain_snapshot(store, task))
+    )
+    for descendant in unresolved_descendants:
+        if descendant.status == "dropped":
+            return _UNRESOLVED_RECOVERY_ATTENTION_REASON
         descendant_decision = decide_failed_task_recovery(
             store,
             descendant,
@@ -658,5 +668,5 @@ def _get_failed_recovery_needs_attention_reason(
             seen_task_ids=seen_task_ids,
         )
         if descendant_reason is not None:
-            return "newer-failed-recovery-descendant-needs-attention"
+            return _UNRESOLVED_RECOVERY_ATTENTION_REASON
     return None

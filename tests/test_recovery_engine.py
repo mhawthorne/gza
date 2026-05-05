@@ -6,6 +6,7 @@ import pytest
 from gza.recovery_engine import (
     decide_failed_task_recovery,
     get_completed_recovery_descendant,
+    get_failed_recovery_needs_attention_reason,
     get_recovery_chain_state,
     get_recovery_chain_root_task_id,
     is_chain_resolved_by_recovery,
@@ -284,7 +285,7 @@ def test_recovery_engine_pending_match_stays_suppressed_by_newer_failed_descenda
 
     decision = decide_failed_task_recovery(store, root, max_recovery_attempts=3)
     assert decision.action == "skip"
-    assert decision.reason_code == "recovery_has_newer_failed_descendant"
+    assert decision.reason_code == "recovery_has_newer_unresolved_descendant"
     assert decision.recovery_task_id is None
     assert decision.reuse_existing is False
 
@@ -361,11 +362,93 @@ def test_recovery_engine_only_terminal_failed_node_remains_actionable(tmp_path: 
 
     root_decision = decide_failed_task_recovery(store, root, max_recovery_attempts=3)
     assert root_decision.action == "skip"
-    assert root_decision.reason_code == "recovery_has_newer_failed_descendant"
+    assert root_decision.reason_code == "recovery_has_newer_unresolved_descendant"
 
     child_decision = decide_failed_task_recovery(store, retry_child, max_recovery_attempts=3)
     assert child_decision.action == "skip"
     assert child_decision.reason_code == "manual_review_required"
+
+
+def test_recovery_engine_dropped_recovery_child_requires_shared_attention(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="implement")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "MAX_TURNS"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    dropped_resume = store.add(root.prompt, task_type=root.task_type, based_on=root.id, depends_on=root.depends_on)
+    assert dropped_resume.id is not None
+    dropped_resume.status = "dropped"
+    dropped_resume.session_id = root.session_id
+    dropped_resume.branch = root.branch
+    dropped_resume.completed_at = datetime.now(UTC)
+    store.update(dropped_resume)
+
+    decision = decide_failed_task_recovery(store, root, max_recovery_attempts=3)
+    assert decision.action == "skip"
+    assert decision.reason_code == "recovery_has_newer_unresolved_descendant"
+    assert decision.recovery_task_id is None
+    assert decision.reuse_existing is False
+    assert get_failed_recovery_needs_attention_reason(store, root, decision=decision, max_recovery_attempts=3) == (
+        "newer-recovery-descendant-needs-attention"
+    )
+    assert is_chain_resolved_by_recovery(store, root) is False
+
+
+def test_recovery_engine_failed_then_dropped_recovery_descendant_requires_shared_attention(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="implement")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "MAX_TURNS"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type=root.task_type, based_on=root.id, depends_on=root.depends_on)
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "MAX_TURNS"
+    failed_resume.session_id = root.session_id
+    failed_resume.branch = root.branch
+    failed_resume.completed_at = datetime.now(UTC)
+    store.update(failed_resume)
+
+    dropped_grandchild = store.add(
+        failed_resume.prompt,
+        task_type=failed_resume.task_type,
+        based_on=failed_resume.id,
+        depends_on=failed_resume.depends_on,
+    )
+    assert dropped_grandchild.id is not None
+    dropped_grandchild.status = "dropped"
+    dropped_grandchild.session_id = failed_resume.session_id
+    dropped_grandchild.branch = failed_resume.branch
+    dropped_grandchild.completed_at = datetime.now(UTC)
+    store.update(dropped_grandchild)
+
+    root_decision = decide_failed_task_recovery(store, root, max_recovery_attempts=3)
+    assert root_decision.action == "skip"
+    assert root_decision.reason_code == "recovery_has_newer_unresolved_descendant"
+    assert (
+        get_failed_recovery_needs_attention_reason(store, root, decision=root_decision, max_recovery_attempts=3)
+        == "newer-recovery-descendant-needs-attention"
+    )
+
+    child_decision = decide_failed_task_recovery(store, failed_resume, max_recovery_attempts=3)
+    assert child_decision.action == "skip"
+    assert child_decision.reason_code == "manual_review_required"
+    assert is_chain_resolved_by_recovery(store, root) is False
+    assert is_chain_resolved_by_recovery(store, failed_resume) is False
 
 
 def test_recovery_engine_blocked_failed_task_with_pending_child_skips_until_dependency_ready(

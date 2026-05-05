@@ -4930,7 +4930,7 @@ def test_cmd_watch_restart_failed_dry_run_hides_skipped_by_default_and_sorts_old
     assert f'{exhausted_child.id} implement "Failed resume attempt" reason=max-resume-attempts-reached' in normalized
     assert "automatic recovery stops here; manual review required" in normalized
     assert f"{exhausted_root.id} implement" in normalized
-    assert "reason=newer-failed-recovery-descendant-needs-attention" in normalized
+    assert "reason=newer-recovery-descendant-needs-attention" in normalized
     assert "2 actionable (0 resume, 2 retry), 3 needs attention, 1 skipped hidden" in normalized
 
 
@@ -5232,8 +5232,8 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_faile
     assert failed.id in stdout
     assert manual_follow_up.id in stdout
     assert "retry  " in stdout
-    assert "reason=recovery_has_newer_failed_descendant" not in stdout
-    assert "newer failed recovery descendant" not in stdout
+    assert "reason=recovery_has_newer_unresolved_descendant" not in stdout
+    assert "newer recovery descendant" not in stdout
 
 
 def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_completed_same_payload_manual_follow_up(

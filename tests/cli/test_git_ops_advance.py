@@ -3370,7 +3370,6 @@ class TestAdvanceCommand:
         result = run_gza("advance", "--auto", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "a newer failed recovery descendant must be recovered first" in result.stdout
         assert f"Started iterate resume for {first_resume.id}" in result.stdout
         first_resume_children = store.get_based_on_children(first_resume.id)
         assert len(first_resume_children) == 0
@@ -3609,8 +3608,8 @@ class TestAdvanceCommand:
         assert failed_task.id in result.stdout
         assert manual_follow_up.id in result.stdout
         assert "Retry failed task (INFRASTRUCTURE_ERROR)" in result.stdout
-        assert "reason=recovery-has-newer-failed-descendant" not in result.stdout
-        assert "newer failed recovery descendant" not in result.stdout
+        assert "reason=recovery-has-newer-unresolved-descendant" not in result.stdout
+        assert "newer recovery descendant" not in result.stdout
 
     def test_advance_dry_run_keeps_failed_parent_visible_with_completed_same_payload_manual_follow_up(
         self,
@@ -3905,8 +3904,35 @@ class TestAdvanceCommand:
         assert f"{original.id}" in result.stdout
         assert f"{child.id}" in result.stdout
         assert "automatic recovery stops here; manual review required" in result.stdout
-        assert "reason=newer-failed-recovery-descendant-needs-attention" in result.stdout
+        assert "reason=newer-recovery-descendant-needs-attention" in result.stdout
         assert "reason=max-resume-attempts-reached" in result.stdout
+
+    def test_advance_skips_failed_task_with_dropped_resume_child(self, tmp_path: Path):
+        """advance keeps a failed root on needs-attention when its recovery child was dropped."""
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
+        store = make_store(tmp_path)
+        self._setup_git_repo(tmp_path)
+
+        original = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
+
+        dropped_child = store.add("Implement feature", task_type="implement")
+        dropped_child.based_on = original.id
+        dropped_child.status = "dropped"
+        dropped_child.session_id = "sess-abc"
+        dropped_child.branch = original.branch
+        store.update(dropped_child)
+
+        result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Needs attention" in result.stdout
+        assert f"{original.id}" in result.stdout
+        assert f"{dropped_child.id}" not in result.stdout
+        assert "reason=newer-recovery-descendant-needs-attention" in result.stdout
+        assert "a newer recovery descendant requires manual attention first" in normalized
+        assert "Resume" not in result.stdout
+        assert "Retry" not in result.stdout
 
     def test_advance_no_resume_failed_flag_skips(self, tmp_path: Path):
         """advance --no-resume-failed excludes failed tasks from processing."""

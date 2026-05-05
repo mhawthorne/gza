@@ -114,7 +114,7 @@ Needs attention (1 task):
 Summary: 2 actionable (1 resume, 1 retry), 1 needs attention, 0 skipped hidden
 ```
 
-Fully recovered failed ancestors are omitted from this report entirely. Once a retry/resume descendant completes, normal `uv run gza advance`, `uv run gza watch`, and dry-run planning in `uv run gza iterate <failed-id>` treat that completed descendant as the actionable node for merge/review/rebase decisions instead of repeating a permanent recovery skip on the failed ancestor.
+Fully recovered failed ancestors are omitted from this report entirely. Once a retry/resume descendant completes, normal `uv run gza advance`, `uv run gza watch`, and dry-run planning in `uv run gza iterate <failed-id>` treat that completed descendant as the actionable node for merge/review/rebase decisions instead of repeating a permanent recovery skip on the failed ancestor. By contrast, chains that terminate in a failed or dropped recovery descendant stay visible under `Needs attention` until an operator intervenes.
 
 Include ordinary skipped tasks when you need the full picture:
 

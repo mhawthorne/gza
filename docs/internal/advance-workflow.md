@@ -117,7 +117,7 @@ When the engine emits `improve`, the caller (iterate) delegates to `resolve_impr
 | Shared failed-task recovery policy returns `resume` | `resume` — continue from the latest failed improve |
 | Shared failed-task recovery policy returns `retry` | `retry` — fork a fresh improve attempt |
 | `max_resume_attempts == 0` (automatic recovery disabled) | `give_up` — stop iterating; surface `automatic_recovery_disabled` as the stop reason |
-| Shared failed-task recovery policy returns `manual_review_required` (for example, failed resume descendants) | `manual_review` — stop iterating and require operator intervention |
+| Shared failed-task recovery policy returns `manual_review_required` (for example, failed resume descendants or a dropped recovery terminal) | `manual_review` — stop iterating and require operator intervention |
 
 The improve flow now defers recovery edge selection to the shared recovery engine (`decide_failed_task_recovery`), and iterate also resolves fully recovered failed implement IDs through the same completed-descendant planner handoff used by advance/watch. That keeps iterate/advance/watch on one consistent resume/retry/manual-review boundary and avoids stale completed-recovery skip output on recovered ancestors.
 
@@ -142,7 +142,7 @@ Failed task resume rules run in the same ordered rule engine.
 
 | Condition | Action |
 |-----------|--------|
-| Failure is outside the fixed bounded shared policy (for example failed resume descendants) | `skip` |
+| Failure is outside the fixed bounded shared policy (for example failed resume descendants or dropped recovery terminals) | `skip` |
 | Otherwise | `resume` — create resume task and spawn worker |
 
 ## Improve chain semantics
