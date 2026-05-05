@@ -1957,7 +1957,7 @@ def _failure_summary(reason: str) -> str:
     summaries = {
         "AGENT_FORFEIT": "Agent forfeited: could not complete the task.",
         "MAX_STEPS": "Stopped due to max steps limit.",
-        "MAX_TURNS": "Stopped due to max steps limit.",
+        "MAX_TURNS": "Stopped due to max turns limit.",
         "TERMINATED": "Stopped by an external termination signal.",
         "PREREQUISITE_UNMERGED": "Dependency is not yet merged to main.",
         "TEST_FAILURE": "Stopped due to verification/test failure.",

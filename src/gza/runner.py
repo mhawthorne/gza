@@ -75,6 +75,24 @@ EXTRACTION_ALREADY_MERGED_COMPLETION_REASON = "EXTRACTION_ALREADY_MERGED"
 
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
 TERMINATED_FAILURE_REASON = "TERMINATED"
+_RUNNER_OWNED_LOG_FALLBACK_REASONS = frozenset(
+    {
+        EXTRACTION_PRECHECK_FAILURE_REASON,
+        PR_REQUIRED_FAILURE_REASON,
+        "GIT_ERROR",
+        "INTERRUPTED",
+        "KILLED",
+        "MAX_STEPS",
+        "MAX_TURNS",
+        "MISSING_REPORT_ARTIFACT",
+        "NO_ACTIVITY",
+        "PREREQUISITE_UNMERGED",
+        "PROVIDER_UNAVAILABLE",
+        "TERMINATED",
+        "TIMEOUT",
+        "WORKER_DIED",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -94,11 +112,18 @@ class ExtractionSeedResult:
     completion_reason: str | None = None
 
 
-def _interruption_failure_reason() -> str:
-    """Classify an interrupted run based on the triggering signal, when known."""
-    if os.environ.get("GZA_INTERRUPT_SIGNAL") == "SIGTERM":
-        return TERMINATED_FAILURE_REASON
-    return "INTERRUPTED"
+@dataclass(frozen=True)
+class ResolvedRunFailure:
+    """Resolved provider-run failure with user-facing status text."""
+
+    reason: str
+    status: str
+    outcome_message: str
+
+
+def _interrupt_signal_name() -> str | None:
+    """Return the current interrupt signal name, if one was recorded."""
+    return os.environ.get("GZA_INTERRUPT_SIGNAL")
 
 
 def _interruption_metadata() -> dict[str, str]:
@@ -116,18 +141,223 @@ def _interruption_metadata() -> dict[str, str]:
     return metadata
 
 
+def _observed_limit_usage(primary: int | None, fallback: int | None) -> int | None:
+    """Return the best available observed usage count for a limit."""
+    return primary if primary is not None else fallback
+
+
+def _limit_reached(used: int | None, limit: int | None) -> bool:
+    """Return whether the observed usage reached the configured limit."""
+    return used is not None and isinstance(limit, int) and used >= limit
+
+
+def _extract_log_fallback_failure_reason(log_file: Path) -> str:
+    """Return a log-scraped fallback reason after filtering runner-owned signals."""
+    reason = extract_failure_reason(log_file)
+    if reason in _RUNNER_OWNED_LOG_FALLBACK_REASONS:
+        return "UNKNOWN"
+    return reason
+
+
 def _resolve_failure_reason(
     *,
+    explicit_reason: str | None = None,
+    interrupt_signal: str | None = None,
+    interrupted: bool = False,
+    error_type: str | None,
+    exit_code: int | None,
+    log_file: Path | None,
+    stats: TaskStats | None = None,
+    step_limit: int | None = None,
+    turn_limit: int | None = None,
+    fallback_to_log: bool = False,
+) -> str:
+    """Resolve the recorded failure reason from the trigger that actually fired."""
+    if explicit_reason is not None:
+        return explicit_reason
+    if interrupted:
+        return TERMINATED_FAILURE_REASON if interrupt_signal == "SIGTERM" else "INTERRUPTED"
+    if exit_code == 124:
+        return "TIMEOUT"
+    observed_steps = _observed_limit_usage(
+        stats.num_steps_computed if stats is not None else None,
+        stats.num_steps_reported if stats is not None else None,
+    )
+    observed_turns = _observed_limit_usage(
+        stats.num_turns_computed if stats is not None else None,
+        stats.num_turns_reported if stats is not None else None,
+    )
+    if error_type == "max_turns" and _limit_reached(observed_turns, turn_limit):
+        return "MAX_TURNS"
+    if error_type == "max_steps" and _limit_reached(observed_steps, step_limit):
+        return "MAX_STEPS"
+    if fallback_to_log and log_file is not None:
+        return _extract_log_fallback_failure_reason(log_file)
+    return "UNKNOWN"
+
+
+def _resolve_run_failure(
+    *,
+    provider_name: str,
+    timeout_minutes: int,
+    step_limit: int | None,
+    turn_limit: int | None,
     error_type: str | None,
     exit_code: int,
     log_file: Path,
-) -> str | None:
-    """Return only structured failure reasons that are safe to branch on."""
-    if exit_code == 124:
-        return "TIMEOUT"
-    if error_type in ("max_turns", "max_steps"):
-        return "MAX_STEPS"
-    return None
+    stats: TaskStats,
+) -> ResolvedRunFailure | None:
+    """Resolve a provider-run failure and the matching operator-facing messages."""
+    if exit_code == 0 and error_type is None:
+        return None
+
+    reason = _resolve_failure_reason(
+        error_type=error_type,
+        exit_code=exit_code,
+        log_file=log_file,
+        stats=stats,
+        step_limit=step_limit,
+        turn_limit=turn_limit,
+        fallback_to_log=True,
+    )
+
+    if reason == "TIMEOUT":
+        return ResolvedRunFailure(
+            reason=reason,
+            status=f"Failed: {provider_name} timed out after {timeout_minutes} minutes",
+            outcome_message=f"Outcome: failed (timeout after {timeout_minutes}m)",
+        )
+    if reason == "MAX_STEPS":
+        return ResolvedRunFailure(
+            reason=reason,
+            status=f"Failed: max steps of {step_limit} exceeded",
+            outcome_message="Outcome: failed (max_steps)",
+        )
+    if reason == "MAX_TURNS":
+        return ResolvedRunFailure(
+            reason=reason,
+            status=f"Failed: max turns of {turn_limit} exceeded",
+            outcome_message="Outcome: failed (max_turns)",
+        )
+    if error_type is not None and exit_code == 0:
+        return ResolvedRunFailure(
+            reason=reason,
+            status=f"Failed: {provider_name} reported {error_type}",
+            outcome_message=f"Outcome: failed (error_type={error_type})",
+        )
+    return ResolvedRunFailure(
+        reason=reason,
+        status=f"Failed: {provider_name} exited with code {exit_code}",
+        outcome_message=f"Outcome: failed (exit_code={exit_code})",
+    )
+
+
+def _mark_task_failed(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    log_file: Path | str | None,
+    stats: TaskStats | None = None,
+    branch: str | None = None,
+    has_commits: bool | None = None,
+    explicit_reason: str | None = None,
+    interrupt_signal: str | None = None,
+    interrupted: bool = False,
+    error_type: str | None = None,
+    exit_code: int | None = None,
+    step_limit: int | None = None,
+    turn_limit: int | None = None,
+    fallback_to_log: bool = False,
+) -> str:
+    """Persist a failed task using the shared failure-reason owner."""
+    resolved_reason = _resolve_failure_reason(
+        explicit_reason=explicit_reason,
+        interrupt_signal=interrupt_signal,
+        interrupted=interrupted,
+        error_type=error_type,
+        exit_code=exit_code,
+        log_file=log_file if isinstance(log_file, Path) else None,
+        stats=stats,
+        step_limit=step_limit,
+        turn_limit=turn_limit,
+        fallback_to_log=fallback_to_log,
+    )
+    log_file_storage = task_log_storage_path(config, log_file) if isinstance(log_file, Path) else log_file
+    store.mark_failed(
+        task,
+        log_file=log_file_storage,
+        stats=stats,
+        branch=branch,
+        has_commits=bool(has_commits),
+        failure_reason=resolved_reason,
+    )
+    return resolved_reason
+
+
+def _write_stats_entry(log_file: Path, stats: TaskStats) -> None:
+    """Write the standard stats log entry for a completed provider run."""
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "stats",
+            "message": (
+                f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, "
+                f"{stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}"
+            ),
+            "duration_seconds": stats.duration_seconds,
+            "cost_usd": stats.cost_usd,
+            "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
+        },
+    )
+
+
+def _record_run_failure(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    log_file: Path,
+    stats: TaskStats,
+    failure: ResolvedRunFailure,
+    exit_code: int,
+    branch: str | None = None,
+    worktree: Path | None = None,
+    has_commits: bool | None = None,
+) -> None:
+    """Emit failure logs/footer and persist the resolved failure reason."""
+    task_footer(
+        task,
+        stats,
+        status=failure.status,
+        branch=branch,
+        worktree=worktree,
+        store=store,
+    )
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "outcome",
+            "message": failure.outcome_message,
+            "exit_code": exit_code,
+            "failure_reason": failure.reason,
+        },
+    )
+    _write_stats_entry(log_file, stats)
+    _mark_task_failed(
+        task=task,
+        config=config,
+        store=store,
+        log_file=log_file,
+        stats=stats,
+        branch=branch,
+        has_commits=has_commits,
+        explicit_reason=failure.reason,
+        error_type=None,
+        exit_code=exit_code,
+    )
 
 
 _TASK_EXECUTION_MODE_BY_INVOCATION_MODE: dict[str, str] = {
@@ -375,10 +605,14 @@ def _mark_preflight_provider_unavailable(
             "failure_reason": "PROVIDER_UNAVAILABLE",
         },
     )
-    store.mark_failed(
-        task,
-        log_file=task_log_storage_path(config, log_file),
-        failure_reason="PROVIDER_UNAVAILABLE",
+    _mark_task_failed(
+        task=task,
+        config=config,
+        store=store,
+        log_file=log_file,
+        explicit_reason="PROVIDER_UNAVAILABLE",
+        error_type=None,
+        exit_code=None,
     )
 
 
@@ -446,10 +680,14 @@ def _mark_preflight_failure(
             "failure_reason": failure_reason,
         },
     )
-    store.mark_failed(
-        task,
-        log_file=str(log_file.relative_to(config.project_dir)),
-        failure_reason=failure_reason,
+    _mark_task_failed(
+        task=task,
+        config=config,
+        store=store,
+        log_file=log_file,
+        explicit_reason=failure_reason,
+        error_type=None,
+        exit_code=None,
     )
 
 
@@ -2903,7 +3141,13 @@ def _complete_code_task(
             if commits_ahead == 0:
                 # No uncommitted changes and no commits on branch - real failure
                 # Note: No need to save WIP here since there are no changes
-                failure_reason = extract_failure_reason(log_file)
+                failure_reason = _resolve_failure_reason(
+                    error_type=None,
+                    exit_code=exit_code,
+                    log_file=log_file,
+                    stats=stats,
+                    fallback_to_log=True,
+                )
                 task_footer(
                     task,
                     stats,
@@ -2931,12 +3175,16 @@ def _complete_code_task(
                         "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
                     },
                 )
-                store.mark_failed(
-                    task,
-                    log_file=str(log_file.relative_to(config.project_dir)),
+                _mark_task_failed(
+                    task=task,
+                    config=config,
+                    store=store,
+                    log_file=log_file,
                     stats=stats,
                     branch=branch_name,
-                    failure_reason=failure_reason,
+                    explicit_reason=failure_reason,
+                    error_type=None,
+                    exit_code=exit_code,
                 )
                 return 0
             # else: branch has commits from a previous run - treat as success without committing
@@ -3004,13 +3252,17 @@ def _complete_code_task(
             task.diff_files_changed = diff_files
             task.diff_lines_added = diff_added
             task.diff_lines_removed = diff_removed
-            store.mark_failed(
-                task,
-                log_file=str(log_file.relative_to(config.project_dir)),
+            _mark_task_failed(
+                task=task,
+                config=config,
+                store=store,
+                log_file=log_file,
                 has_commits=True,
                 stats=stats,
                 branch=branch_name,
-                failure_reason=PR_REQUIRED_FAILURE_REASON,
+                explicit_reason=PR_REQUIRED_FAILURE_REASON,
+                error_type=None,
+                exit_code=1,
             )
             write_log_entry(
                 log_file,
@@ -3021,17 +3273,7 @@ def _complete_code_task(
                     "exit_code": 1,
                 },
             )
-            write_log_entry(
-                log_file,
-                {
-                    "type": "gza",
-                    "subtype": "stats",
-                    "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
-                    "duration_seconds": stats.duration_seconds,
-                    "cost_usd": stats.cost_usd,
-                    "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
-                },
-            )
+            _write_stats_entry(log_file, stats)
             return 1
 
     # Write final log entries before marking completed in DB, so that
@@ -3232,11 +3474,15 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
     """Retry post-code PR/completion steps for tasks blocked on required PR creation."""
     if not task.branch:
         print(f"Error: Task {task.id} has no branch to create/reuse PR")
-        store.mark_failed(
-            task,
+        _mark_task_failed(
+            task=task,
+            config=config,
+            store=store,
             log_file=task.log_file,
             has_commits=bool(task.has_commits),
-            failure_reason=PR_REQUIRED_FAILURE_REASON,
+            explicit_reason=PR_REQUIRED_FAILURE_REASON,
+            error_type=None,
+            exit_code=1,
         )
         return 1
 
@@ -3244,12 +3490,16 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
     pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, git)
     if not pr_ready:
         print("Error: PR-required retry still could not create/reuse PR")
-        store.mark_failed(
-            task,
+        _mark_task_failed(
+            task=task,
+            config=config,
+            store=store,
             log_file=task.log_file,
             branch=task.branch,
             has_commits=bool(task.has_commits),
-            failure_reason=PR_REQUIRED_FAILURE_REASON,
+            explicit_reason=PR_REQUIRED_FAILURE_REASON,
+            error_type=None,
+            exit_code=1,
         )
         return 1
 
@@ -3411,11 +3661,15 @@ def _run_inner(
                     "failure_reason": "GIT_ERROR",
                 },
             )
-            store.mark_failed(
-                task,
-                log_file=str(log_file.relative_to(config.project_dir)),
+            _mark_task_failed(
+                task=task,
+                config=config,
+                store=store,
+                log_file=log_file,
                 branch=branch_name,
-                failure_reason="GIT_ERROR",
+                explicit_reason="GIT_ERROR",
+                error_type=None,
+                exit_code=1,
             )
             return 1
         if blocking_dep is not None:
@@ -3438,11 +3692,15 @@ def _run_inner(
                     "target_branch": target_branch,
                 },
             )
-            store.mark_failed(
-                task,
-                log_file=str(log_file.relative_to(config.project_dir)),
+            _mark_task_failed(
+                task=task,
+                config=config,
+                store=store,
+                log_file=log_file,
                 branch=branch_name,
-                failure_reason="PREREQUISITE_UNMERGED",
+                explicit_reason="PREREQUISITE_UNMERGED",
+                error_type=None,
+                exit_code=1,
             )
             return 1
 
@@ -3517,11 +3775,15 @@ def _run_inner(
                 "failure_reason": EXTRACTION_PRECHECK_FAILURE_REASON,
             },
         )
-        store.mark_failed(
-            task,
-            log_file=str(log_file.relative_to(config.project_dir)),
+        _mark_task_failed(
+            task=task,
+            config=config,
+            store=store,
+            log_file=log_file,
             branch=branch_name,
-            failure_reason=EXTRACTION_PRECHECK_FAILURE_REASON,
+            explicit_reason=EXTRACTION_PRECHECK_FAILURE_REASON,
+            error_type=None,
+            exit_code=1,
         )
         return 1
 
@@ -3584,55 +3846,30 @@ def _run_inner(
             task.session_id = result.session_id
             store.update(task)
 
-        structured_failure_reason = _resolve_failure_reason(
+        resolved_failure = _resolve_run_failure(
+            provider_name=provider.name,
+            timeout_minutes=config.timeout_minutes,
+            step_limit=task_config.max_steps,
+            turn_limit=task_config.max_turns,
             error_type=result.error_type,
             exit_code=exit_code,
             log_file=log_file,
+            stats=stats,
         )
 
-        # Only structured host/provider signals select the dedicated failure branches.
-        if structured_failure_reason == "TIMEOUT":
+        if resolved_failure is not None:
             # Save WIP changes before marking failed
             _save_wip_changes(task, worktree_git, config, branch_name)
-            task_footer(
-                task,
-                stats,
-                status=f"Failed: {provider.name} timed out after {config.timeout_minutes} minutes",
-                branch=branch_name,
+            _record_run_failure(
+                task=task,
+                config=config,
                 store=store,
-            )
-            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (timeout after {config.timeout_minutes}m)", "exit_code": exit_code, "failure_reason": structured_failure_reason})
-            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=structured_failure_reason)
-            return 0
-        elif structured_failure_reason == "MAX_STEPS":
-            # Save WIP changes before marking failed
-            _save_wip_changes(task, worktree_git, config, branch_name)
-            task_footer(
-                task,
-                stats,
-                status=f"Failed: max steps of {task_config.max_steps} exceeded",
+                log_file=log_file,
+                stats=stats,
+                failure=resolved_failure,
+                exit_code=exit_code,
                 branch=branch_name,
-                store=store,
             )
-            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: failed (max_steps)", "exit_code": result.exit_code, "failure_reason": structured_failure_reason})
-            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=structured_failure_reason)
-            return 0
-        elif exit_code != 0:
-            # Save WIP changes before marking failed
-            _save_wip_changes(task, worktree_git, config, branch_name)
-            task_footer(
-                task,
-                stats,
-                status=f"Failed: {provider.name} exited with code {exit_code}",
-                branch=branch_name,
-                store=store,
-            )
-            failure_reason = extract_failure_reason(log_file)
-            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (exit_code={exit_code})", "exit_code": exit_code, "failure_reason": failure_reason})
-            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, branch=branch_name, failure_reason=failure_reason)
             return 0
 
         return _complete_code_task(
@@ -3657,10 +3894,25 @@ def _run_inner(
 
     except GitError as e:
         error_message(f"Git error: {e}")
-        store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), branch=branch_name, failure_reason="GIT_ERROR")
+        _mark_task_failed(
+            task=task,
+            config=config,
+            store=store,
+            log_file=log_file,
+            branch=branch_name,
+            explicit_reason="GIT_ERROR",
+            error_type=None,
+            exit_code=1,
+        )
         return 1
     except KeyboardInterrupt:
-        failure_reason = _interruption_failure_reason()
+        failure_reason = _resolve_failure_reason(
+            interrupt_signal=_interrupt_signal_name(),
+            interrupted=True,
+            error_type=None,
+            exit_code=None,
+            log_file=None,
+        )
         interrupt_metadata = _interruption_metadata()
         # Save WIP changes before returning
         _save_wip_changes(task, worktree_git, config, branch_name)
@@ -3674,7 +3926,17 @@ def _run_inner(
                 **interrupt_metadata,
             },
         )
-        store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), branch=branch_name, failure_reason=failure_reason)
+        _mark_task_failed(
+            task=task,
+            config=config,
+            store=store,
+            log_file=log_file,
+            branch=branch_name,
+            interrupt_signal=_interrupt_signal_name(),
+            interrupted=True,
+            error_type=None,
+            exit_code=None,
+        )
         console.print("\nInterrupted")
         return 130
 
@@ -3837,7 +4099,13 @@ def _run_non_code_task(
             provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type)
             result = provider.run(config, provider_prompt, log_file, worktree_path, **provider_run_kwargs)
         except KeyboardInterrupt:
-            failure_reason = _interruption_failure_reason()
+            failure_reason = _resolve_failure_reason(
+                interrupt_signal=_interrupt_signal_name(),
+                interrupted=True,
+                error_type=None,
+                exit_code=None,
+                log_file=None,
+            )
             interrupt_metadata = _interruption_metadata()
             write_log_entry(
                 log_file,
@@ -3849,7 +4117,16 @@ def _run_non_code_task(
                     **interrupt_metadata,
                 },
             )
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), failure_reason=failure_reason)
+            _mark_task_failed(
+                task=task,
+                config=config,
+                store=store,
+                log_file=log_file,
+                interrupt_signal=_interrupt_signal_name(),
+                interrupted=True,
+                error_type=None,
+                exit_code=None,
+            )
             console.print("\nInterrupted")
             return 130
         finally:
@@ -3867,49 +4144,28 @@ def _run_non_code_task(
             task.session_id = result.session_id
             store.update(task)
 
-        structured_failure_reason = _resolve_failure_reason(
+        resolved_failure = _resolve_run_failure(
+            provider_name=provider.name,
+            timeout_minutes=config.timeout_minutes,
+            step_limit=config.max_steps,
+            turn_limit=config.max_turns,
             error_type=result.error_type,
             exit_code=exit_code,
             log_file=log_file,
+            stats=stats,
         )
 
-        # Only structured host/provider signals select the dedicated failure branches.
-        if structured_failure_reason == "TIMEOUT":
-            task_footer(
-                task,
-                stats,
-                status=f"Failed: {provider.name} timed out after {config.timeout_minutes} minutes",
-                worktree=worktree_path,
+        if resolved_failure is not None:
+            _record_run_failure(
+                task=task,
+                config=config,
                 store=store,
-            )
-            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (timeout after {config.timeout_minutes}m)", "exit_code": exit_code, "failure_reason": structured_failure_reason})
-            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=structured_failure_reason)
-            return 0
-        elif structured_failure_reason == "MAX_STEPS":
-            task_footer(
-                task,
-                stats,
-                status=f"Failed: max steps of {config.max_steps} exceeded",
+                log_file=log_file,
+                stats=stats,
+                failure=resolved_failure,
+                exit_code=exit_code,
                 worktree=worktree_path,
-                store=store,
             )
-            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: failed (max_steps)", "exit_code": result.exit_code, "failure_reason": structured_failure_reason})
-            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=structured_failure_reason)
-            return 0
-        elif exit_code != 0:
-            task_footer(
-                task,
-                stats,
-                status=f"Failed: {provider.name} exited with code {exit_code}",
-                worktree=worktree_path,
-                store=store,
-            )
-            failure_reason = extract_failure_reason(log_file)
-            write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": f"Outcome: failed (exit_code={exit_code})", "exit_code": exit_code, "failure_reason": failure_reason})
-            write_log_entry(log_file, {"type": "gza", "subtype": "stats", "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}", "duration_seconds": stats.duration_seconds, "cost_usd": stats.cost_usd, "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0})
-            store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), stats=stats, failure_reason=failure_reason)
             return 0
 
         # Copy expected report artifact from worktree to main project directory.
@@ -3971,22 +4227,16 @@ def _run_non_code_task(
                         "failure_reason": "MISSING_REPORT_ARTIFACT",
                     },
                 )
-                write_log_entry(
-                    log_file,
-                    {
-                        "type": "gza",
-                        "subtype": "stats",
-                        "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
-                        "duration_seconds": stats.duration_seconds,
-                        "cost_usd": stats.cost_usd,
-                        "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
-                    },
-                )
-                store.mark_failed(
-                    task,
-                    log_file=str(log_file.relative_to(config.project_dir)),
+                _write_stats_entry(log_file, stats)
+                _mark_task_failed(
+                    task=task,
+                    config=config,
+                    store=store,
+                    log_file=log_file,
                     stats=stats,
-                    failure_reason="MISSING_REPORT_ARTIFACT",
+                    explicit_reason="MISSING_REPORT_ARTIFACT",
+                    error_type=None,
+                    exit_code=exit_code,
                 )
                 return 0
 
@@ -4074,5 +4324,13 @@ def _run_non_code_task(
 
     except GitError as e:
         error_message(f"Git error: {e}")
-        store.mark_failed(task, log_file=str(log_file.relative_to(config.project_dir)), failure_reason="GIT_ERROR")
+        _mark_task_failed(
+            task=task,
+            config=config,
+            store=store,
+            log_file=log_file,
+            explicit_reason="GIT_ERROR",
+            error_type=None,
+            exit_code=1,
+        )
         return 1

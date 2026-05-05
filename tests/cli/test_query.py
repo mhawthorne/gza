@@ -3029,7 +3029,7 @@ class TestShowCommand:
         task = store.add("Failed task for show diagnostics")
         assert task.id is not None
         task.status = "failed"
-        task.failure_reason = "AGENT_FORFEIT"
+        task.failure_reason = "MAX_TURNS"
         task.log_file = ".gza/logs/fail.log"
         task.session_id = "session-123"
         task.num_steps_reported = 55
@@ -3101,10 +3101,10 @@ class TestShowCommand:
         result = run_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Failure Reason: AGENT_FORFEIT" in result.stdout
+        assert "Failure Reason: MAX_TURNS" in result.stdout
         assert "[GZA_FAILURE:AGENT_FORFEIT]" in result.stdout
         assert result.stdout.count("[GZA_FAILURE:AGENT_FORFEIT]") == 1
-        assert "Failure Summary: Agent forfeited: could not complete the task." in result.stdout
+        assert "Failure Summary: Stopped due to max turns limit." in result.stdout
         assert "Agent Explanation:" in result.stdout
         assert "Blocked by ordering prerequisite; implementation not started." in result.stdout
         assert "Step Limit:" not in result.stdout
