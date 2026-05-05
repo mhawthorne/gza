@@ -285,4 +285,5 @@ When `--restart-failed` is enabled:
 - Implement recovery launches through iterate-aware execution; non-implement recovery launches through plain worker execution
 - `gza watch --restart-failed --dry-run` prints the failed-task recovery decision report, including shared `Needs attention` rows by default, and exits
 - Fully recovered failed ancestors are omitted from that report and from live watch recovery logs; only unresolved failed tasks and their completed recovery descendants remain visible through the normal advance plan
+- Failed `review` / `improve` / `rebase` rows whose structured target implementation is already merged are omitted from live `--restart-failed` failure transition output and do not contribute to backoff or halt streaks
 - `--max-resume-attempts` applies to all unattended watch-managed resume/retry decisions for that run, including plain watch, failed-task recovery, and advance-driven improve recovery

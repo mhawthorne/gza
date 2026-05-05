@@ -59,6 +59,11 @@ class FailedRecoveryDecision:
     reuse_existing: bool = False
 
 
+def should_hide_failed_recovery_decision(decision: FailedRecoveryDecision) -> bool:
+    """Return whether the decision should stay off operator recovery surfaces."""
+    return decision.action == "skip" and decision.reason_code == "resolved_by_merged_target"
+
+
 @dataclass(frozen=True)
 class RecoveryChainState:
     role: RecoveryRole
