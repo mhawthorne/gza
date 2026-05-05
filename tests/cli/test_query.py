@@ -1349,6 +1349,7 @@ class TestSearchCommand:
 
         assert result.returncode == 0
         assert "No tasks found matching 'missing'" in result.stdout
+        assert "Showing results 0-0 out of 0" in result.stdout
 
     def test_search_json_empty_results_returns_empty_array_without_human_message(self, tmp_path: Path):
         setup_db_with_tasks(tmp_path, [
@@ -1374,6 +1375,7 @@ class TestSearchCommand:
         assert "limit needle three" in result.stdout
         assert "limit needle two" in result.stdout
         assert "limit needle one" not in result.stdout
+        assert "Showing results 1-2 out of 3" in result.stdout
 
     def test_search_last_zero_shows_all_matches(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -1388,6 +1390,7 @@ class TestSearchCommand:
         assert "all needle three" in result.stdout
         assert "all needle two" in result.stdout
         assert "all needle one" in result.stdout
+        assert "Showing results 1-3 out of 3" in result.stdout
 
     def test_search_last_rejects_negative_values(self, tmp_path: Path):
         setup_config(tmp_path)
