@@ -38,6 +38,7 @@ from ..db import (
     task_id_numeric_key,
 )
 from ..failure_policy import is_resumable_failure_reason
+from ..failure_reasons import mark_task_failed_from_cause
 from ..prompts import PromptBuilder
 from ..recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from ..review_tasks import (
@@ -324,7 +325,17 @@ def reconcile_in_progress_tasks(config: Config) -> None:
 
             if is_dead:
                 has_commits = _branch_has_commits(config, task.branch)
-                store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED", has_commits=has_commits)
+                mark_task_failed_from_cause(
+                    task=task,
+                    config=config,
+                    store=store,
+                    log_file=task.log_file,
+                    branch=task.branch,
+                    explicit_reason="WORKER_DIED",
+                    has_commits=has_commits,
+                    error_type=None,
+                    exit_code=None,
+                )
                 continue
 
             # PID is alive — check for a stuck worker that hasn't logged anything.
@@ -345,12 +356,16 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                     except OSError:
                         pass
                 has_commits = _branch_has_commits(config, task.branch)
-                store.mark_failed(
-                    task,
+                mark_task_failed_from_cause(
+                    task=task,
+                    config=config,
+                    store=store,
                     log_file=task.log_file,
                     branch=task.branch,
-                    failure_reason="NO_ACTIVITY",
+                    explicit_reason="NO_ACTIVITY",
                     has_commits=has_commits,
+                    error_type=None,
+                    exit_code=None,
                 )
         except (sqlite3.Error, OSError, ValueError) as exc:
             print(f"Warning: Failed to reconcile task {task_label}: {exc}", file=sys.stderr)
@@ -923,7 +938,17 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
                 in_progress = [refreshed]
         for task in in_progress:
             has_commits = _branch_has_commits(config, task.branch)
-            store.mark_failed(task, log_file=task.log_file, branch=task.branch, failure_reason="WORKER_DIED", has_commits=has_commits)
+            mark_task_failed_from_cause(
+                task=task,
+                config=config,
+                store=store,
+                log_file=task.log_file,
+                branch=task.branch,
+                explicit_reason="WORKER_DIED",
+                has_commits=has_commits,
+                error_type=None,
+                exit_code=None,
+            )
         if startup_log_path:
             with open(startup_log_path, "a") as f:
                 f.write(f"[{datetime.now(UTC).isoformat()}] worker crashed: {e}\n")

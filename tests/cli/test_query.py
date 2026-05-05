@@ -7637,6 +7637,7 @@ class TestKillCommand:
         """kill sends SIGTERM to the worker PID found in the registry."""
         from gza.cli.query import cmd_kill
         from gza.db import SqliteTaskStore
+        from gza.failure_reasons import mark_task_failed_from_cause
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
@@ -7658,7 +7659,8 @@ class TestKillCommand:
             if sig == 0:
                 raise OSError("no such process")
         with patch("gza.cli.query.os.kill", side_effect=fake_kill) as mock_kill:
-            with patch("gza.cli.query.time.sleep"):
+            with patch("gza.cli.query.time.sleep"), \
+                 patch("gza.cli.query.mark_task_failed_from_cause", wraps=mark_task_failed_from_cause) as mock_mark_failed:
                 rc = cmd_kill(args)
 
         captured = capsys.readouterr()
@@ -7672,6 +7674,8 @@ class TestKillCommand:
         assert refreshed is not None
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "KILLED"
+        assert mock_mark_failed.call_count == 1
+        assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "KILLED"
         request = registry.consume_interrupt_request(12345)
         assert request is not None
         assert request["signal"] == "SIGTERM"

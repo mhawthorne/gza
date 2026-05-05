@@ -3130,6 +3130,98 @@ class TestMaxStepsHandling:
         assert failed.status == "failed"
         assert failed.failure_reason == "MAX_TURNS"
 
+    def test_non_code_task_below_step_limit_does_not_mark_max_steps(self, tmp_path: Path):
+        """Provider max_steps below the configured limit should not persist MAX_STEPS."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.slug = "20260505-plan-below-max-steps"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 5
+        config.max_turns = 20
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=4.2,
+            num_steps_computed=4,
+            error_type="max_steps",
+        )
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.console"):
+            exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git)
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "UNKNOWN"
+        assert failed.log_file is not None
+        log_contents = (tmp_path / failed.log_file).read_text()
+        assert "Outcome: failed (error_type=max_steps)" in log_contents
+        assert "Outcome: failed (max_steps)" not in log_contents
+
+    def test_non_code_task_below_turn_limit_does_not_mark_max_turns(self, tmp_path: Path):
+        """Provider max_turns below the configured limit should not persist MAX_TURNS."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.slug = "20260505-plan-below-max-turns"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+        config.max_turns = 5
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=4.2,
+            num_turns_computed=4,
+            error_type="max_turns",
+        )
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.console"):
+            exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git)
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "UNKNOWN"
+        assert failed.log_file is not None
+        log_contents = (tmp_path / failed.log_file).read_text()
+        assert "Outcome: failed (error_type=max_turns)" in log_contents
+        assert "Outcome: failed (max_turns)" not in log_contents
+
     def test_non_code_task_uses_max_steps_ground_truth_over_log_markers(self, tmp_path: Path):
         """Provider max_steps should ignore contaminated failure markers in the log."""
         db_path = tmp_path / "test.db"
@@ -3858,6 +3950,54 @@ class TestFailureReasonGroundTruth:
         assert failed is not None
         assert failed.status == "failed"
         assert failed.failure_reason == "MAX_TURNS"
+
+    def test_code_task_below_step_limit_does_not_mark_max_steps(self, tmp_path: Path):
+        """Provider max_steps below the configured limit should not persist MAX_STEPS."""
+        exit_code, store, task, mock_task_footer = self._run_code_task_failure(
+            tmp_path,
+            exit_code=0,
+            error_type="max_steps",
+            session_id="below-max-steps-session",
+            slug="20260505-implement-below-max-steps",
+            log_markers=(),
+            num_steps_computed=49,
+        )
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "UNKNOWN"
+        assert mock_task_footer.call_count == 1
+        assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider reported max_steps"
+        assert failed.log_file is not None
+        log_contents = (tmp_path / failed.log_file).read_text()
+        assert "Outcome: failed (error_type=max_steps)" in log_contents
+        assert "Outcome: failed (max_steps)" not in log_contents
+
+    def test_code_task_below_turn_limit_does_not_mark_max_turns(self, tmp_path: Path):
+        """Provider max_turns below the configured limit should not persist MAX_TURNS."""
+        exit_code, store, task, mock_task_footer = self._run_code_task_failure(
+            tmp_path,
+            exit_code=0,
+            error_type="max_turns",
+            session_id="below-max-turns-session",
+            slug="20260505-implement-below-max-turns",
+            log_markers=(),
+            num_turns_computed=49,
+        )
+
+        assert exit_code == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "UNKNOWN"
+        assert mock_task_footer.call_count == 1
+        assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider reported max_turns"
+        assert failed.log_file is not None
+        log_contents = (tmp_path / failed.log_file).read_text()
+        assert "Outcome: failed (error_type=max_turns)" in log_contents
+        assert "Outcome: failed (max_turns)" not in log_contents
 
     def test_code_task_prefers_timeout_ground_truth_over_provider_max_steps(self, tmp_path: Path):
         """Combined timeout and provider max_steps signals should render and persist TIMEOUT."""

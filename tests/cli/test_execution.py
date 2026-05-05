@@ -2503,6 +2503,7 @@ class TestReconciliation:
         """WORKER_DIED reconciliation sets has_commits=True when branch has commits."""
         from gza.cli._common import reconcile_in_progress_tasks
         from gza.config import Config
+        from gza.failure_reasons import mark_task_failed_from_cause
         from gza.git import Git
 
         setup_config(tmp_path)
@@ -2534,13 +2535,16 @@ class TestReconciliation:
         store.update(task)
 
         config = Config.load(tmp_path)
-        reconcile_in_progress_tasks(config)
+        with patch("gza.cli._common.mark_task_failed_from_cause", wraps=mark_task_failed_from_cause) as mock_mark_failed:
+            reconcile_in_progress_tasks(config)
 
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "WORKER_DIED"
         assert refreshed.has_commits is True
+        assert mock_mark_failed.call_count == 1
+        assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "WORKER_DIED"
 
     def test_reconciliation_no_commits_on_worker_died(self, tmp_path: Path):
         """WORKER_DIED reconciliation sets has_commits=False when branch has no commits."""
@@ -2583,6 +2587,7 @@ class TestReconciliation:
 
         from gza.cli._common import reconcile_in_progress_tasks
         from gza.config import Config
+        from gza.failure_reasons import mark_task_failed_from_cause
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2598,13 +2603,16 @@ class TestReconciliation:
 
         config = Config.load(tmp_path)
         # Patch SIGTERM so we don't actually signal our own PID
-        with patch("gza.cli._common.os.kill") as mock_kill:
+        with patch("gza.cli._common.os.kill") as mock_kill, \
+             patch("gza.cli._common.mark_task_failed_from_cause", wraps=mark_task_failed_from_cause) as mock_mark_failed:
             reconcile_in_progress_tasks(config)
 
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "NO_ACTIVITY"
+        assert mock_mark_failed.call_count == 1
+        assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "NO_ACTIVITY"
         # kill called once for the signal check (os.kill(pid, 0)) and once to SIGTERM
         assert mock_kill.call_count >= 1
         request = WorkerRegistry(config.workers_path).consume_interrupt_request(os.getpid())
@@ -10858,6 +10866,7 @@ class TestRunAsWorker:
     def test_run_as_worker_exception_marks_failed_and_ps_shows_startup_failure(self, tmp_path: Path):
         """Exception cleanup keeps worker/task failed and startup failure visible in ps rows."""
         from gza.cli.query import _build_ps_rows
+        from gza.failure_reasons import mark_task_failed_from_cause
 
         setup_config(tmp_path)
         config = Config.load(tmp_path)
@@ -10870,7 +10879,8 @@ class TestRunAsWorker:
         args = argparse.Namespace(task_ids=[task.id], resume=False)
 
         with patch("gza.cli.signal.signal"):
-            with patch("gza.cli.run", side_effect=RuntimeError("boom")):
+            with patch("gza.cli.run", side_effect=RuntimeError("boom")), \
+                 patch("gza.cli._common.mark_task_failed_from_cause", wraps=mark_task_failed_from_cause) as mock_mark_failed:
                 rc = _run_as_worker(args, config)
 
         assert rc == 1
@@ -10883,6 +10893,8 @@ class TestRunAsWorker:
         assert refreshed is not None
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "WORKER_DIED"
+        assert mock_mark_failed.call_count == 1
+        assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "WORKER_DIED"
 
         rows, _ = _build_ps_rows(registry, store, include_completed=True)
         row = next(r for r in rows if r["worker_id"] == "w-worker-exception")

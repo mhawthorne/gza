@@ -32,7 +32,7 @@ from .console import (
     task_footer,
     task_header,
 )
-from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason, task_id_numeric_key
+from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason as _extract_failure_reason, task_id_numeric_key
 from .dependency_preconditions import get_unmerged_dependency_precondition
 from .extractions import (
     MANIFEST_FILENAME,
@@ -44,6 +44,10 @@ from .extractions import (
     load_patch_text,
     parse_patch_touched_paths,
     resolve_manifest_patch_path,
+)
+from .failure_reasons import (
+    mark_task_failed_from_cause as _mark_task_failed,
+    resolve_failure_reason as _resolve_failure_reason,
 )
 from .git import Git, GitApplyResult, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
@@ -70,29 +74,14 @@ from .task_slug import (
 
 logger = logging.getLogger(__name__)
 
+# Keep the legacy patch target available for extraction tests that stub the
+# fallback parser on ``gza.runner``.
+extract_failure_reason = _extract_failure_reason
+
 EXTRACTION_PRECHECK_FAILURE_REASON = "EXTRACTION_PRECHECK_FAILED"
 EXTRACTION_ALREADY_MERGED_COMPLETION_REASON = "EXTRACTION_ALREADY_MERGED"
 
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
-TERMINATED_FAILURE_REASON = "TERMINATED"
-_RUNNER_OWNED_LOG_FALLBACK_REASONS = frozenset(
-    {
-        EXTRACTION_PRECHECK_FAILURE_REASON,
-        PR_REQUIRED_FAILURE_REASON,
-        "GIT_ERROR",
-        "INTERRUPTED",
-        "KILLED",
-        "MAX_STEPS",
-        "MAX_TURNS",
-        "MISSING_REPORT_ARTIFACT",
-        "NO_ACTIVITY",
-        "PREREQUISITE_UNMERGED",
-        "PROVIDER_UNAVAILABLE",
-        "TERMINATED",
-        "TIMEOUT",
-        "WORKER_DIED",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -139,61 +128,6 @@ def _interruption_metadata() -> dict[str, str]:
     if detail:
         metadata["detail"] = detail
     return metadata
-
-
-def _observed_limit_usage(primary: int | None, fallback: int | None) -> int | None:
-    """Return the best available observed usage count for a limit."""
-    return primary if primary is not None else fallback
-
-
-def _limit_reached(used: int | None, limit: int | None) -> bool:
-    """Return whether the observed usage reached the configured limit."""
-    return used is not None and isinstance(limit, int) and used >= limit
-
-
-def _extract_log_fallback_failure_reason(log_file: Path) -> str:
-    """Return a log-scraped fallback reason after filtering runner-owned signals."""
-    reason = extract_failure_reason(log_file)
-    if reason in _RUNNER_OWNED_LOG_FALLBACK_REASONS:
-        return "UNKNOWN"
-    return reason
-
-
-def _resolve_failure_reason(
-    *,
-    explicit_reason: str | None = None,
-    interrupt_signal: str | None = None,
-    interrupted: bool = False,
-    error_type: str | None,
-    exit_code: int | None,
-    log_file: Path | None,
-    stats: TaskStats | None = None,
-    step_limit: int | None = None,
-    turn_limit: int | None = None,
-    fallback_to_log: bool = False,
-) -> str:
-    """Resolve the recorded failure reason from the trigger that actually fired."""
-    if explicit_reason is not None:
-        return explicit_reason
-    if interrupted:
-        return TERMINATED_FAILURE_REASON if interrupt_signal == "SIGTERM" else "INTERRUPTED"
-    if exit_code == 124:
-        return "TIMEOUT"
-    observed_steps = _observed_limit_usage(
-        stats.num_steps_computed if stats is not None else None,
-        stats.num_steps_reported if stats is not None else None,
-    )
-    observed_turns = _observed_limit_usage(
-        stats.num_turns_computed if stats is not None else None,
-        stats.num_turns_reported if stats is not None else None,
-    )
-    if error_type == "max_turns" and _limit_reached(observed_turns, turn_limit):
-        return "MAX_TURNS"
-    if error_type == "max_steps" and _limit_reached(observed_steps, step_limit):
-        return "MAX_STEPS"
-    if fallback_to_log and log_file is not None:
-        return _extract_log_fallback_failure_reason(log_file)
-    return "UNKNOWN"
 
 
 def _resolve_run_failure(
@@ -250,51 +184,6 @@ def _resolve_run_failure(
         status=f"Failed: {provider_name} exited with code {exit_code}",
         outcome_message=f"Outcome: failed (exit_code={exit_code})",
     )
-
-
-def _mark_task_failed(
-    *,
-    task: Task,
-    config: Config,
-    store: SqliteTaskStore,
-    log_file: Path | str | None,
-    stats: TaskStats | None = None,
-    branch: str | None = None,
-    has_commits: bool | None = None,
-    explicit_reason: str | None = None,
-    interrupt_signal: str | None = None,
-    interrupted: bool = False,
-    error_type: str | None = None,
-    exit_code: int | None = None,
-    step_limit: int | None = None,
-    turn_limit: int | None = None,
-    fallback_to_log: bool = False,
-) -> str:
-    """Persist a failed task using the shared failure-reason owner."""
-    resolved_reason = _resolve_failure_reason(
-        explicit_reason=explicit_reason,
-        interrupt_signal=interrupt_signal,
-        interrupted=interrupted,
-        error_type=error_type,
-        exit_code=exit_code,
-        log_file=log_file if isinstance(log_file, Path) else None,
-        stats=stats,
-        step_limit=step_limit,
-        turn_limit=turn_limit,
-        fallback_to_log=fallback_to_log,
-    )
-    log_file_storage = task_log_storage_path(config, log_file) if isinstance(log_file, Path) else log_file
-    store.mark_failed(
-        task,
-        log_file=log_file_storage,
-        stats=stats,
-        branch=branch,
-        has_commits=bool(has_commits),
-        failure_reason=resolved_reason,
-    )
-    return resolved_reason
-
-
 def _write_stats_entry(log_file: Path, stats: TaskStats) -> None:
     """Write the standard stats log entry for a completed provider run."""
     write_log_entry(
