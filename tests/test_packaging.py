@@ -19,7 +19,7 @@ def test_hatch_vcs_does_not_write_source_version_file() -> None:
 
 
 def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
-    """Unit tests should keep the suite-wide watchdog in central pytest config."""
+    """Only the integration suite should install pytest-timeout watchdogs."""
     repo_root = Path(__file__).resolve().parents[1]
     pyproject = repo_root / "pyproject.toml"
     pyproject_text = pyproject.read_text()
