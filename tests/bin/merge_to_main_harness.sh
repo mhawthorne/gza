@@ -284,7 +284,6 @@ test_too_many_arguments_prints_usage_error() {
     assert_contains "$RUN_OUTPUT" "Usage: $MERGE_SCRIPT [branch-name] [claude|codex]" "too many arguments should print usage guidance"
     [[ ! -s "$FAKE_GIT_LOG" ]] || fail "too many arguments should fail before invoking git"
 }
-
 test_bootstrap_failure_reports_builder_error() {
     setup_case
     export FAKE_GIT_CURRENT_BRANCH="feature/bootstrap"
@@ -322,7 +321,6 @@ test_missing_launcher_reports_distinct_error() {
     assert_file_not_contains "$FAKE_GIT_LOG" "merge-continue" "missing launcher must not continue the merge"
     [[ ! -s "$FAKE_AGENT_LOG" ]] || fail "missing launcher should not launch the agent"
 }
-
 test_single_argument_agent_uses_current_branch() {
     setup_case
     export FAKE_GIT_CURRENT_BRANCH="feature/current"

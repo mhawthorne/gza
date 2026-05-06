@@ -97,23 +97,17 @@ invoke_conflict_agent() {
 
     LAST_AGENT_INVOCATION_PHASE=""
     LAST_AGENT_LAUNCHER_COMMAND=""
-
     local prompt_file
     prompt_file=$(mktemp)
     printf '%s\n' "$prompt" > "$prompt_file"
 
-    local cmd_file
-    cmd_file=$(mktemp)
-
-    if ! build_agent_command "$agent" "$project_root" "$work_dir" "$cmd_file"; then
+    local -a cmd=()
+    if ! mapfile -d '' -t cmd < <(build_agent_command "$agent" "$project_root" "$work_dir"); then
         LAST_AGENT_INVOCATION_PHASE="bootstrap"
-        rm -f "$prompt_file" "$cmd_file"
+        rm -f "$prompt_file"
         return 1
     fi
 
-    local -a cmd=()
-    mapfile -d '' -t cmd < "$cmd_file"
-    rm -f "$cmd_file"
     if [[ "${#cmd[@]}" -eq 0 || -z "${cmd[0]}" ]]; then
         echo "Error: Failed to build $agent command for conflict resolution." >&2
         LAST_AGENT_INVOCATION_PHASE="bootstrap"
@@ -248,6 +242,11 @@ else
         exit 1
     fi
 
+    if ! git diff --name-only --diff-filter=U | grep -q .; then
+        echo ""
+        echo -e "${RED}Merge failed before conflict resolution could start.${NC}"
+        exit 1
+    fi
     echo ""
     echo -e "${YELLOW}=== Merge conflicts detected ===${NC}"
     echo ""
@@ -289,7 +288,6 @@ Do not run git merge --continue or git commit. Stop after every conflicted file 
         echo "Install the missing launcher or resolve the conflicts manually, then run: git merge --continue"
         exit 1
     fi
-
     if [[ "$AGENT_STATUS" -ne 0 ]]; then
         echo ""
         echo -e "${RED}$SELECTED_AGENT exited with status $AGENT_STATUS while resolving conflicts.${NC}"
