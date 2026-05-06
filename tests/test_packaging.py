@@ -1,6 +1,8 @@
 """Packaging configuration regression tests."""
 
 import ast
+import os
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -95,3 +97,68 @@ def test_unit_test_conftest_does_not_assign_timeout_markers() -> None:
     assert not timeout_calls, (
         f"tests/conftest.py unexpectedly assigns pytest timeout markers at {timeout_calls}"
     )
+
+
+def _run_bin_tests(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "bin" / "tests"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uv = fake_bin / "uv"
+    uv_log = tmp_path / "uv.log"
+    uv_log.write_text("")
+    fake_uv.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >>\"$FAKE_UV_LOG\"\n"
+        "exit 0\n"
+    )
+    fake_uv.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["FAKE_UV_LOG"] = str(uv_log)
+
+    return subprocess.run(
+        ["bash", str(script), *args],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_bin_tests_default_run_skips_integration_pytest(tmp_path: Path) -> None:
+    result = _run_bin_tests(tmp_path)
+
+    assert result.returncode == 0
+    assert (tmp_path / "uv.log").read_text().splitlines() == [
+        "run ruff check src/gza/",
+        "run ty check src/gza/",
+        "run mypy src/gza/",
+        "run python -m checks",
+        'run pytest tests/ -n 8 --dist loadscope -x -o faulthandler_timeout=2',
+    ]
+
+
+def test_bin_tests_integration_flag_runs_integration_pytest(tmp_path: Path) -> None:
+    long_result = _run_bin_tests(tmp_path / "long", "--integration")
+    short_result = _run_bin_tests(tmp_path / "short", "-i")
+
+    assert long_result.returncode == 0
+    assert short_result.returncode == 0
+    assert (tmp_path / "long" / "uv.log").read_text().splitlines()[-1] == "run pytest tests_integration -xv"
+    assert (tmp_path / "short" / "uv.log").read_text().splitlines()[-1] == "run pytest tests_integration -xv"
+
+
+def test_bin_tests_unknown_argument_exits_with_usage_and_no_invocations(tmp_path: Path) -> None:
+    result = _run_bin_tests(tmp_path, "--wat")
+    script = Path(__file__).resolve().parents[1] / "bin" / "tests"
+
+    assert result.returncode == 2
+    assert (tmp_path / "uv.log").read_text() == ""
+    assert result.stderr.splitlines()[-3:] == [
+        "+ echo 'Usage: /workspace/bin/tests [-i|--integration]'",
+        f"Usage: {script} [-i|--integration]",
+        "+ exit 2",
+    ]
