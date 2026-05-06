@@ -35,9 +35,9 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 | `provider` | String | `claude` | AI provider: `claude`, `codex`, or `gemini` |
 | `task_providers` | Dict | `{}` | Route task types to providers (e.g., `review: claude`) |
 | `providers` | Dict | `{}` | Provider-scoped model/task-type config (preferred) |
-| `model` | String | *(empty)* | Legacy global model fallback (compatible) |
-| `reasoning_effort` | String | *(empty)* | Legacy global reasoning effort fallback (Codex) |
-| `task_types` | Dict | `{}` | Legacy global per-task fallback (compatible) |
+| `model` | String | *(empty)* | Default model fallback (compatible) |
+| `reasoning_effort` | String | *(empty)* | Default reasoning effort fallback (Codex) |
+| `task_types` | Dict | `{}` | Task-type fallback configuration (compatible) |
 | `claude` | Dict | *(see below)* | Claude-specific configuration (see [Claude Configuration](#claude-configuration)) |
 | `claude_args` | List | *(deprecated)* | Use `claude.args` instead |
 | `tmux` | Dict | *(see below)* | Tmux session configuration (see [Tmux Sessions](tmux.md)) |
@@ -358,8 +358,8 @@ Model selection:
 Reasoning effort selection:
 1. `providers.<effective_provider>.task_types.<task_type>.reasoning_effort`
 2. `providers.<effective_provider>.reasoning_effort`
-3. `task_types.<task_type>.reasoning_effort` (legacy fallback)
-4. `reasoning_effort` / `defaults.reasoning_effort` (legacy fallback)
+3. `task_types.<task_type>.reasoning_effort` (task-type fallback)
+4. `reasoning_effort` / `defaults.reasoning_effort` (default fallback)
 5. Provider runtime default (if no reasoning effort resolved)
 
 Max steps selection:

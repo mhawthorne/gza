@@ -40,6 +40,8 @@ GEMINI_PRICING = {
     "default": (1.25, 10.00),
 }
 
+GEMINI_TRUST_WORKSPACE_ENV = "GEMINI_CLI_TRUST_WORKSPACE=true"
+
 
 def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """Calculate cost in USD based on model and token counts."""
@@ -251,9 +253,10 @@ class GeminiProvider(Provider):
             return RunResult(exit_code=1)
 
         cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes, config.docker_volumes, config.docker_setup_command)
-        # Insert GEMINI_SHELL_ENABLED before the image name (last element from build_docker_cmd)
-        cmd.insert(-1, "-e")
-        cmd.insert(-1, "GEMINI_SHELL_ENABLED=true")
+        # Insert Gemini headless env before the image name (last element from build_docker_cmd).
+        for env_value in ("GEMINI_SHELL_ENABLED=true", GEMINI_TRUST_WORKSPACE_ENV):
+            cmd.insert(-1, "-e")
+            cmd.insert(-1, env_value)
         cmd.extend([
             "gemini", "-p", prompt,
             "--output-format", "stream-json",
@@ -283,7 +286,7 @@ class GeminiProvider(Provider):
     ) -> RunResult:
         """Run Gemini directly."""
         cmd = [
-            "env", "GEMINI_SHELL_ENABLED=true",
+            "env", "GEMINI_SHELL_ENABLED=true", GEMINI_TRUST_WORKSPACE_ENV,
             "timeout", f"{config.timeout_minutes}m",
             "gemini", "-p", prompt,
             "--output-format", "stream-json",

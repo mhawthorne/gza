@@ -1900,35 +1900,36 @@ class TestMergeStatus:
         from gza.db import migrate_merge_status
         from gza.git import Git
 
+        class FakeGit(Git):
+            def __init__(self) -> None:
+                pass
+
+            def default_branch(self) -> str:
+                return "main"
+
+            def remote_exists(self, remote: str) -> bool:
+                return remote == "origin"
+
+            def fetch(self, remote: str = "origin") -> None:
+                assert remote == "origin"
+
+            def ref_exists(self, ref: str) -> bool:
+                return ref in {"origin/main", "origin/feature/remote-survivor"}
+
+            def branch_exists(self, branch: str) -> bool:
+                return False
+
+            def is_merged(self, source: str, into: str) -> bool:
+                return False
+
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
-
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
 
         task = store.add(prompt="Legacy deleted local branch")
         store.mark_completed(task, has_commits=True, branch="feature/remote-survivor")
         store.set_merge_status(task.id, None)
 
-        git._run("checkout", "-b", "feature/remote-survivor")
-        (tmp_path / "feature.txt").write_text("feature\n")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Feature work")
-        git._run("checkout", "main")
-
-        remote_dir = tmp_path / "origin.git"
-        git._run("init", "--bare", str(remote_dir))
-        git._run("remote", "add", "origin", str(remote_dir))
-        git._run("push", "-u", "origin", "main")
-        git._run("push", "-u", "origin", "feature/remote-survivor")
-        git._run("branch", "-D", "feature/remote-survivor")
-
-        migrate_merge_status(store, git)
+        migrate_merge_status(store, FakeGit())
 
         updated = store.get(task.id)
         assert updated is not None
