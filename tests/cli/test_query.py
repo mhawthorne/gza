@@ -41,6 +41,85 @@ def _mock_unmerged_git() -> MagicMock:
     return git
 
 
+class _FastUnmergedGit:
+    def __init__(self) -> None:
+        self._current_branch = "main"
+        self._branches: set[str] = set()
+        self._refs: set[str] = set()
+        self._merged: dict[tuple[str, str | None], bool] = {}
+        self._numstat = "1\t0\tfeature.txt\n"
+        self._fetch_error: GitError | None = None
+        self.fetch_calls: list[str] = []
+
+    def default_branch(self) -> str:
+        return "main"
+
+    def current_branch(self) -> str:
+        return self._current_branch
+
+    def branch_exists(self, branch: str) -> bool:
+        return bool(branch) and (not self._branches or branch in self._branches)
+
+    def ref_exists(self, ref: str) -> bool:
+        return ref in self._refs
+
+    def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
+        return self._merged.get((branch, into), False)
+
+    def count_commits_ahead(self, branch: str, target: str) -> int:
+        return 1
+
+    def get_diff_stat_parsed(self, revision_range: str) -> tuple[int, int, int]:
+        return (1, 1, 0)
+
+    def get_diff_numstat(self, revision_range: str) -> str:
+        return self._numstat
+
+    def can_merge(self, branch: str, into: str | None = None) -> bool:
+        return True
+
+    def fetch(self, remote: str = "origin") -> None:
+        self.fetch_calls.append(remote)
+        if self._fetch_error is not None:
+            raise self._fetch_error
+        return None
+
+    def _run(self, *args: str) -> None:
+        raise AssertionError("fast unmerged git double does not run subprocesses")
+
+
+class _UnavailableGitHub:
+    def is_available(self) -> bool:
+        return False
+
+
+def _setup_unmerged_env_fast(
+    tmp_path: Path,
+    *,
+    task_prompt: str = "Add feature",
+    task_type: str = "implement",
+    task_id: str = "20260212-add-feature",
+    branch: str = "feature/test",
+    merge_status: str | None = "unmerged",
+    status: str = "completed",
+    has_commits: bool = True,
+):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add(task_prompt, task_type=task_type)
+    task.status = status
+    if status in ("completed", "failed", "dropped"):
+        task.completed_at = datetime.now(UTC)
+    task.branch = branch
+    task.has_commits = has_commits
+    task.merge_status = merge_status
+    task.slug = task_id
+    store.update(task)
+
+    return store, task, _FastUnmergedGit()
+
+
 def _unmerged_branch_block(output: str, branch: str) -> str:
     """Return the rendered unmerged output block for a specific branch."""
     for block in output.split("-" * 32):
@@ -1349,6 +1428,7 @@ class TestSearchCommand:
 
         assert result.returncode == 0
         assert "No tasks found matching 'missing'" in result.stdout
+        assert "Showing results 0-0 out of 0" in result.stdout
 
     def test_search_json_empty_results_returns_empty_array_without_human_message(self, tmp_path: Path):
         setup_db_with_tasks(tmp_path, [
@@ -1374,6 +1454,7 @@ class TestSearchCommand:
         assert "limit needle three" in result.stdout
         assert "limit needle two" in result.stdout
         assert "limit needle one" not in result.stdout
+        assert "Showing results 1-2 out of 3" in result.stdout
 
     def test_search_last_zero_shows_all_matches(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -1388,6 +1469,7 @@ class TestSearchCommand:
         assert "all needle three" in result.stdout
         assert "all needle two" in result.stdout
         assert "all needle one" in result.stdout
+        assert "Showing results 1-3 out of 3" in result.stdout
 
     def test_search_last_rejects_negative_values(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -5589,6 +5671,34 @@ class TestDeleteCommand:
 class TestUnmergedReviewStatus:
     """Tests for review status display in 'gza unmerged' command."""
 
+    _REAL_GIT_TESTS = {
+        "test_unmerged_shows_deleted_branch_if_merge_status_unmerged",
+        "test_unmerged_keeps_deleted_local_branch_visible_when_remote_feature_still_exists",
+        "test_unmerged_migrates_deleted_local_branch_with_remote_survivor_via_shared_reconcile",
+        "test_unmerged_update_backfills_merge_status",
+        "test_unmerged_update_marks_stale_merged_task_as_merged",
+        "test_unmerged_uses_existing_origin_default_branch_without_fetch_by_default",
+        "test_unmerged_fetch_flag_fetches_origin_default_branch_before_canonical_reconcile",
+        "test_unmerged_update_refreshes_diff_stats_for_live_branch",
+        "test_unmerged_into_current_uses_current_branch",
+        "test_unmerged_into_current_keeps_deleted_branch_visible_when_not_merged_into_current",
+        "test_unmerged_target_uses_specified_branch",
+        "test_unmerged_target_keeps_deleted_branch_visible_when_not_merged_into_target",
+        "test_unmerged_update_warns_and_does_not_persist_for_live_targets",
+        "test_unmerged_live_target_excludes_same_branch_fix_descendants",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _use_fast_unmerged_env(self, request, monkeypatch):
+        test_name = getattr(request.node, "originalname", None) or request.node.name
+        if test_name in self._REAL_GIT_TESTS:
+            return
+
+        fake_git = _FastUnmergedGit()
+        monkeypatch.setitem(globals(), "setup_unmerged_env", _setup_unmerged_env_fast)
+        monkeypatch.setattr(query_cli, "Git", lambda _project_dir: fake_git)
+        monkeypatch.setattr(query_cli, "GitHub", _UnavailableGitHub)
+
     @pytest.mark.parametrize(
         "review_output, expected_text",
         [
@@ -6421,12 +6531,6 @@ class TestUnmergedReviewStatus:
         root_review.output_content = "Verdict: APPROVED"
         store.update(root_review)
 
-        git._run("checkout", "-b", "feature/retry", "main")
-        (tmp_path / "retry.txt").write_text("retry branch content\n")
-        git._run("add", "retry.txt")
-        git._run("commit", "-m", "Retry branch commit")
-        git._run("checkout", "main")
-
         retry_impl = store.add("Retry on new branch", task_type="implement")
         retry_impl.status = "completed"
         retry_impl.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
@@ -6455,12 +6559,6 @@ class TestUnmergedReviewStatus:
         )
         root_impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
         store.update(root_impl)
-
-        git._run("checkout", "-b", "feature/retry", "main")
-        (tmp_path / "retry.txt").write_text("retry branch content\n")
-        git._run("add", "retry.txt")
-        git._run("commit", "-m", "Retry branch commit")
-        git._run("checkout", "main")
 
         retry_impl = store.add("Retry on new branch", task_type="implement")
         retry_impl.status = "completed"
@@ -6511,12 +6609,6 @@ class TestUnmergedReviewStatus:
         root_review.depends_on = root_impl.id
         root_review.output_content = "Verdict: APPROVED"
         store.update(root_review)
-
-        git._run("checkout", "-b", "feature/retry", "main")
-        (tmp_path / "retry.txt").write_text("retry branch content\n")
-        git._run("add", "retry.txt")
-        git._run("commit", "-m", "Retry branch commit")
-        git._run("checkout", "main")
 
         retry_impl = store.add("Retry on new branch", task_type="implement")
         retry_impl.status = "completed"
@@ -6578,6 +6670,22 @@ class TestUnmergedReviewStatus:
 
 class TestUnmergedAllFlag:
     """Tests for 'gza unmerged --all' flag."""
+
+    @pytest.fixture(autouse=True)
+    def _use_fast_unmerged_env(self, monkeypatch):
+        fake_git = _FastUnmergedGit()
+        fake_git._branches.add("main")
+
+        def setup_fast(*args, **kwargs):
+            store, task, _git = _setup_unmerged_env_fast(*args, **kwargs)
+            if task.branch:
+                fake_git._branches.add(task.branch)
+            fake_git._branches.add("main")
+            return store, task, fake_git
+
+        monkeypatch.setitem(globals(), "setup_unmerged_env", setup_fast)
+        monkeypatch.setattr(query_cli, "Git", lambda _project_dir: fake_git)
+        monkeypatch.setattr(query_cli, "GitHub", _UnavailableGitHub)
 
     def test_all_flag_excludes_failed_tasks(self, tmp_path: Path):
         """Failed tasks are excluded from gza unmerged (only completed tasks shown)."""
@@ -6649,19 +6757,8 @@ class TestUnmergedAllFlag:
 
     def test_unmerged_shows_deleted_branch_if_merge_status_unmerged(self, tmp_path: Path):
         """Plain unmerged keeps deleted local branches visible without merge proof."""
-
         setup_config(tmp_path)
         store = make_store(tmp_path)
-
-        # We need a git repo but the task's branch won't exist
-        from gza.git import Git
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "file.txt").write_text("initial")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
 
         # Task with merge_status='unmerged' but branch doesn't exist anywhere
         task = store.add("Deleted branch task", task_type="implement")
@@ -6690,12 +6787,7 @@ class TestUnmergedAllFlag:
             branch="feature/deleted-local-remote-survivor",
         )
 
-        remote_dir = tmp_path / "origin.git"
-        git._run("init", "--bare", str(remote_dir))
-        git._run("remote", "add", "origin", str(remote_dir))
-        git._run("push", "-u", "origin", "main")
-        git._run("push", "-u", "origin", "feature/deleted-local-remote-survivor")
-        git._run("branch", "-D", "feature/deleted-local-remote-survivor")
+        git._branches.discard("feature/deleted-local-remote-survivor")
 
         result = run_gza("unmerged", "--project", str(tmp_path))
 
@@ -6715,12 +6807,7 @@ class TestUnmergedAllFlag:
             merge_status=None,
         )
 
-        remote_dir = tmp_path / "origin.git"
-        git._run("init", "--bare", str(remote_dir))
-        git._run("remote", "add", "origin", str(remote_dir))
-        git._run("push", "-u", "origin", "main")
-        git._run("push", "-u", "origin", "feature/legacy-deleted-local-remote-survivor")
-        git._run("branch", "-D", "feature/legacy-deleted-local-remote-survivor")
+        git._branches.discard("feature/legacy-deleted-local-remote-survivor")
 
         result = run_gza("unmerged", "--project", str(tmp_path))
 
@@ -6740,12 +6827,6 @@ class TestUnmergedAllFlag:
             branch="feature/old-task",
             merge_status=None,
         )
-
-        git._run("checkout", "feature/old-task")
-        (tmp_path / "old.txt").write_text("old work")
-        git._run("add", "old.txt")
-        git._run("commit", "-m", "Old work")
-        git._run("checkout", "main")
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
@@ -6777,7 +6858,7 @@ class TestUnmergedAllFlag:
             branch="feature/stale-unmerged",
         )
 
-        git._run("merge", "--no-ff", "feature/stale-unmerged", "-m", "Merge stale branch")
+        git._merged[("feature/stale-unmerged", "main")] = True
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
@@ -6800,8 +6881,6 @@ class TestUnmergedAllFlag:
         tmp_path: Path,
     ):
         """Plain canonical unmerged should reuse an existing origin/default ref without fetching."""
-        from gza.git import Git
-
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Remote-only merged task",
@@ -6809,27 +6888,12 @@ class TestUnmergedAllFlag:
             branch="feature/remote-only-merged-task",
         )
 
-        remote_dir = tmp_path / "origin.git"
-        git._run("init", "--bare", str(remote_dir))
-        git._run("remote", "add", "origin", str(remote_dir))
-        git._run("push", "-u", "origin", "main")
-        git._run("push", "-u", "origin", "feature/remote-only-merged-task")
+        git._refs.add("origin/main")
+        git._merged[("feature/remote-only-merged-task", "origin/main")] = True
 
-        updater_dir = tmp_path / "origin-updater"
-        git._run("clone", str(remote_dir), str(updater_dir))
-        updater_git = Git(updater_dir)
-        updater_git._run("config", "user.name", "Test User")
-        updater_git._run("config", "user.email", "test@example.com")
-        updater_git._run("checkout", "-b", "main", "origin/main")
-        updater_git._run("merge", "--no-ff", "origin/feature/remote-only-merged-task", "-m", "Merge feature remotely")
-        updater_git._run("push", "origin", "main")
+        result = run_gza("unmerged", "--project", str(tmp_path))
 
-        git.fetch("origin")
-
-        with patch("gza.git.Git.fetch", side_effect=AssertionError("fetch should not be called")) as fetch_mock:
-            result = run_gza("unmerged", "--project", str(tmp_path))
-
-        assert fetch_mock.call_count == 0
+        assert git.fetch_calls == []
         assert result.returncode == 0
         assert "Remote-only merged task" not in result.stdout
         assert "No unmerged tasks" in result.stdout
@@ -6839,8 +6903,6 @@ class TestUnmergedAllFlag:
 
     def test_unmerged_fetch_flag_fetches_origin_default_branch_before_canonical_reconcile(self, tmp_path: Path):
         """`--fetch` should refresh origin/default merge evidence before canonical reconcile."""
-        from gza.git import Git
-
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Remote-only merged task",
@@ -6848,20 +6910,8 @@ class TestUnmergedAllFlag:
             branch="feature/remote-only-merged-task",
         )
 
-        remote_dir = tmp_path / "origin.git"
-        git._run("init", "--bare", str(remote_dir))
-        git._run("remote", "add", "origin", str(remote_dir))
-        git._run("push", "-u", "origin", "main")
-        git._run("push", "-u", "origin", "feature/remote-only-merged-task")
-
-        updater_dir = tmp_path / "origin-updater"
-        git._run("clone", str(remote_dir), str(updater_dir))
-        updater_git = Git(updater_dir)
-        updater_git._run("config", "user.name", "Test User")
-        updater_git._run("config", "user.email", "test@example.com")
-        updater_git._run("checkout", "-b", "main", "origin/main")
-        updater_git._run("merge", "--no-ff", "origin/feature/remote-only-merged-task", "-m", "Merge feature remotely")
-        updater_git._run("push", "origin", "main")
+        git._refs.add("origin/main")
+        git._merged[("feature/remote-only-merged-task", "origin/main")] = True
 
         result = run_gza("unmerged", "--fetch", "--project", str(tmp_path))
 
@@ -6874,7 +6924,7 @@ class TestUnmergedAllFlag:
 
     def test_unmerged_fetch_failure_fails_closed_without_rendering_stale_rows(self, tmp_path: Path):
         """`--fetch` should stop instead of showing stale rows after fetch failures."""
-        store, task, _git = setup_unmerged_env(
+        store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Fetch failure task",
             task_id="20260220-fetch-failure-task",
@@ -6887,11 +6937,8 @@ class TestUnmergedAllFlag:
         task.pr_state = "open"
         store.update(task)
 
-        with (
-            patch("gza.git.Git.remote_exists", return_value=True),
-            patch("gza.git.Git.fetch", side_effect=GitError("network down")),
-        ):
-            result = run_gza("unmerged", "--fetch", "--project", str(tmp_path))
+        git._fetch_error = GitError("network down")
+        result = run_gza("unmerged", "--fetch", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "failed to refresh canonical merge truth" in result.stdout
@@ -6920,11 +6967,7 @@ class TestUnmergedAllFlag:
         task.diff_lines_removed = 111
         store.update(task)
 
-        git._run("checkout", "feature/refresh-diff-stats")
-        (tmp_path / "feature.txt").write_text("line1\nline2\n")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Update diff stats")
-        git._run("checkout", "main")
+        git._numstat = "2\t0\tfeature.txt\n"
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
@@ -6945,8 +6988,9 @@ class TestUnmergedAllFlag:
             branch="feature/branch-local-task",
         )
 
-        git._run("checkout", "-b", "integration")
-        git._run("merge", "--no-ff", "feature/branch-local-task", "-m", "Merge feature into integration")
+        git._current_branch = "integration"
+        git._branches.add("integration")
+        git._merged[("feature/branch-local-task", "integration")] = True
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
@@ -6969,8 +7013,9 @@ class TestUnmergedAllFlag:
             branch="feature/deleted-current-target-task",
         )
 
-        git._run("checkout", "-b", "integration")
-        git._run("branch", "-D", "feature/deleted-current-target-task")
+        git._current_branch = "integration"
+        git._branches.add("integration")
+        git._branches.discard("feature/deleted-current-target-task")
 
         result = run_gza("unmerged", "--into-current", "--project", str(tmp_path), cwd=tmp_path)
 
@@ -6991,9 +7036,8 @@ class TestUnmergedAllFlag:
             branch="feature/target-branch-task",
         )
 
-        git._run("checkout", "-b", "integration")
-        git._run("merge", "--no-ff", "feature/target-branch-task", "-m", "Merge feature into integration")
-        git._run("checkout", "main")
+        git._branches.add("integration")
+        git._merged[("feature/target-branch-task", "integration")] = True
 
         result = run_gza("unmerged", "--target", "integration", "--project", str(tmp_path))
         assert result.returncode == 0
@@ -7013,9 +7057,8 @@ class TestUnmergedAllFlag:
             merge_status="merged",
         )
 
-        git._run("checkout", "-b", "integration")
-        git._run("checkout", "main")
-        git._run("branch", "-D", "feature/deleted-explicit-target-task")
+        git._branches.add("integration")
+        git._branches.discard("feature/deleted-explicit-target-task")
 
         result = run_gza("unmerged", "--target", "integration", "--project", str(tmp_path))
 
@@ -7037,9 +7080,8 @@ class TestUnmergedAllFlag:
             merge_status=None,
         )
 
-        git._run("checkout", "-b", "integration")
-        git._run("merge", "--no-ff", "feature/live-target-noop", "-m", "Merge feature into integration")
-        git._run("checkout", "main")
+        git._branches.add("integration")
+        git._merged[("feature/live-target-noop", "integration")] = True
 
         result = run_gza(
             "unmerged",
@@ -7095,6 +7137,13 @@ class TestUnmergedAllFlag:
 
 class TestUnmergedImprovedDisplay:
     """Tests for improved unmerged display (diff stats, review prominence, completed-only)."""
+
+    @pytest.fixture(autouse=True)
+    def _use_fast_unmerged_env(self, monkeypatch):
+        fake_git = _FastUnmergedGit()
+        monkeypatch.setitem(globals(), "setup_unmerged_env", _setup_unmerged_env_fast)
+        monkeypatch.setattr(query_cli, "Git", lambda _project_dir: fake_git)
+        monkeypatch.setattr(query_cli, "GitHub", _UnavailableGitHub)
 
     def test_unmerged_excludes_failed_tasks(self, tmp_path: Path):
         """Failed tasks with merge_status='unmerged' are excluded from unmerged output."""
@@ -7330,13 +7379,6 @@ class TestUnmergedImprovedDisplay:
         """Unmerged output shows diff stats (files, LOC added/removed)."""
         store, task, git = setup_unmerged_env(tmp_path)
 
-        # Add more content on the feature branch for visible diff stats
-        git._run("checkout", "feature/test")
-        (tmp_path / "feature.txt").write_text("line1\nline2\nline3\n")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Expand feature content")
-        git._run("checkout", "main")
-
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         # Diff stats should be shown in branch line
@@ -7381,12 +7423,6 @@ class TestUnmergedImprovedDisplay:
         task.diff_lines_added = 999
         task.diff_lines_removed = 999
         store.update(task)
-
-        git._run("checkout", "-b", "target/base", "main")
-        (tmp_path / "target.txt").write_text("target-branch-change\n")
-        git._run("add", "target.txt")
-        git._run("commit", "-m", "Target branch baseline commit")
-        git._run("checkout", "main")
 
         default_result = run_gza("unmerged", "--project", str(tmp_path))
         assert default_result.returncode == 0

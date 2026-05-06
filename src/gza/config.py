@@ -957,13 +957,13 @@ class Config:
                     task_types=provider_task_types,
                 )
 
-        # Warn when provider-scoped and legacy fields are both set for same semantic target
+        # Warn when provider-scoped and broader fallback fields are both set for the same semantic target.
         legacy_model_set = "model" in data or ("defaults" in data and isinstance(defaults, dict) and "model" in defaults)
         if legacy_model_set:
             for provider_name, provider_config in providers.items():
                 if provider_config.model:
                     warnings.warn(
-                        f"Both provider-scoped model ('providers.{provider_name}.model') and legacy global model "
+                        f"Both provider-scoped model ('providers.{provider_name}.model') and default model "
                         f"('model'/'defaults.model') are set. Using provider-scoped value for provider '{provider_name}'.",
                         stacklevel=2,
                     )
@@ -975,7 +975,7 @@ class Config:
                 if provider_config.reasoning_effort:
                     warnings.warn(
                         f"Both provider-scoped reasoning_effort ('providers.{provider_name}.reasoning_effort') and "
-                        f"legacy global reasoning_effort ('reasoning_effort'/'defaults.reasoning_effort') are set. "
+                        f"default reasoning_effort ('reasoning_effort'/'defaults.reasoning_effort') are set. "
                         f"Using provider-scoped value for provider '{provider_name}'.",
                         stacklevel=2,
                     )
@@ -989,14 +989,14 @@ class Config:
                         continue
                     if provider_task_type.model is not None and "model" in legacy_task_type:
                         warnings.warn(
-                            f"Both provider-scoped and legacy model are set for task type '{task_type}' "
+                            f"Both provider-scoped and task-type default model are set for task type '{task_type}' "
                             f"(providers.{provider_name}.task_types.{task_type}.model and task_types.{task_type}.model). "
                             f"Using provider-scoped value for provider '{provider_name}'.",
                             stacklevel=2,
                         )
                     if provider_task_type.reasoning_effort is not None and "reasoning_effort" in legacy_task_type:
                         warnings.warn(
-                            f"Both provider-scoped and legacy reasoning_effort are set for task type '{task_type}' "
+                            f"Both provider-scoped and task-type default reasoning_effort are set for task type '{task_type}' "
                             f"(providers.{provider_name}.task_types.{task_type}.reasoning_effort and "
                             f"task_types.{task_type}.reasoning_effort). "
                             f"Using provider-scoped value for provider '{provider_name}'.",
@@ -1004,14 +1004,14 @@ class Config:
                         )
                     if provider_task_type.max_turns is not None and "max_turns" in legacy_task_type:
                         warnings.warn(
-                            f"Both provider-scoped and legacy max_turns are set for task type '{task_type}' "
+                            f"Both provider-scoped and task-type default max_turns are set for task type '{task_type}' "
                             f"(providers.{provider_name}.task_types.{task_type}.max_turns and task_types.{task_type}.max_turns). "
                             f"Using provider-scoped value for provider '{provider_name}'.",
                             stacklevel=2,
                         )
                     if provider_task_type.max_steps is not None and "max_steps" in legacy_task_type:
                         warnings.warn(
-                            f"Both provider-scoped and legacy max_steps are set for task type '{task_type}' "
+                            f"Both provider-scoped and task-type default max_steps are set for task type '{task_type}' "
                             f"(providers.{provider_name}.task_types.{task_type}.max_steps and task_types.{task_type}.max_steps). "
                             f"Using provider-scoped value for provider '{provider_name}'.",
                             stacklevel=2,
@@ -2041,7 +2041,7 @@ class Config:
                         if key not in valid_provider_keys:
                             warnings.append(f"Unknown field in 'providers.{provider_name}': '{key}'")
 
-        # Warn when provider-scoped and legacy fields are both set for same semantic target
+        # Warn when provider-scoped and broader fallback fields are both set for the same semantic target.
         legacy_model_set = "model" in data or (
             "defaults" in data and isinstance(data.get("defaults"), dict) and "model" in data["defaults"]
         )
@@ -2049,7 +2049,7 @@ class Config:
             for provider_name, provider_data in data["providers"].items():
                 if isinstance(provider_data, dict) and provider_data.get("model") is not None:
                     warnings.append(
-                        f"Both provider-scoped model ('providers.{provider_name}.model') and legacy global model "
+                        f"Both provider-scoped model ('providers.{provider_name}.model') and default model "
                         f"('model'/'defaults.model') are set. Provider-scoped value takes precedence."
                     )
         legacy_reasoning_effort_set = "reasoning_effort" in data or (
@@ -2060,7 +2060,7 @@ class Config:
                 if isinstance(provider_data, dict) and provider_data.get("reasoning_effort") is not None:
                     warnings.append(
                         "Both provider-scoped reasoning_effort "
-                        f"('providers.{provider_name}.reasoning_effort') and legacy global reasoning_effort "
+                        f"('providers.{provider_name}.reasoning_effort') and default reasoning_effort "
                         "('reasoning_effort'/'defaults.reasoning_effort') are set. Provider-scoped value takes precedence."
                     )
 
@@ -2077,26 +2077,26 @@ class Config:
                         continue
                     if "model" in provider_task_type and "model" in legacy_task_type:
                         warnings.append(
-                            f"Both provider-scoped and legacy model are set for task type '{task_type}' "
+                            f"Both provider-scoped and task-type default model are set for task type '{task_type}' "
                             f"(providers.{provider_name}.task_types.{task_type}.model and task_types.{task_type}.model). "
                             f"Provider-scoped value takes precedence."
                         )
                     if "reasoning_effort" in provider_task_type and "reasoning_effort" in legacy_task_type:
                         warnings.append(
-                            f"Both provider-scoped and legacy reasoning_effort are set for task type '{task_type}' "
+                            f"Both provider-scoped and task-type default reasoning_effort are set for task type '{task_type}' "
                             f"(providers.{provider_name}.task_types.{task_type}.reasoning_effort and "
                             f"task_types.{task_type}.reasoning_effort). "
                             f"Provider-scoped value takes precedence."
                         )
                     if "max_turns" in provider_task_type and "max_turns" in legacy_task_type:
                         warnings.append(
-                            f"Both provider-scoped and legacy max_turns are set for task type '{task_type}' "
+                            f"Both provider-scoped and task-type default max_turns are set for task type '{task_type}' "
                             f"(providers.{provider_name}.task_types.{task_type}.max_turns and task_types.{task_type}.max_turns). "
                             f"Provider-scoped value takes precedence."
                         )
                     if "max_steps" in provider_task_type and "max_steps" in legacy_task_type:
                         warnings.append(
-                            f"Both provider-scoped and legacy max_steps are set for task type '{task_type}' "
+                            f"Both provider-scoped and task-type default max_steps are set for task type '{task_type}' "
                             f"(providers.{provider_name}.task_types.{task_type}.max_steps and task_types.{task_type}.max_steps). "
                             f"Provider-scoped value takes precedence."
                         )

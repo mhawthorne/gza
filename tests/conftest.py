@@ -16,3 +16,14 @@ def _disable_git_signing(tmp_path, monkeypatch):
     global_config = tmp_path / ".gitconfig-empty"
     global_config.write_text("")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rich_color_env(monkeypatch):
+    """Keep Rich color-forcing environment changes from leaking across tests."""
+    for name in ("FORCE_COLOR", "TTY_COMPATIBLE", "CLICOLOR_FORCE", "NO_COLOR"):
+        monkeypatch.delenv(name, raising=False)
+
+    from gza.console import console
+
+    monkeypatch.setattr(console, "no_color", True)

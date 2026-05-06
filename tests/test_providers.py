@@ -26,6 +26,8 @@ from gza.providers.base import (
     GZA_SHIM_SETUP_COMMAND,
     _extract_startup_log_line,
     _format_command_for_log,
+    _get_default_dockerfile_content,
+    _get_file_sha256,
     _get_image_created_time,
     build_docker_cmd,
     ensure_docker_image,
@@ -968,6 +970,22 @@ class TestDockerfileTemplate:
             assert dockerfile.exists()
             assert "ripgrep" in dockerfile.read_text()
 
+    def test_codex_default_dockerfile_uses_checked_in_pin(self):
+        """Generated Codex Dockerfiles should use the checked-in Dockerfile."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@openai/codex",
+            cli_command="codex",
+            config_dir=None,
+            env_vars=[],
+        )
+        repo_root = Path(__file__).resolve().parents[1]
+
+        content = _get_default_dockerfile_content(docker_config)
+
+        assert content == (repo_root / "etc" / "Dockerfile.codex").read_text()
+        assert "RUN npm install -g @openai/codex@0.128.0" in content
+
 
 class TestGeminiCostCalculation:
     """Tests for Gemini cost calculation."""
@@ -1368,6 +1386,56 @@ class TestCodexGitRepoCheckBypass:
 
         cmd = mock_run_parse.call_args[0][0]
         assert "--skip-git-repo-check" in cmd
+
+
+class TestGeminiHeadlessTrust:
+    """Tests that Gemini execution trusts headless workspaces."""
+
+    def test_gemini_docker_sets_trust_workspace_env(self, tmp_path):
+        """Docker gemini command should trust the mounted workspace."""
+        provider = GeminiProvider()
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="gemini",
+            use_docker=True,
+            timeout_minutes=5,
+        )
+        config.docker_image = "test-gemini-image"
+        config.docker_volumes = []
+        config.docker_setup_command = ""
+
+        with patch("gza.providers.gemini.ensure_docker_image", return_value=True), \
+             patch("gza.providers.gemini.build_docker_cmd", return_value=["timeout", "5m", "docker", "run", "--rm", "test-gemini-image"]), \
+             patch.object(provider, "_run_with_output_parsing", return_value=MagicMock(exit_code=0)) as mock_run_parse:
+            provider._run_docker(config, "test prompt", tmp_path / "log.txt", tmp_path)
+
+        cmd = mock_run_parse.call_args[0][0]
+        assert "GEMINI_SHELL_ENABLED=true" in cmd
+        assert "GEMINI_CLI_TRUST_WORKSPACE=true" in cmd
+        assert cmd.index("GEMINI_CLI_TRUST_WORKSPACE=true") < cmd.index("test-gemini-image")
+
+    def test_gemini_direct_sets_trust_workspace_env(self, tmp_path):
+        """Direct gemini command should trust the working directory."""
+        provider = GeminiProvider()
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="gemini",
+            use_docker=False,
+            timeout_minutes=5,
+        )
+
+        with patch.object(provider, "_run_with_output_parsing", return_value=MagicMock(exit_code=0)) as mock_run_parse:
+            provider._run_direct(config, "test prompt", tmp_path / "log.txt", tmp_path)
+
+        cmd = mock_run_parse.call_args[0][0]
+        assert cmd[:4] == [
+            "env",
+            "GEMINI_SHELL_ENABLED=true",
+            "GEMINI_CLI_TRUST_WORKSPACE=true",
+            "timeout",
+        ]
 
 
 class TestDockerDaemonCheck:
@@ -3379,7 +3447,7 @@ class TestEnsureDockerImage:
         mock_run.assert_not_called()
 
     def test_returns_true_when_image_up_to_date(self, tmp_path):
-        """Should return True without building when image is newer than Dockerfile."""
+        """Should return True without building when image matches Dockerfile content."""
         docker_config = DockerConfig(
             image_name="test-image",
             npm_package="@test/cli",
@@ -3394,12 +3462,9 @@ class TestEnsureDockerImage:
         dockerfile = etc_dir / "Dockerfile.testcli"
         dockerfile.write_text("FROM node:20-slim")
 
-        # Mock image as newer than Dockerfile
-        dockerfile_mtime = dockerfile.stat().st_mtime
-        image_time = dockerfile_mtime + 100  # Image created after Dockerfile
-
         with patch("gza.providers.base.is_docker_running", return_value=True), \
-             patch("gza.providers.base._get_image_created_time", return_value=image_time):
+             patch("gza.providers.base._get_image_created_time", return_value=1.0), \
+             patch("gza.providers.base._get_image_label", return_value=_get_file_sha256(dockerfile)):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 result = ensure_docker_image(docker_config, tmp_path)
 
@@ -3408,7 +3473,7 @@ class TestEnsureDockerImage:
         mock_run.assert_not_called()
 
     def test_rebuilds_when_dockerfile_newer(self, tmp_path):
-        """Should rebuild image when Dockerfile is newer than image."""
+        """Should rebuild image when Dockerfile content changed."""
         docker_config = DockerConfig(
             image_name="test-image",
             npm_package="@test/cli",
@@ -3423,12 +3488,9 @@ class TestEnsureDockerImage:
         dockerfile = etc_dir / "Dockerfile.testcli"
         dockerfile.write_text("FROM node:20-slim")
 
-        # Mock image as older than Dockerfile
-        dockerfile_mtime = dockerfile.stat().st_mtime
-        image_time = dockerfile_mtime - 100  # Image created before Dockerfile
-
         with patch("gza.providers.base.is_docker_running", return_value=True), \
-             patch("gza.providers.base._get_image_created_time", return_value=image_time):
+             patch("gza.providers.base._get_image_created_time", return_value=1.0), \
+             patch("gza.providers.base._get_image_label", return_value="old-digest"):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
                 result = ensure_docker_image(docker_config, tmp_path)
@@ -3439,6 +3501,28 @@ class TestEnsureDockerImage:
         call_args = mock_run.call_args[0][0]
         assert "docker" in call_args
         assert "build" in call_args
+        assert any(arg.startswith("gza.dockerfile_sha256=") for arg in call_args)
+
+    def test_rebuilds_existing_image_without_dockerfile_digest(self, tmp_path):
+        """Should rebuild legacy images that lack the Dockerfile content label."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        with patch("gza.providers.base.is_docker_running", return_value=True), \
+             patch("gza.providers.base._get_image_created_time", return_value=1.0), \
+             patch("gza.providers.base._get_image_label", return_value=None):
+            with patch("gza.providers.base.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0)
+                result = ensure_docker_image(docker_config, tmp_path)
+
+        assert result is True
+        mock_run.assert_called_once()
+        assert (tmp_path / "etc" / "Dockerfile.testcli").exists()
 
     def test_builds_when_image_not_exists(self, tmp_path):
         """Should build image when it doesn't exist."""
@@ -3506,6 +3590,25 @@ class TestEnsureDockerImage:
         content = dockerfile.read_text()
         assert "@test/cli" in content
         assert "testcli" in content
+
+    def test_generates_checked_in_provider_dockerfile_when_missing(self, tmp_path):
+        """Should copy checked-in provider Dockerfiles for temp-project image builds."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@openai/codex",
+            cli_command="codex",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        with patch("gza.providers.base.is_docker_running", return_value=True), \
+             patch("gza.providers.base._get_image_created_time", return_value=None):
+            with patch("gza.providers.base.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0)
+                ensure_docker_image(docker_config, tmp_path)
+
+        dockerfile = tmp_path / "etc" / "Dockerfile.codex"
+        assert dockerfile.read_text() == (Path(__file__).resolve().parents[1] / "etc" / "Dockerfile.codex").read_text()
 
     def test_returns_false_on_build_failure(self, tmp_path):
         """Should return False when docker build fails."""
@@ -4978,8 +5081,8 @@ class TestProviderScopedConfig:
         assert is_valid
         assert not errors
         assert any("provider-scoped model" in w for w in warns)
-        assert any("provider-scoped and legacy model are set for task type 'review'" in w for w in warns)
-        assert any("provider-scoped and legacy max_turns are set for task type 'review'" in w for w in warns)
+        assert any("provider-scoped and task-type default model are set for task type 'review'" in w for w in warns)
+        assert any("provider-scoped and task-type default max_turns are set for task type 'review'" in w for w in warns)
 
     def test_getters_apply_provider_scoped_precedence(self, tmp_path):
         """Provider-scoped getters should prefer scoped values then legacy fallbacks."""

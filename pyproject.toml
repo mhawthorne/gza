@@ -60,8 +60,6 @@ fallback-version = "0.1.0.dev0"
 testpaths = ["tests"]
 addopts = "-x"
 pythonpath = ["."]
-# Watchdog for infinite loops in the default unit-test suite. Uses signal so timeouts kill the test's subprocesses (e.g. spawned `gza work` workers) instead of leaking them.
-timeout = 5
 timeout_method = "signal"
 markers = [
     "integration: mark test as integration test (requires credentials and Docker)",

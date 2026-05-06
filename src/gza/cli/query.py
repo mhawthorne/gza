@@ -15,7 +15,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 
 from rich.console import Console
 from rich.markup import escape as rich_escape
@@ -117,6 +117,43 @@ _INCOMPLETE_DEPRECATION_LINES: tuple[str, ...] = (
     "For dropped-dependency blockers, use `uv run gza next --all`.",
     "After `gza unimplemented` ships, it will replace the temporary `advance --unimplemented` spelling.",
 )
+
+
+class _UnmergedGit(Protocol):
+    def default_branch(self) -> str:
+        ...
+
+    def current_branch(self) -> str:
+        ...
+
+    def branch_exists(self, branch: str) -> bool:
+        ...
+
+    def ref_exists(self, ref: str) -> bool:
+        ...
+
+    def is_merged(
+        self,
+        branch: str,
+        into: str | None = None,
+        use_cherry: bool = False,
+    ) -> bool:
+        ...
+
+    def count_commits_ahead(self, branch: str, target: str) -> int:
+        ...
+
+    def get_diff_stat_parsed(self, revision_range: str) -> tuple[int, int, int]:
+        ...
+
+    def get_diff_numstat(self, revision_range: str) -> str:
+        ...
+
+    def can_merge(self, branch: str, into: str | None = None) -> bool:
+        ...
+
+    def fetch(self, remote: str = "origin") -> None:
+        ...
 
 
 def _parse_cli_date(value: str | None) -> _dt.date | None:
@@ -788,8 +825,15 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(json.dumps(result.to_json(), indent=2, default=str))
         return 0
 
+    total_matches = result.total_count or 0
+    displayed_count = len(matches)
+    displayed_start = 1 if displayed_count else 0
+    displayed_end = displayed_count
+    summary = f"Showing results {displayed_start}-{displayed_end} out of {total_matches}"
+
     if not matches:
         console.print(f"No tasks found matching '{term}'")
+        console.print(summary)
         return 0
 
     c = TASK_COLORS
@@ -834,6 +878,7 @@ def cmd_search(args: argparse.Namespace) -> int:
             console.print(f"    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
         print()
 
+    console.print(summary)
     return 0
 
 
@@ -930,7 +975,34 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_unmerged(args: argparse.Namespace) -> int:
+def _format_review_verdict_label(
+    review_verdict: str | None,
+    review_score: int | None,
+    colors: dict[str, str],
+) -> tuple[str | None, str | None]:
+    """Return the unmerged review verdict badge and color override."""
+    verdict_label = None
+    review_status_color = None
+    if review_verdict == "APPROVED":
+        verdict_label = "✓ approved"
+        review_status_color = colors["review_approved"]
+    elif review_verdict == "APPROVED_WITH_FOLLOWUPS":
+        verdict_label = "↺ approved with follow-ups"
+        review_status_color = colors["review_approved"]
+    elif review_verdict == "CHANGES_REQUESTED":
+        verdict_label = "⚠ changes requested"
+        review_status_color = colors["review_changes"]
+    elif review_verdict == "NEEDS_DISCUSSION":
+        verdict_label = "💬 needs discussion"
+        review_status_color = colors["review_discussion"]
+
+    if verdict_label and review_score is not None:
+        verdict_label = f"{verdict_label} ({review_score})"
+
+    return verdict_label, review_status_color
+
+
+def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> int:
     """List tasks with unmerged work on branches."""
     from gza.db import needs_merge_status_migration
 
@@ -952,9 +1024,9 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             return False
 
     config = Config.load(args.project_dir)
-    git = Git(config.project_dir)
-    default_branch = git.default_branch()
-    current_branch = git.current_branch()
+    git_client: _UnmergedGit = git if git is not None else cast(_UnmergedGit, Git(config.project_dir))
+    default_branch = git_client.default_branch()
+    current_branch = git_client.current_branch()
     print(f"On branch {current_branch}")
     target_branch = current_branch if getattr(args, "into_current", False) else (getattr(args, "target", None) or default_branch)
     live_target = _is_branch_target_live(args)
@@ -985,7 +1057,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
 
             reconcile_results, _partial = sync_branch_cohorts(
                 store,
-                git,
+                cast(Git, git_client),
                 build_unmerged_branch_cohorts(store),
                 include_git=True,
                 include_pr=False,
@@ -1025,7 +1097,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             and (t.task_type not in ("improve", "rebase", "fix") or t.based_on is None)
         ]
         live_results = reconcile_branch_merge_truth(
-            git,
+            cast(Git, git_client),
             build_branch_cohorts_for_tasks(store, branch_candidates),
             target_branch=target_branch,
             include_diff_stats=True,
@@ -1262,22 +1334,13 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                         review_score = review.review_score
                         break
 
-        verdict_label = None
-        if review_verdict == "APPROVED":
-            verdict_label = "✓ approved"
-            review_status_color = UNMERGED_COLORS["review_approved"]
-        elif review_verdict == "APPROVED_WITH_FOLLOWUPS":
-            verdict_label = "↺ approved with follow-ups"
-            review_status_color = UNMERGED_COLORS["review_approved"]
-        elif review_verdict == "CHANGES_REQUESTED":
-            verdict_label = "⚠ changes requested"
-            review_status_color = UNMERGED_COLORS["review_changes"]
-        elif review_verdict == "NEEDS_DISCUSSION":
-            verdict_label = "💬 needs discussion"
-            review_status_color = UNMERGED_COLORS["review_discussion"]
-
-        if verdict_label and review_score is not None:
-            verdict_label = f"{verdict_label} ({review_score})"
+        verdict_label, verdict_color = _format_review_verdict_label(
+            review_verdict,
+            review_score,
+            UNMERGED_COLORS,
+        )
+        if verdict_color is not None:
+            review_status_color = verdict_color
 
         review_line = review_classification
         if review_detail:
@@ -1306,7 +1369,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
             console.print(lineage_str)
 
         # Show branch with diff stats (branch may no longer exist if deleted)
-        if representative_branch and git.branch_exists(representative_branch):
+        if representative_branch and git_client.branch_exists(representative_branch):
             # Use cached diff stats if available; fall back to live git call
             use_cached_stats = (
                 target_branch == default_branch
@@ -1316,7 +1379,7 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                 files_changed = representative_task.diff_files_changed
                 insertions = representative_task.diff_lines_added or 0
                 deletions = representative_task.diff_lines_removed or 0
-                commit_count = git.count_commits_ahead(representative_branch, target_branch)
+                commit_count = git_client.count_commits_ahead(representative_branch, target_branch)
                 commits_label = "commit" if commit_count == 1 else "commits"
                 diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
                 branch_detail = f"[{c['branch']}]{commit_count} {commits_label}[/{c['branch']}]"
@@ -1324,15 +1387,15 @@ def cmd_unmerged(args: argparse.Namespace) -> int:
                     branch_detail += f", [{c['branch']}]{diff_str}[/{c['branch']}]"
             else:
                 revision_range = f"{target_branch}...{representative_branch}"
-                files_changed, insertions, deletions = git.get_diff_stat_parsed(revision_range)
-                commit_count = git.count_commits_ahead(representative_branch, target_branch)
+                files_changed, insertions, deletions = git_client.get_diff_stat_parsed(revision_range)
+                commit_count = git_client.count_commits_ahead(representative_branch, target_branch)
                 commits_label = "commit" if commit_count == 1 else "commits"
                 diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
                 branch_detail = f"[{c['branch']}]{commit_count} {commits_label}[/{c['branch']}]"
                 if diff_str:
                     branch_detail += f", [{c['branch']}]{diff_str}[/{c['branch']}]"
             console.print(f"branch: [{c['branch']}]{representative_branch}[/{c['branch']}] ({branch_detail})")
-            if not git.can_merge(representative_branch, target_branch):
+            if not git_client.can_merge(representative_branch, target_branch):
                 console.print("[yellow]⚠️  has conflicts[/yellow]")
         else:
             deleted_branch = representative_branch or branch

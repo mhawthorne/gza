@@ -16,13 +16,15 @@ from gza.cli import cmd_advance
 from gza.config import Config
 from gza.db import SqliteTaskStore
 
-from .conftest import (
+from tests.cli.conftest import (
     make_store,
     run_gza,
     setup_config,
     setup_db_with_tasks,
     setup_git_repo_with_task_branch,
 )
+
+pytestmark = pytest.mark.integration
 
 
 class TestAdvanceAutoPlans:

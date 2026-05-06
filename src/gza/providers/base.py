@@ -10,6 +10,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -185,6 +186,22 @@ def _get_image_label(image_name: str, label_key: str) -> str | None:
     return value
 
 
+def _get_file_sha256(path: Path) -> str:
+    """Return a stable content digest for a file."""
+    return sha256(path.read_bytes()).hexdigest()
+
+
+def _get_default_dockerfile_content(docker_config: DockerConfig) -> str:
+    """Return the default Dockerfile content for a provider."""
+    repo_dockerfile = Path(__file__).resolve().parents[3] / "etc" / f"Dockerfile.{docker_config.cli_command}"
+    if repo_dockerfile.exists():
+        return repo_dockerfile.read_text()
+    return DOCKERFILE_TEMPLATE.format(
+        npm_package=docker_config.npm_package,
+        cli_command=docker_config.cli_command,
+    )
+
+
 def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
     """Ensure Docker image exists, building if needed.
 
@@ -204,39 +221,35 @@ def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
     etc_dir.mkdir(parents=True, exist_ok=True)
     dockerfile_path = etc_dir / f"Dockerfile.{docker_config.cli_command}"
 
+    # Generate Dockerfile before up-to-date checks so temp-project runs can
+    # compare desired image content against an existing named image.
+    if not dockerfile_path.exists():
+        dockerfile_path.write_text(_get_default_dockerfile_content(docker_config))
+
     # Check if image exists and is up-to-date
     rebuild_reason: str | None = None
     image_time = _get_image_created_time(docker_config.image_name)
     if image_time is not None:
-        # Image exists - check if Dockerfile is newer
-        if dockerfile_path.exists():
-            dockerfile_time = dockerfile_path.stat().st_mtime
-            if dockerfile_time > image_time:
-                rebuild_reason = f"{dockerfile_path.name} is newer than image"
-            else:
-                print(
-                    f"Using Docker image {docker_config.image_name} "
-                    f"(up-to-date for {docker_config.cli_command})"
-                )
-                return True  # Image is up-to-date
-        else:
+        # Image exists - prefer exact Dockerfile content comparison. Timestamp
+        # comparison is not reliable for temp-project Dockerfiles generated
+        # after an older named image already exists.
+        dockerfile_digest = _get_file_sha256(dockerfile_path)
+        image_digest = _get_image_label(docker_config.image_name, "gza.dockerfile_sha256")
+        if image_digest == dockerfile_digest:
             print(
                 f"Using Docker image {docker_config.image_name} "
-                f"(up-to-date for {docker_config.cli_command}; no {dockerfile_path.name} timestamp to compare)"
+                f"(up-to-date for {docker_config.cli_command})"
             )
-            return True  # No Dockerfile to compare, image exists
+            return True
+        if image_digest:
+            rebuild_reason = f"{dockerfile_path.name} content changed"
+        else:
+            rebuild_reason = f"{docker_config.image_name} is missing Dockerfile content label"
     else:
         rebuild_reason = "image not found"
 
-    # Generate Dockerfile if it doesn't exist (preserve custom Dockerfiles)
-    if not dockerfile_path.exists():
-        dockerfile_content = DOCKERFILE_TEMPLATE.format(
-            npm_package=docker_config.npm_package,
-            cli_command=docker_config.cli_command,
-        )
-        dockerfile_path.write_text(dockerfile_content)
-
     print(f"Rebuilding Docker image {docker_config.image_name}: {rebuild_reason}")
+    dockerfile_digest = _get_file_sha256(dockerfile_path)
     result = subprocess.run(
         [
             "docker",
@@ -247,6 +260,8 @@ def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
             f"gza.cli_command={docker_config.cli_command}",
             "--label",
             f"gza.npm_package={docker_config.npm_package}",
+            "--label",
+            f"gza.dockerfile_sha256={dockerfile_digest}",
             "-f",
             str(dockerfile_path),
             str(etc_dir),

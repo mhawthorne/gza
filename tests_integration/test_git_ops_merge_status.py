@@ -5,11 +5,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from .conftest import (
+import pytest
+
+from tests.cli.conftest import (
     make_store,
     run_gza,
     setup_config,
 )
+
+pytestmark = pytest.mark.integration
 
 
 class TestMergeStatusTracking:

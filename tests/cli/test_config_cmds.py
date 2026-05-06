@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import sqlite3
-import subprocess
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -380,11 +379,7 @@ class TestLocalConfigOverrides:
             "use_docker: false\n"
         )
 
-        result = subprocess.run(
-            ["uv", "run", "gza", "config", "--json", "--project", str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
+        result = run_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -403,11 +398,7 @@ class TestLocalConfigOverrides:
             "branch_strategy: conventional\n"
         )
 
-        result = subprocess.run(
-            ["uv", "run", "gza", "config", "--json", "--project", str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
+        result = run_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -426,11 +417,7 @@ class TestLocalConfigOverrides:
             "  review: claude\n"
         )
 
-        result = subprocess.run(
-            ["uv", "run", "gza", "config", "--json", "--project", str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
+        result = run_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -456,11 +443,8 @@ class TestLocalConfigOverrides:
             "        reasoning_effort: medium\n"
         )
 
-        result = subprocess.run(
-            ["uv", "run", "gza", "config", "--json", "--project", str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
+        with pytest.warns(UserWarning, match="default reasoning_effort"):
+            result = run_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -570,11 +554,7 @@ class TestLocalConfigOverrides:
         from gza.config_schema import CONFIG_KEY_REGISTRY
         setup_config(tmp_path)
 
-        result = subprocess.run(
-            ["uv", "run", "gza", "config", "keys", "--project", str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
+        result = run_gza("config", "keys", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "KEY" in result.stdout
@@ -597,11 +577,7 @@ class TestLocalConfigOverrides:
         """`gza config keys` should expose watch recovery config with current descriptions."""
         setup_config(tmp_path)
 
-        result = subprocess.run(
-            ["uv", "run", "gza", "config", "keys", "--project", str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
+        result = run_gza("config", "keys", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "watch.restart_failed_batch" in result.stdout
@@ -619,11 +595,7 @@ class TestLocalConfigOverrides:
 
         setup_config(tmp_path)
 
-        result = subprocess.run(
-            ["uv", "run", "gza", "config", "keys", "--json", "--project", str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
+        result = run_gza("config", "keys", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -639,11 +611,7 @@ class TestLocalConfigOverrides:
         """`gza config keys --json` should expose watch recovery config with current descriptions."""
         setup_config(tmp_path)
 
-        result = subprocess.run(
-            ["uv", "run", "gza", "config", "keys", "--json", "--project", str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
+        result = run_gza("config", "keys", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)

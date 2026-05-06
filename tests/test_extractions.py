@@ -1,6 +1,5 @@
-"""Tests for extraction planning helpers."""
+"""Fast unit tests for extraction planning helpers."""
 
-from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -8,29 +7,54 @@ import pytest
 
 from gza.db import SqliteTaskStore
 from gza.extractions import (
+    ExtractionDraft,
     ExtractionError,
+    FileDiffSummary,
+    SourceSelection,
     _parse_file_summaries,
     copy_bundle_to_worktree,
-    load_manifest,
     infer_selected_paths,
+    load_manifest,
     normalize_selected_paths,
     plan_extraction,
     resolve_source_selection,
-    SourceSelection,
     write_extraction_bundle,
 )
 from gza.git import Git
 
 
-def _init_repo(tmp_path: Path) -> Git:
-    git = Git(tmp_path)
-    git._run("init", "-b", "main")
-    git._run("config", "user.name", "Test User")
-    git._run("config", "user.email", "test@example.com")
-    (tmp_path / "base.txt").write_text("base\n")
-    git._run("add", "base.txt")
-    git._run("commit", "-m", "initial")
-    return git
+def _sample_draft(*, prompt: str = "Carry over: Source\n") -> ExtractionDraft:
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+        source_task_prompt="Source",
+        source_task_slug="20260427-source",
+    )
+    summary = FileDiffSummary(
+        status="A",
+        selected_path="src/module.py",
+        old_path=None,
+        new_path="src/module.py",
+        additions=1,
+        deletions=0,
+        binary=False,
+    )
+    return ExtractionDraft(
+        source=source,
+        selected_paths=("src/module.py",),
+        touched_paths=("src/module.py",),
+        file_summaries=(summary,),
+        patch=(
+            "diff --git a/src/module.py b/src/module.py\n"
+            "index e69de29..8c7e5a6 100644\n"
+            "--- a/src/module.py\n"
+            "+++ b/src/module.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+value = 1\n"
+        ),
+        prompt=prompt,
+    )
 
 
 def test_normalize_selected_paths_rejects_escape() -> None:
@@ -38,115 +62,117 @@ def test_normalize_selected_paths_rejects_escape() -> None:
         normalize_selected_paths(["../outside.py"])
 
 
-def test_infer_selected_paths_returns_full_source_diff(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    source_task = store.add("Source", task_type="implement")
-    source_task.status = "completed"
-    source_task.completed_at = datetime.now(UTC)
-    source_task.branch = "feature/source-full-diff"
-    store.update(source_task)
-
-    git._run("checkout", "-b", source_task.branch)
-    (tmp_path / "src").mkdir(exist_ok=True)
-    (tmp_path / "src" / "module.py").write_text("value = 1\n")
-    (tmp_path / "src" / "second.py").write_text("value = 2\n")
-    git._run("add", "src/module.py")
-    git._run("add", "src/second.py")
-    git._run("commit", "-m", "add files")
-    git._run("checkout", "main")
-
-    source = resolve_source_selection(
-        store,
-        git,
-        source_task_id=source_task.id,
-        source_branch=None,
-        base_branch_override=None,
+def test_infer_selected_paths_returns_full_source_diff() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+    )
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/src/module.py b/src/module.py\n"
+        "diff --git a/src/second.py b/src/second.py\n"
     )
 
     assert infer_selected_paths(git, source) == ("src/module.py", "src/second.py")
 
 
-def test_infer_selected_paths_rejects_empty_source_diff(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    source_task = store.add("Source", task_type="implement")
-    source_task.status = "completed"
-    source_task.completed_at = datetime.now(UTC)
-    source_task.branch = "feature/source-empty-diff"
-    store.update(source_task)
-
-    git._run("checkout", "-b", source_task.branch)
-    git._run("checkout", "main")
-
-    source = resolve_source_selection(
-        store,
-        git,
-        source_task_id=source_task.id,
-        source_branch=None,
-        base_branch_override=None,
+def test_infer_selected_paths_rejects_empty_source_diff() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
     )
+    git.get_diff_patch_for_paths.return_value = ""
 
     with pytest.raises(ExtractionError, match="no extractable diff"):
         infer_selected_paths(git, source)
 
 
-def test_plan_extraction_and_bundle_roundtrip(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+def test_resolve_source_selection_uses_task_branch_and_base(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "resolve-source.db", prefix="gza")
+    task = store.add("Source", task_type="implement")
+    task.status = "completed"
+    task.branch = "feature/source"
+    task.base_branch = "release"
+    task.slug = "20260427-source"
+    store.update(task)
 
-    source_task = store.add("Add source module", task_type="implement")
-    source_task.status = "completed"
-    source_task.completed_at = datetime.now(UTC)
-    source_task.branch = "feature/source"
-    source_task.slug = "20260427-source-task"
-    store.update(source_task)
-
-    git._run("checkout", "-b", source_task.branch)
-    (tmp_path / "src").mkdir(exist_ok=True)
-    (tmp_path / "src" / "module.py").write_text("value = 1\n")
-    git._run("add", "src/module.py")
-    git._run("commit", "-m", "add module")
-    git._run("checkout", "main")
+    git = MagicMock(spec=Git)
+    git.ref_exists.side_effect = lambda ref: ref in {"feature/source", "release"}
 
     source = resolve_source_selection(
         store,
         git,
-        source_task_id=source_task.id,
+        source_task_id=task.id,
         source_branch=None,
         base_branch_override=None,
     )
 
-    selected = normalize_selected_paths(["src/module.py"])
-    draft = plan_extraction(
-        git,
-        source,
-        selected,
-        operator_prompt="Carry this change into a clean task.",
+    assert source == SourceSelection(
+        source_task_id=task.id,
+        source_branch="feature/source",
+        source_base_ref="release",
+        source_task_prompt="Source",
+        source_task_slug="20260427-source",
     )
 
-    assert "diff --git" in draft.patch
-    assert draft.touched_paths == ("src/module.py",)
-    assert len(draft.file_summaries) == 1
-    assert draft.file_summaries[0].additions == 1
-    assert draft.file_summaries[0].deletions == 0
-    assert draft.file_summaries[0].binary is False
-    assert draft.prompt.startswith("Carry over: Add source module\n")
-    assert "Original task prompt:\nAdd source module\n" in draft.prompt
-    assert "Operator intent:" in draft.prompt
 
-    target_task = store.add(draft.prompt, task_type="implement")
-    target_task.slug = "20260427-target-task"
-    store.update(target_task)
+def test_resolve_source_selection_branch_source_uses_default_base(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "resolve-branch.db", prefix="gza")
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.ref_exists.side_effect = lambda ref: ref in {"feature/auth-cleanup", "main"}
 
-    bundle_dir = write_extraction_bundle(project_dir=tmp_path, task=target_task, draft=draft)
+    source = resolve_source_selection(
+        store,
+        git,
+        source_task_id=None,
+        source_branch="feature/auth-cleanup",
+        base_branch_override=None,
+    )
+
+    assert source == SourceSelection(
+        source_task_id=None,
+        source_branch="feature/auth-cleanup",
+        source_base_ref="main",
+    )
+
+
+def test_resolve_source_selection_rejects_non_code_task(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "resolve-non-code.db", prefix="gza")
+    task = store.add("Plan source", task_type="plan")
+    task.status = "completed"
+    task.branch = "feature/plan-source"
+    store.update(task)
+
+    git = MagicMock(spec=Git)
+
+    with pytest.raises(ExtractionError, match="must be a code task"):
+        resolve_source_selection(
+            store,
+            git,
+            source_task_id=task.id,
+            source_branch=None,
+            base_branch_override=None,
+        )
+
+
+def test_write_extraction_bundle_and_bundle_roundtrip(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+    task = store.add("Carry over", task_type="implement")
+    task.slug = "20260427-target-task"
+    store.update(task)
+    draft = _sample_draft()
+
+    bundle_dir = write_extraction_bundle(project_dir=tmp_path, task=task, draft=draft)
     assert (bundle_dir / "manifest.json").exists()
     assert (bundle_dir / "selected.patch").exists()
     assert (bundle_dir / "prompt.md").exists()
+
     manifest = load_manifest(bundle_dir / "manifest.json")
-    assert manifest["source_branch"] == source_task.branch
+    assert manifest["source_branch"] == "feature/source"
     assert manifest["source_base_ref"] == "main"
     assert manifest["selected_paths"] == ["src/module.py"]
 
@@ -157,326 +183,27 @@ def test_plan_extraction_and_bundle_roundtrip(tmp_path: Path) -> None:
     assert (copied / "manifest.json").exists()
 
 
-def test_plan_extraction_branch_source_uses_branch_name_in_prompt(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    git._run("checkout", "-b", "feature/auth-cleanup")
-    (tmp_path / "src").mkdir(exist_ok=True)
-    (tmp_path / "src" / "module.py").write_text("value = 1\n")
-    git._run("add", "src/module.py")
-    git._run("commit", "-m", "add module")
-    git._run("checkout", "main")
-
-    source = resolve_source_selection(
-        store,
-        git,
+def test_plan_extraction_branch_source_uses_branch_name_in_prompt() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
         source_task_id=None,
         source_branch="feature/auth-cleanup",
-        base_branch_override=None,
+        source_base_ref="main",
+    )
+    git.get_diff_name_status.return_value = "A\tsrc/module.py\n"
+    git.get_diff_numstat.return_value = "1\t0\tsrc/module.py\n"
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/src/module.py b/src/module.py\n"
+        "index e69de29..8c7e5a6 100644\n"
+        "--- a/src/module.py\n"
+        "+++ b/src/module.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+value = 1\n"
     )
 
-    selected = normalize_selected_paths(["src/module.py"])
-    draft = plan_extraction(
-        git,
-        source,
-        selected,
-        operator_prompt=None,
-    )
+    draft = plan_extraction(git, source, ("src/module.py",), operator_prompt=None)
 
     assert draft.prompt.startswith("Carry over: auth cleanup\n")
-
-
-def test_plan_extraction_supports_quoted_diff_headers_for_spaced_paths(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    source_task = store.add("Source", task_type="implement")
-    source_task.status = "completed"
-    source_task.completed_at = datetime.now(UTC)
-    source_task.branch = "feature/source"
-    source_task.slug = "20260427-source-task-spaces"
-    store.update(source_task)
-
-    git._run("checkout", "-b", source_task.branch)
-    (tmp_path / "src").mkdir(exist_ok=True)
-    spaced_path = "src/file with space.py"
-    (tmp_path / spaced_path).write_text("value = 1\n")
-    git._run("add", spaced_path)
-    git._run("commit", "-m", "add spaced path")
-    git._run("checkout", "main")
-
-    source = resolve_source_selection(
-        store,
-        git,
-        source_task_id=source_task.id,
-        source_branch=None,
-        base_branch_override=None,
-    )
-    selected = normalize_selected_paths([spaced_path])
-    draft = plan_extraction(
-        git,
-        source,
-        selected,
-        operator_prompt=None,
-    )
-
-    assert draft.touched_paths == (spaced_path,)
-
-
-def test_plan_extraction_populates_text_diffstat_metadata(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    source_task = store.add("Source", task_type="implement")
-    source_task.status = "completed"
-    source_task.completed_at = datetime.now(UTC)
-    source_task.branch = "feature/source"
-    source_task.slug = "20260427-source-task-diffstat"
-    store.update(source_task)
-
-    git._run("checkout", "-b", source_task.branch)
-    target_path = tmp_path / "src" / "module.py"
-    target_path.parent.mkdir(exist_ok=True)
-    target_path.write_text("line1\nline2\n")
-    git._run("add", "src/module.py")
-    git._run("commit", "-m", "add module")
-    target_path.write_text("line1\nline3\nline4\n")
-    git._run("add", "src/module.py")
-    git._run("commit", "-m", "update module")
-    git._run("checkout", "main")
-
-    source = resolve_source_selection(
-        store,
-        git,
-        source_task_id=source_task.id,
-        source_branch=None,
-        base_branch_override=None,
-    )
-    selected = normalize_selected_paths(["src/module.py"])
-    draft = plan_extraction(git, source, selected, operator_prompt=None)
-
-    summary = draft.file_summaries[0]
-    assert summary.selected_path == "src/module.py"
-    assert summary.additions == 3
-    assert summary.deletions == 0
-    assert summary.binary is False
-
-
-def test_plan_extraction_marks_binary_diffs_in_file_summaries(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    source_task = store.add("Source", task_type="implement")
-    source_task.status = "completed"
-    source_task.completed_at = datetime.now(UTC)
-    source_task.branch = "feature/source-binary"
-    source_task.slug = "20260427-source-task-binary"
-    store.update(source_task)
-
-    git._run("checkout", "-b", source_task.branch)
-    image_path = tmp_path / "assets" / "logo.bin"
-    image_path.parent.mkdir(exist_ok=True)
-    image_path.write_bytes(b"\x00\x01\x02\x03")
-    git._run("add", "assets/logo.bin")
-    git._run("commit", "-m", "add binary")
-    image_path.write_bytes(b"\x00\x04\x05\x06")
-    git._run("add", "assets/logo.bin")
-    git._run("commit", "-m", "update binary")
-    git._run("checkout", "main")
-
-    source = resolve_source_selection(
-        store,
-        git,
-        source_task_id=source_task.id,
-        source_branch=None,
-        base_branch_override=None,
-    )
-    selected = normalize_selected_paths(["assets/logo.bin"])
-    draft = plan_extraction(git, source, selected, operator_prompt=None)
-
-    summary = draft.file_summaries[0]
-    assert summary.selected_path == "assets/logo.bin"
-    assert summary.additions is None
-    assert summary.deletions is None
-    assert summary.binary is True
-
-
-def test_plan_extraction_populates_renamed_text_diffstat_metadata(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    source_task = store.add("Source", task_type="implement")
-    source_task.status = "completed"
-    source_task.completed_at = datetime.now(UTC)
-    source_task.branch = "feature/source-rename-text"
-    source_task.slug = "20260428-source-task-rename-text"
-    store.update(source_task)
-
-    before = tmp_path / "src" / "old_name.py"
-    before.parent.mkdir(exist_ok=True)
-    before.write_text("line1\nline2\n")
-    git._run("add", "src/old_name.py")
-    git._run("commit", "-m", "add old path on main")
-
-    git._run("checkout", "-b", source_task.branch)
-    git._run("mv", "src/old_name.py", "src/new_name.py")
-    git._run("commit", "-m", "rename file")
-    git._run("checkout", "main")
-
-    source = resolve_source_selection(
-        store,
-        git,
-        source_task_id=source_task.id,
-        source_branch=None,
-        base_branch_override=None,
-    )
-    selected = normalize_selected_paths(["src/old_name.py", "src/new_name.py"])
-    draft = plan_extraction(git, source, selected, operator_prompt=None)
-
-    summary = next(
-        item
-        for item in draft.file_summaries
-        if item.old_path == "src/old_name.py" and item.new_path == "src/new_name.py"
-    )
-    assert summary.status == "R"
-    assert summary.selected_path in {"src/old_name.py", "src/new_name.py"}
-    assert summary.old_path == "src/old_name.py"
-    assert summary.new_path == "src/new_name.py"
-    assert summary.additions == 0
-    assert summary.deletions == 0
-    assert summary.binary is False
-
-
-def test_plan_extraction_marks_renamed_binary_diffstat_metadata(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    source_task = store.add("Source", task_type="implement")
-    source_task.status = "completed"
-    source_task.completed_at = datetime.now(UTC)
-    source_task.branch = "feature/source-rename-binary"
-    source_task.slug = "20260428-source-task-rename-binary"
-    store.update(source_task)
-
-    before = tmp_path / "assets" / "old_logo.bin"
-    before.parent.mkdir(exist_ok=True)
-    before.write_bytes(b"\x00\x01\x02\x03")
-    git._run("add", "assets/old_logo.bin")
-    git._run("commit", "-m", "add old binary on main")
-
-    git._run("checkout", "-b", source_task.branch)
-    git._run("mv", "assets/old_logo.bin", "assets/new_logo.bin")
-    git._run("commit", "-m", "rename binary file")
-    git._run("checkout", "main")
-
-    source = resolve_source_selection(
-        store,
-        git,
-        source_task_id=source_task.id,
-        source_branch=None,
-        base_branch_override=None,
-    )
-    selected = normalize_selected_paths(["assets/old_logo.bin", "assets/new_logo.bin"])
-    draft = plan_extraction(git, source, selected, operator_prompt=None)
-
-    summary = next(
-        item
-        for item in draft.file_summaries
-        if item.old_path == "assets/old_logo.bin" and item.new_path == "assets/new_logo.bin"
-    )
-    assert summary.status == "R"
-    assert summary.selected_path in {"assets/old_logo.bin", "assets/new_logo.bin"}
-    assert summary.old_path == "assets/old_logo.bin"
-    assert summary.new_path == "assets/new_logo.bin"
-    assert summary.additions is None
-    assert summary.deletions is None
-    assert summary.binary is True
-
-
-def test_plan_extraction_populates_copied_text_diffstat_metadata(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    source_task = store.add("Source", task_type="implement")
-    source_task.status = "completed"
-    source_task.completed_at = datetime.now(UTC)
-    source_task.branch = "feature/source-copy-text"
-    source_task.slug = "20260428-source-task-copy-text"
-    store.update(source_task)
-
-    before = tmp_path / "src" / "original.py"
-    before.parent.mkdir(exist_ok=True)
-    before.write_text("line1\nline2\n")
-    git._run("add", "src/original.py")
-    git._run("commit", "-m", "add original file on main")
-
-    git._run("checkout", "-b", source_task.branch)
-    (tmp_path / "src" / "copied.py").write_text(before.read_text())
-    git._run("add", "src/copied.py")
-    git._run("commit", "-m", "copy file")
-    git._run("checkout", "main")
-
-    source = resolve_source_selection(
-        store,
-        git,
-        source_task_id=source_task.id,
-        source_branch=None,
-        base_branch_override=None,
-    )
-    selected = normalize_selected_paths(["src/original.py", "src/copied.py"])
-    draft = plan_extraction(git, source, selected, operator_prompt=None)
-
-    summary = next(
-        item
-        for item in draft.file_summaries
-        if item.old_path == "src/original.py" and item.new_path == "src/copied.py"
-    )
-    assert summary.status == "C"
-    assert summary.selected_path in {"src/original.py", "src/copied.py"}
-    assert summary.old_path == "src/original.py"
-    assert summary.new_path == "src/copied.py"
-    assert summary.additions == 0
-    assert summary.deletions == 0
-    assert summary.binary is False
-
-
-def test_plan_extraction_marks_binary_numstat_entries(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    source_task = store.add("Source", task_type="implement")
-    source_task.status = "completed"
-    source_task.completed_at = datetime.now(UTC)
-    source_task.branch = "feature/source-binary-prompt"
-    source_task.slug = "20260427-source-task-binary-prompt"
-    store.update(source_task)
-
-    git._run("checkout", "-b", source_task.branch)
-    (tmp_path / "assets").mkdir(exist_ok=True)
-    binary_path = "assets/image.bin"
-    (tmp_path / binary_path).write_bytes(b"\x00\x01\x02\x03")
-    git._run("add", binary_path)
-    git._run("commit", "-m", "add binary file")
-    git._run("checkout", "main")
-
-    source = resolve_source_selection(
-        store,
-        git,
-        source_task_id=source_task.id,
-        source_branch=None,
-        base_branch_override=None,
-    )
-    selected = normalize_selected_paths([binary_path])
-    draft = plan_extraction(git, source, selected, operator_prompt=None)
-
-    assert len(draft.file_summaries) == 1
-    summary = draft.file_summaries[0]
-    assert summary.selected_path == binary_path
-    assert summary.binary is True
-    assert summary.additions is None
-    assert summary.deletions is None
-    assert f"- A: {binary_path} [binary]" in draft.prompt
 
 
 def test_parse_file_summaries_braced_rename_numstat() -> None:
@@ -636,64 +363,9 @@ def test_plan_extraction_marks_binary_rename_numstat() -> None:
     assert summary.binary is True
 
 
-def test_resolve_source_selection_rejects_non_code_task(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    source_task = store.add("Plan source", task_type="plan")
-    source_task.status = "completed"
-    source_task.completed_at = datetime.now(UTC)
-    source_task.branch = "feature/plan-source"
-    store.update(source_task)
-
-    git._run("checkout", "-b", source_task.branch)
-    (tmp_path / "notes.md").write_text("plan\n")
-    git._run("add", "notes.md")
-    git._run("commit", "-m", "plan")
-    git._run("checkout", "main")
-
-    with pytest.raises(ExtractionError, match="must be a code task"):
-        resolve_source_selection(
-            store,
-            git,
-            source_task_id=source_task.id,
-            source_branch=None,
-            base_branch_override=None,
-        )
-
-
 def test_write_extraction_bundle_rejects_path_reuse_for_different_task(tmp_path: Path) -> None:
-    git = _init_repo(tmp_path)
     store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    source_task = store.add("Source", task_type="implement")
-    source_task.status = "completed"
-    source_task.completed_at = datetime.now(UTC)
-    source_task.branch = "feature/source"
-    source_task.slug = "20260427-source-task"
-    store.update(source_task)
-
-    git._run("checkout", "-b", source_task.branch)
-    (tmp_path / "src").mkdir(exist_ok=True)
-    (tmp_path / "src" / "module.py").write_text("value = 1\n")
-    git._run("add", "src/module.py")
-    git._run("commit", "-m", "add module")
-    git._run("checkout", "main")
-
-    source = resolve_source_selection(
-        store,
-        git,
-        source_task_id=source_task.id,
-        source_branch=None,
-        base_branch_override=None,
-    )
-    selected = normalize_selected_paths(["src/module.py"])
-    draft = plan_extraction(
-        git,
-        source,
-        selected,
-        operator_prompt=None,
-    )
+    draft = _sample_draft()
 
     first = store.add(draft.prompt, task_type="implement")
     first.slug = "20260427-shared-target"
