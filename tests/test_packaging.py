@@ -17,7 +17,7 @@ def test_hatch_vcs_does_not_write_source_version_file() -> None:
 
 
 def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
-    """Only the integration suite should install pytest-timeout watchdogs."""
+    """Test suites should fail hung tests without applying a global watchdog."""
     repo_root = Path(__file__).resolve().parents[1]
     pyproject = repo_root / "pyproject.toml"
     pyproject_text = pyproject.read_text()
@@ -32,8 +32,8 @@ def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
     assert pytest_options["timeout_method"] == "signal"
 
     unit_conftest = (repo_root / "tests" / "conftest.py").read_text()
-    assert "pytest.mark.timeout(" not in unit_conftest
-    assert "pytest_collection_modifyitems" not in unit_conftest
+    assert "UNIT_TEST_TIMEOUT_SECONDS = 1" in unit_conftest
+    assert "pytest.mark.timeout(UNIT_TEST_TIMEOUT_SECONDS, method=\"signal\")" in unit_conftest
 
     integration_conftest = (repo_root / "tests_integration" / "conftest.py").read_text()
     assert "INTEGRATION_TEST_TIMEOUT_SECONDS = 10" in integration_conftest
@@ -43,8 +43,8 @@ def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
     )
 
 
-def test_unit_tests_do_not_carry_pytest_timeout_overrides() -> None:
-    """Unit tests should not rely on per-test timeout overrides."""
+def test_unit_tests_do_not_carry_per_test_pytest_timeout_overrides() -> None:
+    """Unit tests should rely on the central suite timeout fixture."""
     tests_root = Path(__file__).resolve().parents[1] / "tests"
     timeout_overrides: list[str] = []
 
@@ -67,8 +67,8 @@ def test_unit_tests_do_not_carry_pytest_timeout_overrides() -> None:
     assert not timeout_overrides, f"Found timeout overrides in tests/: {timeout_overrides}"
 
 
-def test_unit_test_conftest_does_not_assign_timeout_markers() -> None:
-    """tests/conftest.py should not inject timeout markers during collection."""
+def test_unit_test_conftest_assigns_only_central_timeout_marker() -> None:
+    """tests/conftest.py should own the unit-suite timeout marker."""
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
     module = ast.parse(conftest_path.read_text(), filename=str(conftest_path))
 
@@ -91,12 +91,8 @@ def test_unit_test_conftest_does_not_assign_timeout_markers() -> None:
             continue
         timeout_calls.append(node.lineno)
 
-    assert not collection_hooks, (
-        f"tests/conftest.py unexpectedly defines pytest_collection_modifyitems at {collection_hooks}"
-    )
-    assert not timeout_calls, (
-        f"tests/conftest.py unexpectedly assigns pytest timeout markers at {timeout_calls}"
-    )
+    assert len(collection_hooks) == 1
+    assert len(timeout_calls) == 1
 
 
 def _run_bin_tests(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -137,8 +133,16 @@ def test_bin_tests_default_run_skips_integration_pytest(tmp_path: Path) -> None:
         "run ty check src/gza/",
         "run mypy src/gza/",
         "run python -m checks",
-        'run pytest tests/ -n 8 --dist loadscope -x -o faulthandler_timeout=2',
+        'run pytest tests/ -n auto --dist loadscope -x -o faulthandler_timeout=2',
     ]
+
+
+def test_github_test_workflow_uses_shared_test_script() -> None:
+    workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "test.yml"
+    workflow_text = workflow.read_text()
+
+    assert "run: ./bin/tests" in workflow_text
+    assert "PYTEST_XDIST_WORKERS" not in workflow_text
 
 
 def test_bin_tests_integration_flag_runs_integration_pytest(tmp_path: Path) -> None:
