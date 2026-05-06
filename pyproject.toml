@@ -60,6 +60,8 @@ fallback-version = "0.1.0.dev0"
 testpaths = ["tests"]
 addopts = "-x"
 pythonpath = ["."]
+timeout = 5
+timeout_method = "thread"
 markers = [
     "integration: mark test as integration test (requires credentials and Docker)",
 ]

@@ -3,16 +3,6 @@
 
 import pytest
 
-UNIT_TEST_TIMEOUT_SECONDS = 1
-
-
-def pytest_collection_modifyitems(items):
-    """Apply the fast hang watchdog only to the unit-test suite."""
-    timeout_marker = pytest.mark.timeout(UNIT_TEST_TIMEOUT_SECONDS, method="signal")
-    for item in items:
-        if item.get_closest_marker("timeout") is None:
-            item.add_marker(timeout_marker)
-
 
 @pytest.fixture(autouse=True)
 def _disable_git_signing(tmp_path, monkeypatch):

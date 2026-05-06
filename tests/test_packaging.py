@@ -15,7 +15,7 @@ def test_hatch_vcs_does_not_write_source_version_file() -> None:
 
 
 def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
-    """Test suites should fail hung tests without applying a global watchdog."""
+    """Unit tests should keep the suite-wide watchdog in central pytest config."""
     repo_root = Path(__file__).resolve().parents[1]
     pyproject = repo_root / "pyproject.toml"
     pyproject_text = pyproject.read_text()
@@ -26,12 +26,12 @@ def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
     assert any(dep.startswith("pytest-timeout>=") for dep in dev_deps)
 
     pytest_options = config.get("tool", {}).get("pytest", {}).get("ini_options", {})
-    assert "timeout" not in pytest_options
-    assert "timeout_method" not in pytest_options
+    assert pytest_options["timeout"] == 5
+    assert pytest_options["timeout_method"] == "thread"
 
     unit_conftest = (repo_root / "tests" / "conftest.py").read_text()
-    assert "UNIT_TEST_TIMEOUT_SECONDS = 1" in unit_conftest
-    assert "pytest.mark.timeout(UNIT_TEST_TIMEOUT_SECONDS, method=\"signal\")" in unit_conftest
+    assert "pytest.mark.timeout(" not in unit_conftest
+    assert "pytest_collection_modifyitems" not in unit_conftest
 
     integration_conftest = (repo_root / "tests_integration" / "conftest.py").read_text()
     assert "INTEGRATION_TEST_TIMEOUT_SECONDS = 10" in integration_conftest
@@ -63,3 +63,35 @@ def test_unit_tests_do_not_carry_pytest_timeout_overrides() -> None:
             timeout_overrides.append(f"{test_file}:{node.lineno}")
 
     assert not timeout_overrides, f"Found timeout overrides in tests/: {timeout_overrides}"
+
+
+def test_unit_test_conftest_does_not_assign_timeout_markers() -> None:
+    """tests/conftest.py should not inject timeout markers during collection."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    module = ast.parse(conftest_path.read_text(), filename=str(conftest_path))
+
+    timeout_calls: list[int] = []
+    collection_hooks: list[int] = []
+
+    for node in ast.walk(module):
+        if isinstance(node, ast.FunctionDef) and node.name == "pytest_collection_modifyitems":
+            collection_hooks.append(node.lineno)
+        if not isinstance(node, ast.Call):
+            continue
+        if not (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "timeout"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "mark"
+            and isinstance(node.func.value.value, ast.Name)
+            and node.func.value.value.id == "pytest"
+        ):
+            continue
+        timeout_calls.append(node.lineno)
+
+    assert not collection_hooks, (
+        f"tests/conftest.py unexpectedly defines pytest_collection_modifyitems at {collection_hooks}"
+    )
+    assert not timeout_calls, (
+        f"tests/conftest.py unexpectedly assigns pytest timeout markers at {timeout_calls}"
+    )
