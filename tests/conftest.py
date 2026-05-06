@@ -19,7 +19,6 @@ def pytest_collection_modifyitems(items):
             else:
                 item.add_marker(functional_timeout_marker)
 
-
 @pytest.fixture(autouse=True)
 def _disable_git_signing(tmp_path, monkeypatch):
     """Disable git commit signing for all tests.
