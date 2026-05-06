@@ -143,9 +143,11 @@ CMD ["claude"]
 
 Gza automatically detects when your Dockerfile has changed:
 
-- Compares the Dockerfile's modification time against the Docker image's creation time
-- Rebuilds the image if the Dockerfile is newer
-- Prints "Dockerfile changed, rebuilding..." when this happens
+- Hashes the Dockerfile content and compares it with the image label `gza.dockerfile_sha256`
+- Rebuilds the image when the Dockerfile content digest differs from the image label
+- Rebuilds legacy images that do not have the `gza.dockerfile_sha256` label yet
+- Prints `Rebuilding Docker image ...: Dockerfile.<cli> content changed` when the content digest differs
+- Prints `Rebuilding Docker image ...: <image> is missing Dockerfile content label` when refreshing a legacy image
 
 To force a rebuild manually:
 

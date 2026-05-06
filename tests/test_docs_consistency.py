@@ -222,6 +222,30 @@ def test_configuration_docs_describe_comments_only_improve_path() -> None:
     assert "improve still runs using comments-only feedback" in config_content
 
 
+def test_docker_docs_describe_digest_based_rebuild_freshness() -> None:
+    """Docker docs should reflect digest-label freshness checks, not mtime heuristics."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    docker_content = (docs_root / "docker.md").read_text()
+
+    required_snippets = [
+        "gza.dockerfile_sha256",
+        "content digest differs",
+        "missing Dockerfile content label",
+        "Dockerfile.<cli> content changed",
+    ]
+    stale_snippets = [
+        "modification time",
+        "Docker image's creation time",
+        "if the Dockerfile is newer",
+        'Prints "Dockerfile changed, rebuilding..." when this happens',
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in docker_content
+    for snippet in stale_snippets:
+        assert snippet not in docker_content
+
+
 def test_plan_implement_review_example_uses_uv_run_gza_shell_snippets() -> None:
     """Workflow example should not mix bare gza shell snippets with uv run gza guidance."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"
