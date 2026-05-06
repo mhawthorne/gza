@@ -2,6 +2,7 @@
 set -ex
 
 PYTEST_XDIST_WORKERS="${PYTEST_XDIST_WORKERS:-8}"
+PYTEST_FAULTHANDLER_TIMEOUT="${PYTEST_FAULTHANDLER_TIMEOUT:-2}"
 RUN_INTEGRATION=0
 
 while [ "$#" -gt 0 ]; do
@@ -21,7 +22,7 @@ uv run ruff check src/gza/
 uv run ty check src/gza/
 uv run mypy src/gza/
 uv run python -m checks
-uv run pytest tests/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x -o faulthandler_timeout=2
+uv run pytest tests/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x -o faulthandler_timeout=$PYTEST_FAULTHANDLER_TIMEOUT
 
 if [ "$RUN_INTEGRATION" -eq 1 ]; then
     uv run pytest tests_integration -xv

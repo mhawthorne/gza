@@ -17,7 +17,7 @@ def test_hatch_vcs_does_not_write_source_version_file() -> None:
 
 
 def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
-    """Unit tests should keep the suite-wide watchdog in central pytest config."""
+    """Only the integration suite should install pytest-timeout watchdogs."""
     repo_root = Path(__file__).resolve().parents[1]
     pyproject = repo_root / "pyproject.toml"
     pyproject_text = pyproject.read_text()
@@ -28,8 +28,8 @@ def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
     assert any(dep.startswith("pytest-timeout>=") for dep in dev_deps)
 
     pytest_options = config.get("tool", {}).get("pytest", {}).get("ini_options", {})
-    assert pytest_options["timeout"] == 5
-    assert pytest_options["timeout_method"] == "thread"
+    assert "timeout" not in pytest_options
+    assert pytest_options["timeout_method"] == "signal"
 
     unit_conftest = (repo_root / "tests" / "conftest.py").read_text()
     assert "pytest.mark.timeout(" not in unit_conftest
@@ -158,7 +158,7 @@ def test_bin_tests_unknown_argument_exits_with_usage_and_no_invocations(tmp_path
     assert result.returncode == 2
     assert (tmp_path / "uv.log").read_text() == ""
     assert result.stderr.splitlines()[-3:] == [
-        "+ echo 'Usage: /workspace/bin/tests [-i|--integration]'",
+        f"+ echo 'Usage: {script} [-i|--integration]'",
         f"Usage: {script} [-i|--integration]",
         "+ exit 2",
     ]
