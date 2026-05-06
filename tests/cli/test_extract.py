@@ -3,16 +3,14 @@
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 
-from gza.db import SqliteTaskStore
-from gza.db import Task
+from gza.config import Config
+from gza.db import SqliteTaskStore, Task
 from gza.extractions import ExtractionError
-from gza.git import Git
-from gza.providers import RunResult
-from gza.runner import EXTRACTION_PRECHECK_FAILURE_REASON
+from gza.git import Git, GitApplyResult
 
 from .conftest import get_latest_task, make_store, run_gza, setup_config
 
@@ -620,61 +618,47 @@ def test_extract_queued_duplicates_get_distinct_slugs_and_bundle_dirs(tmp_path: 
 
 def test_extract_queued_duplicates_run_without_extraction_identity_collision(tmp_path: Path) -> None:
     setup_config(tmp_path)
-    git = _init_repo(tmp_path)
-    source_task = _create_completed_source_task(tmp_path, git)
     store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    patch_text = "diff --git a/src/extracted.py b/src/extracted.py\n"
 
-    run_gza(
-        "extract",
-        str(source_task.id),
-        "src/extracted.py",
-        "--queue",
-        "--project",
-        str(tmp_path),
-    )
-    run_gza(
-        "extract",
-        str(source_task.id),
-        "src/extracted.py",
-        "--queue",
-        "--project",
-        str(tmp_path),
-    )
+    class FakeWorktreeGit:
+        def ref_exists(self, ref: str) -> bool:
+            return False
 
-    mock_provider = Mock()
-    mock_provider.name = "TestProvider"
-    mock_provider.check_credentials.return_value = True
-    mock_provider.verify_credentials.return_value = True
-    mock_provider.run.return_value = RunResult(
-        exit_code=0,
-        duration_seconds=1.0,
-        num_turns_reported=1,
-        cost_usd=0.01,
-        error_type=None,
-    )
+        def apply_patch_file_result(self, patch_path: Path) -> GitApplyResult:
+            return GitApplyResult(returncode=0, stdout="", stderr="")
 
-    with (
-        patch("gza.runner.get_provider", return_value=mock_provider),
-        patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
-        patch("gza.runner.load_dotenv"),
-    ):
-        result = run_gza(
-            "work",
-            "--count",
-            "2",
-            "--no-docker",
-            "--project",
-            str(tmp_path),
+    from gza.runner import _seed_extraction_bundle_if_present
+
+    tasks: list[Task] = []
+    for suffix in ("one", "two"):
+        task = store.add("Carry over: Add extracted source module", task_type="implement")
+        task.slug = f"20260427-test-source-extract-{suffix}"
+        store.update(task)
+        tasks.append(task)
+
+        bundle_dir = tmp_path / ".gza" / "extractions" / task.slug
+        bundle_dir.mkdir(parents=True)
+        (bundle_dir / "selected.patch").write_text(patch_text)
+        (bundle_dir / "manifest.json").write_text(json.dumps({
+            "version": 1,
+            "target_task_id": task.id,
+            "target_slug": task.slug,
+            "patch_path": "selected.patch",
+            "selected_paths": ["src/extracted.py"],
+            "touched_paths": ["src/extracted.py"],
+            "source_branch": "feature/source",
+            "source_base_ref": "main",
+        }))
+
+    for task in tasks:
+        result = _seed_extraction_bundle_if_present(
+            task,
+            config,
+            tmp_path / "worktree",
+            FakeWorktreeGit(),
+            tmp_path / f"{task.id}.log",
+            resume=False,
         )
-
-    assert result.returncode == 0
-    assert "Extraction bundle target identity mismatch" not in result.stdout
-
-    extract_tasks = [
-        task
-        for task in store.get_all()
-        if task.task_type == "implement" and task.prompt.startswith("Carry over: Add extracted source module\n")
-    ]
-    assert len(extract_tasks) == 2
-    for task in extract_tasks:
-        assert task.failure_reason != EXTRACTION_PRECHECK_FAILURE_REASON
+        assert result.seeded_paths == frozenset({"src/extracted.py"})

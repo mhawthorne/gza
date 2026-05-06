@@ -178,3 +178,4 @@ case "$SELECTED_PROVIDER" in
         exit 1
         ;;
 esac
+echo

@@ -14,21 +14,31 @@ def test_hatch_vcs_does_not_write_source_version_file() -> None:
     assert "vcs" not in hooks
 
 
-def test_pytest_timeout_watchdog_is_enabled_by_default() -> None:
-    """Pytest should fail hung unit tests quickly under the default watchdog."""
-    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
+    """Test suites should fail hung tests without applying a global watchdog."""
+    repo_root = Path(__file__).resolve().parents[1]
+    pyproject = repo_root / "pyproject.toml"
     pyproject_text = pyproject.read_text()
     config = tomllib.loads(pyproject_text)
-    watchdog_comment = "# Watchdog for infinite loops in the default unit-test suite."
 
     dependency_groups = config.get("dependency-groups", {})
     dev_deps = dependency_groups.get("dev", [])
     assert any(dep.startswith("pytest-timeout>=") for dep in dev_deps)
 
     pytest_options = config.get("tool", {}).get("pytest", {}).get("ini_options", {})
-    assert pytest_options.get("timeout") == 5
-    assert pytest_options.get("timeout_method") == "signal"
-    assert watchdog_comment in pyproject_text
+    assert "timeout" not in pytest_options
+    assert "timeout_method" not in pytest_options
+
+    unit_conftest = (repo_root / "tests" / "conftest.py").read_text()
+    assert "UNIT_TEST_TIMEOUT_SECONDS = 1" in unit_conftest
+    assert "pytest.mark.timeout(UNIT_TEST_TIMEOUT_SECONDS, method=\"signal\")" in unit_conftest
+
+    integration_conftest = (repo_root / "tests_integration" / "conftest.py").read_text()
+    assert "INTEGRATION_TEST_TIMEOUT_SECONDS = 10" in integration_conftest
+    assert (
+        "pytest.mark.timeout(INTEGRATION_TEST_TIMEOUT_SECONDS, method=\"signal\")"
+        in integration_conftest
+    )
 
 
 def test_unit_tests_do_not_carry_pytest_timeout_overrides() -> None:

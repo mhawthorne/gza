@@ -14,8 +14,9 @@ import pytest
 from gza.config import Config
 from gza.providers import ClaudeProvider, CodexProvider, GeminiProvider
 
-# Skip all tests in this module unless explicitly running integration tests
-pytestmark = pytest.mark.integration
+# Skip all tests in this module unless explicitly running integration tests.
+# Provider smoke tests shell out to external CLIs with their own 2-minute timeout.
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(150)]
 
 
 def _load_gza_env() -> None:
