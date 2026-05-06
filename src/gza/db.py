@@ -497,11 +497,6 @@ def _is_readonly_snapshot_operational_error(exc: sqlite3.OperationalError) -> bo
     return _is_readonly_operational_error(exc)
 
 
-def _is_readonly_snapshot_operational_error(exc: sqlite3.OperationalError) -> bool:
-    """Return True for explicit sqlite read-only write failures."""
-    return _is_readonly_operational_error(exc)
-
-
 def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     """Check whether a table contains a specific column."""
     try:
