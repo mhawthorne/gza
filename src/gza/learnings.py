@@ -181,9 +181,10 @@ def _build_summarization_prompt(
         f"{tasks_text}\n\n"
         "## Instructions\n\n"
         "Update the learnings based on the recent tasks above:\n"
-        "- ADD new patterns, conventions, or pitfalls discovered in recent tasks\n"
+        "- ADD new patterns, conventions, or pitfalls only when they generalize to future work\n"
+        "- Treat task outcomes and current code/config state as evidence, not automatic future rules\n"
         "- REVISE any existing learnings that are now outdated or wrong based on recent work\n"
-        "- KEEP existing learnings that are still valid, even if not mentioned in recent tasks\n"
+        "- KEEP existing learnings only when they still describe a durable convention or principle\n"
         "- REMOVE learnings only if recent tasks clearly contradict them\n\n"
         "Focus on:\n"
         "- Codebase conventions (naming, structure, idioms)\n"
@@ -193,6 +194,8 @@ def _build_summarization_prompt(
         "- Workflow preferences (tools, commands)\n\n"
         "Do NOT include:\n"
         '- Task-specific details that don\'t generalize\n'
+        "- Descriptions of past implementation choices unless they remain intentional guidance\n"
+        "- Current code or configuration state by itself; include the principle behind it instead\n"
         "- Generic software engineering advice\n"
         '- Vague platitudes ("write clean code", "test thoroughly")\n'
         "- Repetitive or near-duplicate entries\n\n"

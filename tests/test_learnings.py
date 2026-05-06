@@ -445,6 +445,17 @@ def test_build_summarization_prompt_includes_existing_learnings():
     assert "topic headers" in prompt
 
 
+def test_build_summarization_prompt_distinguishes_state_from_guidance():
+    """Current task outcomes should not become durable learnings by default."""
+    from gza.db import Task
+    tasks: list[Task] = []
+    prompt = _build_summarization_prompt(tasks)
+    assert "evidence, not automatic future rules" in prompt
+    assert "durable convention or principle" in prompt
+    assert "past implementation choices unless they remain intentional guidance" in prompt
+    assert "Current code or configuration state by itself" in prompt
+
+
 def test_build_summarization_prompt_no_existing_learnings():
     """Prompt must say 'No existing learnings.' when file is empty."""
     from gza.db import Task

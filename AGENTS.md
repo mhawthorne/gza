@@ -64,9 +64,7 @@ Key modules: `src/gza/db.py` (storage), `src/gza/cli/` (CLI), `src/gza/runner.py
 
 **Single code path**: Don't duplicate logic across entry points. All entry points for the same operation must use the same underlying mechanism.
 
-**Write tests for every change.** Tests go in `tests/` with `test_` prefix. Run: `uv run pytest tests/ -v`
-
-**Scripts are not project code.** Do not add `tests/test_*.py` coverage for repo scripts (including `scripts/` and `bin/`); validate them ad hoc instead.
+**Tests scale with risk.** Write tests for behavior changes in project code. Do not add unit tests for repo scripts, generated/internal metadata, one-off config wording, prompt-only edits, or documentation-only changes unless fixing a concrete regression or guarding a stable user-facing contract. Validate scripts and config syntax ad hoc instead.
 
 **Use Explore subagents** for multi-file research (3+ files) instead of sequential reads.
 
