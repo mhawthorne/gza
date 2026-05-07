@@ -18,6 +18,7 @@ from gza.db import (
     SqliteTaskStore,
     StepRef,
     Task,
+    _ClosingSqliteConnection,
     _is_readonly_operational_error,
     _is_readonly_snapshot_operational_error,
     check_migration_status,
@@ -580,6 +581,25 @@ class TestConnectionLifecycle:
         for conn in seen_connections:
             with pytest.raises(sqlite3.ProgrammingError):
                 conn.execute("SELECT 1")
+
+    def test_write_pragmas_are_only_applied_once_per_store(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        db_path = tmp_path / "test.db"
+        seen_pragmas: list[str] = []
+
+        class TrackingConnection(_ClosingSqliteConnection):
+            def execute(self, sql: str, parameters=(), /):
+                if sql in {"PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"}:
+                    seen_pragmas.append(sql)
+                return super().execute(sql, parameters)
+
+        monkeypatch.setattr("gza.db._ClosingSqliteConnection", TrackingConnection)
+
+        store = SqliteTaskStore(db_path)
+        store.add("Task 1")
+        store.add("Task 2")
+        store.get_all()
+
+        assert seen_pragmas == ["PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"]
 
     def test_get_by_group(self, tmp_path: Path):
         """Test get_by_group returns tasks in correct order."""

@@ -1891,6 +1891,7 @@ class SqliteTaskStore:
         self._query_only_empty_db = False
         self._query_only_table_exists: dict[str, bool] = {}
         self._query_only_columns: dict[str, set[str]] = {}
+        self._write_pragmas_applied = False
         if self._open_mode == "query_only":
             self._ensure_db_query_only()
         else:
@@ -2307,12 +2308,14 @@ class SqliteTaskStore:
             except sqlite3.OperationalError:
                 pass
             return conn
-        for pragma in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"):
-            try:
-                conn.execute(pragma)
-            except sqlite3.OperationalError as exc:
-                if "readonly" not in str(exc).lower() and "read-only" not in str(exc).lower():
-                    raise
+        if not self._write_pragmas_applied:
+            for pragma in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"):
+                try:
+                    conn.execute(pragma)
+                except sqlite3.OperationalError as exc:
+                    if "readonly" not in str(exc).lower() and "read-only" not in str(exc).lower():
+                        raise
+            self._write_pragmas_applied = True
         return conn
 
     def _row_to_task(self, row: sqlite3.Row, *, tags: tuple[str, ...] = ()) -> Task:
