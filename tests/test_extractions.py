@@ -90,6 +90,22 @@ def test_infer_selected_paths_rejects_empty_source_diff() -> None:
         infer_selected_paths(git, source)
 
 
+def test_infer_selected_paths_returns_commit_scope_diff() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
+        source_task_id=None,
+        source_commits=("a" * 40, "b" * 40),
+    )
+    git.get_commit_name_status.return_value = ""
+    git.get_commit_numstat.return_value = ""
+    git.get_commit_patch_for_paths.side_effect = [
+        "diff --git a/src/one.py b/src/one.py\n",
+        "diff --git a/src/two.py b/src/two.py\n",
+    ]
+
+    assert infer_selected_paths(git, source) == ("src/one.py", "src/two.py")
+
+
 def test_resolve_source_selection_uses_task_branch_and_base(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "resolve-source.db", prefix="gza")
     task = store.add("Source", task_type="implement")
@@ -140,6 +156,44 @@ def test_resolve_source_selection_branch_source_uses_default_base(tmp_path: Path
     )
 
 
+def test_resolve_source_selection_commit_source_resolves_in_order(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "resolve-commit.db", prefix="gza")
+    git = MagicMock(spec=Git)
+    git.ref_exists.return_value = True
+    git.rev_parse.side_effect = ["a" * 40, "b" * 40]
+
+    source = resolve_source_selection(
+        store,
+        git,
+        source_task_id=None,
+        source_branch=None,
+        source_commits=("HEAD~2", "HEAD~1"),
+        base_branch_override=None,
+    )
+
+    assert source == SourceSelection(
+        source_task_id=None,
+        source_commits=("a" * 40, "b" * 40),
+    )
+
+
+def test_resolve_source_selection_commit_source_rejects_duplicates_after_resolution(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "resolve-commit-dup.db", prefix="gza")
+    git = MagicMock(spec=Git)
+    git.ref_exists.return_value = True
+    git.rev_parse.side_effect = ["a" * 40, "a" * 40]
+
+    with pytest.raises(ExtractionError, match="Duplicate source commit selected"):
+        resolve_source_selection(
+            store,
+            git,
+            source_task_id=None,
+            source_branch=None,
+            source_commits=("HEAD", "HEAD^0"),
+            base_branch_override=None,
+        )
+
+
 def test_resolve_source_selection_rejects_non_code_task(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "resolve-non-code.db", prefix="gza")
     task = store.add("Plan source", task_type="plan")
@@ -174,6 +228,7 @@ def test_write_extraction_bundle_and_bundle_roundtrip(tmp_path: Path) -> None:
     manifest = load_manifest(bundle_dir / "manifest.json")
     assert manifest["source_branch"] == "feature/source"
     assert manifest["source_base_ref"] == "main"
+    assert manifest["source_commits"] == []
     assert manifest["selected_paths"] == ["src/module.py"]
 
     worktree = tmp_path / "worktree"
@@ -204,6 +259,44 @@ def test_plan_extraction_branch_source_uses_branch_name_in_prompt() -> None:
     draft = plan_extraction(git, source, ("src/module.py",), operator_prompt=None)
 
     assert draft.prompt.startswith("Carry over: auth cleanup\n")
+
+
+def test_plan_extraction_commit_source_preserves_commit_order() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
+        source_task_id=None,
+        source_commits=("a" * 40, "b" * 40),
+    )
+    git.get_commit_name_status.side_effect = [
+        "M\tsrc/first.py\n",
+        "M\tsrc/second.py\n",
+    ]
+    git.get_commit_numstat.side_effect = [
+        "1\t0\tsrc/first.py\n",
+        "2\t1\tsrc/second.py\n",
+    ]
+    git.get_commit_patch_for_paths.side_effect = [
+        "diff --git a/src/first.py b/src/first.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/first.py\n"
+        "+++ b/src/first.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+first = True\n",
+        "diff --git a/src/second.py b/src/second.py\n"
+        "index 3333333..4444444 100644\n"
+        "--- a/src/second.py\n"
+        "+++ b/src/second.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+second = True\n",
+    ]
+
+    draft = plan_extraction(git, source, ("src/first.py", "src/second.py"), operator_prompt=None)
+
+    assert "commits in extraction order" in draft.prompt
+    assert draft.patch.index("diff --git a/src/first.py b/src/first.py") < draft.patch.index(
+        "diff --git a/src/second.py b/src/second.py"
+    )
+    assert draft.touched_paths == ("src/first.py", "src/second.py")
 
 
 def test_parse_file_summaries_braced_rename_numstat() -> None:

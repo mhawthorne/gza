@@ -1434,6 +1434,73 @@ class TestExtractionGitHelpers:
                 check=False,
             )
 
+    def test_get_commit_name_status_scoped_to_paths(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="M\tsrc/file.py\n", stderr="")
+            output = git.get_commit_name_status("abc123", ("src/file.py",))
+            assert output == "M\tsrc/file.py"
+            mock_run.assert_called_once_with(
+                "show",
+                "--format=",
+                "--name-status",
+                "--find-renames",
+                "--find-copies",
+                "--find-copies-harder",
+                "abc123",
+                "--",
+                "src/file.py",
+                check=False,
+            )
+
+    def test_get_commit_numstat_scoped_to_paths(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="1\t0\tsrc/file.py\n", stderr="")
+            output = git.get_commit_numstat("abc123", ("src/file.py",))
+            assert output == "1\t0\tsrc/file.py"
+            mock_run.assert_called_once_with(
+                "show",
+                "--format=",
+                "--numstat",
+                "--find-renames",
+                "--find-copies",
+                "--find-copies-harder",
+                "abc123",
+                "--",
+                "src/file.py",
+                check=False,
+            )
+
+    def test_get_commit_patch_for_paths_uses_rename_copy_detection(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="diff --git ...", stderr="")
+            output = git.get_commit_patch_for_paths("abc123", ("src/file.py",), binary=True)
+
+            assert output == "diff --git ..."
+            mock_run.assert_called_once_with(
+                "show",
+                "--format=",
+                "--find-renames",
+                "--find-copies",
+                "--find-copies-harder",
+                "--binary",
+                "abc123",
+                "--",
+                "src/file.py",
+                check=False,
+            )
+
     def test_apply_patch_file_uses_3way(self, tmp_path: Path):
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()

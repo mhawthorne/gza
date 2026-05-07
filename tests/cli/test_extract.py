@@ -2,7 +2,7 @@
 
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from gza.db import SqliteTaskStore
 from gza.extractions import ExtractionDraft, ExtractionError, FileDiffSummary, SourceSelection
@@ -18,6 +18,8 @@ def _args(project_dir: Path, **overrides: object) -> Namespace:
         "max_turns": None,
         "source": None,
         "branch": None,
+        "commits": (),
+        "per_commit": False,
         "paths": (),
         "files_from": None,
         "prompt": None,
@@ -136,6 +138,238 @@ def test_extract_dry_run_uses_current_branch_when_no_source_selector(tmp_path: P
     mock_print.assert_called_once()
     assert mock_print.call_args.kwargs["source_label"] == "branch feature/current"
     assert mock_print.call_args.kwargs["dry_run"] is True
+
+
+def test_extract_commit_mode_uses_commit_selector(tmp_path: Path) -> None:
+    from gza.cli.execution import cmd_extract
+
+    setup_config(tmp_path)
+    source = SourceSelection(
+        source_task_id=None,
+        source_commits=("a" * 40,),
+    )
+    draft = _draft(source=source)
+    git = MagicMock(spec=Git)
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch("gza.cli.execution.resolve_source_selection", return_value=source) as mock_resolve_source,
+        patch("gza.cli.execution.infer_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", return_value=draft),
+        patch("gza.cli.execution._print_extraction_plan_summary") as mock_print,
+    ):
+        rc = cmd_extract(_args(tmp_path, dry_run=True, commits=("HEAD~1",)))
+
+    assert rc == 0
+    assert mock_resolve_source.call_args.kwargs["source_commits"] == ("HEAD~1",)
+    assert mock_print.call_args.kwargs["source_label"] == "commit aaaaaaaaaaaa"
+
+
+def test_extract_commit_mode_treats_first_positional_as_selected_path(tmp_path: Path) -> None:
+    from gza.cli.execution import cmd_extract
+
+    setup_config(tmp_path)
+    source = SourceSelection(
+        source_task_id=None,
+        source_commits=("a" * 40,),
+    )
+    draft = _draft(source=source)
+    git = MagicMock(spec=Git)
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch("gza.cli.execution.normalize_selected_paths", return_value=("src/file.py",)) as mock_normalize,
+        patch("gza.cli.execution.resolve_source_selection", return_value=source) as mock_resolve_source,
+        patch("gza.cli.execution.plan_extraction", return_value=draft) as mock_plan,
+        patch("gza.cli.execution._print_extraction_plan_summary"),
+    ):
+        rc = cmd_extract(_args(tmp_path, source="src/file.py", commits=("HEAD",), dry_run=True))
+
+    assert rc == 0
+    mock_normalize.assert_called_once_with(["src/file.py"])
+    assert mock_resolve_source.call_args.kwargs["source_task_id"] is None
+    mock_plan.assert_called_once_with(
+        git,
+        source,
+        ("src/file.py",),
+        operator_prompt=None,
+    )
+
+
+def test_extract_per_commit_queue_treats_first_positional_as_selected_path(tmp_path: Path) -> None:
+    from gza.cli.execution import cmd_extract
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    sources = [
+        SourceSelection(source_task_id=None, source_commits=("a" * 40,)),
+        SourceSelection(source_task_id=None, source_commits=("b" * 40,)),
+    ]
+    drafts = [_draft(source=sources[0]), _draft(source=sources[1])]
+    git = MagicMock(spec=Git)
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch("gza.cli.execution.normalize_selected_paths", return_value=("src/file.py",)) as mock_normalize,
+        patch(
+            "gza.cli.execution.resolve_source_selection",
+            return_value=SourceSelection(source_task_id=None, source_commits=("a" * 40, "b" * 40)),
+        ) as mock_resolve_source,
+        patch("gza.cli.execution.plan_extraction", side_effect=drafts) as mock_plan,
+        patch("gza.cli.execution.generate_slug", side_effect=["20260427-one", "20260427-two"]),
+        patch(
+            "gza.cli.execution.write_extraction_bundle",
+            side_effect=[
+                tmp_path / ".gza" / "extractions" / "20260427-one",
+                tmp_path / ".gza" / "extractions" / "20260427-two",
+            ],
+        ),
+        patch("gza.cli.execution._print_extraction_plan_summary"),
+    ):
+        rc = cmd_extract(
+            _args(
+                tmp_path,
+                source="src/file.py",
+                commits=("HEAD~2", "HEAD~1"),
+                per_commit=True,
+                queue=True,
+            )
+        )
+
+    assert rc == 0
+    assert store.get_all()
+    mock_normalize.assert_called_once_with(["src/file.py"])
+    assert mock_resolve_source.call_args.kwargs["source_task_id"] is None
+    assert mock_plan.call_args_list[0].args[2] == ("src/file.py",)
+    assert mock_plan.call_args_list[1].args[2] == ("src/file.py",)
+
+
+def test_extract_per_commit_creates_one_task_per_selected_commit_in_order(tmp_path: Path) -> None:
+    from gza.cli.execution import cmd_extract
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    sources = [
+        SourceSelection(source_task_id=None, source_commits=("a" * 40,)),
+        SourceSelection(source_task_id=None, source_commits=("b" * 40,)),
+    ]
+    drafts = [_draft(source=sources[0]), _draft(source=sources[1])]
+    git = MagicMock(spec=Git)
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch(
+            "gza.cli.execution.resolve_source_selection",
+            return_value=SourceSelection(source_task_id=None, source_commits=("a" * 40, "b" * 40)),
+        ),
+        patch("gza.cli.execution.infer_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", side_effect=drafts),
+        patch("gza.cli.execution.generate_slug", side_effect=["20260427-one", "20260427-two"]),
+        patch(
+            "gza.cli.execution.write_extraction_bundle",
+            side_effect=[
+                tmp_path / ".gza" / "extractions" / "20260427-one",
+                tmp_path / ".gza" / "extractions" / "20260427-two",
+            ],
+        ),
+        patch("gza.cli.execution._print_extraction_plan_summary"),
+    ):
+        rc = cmd_extract(_args(tmp_path, commits=("HEAD~2", "HEAD~1"), per_commit=True, queue=True))
+
+    assert rc == 0
+    created = [task for task in store.get_all() if task.task_type == "implement"]
+    assert len(created) == 2
+    assert created[0].prompt == drafts[0].prompt
+    assert created[1].prompt == drafts[1].prompt
+
+
+def test_extract_per_commit_immediate_run_seeds_run_defaults(tmp_path: Path) -> None:
+    from gza.cli.execution import cmd_extract
+
+    setup_config(tmp_path)
+    sources = [
+        SourceSelection(source_task_id=None, source_commits=("a" * 40,)),
+        SourceSelection(source_task_id=None, source_commits=("b" * 40,)),
+    ]
+    drafts = [_draft(source=sources[0]), _draft(source=sources[1])]
+    git = MagicMock(spec=Git)
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch(
+            "gza.cli.execution.resolve_source_selection",
+            return_value=SourceSelection(source_task_id=None, source_commits=("a" * 40, "b" * 40)),
+        ),
+        patch("gza.cli.execution.infer_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", side_effect=drafts),
+        patch("gza.cli.execution.generate_slug", side_effect=["20260427-one", "20260427-two"]),
+        patch(
+            "gza.cli.execution.write_extraction_bundle",
+            side_effect=[
+                tmp_path / ".gza" / "extractions" / "20260427-one",
+                tmp_path / ".gza" / "extractions" / "20260427-two",
+            ],
+        ),
+        patch("gza.cli.execution._print_extraction_plan_summary"),
+        patch("gza.cli.execution.cmd_run", return_value=0) as mock_run,
+    ):
+        rc = cmd_extract(_args(tmp_path, commits=("HEAD~2", "HEAD~1"), per_commit=True))
+
+    assert rc == 0
+    forwarded = mock_run.call_args.args[0]
+    assert forwarded.task_ids == ANY
+    assert len(forwarded.task_ids) == 2
+    assert forwarded.worker_mode is False
+    assert forwarded.count is None
+
+
+def test_extract_per_commit_background_seeds_count_default(tmp_path: Path) -> None:
+    from gza.cli.execution import cmd_extract
+
+    setup_config(tmp_path)
+    sources = [
+        SourceSelection(source_task_id=None, source_commits=("a" * 40,)),
+        SourceSelection(source_task_id=None, source_commits=("b" * 40,)),
+    ]
+    drafts = [_draft(source=sources[0]), _draft(source=sources[1])]
+    git = MagicMock(spec=Git)
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch(
+            "gza.cli.execution.resolve_source_selection",
+            return_value=SourceSelection(source_task_id=None, source_commits=("a" * 40, "b" * 40)),
+        ),
+        patch("gza.cli.execution.infer_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", side_effect=drafts),
+        patch("gza.cli.execution.generate_slug", side_effect=["20260427-one", "20260427-two"]),
+        patch(
+            "gza.cli.execution.write_extraction_bundle",
+            side_effect=[
+                tmp_path / ".gza" / "extractions" / "20260427-one",
+                tmp_path / ".gza" / "extractions" / "20260427-two",
+            ],
+        ),
+        patch("gza.cli.execution._print_extraction_plan_summary"),
+        patch("gza.cli.execution._spawn_background_workers", return_value=0) as mock_spawn,
+    ):
+        rc = cmd_extract(_args(tmp_path, commits=("HEAD~2", "HEAD~1"), per_commit=True, background=True))
+
+    assert rc == 0
+    forwarded = mock_spawn.call_args.args[0]
+    assert len(forwarded.task_ids) == 2
+    assert forwarded.count is None
+
+
+def test_extract_per_commit_requires_commit_selector(tmp_path: Path, capsys) -> None:
+    from gza.cli.execution import cmd_extract
+
+    setup_config(tmp_path)
+    rc = cmd_extract(_args(tmp_path, per_commit=True, dry_run=True))
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "--per-commit requires one or more --commit values" in captured.out
 
 
 def test_extract_bundle_write_failure_marks_failed_task_when_delete_fails(tmp_path: Path) -> None:

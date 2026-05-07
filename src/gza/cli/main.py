@@ -1957,12 +1957,15 @@ def main() -> int:
     # extract command
     extract_parser = subparsers.add_parser(
         "extract",
-        help="Create an implementation task from selected file changes on a source task/branch",
+        help="Create an implementation task from selected file changes on a source task, branch, or commit set",
     )
     extract_parser.add_argument(
         "source",
         nargs="?",
-        help="Source full prefixed task ID to extract from (defaults to current branch when omitted)",
+        help=(
+            "Source full prefixed task ID to extract from "
+            "(with --branch/--commit, positionals are treated as selected paths)"
+        ),
     )
     extract_parser.add_argument(
         "paths",
@@ -1973,6 +1976,18 @@ def main() -> int:
         "--branch",
         metavar="BRANCH",
         help="Source branch to extract from (alternative to SOURCE task ID; defaults to current branch)",
+    )
+    extract_parser.add_argument(
+        "--commit",
+        action="append",
+        dest="commits",
+        metavar="REV",
+        help="Committed git revision to extract from (repeatable; applied in the order provided)",
+    )
+    extract_parser.add_argument(
+        "--per-commit",
+        action="store_true",
+        help="With --commit: create one extracted task per selected commit, preserving the provided commit order",
     )
     extract_parser.add_argument(
         "--files-from",

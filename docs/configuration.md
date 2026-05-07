@@ -1335,6 +1335,7 @@ Create a new implementation task from a selected subset of file changes on a sou
 gza extract [PATH ...] [options]
 gza extract SOURCE [PATH ...] [options]
 gza extract --branch BRANCH [PATH ...] [options]
+gza extract --commit REV [--commit REV ...] [PATH ...] [options]
 gza extract SOURCE --files-from FILE [options]
 ```
 
@@ -1343,6 +1344,8 @@ gza extract SOURCE --files-from FILE [options]
 | `SOURCE` | Full prefixed completed/failed code task ID to extract from; omit to use the current branch |
 | `PATH ...` | Repo-relative selected files to extract; omit to extract all changed files from the source diff |
 | `--branch BRANCH` | Source branch to extract from (alternative to `SOURCE`; defaults to current branch when omitted) |
+| `--commit REV` | Committed git revision to extract from (repeatable; applied in the order provided) |
+| `--per-commit` | With `--commit`: create one extracted task per selected commit, preserving the provided commit order |
 | `--files-from FILE` | Read newline-delimited selected files from file |
 | `--prompt TEXT` | Additional operator intent appended to the drafted prompt |
 | `--review` | Auto-create review task on completion |
@@ -1360,7 +1363,9 @@ gza extract SOURCE --files-from FILE [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when running the extracted implement task |
 
-At run time, extracted tasks re-derive their selected patch from the current `source_base_ref...source_branch` diff before seeding the worktree. If that refreshed diff is empty because the source work is already on the base branch, the task completes successfully without invoking the agent.
+`gza extract` accepts exactly one source selector: `SOURCE`, `--branch BRANCH`, or one or more `--commit REV` flags. When multiple commits are provided, extraction applies them in the exact order given on the command line. Without `--per-commit`, that ordered commit set becomes one extraction bundle and one implement task. With `--per-commit`, `gza extract` creates one extracted implement task per selected commit, still preserving the provided order.
+
+At run time, branch/task-based extracted tasks re-derive their selected patch from the current `source_base_ref...source_branch` diff before seeding the worktree. Commit-based extracted tasks re-derive their patch from the stored committed revisions in manifest order. If that refreshed diff is empty, the task completes successfully without invoking the agent.
 
 ### advance
 

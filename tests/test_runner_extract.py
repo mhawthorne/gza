@@ -54,26 +54,27 @@ def _write_bundle(
     task_slug: str,
     *,
     patch_text: str,
-    source_branch: str,
+    source_branch: str | None = None,
     source_base_ref: str = "main",
+    source_commits: list[str] | None = None,
     selected_paths: list[str] | None = None,
 ) -> None:
     selected = selected_paths or ["src/file.py"]
     bundle_dir = project_dir / ".gza" / "extractions" / task_slug
     bundle_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "version": 1,
+        "source_branch": source_branch,
+        "source_base_ref": source_base_ref,
+        "source_commits": source_commits or [],
+        "target_task_id": task_id,
+        "target_slug": task_slug,
+        "selected_paths": selected,
+        "touched_paths": selected,
+        "patch_path": "selected.patch",
+    }
     (bundle_dir / "manifest.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "source_branch": source_branch,
-                "source_base_ref": source_base_ref,
-                "target_task_id": task_id,
-                "target_slug": task_slug,
-                "selected_paths": selected,
-                "touched_paths": selected,
-                "patch_path": "selected.patch",
-            }
-        )
+        json.dumps(manifest)
     )
     (bundle_dir / "selected.patch").write_text(patch_text)
     (bundle_dir / "prompt.md").write_text("seed prompt\n")
@@ -135,6 +136,74 @@ def test_seed_extraction_bundle_applies_patch_and_returns_paths(tmp_path: Path) 
     )
 
     assert seeded.seeded_paths == frozenset({"src/file.py"})
+
+
+def test_seed_extraction_bundle_rederives_patch_from_source_commits(tmp_path: Path) -> None:
+    task_store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = task_store.add("Extracted task", task_type="implement")
+    task.slug = "20260427-commit-target"
+    task_store.update(task)
+
+    _write_bundle(
+        tmp_path,
+        task.id,
+        task.slug,
+        patch_text=(
+            "diff --git a/src/file.py b/src/file.py\n"
+            "index e69de29..8c7e5a6 100644\n"
+            "--- a/src/file.py\n"
+            "+++ b/src/file.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+print('stored')\n"
+        ),
+        source_commits=["a" * 40, "b" * 40],
+    )
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    log_file = tmp_path / "logs" / "task.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+
+    worktree_git = Mock()
+    worktree_git.ref_exists.side_effect = lambda ref: ref in {"a" * 40, "b" * 40}
+    worktree_git.get_commit_patch_for_paths.side_effect = [
+        "diff --git a/src/file.py b/src/file.py\n"
+        "index e69de29..1111111 100644\n"
+        "--- a/src/file.py\n"
+        "+++ b/src/file.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+print('first')\n",
+        "diff --git a/src/file.py b/src/file.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/file.py\n"
+        "+++ b/src/file.py\n"
+        "@@ -1 +1,2 @@\n"
+        " print('first')\n"
+        "+print('second')\n",
+    ]
+    worktree_git.apply_patch_file_result.return_value = GitApplyResult(
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+
+    seeded = _seed_extraction_bundle_if_present(
+        task,
+        config,
+        worktree,
+        worktree_git,
+        log_file,
+        resume=False,
+    )
+
+    assert seeded.seeded_paths == frozenset({"src/file.py"})
+    runtime_patch = worktree / ".gza" / "extractions" / task.slug / "selected.runtime.patch"
+    assert runtime_patch.exists()
+    patch_text = runtime_patch.read_text()
+    assert patch_text.index("+print('first')") < patch_text.index("+print('second')")
     assert seeded.completion_reason is None
     worktree_git.apply_patch_file_result.assert_called_once()
 

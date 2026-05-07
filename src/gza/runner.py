@@ -2248,67 +2248,126 @@ def _seed_extraction_bundle_if_present(
         raise ExtractionError("Extraction manifest selected_paths must contain non-empty strings")
     selected_paths: tuple[str, ...] = tuple(selected_paths_raw)
 
+    stored_hunk_count = _count_patch_hunks(patch_text)
     source_branch = manifest.get("source_branch")
     source_base_ref = manifest.get("source_base_ref")
-    if not isinstance(source_branch, str) or not source_branch:
-        raise ExtractionError("Extraction manifest missing required source_branch")
-    if not isinstance(source_base_ref, str) or not source_base_ref:
-        raise ExtractionError("Extraction manifest missing required source_base_ref")
+    source_commits_raw = manifest.get("source_commits", [])
+    if source_commits_raw is None:
+        source_commits_raw = []
+    if not isinstance(source_commits_raw, (list, tuple)):
+        raise ExtractionError("Extraction manifest source_commits must be a list when present")
+    if any(not isinstance(value, str) or not value for value in source_commits_raw):
+        raise ExtractionError("Extraction manifest source_commits must contain non-empty strings")
+    source_commits = tuple(source_commits_raw)
 
-    stored_hunk_count = _count_patch_hunks(patch_text)
-    revision_range = f"{source_base_ref}...{source_branch}"
+    current_patch_text: str | None = None
+    runtime_refresh_available = False
+    source_context: dict[str, object]
+    refresh_message: str
 
-    if worktree_git.ref_exists(source_branch):
-        if not worktree_git.ref_exists(source_base_ref):
-            raise ExtractionError(f"Extraction source base ref not found: {source_base_ref}")
+    if source_commits:
+        missing_commits = [commit for commit in source_commits if not worktree_git.ref_exists(commit)]
+        if not missing_commits:
+            runtime_refresh_available = True
+            current_patch_parts = [
+                worktree_git.get_commit_patch_for_paths(commit, selected_paths, binary=True).rstrip("\n")
+                for commit in source_commits
+            ]
+            current_patch_text = "\n".join(part for part in current_patch_parts if part).strip("\n")
+            if current_patch_text:
+                current_patch_text += "\n"
+            source_context = {
+                "source_commits": list(source_commits),
+                "selected_paths": list(selected_paths),
+            }
+            refresh_message = (
+                f"Extraction patch runtime refresh: re-derived hunks={{rederived}}, stored hunks={stored_hunk_count}"
+            )
+        else:
+            source_context = {
+                "source_commits": list(source_commits),
+                "selected_paths": list(selected_paths),
+            }
+            refresh_message = (
+                "Extraction patch runtime refresh: re-derived hunks=unavailable "
+                f"(source commits unreachable: {', '.join(missing_commits)}), stored hunks={stored_hunk_count}"
+            )
+    else:
+        if not isinstance(source_branch, str) or not source_branch:
+            raise ExtractionError("Extraction manifest missing required source_branch")
+        if not isinstance(source_base_ref, str) or not source_base_ref:
+            raise ExtractionError("Extraction manifest missing required source_base_ref")
+        revision_range = f"{source_base_ref}...{source_branch}"
+        source_context = {
+            "source_branch": source_branch,
+            "source_base_ref": source_base_ref,
+            "selected_paths": list(selected_paths),
+        }
+        if worktree_git.ref_exists(source_branch):
+            if not worktree_git.ref_exists(source_base_ref):
+                raise ExtractionError(f"Extraction source base ref not found: {source_base_ref}")
+            runtime_refresh_available = True
+            current_patch_text = worktree_git.get_diff_patch_for_paths(
+                revision_range,
+                selected_paths,
+                binary=True,
+            )
+            refresh_message = (
+                f"Extraction patch runtime refresh: re-derived hunks={{rederived}}, stored hunks={stored_hunk_count}"
+            )
+        else:
+            refresh_message = (
+                f"Extraction patch runtime refresh: re-derived hunks=unavailable "
+                f"(source branch '{source_branch}' unreachable), stored hunks={stored_hunk_count}"
+            )
 
-        current_patch_text = worktree_git.get_diff_patch_for_paths(
-            revision_range,
-            selected_paths,
-            binary=True,
-        )
+    if runtime_refresh_available:
+        assert current_patch_text is not None
         current_hunk_count = _count_patch_hunks(current_patch_text)
         write_log_entry(
             log_file,
             {
                 "type": "gza",
                 "subtype": "info",
-                "message": (
-                    f"Extraction patch runtime refresh: re-derived hunks={current_hunk_count}, "
-                    f"stored hunks={stored_hunk_count}"
-                ),
-                "source_branch": source_branch,
-                "source_base_ref": source_base_ref,
-                "selected_paths": list(selected_paths),
+                "message": refresh_message.format(rederived=current_hunk_count),
+                **source_context,
                 "rederived_hunk_count": current_hunk_count,
                 "stored_hunk_count": stored_hunk_count,
             },
         )
         if not current_patch_text.strip():
-            return _already_merged_extraction_seed_result(
-                task,
-                log_file,
-                message=(
-                    f"Extraction source diff is empty against current base; marking task {task.id} "
+            empty_message = (
+                f"Extraction source diff is empty against current base; marking task {task.id} "
+                f"{EXTRACTION_ALREADY_MERGED_COMPLETION_REASON}"
+            )
+            if source_commits:
+                empty_message = (
+                    f"Extraction source commit set is empty for selected paths; marking task {task.id} "
                     f"{EXTRACTION_ALREADY_MERGED_COMPLETION_REASON}"
-                ),
-            )
-
-        current_base_delta = worktree_git.get_diff_patch_for_paths(
-            f"{source_base_ref}..{source_branch}",
-            selected_paths,
-            binary=True,
-        )
-        if not current_base_delta.strip():
+                )
             return _already_merged_extraction_seed_result(
                 task,
                 log_file,
-                message=(
-                    "Extraction source branch adds nothing to the current base for selected paths; "
-                    f"marking task {task.id} {EXTRACTION_ALREADY_MERGED_COMPLETION_REASON}"
-                ),
+                message=empty_message,
             )
 
+        if not source_commits:
+            assert isinstance(source_base_ref, str)
+            assert isinstance(source_branch, str)
+            current_base_delta = worktree_git.get_diff_patch_for_paths(
+                f"{source_base_ref}..{source_branch}",
+                selected_paths,
+                binary=True,
+            )
+            if not current_base_delta.strip():
+                return _already_merged_extraction_seed_result(
+                    task,
+                    log_file,
+                    message=(
+                        "Extraction source branch adds nothing to the current base for selected paths; "
+                        f"marking task {task.id} {EXTRACTION_ALREADY_MERGED_COMPLETION_REASON}"
+                    ),
+                )
         current_touched_paths = parse_patch_touched_paths(current_patch_text)
         if not current_touched_paths:
             raise ExtractionError("Runtime re-derived extraction patch has no touched file paths")
@@ -2363,12 +2422,8 @@ def _seed_extraction_bundle_if_present(
         {
             "type": "gza",
             "subtype": "info",
-            "message": (
-                f"Extraction patch runtime refresh: re-derived hunks=unavailable "
-                f"(source branch '{source_branch}' unreachable), stored hunks={stored_hunk_count}"
-            ),
-            "source_branch": source_branch,
-            "source_base_ref": source_base_ref,
+            "message": refresh_message,
+            **source_context,
             "rederived_hunk_count": None,
             "stored_hunk_count": stored_hunk_count,
         },
