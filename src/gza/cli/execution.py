@@ -107,6 +107,43 @@ def _selected_tags_for_new_task(args: argparse.Namespace) -> tuple[str, ...]:
     return tags or ()
 
 
+def _extract_run_args(args: argparse.Namespace, task_ids: list[str]) -> argparse.Namespace:
+    """Clone extract args and seed defaults expected by shared run helpers."""
+    worker_args = argparse.Namespace(**vars(args))
+    worker_args.task_ids = task_ids
+    if not hasattr(worker_args, "worker_mode"):
+        worker_args.worker_mode = False
+    if not hasattr(worker_args, "count"):
+        worker_args.count = None
+    return worker_args
+
+
+def _maybe_reinterpret_extract_source_as_path(
+    config: Config,
+    source_task_id_raw: str | None,
+    source_branch: str | None,
+    source_commits: tuple[str, ...],
+    selected_raw: list[str],
+    store: SqliteTaskStore | None,
+) -> tuple[str | None, list[str], SqliteTaskStore | None]:
+    """Treat the optional SOURCE positional as a path for branch/commit selectors."""
+    if not source_task_id_raw or (not source_branch and not source_commits):
+        return source_task_id_raw, selected_raw, store
+
+    try:
+        source_id_candidate = resolve_id(config, source_task_id_raw)
+    except InvalidTaskIdError:
+        selected_raw.insert(0, source_task_id_raw)
+        return None, selected_raw, store
+
+    if store is None:
+        store = get_store(config)
+    if store.get(source_id_candidate) is None:
+        selected_raw.insert(0, source_task_id_raw)
+        return None, selected_raw, store
+    return source_task_id_raw, selected_raw, store
+
+
 def _format_extraction_diff_summary(draft: ExtractionDraft) -> list[str]:
     """Render concise per-file diff metadata for extract command summaries."""
     lines: list[str] = []
@@ -568,19 +605,14 @@ def cmd_extract(args: argparse.Namespace) -> int:
     selected_raw: list[str] = list(getattr(args, "paths", ()) or ())
     store: SqliteTaskStore | None = None
 
-    # argparse uses "source?" then "paths*"; in `--branch` mode the first path
-    # can land in `source`. Reassign to selected paths unless it is a real task ID.
-    if source_branch and source_task_id_raw and not source_commits:
-        try:
-            source_id_candidate = resolve_id(config, source_task_id_raw)
-        except InvalidTaskIdError:
-            selected_raw.insert(0, source_task_id_raw)
-            source_task_id_raw = None
-        else:
-            store = get_store(config)
-            if store.get(source_id_candidate) is None:
-                selected_raw.insert(0, source_task_id_raw)
-                source_task_id_raw = None
+    source_task_id_raw, selected_raw, store = _maybe_reinterpret_extract_source_as_path(
+        config,
+        source_task_id_raw,
+        source_branch,
+        source_commits,
+        selected_raw,
+        store,
+    )
 
     files_from = getattr(args, "files_from", None)
     if files_from:
@@ -731,8 +763,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
         )
 
     if hasattr(args, "background") and args.background:
-        worker_args = argparse.Namespace(**vars(args))
-        worker_args.task_ids = [task.id for task in created_tasks if task.id is not None]
+        worker_args = _extract_run_args(args, [task.id for task in created_tasks if task.id is not None])
         if len(worker_args.task_ids) == 1:
             return _spawn_background_worker(worker_args, config, task_id=worker_args.task_ids[0])
         return _spawn_background_workers(worker_args, config)
@@ -750,8 +781,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
             invocation=_foreground_command_invocation("extract"),
         )
 
-    worker_args = argparse.Namespace(**vars(args))
-    worker_args.task_ids = task_ids
+    worker_args = _extract_run_args(args, task_ids)
     return cmd_run(worker_args)
 
 

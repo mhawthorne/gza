@@ -1924,7 +1924,10 @@ def main() -> int:
     extract_parser.add_argument(
         "source",
         nargs="?",
-        help="Source full prefixed task ID to extract from (defaults to current branch when omitted)",
+        help=(
+            "Source full prefixed task ID to extract from "
+            "(with --branch/--commit, positionals are treated as selected paths)"
+        ),
     )
     extract_parser.add_argument(
         "paths",
