@@ -662,6 +662,15 @@ class TestConnectionLifecycle:
         assert store.next_task_after("bad-prefix-1") is None
         assert store.next_task_after(only.id) is None
 
+    def test_add_repeatedly_does_not_leave_project_sequence_write_locked(self, tmp_path: Path):
+        """Repeated task creation should not leave the sequence row write-locked."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        created_ids = [store.add(f"Task {i}").id for i in range(10)]
+
+        assert created_ids == [f"gza-{i}" for i in range(1, 11)]
+
     def test_get_by_seq_looks_up_task_by_prefix_and_sequence(self, tmp_path: Path):
         """get_by_seq supports explicit ordinal lookups with optional prefix override."""
         db_path = tmp_path / "test.db"
