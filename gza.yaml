@@ -15,6 +15,11 @@ merge_squash_threshold: 1
 
 max_review_cycles: 10
 
+watch:
+  batch: 2
+  poll: 60 
+  no_activity_timeout: 120
+  
 #provider: claude
 #model: claude-sonnet-4-6
 provider: codex
