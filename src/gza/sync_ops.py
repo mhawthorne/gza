@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal, cast
 
-from .db import SqliteTaskStore, Task
+from .db import SqliteTaskStore, Task, task_owns_merge_status
 from .git import Git, GitError, parse_diff_numstat
 from .github import GitHub, GitHubError, PullRequestDetails
 
@@ -37,6 +37,10 @@ class BranchCohort:
     @property
     def code_tasks(self) -> tuple[Task, ...]:
         return tuple(task for task in self.tasks if task.branch == self.branch and task.has_commits)
+
+    @property
+    def merge_status_owner_tasks(self) -> tuple[Task, ...]:
+        return tuple(task for task in self.code_tasks if task_owns_merge_status(task))
 
     @property
     def representative_task(self) -> Task:
@@ -281,7 +285,8 @@ def reconcile_branch_merge_truth(
             result.skipped_reason = "no code-bearing task rows"
             continue
 
-        desired_merge_status = code_tasks[0].merge_status
+        owner_tasks = cohort.merge_status_owner_tasks
+        desired_merge_status = owner_tasks[0].merge_status if owner_tasks else code_tasks[0].merge_status
         try:
             local_branch_exists = git.branch_exists(cohort.branch)
             reconcile_ref = cohort.branch if local_branch_exists else _remote_branch_ref_for_reconcile(
@@ -385,7 +390,9 @@ def _enrich_branch_pr_state(
 
     branch = cohort.branch
     representative = cohort.representative_task
-    desired_merge_status = result.merge_status if result.merge_status is not None else code_tasks[0].merge_status
+    owner_tasks = cohort.merge_status_owner_tasks
+    baseline_merge_status = owner_tasks[0].merge_status if owner_tasks else code_tasks[0].merge_status
+    desired_merge_status = result.merge_status if result.merge_status is not None else baseline_merge_status
     branch_exists = git.branch_exists(branch)
     remote_merged = (
         git.is_merged(branch, into=remote_default_ref)
@@ -457,7 +464,7 @@ def _enrich_branch_pr_state(
     return _BranchPersistenceUpdate(
         merge_status=(
             desired_merge_status
-            if desired_merge_status != code_tasks[0].merge_status
+            if desired_merge_status != baseline_merge_status
             else _UNSET
         ),
         pr_number=(
@@ -725,13 +732,17 @@ def _persist_branch_state(
     pr_last_synced_at: datetime | None | object = _UNSET,
     sync_last_synced_at: datetime | None | object = _UNSET,
 ) -> None:
-    """Write normalized branch-scoped sync state back to every code-bearing row."""
+    """Write normalized branch-scoped sync state back to each code-bearing row.
+
+    Merge truth is stored only on rows that own merge status; other branch-scoped
+    sync fields continue to fan out across the cohort.
+    """
     for original in tasks:
         task = store.get(original.id) if original.id is not None else None
         if task is None:
             continue
         if merge_status is not _UNSET:
-            typed_merge_status = cast("str | None", merge_status)
+            typed_merge_status = cast("str | None", merge_status) if task_owns_merge_status(task) else None
             previous_merge_status = task.merge_status
             previous_merged_at = task.merged_at
             task.merge_status = typed_merge_status

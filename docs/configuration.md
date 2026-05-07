@@ -983,7 +983,7 @@ uv run gza unmerged [options]
 | `--into-current` | Compare against the current branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 | `--target BRANCH` | Compare against the specified branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 
-`uv run gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills legacy `merge_status` when needed, refreshes canonical branch-cohort merge truth from local git plus any already-present `origin/<default-branch>` remote-tracking ref, persists normalized `merge_status` and diff stats, and then prints the reconciled default-branch unmerged list.
+`uv run gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills legacy `merge_status` when needed for merge-owning code rows, refreshes canonical branch-cohort merge truth from local git plus any already-present `origin/<default-branch>` remote-tracking ref, persists normalized `merge_status` and diff stats, and then prints the reconciled default-branch unmerged list. Same-branch improve/fix/rebase follow-ups may validly keep `merge_status = NULL` because the owning implementation row carries the shared branch merge truth.
 
 This is the deliberate narrow exception to the usual read-only query convention: only plain default-branch `uv run gza unmerged` mutates, because its entire purpose is to answer the canonical question "what still needs to be merged?" without leaving stale cached rows behind.
 
@@ -1520,7 +1520,7 @@ uv run gza sync [task_id ...] [options]
 | `--no-fetch` | Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch |
 
 Use `uv run gza unmerged` for the daily "what still needs to be merged?" check. `uv run gza sync` remains the broader explicit branch and PR reconciliation command. It:
-- dedupes work by branch and writes normalized state back to every same-branch task row that carries commits
+- dedupes work by branch, writing shared branch metadata back to every same-branch task row that carries commits while persisting merge status only on the merge-owning row
 - refreshes cached `merge_status`, `diff_*` stats, `pr_number`, `pr_state`, `pr_last_synced_at`, and `sync_last_synced_at`
 - discovers PRs by branch for bounded candidates that need PR reconciliation
 - auto-closes stale open PRs only after posting a comment and only when a fresh `origin/<default-branch>` fetch proves the branch content is already present upstream

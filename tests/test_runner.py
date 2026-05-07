@@ -7568,6 +7568,10 @@ class TestExtractedRunInnerHelpers:
         unresolved_impl_comments = store.get_comments(impl_task.id, unresolved_only=True)
         assert [comment.content for comment in unresolved_impl_comments] == ["New implementation comment"]
 
+        refreshed_improve2 = store.get(improve2.id)
+        assert refreshed_improve2 is not None
+        assert refreshed_improve2.merge_status is None
+
         refreshed_improve1 = store.get(improve1.id)
         assert refreshed_improve1 is not None
         assert refreshed_improve1.review_cleared_at is None

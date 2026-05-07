@@ -7029,6 +7029,36 @@ class TestUnmergedAllFlag:
         updated_task = store.get(task.id)
         assert updated_task.merge_status == "merged"
 
+    def test_unmerged_same_branch_improve_without_merge_status_does_not_print_migration_banner(
+        self,
+        tmp_path: Path,
+    ):
+        """Valid non-owner improve rows must not trigger legacy merge-status migration output."""
+        store, impl_task, _git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Implementation owner task",
+            branch="feature/same-branch-improve",
+            merge_status="unmerged",
+        )
+
+        improve_task = store.add(
+            "Improve on shared branch",
+            task_type="improve",
+            same_branch=True,
+            based_on=impl_task.id,
+        )
+        store.mark_completed(improve_task, has_commits=True, branch="feature/same-branch-improve")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Migrating merge status" not in result.stdout
+        assert "Implementation owner task" in result.stdout
+
+        refreshed_improve = store.get(improve_task.id)
+        assert refreshed_improve is not None
+        assert refreshed_improve.merge_status is None
+
     def test_unmerged_uses_existing_origin_default_branch_without_fetch_by_default(
         self,
         tmp_path: Path,
@@ -8342,8 +8372,8 @@ class TestLineageCommand:
         assert cli_query._LINEAGE_REL_LABELS is query_module._LINEAGE_REL_LABELS
         assert "_LINEAGE_REL_LABELS:" not in cli_query_path.read_text()
 
-    def test_lineage_merge_labels_render_for_implement_and_improve_only(self, tmp_path: Path):
-        """Implement/improve rows render merge labels; other types do not."""
+    def test_lineage_merge_labels_render_only_for_merge_owners(self, tmp_path: Path):
+        """Shared-branch improve rows must not render independent merge labels."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -8382,9 +8412,10 @@ class TestLineageCommand:
         output = result.stdout
 
         assert "[merged]" in output
-        assert "[unmerged]" in output
         assert "Implement no merge status [merged]" not in output
         assert "Implement no merge status [unmerged]" not in output
+        assert "Improve unmerged [unmerged]" not in output
+        assert "Improve unmerged [merged]" not in output
         assert "review completed [merged]" not in output
         assert "review completed [unmerged]" not in output
 

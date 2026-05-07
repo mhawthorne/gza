@@ -45,6 +45,7 @@ from ..db import (
     Task as DbTask,
     _is_readonly_snapshot_operational_error,
     task_id_numeric_key as _task_id_numeric_key,
+    task_owns_merge_status,
 )
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git, GitError, active_worktree_path_for_branch
@@ -53,7 +54,6 @@ from ..pr_ops import lookup_task_pr
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
     TaskLineageNode,
-    _is_shared_branch_descendant as _is_query_shared_branch_descendant,
     build_lineage_tree as _build_lineage_tree_for_root,
     get_code_changing_descendants_for_root as _get_code_changing_descendants_for_root_task,
     get_reviews_for_root as _get_reviews_for_root_task,
@@ -540,13 +540,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     ) -> None:
         """Render a single task entry."""
         shares_parent_branch = _task_shares_parent_branch(task, parent_task)
-        lineage_root = _resolve_lineage_root_task(store, task)
-        shares_owner_branch = _is_query_shared_branch_descendant(task, lineage_root)
-        use_merge_status = (
-            task.merge_status == "unmerged"
-            and not shares_parent_branch
-            and not shares_owner_branch
-        )
+        use_merge_status = task.merge_status == "unmerged" and task_owns_merge_status(task)
         if use_merge_status:
             status_label = "unmerged"
             status_color = c['unmerged']
@@ -598,7 +592,7 @@ def cmd_history(args: argparse.Namespace) -> int:
             )
 
         type_label = f"\\[{task.task_type}]"
-        merge_label = " \\[merged]" if task.merge_status == "merged" else ""
+        merge_label = " \\[merged]" if task.merge_status == "merged" and task_owns_merge_status(task) else ""
         tid = c['task_id']
         if task.based_on and task.depends_on:
             parent_label = f" ← [{tid}]{task.based_on}[/{tid}] (dep [{tid}]{task.depends_on}[/{tid}])"
@@ -2259,8 +2253,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         return value[:60] + "…" if len(value) > 60 else value
 
     def _merge_label_text(t: DbTask) -> str:
-        type_str = t.task_type or "implement"
-        if type_str not in {"implement", "improve"}:
+        if not task_owns_merge_status(t):
             return ""
         if t.merge_status == "merged":
             return "[merged]"

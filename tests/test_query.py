@@ -449,6 +449,23 @@ class TestQueryIncomplete:
         child_ids = {child.task.id for child in lineages[0].tree.children}
         assert improve.id in child_ids
 
+    def test_unmerged_root_keeps_completed_improve_without_merge_status_visible(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("implement root", task_type="implement")
+        self._complete(root, merge_status="unmerged")
+        store.update(root)
+        assert root.id is not None
+
+        improve = store.add("improve done", task_type="improve", based_on=root.id, same_branch=True)
+        self._complete(improve, merge_status=None)
+        store.update(improve)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {root.id, improve.id}
+
     def test_retry_chain_failed_failed_completed_keeps_only_latest_unresolved(self, tmp_path: Path):
         store = self._store(tmp_path)
 

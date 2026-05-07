@@ -46,6 +46,7 @@ __all__ = [
     "import_legacy_local_db",
     "resolve_task_id",
     "task_id_numeric_key",
+    "task_owns_merge_status",
 ]
 
 StoreOpenMode = Literal["readwrite", "query_only"]
@@ -160,6 +161,17 @@ def _normalize_tags(tags: Iterable[str] | None) -> tuple[str, ...]:
     for raw in tags:
         normalized.add(_normalize_tag(str(raw)))
     return tuple(sorted(normalized))
+
+
+def task_owns_merge_status(task: "Task") -> bool:
+    """Return whether this task row owns persisted merge state.
+
+    Same-branch follow-up task types update an owning implementation branch
+    rather than introducing independent merge truth for their own rows.
+    """
+    if task.task_type not in {"task", "implement", "improve", "fix", "rebase"}:
+        return False
+    return not (task.task_type in {"improve", "fix", "rebase"} and task.based_on is not None)
 
 
 def _backfill_task_tags_from_group(conn: sqlite3.Connection) -> None:
@@ -3430,6 +3442,10 @@ class SqliteTaskStore:
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
+    def get_merge_status_backfill_candidates(self) -> list[Task]:
+        """Return merge-owning legacy rows that still need merge_status backfill."""
+        return [task for task in self.get_canonical_unmerged_candidates() if task.merge_status is None]
+
     def get_tasks_for_branch(self, branch: str) -> list[Task]:
         """Return all task rows attached to a branch, oldest first."""
         with self._connect() as conn:
@@ -4392,7 +4408,7 @@ class SqliteTaskStore:
         task.completion_reason = completion_reason
         task.has_commits = has_commits
         if has_commits:
-            task.merge_status = "unmerged"
+            task.merge_status = "unmerged" if task_owns_merge_status(task) else None
         if branch:
             task.branch = branch
         if log_file:
@@ -4500,12 +4516,7 @@ class SqliteTaskStore:
 
 def needs_merge_status_migration(store: "SqliteTaskStore") -> bool:
     """Check if any tasks need merge_status backfilled."""
-    with store._connect() as conn:
-        cur = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE project_id = ? AND merge_status IS NULL AND has_commits = 1",
-            (store._project_id,),
-        )
-        return cur.fetchone()[0] > 0
+    return bool(store.get_merge_status_backfill_candidates())
 
 
 def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
@@ -4524,9 +4535,7 @@ def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
     assert isinstance(git, GitClass)
 
     default_branch = git.default_branch()
-    candidate_tasks = [
-        task for task in store.get_canonical_unmerged_candidates() if task.merge_status is None
-    ]
+    candidate_tasks = store.get_merge_status_backfill_candidates()
 
     remote_default_ref: str | None = None
     remote_exists = getattr(git, "remote_exists", None)

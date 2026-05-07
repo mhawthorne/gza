@@ -159,7 +159,8 @@ def test_sync_branch_cohorts_normalizes_same_branch_rows(tmp_path):
     child.completed_at = datetime.now(UTC)
     child.branch = "feature/shared"
     child.has_commits = True
-    child.merge_status = "unmerged"
+    child.merge_status = "merged"
+    child.merged_at = datetime.now(UTC) - timedelta(days=1)
     child.based_on = parent.id
     child.same_branch = True
     store.update(child)
@@ -189,9 +190,51 @@ def test_sync_branch_cohorts_normalizes_same_branch_rows(tmp_path):
     assert refreshed_parent.diff_files_changed == 1
     assert refreshed_child.diff_files_changed == 1
     assert refreshed_parent.merge_status == "unmerged"
-    assert refreshed_child.merge_status == "unmerged"
+    assert refreshed_child.merge_status is None
+    assert refreshed_child.merged_at is None
     assert refreshed_parent.sync_last_synced_at is not None
     assert refreshed_child.sync_last_synced_at is not None
+
+
+def test_sync_branch_cohorts_marks_only_owner_row_merged_for_same_branch_improve(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    parent = _completed_branch_task(store, "Parent task", "feature/shared-merged")
+    child = store.add("Improve task", task_type="improve", based_on=parent.id)
+    child.status = "completed"
+    child.completed_at = datetime.now(UTC)
+    child.branch = "feature/shared-merged"
+    child.has_commits = True
+    child.merge_status = "unmerged"
+    child.same_branch = True
+    store.update(child)
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.ref_exists.return_value = True
+    git.branch_exists.return_value = True
+    git.get_diff_numstat.return_value = ""
+    git.is_merged.side_effect = lambda branch, into: into == "origin/main"
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        [BranchCohort(branch="feature/shared-merged", tasks=tuple(store.get_tasks_for_branch("feature/shared-merged")))],
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=True,
+    )
+
+    assert partial is False
+    assert results[0].merge_status == "merged"
+    refreshed_parent = store.get(parent.id)
+    refreshed_child = store.get(child.id)
+    assert refreshed_parent is not None
+    assert refreshed_child is not None
+    assert refreshed_parent.merge_status == "merged"
+    assert refreshed_parent.merged_at is not None
+    assert refreshed_child.merge_status is None
+    assert refreshed_child.merged_at is None
 
 
 def test_sync_branch_cohorts_marks_merged_when_origin_default_ref_proves_remote_merge(tmp_path):
