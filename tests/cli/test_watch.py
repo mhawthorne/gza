@@ -2232,29 +2232,40 @@ def test_ensure_watch_main_checkout_detaches_existing_shared_default_branch_work
     """Isolation helper should not leave the integration worktree attached to the shared default-branch ref."""
     setup_config(tmp_path)
     config = Config.load(tmp_path)
-    git = Git(tmp_path)
-    git._run("init", "-b", "main")
-    git._run("config", "user.name", "Test User")
-    git._run("config", "user.email", "test@example.com")
-    (tmp_path / "file.txt").write_text("initial\n")
-    git._run("add", "file.txt")
-    git._run("commit", "-m", "Initial commit")
-
     checkout_path = config.main_checkout_integration_path
-    checkout_path.parent.mkdir(parents=True, exist_ok=True)
-    git._run("worktree", "add", "--force", str(checkout_path), "main")
 
-    isolated_git = ensure_watch_main_checkout(config, git, "main")
+    attached_entry = {
+        "path": str(checkout_path),
+        "branch": "refs/heads/main",
+        "detached": False,
+        "prunable": False,
+    }
+    detached_entry = {
+        "path": str(checkout_path),
+        "branch": None,
+        "detached": True,
+        "prunable": False,
+    }
+    git = MagicMock()
+    git.worktree_list.side_effect = [[attached_entry], [detached_entry]]
 
-    assert isolated_git.current_branch() == "HEAD"
-    entry = next(
-        item
-        for item in git.worktree_list()
-        if Path(str(item["path"])).resolve() == checkout_path.resolve()
-    )
-    assert entry.get("detached") is True
-    assert entry.get("branch") != "refs/heads/main"
-    assert git.has_changes(include_untracked=False) is False
+    workspace_git = MagicMock()
+    workspace_git.current_branch.return_value = "HEAD"
+    workspace_git.has_changes.return_value = False
+
+    with patch("gza.cli.git_ops.Git", return_value=workspace_git) as git_cls:
+        isolated_git = ensure_watch_main_checkout(config, git, "main")
+
+    assert isolated_git is workspace_git
+    git_cls.assert_called_once_with(checkout_path)
+    git._run.assert_not_called()
+    assert workspace_git._run.call_args_list == [
+        call("checkout", "--detach", "main"),
+        call("reset", "--hard", "main"),
+        call("clean", "-fd"),
+    ]
+    workspace_git.current_branch.assert_called_once_with()
+    workspace_git.has_changes.assert_called_once_with(include_untracked=True)
 
 
 def test_execute_merge_action_marks_already_merged_task_without_error(tmp_path: Path) -> None:
