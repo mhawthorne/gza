@@ -2521,7 +2521,14 @@ class SqliteTaskStore:
             "RETURNING next_seq",
             (self._project_id, self._prefix),
         )
-        seq = int(cur.fetchone()["next_seq"])
+        try:
+            row = cur.fetchone()
+        finally:
+            # Finalize RETURNING cursors eagerly so SQLite can release the
+            # implicit write transaction before the connection is reused.
+            cur.close()
+        assert row is not None
+        seq = int(row["next_seq"])
         return f"{self._prefix}-{seq}"
 
     def add(
