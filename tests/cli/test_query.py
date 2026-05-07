@@ -7803,6 +7803,153 @@ class TestUnmergedUnifiedQueryOutput:
         assert "Progress:" in result.stderr
         assert "On branch" not in result.stdout
 
+    def test_unmerged_json_limit_footer_stays_off_stdout(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        store, first_task, _git = _setup_unmerged_env_fast(
+            tmp_path,
+            task_prompt="JSON row 0",
+            branch="feature/json-0",
+        )
+        first_task.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        store.update(first_task)
+
+        for index in range(1, 6):
+            task = store.add(f"JSON row {index}", task_type="implement")
+            task.status = "completed"
+            task.completed_at = datetime(2026, 2, 12, 10 + index, 0, tzinfo=UTC)
+            task.branch = f"feature/json-{index}"
+            task.has_commits = True
+            task.merge_status = "unmerged"
+            store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            update=False,
+            limit=5,
+            commits_only=False,
+            all=False,
+            json=True,
+            fields=None,
+            preset=None,
+            view="rich",
+        )
+
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        payload = json.loads(captured.out)
+        assert len(payload) == 5
+        assert [row["prompt"] for row in payload] == [
+            "JSON row 5",
+            "JSON row 4",
+            "JSON row 3",
+            "JSON row 2",
+            "JSON row 1",
+        ]
+        assert "Showing 5 of 6" not in captured.out
+        assert "Showing 5 of 6" in captured.err
+
+    def test_unmerged_same_branch_pending_descendant_does_not_replace_completed_representative(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        store, root_task, _git = _setup_unmerged_env_fast(
+            tmp_path,
+            task_prompt="Completed unmerged implementation",
+            branch="feature/shared-branch",
+        )
+        root_task.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        root_task.has_commits = True
+        root_task.merge_status = "unmerged"
+        store.update(root_task)
+
+        pending_descendant = store.add("Pending same-branch follow-up", task_type="implement")
+        pending_descendant.status = "pending"
+        pending_descendant.created_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        pending_descendant.based_on = root_task.id
+        pending_descendant.branch = "feature/shared-branch"
+        pending_descendant.same_branch = True
+        pending_descendant.has_commits = False
+        store.update(pending_descendant)
+
+        rich_args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            update=False,
+            limit=5,
+            commits_only=False,
+            all=False,
+            json=False,
+            fields=None,
+            preset=None,
+            view="rich",
+        )
+        flat_args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            update=False,
+            limit=5,
+            commits_only=False,
+            all=False,
+            json=False,
+            fields=None,
+            preset=None,
+            view="flat",
+        )
+        json_args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            update=False,
+            limit=5,
+            commits_only=False,
+            all=False,
+            json=True,
+            fields="id,prompt,status",
+            preset=None,
+            view="rich",
+        )
+
+        rich_result = query_cli.cmd_unmerged(rich_args, git=_FastUnmergedGit())
+        rich_output = capsys.readouterr()
+        assert rich_result == 0
+        rich_block = _unmerged_branch_block(rich_output.out, "feature/shared-branch")
+        rich_header = next(line for line in rich_block.splitlines() if line.startswith("⚡ "))
+        assert rich_header.endswith("Completed unmerged implementation")
+        assert root_task.id in rich_header
+
+        flat_result = query_cli.cmd_unmerged(flat_args, git=_FastUnmergedGit())
+        flat_output = capsys.readouterr()
+        assert flat_result == 0
+        flat_lines = [line for line in flat_output.out.splitlines() if root_task.id in line]
+        assert flat_lines
+        assert "Completed unmerged implementation" in flat_lines[0]
+        assert "Pending same-branch follow-up" not in flat_lines[0]
+
+        json_result = query_cli.cmd_unmerged(json_args, git=_FastUnmergedGit())
+        json_output = capsys.readouterr()
+        assert json_result == 0
+        assert json.loads(json_output.out) == [
+            {
+                "id": root_task.id,
+                "prompt": "Completed unmerged implementation",
+                "status": "completed",
+            }
+        ]
+
     def test_unmerged_json_id_prompt_projection_skips_lineage_rendering_work(
         self,
         tmp_path: Path,

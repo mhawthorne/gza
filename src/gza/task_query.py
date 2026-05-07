@@ -80,6 +80,7 @@ class TaskQuery:
     exclude_lineage_of: str | None = None
     root_ids: tuple[str, ...] | None = None
     exclude_root_ids: tuple[str, ...] | None = None
+    task_ids: tuple[str, ...] | None = None
     branch_owner_ids: tuple[str, ...] | None = None
     groups: tuple[str, ...] | None = None
     tag_filters: tuple[str, ...] | None = None
@@ -338,6 +339,7 @@ class TaskQueryPresets:
     def unmerged(
         *,
         branch_owner_ids: tuple[str, ...],
+        task_ids: tuple[str, ...] | None = None,
         limit: int | None = 5,
         mode: PresentationMode = "rich",
         projection: ProjectionSpec | None = None,
@@ -345,6 +347,7 @@ class TaskQueryPresets:
         return TaskQuery(
             scope="lineages",
             limit=limit,
+            task_ids=task_ids,
             branch_owner_ids=branch_owner_ids,
             projection=projection or ProjectionSpec(preset=TaskProjectionPreset.UNMERGED_DEFAULT),
             presentation=PresentationSpec(mode=mode),
@@ -518,6 +521,7 @@ class TaskQueryService:
                     exclude_lineage_of=query.exclude_lineage_of,
                     root_ids=query.root_ids,
                     exclude_root_ids=query.exclude_root_ids,
+                    task_ids=query.task_ids,
                     branch_owner_ids=query.branch_owner_ids,
                     groups=query.groups,
                     tag_filters=query.tag_filters,
@@ -628,6 +632,10 @@ class TaskQueryService:
                 for task in filtered
                 if (root := _resolve_lineage_root(self._store, task)).id not in disallowed_root_ids
             ]
+
+        if query.task_ids is not None:
+            allowed_task_ids = set(query.task_ids)
+            filtered = [task for task in filtered if task.id in allowed_task_ids]
 
         if query.lineage_of is not None:
             lineage_task = self._store.get(query.lineage_of)

@@ -1179,6 +1179,7 @@ def _enrich_unmerged_result(
             continue
 
         owner_task = row.owner_task
+        selected_members = row.members
         pruned_tree = _prune_unmerged_lineage_tree(row.tree, owner_task=owner_task)
         members = tuple(_flatten_query_lineage_tree(pruned_tree)) if pruned_tree is not None else row.members
         representative_branch = owner_task.branch
@@ -1191,13 +1192,13 @@ def _enrich_unmerged_result(
 
         branch_implement_tasks = [
             task
-            for task in members
+            for task in selected_members
             if task.task_type == "implement" and task.branch == representative_branch
         ]
         if branch_implement_tasks:
             representative_task = max(branch_implement_tasks, key=_task_recency_key)
-        elif members:
-            representative_task = max(members, key=_task_recency_key)
+        elif selected_members:
+            representative_task = max(selected_members, key=_task_recency_key)
         else:
             representative_task = owner_task
 
@@ -1610,6 +1611,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     )
     query = _TaskQueryPresets.unmerged(
         branch_owner_ids=owner_ids,
+        task_ids=tuple(task.id for task in selected_tasks if task.id is not None),
         limit=limit,
         mode=view_mode,
         projection=projection,
@@ -1636,15 +1638,20 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
 
     rendered = result.render(view_mode)
     if rendered:
-        console.print(rendered)
+        if use_json:
+            print(rendered)
+        else:
+            console.print(rendered)
     else:
         _print_unmerged_empty(use_json=use_json)
         return 0
 
     if limit is not None and result.total_count and result.total_count > limit:
-        console.print(
-            f"\n[dim]Showing {limit} of {result.total_count} unmerged tasks (use -n 0 for all)[/dim]"
-        )
+        footer = f"\n[dim]Showing {limit} of {result.total_count} unmerged tasks (use -n 0 for all)[/dim]"
+        if use_json:
+            _stderr_console.print(footer)
+        else:
+            console.print(footer)
 
     return 0
 
