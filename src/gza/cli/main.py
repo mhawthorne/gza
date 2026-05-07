@@ -581,6 +581,27 @@ def main() -> int:
         metavar="BRANCH",
         help="List tasks unmerged relative to the specified branch instead of the default branch",
     )
+    unmerged_parser.add_argument(
+        "--view",
+        choices=["rich", "flat", "tree"],
+        default="rich",
+        help="Presentation mode (default: rich)",
+    )
+    unmerged_parser.add_argument(
+        "--fields",
+        metavar="CSV",
+        help="Projection fields override (comma-separated, requires --json)",
+    )
+    unmerged_parser.add_argument(
+        "--preset",
+        metavar="NAME",
+        help="Projection preset override (requires --json)",
+    )
+    unmerged_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output JSON rows from the unified query API",
+    )
 
     # advance command
     advance_parser = subparsers.add_parser(

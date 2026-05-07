@@ -982,6 +982,10 @@ uv run gza unmerged [options]
 | `--update` | Deprecated compatibility alias for the default default-branch refresh; plain `uv run gza unmerged` already persists canonical merge truth before listing. Has no effect with `--into-current` or `--target` |
 | `--into-current` | Compare against the current branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 | `--target BRANCH` | Compare against the specified branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
+| `--view MODE` | Presentation mode: `rich`, `flat`, or `tree` (default: `rich`) |
+| `--json` | Output JSON rows from the unified query API |
+| `--fields CSV` | Projection field override for JSON output (for example `id,prompt`; requires `--json`) |
+| `--preset NAME` | Projection preset override for JSON output (default unmerged preset: `unmerged_default`; requires `--json`) |
 
 `uv run gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills legacy `merge_status` when needed for merge-owning code rows, refreshes canonical branch-cohort merge truth from local git plus any already-present `origin/<default-branch>` remote-tracking ref, persists normalized `merge_status` and diff stats, and then prints the reconciled default-branch unmerged list. Same-branch improve/fix/rebase follow-ups may validly keep `merge_status = NULL` because the owning implementation row carries the shared branch merge truth.
 
@@ -997,9 +1001,13 @@ If the canonical default-branch refresh cannot persist because the database is r
 
 With `--into-current` or `--target`, `uv run gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged. `--update` has no effect in those modes beyond the deprecation warning. If a live branch comparison or diff-stat refresh fails for any branch, the command exits non-zero and does not print a potentially stale unmerged list from fallback state.
 
-For each unmerged implementation, output includes:
+`uv run gza unmerged` now builds an unmerged-specific query preset and then renders that result through the shared query projection/presentation path. The default `rich` view keeps the branch/review context, while `--view flat` drops the lineage-heavy sections and `--json --fields id,prompt` can return a narrow machine-readable list.
+
+During execution, the command logs concise progress for the refresh, query, and render phases. Those lines include counts for how many candidate tasks are being refreshed, how many task rows the query scans, and how many filtered rows are rendered.
+
+For each unmerged implementation in the default `rich` view, output includes:
 - Branch diff/commit summary.
-- A `lineage:` branch-rendered tree showing related task IDs and types (implementation, review, improve).
+- A `lineage:` branch-rendered tree showing related task IDs and types (implementation, review, improve). This view prunes fully merged ancestors and sibling subtrees that live on other branches, so the displayed tree stays focused on the branch that is still unmerged.
 - A `review:` freshness classification:
   - `no review` when no completed review exists.
   - `reviewed` when the latest completed review still reflects current code.

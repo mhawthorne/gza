@@ -7686,6 +7686,254 @@ class TestUnmergedImprovedDisplay:
         assert "2026-02-12" in result.stdout
 
 
+class TestUnmergedUnifiedQueryOutput:
+    def test_unmerged_view_flat_omits_lineage_heavy_sections(self, tmp_path: Path) -> None:
+        store, task, _git = setup_unmerged_env(tmp_path, task_prompt="Flat output task")
+
+        review = store.add("Review flat output", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.depends_on = task.id
+        review.output_content = "Verdict: APPROVED"
+        store.update(review)
+
+        result = run_gza("unmerged", "--view", "flat", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Flat output task" in result.stdout
+        assert "lineage:" not in result.stdout
+        assert "branch:" not in result.stdout
+        assert "review:" not in result.stdout
+
+    def test_unmerged_json_empty_results_returns_empty_array_without_human_message(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_unmerged_env(
+            tmp_path,
+            task_prompt="No-commit task",
+            branch="feature/no-commit-task",
+            has_commits=False,
+            merge_status=None,
+        )
+
+        result = run_gza("unmerged", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == []
+        assert "No unmerged tasks" not in result.stdout
+
+    def test_unmerged_json_migration_message_goes_to_stderr_and_stdout_stays_json(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        make_store(tmp_path)
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            update=False,
+            limit=5,
+            commits_only=False,
+            all=False,
+            json=True,
+            fields=None,
+            preset=None,
+            view="rich",
+        )
+
+        with patch("gza.db.needs_merge_status_migration", return_value=True):
+            result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert json.loads(captured.out) == []
+        assert "Migrating merge status" not in captured.out
+        assert "Migrating merge status" in captured.err
+
+    def test_unmerged_view_flat_skips_lineage_rendering_work(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _setup_unmerged_env_fast(tmp_path, task_prompt="Flat output task")
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            update=False,
+            limit=5,
+            commits_only=False,
+            all=False,
+            json=False,
+            fields=None,
+            preset=None,
+            view="flat",
+        )
+
+        with patch("gza.cli.query._format_lineage", side_effect=AssertionError("lineage render should be skipped")):
+            result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert "Flat output task" in captured.out
+
+    def test_unmerged_json_fields_support_narrow_projection_and_keep_progress_on_stderr(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_unmerged_env(tmp_path, task_prompt="JSON output task")
+
+        result = run_gza(
+            "unmerged",
+            "--json",
+            "--fields",
+            "id,prompt",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload == [{"id": payload[0]["id"], "prompt": "JSON output task"}]
+        assert "Progress:" in result.stderr
+        assert "On branch" not in result.stdout
+
+    def test_unmerged_json_id_prompt_projection_skips_lineage_rendering_work(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _store, task, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="JSON output task")
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            update=False,
+            limit=5,
+            commits_only=False,
+            all=False,
+            json=True,
+            fields="id,prompt",
+            preset=None,
+            view="rich",
+        )
+
+        with patch("gza.cli.query._format_lineage", side_effect=AssertionError("lineage render should be skipped")):
+            result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert json.loads(captured.out) == [{"id": task.id, "prompt": "JSON output task"}]
+        assert "Progress:" in captured.err
+
+    def test_unmerged_rich_view_still_computes_pruned_lineage_text(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _setup_unmerged_env_fast(tmp_path, task_prompt="Rich output task")
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            update=False,
+            limit=5,
+            commits_only=False,
+            all=False,
+            json=False,
+            fields=None,
+            preset=None,
+            view="rich",
+        )
+        original_format_lineage = query_cli._format_lineage
+
+        with patch("gza.cli.query.GitHub", _UnavailableGitHub):
+            with patch("gza.cli.query._format_lineage", wraps=original_format_lineage) as format_lineage:
+                result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert format_lineage.call_count > 0
+        assert "lineage:" in captured.out
+        assert "Rich output task" in captured.out
+
+    def test_unmerged_progress_logs_counts_for_refresh_query_and_render(self, tmp_path: Path) -> None:
+        setup_unmerged_env(tmp_path, task_prompt="Progress task")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert re.search(r"Progress: refreshing canonical merge truth for \d+ candidate tasks", result.stdout)
+        assert re.search(r"Progress: running unmerged query over \d+ task rows for \d+ selected branches", result.stdout)
+        assert re.search(r"Progress: rendering \d+ row\(s\) from \d+ filtered result\(s\) as rich", result.stdout)
+
+    def test_unmerged_prunes_fully_merged_other_branch_ancestors_and_siblings(self, tmp_path: Path) -> None:
+        from gza.git import Git
+
+        store, root, git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Merged branch A root",
+            branch="feature/a-root",
+            merge_status="merged",
+        )
+        root.completed_at = datetime(2026, 2, 12, 9, 0, tzinfo=UTC)
+        store.update(root)
+        assert root.id is not None
+
+        branch_b = store.add("Unmerged branch B task", task_type="implement")
+        branch_b.status = "completed"
+        branch_b.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        branch_b.based_on = root.id
+        branch_b.branch = "feature/b-task"
+        branch_b.has_commits = True
+        branch_b.merge_status = "unmerged"
+        store.update(branch_b)
+        assert branch_b.id is not None
+
+        merged_sibling = store.add("Merged branch A sibling", task_type="implement")
+        merged_sibling.status = "completed"
+        merged_sibling.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        merged_sibling.based_on = root.id
+        merged_sibling.branch = "feature/a-root"
+        merged_sibling.same_branch = True
+        merged_sibling.has_commits = True
+        merged_sibling.merge_status = "merged"
+        store.update(merged_sibling)
+        assert merged_sibling.id is not None
+
+        merged_sibling_child = store.add("Merged branch A child", task_type="review")
+        merged_sibling_child.status = "completed"
+        merged_sibling_child.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        merged_sibling_child.depends_on = merged_sibling.id
+        merged_sibling_child.output_content = "Verdict: APPROVED"
+        store.update(merged_sibling_child)
+
+        real_git = Git(tmp_path)
+        real_git._run("checkout", "-b", "feature/b-task")
+        (tmp_path / "feature_b.txt").write_text("branch b")
+        real_git._run("add", "feature_b.txt")
+        real_git._run("commit", "-m", "Add branch b")
+        real_git._run("checkout", "main")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Unmerged branch B task" in result.stdout
+        assert branch_b.id in result.stdout
+        assert "Merged branch A root" not in result.stdout
+        assert root.id not in result.stdout
+        assert "Merged branch A sibling" not in result.stdout
+        assert merged_sibling.id not in result.stdout
+        assert "Merged branch A child" not in result.stdout
+
+
 class TestFailureReasonField:
     """Tests for the failure_reason field on Task."""
 

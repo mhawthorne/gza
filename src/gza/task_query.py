@@ -11,7 +11,7 @@ from gza.db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_num
 
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
-PresentationMode = Literal["flat", "grouped", "lineage", "tree", "one_line", "json"]
+PresentationMode = Literal["flat", "grouped", "lineage", "tree", "one_line", "json", "rich"]
 _T = TypeVar("_T")
 
 
@@ -141,6 +141,7 @@ class TaskProjectionPreset:
     SHOW_DETAIL = "show_detail"
     JSON_MINIMAL = "json_minimal"
     QUEUE_DEFAULT = "queue_default"
+    UNMERGED_DEFAULT = "unmerged_default"
 
 
 _TASK_DEFAULT_FIELDS: tuple[str, ...] = (
@@ -188,6 +189,35 @@ _PROJECTION_PRESET_FIELDS: dict[str, tuple[str, ...]] = {
         "queue_position",
         "blocked",
         "blocking_id",
+    ),
+    TaskProjectionPreset.UNMERGED_DEFAULT: (
+        "id",
+        "prompt",
+        "status",
+        "task_type",
+        "completed_at",
+        "lineage_root_id",
+        "branch_owner_id",
+        "member_ids",
+        "unresolved_ids",
+        "lineage_text",
+        "branch",
+        "target_branch",
+        "branch_deleted",
+        "commit_count",
+        "files_changed",
+        "insertions",
+        "deletions",
+        "has_conflicts",
+        "pr_url",
+        "review_status",
+        "review_detail",
+        "review_verdict",
+        "review_score",
+        "report_file",
+        "stats",
+        "completion_reason",
+        "failure_reason",
     ),
 }
 
@@ -302,6 +332,22 @@ class TaskQueryPresets:
             sort=SortSpec(field="pickup_order", descending=False),
             projection=ProjectionSpec(preset=TaskProjectionPreset.QUEUE_DEFAULT),
             presentation=PresentationSpec(mode="flat"),
+        )
+
+    @staticmethod
+    def unmerged(
+        *,
+        branch_owner_ids: tuple[str, ...],
+        limit: int | None = 5,
+        mode: PresentationMode = "rich",
+        projection: ProjectionSpec | None = None,
+    ) -> TaskQuery:
+        return TaskQuery(
+            scope="lineages",
+            limit=limit,
+            branch_owner_ids=branch_owner_ids,
+            projection=projection or ProjectionSpec(preset=TaskProjectionPreset.UNMERGED_DEFAULT),
+            presentation=PresentationSpec(mode=mode),
         )
 
 
@@ -984,20 +1030,7 @@ class TaskQueryService:
         return False
 
     def _projection_fields(self, projection: ProjectionSpec, scope: QueryScope) -> tuple[str, ...]:
-        if projection.fields is not None:
-            return projection.fields
-
-        preset_fields = _PROJECTION_PRESET_FIELDS.get(projection.preset)
-        if preset_fields is None:
-            return _LINEAGE_DEFAULT_FIELDS if scope == "lineages" else _TASK_DEFAULT_FIELDS
-
-        if scope == "tasks":
-            return tuple(
-                field_name
-                for field_name in preset_fields
-                if field_name not in {"member_ids", "unresolved_ids"}
-            )
-        return preset_fields
+        return projection_fields(projection, scope=scope)
 
     def _apply_projection(
         self,
@@ -1006,8 +1039,7 @@ class TaskQueryService:
         *,
         scope: QueryScope,
     ) -> dict[str, object]:
-        allowed_fields = set(self._projection_fields(projection, scope))
-        return {key: value for key, value in values.items() if key in allowed_fields}
+        return apply_projection_values(values, projection, scope=scope)
 
 
 def _normalize_dt(value: datetime | None) -> datetime:
@@ -1058,6 +1090,35 @@ def task_matches_tag_filters(
     requested = set(tag_filters)
     task_values = set(task_tags)
     return bool(task_values & requested) if any_tag else requested.issubset(task_values)
+
+
+def projection_fields(projection: ProjectionSpec, *, scope: QueryScope) -> tuple[str, ...]:
+    """Resolve the effective projection fields for a query scope."""
+    if projection.fields is not None:
+        return projection.fields
+
+    preset_fields = _PROJECTION_PRESET_FIELDS.get(projection.preset)
+    if preset_fields is None:
+        return _LINEAGE_DEFAULT_FIELDS if scope == "lineages" else _TASK_DEFAULT_FIELDS
+
+    if scope == "tasks":
+        return tuple(
+            field_name
+            for field_name in preset_fields
+            if field_name not in {"member_ids", "unresolved_ids"}
+        )
+    return preset_fields
+
+
+def apply_projection_values(
+    values: Mapping[str, object],
+    projection: ProjectionSpec,
+    *,
+    scope: QueryScope,
+) -> dict[str, object]:
+    """Project a value mapping using the shared preset/field rules."""
+    allowed_fields = set(projection_fields(projection, scope=scope))
+    return {key: value for key, value in values.items() if key in allowed_fields}
 
 
 def _history_filter_cls() -> Any:
@@ -1135,6 +1196,7 @@ def _is_lineage_complete(task: DbTask) -> bool:
 
 
 __all__ = [
+    "apply_projection_values",
     "DateFilter",
     "PresentationSpec",
     "ProjectionSpec",
@@ -1149,5 +1211,6 @@ __all__ = [
     "TextFilter",
     "normalize_tag_filters",
     "parse_csv",
+    "projection_fields",
     "task_matches_tag_filters",
 ]

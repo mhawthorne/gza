@@ -55,8 +55,10 @@ from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
     TaskLineageNode,
     build_lineage_tree as _build_lineage_tree_for_root,
+    flatten_lineage_tree as _flatten_query_lineage_tree,
     get_code_changing_descendants_for_root as _get_code_changing_descendants_for_root_task,
     get_reviews_for_root as _get_reviews_for_root_task,
+    is_lineage_complete as _query_is_lineage_complete,
     resolve_lineage_root as _resolve_lineage_root_task,
 )
 from ..runner import _get_task_output, get_effective_config_for_task, write_log_entry
@@ -72,12 +74,15 @@ from ..task_query import (
     PresentationSpec as _TaskPresentationSpec,
     ProjectionSpec as _TaskProjectionSpec,
     SortSpec as _TaskSortSpec,
+    TaskProjectionPreset as _TaskProjectionPreset,
     TaskQuery as _TaskQuery,
     TaskQueryPresets as _TaskQueryPresets,
     TaskQueryResult as _TaskQueryResult,
     TaskQueryService as _TaskQueryService,
     TaskRow as _TaskRow,
+    apply_projection_values as _apply_query_projection_values,
     parse_csv as _parse_csv,
+    projection_fields as _projection_fields,
 )
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
@@ -1010,6 +1015,428 @@ def _format_review_verdict_label(
     return verdict_label, review_status_color
 
 
+def _print_unmerged_progress(message: str, *, to_stderr: bool = False) -> None:
+    target = _stderr_console if to_stderr else console
+    target.print(f"[dim]Progress:[/dim] {message}")
+
+
+def _print_unmerged_status(message: str, *, to_stderr: bool = False) -> None:
+    target = _stderr_console if to_stderr else console
+    target.print(message)
+
+
+def _print_unmerged_empty(*, use_json: bool) -> None:
+    if use_json:
+        console.print("[]")
+        return
+    console.print("No unmerged tasks")
+
+
+def _unmerged_effective_fields(query: _TaskQuery) -> set[str]:
+    return set(_projection_fields(query.projection, scope="lineages"))
+
+
+def _resolve_unmerged_branch_owner(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    root = _resolve_lineage_root_task(store, task)
+    if _is_query_shared_branch_descendant(task, root):
+        return root
+    return task
+
+
+def _subtree_fully_merged_on_other_branch(node: TaskLineageNode, owner_branch: str | None) -> bool:
+    branch = node.task.branch
+    if not owner_branch or not branch or branch == owner_branch:
+        return False
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if not _query_is_lineage_complete(current.task):
+            return False
+        stack.extend(current.children)
+    return True
+
+
+def _task_fully_merged_on_other_branch(task: DbTask, owner_branch: str | None) -> bool:
+    return bool(
+        owner_branch
+        and task.branch
+        and task.branch != owner_branch
+        and _query_is_lineage_complete(task)
+    )
+
+
+def _prune_unmerged_lineage_tree(
+    tree: TaskLineageNode | None,
+    *,
+    owner_task: DbTask,
+) -> TaskLineageNode | None:
+    if tree is None or owner_task.id is None:
+        return tree
+
+    owner_id = owner_task.id
+    owner_branch = owner_task.branch
+
+    def _walk(node: TaskLineageNode) -> tuple[bool, TaskLineageNode | None]:
+        contains_owner = node.task.id == owner_id
+        owner_child: TaskLineageNode | None = None
+        kept_children: list[TaskLineageNode] = []
+
+        for child in node.children:
+            child_contains_owner, pruned_child = _walk(child)
+            if child_contains_owner:
+                contains_owner = True
+                owner_child = pruned_child
+                if pruned_child is not None:
+                    kept_children.append(pruned_child)
+                continue
+            if pruned_child is None:
+                continue
+            if _subtree_fully_merged_on_other_branch(pruned_child, owner_branch):
+                continue
+            kept_children.append(pruned_child)
+
+        pruned = TaskLineageNode(
+            task=node.task,
+            depth=node.depth,
+            relationship=node.relationship,
+            children=kept_children,
+        )
+
+        if contains_owner and node.task.id != owner_id and _task_fully_merged_on_other_branch(node.task, owner_branch):
+            return True, owner_child
+        if not contains_owner and _subtree_fully_merged_on_other_branch(pruned, owner_branch):
+            return False, None
+        return contains_owner, pruned
+
+    _contains_owner, pruned_tree = _walk(tree)
+    if pruned_tree is None:
+        return None
+
+    def _assign_depths(node: TaskLineageNode, depth: int) -> None:
+        node.depth = depth
+        for child in node.children:
+            _assign_depths(child, depth + 1)
+
+    _assign_depths(pruned_tree, 0)
+    return pruned_tree
+
+
+def _enrich_unmerged_result(
+    result: _TaskQueryResult,
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+    git_client: _UnmergedGit,
+    target_branch: str,
+    default_branch: str,
+) -> _TaskQueryResult:
+    effective_fields = _unmerged_effective_fields(result.query)
+    presentation_mode = result.query.presentation.mode
+    needs_lineage_text = presentation_mode == "rich" or (
+        presentation_mode == "json" and "lineage_text" in effective_fields
+    )
+    needs_branch_metadata = presentation_mode == "rich" or (
+        presentation_mode == "json"
+        and bool(
+            effective_fields
+            & {
+                "branch",
+                "target_branch",
+                "branch_deleted",
+                "commit_count",
+                "files_changed",
+                "insertions",
+                "deletions",
+                "has_conflicts",
+            }
+        )
+    )
+    needs_review_metadata = presentation_mode == "rich" or (
+        presentation_mode == "json"
+        and bool(
+            effective_fields
+            & {
+                "review_status",
+                "review_detail",
+                "review_verdict",
+                "review_score",
+            }
+        )
+    )
+    needs_pr_metadata = presentation_mode == "rich" or (
+        presentation_mode == "json" and "pr_url" in effective_fields
+    )
+    gh: GitHub | None = None
+    gh_available = False
+    if needs_pr_metadata:
+        gh = GitHub()
+        gh_available = gh.is_available()
+    rows: list[_TaskRow | _LineageRow] = []
+
+    for row in result.rows:
+        if not isinstance(row, _LineageRow):
+            rows.append(row)
+            continue
+
+        owner_task = row.owner_task
+        pruned_tree = _prune_unmerged_lineage_tree(row.tree, owner_task=owner_task)
+        members = tuple(_flatten_query_lineage_tree(pruned_tree)) if pruned_tree is not None else row.members
+        representative_branch = owner_task.branch
+
+        def _task_recency_key(task: DbTask) -> tuple[int, datetime]:
+            return (
+                _task_id_numeric_key(task.id),
+                _normalize_task_timestamp(task.completed_at or task.created_at),
+            )
+
+        branch_implement_tasks = [
+            task
+            for task in members
+            if task.task_type == "implement" and task.branch == representative_branch
+        ]
+        if branch_implement_tasks:
+            representative_task = max(branch_implement_tasks, key=_task_recency_key)
+        elif members:
+            representative_task = max(members, key=_task_recency_key)
+        else:
+            representative_task = owner_task
+
+        representative_branch = representative_task.branch or representative_branch
+        lineage_root = _resolve_lineage_root_task(store, representative_task)
+
+        root_branch = lineage_root.branch
+        include_root_review_fallback = bool(
+            lineage_root.id is not None
+            and (
+                lineage_root.id == representative_task.id
+                or not representative_branch
+                or not root_branch
+                or root_branch == representative_branch
+            )
+        )
+        effective_review_cleared_at = (
+            lineage_root.review_cleared_at if include_root_review_fallback else None
+        )
+        review_classification = "no review"
+        review_detail = None
+        review_verdict = None
+        review_score: int | None = None
+        if needs_review_metadata or needs_lineage_text:
+            code_changing_tasks = _get_code_changing_descendants_for_root_task(store, lineage_root)
+            review_source_task_ids: set[str] = set()
+            same_branch_code_changing_tasks: list[DbTask] = []
+            same_branch_code_change_ids: set[str] = set()
+            for task in code_changing_tasks:
+                if not task.branch or task.branch != representative_branch:
+                    continue
+                if task.id is not None and task.id in same_branch_code_change_ids:
+                    continue
+                if task.id is not None:
+                    same_branch_code_change_ids.add(task.id)
+                same_branch_code_changing_tasks.append(task)
+
+            stack = [pruned_tree] if pruned_tree is not None else []
+            while stack:
+                node = stack.pop()
+                task = node.task
+                if (
+                    task.task_type == "implement"
+                    and task.branch
+                    and task.branch == representative_branch
+                    and task.id != lineage_root.id
+                ):
+                    if task.id is None or task.id not in same_branch_code_change_ids:
+                        if task.id is not None:
+                            same_branch_code_change_ids.add(task.id)
+                        same_branch_code_changing_tasks.append(task)
+                if (
+                    task.id is not None
+                    and task.task_type == "implement"
+                    and (
+                        (representative_branch and task.branch == representative_branch)
+                        or (include_root_review_fallback and task.id == lineage_root.id)
+                    )
+                ):
+                    review_source_task_ids.add(task.id)
+                stack.extend(node.children)
+
+            for task in same_branch_code_changing_tasks:
+                if task.id is not None:
+                    review_source_task_ids.add(task.id)
+
+            reviews: list[DbTask] = []
+            seen_review_ids: set[str] = set()
+            for task_id in review_source_task_ids:
+                for review in store.get_reviews_for_task(task_id):
+                    if review.id is None or review.id in seen_review_ids:
+                        continue
+                    seen_review_ids.add(review.id)
+                    reviews.append(review)
+            if reviews:
+                reviews.sort(
+                    key=lambda review: (
+                        _normalize_task_timestamp(review.completed_at),
+                        _task_id_numeric_key(review.id if isinstance(review.id, str) else None),
+                    ),
+                    reverse=True,
+                )
+            elif include_root_review_fallback:
+                reviews = _get_reviews_for_root_task(store, lineage_root)
+
+            latest_review = next((review for review in reviews if review.status == "completed"), None)
+            latest_code_change = max(
+                (task for task in same_branch_code_changing_tasks if task.completed_at is not None),
+                key=lambda task: _normalize_task_timestamp(task.completed_at),
+                default=None,
+            )
+
+            if latest_review is not None and latest_review.completed_at is not None:
+                latest_review_completed = _normalize_task_timestamp(latest_review.completed_at)
+                review_cleared_stale = bool(
+                    effective_review_cleared_at
+                    and _normalize_task_timestamp(effective_review_cleared_at) >= latest_review_completed
+                )
+                latest_code_change_stale = bool(
+                    latest_code_change
+                    and latest_code_change.completed_at
+                    and _normalize_task_timestamp(latest_code_change.completed_at) > latest_review_completed
+                )
+                review_is_stale = review_cleared_stale or latest_code_change_stale
+
+                if review_is_stale:
+                    review_classification = "review stale"
+                    latest_review_id = latest_review.id if latest_review.id is not None else "?"
+                    if review_cleared_stale:
+                        review_detail = f"review state cleared after last review {latest_review_id}"
+                    elif latest_code_change_stale and latest_code_change and latest_code_change.id is not None:
+                        review_detail = (
+                            f"last review {latest_review_id} before latest "
+                            f"{latest_code_change.task_type} {latest_code_change.id}"
+                        )
+                    else:
+                        review_detail = f"last review {latest_review_id} is stale"
+                else:
+                    review_classification = "reviewed"
+
+                if review_classification != "review stale":
+                    for review in reviews:
+                        if review.status != "completed" or review.completed_at is None:
+                            continue
+                        if (
+                            effective_review_cleared_at
+                            and _normalize_task_timestamp(effective_review_cleared_at)
+                            >= _normalize_task_timestamp(review.completed_at)
+                        ):
+                            continue
+                        parsed_verdict = get_review_verdict(config, review)
+                        if parsed_verdict:
+                            review_verdict = parsed_verdict
+                            review_score = review.review_score
+                            break
+
+        verdict_label = None
+        if needs_review_metadata:
+            verdict_label, _verdict_color = _format_review_verdict_label(
+                review_verdict,
+                review_score,
+                UNMERGED_COLORS_DICT,
+            )
+
+        branch_deleted = False
+        commit_count: int | None = None
+        files_changed: int | None = None
+        insertions: int | None = None
+        deletions: int | None = None
+        has_conflicts = False
+        if needs_branch_metadata:
+            if representative_branch and git_client.branch_exists(representative_branch):
+                use_cached_stats = (
+                    target_branch == default_branch
+                    and representative_task.diff_files_changed is not None
+                )
+                if use_cached_stats:
+                    files_changed = representative_task.diff_files_changed
+                    insertions = representative_task.diff_lines_added or 0
+                    deletions = representative_task.diff_lines_removed or 0
+                else:
+                    revision_range = f"{target_branch}...{representative_branch}"
+                    files_changed, insertions, deletions = git_client.get_diff_stat_parsed(revision_range)
+                commit_count = git_client.count_commits_ahead(representative_branch, target_branch)
+                has_conflicts = not git_client.can_merge(representative_branch, target_branch)
+            else:
+                branch_deleted = bool(representative_branch)
+
+        pr_url: str | None = None
+        if needs_pr_metadata and gh is not None:
+            pr_lookup = lookup_task_pr(
+                representative_task,
+                gh=gh,
+                available=gh_available,
+                include_number=False,
+            )
+            if pr_lookup.found and pr_lookup.pr_url:
+                pr_url = pr_lookup.pr_url
+
+        unmerged_values = dict(row.values)
+        unmerged_values.update(
+            {
+                "member_ids": [member.id for member in members if member.id is not None],
+                "unresolved_ids": [task.id for task in row.unresolved_tasks if task.id is not None],
+                "lineage_text": (
+                    _format_lineage(
+                        pruned_tree,
+                        annotate=True,
+                        review_verdict_resolver=lambda review_task: get_review_verdict(config, review_task),
+                    )
+                    if needs_lineage_text and pruned_tree is not None
+                    else None
+                ),
+                "branch": representative_branch,
+                "target_branch": target_branch,
+                "branch_deleted": branch_deleted,
+                "commit_count": commit_count,
+                "files_changed": files_changed,
+                "insertions": insertions,
+                "deletions": deletions,
+                "has_conflicts": has_conflicts,
+                "pr_url": pr_url,
+                "id": representative_task.id,
+                "prompt": representative_task.prompt,
+                "status": representative_task.status,
+                "task_type": representative_task.task_type,
+                "completed_at": representative_task.completed_at,
+                "review_status": review_classification,
+                "review_detail": review_detail,
+                "review_verdict": verdict_label or review_verdict,
+                "review_score": review_score,
+                "report_file": representative_task.report_file,
+                "stats": format_stats(representative_task),
+                "completion_reason": representative_task.completion_reason,
+                "failure_reason": (
+                    representative_task.failure_reason
+                    if representative_task.failure_reason
+                    and representative_task.failure_reason != "UNKNOWN"
+                    else None
+                ),
+            }
+        )
+        rows.append(
+            _LineageRow(
+                owner_task=representative_task,
+                members=members,
+                tree=pruned_tree,
+                unresolved_tasks=row.unresolved_tasks,
+                values=_apply_query_projection_values(
+                    unmerged_values,
+                    result.query.projection,
+                    scope="lineages",
+                ),
+            )
+        )
+
+    return _TaskQueryResult(query=result.query, rows=tuple(rows), total_count=result.total_count)
+
+
 def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> int:
     """List tasks with unmerged work on branches."""
     from gza.db import needs_merge_status_migration
@@ -1035,7 +1462,12 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     git_client: _UnmergedGit = git if git is not None else cast(_UnmergedGit, Git(config.project_dir))
     default_branch = git_client.default_branch()
     current_branch = git_client.current_branch()
-    print(f"On branch {current_branch}")
+    projection_fields = _parse_csv(getattr(args, "fields", None))
+    projection_preset = getattr(args, "preset", None)
+    use_json = bool(getattr(args, "json", False))
+    view_mode = "json" if use_json else cast(_PresentationMode, getattr(args, "view", "rich"))
+    if not use_json:
+        print(f"On branch {current_branch}")
     target_branch = current_branch if getattr(args, "into_current", False) else (getattr(args, "target", None) or default_branch)
     live_target = _is_branch_target_live(args)
     update_requested = bool(getattr(args, "update", False))
@@ -1053,35 +1485,96 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
                 file=sys.stderr,
             )
 
+    if not use_json and (projection_fields is not None or projection_preset):
+        print("error: --fields and --preset require --json for gza unmerged", file=sys.stderr)
+        return 2
+
     store: SqliteTaskStore | None = None
+    service: _TaskQueryService | None = None
+    selected_tasks: list[DbTask] = []
     try:
         store = get_store(config, open_mode="query_only" if live_target else "readwrite")
-        if not live_target:
-            if needs_merge_status_migration(store):
+        service = _TaskQueryService(store)
+
+        if live_target:
+            history = store.get_history(limit=None)
+            branch_candidates = [
+                task
+                for task in history
+                if task.status == "completed"
+                and task.branch
+                and task.has_commits
+                and (task.task_type not in ("improve", "rebase", "fix") or task.based_on is None)
+            ]
+            _print_unmerged_progress(
+                f"refreshing live merge truth against {target_branch} for "
+                f"{len(branch_candidates)} candidate tasks",
+                to_stderr=use_json,
+            )
+            live_results = reconcile_branch_merge_truth(
+                cast(Git, git_client),
+                build_branch_cohorts_for_tasks(store, branch_candidates),
+                target_branch=target_branch,
+                include_diff_stats=True,
+            )
+            first_live_error = next(
+                (
+                    (result.branch, result.errors[0])
+                    for result in live_results
+                    if result.errors
+                ),
+                None,
+            )
+            if first_live_error is not None:
+                failing_branch, error_text = first_live_error
+                print(
+                    "Error: failed to reconcile unmerged branches relative to "
+                    f"{target_branch}: {failing_branch}: {error_text}"
+                )
+                return 1
+            live_unmerged_branches = {
+                result.branch
+                for result in live_results
+                if result.skipped_reason is None and result.merge_status != "merged"
+            }
+            selected_tasks = [
+                task for task in branch_candidates if task.branch in live_unmerged_branches
+            ]
+            if not use_json:
                 console.print(
-                    f"[{TASK_COLORS['task_id']}]Migrating merge status for existing tasks..."
+                    f"[{TASK_COLORS['task_id']}]Showing tasks unmerged relative to {target_branch}"
                     f"[/{TASK_COLORS['task_id']}]"
                 )
-
-            reconcile_results, _partial = sync_branch_cohorts(
+        else:
+            if needs_merge_status_migration(store):
+                _print_unmerged_status(
+                    f"[{TASK_COLORS['task_id']}]Migrating merge status for existing tasks..."
+                    f"[/{TASK_COLORS['task_id']}]",
+                    to_stderr=use_json,
+                )
+            refresh_cohorts = build_unmerged_branch_cohorts(store)
+            refresh_candidate_count = sum(len(cohort.tasks) for cohort in refresh_cohorts)
+            _print_unmerged_progress(
+                f"refreshing canonical merge truth for {refresh_candidate_count} candidate tasks "
+                f"across {len(refresh_cohorts)} branches",
+                to_stderr=use_json,
+            )
+            reconcile_results, partial = sync_branch_cohorts(
                 store,
                 cast(Git, git_client),
-                build_unmerged_branch_cohorts(store),
+                refresh_cohorts,
                 include_git=True,
                 include_pr=False,
                 dry_run=False,
                 fetch_remote=bool(getattr(args, "fetch", False)),
                 allow_cached_remote_target_ref_without_fetch=True,
             )
-            if _partial:
-                errors = [
-                    error
-                    for result in reconcile_results
-                    for error in result.errors
-                ]
+            if partial:
+                errors = [error for result in reconcile_results for error in result.errors]
                 if errors:
                     print(f"Error: failed to refresh canonical merge truth: {errors[0]}")
                     return 1
+            selected_tasks = [task for task in store.get_unmerged() if task.status == "completed"]
     except sqlite3.OperationalError as exc:
         if _is_readonly_snapshot_refresh_error(
             exc,
@@ -1095,341 +1588,63 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
             return 1
         raise
 
-    if live_target:
-        history = store.get_history(limit=None)
-        branch_candidates = [
-            t for t in history
-            if t.status == "completed"
-            and t.branch
-            and t.has_commits
-            and (t.task_type not in ("improve", "rebase", "fix") or t.based_on is None)
-        ]
-        live_results = reconcile_branch_merge_truth(
-            cast(Git, git_client),
-            build_branch_cohorts_for_tasks(store, branch_candidates),
-            target_branch=target_branch,
-            include_diff_stats=True,
-        )
-        first_live_error = next(
-            (
-                (result.branch, result.errors[0])
-                for result in live_results
-                if result.errors
-            ),
-            None,
-        )
-        if first_live_error is not None:
-            failing_branch, error_text = first_live_error
-            print(
-                "Error: failed to reconcile unmerged branches relative to "
-                f"{target_branch}: {failing_branch}: {error_text}"
-            )
-            return 1
-        live_unmerged_branches = {
-            result.branch
-            for result in live_results
-            if result.skipped_reason is None and result.merge_status != "merged"
-        }
-        unmerged = [task for task in branch_candidates if task.branch in live_unmerged_branches]
-        console.print(
-            f"[{TASK_COLORS['task_id']}]Showing tasks unmerged relative to {target_branch}"
-            f"[/{TASK_COLORS['task_id']}]"
-        )
-    else:
-        # Query tasks with merge_status='unmerged' from the database, completed only
-        # --commits-only and --all flags are kept for backwards compatibility but are no-ops
-        all_unmerged = store.get_unmerged()
-        unmerged = [t for t in all_unmerged if t.status == "completed"]
-
-    if not unmerged:
-        console.print("No unmerged tasks")
+    if not selected_tasks:
+        _print_unmerged_empty(use_json=use_json)
         return 0
 
-    total_count = len(unmerged)
-    limit = getattr(args, "limit", 5)
-    if limit > 0:
-        unmerged = unmerged[:limit]
-
-    # Colors for unmerged output — defined in gza.colors.
-    UNMERGED_COLORS = UNMERGED_COLORS_DICT
-    gh = GitHub()
-    gh_available = gh.is_available()
-
-    def _task_recency_key(task: DbTask) -> tuple[int, datetime]:
-        """Stable recency key for choosing a branch representative task."""
-        return (
-            _task_id_numeric_key(task.id),
-            _normalize_task_timestamp(task.completed_at or task.created_at),
+    owner_ids = tuple(
+        dict.fromkeys(
+            owner.id
+            for owner in (_resolve_unmerged_branch_owner(store, task) for task in selected_tasks)
+            if owner.id is not None
         )
+    )
+    if not owner_ids:
+        _print_unmerged_empty(use_json=use_json)
+        return 0
 
-    # Group tasks by branch
-    branch_groups: dict[str, list] = {}
-    for task in unmerged:
-        if task.branch:
-            if task.branch not in branch_groups:
-                branch_groups[task.branch] = []
-            branch_groups[task.branch].append(task)
+    limit = None if getattr(args, "limit", 5) == 0 else getattr(args, "limit", 5)
+    projection = _TaskProjectionSpec(
+        preset=projection_preset or _TaskProjectionPreset.UNMERGED_DEFAULT,
+        fields=projection_fields,
+    )
+    query = _TaskQueryPresets.unmerged(
+        branch_owner_ids=owner_ids,
+        limit=limit,
+        mode=view_mode,
+        projection=projection,
+    )
 
-    # Define task separator (same style as gza work logs)
-    task_separator = "\n" + "-"*32 + "\n"
+    scan_count = len(store.get_all())
+    _print_unmerged_progress(
+        f"running unmerged query over {scan_count} task rows for {len(owner_ids)} selected branches",
+        to_stderr=use_json,
+    )
+    result = service.run(query)
+    result = _enrich_unmerged_result(
+        result,
+        store=store,
+        config=config,
+        git_client=git_client,
+        target_branch=target_branch,
+        default_branch=default_branch,
+    )
+    _print_unmerged_progress(
+        f"rendering {len(result.rows)} row(s) from {result.total_count or 0} filtered result(s) as {view_mode}",
+        to_stderr=use_json,
+    )
 
-    # Display grouped by branch
-    first_task = True
-    for branch, tasks in branch_groups.items():
-        # Add separator between tasks (not before first task)
-        if not first_task:
-            console.print(task_separator)
-        first_task = False
+    rendered = result.render(view_mode)
+    if rendered:
+        console.print(rendered)
+    else:
+        _print_unmerged_empty(use_json=use_json)
+        return 0
 
-        # Choose the current branch-head implementation for summary/review status.
-        # When retries/resumes share a branch, the latest implementation is the
-        # state users care about when asking what remains unmerged.
-        branch_implement_tasks = [task for task in tasks if task.task_type == "implement"]
-        if branch_implement_tasks:
-            representative_task = max(branch_implement_tasks, key=_task_recency_key)
-        else:
-            representative_task = max(tasks, key=_task_recency_key)
-
-        representative_branch = representative_task.branch or branch
-        lineage_root = _resolve_lineage_root_task(store, representative_task)
-        lineage_tree = _build_lineage_tree_for_root(store, lineage_root)
-        code_changing_tasks = _get_code_changing_descendants_for_root_task(store, lineage_root)
-
-        review_source_task_ids: set[str] = set()
-        root_branch = lineage_root.branch
-        include_root_review_fallback = bool(
-            lineage_root.id is not None
-            and (
-                lineage_root.id == representative_task.id
-                or not representative_branch
-                or not root_branch
-                or root_branch == representative_branch
-            )
+    if limit is not None and result.total_count and result.total_count > limit:
+        console.print(
+            f"\n[dim]Showing {limit} of {result.total_count} unmerged tasks (use -n 0 for all)[/dim]"
         )
-        effective_review_cleared_at = (
-            lineage_root.review_cleared_at if include_root_review_fallback else None
-        )
-        same_branch_code_changing_tasks: list[DbTask] = []
-        same_branch_code_change_ids: set[str] = set()
-        for task in code_changing_tasks:
-            if not task.branch or task.branch != representative_branch:
-                continue
-            if task.id is not None:
-                if task.id in same_branch_code_change_ids:
-                    continue
-                same_branch_code_change_ids.add(task.id)
-            same_branch_code_changing_tasks.append(task)
-
-        stack = [lineage_tree]
-        while stack:
-            node = stack.pop()
-            task = node.task
-            if (
-                task.task_type == "implement"
-                and task.branch
-                and task.branch == representative_branch
-                and task.id != lineage_root.id
-            ):
-                if task.id is None or task.id not in same_branch_code_change_ids:
-                    if task.id is not None:
-                        same_branch_code_change_ids.add(task.id)
-                    same_branch_code_changing_tasks.append(task)
-            if (
-                task.id is not None
-                and task.task_type == "implement"
-                and (
-                    (representative_branch and task.branch == representative_branch)
-                    or (include_root_review_fallback and task.id == lineage_root.id)
-                )
-            ):
-                review_source_task_ids.add(task.id)
-            stack.extend(node.children)
-
-        for task in same_branch_code_changing_tasks:
-            if task.id is not None:
-                review_source_task_ids.add(task.id)
-
-        reviews: list[DbTask] = []
-        seen_review_ids: set[str] = set()
-        for task_id in review_source_task_ids:
-            for review in store.get_reviews_for_task(task_id):
-                if review.id is None or review.id in seen_review_ids:
-                    continue
-                seen_review_ids.add(review.id)
-                reviews.append(review)
-        if reviews:
-            reviews.sort(
-                key=lambda review: (
-                    _normalize_task_timestamp(review.completed_at),
-                    _task_id_numeric_key(review.id if isinstance(review.id, str) else None),
-                ),
-                reverse=True,
-            )
-        elif include_root_review_fallback:
-            # Keep manual/unlinked review fallback for root-slug review tasks.
-            reviews = _get_reviews_for_root_task(store, lineage_root)
-        c = UNMERGED_COLORS  # shorthand
-        lineage_str = _format_lineage(
-            lineage_tree,
-            annotate=True,
-            review_verdict_resolver=lambda review_task: get_review_verdict(config, review_task),
-        )
-
-        # Classify review freshness/status for this implementation.
-        latest_review = next((r for r in reviews if r.status == "completed"), None)
-        latest_code_change = max(
-            (task for task in same_branch_code_changing_tasks if task.completed_at is not None),
-            key=lambda task: _normalize_task_timestamp(task.completed_at),
-            default=None,
-        )
-
-        review_classification = "no review"
-        review_status_color = UNMERGED_COLORS["review_none"]
-        review_detail = None
-        review_verdict = None
-        review_score: int | None = None
-
-        if latest_review:
-            latest_review_completed = latest_review.completed_at
-            assert latest_review_completed is not None
-            latest_review_completed = _normalize_task_timestamp(latest_review_completed)
-
-            review_cleared_stale = bool(
-                effective_review_cleared_at
-                and _normalize_task_timestamp(effective_review_cleared_at) >= latest_review_completed
-            )
-            latest_code_change_stale = bool(
-                latest_code_change
-                and latest_code_change.completed_at
-                and _normalize_task_timestamp(latest_code_change.completed_at) > latest_review_completed
-            )
-            review_is_stale = review_cleared_stale or latest_code_change_stale
-
-            if review_is_stale:
-                review_classification = "review stale"
-                review_status_color = UNMERGED_COLORS["review_changes"]
-                latest_review_id = latest_review.id if latest_review.id is not None else "?"
-                if review_cleared_stale:
-                    review_detail = f"review state cleared after last review {latest_review_id}"
-                elif latest_code_change_stale and latest_code_change and latest_code_change.id is not None:
-                    review_detail = (
-                        f"last review {latest_review_id} before latest "
-                        f"{latest_code_change.task_type} {latest_code_change.id}"
-                    )
-                elif latest_code_change_stale:
-                    review_detail = f"last review {latest_review_id} before latest code-changing task"
-                else:
-                    review_detail = f"last review {latest_review_id} is stale"
-            else:
-                review_classification = "reviewed"
-                review_status_color = UNMERGED_COLORS["review_approved"]
-
-            # Preserve verdict extraction behavior by scanning newest-to-oldest
-            # and taking the first parseable verdict after stale filtering.
-            if review_classification != "review stale":
-                for review in reviews:
-                    if review.status != "completed" or review.completed_at is None:
-                        continue
-                    if (
-                        effective_review_cleared_at
-                        and _normalize_task_timestamp(effective_review_cleared_at)
-                        >= _normalize_task_timestamp(review.completed_at)
-                    ):
-                        continue
-                    verdict = get_review_verdict(config, review)
-                    if verdict:
-                        review_verdict = verdict
-                        review_score = review.review_score
-                        break
-
-        verdict_label, verdict_color = _format_review_verdict_label(
-            review_verdict,
-            review_score,
-            UNMERGED_COLORS,
-        )
-        if verdict_color is not None:
-            review_status_color = verdict_color
-
-        review_line = review_classification
-        if review_detail:
-            review_line = f"{review_line} ({review_detail})"
-        if verdict_label:
-            review_line = f"{review_line} [{verdict_label}]"
-
-        suffix = ""
-        # Append failure reason if present and not UNKNOWN
-        if representative_task.status == "failed" and representative_task.failure_reason and representative_task.failure_reason != "UNKNOWN":
-            suffix += f" [red]failed ({representative_task.failure_reason})[/red]"
-        elif representative_task.status == "completed" and representative_task.completion_reason:
-            suffix += f" [green]completed ({representative_task.completion_reason})[/green]"
-
-        # Header line: task ID, completion time, prompt
-        task_id_len = len(str(representative_task.id))
-        date_len = 19 if representative_task.completed_at else 0
-        prefix_len = 2 + task_id_len + date_len  # "⚡ ID (date) "
-        prompt_display = shorten_prompt(representative_task.prompt, prompt_available_width(prefix=prefix_len))
-        date_str = f"[{c['date']}]({representative_task.completed_at.strftime('%Y-%m-%d %H:%M')})[/{c['date']}]" if representative_task.completed_at else ""
-
-        console.print(f"⚡ [{c['task_id']}]{representative_task.id}[/{c['task_id']}] {date_str} [{c['prompt']}]{prompt_display}[/{c['prompt']}]{suffix}")
-
-        if lineage_str:
-            console.print("lineage:")
-            console.print(lineage_str)
-
-        # Show branch with diff stats (branch may no longer exist if deleted)
-        if representative_branch and git_client.branch_exists(representative_branch):
-            # Use cached diff stats if available; fall back to live git call
-            use_cached_stats = (
-                target_branch == default_branch
-                and representative_task.diff_files_changed is not None
-            )
-            if use_cached_stats:
-                files_changed = representative_task.diff_files_changed
-                insertions = representative_task.diff_lines_added or 0
-                deletions = representative_task.diff_lines_removed or 0
-                commit_count = git_client.count_commits_ahead(representative_branch, target_branch)
-                commits_label = "commit" if commit_count == 1 else "commits"
-                diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
-                branch_detail = f"[{c['branch']}]{commit_count} {commits_label}[/{c['branch']}]"
-                if diff_str:
-                    branch_detail += f", [{c['branch']}]{diff_str}[/{c['branch']}]"
-            else:
-                revision_range = f"{target_branch}...{representative_branch}"
-                files_changed, insertions, deletions = git_client.get_diff_stat_parsed(revision_range)
-                commit_count = git_client.count_commits_ahead(representative_branch, target_branch)
-                commits_label = "commit" if commit_count == 1 else "commits"
-                diff_str = f"+{insertions}/-{deletions} LOC, {files_changed} files" if files_changed else ""
-                branch_detail = f"[{c['branch']}]{commit_count} {commits_label}[/{c['branch']}]"
-                if diff_str:
-                    branch_detail += f", [{c['branch']}]{diff_str}[/{c['branch']}]"
-            console.print(f"branch: [{c['branch']}]{representative_branch}[/{c['branch']}] ({branch_detail})")
-            if not git_client.can_merge(representative_branch, target_branch):
-                console.print("[yellow]⚠️  has conflicts[/yellow]")
-        else:
-            deleted_branch = representative_branch or branch
-            console.print(f"branch: [{c['branch']}]{deleted_branch}[/{c['branch']}] ([{c['task_id']}]branch deleted[/{c['task_id']}])")
-
-        pr_lookup = lookup_task_pr(
-            representative_task,
-            gh=gh,
-            available=gh_available,
-            include_number=False,
-        )
-        if pr_lookup.found and pr_lookup.pr_url:
-            console.print(f"pr: [{c['task_id']}]{pr_lookup.pr_url}[/{c['task_id']}]")
-
-        # Review freshness status for this implementation.
-        console.print(f"review: [{review_status_color}]{review_line}[/{review_status_color}]")
-
-        if representative_task.report_file:
-            console.print(f"report: [{c['task_id']}]{representative_task.report_file}[/{c['task_id']}]")
-
-        stats_str = format_stats(representative_task)
-        if stats_str:
-            console.print(f"stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
-
-    if limit > 0 and total_count > limit:
-        console.print(f"\n[dim]Showing {limit} of {total_count} unmerged tasks (use -n 0 for all)[/dim]")
 
     return 0
 

@@ -497,6 +497,10 @@ class TestHelpOutput:
         assert "--update" in unmerged_help.stdout
         assert "--into-current" in unmerged_help.stdout
         assert "--target BRANCH" in unmerged_help.stdout
+        assert "--view {rich,flat,tree}" in unmerged_help.stdout
+        assert "--json" in unmerged_help.stdout
+        assert "--fields CSV" in unmerged_help.stdout
+        assert "--preset NAME" in unmerged_help.stdout
         assert help_text.count("Retained compatibility no-op; has no effect on unmerged output") == 2
         assert "Show last N unmerged tasks (default: 5, 0 for all)" in help_text
         assert "Fetch `origin` before the canonical default-branch refresh" in help_text
@@ -504,6 +508,10 @@ class TestHelpOutput:
         assert "Deprecated compatibility alias for the default default-branch refresh" in help_text
         assert "plain `uv run gza unmerged` already persists canonical merge truth before listing" in help_text
         assert "plain `gza unmerged` already persists canonical merge truth before listing" not in help_text
+        assert "Presentation mode (default: rich)" in help_text
+        assert "Projection fields override" in help_text
+        assert "Projection preset override" in help_text
+        assert "Output JSON rows from the unified query API" in help_text
 
         assert "uv run gza unmerged [options]" in docs_text
         assert "\ngza unmerged [options]\n" not in docs_raw
@@ -511,12 +519,19 @@ class TestHelpOutput:
         assert "`--commits-only` | Backwards-compatible no-op retained in the CLI surface" in docs_text
         assert "`--all` | Backwards-compatible no-op retained in the CLI surface" in docs_text
         assert "`--fetch` | Fetch `origin` before the canonical default-branch refresh" in docs_text
+        assert "| `--view MODE` | Presentation mode: `rich`, `flat`, or `tree` (default: `rich`) |" in docs_text
+        assert "| `--json` | Output JSON rows from the unified query API |" in docs_text
+        assert "| `--fields CSV` | Projection field override for JSON output" in docs_text
+        assert "| `--preset NAME` | Projection preset override for JSON output" in docs_text
         assert "opens the task store read/write" in docs_text
         assert "By default, plain `uv run gza unmerged` does not initiate network I/O" in docs_text
         assert "This is the deliberate narrow exception to the usual read-only query convention" in docs_text
         assert "If the canonical default-branch refresh cannot persist because the database is read-only" in docs_text
         assert "`--update` is deprecated because plain `uv run gza unmerged` now does the canonical refresh automatically" in docs_text
         assert "With `--into-current` or `--target`, `uv run gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged" in docs_text
+        assert "builds an unmerged-specific query preset and then renders that result through the shared query projection/presentation path" in docs_text
+        assert "logs concise progress for the refresh, query, and render phases" in docs_text
+        assert "prunes fully merged ancestors and sibling subtrees that live on other branches" in docs_text
 
     def test_show_help_and_docs_describe_prompt_as_plain_text(self, tmp_path):
         """`show --prompt` should be documented as plain prompt-text output, not JSON."""

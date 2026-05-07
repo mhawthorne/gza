@@ -153,6 +153,16 @@ def test_projection_preset_override_changes_output_shape(tmp_path: Path) -> None
     assert set(minimal_json[0].keys()) == {"id", "prompt", "status", "task_type"}
 
 
+def test_unmerged_preset_uses_lineage_scope_and_unmerged_default_projection() -> None:
+    query = TaskQueryPresets.unmerged(branch_owner_ids=("gza-1",), limit=7, mode="flat")
+
+    assert query.scope == "lineages"
+    assert query.limit == 7
+    assert query.branch_owner_ids == ("gza-1",)
+    assert query.projection.preset == TaskProjectionPreset.UNMERGED_DEFAULT
+    assert query.presentation.mode == "flat"
+
+
 def test_incomplete_date_field_created_vs_effective_affects_lineage_selection(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
