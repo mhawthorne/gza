@@ -7029,6 +7029,36 @@ class TestUnmergedAllFlag:
         updated_task = store.get(task.id)
         assert updated_task.merge_status == "merged"
 
+    def test_unmerged_same_branch_improve_without_merge_status_does_not_print_migration_banner(
+        self,
+        tmp_path: Path,
+    ):
+        """Valid non-owner improve rows must not trigger legacy merge-status migration output."""
+        store, impl_task, _git = setup_unmerged_env(
+            tmp_path,
+            task_prompt="Implementation owner task",
+            branch="feature/same-branch-improve",
+            merge_status="unmerged",
+        )
+
+        improve_task = store.add(
+            "Improve on shared branch",
+            task_type="improve",
+            same_branch=True,
+            based_on=impl_task.id,
+        )
+        store.mark_completed(improve_task, has_commits=True, branch="feature/same-branch-improve")
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Migrating merge status" not in result.stdout
+        assert "Implementation owner task" in result.stdout
+
+        refreshed_improve = store.get(improve_task.id)
+        assert refreshed_improve is not None
+        assert refreshed_improve.merge_status is None
+
     def test_unmerged_uses_existing_origin_default_branch_without_fetch_by_default(
         self,
         tmp_path: Path,

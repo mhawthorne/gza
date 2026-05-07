@@ -1903,6 +1903,43 @@ class TestMergeStatus:
         assert impl_task.id in unmerged_ids
         assert fix_task.id not in unmerged_ids
 
+    def test_needs_merge_status_migration_ignores_same_branch_improve_rows(self, tmp_path: Path):
+        """Same-branch improve rows may validly keep merge_status=None after completion."""
+        from gza.db import needs_merge_status_migration
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl_task, has_commits=True, branch="feature/impl")
+
+        improve_task = store.add(
+            prompt="Improve implementation",
+            task_type="improve",
+            same_branch=True,
+            based_on=impl_task.id,
+        )
+        store.mark_completed(improve_task, has_commits=True, branch="feature/impl")
+
+        refreshed_improve = store.get(improve_task.id)
+        assert refreshed_improve is not None
+        assert refreshed_improve.merge_status is None
+        assert needs_merge_status_migration(store) is False
+
+    def test_needs_merge_status_migration_still_flags_merge_owner_rows(self, tmp_path: Path):
+        """Merge-owning legacy rows with commits still require backfill."""
+        from gza.db import needs_merge_status_migration
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Legacy implement", task_type="implement")
+        store.mark_completed(impl_task, has_commits=True, branch="feature/impl")
+        assert impl_task.id is not None
+        store.set_merge_status(impl_task.id, None)
+
+        assert needs_merge_status_migration(store) is True
+
     def test_migrate_merge_status_logs_when_remote_probe_fails(self, tmp_path: Path, caplog: pytest.LogCaptureFixture):
         """Migration logs a warning and defaults safely when origin inspection fails."""
         from gza.db import migrate_merge_status
