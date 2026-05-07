@@ -1030,16 +1030,23 @@ gza history [options]
 |--------|-------------|
 | `--last N`, `-n N` | Show last N tasks (default: 5) |
 | `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
+| `--type-not TYPE` | Exclude the given task type |
 | `--days N` | Show only tasks from the last N days |
 | `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
 | `--end-date YYYY-MM-DD` | Show only tasks on or before this date |
 | `--status STATUS` | Filter by status: `completed`, `failed`, or `unmerged` |
+| `--status-not STATUS` | Exclude the given status |
+| `--tag TAG` | Filter by tag (repeatable; all tags required by default) |
+| `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |
+| `--any-tag` | With repeated `--tag` and/or `--tag-not` values, match any requested tag instead of all |
 | `--incomplete` | Show only unresolved tasks (failed or unmerged) |
 | `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
 | `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `effective`) |
 | `--fields CSV` | Projection fields override for JSON output only (comma-separated; requires `--json`) |
 | `--preset NAME` | Projection preset override for JSON output only (requires `--json`) |
 | `--json` | Output JSON rows from the unified query API |
+
+Positive and negative filters on the same field are applied in order: include matches for the positive flag first, then drop anything matching the corresponding `--...-not` flag. If the same value appears in both, the negative filter wins and that row is excluded.
 
 #### Replacing `gza incomplete`
 
@@ -1068,19 +1075,28 @@ gza search <term> [options]
 | `term` | Substring to match in task prompt text |
 | `--last N`, `-n N` | Show last N matching tasks (default: 10; use `0` for all) |
 | `--status CSV` | Filter statuses (comma-separated) |
+| `--status-not CSV` | Exclude statuses (comma-separated) |
 | `--type CSV` | Filter task types (comma-separated) |
+| `--type-not CSV` | Exclude task types (comma-separated) |
 | `--days N` | Show only matches from the last N days |
 | `--start-date YYYY-MM-DD` | Show only matches on or after this date |
 | `--end-date YYYY-MM-DD` | Show only matches on or before this date |
 | `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `created`) |
 | `--related-to TASK_ID` | Restrict to tasks related to the given lineage |
+| `--related-to-not TASK_ID` | Exclude tasks related to the given lineage |
 | `--lineage-of TASK_ID` | Restrict to the canonical lineage containing TASK_ID |
+| `--lineage-of-not TASK_ID` | Exclude the canonical lineage containing TASK_ID |
 | `--root CSV` | Restrict by lineage root IDs (comma-separated) |
+| `--root-not CSV` | Exclude lineage root IDs (comma-separated) |
+| `--tag TAG` | Filter by tag (repeatable; all tags required by default) |
+| `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |
+| `--any-tag` | With repeated `--tag` and/or `--tag-not` values, match any requested tag instead of all |
 | `--fields CSV` | Projection fields override for JSON output only (comma-separated; requires `--json`) |
 | `--preset NAME` | Projection preset override for JSON output only (requires `--json`) |
 | `--json` | Output JSON rows from the unified query API |
 
 Text output ends with a summary footer such as `Showing results 1-9 out of 55`.
+Positive and negative filters on the same field are applied in order: include matches for the positive flag first, then drop anything matching the corresponding `--...-not` flag. If the same value appears in both, the negative filter wins and that row is excluded.
 ### checkout
 
 Checkout a task's branch, removing any stale worktree if needed.

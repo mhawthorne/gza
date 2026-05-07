@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -403,6 +404,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     use_json = bool(getattr(args, "json", False))
     try:
         tags = validate_cli_tag_values(tuple(getattr(args, "tags", None) or ()))
+        tags_not = validate_cli_tag_values(tuple(getattr(args, "tags_not", None) or ()))
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
@@ -421,7 +423,9 @@ def cmd_history(args: argparse.Namespace) -> int:
     f = HistoryFilter(
         limit=limit,
         status=status,
+        status_not=getattr(args, "status_not", None),
         task_type=task_type,
+        task_type_not=getattr(args, "type_not", None),
         incomplete=incomplete,
         days=days,
         start_date=start_date,
@@ -429,6 +433,7 @@ def cmd_history(args: argparse.Namespace) -> int:
         date_field=date_field,
         lineage_depth=lineage_depth,
         tags=tags or None,
+        tags_not=tags_not or None,
         any_tag=any_tag,
     )
 
@@ -759,6 +764,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     use_json = bool(getattr(args, "json", False))
     try:
         tags = validate_cli_tag_values(tuple(getattr(args, "tags", None) or ()))
+        tags_not = validate_cli_tag_values(tuple(getattr(args, "tags_not", None) or ()))
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
@@ -775,65 +781,54 @@ def cmd_search(args: argparse.Namespace) -> int:
         end=_parse_cli_date(getattr(args, "end_date", None)),
     )
     related_to = resolve_id(config, args.related_to) if getattr(args, "related_to", None) else None
+    related_to_not = (
+        resolve_id(config, args.related_to_not) if getattr(args, "related_to_not", None) else None
+    )
     lineage_of = resolve_id(config, args.lineage_of) if getattr(args, "lineage_of", None) else None
+    lineage_of_not = (
+        resolve_id(config, args.lineage_of_not) if getattr(args, "lineage_of_not", None) else None
+    )
     root_ids = None
     if getattr(args, "root", None):
         parsed_roots = _parse_csv(args.root)
         root_ids = tuple(resolve_id(config, value) for value in parsed_roots) if parsed_roots else None
+    exclude_root_ids = None
+    if getattr(args, "root_not", None):
+        parsed_roots_not = _parse_csv(args.root_not)
+        exclude_root_ids = (
+            tuple(resolve_id(config, value) for value in parsed_roots_not)
+            if parsed_roots_not
+            else None
+        )
 
     query = _TaskQueryPresets.search(
         term=term,
         limit=limit,
         statuses=_parse_csv(getattr(args, "status", None)),
+        exclude_statuses=_parse_csv(getattr(args, "status_not", None)),
         task_types=_parse_csv(getattr(args, "type", None)),
+        exclude_task_types=_parse_csv(getattr(args, "type_not", None)),
         date_filter=date_filter,
         related_to=related_to,
+        exclude_related_to=related_to_not,
         lineage_of=lineage_of,
+        exclude_lineage_of=lineage_of_not,
         root_ids=root_ids,
+        exclude_root_ids=exclude_root_ids,
     )
-    query = _TaskQuery(
-        scope=query.scope,
-        limit=query.limit,
-        text=query.text,
-        statuses=query.statuses,
-        task_types=query.task_types,
-        lifecycle_state=query.lifecycle_state,
-        merge_chain_state=query.merge_chain_state,
-        dependency_state=query.dependency_state,
-        related_to=query.related_to,
-        lineage_of=query.lineage_of,
-        root_ids=query.root_ids,
-        branch_owner_ids=query.branch_owner_ids,
+    query = replace(
+        query,
         tag_filters=tags or None,
+        exclude_tag_filters=tags_not or None,
         any_tag=any_tag,
-        date_filter=query.date_filter,
-        sort=query.sort,
-        projection=query.projection,
-        presentation=query.presentation,
     )
     if projection_preset or projection_fields is not None:
-        query = _TaskQuery(
-            scope=query.scope,
-            limit=query.limit,
-            text=query.text,
-            statuses=query.statuses,
-            task_types=query.task_types,
-            lifecycle_state=query.lifecycle_state,
-            merge_chain_state=query.merge_chain_state,
-            dependency_state=query.dependency_state,
-            related_to=query.related_to,
-            lineage_of=query.lineage_of,
-            root_ids=query.root_ids,
-            branch_owner_ids=query.branch_owner_ids,
-            tag_filters=query.tag_filters,
-            any_tag=query.any_tag,
-            date_filter=query.date_filter,
-            sort=query.sort,
+        query = replace(
+            query,
             projection=_TaskProjectionSpec(
                 preset=projection_preset or query.projection.preset,
                 fields=projection_fields,
             ),
-            presentation=query.presentation,
         )
     result = service.run(query)
     matches = [row.task for row in result.rows if isinstance(row, _TaskRow)]

@@ -1359,6 +1359,52 @@ class TestHistoryCommand:
         prompts = [row["prompt"] for row in rows]
         assert prompts == ["Tagged completed history"]
 
+    def test_history_negative_filters_cover_status_type_and_tag(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        keep = store.add("keep completed history", task_type="implement", tags=("release",))
+        keep.status = "completed"
+        keep.completed_at = datetime.now(UTC)
+        store.update(keep)
+
+        failed = store.add("failed history", task_type="implement", tags=("release",))
+        failed.status = "failed"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        plan = store.add("plan history", task_type="plan", tags=("release",))
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        blocked = store.add("blocked history", task_type="implement", tags=("release", "blocked"))
+        blocked.status = "completed"
+        blocked.completed_at = datetime.now(UTC)
+        store.update(blocked)
+
+        result = run_gza(
+            "history",
+            "--status",
+            "completed",
+            "--status-not",
+            "failed",
+            "--type-not",
+            "plan",
+            "--tag",
+            "release",
+            "--tag-not",
+            "blocked",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "keep completed history" in result.stdout
+        assert "failed history" not in result.stdout
+        assert "plan history" not in result.stdout
+        assert "blocked history" not in result.stdout
+
 
 class TestSearchCommand:
     """Tests for 'gza search' command."""
@@ -1570,6 +1616,113 @@ class TestSearchCommand:
         rows = json.loads(json_result.stdout)
         prompts = [row["prompt"] for row in rows]
         assert prompts == ["Tagged search task"]
+
+    def test_search_negative_filters_cover_status_type_tag_and_lineage(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root_keep = store.add("needle keep task", task_type="implement", tags=("release",))
+        root_keep.status = "completed"
+        root_keep.completed_at = datetime.now(UTC)
+        store.update(root_keep)
+        assert root_keep.id is not None
+
+        failed = store.add("needle failed task", task_type="implement", tags=("release",))
+        failed.status = "failed"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        plan = store.add("needle plan task", task_type="plan", tags=("release",))
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        blocked = store.add("needle blocked task", task_type="implement", tags=("release", "blocked"))
+        blocked.status = "completed"
+        blocked.completed_at = datetime.now(UTC)
+        store.update(blocked)
+
+        root_excluded = store.add("needle root excluded", task_type="implement", tags=("release",))
+        root_excluded.status = "completed"
+        root_excluded.completed_at = datetime.now(UTC)
+        store.update(root_excluded)
+        assert root_excluded.id is not None
+
+        child_excluded = store.add(
+            "needle child excluded",
+            task_type="review",
+            tags=("release",),
+            based_on=root_excluded.id,
+            same_branch=True,
+        )
+        child_excluded.status = "completed"
+        child_excluded.completed_at = datetime.now(UTC)
+        store.update(child_excluded)
+        assert child_excluded.id is not None
+
+        result = run_gza(
+            "search",
+            "needle",
+            "--status",
+            "completed,failed",
+            "--status-not",
+            "failed",
+            "--type",
+            "implement,plan,review",
+            "--type-not",
+            "plan,review",
+            "--tag",
+            "release",
+            "--tag-not",
+            "blocked",
+            "--root",
+            f"{root_keep.id},{root_excluded.id}",
+            "--related-to-not",
+            child_excluded.id,
+            "--lineage-of-not",
+            child_excluded.id,
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "needle keep task" in result.stdout
+        assert "needle failed task" not in result.stdout
+        assert "needle plan task" not in result.stdout
+        assert "needle blocked task" not in result.stdout
+        assert "needle root excluded" not in result.stdout
+        assert "needle child excluded" not in result.stdout
+
+    def test_search_negative_filters_override_positive_matches_for_same_field(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("needle overlap task", task_type="implement", tags=("release",))
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza(
+            "search",
+            "needle",
+            "--status",
+            "completed",
+            "--status-not",
+            "completed",
+            "--type",
+            "implement",
+            "--type-not",
+            "implement",
+            "--tag",
+            "release",
+            "--tag-not",
+            "release",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "No tasks found matching 'needle'" in result.stdout
+        assert "Showing results 0-0 out of 0" in result.stdout
 
 
 class TestNextCommand:

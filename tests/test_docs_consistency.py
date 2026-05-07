@@ -171,6 +171,9 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
         "gza run-inline <task_id> [options]",
         "### search",
         "gza search <term> [options]",
+        "| `--status-not CSV` | Exclude statuses (comma-separated) |",
+        "| `--related-to-not TASK_ID` | Exclude tasks related to the given lineage |",
+        "Positive and negative filters on the same field are applied in order",
         "Replacing `gza incomplete`",
         "`uv run gza history --incomplete` remains available as a factual unresolved-history filter.",
         "### tv",
@@ -180,6 +183,8 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
         "### fix",
         "gza fix <task_id> [options]",
         "| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |",
+        "| `--status-not STATUS` | Exclude the given status |",
+        "| `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |",
     ]
     for snippet in required_snippets:
         assert snippet in config_content

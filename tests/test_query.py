@@ -204,6 +204,41 @@ class TestQueryHistory:
         results = query_history(store, f)
         assert len(results) == 10
 
+    def test_negative_filters_apply_to_history_query(self, tmp_path: Path):
+        store = self._make_store(tmp_path)
+
+        keep = store.add("keep history task", task_type="implement", tags=("release",))
+        keep.status = "completed"
+        keep.completed_at = datetime.now(UTC)
+        store.update(keep)
+
+        excluded_status = store.add("exclude status history task", task_type="implement", tags=("release",))
+        excluded_status.status = "failed"
+        excluded_status.completed_at = datetime.now(UTC)
+        store.update(excluded_status)
+
+        excluded_type = store.add("exclude type history task", task_type="plan", tags=("release",))
+        excluded_type.status = "completed"
+        excluded_type.completed_at = datetime.now(UTC)
+        store.update(excluded_type)
+
+        excluded_tag = store.add("exclude tag history task", task_type="implement", tags=("release", "blocked"))
+        excluded_tag.status = "completed"
+        excluded_tag.completed_at = datetime.now(UTC)
+        store.update(excluded_tag)
+
+        f = HistoryFilter(
+            limit=None,
+            status="completed",
+            status_not="failed",
+            task_type_not="plan",
+            tags=("release",),
+            tags_not=("blocked",),
+        )
+        results = query_history(store, f)
+
+        assert [task.prompt for task in results] == ["keep history task"]
+
 
 class TestGetTaskLineage:
     """Tests for get_task_lineage traversal."""
