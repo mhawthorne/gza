@@ -8,7 +8,7 @@ import re
 import signal as signal_mod
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -691,6 +691,12 @@ class TestEditCommand:
 
 class TestRetryCommand:
     """Tests for 'gza retry' command."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_foreground_runner(self):
+        """Keep retry command tests focused on CLI behavior, not agent execution."""
+        with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
+            yield run_foreground
 
     def test_retry_completed_task(self, tmp_path: Path):
         """Retry command creates a new pending task from a completed task."""
@@ -1415,6 +1421,12 @@ class TestResumeCommand:
 
 class TestWorkCommandMultiTask:
     """Tests for 'gza work' command with multiple task IDs."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_work_runner(self):
+        """Keep work command tests focused on selection/CLI behavior, not task execution."""
+        with patch("gza.cli.execution.run", return_value=0) as run_mock:
+            yield run_mock
 
     def test_work_with_single_task_id(self, tmp_path: Path):
         """Work command accepts a single task ID."""
@@ -2962,6 +2974,12 @@ class TestImplementCommand:
 class TestImproveCommand:
     """Tests for 'gza improve' command."""
 
+    @pytest.fixture(autouse=True)
+    def _mock_foreground_runner(self):
+        """Keep improve command tests focused on CLI behavior, not agent execution."""
+        with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
+            yield run_foreground
+
     def test_improve_creates_task_from_implementation_and_review(self, tmp_path: Path):
         """Improve command creates an improve task with correct relationships."""
 
@@ -4420,6 +4438,12 @@ class TestCommentCommand:
 
 class TestReviewCommand:
     """Tests for the 'gza review' command."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_foreground_runner(self):
+        """Keep review command tests focused on CLI behavior, not agent execution."""
+        with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
+            yield run_foreground
 
     def test_review_creates_task_for_completed_implementation(self, tmp_path: Path):
         """Review command creates a review task for a completed implementation."""
@@ -10336,19 +10360,10 @@ class TestRunForeground:
     def test_auto_rebase_before_resume_creates_completed_rebase_child(self, tmp_path: Path):
         """Resume preflight creates a completed rebase child task on success."""
         from gza.cli import _auto_rebase_before_resume
-        from gza.git import Git
 
         setup_config(tmp_path)
         config = Config.load(tmp_path)
         store = make_store(tmp_path)
-
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "file.txt").write_text("base\n")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "Initial commit")
 
         task = store.add("Resume target", task_type="implement")
         assert task.id is not None
@@ -10357,16 +10372,23 @@ class TestRunForeground:
         task.branch = "feature/resume-target"
         store.update(task)
 
-        git._run("checkout", "-b", task.branch)
-        (tmp_path / "feature.txt").write_text("feature\n")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Feature commit")
-        git._run("checkout", "main")
-        (tmp_path / "main.txt").write_text("main update\n")
-        git._run("add", "main.txt")
-        git._run("commit", "-m", "Main update")
+        def fake_task_backed_rebase(*, store, rebase_task, branch, target_branch, **_kwargs):
+            store.mark_completed(
+                rebase_task,
+                branch=branch,
+                log_file=".gza/logs/rebase.log",
+                output_content=f"Rebased '{branch}' onto '{target_branch}'.",
+            )
+            return 0
 
-        rc = _auto_rebase_before_resume(config, task.id)
+        mock_git = MagicMock()
+        mock_git.default_branch.return_value = "main"
+
+        with (
+            patch("gza.git.Git", return_value=mock_git),
+            patch("gza.cli.git_ops._run_task_backed_rebase", side_effect=fake_task_backed_rebase),
+        ):
+            rc = _auto_rebase_before_resume(config, task.id)
 
         assert rc == 0
         rebase_children = [t for t in store.get_based_on_children(task.id) if t.task_type == "rebase"]
