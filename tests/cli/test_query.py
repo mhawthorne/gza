@@ -7953,7 +7953,6 @@ class TestUnmergedUnifiedQueryOutput:
                 "status": "completed",
             }
         ]
-
     def test_unmerged_json_id_prompt_projection_skips_lineage_rendering_work(
         self,
         tmp_path: Path,
