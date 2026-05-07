@@ -35,10 +35,15 @@ class SourceSelection:
     """Resolved source identity for extraction planning."""
 
     source_task_id: str | None
-    source_branch: str
-    source_base_ref: str
+    source_branch: str | None = None
+    source_base_ref: str | None = None
+    source_commits: tuple[str, ...] = ()
     source_task_prompt: str | None = None
     source_task_slug: str | None = None
+
+    @property
+    def mode(self) -> str:
+        return "commit" if self.source_commits else "branch"
 
 
 @dataclass(frozen=True)
@@ -130,11 +135,13 @@ def resolve_source_selection(
     *,
     source_task_id: str | None,
     source_branch: str | None,
+    source_commits: tuple[str, ...] = (),
     base_branch_override: str | None,
 ) -> SourceSelection:
     """Resolve extraction source from task ID or explicit branch selector."""
-    if bool(source_task_id) == bool(source_branch):
-        raise ExtractionError("Specify exactly one source selector: SOURCE task ID or --branch")
+    selectors = int(bool(source_task_id)) + int(bool(source_branch)) + int(bool(source_commits))
+    if selectors != 1:
+        raise ExtractionError("Specify exactly one source selector: SOURCE task ID, --branch, or --commit")
 
     if source_task_id:
         task = store.get(source_task_id)
@@ -154,6 +161,22 @@ def resolve_source_selection(
             source_base_ref=base_ref,
             source_task_prompt=task.prompt,
             source_task_slug=task.slug,
+        )
+
+    if source_commits:
+        resolved_commits: list[str] = []
+        seen: set[str] = set()
+        for commit_ref in source_commits:
+            if not git.ref_exists(commit_ref):
+                raise ExtractionError(f"Source commit not found: {commit_ref}")
+            resolved = git.rev_parse(commit_ref)
+            if resolved in seen:
+                raise ExtractionError(f"Duplicate source commit selected: {commit_ref}")
+            seen.add(resolved)
+            resolved_commits.append(resolved)
+        return SourceSelection(
+            source_task_id=None,
+            source_commits=tuple(resolved_commits),
         )
 
     assert source_branch is not None
@@ -181,17 +204,11 @@ def plan_extraction(
     if not selected_paths:
         raise ExtractionError("Select at least one file path for extraction")
 
-    revision_range = f"{source.source_base_ref}...{source.source_branch}"
-    name_status_text = git.get_diff_name_status(revision_range, selected_paths)
-    numstat_text = git.get_diff_numstat(revision_range, selected_paths)
+    name_status_text, numstat_text, patch = _collect_source_diff(git, source, selected_paths)
     summaries = _parse_file_summaries(name_status_text, numstat_text, selected_paths)
     _ensure_every_selected_path_changed(summaries, selected_paths)
-
-    patch = git.get_diff_patch_for_paths(revision_range, selected_paths, binary=True)
     if not patch.strip():
-        raise ExtractionError(
-            "No extractable diff for the selected file set on the source branch",
-        )
+        raise ExtractionError(_no_extractable_diff_message(source, selected=True))
 
     touched_paths = parse_patch_touched_paths(patch)
     if not touched_paths:
@@ -229,11 +246,10 @@ def plan_extraction(
 
 def infer_selected_paths(git: Git, source: SourceSelection) -> tuple[str, ...]:
     """Infer the full changed path set for a source diff."""
-    revision_range = f"{source.source_base_ref}...{source.source_branch}"
-    patch = git.get_diff_patch_for_paths(revision_range, (), binary=True)
+    _name_status_text, _numstat_text, patch = _collect_source_diff(git, source, ())
     selected_paths = tuple(parse_patch_touched_paths(patch))
     if not selected_paths:
-        raise ExtractionError("Source branch has no extractable diff against the chosen base")
+        raise ExtractionError(_no_extractable_diff_message(source, selected=False))
     return selected_paths
 
 
@@ -248,13 +264,18 @@ def draft_extraction_prompt(
     objective = _describe_source_objective(source)
     if source.source_task_id:
         source_label = f"task {source.source_task_id}"
+    elif source.mode == "commit":
+        source_label = _describe_commit_source_label(source.source_commits)
     else:
+        assert source.source_branch is not None
         source_label = f"branch {source.source_branch}"
+
+    source_detail = _describe_prompt_source_detail(source)
 
     lines = [
         f"Carry over: {objective}",
         "",
-        f"Source: {source_label} (branch `{source.source_branch}` vs `{source.source_base_ref}`).",
+        f"Source: {source_label} ({source_detail}).",
         "",
     ]
 
@@ -306,10 +327,14 @@ def _describe_source_objective(source: SourceSelection) -> str:
         if humanized_slug:
             return humanized_slug
 
-    branch_summary = source.source_branch.rsplit("/", 1)[-1]
-    humanized_branch = _humanize_identifier(branch_summary)
-    if humanized_branch:
-        return humanized_branch
+    if source.source_branch:
+        branch_summary = source.source_branch.rsplit("/", 1)[-1]
+        humanized_branch = _humanize_identifier(branch_summary)
+        if humanized_branch:
+            return humanized_branch
+
+    if source.source_commits:
+        return _describe_commit_objective(source.source_commits)
 
     return "selected source changes"
 
@@ -363,6 +388,7 @@ def write_extraction_bundle(
         "source_task_id": draft.source.source_task_id,
         "source_branch": draft.source.source_branch,
         "source_base_ref": draft.source.source_base_ref,
+        "source_commits": list(draft.source.source_commits),
         "target_task_id": task.id,
         "target_slug": task.slug,
         "selected_paths": list(draft.selected_paths),
@@ -530,6 +556,85 @@ def _validate_task_source(task: Task) -> None:
         )
     if not task.branch:
         raise ExtractionError(f"Task {task.id} has no branch to extract from")
+
+
+def _collect_source_diff(
+    git: Git,
+    source: SourceSelection,
+    selected_paths: tuple[str, ...],
+) -> tuple[str, str, str]:
+    if source.mode == "commit":
+        return _collect_commit_source_diff(git, source.source_commits, selected_paths)
+
+    assert source.source_base_ref is not None
+    assert source.source_branch is not None
+    revision_range = f"{source.source_base_ref}...{source.source_branch}"
+    return (
+        git.get_diff_name_status(revision_range, selected_paths),
+        git.get_diff_numstat(revision_range, selected_paths),
+        git.get_diff_patch_for_paths(revision_range, selected_paths, binary=True),
+    )
+
+
+def _collect_commit_source_diff(
+    git: Git,
+    source_commits: tuple[str, ...],
+    selected_paths: tuple[str, ...],
+) -> tuple[str, str, str]:
+    name_status_parts: list[str] = []
+    numstat_parts: list[str] = []
+    patch_parts: list[str] = []
+
+    for commit_ref in source_commits:
+        name_status_text = git.get_commit_name_status(commit_ref, selected_paths)
+        if name_status_text:
+            name_status_parts.append(name_status_text)
+        numstat_text = git.get_commit_numstat(commit_ref, selected_paths)
+        if numstat_text:
+            numstat_parts.append(numstat_text)
+        patch_text = git.get_commit_patch_for_paths(commit_ref, selected_paths, binary=True)
+        if patch_text.strip():
+            patch_parts.append(patch_text.rstrip("\n"))
+
+    return (
+        "\n".join(name_status_parts),
+        "\n".join(numstat_parts),
+        ("\n".join(patch_parts) + ("\n" if patch_parts else "")),
+    )
+
+
+def _no_extractable_diff_message(source: SourceSelection, *, selected: bool) -> str:
+    if source.mode == "commit":
+        if selected:
+            return "No extractable diff for the selected file set on the chosen source commit set"
+        return "Source commit set has no extractable diff for the selected revisions"
+    if selected:
+        return "No extractable diff for the selected file set on the source branch"
+    return "Source branch has no extractable diff against the chosen base"
+
+
+def _describe_commit_source_label(source_commits: tuple[str, ...]) -> str:
+    if len(source_commits) == 1:
+        return f"commit {source_commits[0][:12]}"
+    return f"{len(source_commits)} commits"
+
+
+def _describe_prompt_source_detail(source: SourceSelection) -> str:
+    if source.mode == "commit":
+        if len(source.source_commits) == 1:
+            return f"commit `{source.source_commits[0]}`"
+        commits_text = ", ".join(f"`{commit}`" for commit in source.source_commits)
+        return f"commits in extraction order: {commits_text}"
+
+    assert source.source_branch is not None
+    assert source.source_base_ref is not None
+    return f"branch `{source.source_branch}` vs `{source.source_base_ref}`"
+
+
+def _describe_commit_objective(source_commits: tuple[str, ...]) -> str:
+    if len(source_commits) == 1:
+        return f"commit {source_commits[0][:12]}"
+    return f"selected changes from {len(source_commits)} commits"
 
 
 def _parse_file_summaries(

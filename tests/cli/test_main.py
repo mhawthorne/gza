@@ -330,21 +330,6 @@ class TestHelpOutput:
         assert expected in docs_text
         assert "If GitHub is unavailable, lookup fails, or no live PR exists, improve preserves the normal auto-review flow." in docs_text
 
-    def test_improve_help_and_docs_describe_narrow_pr_sync_before_auto_review(self, tmp_path):
-        """`improve --help` and docs should explain the same-branch push-before-review exception."""
-        setup_config(tmp_path)
-
-        improve_help = run_gza("improve", "--help", "--project", str(tmp_path))
-        assert improve_help.returncode == 0
-
-        help_text = " ".join(improve_help.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
-
-        expected = "if the branch already has an open PR, push same-branch improve commits first"
-        assert expected in help_text
-        assert expected in docs_text
-        assert "If GitHub is unavailable, lookup fails, or no live PR exists, improve preserves the normal auto-review flow." in docs_text
-
     def test_watch_and_queue_tag_help_point_to_same_scoped_pickup_preview(self, tmp_path):
         """Help/docs should make `queue --tag` the preview for `watch --tag`."""
         setup_config(tmp_path)
@@ -597,6 +582,27 @@ class TestHelpOutput:
 
         assert result.returncode == 0
         assert "--depends-on" not in result.stdout
+
+    def test_extract_help_and_docs_describe_commit_mode(self, tmp_path):
+        """`extract --help` and docs should document commit-based extraction and ordering semantics."""
+        setup_config(tmp_path)
+
+        help_result = run_gza("extract", "--help", "--project", str(tmp_path))
+
+        assert help_result.returncode == 0
+        help_text = " ".join(help_result.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "--commit REV" in help_result.stdout
+        assert "--per-commit" in help_result.stdout
+        assert "Committed git revision to extract from" in help_text
+        assert "applied in the order provided" in help_text
+        assert "create one extracted task per selected commit" in help_text
+
+        assert "--commit REV" in docs_text
+        assert "--per-commit" in docs_text
+        assert "applied in the order provided" in docs_text
+        assert "one extracted task per selected commit" in docs_text
 
 class TestReconciliationWarnings:
     """Tests for reconciliation failure visibility during CLI dispatch."""

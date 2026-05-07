@@ -27,6 +27,7 @@ from ..db import (
 from ..extractions import (
     ExtractionDraft,
     ExtractionError,
+    SourceSelection,
     infer_selected_paths,
     normalize_selected_paths,
     plan_extraction,
@@ -145,6 +146,87 @@ def _print_extraction_plan_summary(
         print(f"  Bundle: {bundle_path}")
     if dry_run:
         print("  No task created; no extraction bundle written.")
+
+
+def _describe_extract_source_label(source: SourceSelection) -> str:
+    if source.source_task_id:
+        return f"task {source.source_task_id}"
+    if source.source_commits:
+        if len(source.source_commits) == 1:
+            return f"commit {source.source_commits[0][:12]}"
+        return f"{len(source.source_commits)} commits"
+    assert source.source_branch is not None
+    return f"branch {source.source_branch}"
+
+
+def _create_extract_task(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    draft: ExtractionDraft,
+    tags: tuple[str, ...],
+    create_review: bool,
+    create_pr: bool,
+    branch_type: str | None,
+    model: str | None,
+    provider: str | None,
+    skip_learnings: bool,
+    base_branch: str | None,
+) -> tuple[DbTask, Path]:
+    impl_task = store.add(
+        draft.prompt,
+        task_type="implement",
+        tags=tags,
+        create_review=create_review,
+        create_pr=create_pr,
+        same_branch=False,
+        base_branch=base_branch,
+        task_type_hint=branch_type,
+        model=model,
+        provider=provider,
+        skip_learnings=skip_learnings,
+    )
+
+    if impl_task.slug is None:
+        slug_prompt = next(
+            (line.strip() for line in draft.prompt.splitlines() if line.strip()),
+            draft.prompt,
+        )
+        impl_task.slug = generate_slug(
+            slug_prompt,
+            existing_id=None,
+            log_path=config.log_path,
+            git=git,
+            store=store,
+            exclude_task_id=impl_task.id,
+            project_name=config.project_name,
+            project_prefix=config.project_prefix,
+            branch_strategy=config.branch_strategy,
+            explicit_type=impl_task.task_type_hint,
+        )
+        store.update(impl_task)
+
+    try:
+        bundle_dir = write_extraction_bundle(
+            project_dir=config.project_dir,
+            task=impl_task,
+            draft=draft,
+        )
+    except (ExtractionError, OSError):
+        if impl_task.id and not store.delete(impl_task.id):
+            created_task = store.get(impl_task.id)
+            if created_task is not None:
+                mark_task_failed_from_cause(
+                    task=created_task,
+                    config=config,
+                    store=store,
+                    log_file=None,
+                    explicit_reason="EXTRACTION_BUNDLE_WRITE_FAILED",
+                )
+        raise
+
+    return impl_task, bundle_dir
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -482,12 +564,13 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
     source_task_id_raw = args.source if hasattr(args, "source") else None
     source_branch = args.branch if hasattr(args, "branch") else None
+    source_commits = tuple(getattr(args, "commits", ()) or ())
     selected_raw: list[str] = list(getattr(args, "paths", ()) or ())
     store: SqliteTaskStore | None = None
 
     # argparse uses "source?" then "paths*"; in `--branch` mode the first path
     # can land in `source`. Reassign to selected paths unless it is a real task ID.
-    if source_branch and source_task_id_raw:
+    if source_branch and source_task_id_raw and not source_commits:
         try:
             source_id_candidate = resolve_id(config, source_task_id_raw)
         except InvalidTaskIdError:
@@ -525,63 +608,91 @@ def cmd_extract(args: argparse.Namespace) -> int:
         try:
             source_task_id = resolve_id(config, source_task_id_raw)
         except InvalidTaskIdError as exc:
-            if source_branch:
+            if source_branch or source_commits:
                 print(f"Error: {exc}")
                 return 1
             selected_raw.insert(0, source_task_id_raw)
             source_task_id_raw = None
         else:
             if store.get(source_task_id) is None:
-                if source_branch:
+                if source_branch or source_commits:
                     print(f"Error: Task {source_task_id} not found")
                     return 1
                 selected_raw.insert(0, source_task_id_raw)
                 source_task_id = None
                 source_task_id_raw = None
 
-    if not source_task_id and not source_branch:
+    if getattr(args, "per_commit", False) and not source_commits:
+        print("Error: --per-commit requires one or more --commit values")
+        return 1
+
+    if not source_task_id and not source_branch and not source_commits:
         try:
             source_branch = git.current_branch()
         except Exception as exc:
             print(f"Error: failed to determine current branch for extract: {exc}")
             return 1
 
-    if bool(source_task_id) == bool(source_branch):
-        print("Error: Specify exactly one source selector: SOURCE task ID or --branch")
+    selector_count = int(bool(source_task_id)) + int(bool(source_branch)) + int(bool(source_commits))
+    if selector_count != 1:
+        print("Error: Specify exactly one source selector: SOURCE task ID, --branch, or --commit")
         return 1
 
     try:
-        source = resolve_source_selection(
+        resolved_source = resolve_source_selection(
             store,
             git,
             source_task_id=source_task_id,
             source_branch=source_branch,
+            source_commits=source_commits,
             base_branch_override=getattr(args, "base_branch", None),
         )
-        if selected_raw:
-            selected_paths = normalize_selected_paths(selected_raw)
-        else:
-            selected_paths = infer_selected_paths(git, source)
-        draft = plan_extraction(
-            git,
-            source,
-            selected_paths,
-            operator_prompt=getattr(args, "prompt", None),
-        )
+        normalized_selected_paths = normalize_selected_paths(selected_raw) if selected_raw else None
     except ExtractionError as exc:
         print(f"Error: {exc}")
         return 1
 
-    source_label = (
-        f"task {source.source_task_id}" if source.source_task_id else f"branch {source.source_branch}"
-    )
+    per_commit = bool(getattr(args, "per_commit", False))
+    if per_commit:
+        sources = [
+            SourceSelection(
+                source_task_id=None,
+                source_commits=(commit,),
+            )
+            for commit in resolved_source.source_commits
+        ]
+    else:
+        sources = [resolved_source]
+
+    drafts: list[tuple[SourceSelection, ExtractionDraft]] = []
+    try:
+        for source in sources:
+            if normalized_selected_paths is not None:
+                selected_paths = normalized_selected_paths
+            else:
+                selected_paths = infer_selected_paths(git, source)
+            draft = plan_extraction(
+                git,
+                source,
+                selected_paths,
+                operator_prompt=getattr(args, "prompt", None),
+            )
+            drafts.append((source, draft))
+    except ExtractionError as exc:
+        print(f"Error: {exc}")
+        return 1
+
     if getattr(args, "dry_run", False):
-        _print_extraction_plan_summary(
-            draft=draft,
-            source_label=source_label,
-            heading="✓ Dry run: extraction plan preview",
-            dry_run=True,
-        )
+        heading = "✓ Dry run: extraction plan preview"
+        if per_commit:
+            heading = f"✓ Dry run: {len(drafts)} per-commit extraction plans"
+        for index, (source, draft) in enumerate(drafts, start=1):
+            _print_extraction_plan_summary(
+                draft=draft,
+                source_label=_describe_extract_source_label(source),
+                heading=heading if len(drafts) == 1 else f"{heading} [{index}/{len(drafts)}]",
+                dry_run=True,
+            )
         return 0
 
     create_review = bool(getattr(args, "review", False))
@@ -591,85 +702,57 @@ def cmd_extract(args: argparse.Namespace) -> int:
     provider = args.provider if hasattr(args, "provider") and args.provider else None
     skip_learnings = bool(getattr(args, "skip_learnings", False))
     base_branch = args.base_branch if hasattr(args, "base_branch") and args.base_branch else None
-
-    impl_task = store.add(
-        draft.prompt,
-        task_type="implement",
-        tags=tags,
-        create_review=create_review,
-        create_pr=create_pr,
-        same_branch=False,
-        base_branch=base_branch,
-        task_type_hint=branch_type,
-        model=model,
-        provider=provider,
-        skip_learnings=skip_learnings,
-    )
-
-    # Assign slug at creation time so extraction artifacts can be persisted at the slug path.
-    if impl_task.slug is None:
-        slug_prompt = next(
-            (line.strip() for line in draft.prompt.splitlines() if line.strip()),
-            draft.prompt,
-        )
-        impl_task.slug = generate_slug(
-            slug_prompt,
-            existing_id=None,
-            log_path=config.log_path,
-            git=git,
-            store=store,
-            exclude_task_id=impl_task.id,
-            project_name=config.project_name,
-            project_prefix=config.project_prefix,
-            branch_strategy=config.branch_strategy,
-            explicit_type=impl_task.task_type_hint,
-        )
-        store.update(impl_task)
-
-    try:
-        bundle_dir = write_extraction_bundle(
-            project_dir=config.project_dir,
-            task=impl_task,
+    created_tasks: list[DbTask] = []
+    for source, draft in drafts:
+        try:
+            impl_task, bundle_dir = _create_extract_task(
+                config=config,
+                store=store,
+                git=git,
+                draft=draft,
+                tags=tags,
+                create_review=create_review,
+                create_pr=create_pr,
+                branch_type=branch_type,
+                model=model,
+                provider=provider,
+                skip_learnings=skip_learnings,
+                base_branch=base_branch,
+            )
+        except (ExtractionError, OSError) as exc:
+            print(f"Error: {exc}")
+            return 1
+        created_tasks.append(impl_task)
+        _print_extraction_plan_summary(
             draft=draft,
+            source_label=_describe_extract_source_label(source),
+            heading=f"✓ Created extract implement task {impl_task.id}",
+            bundle_path=bundle_dir.relative_to(config.project_dir),
         )
-    except (ExtractionError, OSError) as exc:
-        # Fail closed: avoid leaving a runnable pending task when bundle persistence fails.
-        if impl_task.id and not store.delete(impl_task.id):
-            created_task = store.get(impl_task.id)
-            if created_task is not None:
-                mark_task_failed_from_cause(
-                    task=created_task,
-                    config=config,
-                    store=store,
-                    log_file=None,
-                    explicit_reason="EXTRACTION_BUNDLE_WRITE_FAILED",
-                )
-        print(f"Error: {exc}")
-        return 1
-
-    _print_extraction_plan_summary(
-        draft=draft,
-        source_label=source_label,
-        heading=f"✓ Created extract implement task {impl_task.id}",
-        bundle_path=bundle_dir.relative_to(config.project_dir),
-    )
 
     if hasattr(args, "background") and args.background:
-        assert impl_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
-        worker_args.task_ids = [impl_task.id]
-        return _spawn_background_worker(worker_args, config, task_id=impl_task.id)
+        worker_args.task_ids = [task.id for task in created_tasks if task.id is not None]
+        if len(worker_args.task_ids) == 1:
+            return _spawn_background_worker(worker_args, config, task_id=worker_args.task_ids[0])
+        return _spawn_background_workers(worker_args, config)
 
     if hasattr(args, "queue") and args.queue:
         return 0
 
-    print(f"\nRunning implement task {impl_task.id}...")
-    return _run_foreground(
-        config,
-        task_id=impl_task.id,
-        force=getattr(args, "force", False),
-        invocation=_foreground_command_invocation("extract"),
-    )
+    task_ids = [task.id for task in created_tasks if task.id is not None]
+    if len(task_ids) == 1:
+        print(f"\nRunning implement task {task_ids[0]}...")
+        return _run_foreground(
+            config,
+            task_id=task_ids[0],
+            force=getattr(args, "force", False),
+            invocation=_foreground_command_invocation("extract"),
+        )
+
+    worker_args = argparse.Namespace(**vars(args))
+    worker_args.task_ids = task_ids
+    return cmd_run(worker_args)
 
 
 def cmd_add(args: argparse.Namespace) -> int:

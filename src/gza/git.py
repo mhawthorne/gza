@@ -531,6 +531,23 @@ class Git:
         result = self._run(*args, check=False)
         return result.stdout.strip()
 
+    def get_commit_name_status(self, commit_ref: str, paths: tuple[str, ...] | list[str] = ()) -> str:
+        """Get machine-readable name/status output for a single committed revision."""
+        args = [
+            "show",
+            "--format=",
+            "--name-status",
+            "--find-renames",
+            "--find-copies",
+            "--find-copies-harder",
+            commit_ref,
+        ]
+        if paths:
+            args.append("--")
+            args.extend(paths)
+        result = self._run(*args, check=False)
+        return result.stdout.strip()
+
     def get_diff_patch_for_paths(
         self,
         revision_range: str,
@@ -543,6 +560,51 @@ class Git:
         if binary:
             args.append("--binary")
         args.append(revision_range)
+        if paths:
+            args.append("--")
+            args.extend(paths)
+        result = self._run(*args, check=False)
+        return result.stdout
+
+    def get_commit_numstat(
+        self,
+        commit_ref: str,
+        paths: tuple[str, ...] | list[str] = (),
+    ) -> str:
+        """Get machine-readable numstat output for a single committed revision."""
+        args = [
+            "show",
+            "--format=",
+            "--numstat",
+            "--find-renames",
+            "--find-copies",
+            "--find-copies-harder",
+            commit_ref,
+        ]
+        if paths:
+            args.append("--")
+            args.extend(paths)
+        result = self._run(*args, check=False)
+        return result.stdout.strip()
+
+    def get_commit_patch_for_paths(
+        self,
+        commit_ref: str,
+        paths: tuple[str, ...] | list[str],
+        *,
+        binary: bool = False,
+    ) -> str:
+        """Get patch text for a single committed revision."""
+        args = [
+            "show",
+            "--format=",
+            "--find-renames",
+            "--find-copies",
+            "--find-copies-harder",
+        ]
+        if binary:
+            args.append("--binary")
+        args.append(commit_ref)
         if paths:
             args.append("--")
             args.extend(paths)
