@@ -8342,8 +8342,8 @@ class TestLineageCommand:
         assert cli_query._LINEAGE_REL_LABELS is query_module._LINEAGE_REL_LABELS
         assert "_LINEAGE_REL_LABELS:" not in cli_query_path.read_text()
 
-    def test_lineage_merge_labels_render_for_implement_and_improve_only(self, tmp_path: Path):
-        """Implement/improve rows render merge labels; other types do not."""
+    def test_lineage_merge_labels_render_only_for_merge_owners(self, tmp_path: Path):
+        """Shared-branch improve rows must not render independent merge labels."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -8382,9 +8382,10 @@ class TestLineageCommand:
         output = result.stdout
 
         assert "[merged]" in output
-        assert "[unmerged]" in output
         assert "Implement no merge status [merged]" not in output
         assert "Implement no merge status [unmerged]" not in output
+        assert "Improve unmerged [unmerged]" not in output
+        assert "Improve unmerged [merged]" not in output
         assert "review completed [merged]" not in output
         assert "review completed [unmerged]" not in output
 

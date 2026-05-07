@@ -1765,6 +1765,20 @@ class TestMergeStatus:
         assert retrieved.merge_status == "unmerged"
         assert retrieved.has_commits is True
 
+    def test_mark_completed_same_branch_improve_keeps_merge_status_on_owner_only(self, tmp_path: Path):
+        """Completed same-branch improve rows should not own merge state."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement parent", task_type="implement")
+        improve = store.add(prompt="Improve parent", task_type="improve", based_on=impl.id, same_branch=True)
+        store.mark_completed(improve, has_commits=True, branch="feature/test")
+
+        retrieved = store.get(improve.id)
+        assert retrieved is not None
+        assert retrieved.merge_status is None
+        assert retrieved.has_commits is True
+
     def test_mark_completed_without_commits_leaves_merge_status_none(self, tmp_path: Path):
         """mark_completed with has_commits=False leaves merge_status as None."""
         db_path = tmp_path / "test.db"
