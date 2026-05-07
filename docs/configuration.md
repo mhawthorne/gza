@@ -1520,7 +1520,7 @@ uv run gza sync [task_id ...] [options]
 | `--no-fetch` | Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch |
 
 Use `uv run gza unmerged` for the daily "what still needs to be merged?" check. `uv run gza sync` remains the broader explicit branch and PR reconciliation command. It:
-- dedupes work by branch and writes normalized state back to every same-branch task row that carries commits
+- dedupes work by branch, writing shared branch metadata back to every same-branch task row that carries commits while persisting merge status only on the merge-owning row
 - refreshes cached `merge_status`, `diff_*` stats, `pr_number`, `pr_state`, `pr_last_synced_at`, and `sync_last_synced_at`
 - discovers PRs by branch for bounded candidates that need PR reconciliation
 - auto-closes stale open PRs only after posting a comment and only when a fresh `origin/<default-branch>` fetch proves the branch content is already present upstream
