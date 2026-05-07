@@ -586,3 +586,43 @@ def test_search_negative_lineage_filters_exclude_matching_roots(tmp_path: Path) 
     )
     lineage_prompts = [row.task.prompt for row in lineage_filtered.rows if hasattr(row, "task")]
     assert lineage_prompts == []
+
+
+def test_lineages_incomplete_exclude_task_types_filters_shared_rollup_path(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    review_failed = store.add("Review failed", task_type="review")
+    review_failed.status = "failed"
+    review_failed.completed_at = datetime.now(UTC)
+    review_failed.failure_reason = "TEST_FAILURE"
+    store.update(review_failed)
+
+    implement_failed = store.add("Implement failed", task_type="implement")
+    implement_failed.status = "failed"
+    implement_failed.completed_at = datetime.now(UTC)
+    implement_failed.failure_reason = "TEST_FAILURE"
+    store.update(implement_failed)
+
+    service = TaskQueryService(store)
+
+    excluded = service.run(
+        TaskQuery(
+            scope="lineages",
+            lifecycle_state=("incomplete",),
+            exclude_task_types=("review",),
+            limit=None,
+        )
+    )
+    excluded_owners = [row.owner_task.prompt for row in excluded.rows if hasattr(row, "owner_task")]
+    assert excluded_owners == ["Implement failed"]
+
+    positive = service.run(
+        TaskQuery(
+            scope="lineages",
+            lifecycle_state=("incomplete",),
+            task_types=("implement",),
+            limit=None,
+        )
+    )
+    positive_owners = [row.owner_task.prompt for row in positive.rows if hasattr(row, "owner_task")]
+    assert positive_owners == ["Implement failed"]

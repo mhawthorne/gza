@@ -72,6 +72,7 @@ class TaskQuery:
     exclude_task_types: tuple[str, ...] | None = None
     lifecycle_state: tuple[str, ...] | None = None
     merge_chain_state: tuple[str, ...] | None = None
+    exclude_merge_chain_state: tuple[str, ...] | None = None
     dependency_state: tuple[str, ...] | None = None
     related_to: str | None = None
     exclude_related_to: str | None = None
@@ -383,6 +384,7 @@ class TaskQueryService:
                 date_field=(query.date_filter.field if query.date_filter else "effective"),
             )
             incomplete = _query_incomplete(self._store, f)
+            excluded_task_types = set(query.exclude_task_types) if query.exclude_task_types is not None else None
             unresolved_by_owner: dict[str, list[DbTask]] = {}
             incomplete_owner_by_id: dict[str, DbTask] = {}
             root_by_owner_id: dict[str, DbTask] = {}
@@ -395,6 +397,8 @@ class TaskQueryService:
                 tree_by_root_id[root.id] = item.tree
 
                 for task in item.unresolved_tasks:
+                    if excluded_task_types is not None and task.task_type in excluded_task_types:
+                        continue
                     if not self._matches_group_and_tag_filters(task, query):
                         continue
                     owner = self._resolve_branch_owner(task)
@@ -460,6 +464,7 @@ class TaskQueryService:
                     exclude_task_types=query.exclude_task_types,
                     lifecycle_state=query.lifecycle_state,
                     merge_chain_state=query.merge_chain_state,
+                    exclude_merge_chain_state=query.exclude_merge_chain_state,
                     dependency_state=query.dependency_state,
                     related_to=query.related_to,
                     exclude_related_to=query.exclude_related_to,
@@ -640,6 +645,12 @@ class TaskQueryService:
         if query.merge_chain_state is not None:
             merge_states = set(query.merge_chain_state)
             filtered = [task for task in filtered if self._matches_merge_chain_state(task, merge_states)]
+
+        if query.exclude_merge_chain_state is not None:
+            excluded_merge_states = set(query.exclude_merge_chain_state)
+            filtered = [
+                task for task in filtered if not self._matches_merge_chain_state(task, excluded_merge_states)
+            ]
 
         if query.dependency_state is not None:
             dep_states = set(query.dependency_state)

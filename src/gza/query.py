@@ -112,6 +112,7 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
 
     statuses: tuple[str, ...] | None = None
     merge_chain_state: tuple[str, ...] | None = None
+    exclude_merge_chain_state: tuple[str, ...] | None = None
     if f.status == "unmerged":
         merge_chain_state = ("unmerged",)
         statuses = ("completed", "unmerged")
@@ -120,7 +121,11 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
     else:
         statuses = ("completed", "failed", "unmerged", "dropped")
 
-    exclude_statuses: tuple[str, ...] | None = (f.status_not,) if f.status_not else None
+    exclude_statuses: tuple[str, ...] | None = None
+    if f.status_not == "unmerged":
+        exclude_merge_chain_state = ("unmerged",)
+    elif f.status_not:
+        exclude_statuses = (f.status_not,)
     task_types: tuple[str, ...] | None = (f.task_type,) if f.task_type else None
     exclude_task_types: tuple[str, ...] | None = (f.task_type_not,) if f.task_type_not else None
     lifecycle_state: tuple[str, ...] | None = ("terminal",)
@@ -145,6 +150,7 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
             exclude_task_types=exclude_task_types,
             lifecycle_state=q.lifecycle_state,
             merge_chain_state=merge_chain_state,
+            exclude_merge_chain_state=exclude_merge_chain_state,
             dependency_state=q.dependency_state,
             related_to=q.related_to,
             exclude_related_to=q.exclude_related_to,
@@ -172,6 +178,7 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
             exclude_task_types=exclude_task_types,
             lifecycle_state=q.lifecycle_state,
             merge_chain_state=merge_chain_state,
+            exclude_merge_chain_state=exclude_merge_chain_state,
             dependency_state=q.dependency_state,
             related_to=q.related_to,
             exclude_related_to=q.exclude_related_to,

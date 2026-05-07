@@ -239,6 +239,48 @@ class TestQueryHistory:
 
         assert [task.prompt for task in results] == ["keep history task"]
 
+    def test_unmerged_status_not_uses_merge_chain_semantics(self, tmp_path: Path):
+        store = self._make_store(tmp_path)
+
+        semantic_unmerged = self._add_completed(
+            store,
+            "semantic unmerged task",
+            task_type="implement",
+            merge_status="unmerged",
+            has_commits=True,
+        )
+        merged = self._add_completed(
+            store,
+            "merged task",
+            task_type="implement",
+            merge_status="merged",
+            has_commits=True,
+        )
+
+        legacy_unmerged = store.add("legacy unmerged task", task_type="implement")
+        legacy_unmerged.status = "unmerged"
+        legacy_unmerged.completed_at = datetime.now(UTC)
+        legacy_unmerged.has_commits = True
+        store.update(legacy_unmerged)
+
+        positive = query_history(store, HistoryFilter(limit=None, status="unmerged"))
+        positive_ids = {task.id for task in positive}
+        assert semantic_unmerged.id in positive_ids
+        assert legacy_unmerged.id in positive_ids
+        assert merged.id not in positive_ids
+
+        negative = query_history(store, HistoryFilter(limit=None, status_not="unmerged"))
+        negative_ids = [task.id for task in negative]
+        assert semantic_unmerged.id not in negative_ids
+        assert legacy_unmerged.id not in negative_ids
+        assert merged.id in negative_ids
+
+        both = query_history(
+            store,
+            HistoryFilter(limit=None, status="unmerged", status_not="unmerged"),
+        )
+        assert both == []
+
 
 class TestGetTaskLineage:
     """Tests for get_task_lineage traversal."""
