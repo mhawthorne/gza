@@ -29,7 +29,9 @@ class HistoryFilter:
 
     limit: int | None = 10
     status: str | None = None  # 'completed' | 'failed' | 'unmerged' | 'dropped'
+    status_not: str | None = None
     task_type: str | None = None  # 'task' | 'implement' | 'review' | ...
+    task_type_not: str | None = None
     incomplete: bool = False  # Only tasks not yet merged/resolved
     days: int | None = None  # Only tasks within the last N days
     start_date: str | None = None  # Only tasks on or after this date (YYYY-MM-DD)
@@ -37,6 +39,7 @@ class HistoryFilter:
     date_field: Literal["created", "completed", "effective"] = "effective"
     lineage_depth: int = 0  # Expand lineage N levels (0 = flat)
     tags: tuple[str, ...] | None = None
+    tags_not: tuple[str, ...] | None = None
     any_tag: bool = False
 
 
@@ -109,6 +112,7 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
 
     statuses: tuple[str, ...] | None = None
     merge_chain_state: tuple[str, ...] | None = None
+    exclude_merge_chain_state: tuple[str, ...] | None = None
     if f.status == "unmerged":
         merge_chain_state = ("unmerged",)
         statuses = ("completed", "unmerged")
@@ -117,7 +121,13 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
     else:
         statuses = ("completed", "failed", "unmerged", "dropped")
 
+    exclude_statuses: tuple[str, ...] | None = None
+    if f.status_not == "unmerged":
+        exclude_merge_chain_state = ("unmerged",)
+    elif f.status_not:
+        exclude_statuses = (f.status_not,)
     task_types: tuple[str, ...] | None = (f.task_type,) if f.task_type else None
+    exclude_task_types: tuple[str, ...] | None = (f.task_type_not,) if f.task_type_not else None
     lifecycle_state: tuple[str, ...] | None = ("terminal",)
 
     effective_limit = None if f.incomplete else f.limit
@@ -135,15 +145,22 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
             limit=q.limit,
             text=q.text,
             statuses=q.statuses,
+            exclude_statuses=exclude_statuses,
             task_types=None,
+            exclude_task_types=exclude_task_types,
             lifecycle_state=q.lifecycle_state,
             merge_chain_state=merge_chain_state,
+            exclude_merge_chain_state=exclude_merge_chain_state,
             dependency_state=q.dependency_state,
             related_to=q.related_to,
+            exclude_related_to=q.exclude_related_to,
             lineage_of=q.lineage_of,
+            exclude_lineage_of=q.exclude_lineage_of,
             root_ids=q.root_ids,
+            exclude_root_ids=q.exclude_root_ids,
             branch_owner_ids=q.branch_owner_ids,
             tag_filters=f.tags,
+            exclude_tag_filters=f.tags_not,
             any_tag=f.any_tag,
             date_filter=q.date_filter,
             sort=q.sort,
@@ -156,15 +173,22 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
             limit=q.limit,
             text=q.text,
             statuses=q.statuses,
+            exclude_statuses=exclude_statuses,
             task_types=q.task_types,
+            exclude_task_types=exclude_task_types,
             lifecycle_state=q.lifecycle_state,
             merge_chain_state=merge_chain_state,
+            exclude_merge_chain_state=exclude_merge_chain_state,
             dependency_state=q.dependency_state,
             related_to=q.related_to,
+            exclude_related_to=q.exclude_related_to,
             lineage_of=q.lineage_of,
+            exclude_lineage_of=q.exclude_lineage_of,
             root_ids=q.root_ids,
+            exclude_root_ids=q.exclude_root_ids,
             branch_owner_ids=q.branch_owner_ids,
             tag_filters=f.tags,
+            exclude_tag_filters=f.tags_not,
             any_tag=f.any_tag,
             date_filter=q.date_filter,
             sort=q.sort,
@@ -342,11 +366,16 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
         limit=None,
         status=None,
         task_type=f.task_type,
+        task_type_not=f.task_type_not,
         incomplete=False,
         days=f.days,
         start_date=f.start_date,
         end_date=f.end_date,
         date_field=f.date_field,
+        status_not=f.status_not,
+        tags=f.tags,
+        tags_not=f.tags_not,
+        any_tag=f.any_tag,
     )
     tasks = query_history(store, filtered)
     if not tasks:

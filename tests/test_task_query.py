@@ -494,3 +494,135 @@ def test_dependency_state_blocked_by_dropped_dep_filters_pending_only(tmp_path: 
     assert blocked_pending.id in ids
     assert blocked_pending_dropped.id not in ids
     assert blocked_resolved.id not in ids
+
+
+def test_search_negative_scalar_filters_apply_after_positive_filters(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    keep = store.add("needle keep", task_type="implement", tags=("release",))
+    keep.status = "completed"
+    keep.completed_at = datetime.now(UTC)
+    store.update(keep)
+
+    excluded_status = store.add("needle excluded status", task_type="implement", tags=("release",))
+    excluded_status.status = "failed"
+    excluded_status.completed_at = datetime.now(UTC)
+    store.update(excluded_status)
+
+    excluded_type = store.add("needle excluded type", task_type="plan", tags=("release",))
+    excluded_type.status = "completed"
+    excluded_type.completed_at = datetime.now(UTC)
+    store.update(excluded_type)
+
+    excluded_tag = store.add("needle excluded tag", task_type="implement", tags=("release", "blocked"))
+    excluded_tag.status = "completed"
+    excluded_tag.completed_at = datetime.now(UTC)
+    store.update(excluded_tag)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQueryPresets.search(
+            "needle",
+            limit=None,
+            statuses=("completed", "failed"),
+            exclude_statuses=("failed",),
+            task_types=("implement", "plan"),
+            exclude_task_types=("plan",),
+        )
+    )
+    filtered = service.run(
+        replace(
+            result.query,
+            tag_filters=("release",),
+            exclude_tag_filters=("blocked",),
+        )
+    )
+
+    prompts = [row.task.prompt for row in filtered.rows if hasattr(row, "task")]
+    assert prompts == ["needle keep"]
+
+
+def test_search_negative_lineage_filters_exclude_matching_roots(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    root_a = store.add("needle root a", task_type="implement")
+    root_a.status = "completed"
+    root_a.completed_at = datetime.now(UTC)
+    store.update(root_a)
+    assert root_a.id is not None
+
+    child_a = store.add("needle child a", task_type="review", based_on=root_a.id, same_branch=True)
+    child_a.status = "completed"
+    child_a.completed_at = datetime.now(UTC)
+    store.update(child_a)
+    assert child_a.id is not None
+
+    root_b = store.add("needle root b", task_type="implement")
+    root_b.status = "completed"
+    root_b.completed_at = datetime.now(UTC)
+    store.update(root_b)
+    assert root_b.id is not None
+
+    service = TaskQueryService(store)
+
+    related_filtered = service.run(
+        TaskQueryPresets.search(
+            "needle",
+            limit=None,
+            exclude_related_to=child_a.id,
+        )
+    )
+    related_prompts = [row.task.prompt for row in related_filtered.rows if hasattr(row, "task")]
+    assert related_prompts == ["needle root b"]
+
+    lineage_filtered = service.run(
+        TaskQueryPresets.search(
+            "needle",
+            limit=None,
+            root_ids=(root_a.id, root_b.id),
+            exclude_lineage_of=child_a.id,
+            exclude_root_ids=(root_b.id,),
+        )
+    )
+    lineage_prompts = [row.task.prompt for row in lineage_filtered.rows if hasattr(row, "task")]
+    assert lineage_prompts == []
+
+
+def test_lineages_incomplete_exclude_task_types_filters_shared_rollup_path(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    review_failed = store.add("Review failed", task_type="review")
+    review_failed.status = "failed"
+    review_failed.completed_at = datetime.now(UTC)
+    review_failed.failure_reason = "TEST_FAILURE"
+    store.update(review_failed)
+
+    implement_failed = store.add("Implement failed", task_type="implement")
+    implement_failed.status = "failed"
+    implement_failed.completed_at = datetime.now(UTC)
+    implement_failed.failure_reason = "TEST_FAILURE"
+    store.update(implement_failed)
+
+    service = TaskQueryService(store)
+
+    excluded = service.run(
+        TaskQuery(
+            scope="lineages",
+            lifecycle_state=("incomplete",),
+            exclude_task_types=("review",),
+            limit=None,
+        )
+    )
+    excluded_owners = [row.owner_task.prompt for row in excluded.rows if hasattr(row, "owner_task")]
+    assert excluded_owners == ["Implement failed"]
+
+    positive = service.run(
+        TaskQuery(
+            scope="lineages",
+            lifecycle_state=("incomplete",),
+            task_types=("implement",),
+            limit=None,
+        )
+    )
+    positive_owners = [row.owner_task.prompt for row in positive.rows if hasattr(row, "owner_task")]
+    assert positive_owners == ["Implement failed"]

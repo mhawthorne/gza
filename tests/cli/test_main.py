@@ -80,6 +80,27 @@ class TestHelpOutput:
         assert "from each resolved root" in result.stdout
         assert "Expand lineage N levels for each matching task" not in result.stdout
 
+    def test_history_and_search_help_list_negative_query_filters(self, tmp_path):
+        """Query help should advertise the explicit negative filter flags."""
+        setup_config(tmp_path)
+
+        history_help = run_gza("history", "--help", "--project", str(tmp_path))
+        search_help = run_gza("search", "--help", "--project", str(tmp_path))
+
+        assert history_help.returncode == 0
+        assert "--status-not" in history_help.stdout
+        assert "--type-not" in history_help.stdout
+        assert "--tag-not" in history_help.stdout
+        assert "--tag/--tag-not values" in history_help.stdout
+
+        assert search_help.returncode == 0
+        assert "--status-not" in search_help.stdout
+        assert "--type-not" in search_help.stdout
+        assert "--tag-not" in search_help.stdout
+        assert "--related-to-not" in search_help.stdout
+        assert "--lineage-of-not" in search_help.stdout
+        assert "--root-not" in search_help.stdout
+
     def test_top_level_help_hides_incomplete_command(self, tmp_path):
         """Top-level help should stop advertising `gza incomplete`."""
         setup_config(tmp_path)

@@ -289,6 +289,12 @@ def main() -> int:
         help="Filter tasks by status (e.g., completed, failed, unmerged)",
     )
     history_parser.add_argument(
+        "--status-not",
+        type=str,
+        choices=["completed", "failed", "unmerged"],
+        help="Exclude tasks by status (e.g., completed, failed, unmerged)",
+    )
+    history_parser.add_argument(
         "--incomplete",
         action="store_true",
         help=(
@@ -422,9 +428,19 @@ def main() -> int:
         help="Filter statuses (comma-separated, e.g. completed,failed)",
     )
     search_parser.add_argument(
+        "--status-not",
+        metavar="CSV",
+        help="Exclude statuses (comma-separated, e.g. completed,failed)",
+    )
+    search_parser.add_argument(
         "--type",
         metavar="CSV",
         help="Filter task types (comma-separated)",
+    )
+    search_parser.add_argument(
+        "--type-not",
+        metavar="CSV",
+        help="Exclude task types (comma-separated)",
     )
     search_parser.add_argument(
         "--days",
@@ -456,14 +472,29 @@ def main() -> int:
         help="Limit matches to tasks in the same lineage as TASK_ID",
     )
     search_parser.add_argument(
+        "--related-to-not",
+        metavar="TASK_ID",
+        help="Exclude matches from the same lineage as TASK_ID",
+    )
+    search_parser.add_argument(
         "--lineage-of",
         metavar="TASK_ID",
         help="Limit matches to the canonical lineage containing TASK_ID",
     )
     search_parser.add_argument(
+        "--lineage-of-not",
+        metavar="TASK_ID",
+        help="Exclude matches from the canonical lineage containing TASK_ID",
+    )
+    search_parser.add_argument(
         "--root",
         metavar="CSV",
         help="Filter by lineage root task IDs (comma-separated)",
+    )
+    search_parser.add_argument(
+        "--root-not",
+        metavar="CSV",
+        help="Exclude lineage root task IDs (comma-separated)",
     )
     search_parser.add_argument(
         "--fields",
@@ -488,10 +519,17 @@ def main() -> int:
         help="Filter matches by tag (repeatable)",
     )
     search_parser.add_argument(
+        "--tag-not",
+        action="append",
+        dest="tags_not",
+        metavar="TAG",
+        help="Exclude matches by tag (repeatable, same matching mode as --tag)",
+    )
+    search_parser.add_argument(
         "--any-tag",
         action="store_true",
         dest="any_tag",
-        help="With repeated --tag values, match any tag instead of all tags",
+        help="With repeated --tag/--tag-not values, match any requested tag instead of all tags",
     )
 
     # unmerged command

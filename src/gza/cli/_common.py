@@ -2348,6 +2348,12 @@ def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
         help="Filter tasks by task_type",
     )
     parser.add_argument(
+        "--type-not",
+        type=str,
+        choices=["explore", "plan", "implement", "review", "improve", "fix", "rebase", "internal"],
+        help="Exclude tasks by task_type",
+    )
+    parser.add_argument(
         "--days",
         type=int,
         metavar="N",
@@ -2373,10 +2379,17 @@ def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
         help="Filter by tag (repeatable, AND semantics by default)",
     )
     parser.add_argument(
+        "--tag-not",
+        action="append",
+        dest="tags_not",
+        metavar="TAG",
+        help="Exclude by tag (repeatable, same matching mode as --tag)",
+    )
+    parser.add_argument(
         "--any-tag",
         action="store_true",
         dest="any_tag",
-        help="With repeated --tag values, match any tag instead of all tags",
+        help="With repeated --tag/--tag-not values, match any requested tag instead of all tags",
     )
 
 

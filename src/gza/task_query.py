@@ -67,17 +67,23 @@ class TaskQuery:
     limit: int | None = 10
     text: TextFilter | None = None
     statuses: tuple[str, ...] | None = None
+    exclude_statuses: tuple[str, ...] | None = None
     task_types: tuple[str, ...] | None = None
     exclude_task_types: tuple[str, ...] | None = None
     lifecycle_state: tuple[str, ...] | None = None
     merge_chain_state: tuple[str, ...] | None = None
+    exclude_merge_chain_state: tuple[str, ...] | None = None
     dependency_state: tuple[str, ...] | None = None
     related_to: str | None = None
+    exclude_related_to: str | None = None
     lineage_of: str | None = None
+    exclude_lineage_of: str | None = None
     root_ids: tuple[str, ...] | None = None
+    exclude_root_ids: tuple[str, ...] | None = None
     branch_owner_ids: tuple[str, ...] | None = None
     groups: tuple[str, ...] | None = None
     tag_filters: tuple[str, ...] | None = None
+    exclude_tag_filters: tuple[str, ...] | None = None
     any_tag: bool = False
     pickup_only: bool = False
     date_filter: DateFilter | None = None
@@ -215,21 +221,31 @@ class TaskQueryPresets:
         *,
         limit: int | None = 10,
         statuses: tuple[str, ...] | None = None,
+        exclude_statuses: tuple[str, ...] | None = None,
         task_types: tuple[str, ...] | None = None,
+        exclude_task_types: tuple[str, ...] | None = None,
         date_filter: DateFilter | None = None,
         related_to: str | None = None,
+        exclude_related_to: str | None = None,
         lineage_of: str | None = None,
+        exclude_lineage_of: str | None = None,
         root_ids: tuple[str, ...] | None = None,
+        exclude_root_ids: tuple[str, ...] | None = None,
     ) -> TaskQuery:
         return TaskQuery(
             scope="tasks",
             limit=limit,
             text=TextFilter(contains=term, fields=("prompt",)),
             statuses=statuses,
+            exclude_statuses=exclude_statuses,
             task_types=task_types,
+            exclude_task_types=exclude_task_types,
             related_to=related_to,
+            exclude_related_to=exclude_related_to,
             lineage_of=lineage_of,
+            exclude_lineage_of=exclude_lineage_of,
             root_ids=root_ids,
+            exclude_root_ids=exclude_root_ids,
             date_filter=date_filter,
             projection=ProjectionSpec(preset=TaskProjectionPreset.SEARCH_DEFAULT),
             presentation=PresentationSpec(mode="flat"),
@@ -368,6 +384,7 @@ class TaskQueryService:
                 date_field=(query.date_filter.field if query.date_filter else "effective"),
             )
             incomplete = _query_incomplete(self._store, f)
+            excluded_task_types = set(query.exclude_task_types) if query.exclude_task_types is not None else None
             unresolved_by_owner: dict[str, list[DbTask]] = {}
             incomplete_owner_by_id: dict[str, DbTask] = {}
             root_by_owner_id: dict[str, DbTask] = {}
@@ -380,6 +397,8 @@ class TaskQueryService:
                 tree_by_root_id[root.id] = item.tree
 
                 for task in item.unresolved_tasks:
+                    if excluded_task_types is not None and task.task_type in excluded_task_types:
+                        continue
                     if not self._matches_group_and_tag_filters(task, query):
                         continue
                     owner = self._resolve_branch_owner(task)
@@ -440,17 +459,23 @@ class TaskQueryService:
                     limit=None,
                     text=query.text,
                     statuses=query.statuses,
+                    exclude_statuses=query.exclude_statuses,
                     task_types=query.task_types,
                     exclude_task_types=query.exclude_task_types,
                     lifecycle_state=query.lifecycle_state,
                     merge_chain_state=query.merge_chain_state,
+                    exclude_merge_chain_state=query.exclude_merge_chain_state,
                     dependency_state=query.dependency_state,
                     related_to=query.related_to,
+                    exclude_related_to=query.exclude_related_to,
                     lineage_of=query.lineage_of,
+                    exclude_lineage_of=query.exclude_lineage_of,
                     root_ids=query.root_ids,
+                    exclude_root_ids=query.exclude_root_ids,
                     branch_owner_ids=query.branch_owner_ids,
                     groups=query.groups,
                     tag_filters=query.tag_filters,
+                    exclude_tag_filters=query.exclude_tag_filters,
                     any_tag=query.any_tag,
                     pickup_only=query.pickup_only,
                     date_filter=query.date_filter,
@@ -523,6 +548,10 @@ class TaskQueryService:
             allowed = set(query.statuses)
             filtered = [task for task in filtered if task.status in allowed]
 
+        if query.exclude_statuses is not None:
+            disallowed_statuses = set(query.exclude_statuses)
+            filtered = [task for task in filtered if task.status not in disallowed_statuses]
+
         if query.task_types is not None:
             allowed_types = set(query.task_types)
             filtered = [task for task in filtered if task.task_type in allowed_types]
@@ -546,6 +575,14 @@ class TaskQueryService:
                 if (root := _resolve_lineage_root(self._store, task)).id in allowed_root_ids
             ]
 
+        if query.exclude_root_ids is not None:
+            disallowed_root_ids = set(query.exclude_root_ids)
+            filtered = [
+                task
+                for task in filtered
+                if (root := _resolve_lineage_root(self._store, task)).id not in disallowed_root_ids
+            ]
+
         if query.lineage_of is not None:
             lineage_task = self._store.get(query.lineage_of)
             if lineage_task is None:
@@ -560,6 +597,17 @@ class TaskQueryService:
                 if _resolve_lineage_root(self._store, task).id == root_id
             ]
 
+        if query.exclude_lineage_of is not None:
+            lineage_task = self._store.get(query.exclude_lineage_of)
+            if lineage_task is not None:
+                root_id = _resolve_lineage_root(self._store, lineage_task).id
+                if root_id is not None:
+                    filtered = [
+                        task
+                        for task in filtered
+                        if _resolve_lineage_root(self._store, task).id != root_id
+                    ]
+
         if query.related_to is not None:
             related_task = self._store.get(query.related_to)
             if related_task is None:
@@ -572,6 +620,17 @@ class TaskQueryService:
             }
             filtered = [task for task in filtered if task.id in related_ids]
 
+        if query.exclude_related_to is not None:
+            related_task = self._store.get(query.exclude_related_to)
+            if related_task is not None:
+                root = _resolve_lineage_root(self._store, related_task)
+                related_ids = {
+                    task.id
+                    for task in _flatten_lineage_tree(_build_lineage_tree(self._store, root, max_depth=None))
+                    if task.id is not None
+                }
+                filtered = [task for task in filtered if task.id not in related_ids]
+
         if query.branch_owner_ids is not None:
             allowed_owners = set(query.branch_owner_ids)
             filtered = [
@@ -580,14 +639,18 @@ class TaskQueryService:
                 if self._resolve_branch_owner(task).id in allowed_owners
             ]
 
-        if query.groups is not None:
-            filtered = [task for task in filtered if self._matches_group_and_tag_filters(task, query)]
-        elif query.tag_filters is not None:
+        if query.groups is not None or query.tag_filters is not None or query.exclude_tag_filters is not None:
             filtered = [task for task in filtered if self._matches_group_and_tag_filters(task, query)]
 
         if query.merge_chain_state is not None:
             merge_states = set(query.merge_chain_state)
             filtered = [task for task in filtered if self._matches_merge_chain_state(task, merge_states)]
+
+        if query.exclude_merge_chain_state is not None:
+            excluded_merge_states = set(query.exclude_merge_chain_state)
+            filtered = [
+                task for task in filtered if not self._matches_merge_chain_state(task, excluded_merge_states)
+            ]
 
         if query.dependency_state is not None:
             dep_states = set(query.dependency_state)
@@ -610,6 +673,11 @@ class TaskQueryService:
             if not task_matches_tag_filters(task_tags=task.tags, tag_filters=required, any_tag=query.any_tag):
                 return False
 
+        if query.exclude_tag_filters is not None:
+            excluded = normalize_tag_filters(query.exclude_tag_filters)
+            if task_matches_tag_filters(task_tags=task.tags, tag_filters=excluded, any_tag=query.any_tag):
+                return False
+
         return True
 
     def _apply_lineage_filters(self, rows: Sequence[LineageRow], query: TaskQuery) -> list[LineageRow]:
@@ -623,6 +691,14 @@ class TaskQueryService:
                 if (root := _resolve_lineage_root(self._store, row.owner_task)).id in roots
             ]
 
+        if query.exclude_root_ids is not None:
+            excluded_roots = set(query.exclude_root_ids)
+            filtered = [
+                row
+                for row in filtered
+                if (root := _resolve_lineage_root(self._store, row.owner_task)).id not in excluded_roots
+            ]
+
         if query.lineage_of is not None:
             task = self._store.get(query.lineage_of)
             if task is None:
@@ -633,6 +709,16 @@ class TaskQueryService:
                 for row in filtered
                 if _resolve_lineage_root(self._store, row.owner_task).id == root_id
             ]
+
+        if query.exclude_lineage_of is not None:
+            task = self._store.get(query.exclude_lineage_of)
+            if task is not None:
+                root_id = _resolve_lineage_root(self._store, task).id
+                filtered = [
+                    row
+                    for row in filtered
+                    if _resolve_lineage_root(self._store, row.owner_task).id != root_id
+                ]
 
         if query.related_to is not None:
             task = self._store.get(query.related_to)
@@ -649,6 +735,21 @@ class TaskQueryService:
                 for row in filtered
                 if any(member.id in lineage_ids for member in row.members)
             ]
+
+        if query.exclude_related_to is not None:
+            task = self._store.get(query.exclude_related_to)
+            if task is not None:
+                root = _resolve_lineage_root(self._store, task)
+                lineage_ids = {
+                    item.id
+                    for item in _flatten_lineage_tree(_build_lineage_tree(self._store, root, max_depth=None))
+                    if item.id is not None
+                }
+                filtered = [
+                    row
+                    for row in filtered
+                    if not any(member.id in lineage_ids for member in row.members)
+                ]
 
         return filtered
 
