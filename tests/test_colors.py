@@ -281,7 +281,13 @@ class TestSetTheme:
         c.set_theme("blue")
         assert c.TASK_COLORS_DICT == dataclasses.asdict(c.TASK_COLORS)
         assert c.STATUS_COLORS_DICT == dataclasses.asdict(c.STATUS_COLORS)
+        assert c.TASK_STREAM_COLORS_DICT == dataclasses.asdict(c.TASK_STREAM_COLORS)
         assert c.SHOW_COLORS_DICT == dataclasses.asdict(c.SHOW_COLORS)
+        assert c.UNMERGED_COLORS_DICT == dataclasses.asdict(c.UNMERGED_COLORS)
+        assert c.LINEAGE_COLORS_DICT == dataclasses.asdict(c.LINEAGE_COLORS)
+        assert c.NEXT_COLORS_DICT == dataclasses.asdict(c.NEXT_COLORS)
+        assert c.RUNNER_COLORS_DICT == dataclasses.asdict(c.RUNNER_COLORS)
+        assert c.WORK_COLORS_DICT == dataclasses.asdict(c.WORK_COLORS)
 
     def test_lineage_status_colors_stays_in_sync(self) -> None:
         import gza.colors as c

@@ -430,6 +430,11 @@ _BASE_COLOR_FIELDS: frozenset[str] = frozenset(
     f.name for f in dataclasses.fields(BaseColors)
 )
 
+
+def _flat_dataclass_dict(instance: Any) -> dict[str, Any]:
+    """Convert a flat color dataclass instance to a dict without deep-copy work."""
+    return {f.name: getattr(instance, f.name) for f in dataclasses.fields(instance)}
+
 def _apply_domain_theme(
     default_instance: Any,
     domain_overrides: dict[str, str],
@@ -489,15 +494,15 @@ def _build_themed_instances(
         "NEXT_COLORS": next_c,
         "RUNNER_COLORS": runner_c,
         "WORK_COLORS": work_c,
-        "TASK_COLORS_DICT": dataclasses.asdict(task_c),
-        "STATUS_COLORS_DICT": dataclasses.asdict(status_c),
-        "TASK_STREAM_COLORS_DICT": dataclasses.asdict(stream_c),
-        "SHOW_COLORS_DICT": dataclasses.asdict(show_c),
-        "UNMERGED_COLORS_DICT": dataclasses.asdict(unmerged_c),
-        "LINEAGE_COLORS_DICT": dataclasses.asdict(lineage_c),
-        "NEXT_COLORS_DICT": dataclasses.asdict(next_c),
-        "RUNNER_COLORS_DICT": dataclasses.asdict(runner_c),
-        "WORK_COLORS_DICT": dataclasses.asdict(work_c),
+        "TASK_COLORS_DICT": _flat_dataclass_dict(task_c),
+        "STATUS_COLORS_DICT": _flat_dataclass_dict(status_c),
+        "TASK_STREAM_COLORS_DICT": _flat_dataclass_dict(stream_c),
+        "SHOW_COLORS_DICT": _flat_dataclass_dict(show_c),
+        "UNMERGED_COLORS_DICT": _flat_dataclass_dict(unmerged_c),
+        "LINEAGE_COLORS_DICT": _flat_dataclass_dict(lineage_c),
+        "NEXT_COLORS_DICT": _flat_dataclass_dict(next_c),
+        "RUNNER_COLORS_DICT": _flat_dataclass_dict(runner_c),
+        "WORK_COLORS_DICT": _flat_dataclass_dict(work_c),
         "LINEAGE_STATUS_COLORS": {
             "completed": status_c.completed,
             "failed": status_c.failed,
@@ -586,15 +591,15 @@ WORK_COLORS: WorkColors = WorkColors()
 # Dict variants (drop-in replacements for the old inline dictionaries)
 # ---------------------------------------------------------------------------
 
-TASK_COLORS_DICT: dict[str, str] = dataclasses.asdict(TASK_COLORS)
-STATUS_COLORS_DICT: dict[str, str] = dataclasses.asdict(STATUS_COLORS)
-TASK_STREAM_COLORS_DICT: dict[str, str] = dataclasses.asdict(TASK_STREAM_COLORS)
-SHOW_COLORS_DICT: dict[str, str] = dataclasses.asdict(SHOW_COLORS)
-UNMERGED_COLORS_DICT: dict[str, str] = dataclasses.asdict(UNMERGED_COLORS)
-LINEAGE_COLORS_DICT: dict[str, str] = dataclasses.asdict(LINEAGE_COLORS)
-NEXT_COLORS_DICT: dict[str, str] = dataclasses.asdict(NEXT_COLORS)
-RUNNER_COLORS_DICT: dict[str, str] = dataclasses.asdict(RUNNER_COLORS)
-WORK_COLORS_DICT: dict[str, str] = dataclasses.asdict(WORK_COLORS)
+TASK_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(TASK_COLORS)
+STATUS_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(STATUS_COLORS)
+TASK_STREAM_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(TASK_STREAM_COLORS)
+SHOW_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(SHOW_COLORS)
+UNMERGED_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(UNMERGED_COLORS)
+LINEAGE_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(LINEAGE_COLORS)
+NEXT_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(NEXT_COLORS)
+RUNNER_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(RUNNER_COLORS)
+WORK_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(WORK_COLORS)
 
 # Lineage-status dict (subset of StatusColors, keyed by status string)
 LINEAGE_STATUS_COLORS: dict[str, str] = {
