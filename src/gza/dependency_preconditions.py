@@ -22,8 +22,8 @@ def get_unmerged_dependency_precondition(
         return None
     if dep.id is not None:
         unit = store.resolve_merge_unit_for_task(dep.id)
-        if unit is not None and unit.state == "merged":
-            return None
+        if unit is not None:
+            return None if unit.state == "merged" else dep
     if dep.merge_status == "merged":
         return None
     return dep

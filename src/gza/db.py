@@ -3751,6 +3751,55 @@ class SqliteTaskStore:
             ).fetchone()
         return self._row_to_merge_unit(row)
 
+    def _related_branch_tasks_for_merge_unit(self, task: Task, branch_tasks: list[Task]) -> list[Task]:
+        """Return same-branch tasks that are provably part of the same work line."""
+        if task.id is None:
+            return [task]
+
+        tasks_by_id = {branch_task.id: branch_task for branch_task in branch_tasks if branch_task.id is not None}
+        current_task = tasks_by_id.setdefault(task.id, task)
+        assert current_task.id is not None
+        related_ids: set[str] = set()
+        stack = [current_task.id]
+
+        while stack:
+            current_id = stack.pop()
+            if current_id in related_ids:
+                continue
+            related_ids.add(current_id)
+            current = tasks_by_id.get(current_id)
+            if current is None:
+                continue
+
+            for linked_id in (current.based_on, current.depends_on):
+                if linked_id is not None and linked_id in tasks_by_id and linked_id not in related_ids:
+                    stack.append(linked_id)
+
+            for branch_task in branch_tasks:
+                if branch_task.id is None or branch_task.id in related_ids:
+                    continue
+                if branch_task.based_on == current_id or branch_task.depends_on == current_id:
+                    stack.append(branch_task.id)
+
+        related_tasks = [branch_task for branch_task in branch_tasks if branch_task.id in related_ids]
+        if not related_tasks:
+            return [task]
+        return related_tasks
+
+    def _resolve_related_merge_unit(
+        self,
+        related_branch_tasks: list[Task],
+        target_branch: str,
+    ) -> MergeUnit | None:
+        """Resolve an existing merge unit only from proven related same-branch tasks."""
+        for branch_task in reversed(related_branch_tasks):
+            if branch_task.id is None:
+                continue
+            active_unit = self.resolve_merge_unit_for_task(branch_task.id)
+            if active_unit is not None and active_unit.target_branch == target_branch and active_unit.superseded_by_unit_id is None:
+                return active_unit
+        return None
+
     def get_or_create_merge_unit_for_task(
         self,
         task: Task,
@@ -3766,15 +3815,10 @@ class SqliteTaskStore:
             return existing
 
         same_branch_tasks = self.get_tasks_for_branch(task.branch)
-        active_unit: MergeUnit | None = None
-        for branch_task in reversed(same_branch_tasks):
-            if branch_task.id is None:
-                continue
-            active_unit = self.resolve_merge_unit_for_task(branch_task.id)
-            if active_unit is not None and active_unit.target_branch == target_branch and active_unit.superseded_by_unit_id is None:
-                break
+        related_branch_tasks = self._related_branch_tasks_for_merge_unit(task, same_branch_tasks)
+        active_unit = self._resolve_related_merge_unit(related_branch_tasks, target_branch)
         if active_unit is None or active_unit.target_branch != target_branch:
-            owner_task = next((branch_task for branch_task in same_branch_tasks if task_owns_merge_status(branch_task)), task)
+            owner_task = next((branch_task for branch_task in related_branch_tasks if task_owns_merge_status(branch_task)), task)
             active_unit = self.create_merge_unit(
                 source_branch=task.branch,
                 target_branch=target_branch,
@@ -3790,7 +3834,7 @@ class SqliteTaskStore:
                 diff_lines_removed=owner_task.diff_lines_removed,
             )
 
-        for branch_task in same_branch_tasks:
+        for branch_task in related_branch_tasks:
             if branch_task.id is None:
                 continue
             self.attach_task_to_merge_unit(

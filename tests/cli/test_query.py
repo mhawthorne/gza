@@ -9166,6 +9166,64 @@ class TestUnmergedUnifiedQueryOutput:
         assert payload[0]["source_branch"] == "feature/test"
         assert payload[0]["target_branch"] == "main"
 
+    def test_unmerged_live_target_json_fields_use_live_state_not_default_target_unit(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        store, task, git = _setup_unmerged_env_fast(tmp_path, task_prompt="Live target unit metadata task")
+        assert task.id is not None
+        unit = store.get_or_create_merge_unit_for_task(task, "main")
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target="release",
+            fetch=False,
+            limit=5,
+            json=True,
+            fields="id,merge_unit_id,merge_unit_state,target_branch",
+        )
+
+        result = query_cli.cmd_unmerged(args, git=git)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        payload = json.loads(captured.out)
+        assert payload[0]["target_branch"] == "release"
+        assert payload[0]["merge_unit_state"] == "unmerged"
+        assert payload[0]["merge_unit_id"] is None
+
+    def test_unmerged_live_target_text_fields_use_live_state_not_default_target_unit(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        store, task, git = _setup_unmerged_env_fast(tmp_path, task_prompt="Live target text metadata task")
+        assert task.id is not None
+        unit = store.get_or_create_merge_unit_for_task(task, "main")
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target="release",
+            fetch=False,
+            limit=5,
+            json=False,
+            fields="id,merge_unit_state,target_branch",
+        )
+
+        result = query_cli.cmd_unmerged(args, git=git)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert "target_branch: release" in captured.out
+        assert "merge_unit_state: unmerged" in captured.out
+
     def test_unmerged_text_fields_support_single_and_multi_projection(
         self,
         tmp_path: Path,

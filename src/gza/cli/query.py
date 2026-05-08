@@ -1435,6 +1435,7 @@ def _enrich_unmerged_result(
     git_client: _UnmergedGit,
     target_branch: str,
     default_branch: str,
+    live_branch_states: dict[str, str | None] | None = None,
 ) -> _TaskQueryResult:
     effective_fields = _unmerged_effective_fields(result.query)
     needs_lineage_text = "lineage_text" in effective_fields
@@ -1678,6 +1679,19 @@ def _enrich_unmerged_result(
                 pr_url = pr_lookup.pr_url
 
         unmerged_values = dict(row.values)
+        live_merge_state = (
+            live_branch_states.get(representative_branch)
+            if live_branch_states is not None and representative_branch is not None
+            else None
+        )
+        merge_unit_id = merge_unit.id if merge_unit is not None else None
+        merge_unit_state = merge_unit.state if merge_unit is not None else owner_task.merge_status
+        source_branch = merge_unit.source_branch if merge_unit is not None else representative_branch
+        if live_merge_state is not None:
+            merge_unit_state = live_merge_state
+            if merge_unit is None or merge_unit.target_branch != target_branch:
+                merge_unit_id = None
+                source_branch = representative_branch
         unmerged_values.update(
             {
                 "member_ids": [member.id for member in members if member.id is not None],
@@ -1692,10 +1706,10 @@ def _enrich_unmerged_result(
                     else None
                 ),
                 "branch": representative_branch,
-                "source_branch": merge_unit.source_branch if merge_unit is not None else representative_branch,
+                "source_branch": source_branch,
                 "target_branch": target_branch,
-                "merge_unit_id": merge_unit.id if merge_unit is not None else None,
-                "merge_unit_state": merge_unit.state if merge_unit is not None else owner_task.merge_status,
+                "merge_unit_id": merge_unit_id,
+                "merge_unit_state": merge_unit_state,
                 "branch_deleted": branch_deleted,
                 "commit_count": commit_count,
                 "files_changed": files_changed,
@@ -1781,6 +1795,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     try:
         store = get_store(config, open_mode="query_only" if live_target else "readwrite")
         service = _TaskQueryService(store)
+        live_branch_states: dict[str, str | None] | None = None
 
         if live_target:
             history = store.get_history(limit=None)
@@ -1822,6 +1837,11 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
                 result.branch
                 for result in live_results
                 if result.skipped_reason is None and result.merge_status != "merged"
+            }
+            live_branch_states = {
+                result.branch: result.merge_status
+                for result in live_results
+                if result.skipped_reason is None and result.merge_status is not None
             }
             selected_tasks = [
                 task for task in branch_candidates if task.branch in live_unmerged_branches
@@ -1931,6 +1951,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
         git_client=git_client,
         target_branch=target_branch,
         default_branch=default_branch,
+        live_branch_states=live_branch_states,
     )
     _print_unmerged_progress(
         f"rendering {len(result.rows)} row(s) from {result.total_count or 0} filtered result(s) as {view_mode}",

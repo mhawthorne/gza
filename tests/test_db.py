@@ -1970,6 +1970,66 @@ class TestMergeStatus:
         attached_ids = {task.id for task in store.list_tasks_for_merge_unit(impl_unit.id)}
         assert attached_ids == {impl.id, review.id, improve.id}
 
+    def test_reused_branch_creates_new_merge_unit_for_unrelated_work(self, tmp_path: Path) -> None:
+        """Unrelated later work on a reused branch must not reopen the historical unit."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        original = store.add(prompt="Original feature", task_type="implement")
+        store.mark_completed(original, has_commits=True, branch="feature/reused")
+        assert original.id is not None
+        original_unit = store.resolve_merge_unit_for_task(original.id)
+        assert original_unit is not None
+        store.set_merge_unit_state(original_unit.id, "merged")
+
+        merged_original = store.get(original.id)
+        assert merged_original is not None
+        assert merged_original.merge_status == "merged"
+        original_merged_at = merged_original.merged_at
+
+        unrelated = store.add(prompt="Unrelated feature", task_type="implement")
+        store.mark_completed(unrelated, has_commits=True, branch="feature/reused")
+        assert unrelated.id is not None
+        unrelated_unit = store.resolve_merge_unit_for_task(unrelated.id)
+        assert unrelated_unit is not None
+
+        assert unrelated_unit.id != original_unit.id
+        assert store.get_merge_unit(original_unit.id).state == "merged"
+        assert {task.id for task in store.list_tasks_for_merge_unit(original_unit.id)} == {original.id}
+        assert {task.id for task in store.list_tasks_for_merge_unit(unrelated_unit.id)} == {unrelated.id}
+
+        refreshed_original = store.get(original.id)
+        assert refreshed_original is not None
+        assert refreshed_original.merge_status == "merged"
+        assert refreshed_original.merged_at == original_merged_at
+
+    def test_same_branch_improve_reuses_related_merged_unit(self, tmp_path: Path) -> None:
+        """A same-lineage same-branch improve task should reopen the existing unit."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/reused")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+        store.set_merge_unit_state(impl_unit.id, "merged")
+
+        improve = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        store.mark_completed(improve, has_commits=True, branch="feature/reused")
+        assert improve.id is not None
+        improve_unit = store.resolve_merge_unit_for_task(improve.id)
+        assert improve_unit is not None
+
+        assert improve_unit.id == impl_unit.id
+        assert store.get_merge_unit(impl_unit.id).state == "unmerged"
+        assert {task.id for task in store.list_tasks_for_merge_unit(impl_unit.id)} == {impl.id, improve.id}
+
     def test_migrate_merge_status_logs_when_remote_probe_fails(self, tmp_path: Path, caplog: pytest.LogCaptureFixture):
         """Migration logs a warning and defaults safely when origin inspection fails."""
         from gza.db import migrate_merge_status
