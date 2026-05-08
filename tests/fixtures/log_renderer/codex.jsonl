@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"thread_123"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'ls src/gza'","aggregated_output":"db.py\ncli.py","exit_code":0}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"I found the root cause."}}
+{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":8,"cached_input_tokens":4}}
+{"type":"item.completed","item":{"id":"item_3","type":"reasoning"}}
+{"type":"error","message":"top-level codex error"}
+{"type":"weird.codex","message":"unexpected branch","session_id":"sess-9","extra":"x"}

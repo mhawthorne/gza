@@ -1473,10 +1473,9 @@ def test_live_log_printer_uses_formatter_console_for_stream_output(monkeypatch: 
     assert any("\\[result] warning:" in line for line in printed)
 
 
-def test_live_log_printer_renders_claude_model_parity_when_models_match(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_log_printer_renders_gza_info_and_init_events(monkeypatch: pytest.MonkeyPatch) -> None:
     import gza.providers.output_formatter as output_formatter
 
-    agent_messages: list[str] = []
     console_lines: list[str] = []
 
     class _FakeConsole:
@@ -1488,8 +1487,8 @@ def test_live_log_printer_renders_claude_model_parity_when_models_match(monkeypa
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.console = _FakeConsole()
 
-        def print_agent_message(self, text: str, **_kwargs: Any) -> None:
-            agent_messages.append(text)
+        def print_agent_message(self, _text: str, **_kwargs: Any) -> None:
+            return None
 
         def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1510,15 +1509,13 @@ def test_live_log_printer_renders_claude_model_parity_when_models_match(monkeypa
     printer.process({"type": "gza", "subtype": "info", "message": "Provider: Claude, Model: claude-opus-4-6"})
     printer.process({"type": "system", "subtype": "init", "model": "claude-opus-4-6"})
 
-    assert "Claude model parity: configured=claude-opus-4-6, provider_reported=claude-opus-4-6" in agent_messages
-    assert not any("WARNING: Model mismatch" in line for line in console_lines)
-    assert not any("provider did not echo model" in line for line in agent_messages)
+    assert any("Provider: Claude, Model: claude-opus-4-6" in line for line in console_lines)
+    assert any("Session initialized" in line for line in console_lines)
 
 
-def test_live_log_printer_warns_on_model_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_log_printer_keeps_provider_info_visible_when_models_differ(monkeypatch: pytest.MonkeyPatch) -> None:
     import gza.providers.output_formatter as output_formatter
 
-    agent_messages: list[str] = []
     console_lines: list[str] = []
 
     class _FakeConsole:
@@ -1530,8 +1527,8 @@ def test_live_log_printer_warns_on_model_mismatch(monkeypatch: pytest.MonkeyPatc
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.console = _FakeConsole()
 
-        def print_agent_message(self, text: str, **_kwargs: Any) -> None:
-            agent_messages.append(text)
+        def print_agent_message(self, _text: str, **_kwargs: Any) -> None:
+            return None
 
         def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1552,25 +1549,26 @@ def test_live_log_printer_warns_on_model_mismatch(monkeypatch: pytest.MonkeyPatc
     printer.process({"type": "gza", "subtype": "info", "message": "Provider: Claude, Model: claude-opus-4-6"})
     printer.process({"type": "system", "subtype": "init", "model": "claude-sonnet-4-5"})
 
-    assert "Claude model parity: configured=claude-opus-4-6, provider_reported=claude-sonnet-4-5" in agent_messages
-    assert any("WARNING: Model mismatch (claude-opus-4-6 != claude-sonnet-4-5)" in line for line in console_lines)
+    assert any("Provider: Claude, Model: claude-opus-4-6" in line for line in console_lines)
+    assert any("Session initialized (model: claude-sonnet-4-5)" in line for line in console_lines)
 
 
-def test_live_log_printer_notes_when_provider_does_not_echo_model(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_log_printer_handles_provider_without_model_echo(monkeypatch: pytest.MonkeyPatch) -> None:
     import gza.providers.output_formatter as output_formatter
 
-    agent_messages: list[str] = []
+    console_lines: list[str] = []
 
     class _FakeConsole:
-        def print(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
+        def print(self, *args: Any, **_kwargs: Any) -> None:
+            if args:
+                console_lines.append(str(args[0]))
 
     class _FakeFormatter:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.console = _FakeConsole()
 
-        def print_agent_message(self, text: str, **_kwargs: Any) -> None:
-            agent_messages.append(text)
+        def print_agent_message(self, _text: str, **_kwargs: Any) -> None:
+            return None
 
         def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1591,13 +1589,13 @@ def test_live_log_printer_notes_when_provider_does_not_echo_model(monkeypatch: p
     printer.process({"type": "gza", "subtype": "info", "message": "Provider: Codex, Model: gpt-5.3-codex"})
     printer.process({"type": "thread.started", "thread_id": "thread_abc"})
 
-    assert "Codex model parity: configured=gpt-5.3-codex, provider_reported=(provider did not echo model)" in agent_messages
+    assert any("Provider: Codex, Model: gpt-5.3-codex" in line for line in console_lines)
+    assert any("Session started (thread: thread_abc)" in line for line in console_lines)
 
 
-def test_live_log_printer_parses_gemini_init_model_for_parity(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_log_printer_parses_gemini_init_event(monkeypatch: pytest.MonkeyPatch) -> None:
     import gza.providers.output_formatter as output_formatter
 
-    agent_messages: list[str] = []
     console_lines: list[str] = []
 
     class _FakeConsole:
@@ -1609,8 +1607,8 @@ def test_live_log_printer_parses_gemini_init_model_for_parity(monkeypatch: pytes
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.console = _FakeConsole()
 
-        def print_agent_message(self, text: str, **_kwargs: Any) -> None:
-            agent_messages.append(text)
+        def print_agent_message(self, _text: str, **_kwargs: Any) -> None:
+            return None
 
         def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1631,18 +1629,19 @@ def test_live_log_printer_parses_gemini_init_model_for_parity(monkeypatch: pytes
     printer.process({"type": "gza", "subtype": "info", "message": "Provider: Gemini, Model: gemini-2.5-pro"})
     printer.process({"type": "init", "model": "gemini-2.5-flash"})
 
-    assert "Gemini model parity: configured=gemini-2.5-pro, provider_reported=gemini-2.5-flash" in agent_messages
-    assert any("WARNING: Model mismatch (gemini-2.5-pro != gemini-2.5-flash)" in line for line in console_lines)
+    assert any("Provider: Gemini, Model: gemini-2.5-pro" in line for line in console_lines)
+    assert any("Session initialized (model: gemini-2.5-flash)" in line for line in console_lines)
 
 
 def test_live_log_printer_renders_top_level_error_entries(monkeypatch: pytest.MonkeyPatch) -> None:
     import gza.providers.output_formatter as output_formatter
 
-    error_lines: list[str] = []
+    console_lines: list[str] = []
 
     class _FakeConsole:
-        def print(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
+        def print(self, *args: Any, **_kwargs: Any) -> None:
+            if args:
+                console_lines.append(str(args[0]))
 
     class _FakeFormatter:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -1657,8 +1656,8 @@ def test_live_log_printer_renders_top_level_error_entries(monkeypatch: pytest.Mo
         def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
             return None
 
-        def print_error(self, message: str, **_kwargs: Any) -> None:
-            error_lines.append(message)
+        def print_error(self, _message: str, **_kwargs: Any) -> None:
+            return None
 
         def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1669,13 +1668,13 @@ def test_live_log_printer_renders_top_level_error_entries(monkeypatch: pytest.Mo
     printer = _LiveLogPrinter()
     printer.process({"type": "error", "message": "invalid_request_error: missing model"})
 
-    assert error_lines == ["[error] invalid_request_error: missing model"]
+    assert console_lines == [r"[red]\[error] invalid_request_error: missing model[/red]"]
 
 
 def test_live_log_printer_unwraps_nested_error_payloads(monkeypatch: pytest.MonkeyPatch) -> None:
     import gza.providers.output_formatter as output_formatter
 
-    error_lines: list[str] = []
+    console_lines: list[str] = []
     payload = json.dumps(
         {
             "error": {
@@ -1686,8 +1685,9 @@ def test_live_log_printer_unwraps_nested_error_payloads(monkeypatch: pytest.Monk
     )
 
     class _FakeConsole:
-        def print(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
+        def print(self, *args: Any, **_kwargs: Any) -> None:
+            if args:
+                console_lines.append(str(args[0]))
 
     class _FakeFormatter:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -1702,8 +1702,8 @@ def test_live_log_printer_unwraps_nested_error_payloads(monkeypatch: pytest.Monk
         def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
             return None
 
-        def print_error(self, message: str, **_kwargs: Any) -> None:
-            error_lines.append(message)
+        def print_error(self, _message: str, **_kwargs: Any) -> None:
+            return None
 
         def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1714,7 +1714,7 @@ def test_live_log_printer_unwraps_nested_error_payloads(monkeypatch: pytest.Monk
     printer = _LiveLogPrinter()
     printer.process({"type": "error", "message": payload})
 
-    assert error_lines == [
-        "[error] The model `gpt-missing` does not exist",
-        f"[error] payload: {payload}",
+    assert console_lines == [
+        r"[red]\[error] The model `gpt-missing` does not exist[/red]",
+        f"[red]\\[error] payload: {payload}[/red]",
     ]

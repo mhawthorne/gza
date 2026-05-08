@@ -1,0 +1,11 @@
+{"type":"init","model":"gemini-2.5-pro"}
+{"type":"message","role":"user","content":"turn boundary"}
+{"type":"message","role":"assistant","delta":true,"content":"streaming"}
+{"type":"message","role":"assistant","content":"Planning changes now."}
+{"type":"tool_use","tool_name":"Read","tool_input":{"file_path":"src/gza/cli/log.py"}}
+{"type":"tool_output","call_id":"tool_1","content":"loaded"}
+{"type":"tool_error","call_id":"tool_1","message":"permission denied"}
+{"type":"tool_retry","call_id":"tool_1","retry_of_call_id":"tool_0"}
+{"type":"error","message":"gemini top-level error"}
+{"type":"oddity","message":"unknown event","model":"gemini-x","zeta":1}
+{"type":"result","stats":{"input_tokens":30,"output_tokens":12},"result":"Gemini finished."}

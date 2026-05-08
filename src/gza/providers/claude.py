@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from rich.markup import escape as rich_escape
+
 from .base import (
     DockerConfig,
     PreflightCheckResult,
@@ -26,6 +28,17 @@ from .base import (
     ensure_docker_image,
     verify_docker_credentials,
     write_preflight_entry,
+)
+from .log_rendering import (
+    RenderedLines,
+    RenderStats,
+    error_lines,
+    generic_log_summary,
+    generic_tv_summary,
+    message_content_items,
+    pretty_json_lines,
+    summarize_tool_detail,
+    tool_one_liner,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
 
@@ -86,6 +99,183 @@ def calculate_cost(input_tokens: int, output_tokens: int, model: str = "") -> fl
         (output_tokens * output_price / 1_000_000)
     )
     return round(cost, 4)
+
+
+class ClaudeLogRenderer:
+    """Render Claude JSONL events for log replay/live and TV surfaces."""
+
+    def __init__(self, *, configured_model: str | None = None, verbose: bool = False) -> None:
+        self.configured_model = configured_model
+        self.verbose = verbose
+        self.stats = RenderStats()
+        self.suppressed_count = 0
+        self._seen_message_ids: set[str] = set()
+        self._provider_model: str | None = None
+
+    def handle_log(self, entry: dict[str, Any], *, live: bool) -> RenderedLines:
+        return self._handle(entry, live=live, tv=False)
+
+    def handle_tv(self, entry: dict[str, Any]) -> RenderedLines:
+        return self._handle(entry, live=False, tv=True)
+
+    def _handle(self, entry: dict[str, Any], *, live: bool, tv: bool) -> RenderedLines:
+        event_type = entry.get("type")
+        if event_type == "gza":
+            return self._render_gza(entry, tv=tv)
+        if event_type == "raw":
+            message = entry.get("message", "")
+            if isinstance(message, str) and message:
+                lines = [rich_escape(message)] if not tv else [message]
+                return RenderedLines(log_lines=lines if not tv else [], tv_lines=lines if tv else [])
+            return RenderedLines()
+        if event_type == "error":
+            lines = error_lines(entry.get("message", ""))
+            if tv:
+                return RenderedLines(tv_lines=[generic_tv_summary(entry)])
+            return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in lines])
+        if event_type == "system":
+            return self._render_system(entry, tv=tv)
+        if event_type == "assistant":
+            return self._render_assistant(entry, live=live, tv=tv)
+        if event_type == "user":
+            return self._render_user(entry, tv=tv)
+        if event_type == "result":
+            return self._render_result(entry, tv=tv)
+        return self._render_unknown(entry, tv=tv)
+
+    def _render_gza(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        subtype = entry.get("subtype", "")
+        message = entry.get("message", "")
+        if subtype == "info" and isinstance(message, str):
+            prefix = "Provider:"
+            if message.strip().startswith(prefix):
+                _, _, model = message.partition("Model:")
+                model_value = model.strip()
+                if model_value:
+                    self.configured_model = model_value
+        if not message:
+            return RenderedLines()
+        prefix = f"[gza:{subtype}]" if subtype else "[gza]"
+        line = f"{prefix} {message}"
+        return RenderedLines(log_lines=[rich_escape(line)] if not tv else [], tv_lines=[line] if tv else [])
+
+    def _render_system(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        subtype = entry.get("subtype", "")
+        model = entry.get("model")
+        if isinstance(model, str) and model.strip():
+            self._provider_model = model.strip()
+        if subtype == "init":
+            line = f"Session initialized (model: {self._provider_model or 'unknown'})"
+            return RenderedLines(
+                log_lines=[line] if not tv else [],
+                tv_lines=[line] if tv else [],
+            )
+        self.suppressed_count += 1
+        return RenderedLines()
+
+    def _render_assistant(self, entry: dict[str, Any], *, live: bool, tv: bool) -> RenderedLines:
+        message = entry.get("message", {})
+        starts_step = False
+        message_id = message.get("id") if isinstance(message, dict) else None
+        if isinstance(message_id, str) and message_id and message_id not in self._seen_message_ids:
+            self._seen_message_ids.add(message_id)
+            self.stats.step_count += 1
+            starts_step = True
+            usage = message.get("usage", {}) if isinstance(message, dict) else {}
+            if isinstance(usage, dict):
+                self.stats.input_tokens += int(usage.get("input_tokens", 0) or 0)
+                self.stats.input_tokens += int(usage.get("cache_creation_input_tokens", 0) or 0)
+                self.stats.input_tokens += int(usage.get("cache_read_input_tokens", 0) or 0)
+                self.stats.output_tokens += int(usage.get("output_tokens", 0) or 0)
+                self.stats.cost_usd = calculate_cost(
+                    self.stats.input_tokens,
+                    self.stats.output_tokens,
+                    self._provider_model or self.configured_model or "",
+                )
+
+        log_lines: list[str] = []
+        tv_lines: list[str] = []
+        text_found = False
+        tool_found = False
+        for item in message_content_items(entry):
+            item_type = item.get("type")
+            if item_type == "text":
+                text = item.get("text", "")
+                if isinstance(text, str) and text.strip():
+                    text_found = True
+                    if tv:
+                        tv_lines.extend([line for line in text.splitlines() if line.strip()][-6:])
+                    else:
+                        log_lines.append(rich_escape(text.strip()))
+            elif item_type == "tool_use":
+                tool_found = True
+                name = str(item.get("name", "unknown"))
+                tool_input = item.get("input", {})
+                if not isinstance(tool_input, dict):
+                    tool_input = {}
+                if tv:
+                    tv_lines.append(f"-> {tool_one_liner(name, tool_input)}")
+                else:
+                    log_lines.append(f"[green]\\[tool: {rich_escape(name)}][/green] {rich_escape(summarize_tool_detail(name, tool_input))}")
+
+        if not text_found and not tool_found:
+            self.suppressed_count += 1
+            return RenderedLines(starts_step=starts_step)
+        return RenderedLines(log_lines=log_lines, tv_lines=tv_lines, starts_step=starts_step)
+
+    def _render_user(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        log_lines: list[str] = []
+        tv_lines: list[str] = []
+        for item in message_content_items(entry):
+            if item.get("type") != "tool_result":
+                continue
+            result = item.get("content", "")
+            if isinstance(result, str):
+                result = result.replace("\\n", "\n").replace("\\t", "\t")
+            is_error = bool(item.get("is_error", False))
+            rendered = str(result).strip()
+            if not rendered:
+                continue
+            if tv:
+                prefix = "tool_error" if is_error else "tool_output"
+                tv_lines.append(f"{prefix} {rendered}")
+            else:
+                if is_error:
+                    log_lines.append(f"[red]{rich_escape(rendered)}[/red]")
+                else:
+                    log_lines.append(rich_escape(rendered))
+        return RenderedLines(log_lines=log_lines, tv_lines=tv_lines)
+
+    def _render_result(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        cost = entry.get("total_cost_usd") or entry.get("cost_usd")
+        if isinstance(cost, (int, float)):
+            self.stats.cost_usd = float(cost)
+        result_text = str(entry.get("result", "") or "").strip()
+        subtype = str(entry.get("subtype") or "")
+        is_error = bool(entry.get("is_error", False))
+        if tv:
+            if result_text:
+                return RenderedLines(tv_lines=[f"result {result_text}"])
+            if subtype:
+                return RenderedLines(tv_lines=[f"result {subtype}"])
+            return RenderedLines()
+        if is_error:
+            return RenderedLines(log_lines=[f"[red]\\[result] ERROR:[/red] {rich_escape(result_text)}"])
+        if subtype and subtype != "success":
+            if result_text:
+                return RenderedLines(log_lines=[f"[yellow]\\[result] {rich_escape(subtype)}:[/yellow] {rich_escape(result_text)}"])
+            return RenderedLines(log_lines=[f"[yellow]\\[result] {rich_escape(subtype)}[/yellow]"])
+        if result_text:
+            return RenderedLines(log_lines=[f"[green]\\[result][/green] {rich_escape(result_text)}"])
+        return RenderedLines()
+
+    def _render_unknown(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        if tv:
+            return RenderedLines(tv_lines=[generic_tv_summary(entry)])
+        lines = [generic_log_summary(entry)]
+        if self.verbose:
+            lines.extend(rich_escape(line) for line in pretty_json_lines(entry))
+        return RenderedLines(log_lines=lines)
 
 def sync_keychain_credentials() -> bool:
     """Extract Claude OAuth credentials from macOS Keychain and write to ~/.claude/.credentials.json.

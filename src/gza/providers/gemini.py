@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from rich.markup import escape as rich_escape
+
 from .base import (
     DockerConfig,
     PreflightCheckResult,
@@ -20,6 +22,16 @@ from .base import (
     ensure_docker_image,
     verify_docker_credentials,
     write_preflight_entry,
+)
+from .log_rendering import (
+    RenderedLines,
+    RenderStats,
+    error_lines,
+    generic_log_summary,
+    generic_tv_summary,
+    pretty_json_lines,
+    text_to_lines,
+    tool_one_liner,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
 
@@ -57,6 +69,135 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     input_price, output_price = pricing
     cost = (input_tokens * input_price / 1_000_000) + (output_tokens * output_price / 1_000_000)
     return round(cost, 6)
+
+
+class GeminiLogRenderer:
+    """Render Gemini JSONL events for log replay/live and TV surfaces."""
+
+    def __init__(self, *, configured_model: str | None = None, verbose: bool = False) -> None:
+        self.configured_model = configured_model
+        self.verbose = verbose
+        self.stats = RenderStats()
+        self.suppressed_count = 0
+        self._provider_model: str | None = None
+
+    def handle_log(self, entry: dict[str, Any], *, live: bool) -> RenderedLines:
+        return self._handle(entry, tv=False)
+
+    def handle_tv(self, entry: dict[str, Any]) -> RenderedLines:
+        return self._handle(entry, tv=True)
+
+    def _handle(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        event_type = entry.get("type")
+        if event_type == "gza":
+            return self._render_gza(entry, tv=tv)
+        if event_type == "raw":
+            message = entry.get("message", "")
+            if isinstance(message, str) and message:
+                lines = [rich_escape(message)] if not tv else [message]
+                return RenderedLines(log_lines=lines if not tv else [], tv_lines=lines if tv else [])
+            return RenderedLines()
+        if event_type == "error":
+            if tv:
+                return RenderedLines(tv_lines=[generic_tv_summary(entry)])
+            return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in error_lines(entry.get("message", ""))])
+        if event_type == "init":
+            model = entry.get("model")
+            if isinstance(model, str) and model.strip():
+                self._provider_model = model.strip()
+            line = f"Session initialized (model: {self._provider_model or 'unknown'})"
+            return RenderedLines(log_lines=[line] if not tv else [], tv_lines=[line] if tv else [])
+        if event_type == "message":
+            return self._render_message(entry, tv=tv)
+        if event_type == "tool_use":
+            return self._render_tool_use(entry, tv=tv)
+        if event_type in {"tool_output", "tool_error", "tool_retry"}:
+            return self._render_tool_result(entry, tv=tv)
+        if event_type == "result":
+            return self._render_result(entry, tv=tv)
+        return self._render_unknown(entry, tv=tv)
+
+    def _render_gza(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        subtype = entry.get("subtype", "")
+        message = entry.get("message", "")
+        if subtype == "info" and isinstance(message, str):
+            prefix = "Provider:"
+            if message.strip().startswith(prefix):
+                _, _, model = message.partition("Model:")
+                model_value = model.strip()
+                if model_value:
+                    self.configured_model = model_value
+        if not message:
+            return RenderedLines()
+        line = f"[gza:{subtype}] {message}" if subtype else f"[gza] {message}"
+        return RenderedLines(log_lines=[rich_escape(line)] if not tv else [], tv_lines=[line] if tv else [])
+
+    def _render_message(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        role = entry.get("role")
+        if entry.get("delta"):
+            self.suppressed_count += 1
+            return RenderedLines()
+        if role == "user":
+            self.suppressed_count += 1
+            return RenderedLines()
+        if role == "assistant":
+            content = entry.get("content", "")
+            if isinstance(content, str) and content.strip():
+                self.stats.step_count += 1
+                if tv:
+                    return RenderedLines(tv_lines=text_to_lines(content), starts_step=True)
+                return RenderedLines(log_lines=[rich_escape(content.strip())], starts_step=True)
+        return self._render_unknown(entry, tv=tv)
+
+    def _render_tool_use(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        tool_name = str(entry.get("tool_name", "unknown"))
+        tool_input = entry.get("tool_input", {})
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        if tv:
+            return RenderedLines(tv_lines=[f"-> {tool_one_liner(tool_name, tool_input)}"])
+        return RenderedLines(log_lines=[f"[green]\\[tool: {rich_escape(tool_name)}][/green] {rich_escape(tool_one_liner(tool_name, tool_input))}"])
+
+    def _render_tool_result(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        event_type = str(entry.get("type"))
+        payload = {key: value for key, value in entry.items() if key not in {"type", "id", "call_id"}}
+        line = f"{event_type} {json.dumps(payload, ensure_ascii=True, sort_keys=True)}"
+        if tv:
+            return RenderedLines(tv_lines=[line[:200]])
+        color = "red" if event_type == "tool_error" else "white"
+        return RenderedLines(log_lines=[f"[{color}]{rich_escape(line)}[/{color}]"])
+
+    def _render_result(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        stats = entry.get("stats", {})
+        if isinstance(stats, dict):
+            input_tokens = stats.get("input_tokens")
+            output_tokens = stats.get("output_tokens")
+            if isinstance(input_tokens, int):
+                self.stats.input_tokens = input_tokens
+            if isinstance(output_tokens, int):
+                self.stats.output_tokens = output_tokens
+            if self.stats.input_tokens or self.stats.output_tokens:
+                self.stats.cost_usd = calculate_cost(
+                    self._provider_model or self.configured_model or "default",
+                    self.stats.input_tokens,
+                    self.stats.output_tokens,
+                )
+        result_text = str(entry.get("result", "") or "").strip()
+        if tv:
+            if result_text:
+                return RenderedLines(tv_lines=[f"result {result_text}"])
+            return RenderedLines()
+        if result_text:
+            return RenderedLines(log_lines=[f"[green]\\[result][/green] {rich_escape(result_text)}"])
+        return RenderedLines()
+
+    def _render_unknown(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        if tv:
+            return RenderedLines(tv_lines=[generic_tv_summary(entry)])
+        lines = [generic_log_summary(entry)]
+        if self.verbose:
+            lines.extend(rich_escape(line) for line in pretty_json_lines(entry))
+        return RenderedLines(log_lines=lines)
 
 
 def _get_docker_config(image_name: str) -> DockerConfig:

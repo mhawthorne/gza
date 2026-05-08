@@ -10,6 +10,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from rich.markup import escape as rich_escape
+
 from .base import (
     DockerConfig,
     PreflightCheckResult,
@@ -19,6 +21,16 @@ from .base import (
     ensure_docker_image,
     verify_docker_credentials,
     write_preflight_entry,
+)
+from .log_rendering import (
+    RenderedLines,
+    RenderStats,
+    error_lines,
+    generic_log_summary,
+    generic_tv_summary,
+    pretty_json_lines,
+    strip_shell_wrapper,
+    text_to_lines,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
 
@@ -81,6 +93,140 @@ def calculate_cost(input_tokens: int, output_tokens: int, model: str = "") -> fl
         (output_tokens * output_price / 1_000_000)
     )
     return round(cost, 4)
+
+
+class CodexLogRenderer:
+    """Render Codex JSONL events for log replay/live and TV surfaces."""
+
+    def __init__(self, *, configured_model: str | None = None, verbose: bool = False) -> None:
+        self.configured_model = configured_model
+        self.verbose = verbose
+        self.stats = RenderStats()
+        self.suppressed_count = 0
+        self._usage_seen: set[tuple[int, int, int]] = set()
+
+    def handle_log(self, entry: dict[str, Any], *, live: bool) -> RenderedLines:
+        return self._handle(entry, tv=False)
+
+    def handle_tv(self, entry: dict[str, Any]) -> RenderedLines:
+        return self._handle(entry, tv=True)
+
+    def _handle(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        self._maybe_accumulate_usage(entry)
+        event_type = entry.get("type")
+        if event_type == "gza":
+            return self._render_gza(entry, tv=tv)
+        if event_type == "raw":
+            message = entry.get("message", "")
+            if isinstance(message, str) and message:
+                lines = [rich_escape(message)] if not tv else [message]
+                return RenderedLines(log_lines=lines if not tv else [], tv_lines=lines if tv else [])
+            return RenderedLines()
+        if event_type == "error":
+            if tv:
+                return RenderedLines(tv_lines=[generic_tv_summary(entry)])
+            return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in error_lines(entry.get("message", ""))])
+        if event_type == "thread.started":
+            thread_id = entry.get("thread_id")
+            if thread_id:
+                line = f"Session started (thread: {thread_id})"
+                return RenderedLines(log_lines=[line] if not tv else [], tv_lines=[line] if tv else [])
+            return self._render_unknown(entry, tv=tv)
+        if event_type == "turn.started":
+            self.suppressed_count += 1
+            return RenderedLines()
+        if event_type == "turn.completed":
+            self.suppressed_count += 1
+            return RenderedLines()
+        if event_type == "item.started":
+            self.suppressed_count += 1
+            return RenderedLines()
+        if event_type == "item.completed":
+            return self._render_item_completed(entry, tv=tv)
+        return self._render_unknown(entry, tv=tv)
+
+    def _render_gza(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        subtype = entry.get("subtype", "")
+        message = entry.get("message", "")
+        if subtype == "info" and isinstance(message, str):
+            prefix = "Provider:"
+            if message.strip().startswith(prefix):
+                _, _, model = message.partition("Model:")
+                model_value = model.strip()
+                if model_value:
+                    self.configured_model = model_value
+        if not message:
+            return RenderedLines()
+        line = f"[gza:{subtype}] {message}" if subtype else f"[gza] {message}"
+        return RenderedLines(log_lines=[rich_escape(line)] if not tv else [], tv_lines=[line] if tv else [])
+
+    def _maybe_accumulate_usage(self, entry: dict[str, Any]) -> None:
+        event_type = entry.get("type")
+        if not isinstance(event_type, str):
+            return
+        if not (event_type.endswith(".completed") or event_type.endswith(".error")):
+            return
+        usage = entry.get("usage")
+        if not isinstance(usage, dict):
+            return
+        input_tokens = _as_nonnegative_int(usage.get("input_tokens"))
+        output_tokens = _as_nonnegative_int(usage.get("output_tokens"))
+        cached_tokens = _as_nonnegative_int(usage.get("cached_input_tokens"))
+        key = (input_tokens, output_tokens, cached_tokens)
+        if key in self._usage_seen:
+            return
+        self._usage_seen.add(key)
+        self.stats.input_tokens += input_tokens + cached_tokens
+        self.stats.output_tokens += output_tokens
+        self.stats.cost_usd = calculate_cost(
+            self.stats.input_tokens,
+            self.stats.output_tokens,
+            self.configured_model or "",
+        )
+
+    def _render_item_completed(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        item = entry.get("item", {})
+        if not isinstance(item, dict):
+            return self._render_unknown(entry, tv=tv)
+        item_type = item.get("type")
+        if item_type == "agent_message":
+            text = item.get("text", "")
+            if isinstance(text, str) and text.strip():
+                self.stats.step_count += 1
+                if tv:
+                    return RenderedLines(tv_lines=text_to_lines(text), starts_step=True)
+                return RenderedLines(log_lines=[rich_escape(text.strip())], starts_step=True)
+            return RenderedLines()
+        if item_type == "command_execution":
+            command = str(item.get("command", ""))
+            output = str(item.get("aggregated_output", "") or "").strip()
+            exit_code = item.get("exit_code")
+            if tv:
+                lines = [f"-> $ {truncate_text(strip_shell_wrapper(command), 120)}"] if command else []
+                lines.extend(f"  {line}" for line in text_to_lines(output, max_lines=3, max_chars=120))
+                return RenderedLines(tv_lines=lines)
+            lines = [f"[green]\\[tool: Bash][/green] {rich_escape(strip_shell_wrapper(command))}"] if command else []
+            if output:
+                rendered = rich_escape(output if len(output) <= 200 else output[:200] + "...")
+                if isinstance(exit_code, int) and exit_code != 0:
+                    lines.append(f"[red]{rendered}[/red]")
+                else:
+                    lines.append(rendered)
+            return RenderedLines(log_lines=lines)
+        if item_type == "reasoning":
+            has_signal = any(item.get(key) for key in ("summary", "text", "error"))
+            if not has_signal:
+                self.suppressed_count += 1
+                return RenderedLines()
+        return self._render_unknown(entry, tv=tv)
+
+    def _render_unknown(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        if tv:
+            return RenderedLines(tv_lines=[generic_tv_summary(entry)])
+        lines = [generic_log_summary(entry)]
+        if self.verbose:
+            lines.extend(rich_escape(line) for line in pretty_json_lines(entry))
+        return RenderedLines(log_lines=lines)
 
 
 def build_headless_exec_args(work_dir: str | Path) -> list[str]:

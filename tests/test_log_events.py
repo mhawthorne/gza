@@ -38,11 +38,12 @@ def _count_steps_via_log_printer(path: Path) -> int:
         if not line or line.startswith("---"):
             continue
         printer.process(json.loads(line))
-    return printer._step_count
+    return printer.renderer.stats.step_count
 
 
 def _count_steps_via_tv_scan(path: Path) -> int:
-    _lines, stats = _scan_log(path, 1000)
+    provider = "codex" if "codex" in path.name else "claude"
+    _lines, stats = _scan_log(path, 1000, provider)
     return stats.step_count
 
 
@@ -93,7 +94,7 @@ def test_tv_scan_ignores_non_object_json_lines(tmp_path: Path):
         + "\n"
     )
 
-    lines, stats = _scan_log(path, 1000)
+    lines, stats = _scan_log(path, 1000, None)
 
-    assert stats.step_count == 2
+    assert stats.step_count == 1
     assert "plain string line" in lines
