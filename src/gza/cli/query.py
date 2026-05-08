@@ -2278,12 +2278,12 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
 
 def _started_at(worker: WorkerMetadata | None, task: DbTask | None) -> datetime | None:
     """Get the best available started timestamp."""
+    if task:
+        return task.started_at or task.created_at
     if worker:
         started = _parse_iso(worker.started_at)
         if started:
             return started
-    if task:
-        return task.started_at or task.created_at
     return None
 
 

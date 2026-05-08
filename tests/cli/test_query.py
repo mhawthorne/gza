@@ -4458,6 +4458,10 @@ class TestPsCommand:
         store = make_store(tmp_path)
         task = store.add("Reconciled task")
         store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.started_at = datetime(2026, 1, 8, 0, 1, tzinfo=UTC)
+        store.update(task)
 
         workers_dir = tmp_path / ".gza" / "workers"
         workers_dir.mkdir(parents=True, exist_ok=True)
@@ -4468,7 +4472,7 @@ class TestPsCommand:
                 pid=os.getpid(),
                 task_id=task.id,
                 task_slug=None,
-                started_at=datetime.now(UTC).isoformat(),
+                started_at="2026-01-08T00:00:00+00:00",
                 status="running",
                 log_file=None,
                 worktree=None,
@@ -4482,7 +4486,7 @@ class TestPsCommand:
         assert rows[0]["task_id"] == task.id
         assert rows[0]["source"] == "both"
         assert rows[0]["is_orphaned"] is False
-        assert rows[0]["started_at"] is not None
+        assert rows[0]["started_at"] == "2026-01-08T00:01:00+00:00"
 
         registry.remove("w-test-both")
 
@@ -4564,6 +4568,58 @@ class TestPsCommand:
         assert rows[0]["task_id"] == task.id
         assert rows[0]["status"] == "in_progress"
         assert rows[0]["is_orphaned"] is False
+
+    def test_ps_build_rows_prefer_task_started_at_over_older_worker(self, tmp_path: Path, monkeypatch):
+        """Task-backed ps rows should use task timing, not worker process age."""
+        import os
+
+        from gza.cli.query import _build_ps_rows
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Claimed task with newer task start")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.started_at = datetime(2026, 1, 8, 0, 1, tzinfo=UTC)
+        task.running_pid = os.getpid()
+        store.update(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-task-start-precedence",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at="2026-01-08T00:00:00+00:00",
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        fixed_now = datetime(2026, 1, 8, 0, 2, 30, tzinfo=UTC)
+
+        class _FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return fixed_now.replace(tzinfo=None)
+                return fixed_now.astimezone(tz)
+
+        monkeypatch.setattr(query_cli, "datetime", _FixedDateTime)
+
+        rows, _ = _build_ps_rows(registry, store, include_completed=False)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["started"] == "2026-01-08 00:01:00 UTC"
+        assert rows[0]["started_at"] == "2026-01-08T00:01:00+00:00"
+        assert rows[0]["sort_timestamp"] == "2026-01-08T00:01:00+00:00"
+        assert rows[0]["duration"] == "1m 30s"
 
     def test_no_orphan_warning_for_healthy_no_id_background_claim(self, tmp_path: Path):
         """Healthy claimed no-id background runs should not be classified as orphaned."""
@@ -4694,6 +4750,10 @@ class TestPsCommand:
         store = make_store(tmp_path)
         task = store.add("Formatted start time")
         store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.started_at = datetime(2026, 1, 8, 0, 1, tzinfo=UTC)
+        store.update(task)
 
         workers_dir = tmp_path / ".gza" / "workers"
         workers_dir.mkdir(parents=True, exist_ok=True)
@@ -4713,7 +4773,8 @@ class TestPsCommand:
 
         result = run_gza("ps", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "2026-01-08 00:00:00 UTC" in result.stdout
+        assert "2026-01-08 00:01:00 UTC" in result.stdout
+        assert "2026-01-08 00:00:00 UTC" not in result.stdout
 
         registry.remove("w-test-start-format")
 
@@ -5501,6 +5562,69 @@ class TestPsCommand:
         # capsys captures a non-TTY stream, so ANSI codes must be absent
         assert "\033[2J" not in captured.out
         assert "\033[H" not in captured.out
+
+    def test_ps_poll_json_prefers_task_started_at_over_older_worker(self, tmp_path: Path, capsys, monkeypatch):
+        """Poll-mode task rows should keep using task timing in JSON snapshots."""
+        import argparse
+        import os
+
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Polled claimed task")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.started_at = datetime(2026, 1, 8, 0, 1, tzinfo=UTC)
+        task.running_pid = os.getpid()
+        store.update(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-poll-task-start-precedence",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at="2026-01-08T00:00:00+00:00",
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        fixed_now = datetime(2026, 1, 8, 0, 2, 30, tzinfo=UTC)
+
+        class _FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return fixed_now.replace(tzinfo=None)
+                return fixed_now.astimezone(tz)
+
+        monkeypatch.setattr(query_cli, "datetime", _FixedDateTime)
+
+        args = argparse.Namespace(project_dir=tmp_path, quiet=False, json=True, poll=None)
+        query_cli._print_ps_output(
+            args,
+            registry,
+            store,
+            poll_interval=2,
+            seen_tasks={},
+            recent_minutes=10,
+        )
+
+        captured = capsys.readouterr()
+        json_start = captured.out.index("[")
+        json_output = captured.out[json_start:]
+        rows = json.loads(json_output)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["started_at"] == "2026-01-08T00:01:00+00:00"
+        assert rows[0]["duration"] == "1m 30s"
 
     def test_ps_poll_keeps_completed_tasks_visible(self, tmp_path: Path):
         """Poll mode keeps completed tasks visible so users see transitions.
