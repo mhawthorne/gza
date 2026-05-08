@@ -4748,8 +4748,8 @@ class TestResumeVerificationPrompt:
 class TestNonCodeReportArtifactContract:
     """Regression tests for non-code report artifact contract enforcement."""
 
-    def test_resume_review_fails_when_stale_filename_written(self, tmp_path: Path):
-        """Resumed review should fail when provider writes only the old review filename."""
+    def test_resume_review_recovers_when_single_stale_filename_written(self, tmp_path: Path):
+        """Resumed review should recover from exactly one mismatched report filename."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -4809,7 +4809,10 @@ class TestNonCodeReportArtifactContract:
         mock_git.default_branch.return_value = "main"
         mock_git._run.return_value = Mock(returncode=0)
 
-        with patch("gza.runner.post_review_to_pr"), patch("gza.runner.console"):
+        mock_console = Mock()
+        with patch("gza.runner.post_review_to_pr"), patch("gza.runner.console", mock_console), patch(
+            "gza.runner.maybe_auto_regenerate_learnings", return_value=None
+        ):
             exit_code = _run_non_code_task(
                 resumed_review, config, store, mock_provider, mock_git, resume=True
             )
@@ -4817,12 +4820,20 @@ class TestNonCodeReportArtifactContract:
         assert exit_code == 0
         refreshed = store.get(resumed_review.id)
         assert refreshed is not None
-        assert refreshed.status == "failed"
-        assert refreshed.failure_reason == "MISSING_REPORT_ARTIFACT"
-        assert refreshed.report_file is None
-        assert refreshed.output_content is None
+        assert refreshed.status == "completed"
+        assert refreshed.failure_reason is None
+        assert refreshed.output_content == "# Review\n\nVerdict: APPROVED"
         expected_host_report = tmp_path / ".gza" / "reviews" / f"{resumed_review.slug}.md"
-        assert not expected_host_report.exists()
+        assert expected_host_report.exists()
+        assert expected_host_report.read_text() == "# Review\n\nVerdict: APPROVED"
+        warning_lines = [
+            call.args[0]
+            for call in mock_console.print.call_args_list
+            if call.args and "recovering from mismatched file" in str(call.args[0])
+        ]
+        assert warning_lines
+        assert resumed_review.slug in warning_lines[0]
+        assert prior_review.slug in warning_lines[0]
 
     def test_non_code_success_without_expected_report_marks_failed_and_skips_copy_back(self, tmp_path: Path):
         """Provider success without expected report must not mark completion or copy host artifact."""
@@ -5111,6 +5122,114 @@ class TestNonCodeReportArtifactContract:
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "MISSING_REPORT_ARTIFACT"
         assert refreshed.output_content is None
+
+    def test_missing_report_artifact_without_any_md_candidates_still_fails(self, tmp_path: Path):
+        """Missing expected report with an empty provider log and no md candidates should fail."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        review_task = store.add(prompt="Review feature empty-dir", task_type="review")
+        review_task.slug = "20260213-review-feature-empty-dir"
+        store.update(review_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 50
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=1.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            session_id="session-empty-dir",
+            error_type=None,
+        )
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        with patch("gza.runner.console"):
+            exit_code = _run_non_code_task(
+                review_task, config, store, mock_provider, mock_git, resume=False
+            )
+
+        assert exit_code == 0
+        refreshed = store.get(review_task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "MISSING_REPORT_ARTIFACT"
+        assert refreshed.output_content is None
+
+    def test_missing_report_artifact_with_multiple_md_candidates_still_fails(self, tmp_path: Path):
+        """Missing expected report with multiple mismatched md candidates should still fail."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        review_task = store.add(prompt="Review feature ambiguous", task_type="review")
+        review_task.slug = "20260213-review-feature-ambiguous"
+        store.update(review_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 50
+
+        def provider_run(_config, _prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            review_dir = work_dir / ".gza" / "reviews"
+            review_dir.mkdir(parents=True, exist_ok=True)
+            (review_dir / "20260212-review-feature-ambiguous-old.md").write_text("# Review\n\nVerdict: APPROVED")
+            (review_dir / "20260211-review-feature-ambiguous-older.md").write_text("# Review\n\nVerdict: APPROVED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id="session-ambiguous",
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.side_effect = provider_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        mock_console = Mock()
+        with patch("gza.runner.console", mock_console):
+            exit_code = _run_non_code_task(
+                review_task, config, store, mock_provider, mock_git, resume=False
+            )
+
+        assert exit_code == 0
+        refreshed = store.get(review_task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "MISSING_REPORT_ARTIFACT"
+        assert refreshed.output_content is None
+        candidate_lines = [
+            call.args[0]
+            for call in mock_console.print.call_args_list
+            if call.args and "Detected report files with other names in worktree" in str(call.args[0])
+        ]
+        assert candidate_lines
+        assert "20260211-review-feature-ambiguous-older.md" in candidate_lines[0]
+        assert "20260212-review-feature-ambiguous-old.md" in candidate_lines[0]
 
     def test_normal_run_does_not_include_verification_prompt(self, tmp_path: Path):
         """Test that normal (non-resume) runs use the standard prompt without verification."""

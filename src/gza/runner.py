@@ -4139,50 +4139,66 @@ def _run_non_code_task(
                     for path in worktree_report_dir.glob("*.md")
                     if path != worktree_report_path
                 )
-                mismatch_note = (
-                    f" (found other report files: {', '.join(str(p) for p in stale_candidates)})"
-                    if stale_candidates
-                    else ""
-                )
-                failure_message = (
-                    f"Outcome: failed (missing report artifact: expected {expected_relative}{mismatch_note})"
-                )
-                console.print(f"Expected report file: [yellow]{report_file_relative}[/yellow]")
-                if stale_candidates:
-                    console.print(
-                        "Detected report files with other names in worktree "
-                        f"(possible stale resume session state): {', '.join(str(p) for p in stale_candidates)}"
+                if len(stale_candidates) == 1:
+                    actual_relative = stale_candidates[0]
+                    logger.warning(
+                        "Task %s: expected report artifact %s missing; recovering from mismatched file %s",
+                        task.slug,
+                        expected_relative,
+                        actual_relative,
                     )
-                console.print(f"See log file for details: {log_file.relative_to(config.project_dir)}")
-                task_footer(
-                    task,
-                    stats,
-                    status="Failed: expected report artifact was not created",
-                    worktree=worktree_path,
-                    store=store,
-                )
-                write_log_entry(
-                    log_file,
-                    {
-                        "type": "gza",
-                        "subtype": "outcome",
-                        "message": failure_message,
-                        "exit_code": exit_code,
-                        "failure_reason": "MISSING_REPORT_ARTIFACT",
-                    },
-                )
-                _write_stats_entry(log_file, stats)
-                _mark_task_failed(
-                    task=task,
-                    config=config,
-                    store=store,
-                    log_file=log_file,
-                    stats=stats,
-                    explicit_reason="MISSING_REPORT_ARTIFACT",
-                    error_type=None,
-                    exit_code=exit_code,
-                )
-                return 0
+                    console.print(
+                        "[yellow]Warning: expected report artifact "
+                        f"{expected_relative} was not created; recovering from mismatched file "
+                        f"{actual_relative}[/yellow]"
+                    )
+                    recovered_content = (worktree_path / actual_relative).read_text()
+                    worktree_report_path.write_text(recovered_content)
+                else:
+                    mismatch_note = (
+                        f" (found other report files: {', '.join(str(p) for p in stale_candidates)})"
+                        if stale_candidates
+                        else ""
+                    )
+                    failure_message = (
+                        f"Outcome: failed (missing report artifact: expected {expected_relative}{mismatch_note})"
+                    )
+                    console.print(f"Expected report file: [yellow]{report_file_relative}[/yellow]")
+                    if stale_candidates:
+                        console.print(
+                            "Detected report files with other names in worktree "
+                            f"(possible stale resume session state): {', '.join(str(p) for p in stale_candidates)}"
+                        )
+                    console.print(f"See log file for details: {log_file.relative_to(config.project_dir)}")
+                    task_footer(
+                        task,
+                        stats,
+                        status="Failed: expected report artifact was not created",
+                        worktree=worktree_path,
+                        store=store,
+                    )
+                    write_log_entry(
+                        log_file,
+                        {
+                            "type": "gza",
+                            "subtype": "outcome",
+                            "message": failure_message,
+                            "exit_code": exit_code,
+                            "failure_reason": "MISSING_REPORT_ARTIFACT",
+                        },
+                    )
+                    _write_stats_entry(log_file, stats)
+                    _mark_task_failed(
+                        task=task,
+                        config=config,
+                        store=store,
+                        log_file=log_file,
+                        stats=stats,
+                        explicit_reason="MISSING_REPORT_ARTIFACT",
+                        error_type=None,
+                        exit_code=exit_code,
+                    )
+                    return 0
 
         console.print(f"Report written to: {report_file_relative}")
         # Ensure target directory exists

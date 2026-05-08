@@ -40,6 +40,8 @@ Unlike code task worktrees, non-code task worktrees are **removed on success** a
 
 **Log-recovery path**: When the expected report artifact is missing but content can be recovered from the provider's JSONL log (a `{"type": "result"}` entry), the task completes successfully and the worktree is cleaned up normally — not preserved. This recovery is logged as a warning and the outcome is recorded as `completed (recovered from provider log)`.
 
+**Single-file stale-name recovery**: If log recovery fails and the report directory contains exactly one other `*.md` file, gza treats that as a stale filename mismatch, copies its contents into the expected path, logs a warning naming both filenames, and completes normally. If there are zero or multiple mismatched `*.md` files, the task still fails with `MISSING_REPORT_ARTIFACT`.
+
 ### `gza rebase` CLI (foreground mode)
 
 Foreground `gza rebase` creates a dedicated `rebase` child task and uses that row as the canonical execution owner (status + `log_file`) across both mechanical and provider-assisted phases.
