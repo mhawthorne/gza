@@ -6,11 +6,17 @@ import json
 from datetime import datetime
 from typing import Literal
 
-from gza.console import shorten_prompt
+import gza.colors as _colors
+from gza.console import shorten_prompt, truncate
 from gza.query import TaskLineageNode
-from gza.task_query import LineageRow, TaskQueryResult, TaskRow
+from gza.task_query import (
+    LineageRow,
+    TaskQueryResult,
+    TaskRow,
+    projection_fields,
+)
 
-PresentationMode = Literal["flat", "grouped", "lineage", "tree", "one_line", "json", "rich"]
+PresentationMode = Literal["flat", "blocks", "grouped", "lineage", "tree", "one_line", "json", "rich"]
 
 
 def render_query_result(result: TaskQueryResult, mode: PresentationMode) -> str:
@@ -20,6 +26,9 @@ def render_query_result(result: TaskQueryResult, mode: PresentationMode) -> str:
 
     if mode == "one_line":
         return _render_one_line(result)
+
+    if mode == "blocks":
+        return _render_blocks(result)
 
     if mode == "rich":
         return _render_rich(result)
@@ -177,7 +186,8 @@ def _render_rich(result: TaskQueryResult) -> str:
         completed_at = values.get("completed_at")
         if isinstance(completed_at, datetime):
             header_bits.append(f"({completed_at.strftime('%Y-%m-%d %H:%M')})")
-        lines.append(f"⚡ {' '.join(header_bits)} {values.get('prompt', task.prompt)}".rstrip())
+        header_prompt = _headline_prompt(str(values.get("prompt", task.prompt)))
+        lines.append(f"⚡ {' '.join(header_bits)} {header_prompt}".rstrip())
 
         tree_text = values.get("lineage_text")
         if not isinstance(tree_text, str):
@@ -218,10 +228,11 @@ def _render_rich(result: TaskQueryResult) -> str:
             review_verdict = values.get("review_verdict")
             if review_verdict:
                 score = values.get("review_score")
+                review_badge = str(review_verdict)
                 if score is not None:
-                    review_line = f"{review_line} [{review_verdict} ({score})]"
-                else:
-                    review_line = f"{review_line} [{review_verdict}]"
+                    review_badge = f"{review_badge} ({score})"
+                review_badge = _style_unmerged_field_value("review_verdict", review_badge, review_verdict)
+                review_line = f"{review_line} [{review_badge}]"
             lines.append(f"review: {review_line}")
 
         report_file = values.get("report_file")
@@ -242,6 +253,57 @@ def _render_rich(result: TaskQueryResult) -> str:
     if total_rows == 0:
         return ""
     return "\n".join(lines)
+
+
+def _projection_field_order(result: TaskQueryResult) -> tuple[str, ...]:
+    scope: Literal["tasks", "lineages"] = (
+        "lineages" if any(isinstance(row, LineageRow) for row in result.rows) else "tasks"
+    )
+    return projection_fields(result.query.projection, scope=scope)
+
+
+def _render_blocks(result: TaskQueryResult) -> str:
+    fields = _projection_field_order(result)
+    if not fields:
+        return ""
+
+    lines: list[str] = []
+    single_field = len(fields) == 1
+    for index, row in enumerate(result.rows):
+        if index > 0 and not single_field:
+            lines.append("-" * 32)
+        values = row.values
+        if single_field:
+            rendered = _render_field_value(fields[0], values.get(fields[0]))
+            lines.append(rendered)
+            continue
+        for field_name in fields:
+            lines.append(f"{field_name}: {_render_field_value(field_name, values.get(field_name))}")
+    return "\n".join(lines)
+
+
+def _render_field_value(field_name: str, value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, list):
+        return ", ".join("" if item is None else str(item) for item in value)
+    if isinstance(value, tuple):
+        return ", ".join("" if item is None else str(item) for item in value)
+    return _style_unmerged_field_value(field_name, str(value), value)
+
+
+def _headline_prompt(prompt: str) -> str:
+    first_line = next((line.strip() for line in prompt.splitlines() if line.strip()), "")
+    return truncate(first_line, 100) if first_line else shorten_prompt(prompt, 100)
+
+
+def _style_unmerged_field_value(field_name: str, display_value: str, raw_value: object) -> str:
+    color = _colors.get_unmerged_field_value_color(field_name, raw_value)
+    if not color:
+        return display_value
+    return f"[{color}]{display_value}[/{color}]"
 
 
 __all__ = ["render_query_result"]

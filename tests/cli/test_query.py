@@ -5828,8 +5828,8 @@ class TestUnmergedReviewStatus:
         "test_unmerged_shows_deleted_branch_if_merge_status_unmerged",
         "test_unmerged_keeps_deleted_local_branch_visible_when_remote_feature_still_exists",
         "test_unmerged_migrates_deleted_local_branch_with_remote_survivor_via_shared_reconcile",
-        "test_unmerged_update_backfills_merge_status",
-        "test_unmerged_update_marks_stale_merged_task_as_merged",
+        "test_unmerged_backfills_merge_status",
+        "test_unmerged_marks_stale_merged_task_as_merged",
         "test_unmerged_uses_existing_origin_default_branch_without_fetch_by_default",
         "test_unmerged_fetch_flag_fetches_origin_default_branch_before_canonical_reconcile",
         "test_unmerged_update_refreshes_diff_stats_for_live_branch",
@@ -5837,7 +5837,7 @@ class TestUnmergedReviewStatus:
         "test_unmerged_into_current_keeps_deleted_branch_visible_when_not_merged_into_current",
         "test_unmerged_target_uses_specified_branch",
         "test_unmerged_target_keeps_deleted_branch_visible_when_not_merged_into_target",
-        "test_unmerged_update_warns_and_does_not_persist_for_live_targets",
+        "test_unmerged_live_target_does_not_persist_reconciliation",
         "test_unmerged_live_target_excludes_same_branch_fix_descendants",
     }
 
@@ -6821,8 +6821,8 @@ class TestUnmergedReviewStatus:
         assert not (older_idx < marker_idx < latest_idx)
 
 
-class TestUnmergedAllFlag:
-    """Tests for 'gza unmerged --all' flag."""
+class TestUnmergedSelectionBehavior:
+    """Tests for `gza unmerged` task selection behavior."""
 
     @pytest.fixture(autouse=True)
     def _use_fast_unmerged_env(self, monkeypatch):
@@ -6840,7 +6840,7 @@ class TestUnmergedAllFlag:
         monkeypatch.setattr(query_cli, "Git", lambda _project_dir: fake_git)
         monkeypatch.setattr(query_cli, "GitHub", _UnavailableGitHub)
 
-    def test_all_flag_excludes_failed_tasks(self, tmp_path: Path):
+    def test_unmerged_excludes_failed_tasks(self, tmp_path: Path):
         """Failed tasks are excluded from gza unmerged (only completed tasks shown)."""
         store, task, git = setup_unmerged_env(
             tmp_path,
@@ -6857,13 +6857,8 @@ class TestUnmergedAllFlag:
         assert "Failed but useful task" not in result.stdout
         assert "No unmerged tasks" in result.stdout
 
-        # --all is a no-op: same result
-        result = run_gza("unmerged", "--all", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "Failed but useful task" not in result.stdout
-
-    def test_all_flag_is_noop_with_merge_status(self, tmp_path: Path):
-        """--all flag is a no-op since we now use merge_status from the database."""
+    def test_unmerged_shows_only_unmerged_rows(self, tmp_path: Path):
+        """Only rows with canonical unmerged merge state should appear."""
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Unmerged task",
@@ -6883,12 +6878,6 @@ class TestUnmergedAllFlag:
 
         # Without --all
         result = run_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "Unmerged task" in result.stdout
-        assert "Merged task" not in result.stdout
-
-        # With --all: same result (it's a no-op)
-        result = run_gza("unmerged", "--all", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Unmerged task" in result.stdout
         assert "Merged task" not in result.stdout
@@ -6971,8 +6960,8 @@ class TestUnmergedAllFlag:
         assert refreshed is not None
         assert refreshed.merge_status == "unmerged"
 
-    def test_unmerged_update_backfills_merge_status(self, tmp_path: Path):
-        """Plain unmerged backfills canonical merge_status; --update only warns."""
+    def test_unmerged_backfills_merge_status(self, tmp_path: Path):
+        """Plain unmerged backfills canonical merge_status."""
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Old task needing migration",
@@ -6989,20 +6978,11 @@ class TestUnmergedAllFlag:
         migrated_task = store.get(task.id)
         assert migrated_task.merge_status == "unmerged"
 
-        result = run_gza("unmerged", "--update", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "deprecated" in result.stderr
-        assert "Migrating merge status" not in result.stdout
-        assert "Old task needing migration" in result.stdout
-
-        updated_task = store.get(task.id)
-        assert updated_task.merge_status == "unmerged"
-
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Migrating merge status" not in result.stdout
 
-    def test_unmerged_update_marks_stale_merged_task_as_merged(self, tmp_path: Path):
+    def test_unmerged_marks_stale_merged_task_as_merged(self, tmp_path: Path):
         """Plain unmerged repairs stale merged rows in the canonical DB view."""
         store, task, git = setup_unmerged_env(
             tmp_path,
@@ -7020,14 +7000,6 @@ class TestUnmergedAllFlag:
 
         stale_task = store.get(task.id)
         assert stale_task.merge_status == "merged"
-
-        result = run_gza("unmerged", "--update", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "deprecated" in result.stderr
-        assert "No unmerged tasks" in result.stdout
-
-        updated_task = store.get(task.id)
-        assert updated_task.merge_status == "merged"
 
     def test_unmerged_same_branch_improve_without_merge_status_does_not_print_migration_banner(
         self,
@@ -7253,8 +7225,8 @@ class TestUnmergedAllFlag:
         assert refreshed is not None
         assert refreshed.merge_status == "merged"
 
-    def test_unmerged_update_warns_and_does_not_persist_for_live_targets(self, tmp_path: Path):
-        """Deprecated `--update` remains a no-op for non-canonical target comparisons."""
+    def test_unmerged_live_target_does_not_persist_reconciliation(self, tmp_path: Path):
+        """Live target comparisons stay query-only and do not backfill merge_status."""
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Live target no-op task",
@@ -7268,15 +7240,12 @@ class TestUnmergedAllFlag:
 
         result = run_gza(
             "unmerged",
-            "--update",
             "--target",
             "integration",
             "--project",
             str(tmp_path),
         )
         assert result.returncode == 0
-        assert "deprecated" in result.stderr
-        assert "has no effect" in result.stderr
         assert "Migrating merge status" not in result.stdout
         assert "No unmerged tasks" in result.stdout
 
@@ -7531,8 +7500,8 @@ class TestUnmergedImprovedDisplay:
         assert "Showing tasks unmerged relative to main" not in captured.out
         assert "Live diff-stat failure task" not in captured.out
 
-    def test_unmerged_only_persists_merge_status_during_explicit_update(self, tmp_path: Path):
-        """Default unmerged persists canonical merge truth; `--update` only warns."""
+    def test_unmerged_persists_merge_status_during_default_refresh(self, tmp_path: Path):
+        """Default unmerged persists canonical merge truth."""
         store, task, _git = setup_unmerged_env(
             tmp_path,
             task_prompt="Legacy merge-status update task",
@@ -7549,14 +7518,6 @@ class TestUnmergedImprovedDisplay:
         migrated = store.get(task.id)
         assert migrated is not None
         assert migrated.merge_status == "unmerged"
-
-        refreshed_view = run_gza("unmerged", "--update", "--project", str(tmp_path))
-        assert refreshed_view.returncode == 0
-        assert "deprecated" in refreshed_view.stderr
-        updated = store.get(task.id)
-        assert updated is not None
-        assert updated.merge_status == "unmerged"
-        assert "Legacy merge-status update task" in refreshed_view.stdout
 
     def test_unmerged_shows_diff_stats(self, tmp_path: Path):
         """Unmerged output shows diff stats (files, LOC added/removed)."""
@@ -7691,23 +7652,33 @@ class TestUnmergedUnifiedQueryOutput:
     def _stub_github(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(query_cli, "GitHub", _UnavailableGitHub)
 
-    def test_unmerged_view_flat_omits_lineage_heavy_sections(self, tmp_path: Path) -> None:
-        store, task, _git = setup_unmerged_env(tmp_path, task_prompt="Flat output task")
+    def test_unmerged_default_text_is_slim_and_scannable(self, tmp_path: Path) -> None:
+        store, task, _git = setup_unmerged_env(
+            tmp_path,
+            task_prompt=(
+                "Ship slimmer unmerged view\n\n"
+                "Context:\n- this should not render verbatim\n\n"
+                "Acceptance:\n- one line only"
+            ),
+        )
 
-        review = store.add("Review flat output", task_type="review")
+        review = store.add("Review slim output", task_type="review")
         review.status = "completed"
         review.completed_at = datetime.now(UTC)
         review.depends_on = task.id
         review.output_content = "Verdict: APPROVED"
         store.update(review)
 
-        result = run_gza("unmerged", "--view", "flat", "--project", str(tmp_path))
+        result = run_gza("unmerged", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Flat output task" in result.stdout
-        assert "lineage:" not in result.stdout
-        assert "branch:" not in result.stdout
-        assert "review:" not in result.stdout
+        header_line = next(line for line in result.stdout.splitlines() if line.startswith("⚡ "))
+        assert "Ship slimmer unmerged view" in header_line
+        assert "Context:" not in header_line
+        assert "Acceptance:" not in header_line
+        assert "lineage:" in result.stdout
+        assert "branch:" in result.stdout
+        assert "review: reviewed [✓ approved]" in " ".join(result.stdout.split())
 
     def test_unmerged_json_empty_results_returns_empty_array_without_human_message(
         self,
@@ -7739,14 +7710,9 @@ class TestUnmergedUnifiedQueryOutput:
             into_current=False,
             target=None,
             fetch=False,
-            update=False,
             limit=5,
-            commits_only=False,
-            all=False,
             json=True,
             fields=None,
-            preset=None,
-            view="rich",
         )
 
         with patch("gza.db.needs_merge_status_migration", return_value=True):
@@ -7758,25 +7724,20 @@ class TestUnmergedUnifiedQueryOutput:
         assert "Migrating merge status" not in captured.out
         assert "Migrating merge status" in captured.err
 
-    def test_unmerged_view_flat_skips_lineage_rendering_work(
+    def test_unmerged_text_fields_skip_lineage_rendering_work(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        _setup_unmerged_env_fast(tmp_path, task_prompt="Flat output task")
+        _setup_unmerged_env_fast(tmp_path, task_prompt="Text output task")
         args = argparse.Namespace(
             project_dir=tmp_path,
             into_current=False,
             target=None,
             fetch=False,
-            update=False,
             limit=5,
-            commits_only=False,
-            all=False,
             json=False,
-            fields=None,
-            preset=None,
-            view="flat",
+            fields="id,prompt",
         )
 
         with patch("gza.cli.query._format_lineage", side_effect=AssertionError("lineage render should be skipped")):
@@ -7784,7 +7745,8 @@ class TestUnmergedUnifiedQueryOutput:
 
         captured = capsys.readouterr()
         assert result == 0
-        assert "Flat output task" in captured.out
+        assert "id:" in captured.out
+        assert "prompt: Text output task" in captured.out
 
     def test_unmerged_json_fields_support_narrow_projection_and_keep_progress_on_stderr(
         self,
@@ -7806,6 +7768,43 @@ class TestUnmergedUnifiedQueryOutput:
         assert payload == [{"id": payload[0]["id"], "prompt": "JSON output task"}]
         assert "Progress:" in result.stderr
         assert "On branch" not in result.stdout
+
+    def test_unmerged_text_fields_support_single_and_multi_projection(self, tmp_path: Path) -> None:
+        store, task, _git = setup_unmerged_env(tmp_path, task_prompt="Projected text row")
+
+        multi = run_gza("unmerged", "--fields", "id,prompt", "--project", str(tmp_path))
+        assert multi.returncode == 0
+        assert "On branch main" in multi.stdout
+        assert f"id: {task.id}" in multi.stdout
+        assert "prompt: Projected text row" in multi.stdout
+
+        single = run_gza("unmerged", "--fields", "id", "--project", str(tmp_path))
+        assert single.returncode == 0
+        value_lines = [line for line in single.stdout.splitlines() if line and not line.startswith("On branch ")]
+        assert value_lines[-1] == task.id
+
+    def test_unmerged_text_fields_unknown_field_errors_clearly(self, tmp_path: Path) -> None:
+        setup_unmerged_env(tmp_path, task_prompt="Unknown field row")
+
+        result = run_gza("unmerged", "--fields", "id,nope", "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "unknown field for gza unmerged: nope" in result.stderr
+
+    @pytest.mark.parametrize("flag_args", [
+        ("--view", "flat"),
+        ("--preset", "json_minimal"),
+        ("--commits-only",),
+        ("--all",),
+        ("--update",),
+    ])
+    def test_unmerged_removed_compatibility_flags_error(self, tmp_path: Path, flag_args: tuple[str, ...]) -> None:
+        setup_unmerged_env(tmp_path, task_prompt="Removed flags row")
+
+        result = run_gza("unmerged", *flag_args, "--project", str(tmp_path))
+
+        assert result.returncode != 0
+        assert "unrecognized arguments" in result.stderr
 
     def test_unmerged_json_limit_footer_stays_off_stdout(
         self,
@@ -7834,14 +7833,9 @@ class TestUnmergedUnifiedQueryOutput:
             into_current=False,
             target=None,
             fetch=False,
-            update=False,
             limit=5,
-            commits_only=False,
-            all=False,
             json=True,
             fields=None,
-            preset=None,
-            view="rich",
         )
 
         result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
@@ -7889,42 +7883,27 @@ class TestUnmergedUnifiedQueryOutput:
             into_current=False,
             target=None,
             fetch=False,
-            update=False,
             limit=5,
-            commits_only=False,
-            all=False,
             json=False,
             fields=None,
-            preset=None,
-            view="rich",
         )
-        flat_args = argparse.Namespace(
+        block_args = argparse.Namespace(
             project_dir=tmp_path,
             into_current=False,
             target=None,
             fetch=False,
-            update=False,
             limit=5,
-            commits_only=False,
-            all=False,
             json=False,
-            fields=None,
-            preset=None,
-            view="flat",
+            fields="id,prompt,status",
         )
         json_args = argparse.Namespace(
             project_dir=tmp_path,
             into_current=False,
             target=None,
             fetch=False,
-            update=False,
             limit=5,
-            commits_only=False,
-            all=False,
             json=True,
             fields="id,prompt,status",
-            preset=None,
-            view="rich",
         )
 
         rich_result = query_cli.cmd_unmerged(rich_args, git=_FastUnmergedGit())
@@ -7935,13 +7914,12 @@ class TestUnmergedUnifiedQueryOutput:
         assert rich_header.endswith("Completed unmerged implementation")
         assert root_task.id in rich_header
 
-        flat_result = query_cli.cmd_unmerged(flat_args, git=_FastUnmergedGit())
-        flat_output = capsys.readouterr()
-        assert flat_result == 0
-        flat_lines = [line for line in flat_output.out.splitlines() if root_task.id in line]
-        assert flat_lines
-        assert "Completed unmerged implementation" in flat_lines[0]
-        assert "Pending same-branch follow-up" not in flat_lines[0]
+        block_result = query_cli.cmd_unmerged(block_args, git=_FastUnmergedGit())
+        block_output = capsys.readouterr()
+        assert block_result == 0
+        assert f"id: {root_task.id}" in block_output.out
+        assert "prompt: Completed unmerged implementation" in block_output.out
+        assert "Pending same-branch follow-up" not in block_output.out
 
         json_result = query_cli.cmd_unmerged(json_args, git=_FastUnmergedGit())
         json_output = capsys.readouterr()
@@ -7964,14 +7942,9 @@ class TestUnmergedUnifiedQueryOutput:
             into_current=False,
             target=None,
             fetch=False,
-            update=False,
             limit=5,
-            commits_only=False,
-            all=False,
             json=True,
             fields="id,prompt",
-            preset=None,
-            view="rich",
         )
 
         with patch("gza.cli.query._format_lineage", side_effect=AssertionError("lineage render should be skipped")):
@@ -7982,7 +7955,7 @@ class TestUnmergedUnifiedQueryOutput:
         assert json.loads(captured.out) == [{"id": task.id, "prompt": "JSON output task"}]
         assert "Progress:" in captured.err
 
-    def test_unmerged_rich_view_still_computes_pruned_lineage_text(
+    def test_unmerged_default_text_still_computes_descendants_only_lineage_text(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -7993,14 +7966,9 @@ class TestUnmergedUnifiedQueryOutput:
             into_current=False,
             target=None,
             fetch=False,
-            update=False,
             limit=5,
-            commits_only=False,
-            all=False,
             json=False,
             fields=None,
-            preset=None,
-            view="rich",
         )
         original_format_lineage = query_cli._format_lineage
 
@@ -8014,17 +7982,138 @@ class TestUnmergedUnifiedQueryOutput:
         assert "lineage:" in captured.out
         assert "Rich output task" in captured.out
 
+    def test_unmerged_default_text_attaches_review_verdict_color_via_theme(self, tmp_path: Path) -> None:
+        store, task, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Color verdict task")
+        review = store.add("Review color verdict", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.depends_on = task.id
+        review.output_content = "Verdict: APPROVED"
+        store.update(review)
+
+        config = query_cli.Config.load(tmp_path)
+        store = query_cli.get_store(config, open_mode="readwrite")
+        service = query_cli._TaskQueryService(store)
+        query = query_cli._TaskQueryPresets.unmerged(
+            branch_owner_ids=(task.id,),
+            task_ids=(task.id,),
+            limit=5,
+            mode="rich",
+            projection=query_cli._TaskProjectionSpec(preset=query_cli._TaskProjectionPreset.UNMERGED_DEFAULT),
+        )
+        result = service.run(query)
+        enriched = query_cli._enrich_unmerged_result(
+            result,
+            store=store,
+            config=config,
+            git_client=_FastUnmergedGit(),
+            target_branch="main",
+            default_branch="main",
+        )
+
+        rendered = enriched.render("rich")
+        assert f"[{query_cli._colors.UNMERGED_COLORS.review_approved}]✓ approved[/{query_cli._colors.UNMERGED_COLORS.review_approved}]" in rendered
+
+    @pytest.mark.parametrize(
+        ("verdict_text", "score", "badge_text"),
+        [
+            ("APPROVED", 91, "✓ approved"),
+            ("CHANGES_REQUESTED", 34, "⚠ changes requested"),
+        ],
+    )
+    def test_unmerged_scored_review_badge_keeps_single_score_and_verdict_theme(
+        self,
+        tmp_path: Path,
+        verdict_text: str,
+        score: int,
+        badge_text: str,
+    ) -> None:
+        store, task, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Scored verdict task")
+        review = store.add("Review scored verdict", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.depends_on = task.id
+        review.output_content = f"Verdict: {verdict_text}"
+        review.review_score = score
+        store.update(review)
+
+        config = query_cli.Config.load(tmp_path)
+        store = query_cli.get_store(config, open_mode="readwrite")
+        service = query_cli._TaskQueryService(store)
+        query = query_cli._TaskQueryPresets.unmerged(
+            branch_owner_ids=(task.id,),
+            task_ids=(task.id,),
+            limit=5,
+            mode="rich",
+            projection=query_cli._TaskProjectionSpec(preset=query_cli._TaskProjectionPreset.UNMERGED_DEFAULT),
+        )
+        result = service.run(query)
+        enriched = query_cli._enrich_unmerged_result(
+            result,
+            store=store,
+            config=config,
+            git_client=_FastUnmergedGit(),
+            target_branch="main",
+            default_branch="main",
+        )
+
+        rendered = enriched.render("rich")
+        color = query_cli._colors.get_unmerged_field_value_color("review_verdict", badge_text)
+        assert color is not None
+        assert rendered.count(f"({score})") == 1
+        assert f"[{color}]{badge_text} ({score})[/{color}]" in rendered
+
     def test_unmerged_progress_logs_counts_for_refresh_query_and_render(self, tmp_path: Path) -> None:
         setup_unmerged_env(tmp_path, task_prompt="Progress task")
 
         result = run_gza("unmerged", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert re.search(r"Progress: refreshing canonical merge truth for \d+ candidate tasks", result.stdout)
-        assert re.search(r"Progress: running unmerged query over \d+ task rows for \d+ selected branches", result.stdout)
-        assert re.search(r"Progress: rendering \d+ row\(s\) from \d+ filtered result\(s\) as rich", result.stdout)
+        assert "Progress:" not in result.stdout
+        assert re.search(r"Progress: refreshing canonical merge truth for \d+ candidate tasks", result.stderr)
+        assert re.search(r"Progress: running unmerged query over \d+ task rows for \d+ selected branches", result.stderr)
+        assert re.search(r"Progress: rendering \d+ row\(s\) from \d+ filtered result\(s\) as rich", result.stderr)
 
-    def test_unmerged_prunes_fully_merged_other_branch_ancestors_and_siblings(self, tmp_path: Path) -> None:
+    def test_unmerged_descendants_only_lineage_excludes_depends_on_only_child(self, tmp_path: Path) -> None:
+        store, impl, _git = setup_unmerged_env(tmp_path, task_prompt="Owner implementation")
+        impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        store.update(impl)
+
+        review = store.add("Review owner", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        review.depends_on = impl.id
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review)
+
+        improve = store.add("Improve owner", task_type="improve")
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        improve.based_on = impl.id
+        improve.depends_on = review.id
+        improve.branch = "feature/test"
+        improve.same_branch = True
+        store.update(improve)
+
+        depends_only_impl = store.add("Depends-only implement noise", task_type="implement")
+        depends_only_impl.status = "completed"
+        depends_only_impl.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
+        depends_only_impl.depends_on = impl.id
+        depends_only_impl.branch = "feature/test"
+        depends_only_impl.same_branch = True
+        store.update(depends_only_impl)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert impl.id in normalized
+        assert review.id in normalized
+        assert improve.id in normalized
+        assert "Depends-only implement noise" not in normalized
+        assert depends_only_impl.id not in normalized
+
+    def test_unmerged_shows_descendants_only_lineage_without_ancestors(self, tmp_path: Path) -> None:
         from gza.git import Git
 
         store, root, git = setup_unmerged_env(

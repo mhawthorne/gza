@@ -54,12 +54,13 @@ from ..pr_ops import lookup_task_pr
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
     TaskLineageNode,
+    _classify_child_relationship as _classify_lineage_child_relationship,
     _is_shared_branch_descendant as _query_is_shared_branch_descendant,
+    _lineage_child_sort_key as _lineage_child_sort_key,
     build_lineage_tree as _build_lineage_tree_for_root,
     flatten_lineage_tree as _flatten_query_lineage_tree,
     get_code_changing_descendants_for_root as _get_code_changing_descendants_for_root_task,
     get_reviews_for_root as _get_reviews_for_root_task,
-    is_lineage_complete as _query_is_lineage_complete,
     resolve_lineage_root as _resolve_lineage_root_task,
 )
 from ..runner import _get_task_output, get_effective_config_for_task, write_log_entry
@@ -107,7 +108,7 @@ from ._common import (
 
 _LINEAGE_REL_LABELS = _QUERY_LINEAGE_REL_LABELS
 _QueryDateField = Literal["created", "completed", "effective"]
-_PresentationMode = Literal["flat", "grouped", "lineage", "tree", "one_line", "json"]
+_PresentationMode = Literal["flat", "blocks", "grouped", "lineage", "tree", "one_line", "json", "rich"]
 _stderr_console = Console(highlight=False, stderr=True)
 
 _INCOMPLETE_DEPRECATION_LINES: tuple[str, ...] = (
@@ -991,7 +992,6 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
 
 def _format_review_verdict_label(
     review_verdict: str | None,
-    review_score: int | None,
     colors: dict[str, str],
 ) -> tuple[str | None, str | None]:
     """Return the unmerged review verdict badge and color override."""
@@ -1009,9 +1009,6 @@ def _format_review_verdict_label(
     elif review_verdict == "NEEDS_DISCUSSION":
         verdict_label = "💬 needs discussion"
         review_status_color = colors["review_discussion"]
-
-    if verdict_label and review_score is not None:
-        verdict_label = f"{verdict_label} ({review_score})"
 
     return verdict_label, review_status_color
 
@@ -1044,82 +1041,94 @@ def _resolve_unmerged_branch_owner(store: SqliteTaskStore, task: DbTask) -> DbTa
     return task
 
 
-def _subtree_fully_merged_on_other_branch(node: TaskLineageNode, owner_branch: str | None) -> bool:
-    branch = node.task.branch
-    if not owner_branch or not branch or branch == owner_branch:
-        return False
-    stack = [node]
-    while stack:
-        current = stack.pop()
-        if not _query_is_lineage_complete(current.task):
-            return False
-        stack.extend(current.children)
-    return True
-
-
-def _task_fully_merged_on_other_branch(task: DbTask, owner_branch: str | None) -> bool:
-    return bool(
-        owner_branch
-        and task.branch
-        and task.branch != owner_branch
-        and _query_is_lineage_complete(task)
-    )
-
-
-def _prune_unmerged_lineage_tree(
-    tree: TaskLineageNode | None,
+def _descendants_only_unmerged_lineage_tree(
+    store: SqliteTaskStore,
     *,
     owner_task: DbTask,
 ) -> TaskLineageNode | None:
-    if tree is None or owner_task.id is None:
-        return tree
+    """Return the unmerged display subtree rooted at the selected branch owner.
 
-    owner_id = owner_task.id
-    owner_branch = owner_task.branch
+    This view follows only `based_on` descendants plus explicit review attachments
+    for included tasks. It intentionally excludes unrelated `depends_on`-only
+    descendants from the slim `gza unmerged` output.
+    """
+    if owner_task.id is None:
+        return TaskLineageNode(task=owner_task, depth=0, relationship="root")
 
-    def _walk(node: TaskLineageNode) -> tuple[bool, TaskLineageNode | None]:
-        contains_owner = node.task.id == owner_id
-        owner_child: TaskLineageNode | None = None
-        kept_children: list[TaskLineageNode] = []
-
-        for child in node.children:
-            child_contains_owner, pruned_child = _walk(child)
-            if child_contains_owner:
-                contains_owner = True
-                owner_child = pruned_child
-                if pruned_child is not None:
-                    kept_children.append(pruned_child)
-                continue
-            if pruned_child is None:
-                continue
-            if _subtree_fully_merged_on_other_branch(pruned_child, owner_branch):
-                continue
-            kept_children.append(pruned_child)
-
-        pruned = TaskLineageNode(
-            task=node.task,
-            depth=node.depth,
-            relationship=node.relationship,
-            children=kept_children,
+    def _build_node(
+        task: DbTask,
+        *,
+        parent_task: DbTask | None,
+        depth: int,
+    ) -> TaskLineageNode:
+        relationship = (
+            "root"
+            if parent_task is None
+            else _classify_lineage_child_relationship(parent_task, task)
         )
+        node = TaskLineageNode(task=task, depth=depth, relationship=relationship)
+        if task.id is None:
+            return node
 
-        if contains_owner and node.task.id != owner_id and _task_fully_merged_on_other_branch(node.task, owner_branch):
-            return True, owner_child
-        if not contains_owner and _subtree_fully_merged_on_other_branch(pruned, owner_branch):
-            return False, None
-        return contains_owner, pruned
+        based_on_children = store.get_based_on_children(task.id)
+        review_children = store.get_reviews_for_task(task.id)
+        review_by_id = {
+            review.id: review for review in review_children if review.id is not None
+        }
+        review_attached_children: dict[str, list[DbTask]] = {
+            review_id: [] for review_id in review_by_id
+        }
+        direct_based_on_children: list[DbTask] = []
+        for child in based_on_children:
+            if child.depends_on is not None and child.depends_on in review_attached_children:
+                review_attached_children[child.depends_on].append(child)
+            else:
+                direct_based_on_children.append(child)
 
-    _contains_owner, pruned_tree = _walk(tree)
-    if pruned_tree is None:
+        direct_children = [*review_children, *direct_based_on_children]
+        direct_children.sort(key=lambda child: _lineage_child_sort_key(task, child))
+
+        for child in direct_children:
+            child_node = _build_node(child, parent_task=task, depth=depth + 1)
+            if child.task_type == "review" and child.id is not None:
+                nested_children = review_attached_children.get(child.id, [])
+                nested_children.sort(
+                    key=lambda nested_child: _lineage_child_sort_key(child, nested_child)
+                )
+                child_node.children.extend(
+                    _build_node(
+                        nested_child,
+                        parent_task=child,
+                        depth=depth + 2,
+                    )
+                    for nested_child in nested_children
+                )
+            node.children.append(child_node)
+
+        return node
+
+    return _build_node(owner_task, parent_task=None, depth=0)
+
+
+def _validate_unmerged_projection_fields(fields: tuple[str, ...] | None) -> tuple[str, ...] | None:
+    """Validate requested unmerged projection fields."""
+    if fields is None:
         return None
-
-    def _assign_depths(node: TaskLineageNode, depth: int) -> None:
-        node.depth = depth
-        for child in node.children:
-            _assign_depths(child, depth + 1)
-
-    _assign_depths(pruned_tree, 0)
-    return pruned_tree
+    allowed = set(
+        _projection_fields(
+            _TaskProjectionSpec(preset=_TaskProjectionPreset.UNMERGED_DEFAULT),
+            scope="lineages",
+        )
+    )
+    invalid = tuple(field_name for field_name in fields if field_name not in allowed)
+    if invalid:
+        noun = "field" if len(invalid) == 1 else "fields"
+        print(
+            f"error: unknown {noun} for gza unmerged: {', '.join(invalid)}",
+            file=sys.stderr,
+        )
+        return None
+    return fields
 
 
 def _enrich_unmerged_result(
@@ -1132,41 +1141,30 @@ def _enrich_unmerged_result(
     default_branch: str,
 ) -> _TaskQueryResult:
     effective_fields = _unmerged_effective_fields(result.query)
-    presentation_mode = result.query.presentation.mode
-    needs_lineage_text = presentation_mode == "rich" or (
-        presentation_mode == "json" and "lineage_text" in effective_fields
+    needs_lineage_text = "lineage_text" in effective_fields
+    needs_branch_metadata = bool(
+        effective_fields
+        & {
+            "branch",
+            "target_branch",
+            "branch_deleted",
+            "commit_count",
+            "files_changed",
+            "insertions",
+            "deletions",
+            "has_conflicts",
+        }
     )
-    needs_branch_metadata = presentation_mode == "rich" or (
-        presentation_mode == "json"
-        and bool(
-            effective_fields
-            & {
-                "branch",
-                "target_branch",
-                "branch_deleted",
-                "commit_count",
-                "files_changed",
-                "insertions",
-                "deletions",
-                "has_conflicts",
-            }
-        )
+    needs_review_metadata = bool(
+        effective_fields
+        & {
+            "review_status",
+            "review_detail",
+            "review_verdict",
+            "review_score",
+        }
     )
-    needs_review_metadata = presentation_mode == "rich" or (
-        presentation_mode == "json"
-        and bool(
-            effective_fields
-            & {
-                "review_status",
-                "review_detail",
-                "review_verdict",
-                "review_score",
-            }
-        )
-    )
-    needs_pr_metadata = presentation_mode == "rich" or (
-        presentation_mode == "json" and "pr_url" in effective_fields
-    )
+    needs_pr_metadata = "pr_url" in effective_fields
     gh: GitHub | None = None
     gh_available = False
     if needs_pr_metadata:
@@ -1180,8 +1178,7 @@ def _enrich_unmerged_result(
             continue
 
         owner_task = row.owner_task
-        selected_members = row.members
-        pruned_tree = _prune_unmerged_lineage_tree(row.tree, owner_task=owner_task)
+        pruned_tree = _descendants_only_unmerged_lineage_tree(store, owner_task=owner_task)
         members = tuple(_flatten_query_lineage_tree(pruned_tree)) if pruned_tree is not None else row.members
         representative_branch = owner_task.branch
 
@@ -1193,13 +1190,17 @@ def _enrich_unmerged_result(
 
         branch_implement_tasks = [
             task
-            for task in selected_members
-            if task.task_type == "implement" and task.branch == representative_branch
+            for task in members
+            if (
+                task.task_type == "implement"
+                and task.branch == representative_branch
+                and task.status in {"completed", "unmerged"}
+            )
         ]
         if branch_implement_tasks:
             representative_task = max(branch_implement_tasks, key=_task_recency_key)
-        elif selected_members:
-            representative_task = max(selected_members, key=_task_recency_key)
+        elif members:
+            representative_task = max(members, key=_task_recency_key)
         else:
             representative_task = owner_task
 
@@ -1340,7 +1341,6 @@ def _enrich_unmerged_result(
         if needs_review_metadata:
             verdict_label, _verdict_color = _format_review_verdict_label(
                 review_verdict,
-                review_score,
                 UNMERGED_COLORS_DICT,
             )
 
@@ -1464,32 +1464,15 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     git_client: _UnmergedGit = git if git is not None else cast(_UnmergedGit, Git(config.project_dir))
     default_branch = git_client.default_branch()
     current_branch = git_client.current_branch()
-    projection_fields = _parse_csv(getattr(args, "fields", None))
-    projection_preset = getattr(args, "preset", None)
+    projection_fields = _validate_unmerged_projection_fields(_parse_csv(getattr(args, "fields", None)))
+    if getattr(args, "fields", None) is not None and projection_fields is None:
+        return 2
     use_json = bool(getattr(args, "json", False))
-    view_mode = "json" if use_json else cast(_PresentationMode, getattr(args, "view", "rich"))
+    view_mode: _PresentationMode = "json" if use_json else ("blocks" if projection_fields is not None else "rich")
     if not use_json:
         print(f"On branch {current_branch}")
     target_branch = current_branch if getattr(args, "into_current", False) else (getattr(args, "target", None) or default_branch)
     live_target = _is_branch_target_live(args)
-    update_requested = bool(getattr(args, "update", False))
-    if update_requested:
-        if live_target:
-            print(
-                "Warning: `gza unmerged --update` is deprecated; it has no effect with "
-                "`--into-current` or `--target` and will be removed.",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                "Warning: `gza unmerged --update` is deprecated; plain `uv run gza unmerged` "
-                "already refreshes canonical default-branch merge truth before listing.",
-                file=sys.stderr,
-            )
-
-    if not use_json and (projection_fields is not None or projection_preset):
-        print("error: --fields and --preset require --json for gza unmerged", file=sys.stderr)
-        return 2
 
     store: SqliteTaskStore | None = None
     service: _TaskQueryService | None = None
@@ -1511,7 +1494,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
             _print_unmerged_progress(
                 f"refreshing live merge truth against {target_branch} for "
                 f"{len(branch_candidates)} candidate tasks",
-                to_stderr=use_json,
+                to_stderr=True,
             )
             live_results = reconcile_branch_merge_truth(
                 cast(Git, git_client),
@@ -1559,7 +1542,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
             _print_unmerged_progress(
                 f"refreshing canonical merge truth for {refresh_candidate_count} candidate tasks "
                 f"across {len(refresh_cohorts)} branches",
-                to_stderr=use_json,
+                to_stderr=True,
             )
             reconcile_results, partial = sync_branch_cohorts(
                 store,
@@ -1607,7 +1590,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
 
     limit = None if getattr(args, "limit", 5) == 0 else getattr(args, "limit", 5)
     projection = _TaskProjectionSpec(
-        preset=projection_preset or _TaskProjectionPreset.UNMERGED_DEFAULT,
+        preset=_TaskProjectionPreset.UNMERGED_DEFAULT,
         fields=projection_fields,
     )
     query = _TaskQueryPresets.unmerged(
@@ -1621,7 +1604,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     scan_count = len(store.get_all())
     _print_unmerged_progress(
         f"running unmerged query over {scan_count} task rows for {len(owner_ids)} selected branches",
-        to_stderr=use_json,
+        to_stderr=True,
     )
     result = service.run(query)
     result = _enrich_unmerged_result(
@@ -1634,7 +1617,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     )
     _print_unmerged_progress(
         f"rendering {len(result.rows)} row(s) from {result.total_count or 0} filtered result(s) as {view_mode}",
-        to_stderr=use_json,
+        to_stderr=True,
     )
 
     rendered = result.render(view_mode)

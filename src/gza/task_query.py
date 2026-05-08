@@ -11,7 +11,7 @@ from gza.db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_num
 
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
-PresentationMode = Literal["flat", "grouped", "lineage", "tree", "one_line", "json", "rich"]
+PresentationMode = Literal["flat", "blocks", "grouped", "lineage", "tree", "one_line", "json", "rich"]
 _T = TypeVar("_T")
 
 
