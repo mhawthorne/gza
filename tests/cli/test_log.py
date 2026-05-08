@@ -1344,6 +1344,31 @@ class TestFormatLogEntry:
         assert r"\[gza:stats]" in result
         assert "Stats: 5 steps, 12.3s, $0.0042" in result
 
+    def test_error_entry_renders_with_error_prefix(self) -> None:
+        """Top-level error entries are rendered in standard log output."""
+        entry = {"type": "error", "message": "invalid_request_error: missing model"}
+        result = _format_log_entry(entry)
+        assert result is not None
+        assert r"\[error]" in result
+        assert "invalid_request_error: missing model" in result
+
+    def test_error_entry_unwraps_nested_json_message(self) -> None:
+        """Nested provider error payloads show the inner message and payload."""
+        payload = json.dumps(
+            {
+                "error": {
+                    "message": "The model `gpt-missing` does not exist",
+                    "type": "invalid_request_error",
+                }
+            }
+        )
+        entry = {"type": "error", "message": payload}
+        result = _format_log_entry(entry)
+        assert result is not None
+        assert "The model `gpt-missing` does not exist" in result
+        assert "payload:" in result
+        assert payload in result
+
     def test_gza_log_entry_renders_in_gza_log_output(self, tmp_path: Path) -> None:
         """Integration: gza log renders gza entries from a JSONL log file."""
         setup_config(tmp_path)
@@ -1608,3 +1633,88 @@ def test_live_log_printer_parses_gemini_init_model_for_parity(monkeypatch: pytes
 
     assert "Gemini model parity: configured=gemini-2.5-pro, provider_reported=gemini-2.5-flash" in agent_messages
     assert any("WARNING: Model mismatch (gemini-2.5-pro != gemini-2.5-flash)" in line for line in console_lines)
+
+
+def test_live_log_printer_renders_top_level_error_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gza.providers.output_formatter as output_formatter
+
+    error_lines: list[str] = []
+
+    class _FakeConsole:
+        def print(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    class _FakeFormatter:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.console = _FakeConsole()
+
+        def print_agent_message(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_error(self, message: str, **_kwargs: Any) -> None:
+            error_lines.append(message)
+
+        def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(output_formatter, "StreamOutputFormatter", _FakeFormatter)
+    monkeypatch.setattr(output_formatter, "truncate_text", lambda text, _max_length: text)
+
+    printer = _LiveLogPrinter()
+    printer.process({"type": "error", "message": "invalid_request_error: missing model"})
+
+    assert error_lines == ["[error] invalid_request_error: missing model"]
+
+
+def test_live_log_printer_unwraps_nested_error_payloads(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gza.providers.output_formatter as output_formatter
+
+    error_lines: list[str] = []
+    payload = json.dumps(
+        {
+            "error": {
+                "message": "The model `gpt-missing` does not exist",
+                "type": "invalid_request_error",
+            }
+        }
+    )
+
+    class _FakeConsole:
+        def print(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    class _FakeFormatter:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.console = _FakeConsole()
+
+        def print_agent_message(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_error(self, message: str, **_kwargs: Any) -> None:
+            error_lines.append(message)
+
+        def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(output_formatter, "StreamOutputFormatter", _FakeFormatter)
+    monkeypatch.setattr(output_formatter, "truncate_text", lambda text, _max_length: text)
+
+    printer = _LiveLogPrinter()
+    printer.process({"type": "error", "message": payload})
+
+    assert error_lines == [
+        "[error] The model `gpt-missing` does not exist",
+        f"[error] payload: {payload}",
+    ]
