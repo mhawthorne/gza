@@ -29,8 +29,8 @@ def test_claude_renderer_renders_known_events_and_counts_suppression() -> None:
         starts += int(rendered.starts_step)
 
     joined = "\n".join(lines)
-    assert starts == 2
-    assert renderer.stats.step_count == 2
+    assert starts == 1
+    assert renderer.stats.step_count == 1
     assert renderer.stats.input_tokens == 15
     assert renderer.stats.output_tokens == 5
     assert renderer.suppressed_count == 2
@@ -267,6 +267,68 @@ def test_live_log_printer_uses_provider_renderer_step_count() -> None:
     assert seen is True
     assert printer.renderer.stats.step_count == 1
     assert printer.renderer.suppressed_count == 4
+
+
+def test_codex_renderer_falls_back_for_empty_agent_message() -> None:
+    log_renderer = get_log_renderer("codex")
+    tv_renderer = get_log_renderer("codex")
+    entry = {"type": "item.completed", "item": {"type": "agent_message", "id": "a1", "text": ""}}
+
+    log_rendered = log_renderer.handle_log(entry, live=False)
+    tv_rendered = tv_renderer.handle_tv(entry)
+
+    assert log_rendered.starts_step is False
+    assert log_rendered.log_lines[0].startswith("[event:item.completed]")
+    assert "item.type=agent_message" in log_rendered.log_lines[0]
+    assert tv_rendered.starts_step is False
+    assert tv_rendered.tv_lines[0].startswith("event:item.completed")
+    assert log_renderer.stats.step_count == 0
+    assert tv_renderer.stats.step_count == 0
+    assert log_renderer.suppressed_count == 0
+    assert tv_renderer.suppressed_count == 0
+
+
+def test_codex_renderer_falls_back_for_command_execution_without_command_or_output() -> None:
+    log_renderer = get_log_renderer("codex")
+    tv_renderer = get_log_renderer("codex")
+    entry = {
+        "type": "item.completed",
+        "item": {"type": "command_execution", "id": "cmd1", "status": "failed", "error": "boom"},
+    }
+
+    log_rendered = log_renderer.handle_log(entry, live=False)
+    tv_rendered = tv_renderer.handle_tv(entry)
+
+    assert log_rendered.log_lines[0].startswith("[event:item.completed]")
+    assert "item.type=command_execution" in log_rendered.log_lines[0]
+    assert "item.id=cmd1" in log_rendered.log_lines[0]
+    assert tv_rendered.tv_lines[0].startswith("event:item.completed")
+    assert log_renderer.suppressed_count == 0
+    assert tv_renderer.suppressed_count == 0
+
+
+def test_live_log_printer_does_not_emit_blank_header_for_suppressed_empty_claude_assistant() -> None:
+    printer = _LiveLogPrinter(live=False, provider="claude")
+    empty_entry = {"type": "assistant", "message": {"id": "msg_empty", "content": []}}
+
+    with printer._console.capture() as capture:
+        seen = printer.process(empty_entry)
+
+    assert capture.get() == ""
+    assert seen is False
+    assert printer.renderer.stats.step_count == 0
+    assert printer.renderer.suppressed_count == 1
+
+    visible_entry = {
+        "type": "assistant",
+        "message": {"id": "msg_visible", "content": [{"type": "text", "text": "Visible step"}]},
+    }
+    with printer._console.capture() as capture:
+        seen = printer.process(visible_entry)
+
+    assert "| Step 1 |" in capture.get()
+    assert seen is True
+    assert printer.renderer.stats.step_count == 1
 
 
 def test_gza_log_prints_suppressed_footer_and_verbose_unknown_payload(tmp_path: Path) -> None:

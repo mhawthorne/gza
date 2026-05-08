@@ -203,28 +203,35 @@ class CodexLogRenderer:
             return self._render_unknown(entry, tv=tv)
         item_type = item.get("type")
         if item_type == "agent_message":
-            text = item.get("text", "")
+            text = item.get("text")
             if isinstance(text, str) and text.strip():
                 self.stats.step_count += 1
                 if tv:
                     return RenderedLines(tv_lines=text_to_lines(text), starts_step=True)
                 return RenderedLines(log_lines=[rich_escape(text.strip())], starts_step=True)
-            return RenderedLines()
+            return self._render_unknown(entry, tv=tv)
         if item_type == "command_execution":
-            command = str(item.get("command", ""))
-            output = str(item.get("aggregated_output", "") or "").strip()
+            command = item.get("command")
+            if not isinstance(command, str):
+                command = ""
+            output = item.get("aggregated_output")
+            if not isinstance(output, str):
+                output = ""
+            output = output.strip()
             exit_code = item.get("exit_code")
+            if not command and not output:
+                return self._render_unknown(entry, tv=tv)
             if tv:
                 lines = [f"-> $ {truncate_text(strip_shell_wrapper(command), 120)}"] if command else []
                 lines.extend(f"  {line}" for line in text_to_lines(output, max_lines=3, max_chars=120))
                 return RenderedLines(tv_lines=lines)
             lines = [f"[green]\\[tool: Bash][/green] {rich_escape(strip_shell_wrapper(command))}"] if command else []
             if output:
-                rendered = rich_escape(output if len(output) <= 200 else output[:200] + "...")
+                rendered_output = rich_escape(output if len(output) <= 200 else output[:200] + "...")
                 if isinstance(exit_code, int) and exit_code != 0:
-                    lines.append(f"[red]{rendered}[/red]")
+                    lines.append(f"[red]{rendered_output}[/red]")
                 else:
-                    lines.append(rendered)
+                    lines.append(rendered_output)
             return RenderedLines(log_lines=lines)
         if item_type == "reasoning":
             has_signal = any(item.get(key) for key in ("summary", "text", "error"))

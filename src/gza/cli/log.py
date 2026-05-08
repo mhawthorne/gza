@@ -141,6 +141,21 @@ def _build_step_timeline(
     configured_model: str | None = None,
 ) -> list[dict]:
     """Build a step-first timeline from provider renderer output."""
+    steps, _suppressed_count = _build_step_timeline_with_metadata(
+        entries,
+        provider=provider,
+        configured_model=configured_model,
+    )
+    return steps
+
+
+def _build_step_timeline_with_metadata(
+    entries: list[dict],
+    *,
+    provider: str | None = None,
+    configured_model: str | None = None,
+) -> tuple[list[dict], int]:
+    """Build a step-first timeline from provider renderer output."""
     steps: list[dict] = []
     current_step: dict | None = None
     renderer = get_log_renderer(provider, configured_model=configured_model, verbose=False)
@@ -160,7 +175,7 @@ def _build_step_timeline(
                 _append_substep(current_step, detail)
             continue
 
-        if rendered.starts_step:
+        if rendered.starts_step and details:
             message_text = details[0] if details else None
             current_step = _append_timeline_step(steps, message_text)
             for detail in details[1:]:
@@ -174,7 +189,7 @@ def _build_step_timeline(
         for detail in details:
             _append_substep(current_step, detail)
 
-    return steps
+    return steps, renderer.suppressed_count
 
 
 def _display_step_timeline(
@@ -183,12 +198,16 @@ def _display_step_timeline(
     verbose: bool,
     provider: str | None = None,
     configured_model: str | None = None,
-) -> None:
+) -> int:
     """Render a step-first timeline in compact or verbose mode."""
-    steps = _build_step_timeline(entries, provider=provider, configured_model=configured_model)
+    steps, suppressed_count = _build_step_timeline_with_metadata(
+        entries,
+        provider=provider,
+        configured_model=configured_model,
+    )
     if not steps:
         console.print("No step entries found.", soft_wrap=True)
-        return
+        return suppressed_count
 
     for step in steps:
         title = f"[{_lc()}]\\[Step {step['step_id']}][/{_lc()}]"
@@ -203,6 +222,7 @@ def _display_step_timeline(
         if verbose:
             for substep in step["substeps"]:
                 console.print(f"  [green]\\[{substep['substep_id']}][/green] {rich_escape(substep['detail'])}", soft_wrap=True)
+    return suppressed_count
 
 
 class _LiveLogPrinter:
@@ -231,7 +251,8 @@ class _LiveLogPrinter:
     def process(self, entry: dict) -> bool:
         """Process a single JSON log entry and print it."""
         rendered = self._renderer.handle_log(entry, live=self._live)
-        if rendered.starts_step:
+        has_visible_output = bool(rendered.log_lines)
+        if rendered.starts_step and has_visible_output:
             if self._start_time is None:
                 self._start_time = time.time()
             if self._renderer.stats.step_count > 1:
@@ -251,7 +272,7 @@ class _LiveLogPrinter:
 
         for line in rendered.log_lines:
             self._console.print(line, soft_wrap=True)
-        return rendered.starts_step or bool(rendered.log_lines)
+        return has_visible_output
 
 
 def _format_log_entry(entry: dict) -> str | None:
@@ -642,9 +663,10 @@ def cmd_log(args: argparse.Namespace) -> int:
         _sep = f"[{_lc()}]" + "━" * 70 + f"[/{_lc()}]"
 
         timeline_mode = getattr(args, "timeline_mode", None)
+        suppressed_count = 0
         try:
             if timeline_mode and entries:
-                _display_step_timeline(
+                suppressed_count = _display_step_timeline(
                     entries,
                     verbose=timeline_mode == "verbose",
                     provider=provider_name,
@@ -683,7 +705,7 @@ def cmd_log(args: argparse.Namespace) -> int:
                         console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
             else:
                 # No result entry yet - show compact step timeline
-                _display_step_timeline(
+                suppressed_count = _display_step_timeline(
                     entries,
                     verbose=False,
                     provider=provider_name,
@@ -693,13 +715,13 @@ def cmd_log(args: argparse.Namespace) -> int:
             _print_unknown_log_provider_error(exc)
             return 1
 
-        if entries and timeline_mode is None:
-            suppressed_count = printer.renderer.suppressed_count if "printer" in locals() else 0
-            if suppressed_count:
-                console.print(
-                    f"({suppressed_count} routine events suppressed; rerun with --raw to see them)",
-                    soft_wrap=True,
-                )
+        if entries and timeline_mode is None and "printer" in locals():
+            suppressed_count = printer.renderer.suppressed_count
+        if entries and suppressed_count:
+            console.print(
+                f"({suppressed_count} routine events suppressed; rerun with --raw to see them)",
+                soft_wrap=True,
+            )
 
         console.print()
         console.print(_sep, soft_wrap=True)

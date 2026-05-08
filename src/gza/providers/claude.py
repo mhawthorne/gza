@@ -231,40 +231,48 @@ class ClaudeLogRenderer:
                 if item_type not in (None, ""):
                     unknown_block_types.append(str(item_type))
 
-        starts_step = False
-        if isinstance(message_id, str) and message_id:
-            if message_id not in self._seen_message_ids:
-                self._seen_message_ids.add(message_id)
-                starts_step = True
-        elif text_found or tool_found or unknown_block_found:
-            starts_step = True
-
-        if starts_step:
-            self.stats.step_count += 1
-            usage = message.get("usage", {}) if isinstance(message, dict) else {}
-            if isinstance(usage, dict):
-                self.stats.input_tokens += int(usage.get("input_tokens", 0) or 0)
-                self.stats.input_tokens += int(usage.get("cache_creation_input_tokens", 0) or 0)
-                self.stats.input_tokens += int(usage.get("cache_read_input_tokens", 0) or 0)
-                self.stats.output_tokens += int(usage.get("output_tokens", 0) or 0)
-                self.stats.cost_usd = calculate_cost(
-                    self.stats.input_tokens,
-                    self.stats.output_tokens,
-                    self._provider_model or self.configured_model or "",
-                )
-
         if not text_found and not tool_found:
             if unknown_block_found:
+                starts_step = self._mark_step_start(message_id)
                 rendered = self._render_unknown_assistant(entry, tv=tv, unknown_block_types=unknown_block_types)
                 rendered.starts_step = starts_step
+                if starts_step:
+                    self._accumulate_usage(message)
                 return rendered
             self.suppressed_count += 1
-            return RenderedLines(starts_step=starts_step)
+            return RenderedLines()
+        starts_step = self._mark_step_start(message_id)
+        if starts_step:
+            self._accumulate_usage(message)
         if unknown_block_found:
             fallback = self._render_unknown_assistant(entry, tv=tv, unknown_block_types=unknown_block_types)
             log_lines.extend(fallback.log_lines)
             tv_lines.extend(fallback.tv_lines)
         return RenderedLines(log_lines=log_lines, tv_lines=tv_lines, starts_step=starts_step)
+
+    def _mark_step_start(self, message: object) -> bool:
+        if isinstance(message, str) and message:
+            if message in self._seen_message_ids:
+                return False
+            self._seen_message_ids.add(message)
+            self.stats.step_count += 1
+            return True
+        self.stats.step_count += 1
+        return True
+
+    def _accumulate_usage(self, message: dict[str, Any]) -> None:
+        usage = message.get("usage", {})
+        if not isinstance(usage, dict):
+            return
+        self.stats.input_tokens += int(usage.get("input_tokens", 0) or 0)
+        self.stats.input_tokens += int(usage.get("cache_creation_input_tokens", 0) or 0)
+        self.stats.input_tokens += int(usage.get("cache_read_input_tokens", 0) or 0)
+        self.stats.output_tokens += int(usage.get("output_tokens", 0) or 0)
+        self.stats.cost_usd = calculate_cost(
+            self.stats.input_tokens,
+            self.stats.output_tokens,
+            self._provider_model or self.configured_model or "",
+        )
 
     def _is_routine_system_event(self, entry: dict[str, Any]) -> bool:
         return not self._has_error_signal(entry)

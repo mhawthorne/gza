@@ -920,6 +920,82 @@ class TestLogCommand:
         assert "[S1.1] [event:mystery]" in result.stdout
         assert "message=still visible in timeline" in result.stdout
 
+    @pytest.mark.parametrize("flag", ["--steps", "--steps-verbose"])
+    def test_log_steps_modes_print_suppressed_footer(self, tmp_path: Path, flag: str):
+        """Explicit timeline modes should report suppressed routine events in a footer."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Timeline suppression footer task")
+        task.status = "completed"
+        task.provider = "claude"
+        task.provider_is_explicit = True
+        task.log_file = ".gza/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "test.log").write_text(
+            "\n".join(
+                json.dumps(line)
+                for line in [
+                    {"type": "system", "subtype": "session", "message": "routine session metadata"},
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg_1",
+                            "content": [{"type": "text", "text": "Visible step"}],
+                        },
+                    },
+                ]
+            )
+        )
+
+        result = run_gza("log", str(task.id), flag, "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "[Step S1] Visible step" in result.stdout
+        assert "routine session metadata" not in result.stdout
+        assert "1 routine events suppressed" in result.stdout
+
+    def test_log_replay_suppressed_empty_claude_assistant_has_no_blank_header(self, tmp_path: Path):
+        """Formatted replay should not create a phantom step for suppressed empty assistant events."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Suppressed empty assistant replay task")
+        task.status = "completed"
+        task.provider = "claude"
+        task.provider_is_explicit = True
+        task.log_file = ".gza/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "test.log").write_text(
+            "\n".join(
+                json.dumps(line)
+                for line in [
+                    {"type": "assistant", "message": {"id": "msg_empty", "content": []}},
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg_visible",
+                            "content": [{"type": "text", "text": "Visible step"}],
+                        },
+                    },
+                ]
+            )
+        )
+
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "| Step 1 |" in result.stdout
+        assert "| Step 2 |" not in result.stdout
+        assert "Visible step" in result.stdout
+        assert "1 routine events suppressed" in result.stdout
+
     def test_log_by_task_id_invalid_format(self, tmp_path: Path):
         """Log command rejects non-decimal full-ID formats."""
         setup_config(tmp_path)
@@ -1516,6 +1592,24 @@ class TestBuildStepTimeline:
         assert len(steps[0]["substeps"]) == 1
         assert steps[0]["substeps"][0]["detail"].startswith("[event:assistant]")
         assert "new_block" in steps[0]["substeps"][0]["detail"]
+
+    def test_claude_timeline_skips_suppressed_empty_assistant_steps(self) -> None:
+        """Suppressed empty assistant events should not create blank timeline steps."""
+        entries = [
+            {"type": "assistant", "message": {"id": "msg_empty", "content": []}},
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_visible",
+                    "content": [{"type": "text", "text": "Visible step"}],
+                },
+            },
+        ]
+
+        steps = _build_step_timeline(entries, provider="claude")
+
+        assert len(steps) == 1
+        assert steps[0]["message_text"] == "Visible step"
 
 
 def test_live_log_printer_uses_formatter_console_for_stream_output(monkeypatch: pytest.MonkeyPatch) -> None:
