@@ -186,16 +186,12 @@ class CodexProvider(Provider):
     def _verify_docker(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify credentials work in Docker."""
         docker_config = _get_docker_config(f"{config.docker_image}-codex")
-        if not ensure_docker_image(docker_config, config.project_dir):
-            write_preflight_entry(
-                log_file,
-                event="docker_image_build_failed",
-                command=["docker", "build", "-t", docker_config.image_name],
-                returncode=None,
-                stdout_tail="",
-                stderr_tail="",
-                message="Failed to build Codex Docker image",
-            )
+        if not ensure_docker_image(
+            docker_config,
+            config.project_dir,
+            log_file=log_file,
+            provider_label="Codex",
+        ):
             print("Error: Failed to build Docker image")
             return PreflightCheckResult.failure(
                 failure_reason="INFRASTRUCTURE_ERROR",

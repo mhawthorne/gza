@@ -3448,6 +3448,40 @@ class TestEnsureDockerImage:
         assert result is False
         mock_run.assert_not_called()
 
+    def test_logs_daemon_unavailable_to_task_log(self, tmp_path):
+        """Docker preflight should persist daemon-unavailable failures to the task log."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+        log_file = tmp_path / "task.log"
+        log_file.touch()
+
+        with patch("gza.providers.base.is_docker_running", return_value=False):
+            result = ensure_docker_image(
+                docker_config,
+                tmp_path,
+                log_file=log_file,
+                provider_label="Claude",
+            )
+
+        assert result is False
+        entries = [
+            json.loads(line)
+            for line in log_file.read_text().splitlines()
+            if line.strip()
+        ]
+        assert len(entries) == 1
+        assert entries[0]["event"] == "docker_daemon_unavailable"
+        assert entries[0]["returncode"] is None
+        assert entries[0]["command"] == "docker info"
+        assert entries[0]["message"] == (
+            "Failed to build Claude Docker image: Docker daemon is not running"
+        )
+
     def test_returns_true_when_image_up_to_date(self, tmp_path):
         """Should return True without building when image matches Dockerfile content."""
         docker_config = DockerConfig(
@@ -3629,6 +3663,53 @@ class TestEnsureDockerImage:
                 result = ensure_docker_image(docker_config, tmp_path)
 
         assert result is False
+
+    def test_logs_build_failure_and_echoes_output(self, tmp_path, capsys):
+        """Docker build preflight failures should echo output and persist it to the task log."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+        log_file = tmp_path / "task.log"
+        log_file.touch()
+        failed_build = subprocess.CompletedProcess(
+            args=["docker", "build"],
+            returncode=1,
+            stdout="step 1/4\nbuild stdout\n",
+            stderr="build stderr\n",
+        )
+
+        with (
+            patch("gza.providers.base.is_docker_running", return_value=True),
+            patch("gza.providers.base._get_image_created_time", return_value=None),
+            patch("gza.providers.base.subprocess.run", return_value=failed_build),
+        ):
+            result = ensure_docker_image(
+                docker_config,
+                tmp_path,
+                log_file=log_file,
+                provider_label="Gemini",
+            )
+
+        assert result is False
+        captured = capsys.readouterr()
+        assert "build stdout" in captured.out
+        assert "build stderr" in captured.err
+        entries = [
+            json.loads(line)
+            for line in log_file.read_text().splitlines()
+            if line.strip()
+        ]
+        assert len(entries) == 1
+        assert entries[0]["event"] == "docker_image_build_failed"
+        assert entries[0]["returncode"] == 1
+        assert entries[0]["stdout_tail"] == "step 1/4\nbuild stdout\n"
+        assert entries[0]["stderr_tail"] == "build stderr\n"
+        assert entries[0]["message"] == "Failed to build Gemini Docker image"
+        assert "docker build" in entries[0]["command"]
 
 
 class TestCodexProvider:
@@ -5983,6 +6064,49 @@ class TestPreflightLogging:
         assert ok.failure_reason == "INFRASTRUCTURE_ERROR"
         entries = self._read_preflight_entries(log_file)
         assert entries and entries[0]["event"] == "verify_credentials_missing_binary"
+
+    @pytest.mark.parametrize(
+        ("provider", "module_path", "provider_label", "config_kwargs"),
+        [
+            (ClaudeProvider, "gza.providers.claude", "Claude", {"provider": "claude"}),
+            (CodexProvider, "gza.providers.codex", "Codex", {"provider": "codex"}),
+            (GeminiProvider, "gza.providers.gemini", "Gemini", {"provider": "gemini"}),
+        ],
+    )
+    def test_verify_docker_relies_on_centralized_build_failure_logging(
+        self,
+        tmp_path: Path,
+        provider,
+        module_path: str,
+        provider_label: str,
+        config_kwargs: dict[str, str],
+    ):
+        """Provider docker preflight should pass log context into base image setup and avoid duplicate log writes."""
+        log_file = tmp_path / "task.log"
+        log_file.touch()
+        provider_instance = provider()
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            use_docker=True,
+            **config_kwargs,
+        )
+
+        with (
+            patch(f"{module_path}.ensure_docker_image", return_value=False) as mock_ensure,
+            patch(f"{module_path}.verify_docker_credentials") as mock_verify,
+            patch(f"{module_path}.write_preflight_entry") as mock_write,
+        ):
+            result = provider_instance.verify_credentials(config, log_file=log_file)
+
+        assert result.ok is False
+        assert result.failure_reason == "INFRASTRUCTURE_ERROR"
+        assert result.message == f"Preflight failed: failed to build {provider_label} Docker image"
+        mock_ensure.assert_called_once()
+        assert mock_ensure.call_args.kwargs["log_file"] == log_file
+        assert mock_ensure.call_args.kwargs["provider_label"] == provider_label
+        mock_verify.assert_not_called()
+        mock_write.assert_not_called()
 
     def test_codex_exec_cmd_passes_skip_update_flag(self, tmp_path: Path):
         """Codex exec invocations must set check_for_update_on_startup=false."""

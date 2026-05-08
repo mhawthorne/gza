@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -202,12 +203,21 @@ def _get_default_dockerfile_content(docker_config: DockerConfig) -> str:
     )
 
 
-def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
+def ensure_docker_image(
+    docker_config: DockerConfig,
+    project_dir: Path,
+    log_file: Path | None = None,
+    provider_label: str = "Docker",
+) -> bool:
     """Ensure Docker image exists, building if needed.
 
     Args:
         docker_config: Docker configuration
         project_dir: Project directory for storing Dockerfile
+        log_file: Task log path; when set, build failures are recorded as a
+            preflight entry with captured stdout/stderr so the failure survives
+            worker-startup-log cleanup.
+        provider_label: Human-readable provider name for log messages.
 
     Returns:
         True if image is available, False on failure
@@ -215,6 +225,15 @@ def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
     if not is_docker_running():
         print("Error: Docker daemon is not running")
         print("  Start Docker Desktop or use --no-docker flag")
+        write_preflight_entry(
+            log_file,
+            event="docker_daemon_unavailable",
+            command=["docker", "info"],
+            returncode=None,
+            stdout_tail="",
+            stderr_tail="",
+            message=f"Failed to build {provider_label} Docker image: Docker daemon is not running",
+        )
         return False
 
     etc_dir = project_dir / "etc"
@@ -250,23 +269,36 @@ def ensure_docker_image(docker_config: DockerConfig, project_dir: Path) -> bool:
 
     print(f"Rebuilding Docker image {docker_config.image_name}: {rebuild_reason}")
     dockerfile_digest = _get_file_sha256(dockerfile_path)
-    result = subprocess.run(
-        [
-            "docker",
-            "build",
-            "-t",
-            docker_config.image_name,
-            "--label",
-            f"gza.cli_command={docker_config.cli_command}",
-            "--label",
-            f"gza.npm_package={docker_config.npm_package}",
-            "--label",
-            f"gza.dockerfile_sha256={dockerfile_digest}",
-            "-f",
-            str(dockerfile_path),
-            str(etc_dir),
-        ],
-    )
+    build_cmd = [
+        "docker",
+        "build",
+        "-t",
+        docker_config.image_name,
+        "--label",
+        f"gza.cli_command={docker_config.cli_command}",
+        "--label",
+        f"gza.npm_package={docker_config.npm_package}",
+        "--label",
+        f"gza.dockerfile_sha256={dockerfile_digest}",
+        "-f",
+        str(dockerfile_path),
+        str(etc_dir),
+    ]
+    result = subprocess.run(build_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        write_preflight_entry(
+            log_file,
+            event="docker_image_build_failed",
+            command=build_cmd,
+            returncode=result.returncode,
+            stdout_tail=result.stdout,
+            stderr_tail=result.stderr,
+            message=f"Failed to build {provider_label} Docker image",
+        )
     return result.returncode == 0
 
 
