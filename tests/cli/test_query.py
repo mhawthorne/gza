@@ -7590,8 +7590,12 @@ class TestUnmergedUnifiedQueryOutput:
     def _stub_github(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(query_cli, "GitHub", _UnavailableGitHub)
 
-    def test_unmerged_default_text_is_slim_and_scannable(self, tmp_path: Path) -> None:
-        store, task, _git = setup_unmerged_env(
+    def test_unmerged_default_text_is_slim_and_scannable(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        store, task, _git = _setup_unmerged_env_fast(
             tmp_path,
             task_prompt=(
                 "Ship slimmer unmerged view\n\n"
@@ -7607,22 +7611,34 @@ class TestUnmergedUnifiedQueryOutput:
         review.output_content = "Verdict: APPROVED"
         store.update(review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=False,
+            fields=None,
+        )
 
-        assert result.returncode == 0
-        header_line = next(line for line in result.stdout.splitlines() if line.startswith("⚡ "))
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        header_line = next(line for line in captured.out.splitlines() if line.startswith("⚡ "))
         assert "Ship slimmer unmerged view" in header_line
         assert "Context:" not in header_line
         assert "Acceptance:" not in header_line
-        assert "lineage:" in result.stdout
-        assert "branch:" in result.stdout
-        assert "review: reviewed [✓ approved]" in " ".join(result.stdout.split())
+        assert "lineage:" in captured.out
+        assert "branch:" in captured.out
+        assert "review: reviewed [✓ approved]" in " ".join(captured.out.split())
 
     def test_unmerged_json_empty_results_returns_empty_array_without_human_message(
         self,
         tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        setup_unmerged_env(
+        _setup_unmerged_env_fast(
             tmp_path,
             task_prompt="No-commit task",
             branch="feature/no-commit-task",
@@ -7630,11 +7646,22 @@ class TestUnmergedUnifiedQueryOutput:
             merge_status=None,
         )
 
-        result = run_gza("unmerged", "--json", "--project", str(tmp_path))
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=True,
+            fields=None,
+        )
 
-        assert result.returncode == 0
-        assert json.loads(result.stdout) == []
-        assert "No unmerged tasks" not in result.stdout
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert json.loads(captured.out) == []
+        assert "No unmerged tasks" not in captured.out
 
     def test_unmerged_json_migration_message_goes_to_stderr_and_stdout_stays_json(
         self,
@@ -7689,45 +7716,89 @@ class TestUnmergedUnifiedQueryOutput:
     def test_unmerged_json_fields_support_narrow_projection_and_keep_progress_on_stderr(
         self,
         tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        setup_unmerged_env(tmp_path, task_prompt="JSON output task")
+        _setup_unmerged_env_fast(tmp_path, task_prompt="JSON output task")
 
-        result = run_gza(
-            "unmerged",
-            "--json",
-            "--fields",
-            "id,prompt",
-            "--project",
-            str(tmp_path),
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=True,
+            fields="id,prompt",
         )
 
-        assert result.returncode == 0
-        payload = json.loads(result.stdout)
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        payload = json.loads(captured.out)
         assert payload == [{"id": payload[0]["id"], "prompt": "JSON output task"}]
-        assert "Progress:" in result.stderr
-        assert "On branch" not in result.stdout
+        assert "Progress:" in captured.err
+        assert "On branch" not in captured.out
 
-    def test_unmerged_text_fields_support_single_and_multi_projection(self, tmp_path: Path) -> None:
-        store, task, _git = setup_unmerged_env(tmp_path, task_prompt="Projected text row")
+    def test_unmerged_text_fields_support_single_and_multi_projection(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _store, task, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Projected text row")
 
-        multi = run_gza("unmerged", "--fields", "id,prompt", "--project", str(tmp_path))
-        assert multi.returncode == 0
-        assert "On branch main" in multi.stdout
-        assert f"id: {task.id}" in multi.stdout
-        assert "prompt: Projected text row" in multi.stdout
+        multi_args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=False,
+            fields="id,prompt",
+        )
+        multi_result = query_cli.cmd_unmerged(multi_args, git=_FastUnmergedGit())
+        multi = capsys.readouterr()
+        assert multi_result == 0
+        assert "On branch main" in multi.out
+        assert f"id: {task.id}" in multi.out
+        assert "prompt: Projected text row" in multi.out
 
-        single = run_gza("unmerged", "--fields", "id", "--project", str(tmp_path))
-        assert single.returncode == 0
-        value_lines = [line for line in single.stdout.splitlines() if line and not line.startswith("On branch ")]
+        single_args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=False,
+            fields="id",
+        )
+        single_result = query_cli.cmd_unmerged(single_args, git=_FastUnmergedGit())
+        single = capsys.readouterr()
+        assert single_result == 0
+        value_lines = [line for line in single.out.splitlines() if line and not line.startswith("On branch ")]
         assert value_lines[-1] == task.id
 
-    def test_unmerged_text_fields_unknown_field_errors_clearly(self, tmp_path: Path) -> None:
-        setup_unmerged_env(tmp_path, task_prompt="Unknown field row")
+    def test_unmerged_text_fields_unknown_field_errors_clearly(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _setup_unmerged_env_fast(tmp_path, task_prompt="Unknown field row")
 
-        result = run_gza("unmerged", "--fields", "id,nope", "--project", str(tmp_path))
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=False,
+            fields="id,nope",
+        )
 
-        assert result.returncode == 2
-        assert "unknown field for gza unmerged: nope" in result.stderr
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 2
+        assert "unknown field for gza unmerged: nope" in captured.err
 
     @pytest.mark.parametrize("flag_args", [
         ("--view", "flat"),
@@ -7737,8 +7808,6 @@ class TestUnmergedUnifiedQueryOutput:
         ("--update",),
     ])
     def test_unmerged_removed_compatibility_flags_error(self, tmp_path: Path, flag_args: tuple[str, ...]) -> None:
-        setup_unmerged_env(tmp_path, task_prompt="Removed flags row")
-
         result = run_gza("unmerged", *flag_args, "--project", str(tmp_path))
 
         assert result.returncode != 0
@@ -8001,19 +8070,38 @@ class TestUnmergedUnifiedQueryOutput:
         assert rendered.count(f"({score})") == 1
         assert f"[{color}]{badge_text} ({score})[/{color}]" in rendered
 
-    def test_unmerged_progress_logs_counts_for_refresh_query_and_render(self, tmp_path: Path) -> None:
-        setup_unmerged_env(tmp_path, task_prompt="Progress task")
+    def test_unmerged_progress_logs_counts_for_refresh_query_and_render(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _setup_unmerged_env_fast(tmp_path, task_prompt="Progress task")
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=False,
+            fields=None,
+        )
 
-        assert result.returncode == 0
-        assert "Progress:" not in result.stdout
-        assert re.search(r"Progress: refreshing canonical merge truth for \d+ candidate tasks", result.stderr)
-        assert re.search(r"Progress: running unmerged query over \d+ task rows for \d+ selected branches", result.stderr)
-        assert re.search(r"Progress: rendering \d+ row\(s\) from \d+ filtered result\(s\) as rich", result.stderr)
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
 
-    def test_unmerged_descendants_only_lineage_excludes_depends_on_only_child(self, tmp_path: Path) -> None:
-        store, impl, _git = setup_unmerged_env(tmp_path, task_prompt="Owner implementation")
+        captured = capsys.readouterr()
+        assert result == 0
+        assert "Progress:" not in captured.out
+        assert re.search(r"Progress: refreshing canonical merge truth for \d+ candidate tasks", captured.err)
+        assert re.search(r"Progress: running unmerged query over \d+ task rows for \d+ selected branches", captured.err)
+        assert re.search(r"Progress: rendering \d+ row\(s\) from \d+ filtered result\(s\) as rich", captured.err)
+
+    def test_unmerged_descendants_only_lineage_excludes_depends_on_only_child(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        store, impl, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Owner implementation")
         impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
         store.update(impl)
 
@@ -8041,20 +8129,33 @@ class TestUnmergedUnifiedQueryOutput:
         depends_only_impl.same_branch = True
         store.update(depends_only_impl)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=False,
+            fields=None,
+        )
 
-        assert result.returncode == 0
-        normalized = " ".join(result.stdout.split())
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        normalized = " ".join(captured.out.split())
         assert impl.id in normalized
         assert review.id in normalized
         assert improve.id in normalized
         assert "Depends-only implement noise" not in normalized
         assert depends_only_impl.id not in normalized
 
-    def test_unmerged_shows_descendants_only_lineage_without_ancestors(self, tmp_path: Path) -> None:
-        from gza.git import Git
-
-        store, root, git = setup_unmerged_env(
+    def test_unmerged_shows_descendants_only_lineage_without_ancestors(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        store, root, _git = _setup_unmerged_env_fast(
             tmp_path,
             task_prompt="Merged branch A root",
             branch="feature/a-root",
@@ -8092,23 +8193,30 @@ class TestUnmergedUnifiedQueryOutput:
         merged_sibling_child.output_content = "Verdict: APPROVED"
         store.update(merged_sibling_child)
 
-        real_git = Git(tmp_path)
-        real_git._run("checkout", "-b", "feature/b-task")
-        (tmp_path / "feature_b.txt").write_text("branch b")
-        real_git._run("add", "feature_b.txt")
-        real_git._run("commit", "-m", "Add branch b")
-        real_git._run("checkout", "main")
+        fast_git = _FastUnmergedGit()
+        fast_git._merged[("feature/a-root", "main")] = True
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=False,
+            fields=None,
+        )
 
-        assert result.returncode == 0
-        assert "Unmerged branch B task" in result.stdout
-        assert branch_b.id in result.stdout
-        assert "Merged branch A root" not in result.stdout
-        assert root.id not in result.stdout
-        assert "Merged branch A sibling" not in result.stdout
-        assert merged_sibling.id not in result.stdout
-        assert "Merged branch A child" not in result.stdout
+        result = query_cli.cmd_unmerged(args, git=fast_git)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert "Unmerged branch B task" in captured.out
+        assert branch_b.id in captured.out
+        assert "Merged branch A root" not in captured.out
+        assert root.id not in captured.out
+        assert "Merged branch A sibling" not in captured.out
+        assert merged_sibling.id not in captured.out
+        assert "Merged branch A child" not in captured.out
 
 
 class TestFailureReasonField:
