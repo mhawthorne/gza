@@ -91,6 +91,62 @@ def test_gemini_renderer_suppresses_routine_events_and_keeps_unknowns_visible() 
     assert "event:oddity message=unknown event" in joined
 
 
+def test_gemini_renderer_keeps_user_content_visible_and_only_suppresses_empty_boundaries() -> None:
+    renderer = get_log_renderer("gemini")
+
+    visible_entry = {"type": "message", "role": "user", "content": "important prompt/context"}
+    log_rendered = renderer.handle_log(visible_entry, live=False)
+    tv_rendered = renderer.handle_tv(visible_entry)
+
+    assert log_rendered.log_lines == ["user: important prompt/context"]
+    assert tv_rendered.tv_lines == ["user: important prompt/context"]
+    assert renderer.suppressed_count == 0
+
+    renderer.handle_log({"type": "message", "role": "user", "content": ""}, live=False)
+
+    assert renderer.suppressed_count == 1
+
+
+def test_claude_renderer_falls_back_for_unknown_assistant_blocks() -> None:
+    renderer = get_log_renderer("claude")
+    entry = {
+        "type": "assistant",
+        "message": {
+            "id": "msg_unknown",
+            "content": [{"type": "new_block", "payload": "visible"}],
+        },
+    }
+
+    log_rendered = renderer.handle_log(entry, live=False)
+    tv_rendered = renderer.handle_tv(entry)
+
+    assert log_rendered.starts_step is True
+    assert tv_rendered.starts_step is False
+    assert log_rendered.log_lines[0].startswith("[event:assistant]")
+    assert "new_block" in log_rendered.log_lines[0]
+    assert tv_rendered.tv_lines[0].startswith("event:assistant")
+    assert renderer.suppressed_count == 0
+
+
+def test_claude_renderer_keeps_non_init_system_errors_visible() -> None:
+    renderer = get_log_renderer("claude")
+    entry = {
+        "type": "system",
+        "subtype": "metadata",
+        "message": "error from provider metadata sync",
+        "error": {"message": "visible failure"},
+    }
+
+    log_rendered = renderer.handle_log(entry, live=False)
+    tv_rendered = renderer.handle_tv(entry)
+
+    assert "[event:system]" in log_rendered.log_lines[0]
+    assert "subtype=metadata" in log_rendered.log_lines[0]
+    assert "error={\"message\": \"visible failure\"}" in log_rendered.log_lines[0]
+    assert tv_rendered.tv_lines == ["event:system message=error from provider metadata sync"]
+    assert renderer.suppressed_count == 0
+
+
 def test_unknown_event_verbose_mode_expands_json_payload() -> None:
     renderer = get_log_renderer("codex", verbose=True)
     rendered = renderer.handle_log(

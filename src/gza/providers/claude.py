@@ -177,8 +177,10 @@ class ClaudeLogRenderer:
                 log_lines=log_lines,
                 tv_lines=[line] if tv else [],
             )
-        self.suppressed_count += 1
-        return RenderedLines()
+        if self._is_routine_system_event(entry):
+            self.suppressed_count += 1
+            return RenderedLines()
+        return self._render_unknown(entry, tv=tv)
 
     def _model_parity_lines(self) -> list[str]:
         if not self._parity_ready:
@@ -216,7 +218,9 @@ class ClaudeLogRenderer:
         tv_lines: list[str] = []
         text_found = False
         tool_found = False
-        for item in message_content_items(entry):
+        content_items = message_content_items(entry)
+        unknown_block_found = False
+        for item in content_items:
             item_type = item.get("type")
             if item_type == "text":
                 text = item.get("text", "")
@@ -236,11 +240,37 @@ class ClaudeLogRenderer:
                     tv_lines.append(f"-> {tool_one_liner(name, tool_input)}")
                 else:
                     log_lines.append(f"[green]\\[tool: {rich_escape(name)}][/green] {rich_escape(summarize_tool_detail(name, tool_input))}")
+            elif item:
+                unknown_block_found = True
 
         if not text_found and not tool_found:
+            if unknown_block_found:
+                rendered = self._render_unknown(entry, tv=tv)
+                rendered.starts_step = starts_step
+                return rendered
             self.suppressed_count += 1
             return RenderedLines(starts_step=starts_step)
         return RenderedLines(log_lines=log_lines, tv_lines=tv_lines, starts_step=starts_step)
+
+    def _is_routine_system_event(self, entry: dict[str, Any]) -> bool:
+        subtype = str(entry.get("subtype") or "")
+        if subtype != "metadata":
+            return False
+        if self._has_error_signal(entry):
+            return False
+        return True
+
+    def _has_error_signal(self, entry: dict[str, Any]) -> bool:
+        error_value = entry.get("error")
+        if error_value not in (None, "", [], {}):
+            return True
+        subtype = str(entry.get("subtype") or "").lower()
+        if "error" in subtype:
+            return True
+        message = entry.get("message")
+        if isinstance(message, str) and "error" in message.lower():
+            return True
+        return False
 
     def _render_user(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         log_lines: list[str] = []

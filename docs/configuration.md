@@ -573,6 +573,7 @@ gza log <identifier> [options]
 | `--follow`, `-f` | Follow log in real-time |
 | `--tail N` | Show last N lines |
 | `--raw` | Show raw JSON lines |
+| `--verbose` | Keep formatted provider rendering, but expand generic fallback events with pretty JSON payloads |
 | `--failure`, `-F` | Show failure-focused diagnostics for failed tasks (reason, summary, marker, agent explanation, and last verify/result context) |
 | `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--follow` and `--raw` |
 
@@ -580,6 +581,7 @@ By default, the identifier is treated as a full task ID (for example `gza-1234`)
 If no main task log exists yet, `gza log` can fall back to worker startup logs in `.gza/workers/*-startup.log`.
 Top-level provider `{"type":"error"}` events are rendered in normal log output; if the provider embeds a nested `error.message` JSON payload, `gza log` shows the readable message and keeps the full payload inline.
 When stream metadata is present, `gza log` also shows model parity in-session: configured model (from `gza/info`) vs provider-reported model, including a warning on mismatch or an explicit note when the provider does not echo a model.
+`--verbose` does not switch to raw JSONL. It preserves the curated formatted output and only expands generic fallback events so unknown provider payloads stay inspectable without losing the higher-level rendering.
 
 ### stats
 

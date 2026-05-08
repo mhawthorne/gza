@@ -157,8 +157,7 @@ class GeminiLogRenderer:
             self.suppressed_count += 1
             return RenderedLines()
         if role == "user":
-            self.suppressed_count += 1
-            return RenderedLines()
+            return self._render_user_message(entry, tv=tv)
         if role == "assistant":
             content = entry.get("content", "")
             if isinstance(content, str) and content.strip():
@@ -167,6 +166,34 @@ class GeminiLogRenderer:
                     return RenderedLines(tv_lines=text_to_lines(content), starts_step=True)
                 return RenderedLines(log_lines=[rich_escape(content.strip())], starts_step=True)
         return self._render_unknown(entry, tv=tv)
+
+    def _render_user_message(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        if self._is_routine_user_boundary(entry):
+            self.suppressed_count += 1
+            return RenderedLines()
+
+        content = entry.get("content")
+        if isinstance(content, str) and content.strip():
+            line = f"user: {content.strip()}"
+            if tv:
+                return RenderedLines(tv_lines=text_to_lines(line, max_lines=3))
+            return RenderedLines(log_lines=[rich_escape(line)])
+        return self._render_unknown(entry, tv=tv)
+
+    def _is_routine_user_boundary(self, entry: dict[str, Any]) -> bool:
+        if self._has_visible_content(entry.get("content")):
+            return False
+        routine_keys = {"type", "role", "content", "delta", "id", "message_id", "timestamp"}
+        return all(key in routine_keys for key in entry)
+
+    def _has_visible_content(self, content: Any) -> bool:
+        if isinstance(content, str):
+            return bool(content.strip())
+        if isinstance(content, dict):
+            return bool(content)
+        if isinstance(content, list):
+            return any(self._has_visible_content(item) for item in content)
+        return content not in (None, False)
 
     def _render_tool_use(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         tool_name = str(entry.get("tool_name", "unknown"))
