@@ -293,6 +293,32 @@ def test_plan_extraction_task_source_prefers_specific_body_line_over_vague_title
     assert draft.prompt.startswith("Carry over: Implement session reuse for resumed agents\n")
 
 
+def test_plan_extraction_task_source_prefers_specific_carry_over_prompt_over_generic_diff_title() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+        source_task_prompt="Carry over: Add tenant-aware retry state to extraction resume flow",
+        source_task_slug="20260507-retry-state",
+    )
+    git.get_diff_name_status.return_value = "M\tsrc/runner.py\n"
+    git.get_diff_numstat.return_value = "4\t2\tsrc/runner.py\n"
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/src/runner.py b/src/runner.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/runner.py\n"
+        "+++ b/src/runner.py\n"
+        "@@ -1 +1,4 @@\n"
+        "+retry_state = True\n"
+    )
+
+    draft = plan_extraction(git, source, ("src/runner.py",), operator_prompt=None)
+
+    assert draft.prompt.startswith("Carry over: Add tenant-aware retry state to extraction resume flow\n")
+    assert not draft.prompt.startswith("Carry over: update runner module\n")
+
+
 def test_plan_extraction_commit_source_preserves_commit_order() -> None:
     git = MagicMock(spec=Git)
     source = SourceSelection(

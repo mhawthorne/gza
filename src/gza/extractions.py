@@ -412,6 +412,7 @@ def _normalize_prompt_candidate(value: str) -> str:
         line,
         flags=re.IGNORECASE,
     )
+    line = re.sub(r"^carry\s+over\s*:\s*", "", line, flags=re.IGNORECASE)
     line = re.sub(r"\s+", " ", line).strip(" -:.")
     return line
 
