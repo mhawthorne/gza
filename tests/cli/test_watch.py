@@ -1666,8 +1666,8 @@ def test_count_live_workers_dedupes_registry_and_in_progress_rows_by_pid(tmp_pat
         assert _count_live_workers(config, store) == 1
 
 
-def test_count_live_workers_counts_shutting_down_worker_for_terminal_task(tmp_path: Path) -> None:
-    """A live teardown PID must still consume a slot even after the task row flips terminal."""
+def test_count_live_workers_ignores_shutting_down_worker_for_terminal_task(tmp_path: Path) -> None:
+    """A stale terminal-task registry entry must not consume a slot."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
     task = store.add("Implement feature", task_type="implement")
@@ -1688,11 +1688,11 @@ def test_count_live_workers_counts_shutting_down_worker_for_terminal_task(tmp_pa
         patch("gza.cli.watch.WorkerRegistry", return_value=registry),
         patch("gza.cli.watch._pid_alive", return_value=True),
     ):
-        assert _count_live_workers(config, store) == 1
+        assert _count_live_workers(config, store) == 0
 
 
-def test_collect_live_running_state_counts_live_worker_pid_even_for_terminal_task(tmp_path: Path) -> None:
-    """Live worker PIDs must still consume slots even if the task row has flipped terminal."""
+def test_collect_live_running_state_ignores_terminal_task_worker_entry(tmp_path: Path) -> None:
+    """A stale terminal-task worker must not count as running or anonymous."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -1729,9 +1729,36 @@ def test_collect_live_running_state_counts_live_worker_pid_even_for_terminal_tas
     ):
         live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
 
-    assert live_pids == {4242, 4343, 5252}
+    assert live_pids == {4242, 5252}
     assert running_task_ids == [worker_task.id, pid_only_task.id]
-    assert anonymous_worker_count == 1
+    assert anonymous_worker_count == 0
+
+
+def test_collect_live_running_state_returns_zero_for_stale_terminal_task_worker(
+    tmp_path: Path,
+) -> None:
+    """A stale terminal-task worker entry alone must not count as live or anonymous."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    terminal_task = store.add("Terminal task", task_type="plan")
+    assert terminal_task.id is not None
+    terminal_task.status = "completed"
+    store.update(terminal_task)
+
+    config = Config.load(tmp_path)
+    registry = MagicMock()
+    registry.list_all.return_value = [
+        WorkerMetadata(worker_id="w-1", task_id=terminal_task.id, pid=4343, status="running"),
+    ]
+    registry.is_running.return_value = True
+
+    with patch("gza.cli.watch.WorkerRegistry", return_value=registry):
+        live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
+
+    assert live_pids == set()
+    assert running_task_ids == []
+    assert anonymous_worker_count == 0
 
 
 def test_collect_live_running_state_counts_pending_task_with_live_worker(tmp_path: Path) -> None:
@@ -1757,10 +1784,30 @@ def test_collect_live_running_state_counts_pending_task_with_live_worker(tmp_pat
     assert anonymous_worker_count == 0
 
 
-def test_watch_cycle_does_not_oversubscribe_batch_when_terminal_task_worker_is_still_alive(
+def test_collect_live_running_state_counts_anonymous_live_worker(tmp_path: Path) -> None:
+    """An anonymous live worker must still count and surface as anonymous."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = Config.load(tmp_path)
+    registry = MagicMock()
+    registry.list_all.return_value = [
+        WorkerMetadata(worker_id="w-1", task_id=None, pid=4242, status="running"),
+    ]
+    registry.is_running.return_value = True
+
+    with patch("gza.cli.watch.WorkerRegistry", return_value=registry):
+        live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
+
+    assert live_pids == {4242}
+    assert running_task_ids == []
+    assert anonymous_worker_count == 1
+
+
+def test_watch_cycle_starts_pending_work_when_terminal_task_worker_is_still_alive(
     tmp_path: Path,
 ) -> None:
-    """A live worker in teardown must still block new starts when batch=1."""
+    """A stale terminal-task worker must not block new starts when batch=1."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -1796,8 +1843,9 @@ def test_watch_cycle_does_not_oversubscribe_batch_when_terminal_task_worker_is_s
             log=log,
         )
 
-    assert result.work_done is False
-    assert spawn_iterate.call_count == 0
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == pending_task.id
 
 
 def test_format_wake_message_includes_running_task_ids() -> None:
