@@ -188,6 +188,30 @@ class UnmergedColors:
     review_none: str = default_color
 
 
+_UNMERGED_FIELD_VALUE_COLOR_KEYS: dict[str, dict[str, str]] = {
+    "review_verdict": {
+        "✓ approved": "review_approved",
+        "↺ approved with follow-ups": "review_followups",
+        "⚠ changes requested": "review_changes",
+        "💬 needs discussion": "review_discussion",
+        "no review": "review_none",
+    }
+}
+
+
+def get_unmerged_field_value_color(field_name: str, value: object) -> str | None:
+    """Return the themed color for an unmerged field/value pair, if any."""
+    if not isinstance(value, str):
+        return None
+    field_map = _UNMERGED_FIELD_VALUE_COLOR_KEYS.get(field_name)
+    if field_map is None:
+        return None
+    color_key = field_map.get(value)
+    if color_key is None:
+        return None
+    return getattr(UNMERGED_COLORS, color_key, None)
+
+
 @dataclass(frozen=True)
 class LineageColors:
     """Colors for lineage tree rendering (``_format_lineage`` and ``gza lineage``)."""

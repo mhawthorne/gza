@@ -536,16 +536,6 @@ def main() -> int:
     unmerged_parser = subparsers.add_parser("unmerged", help="List tasks with unmerged work")
     add_common_args(unmerged_parser)
     unmerged_parser.add_argument(
-        "--commits-only",
-        action="store_true",
-        help="Retained compatibility no-op; has no effect on unmerged output",
-    )
-    unmerged_parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Retained compatibility no-op; has no effect on unmerged output",
-    )
-    unmerged_parser.add_argument(
         "-n",
         type=int,
         default=5,
@@ -561,15 +551,6 @@ def main() -> int:
             "merge evidence is current. Has no effect with `--into-current` or `--target`."
         ),
     )
-    unmerged_parser.add_argument(
-        "--update",
-        action="store_true",
-        help=(
-            "Deprecated compatibility alias for the default default-branch refresh; "
-            "plain `uv run gza unmerged` already persists canonical merge truth before listing. "
-            "Has no effect with `--into-current` or `--target`."
-        ),
-    )
     target_group = unmerged_parser.add_mutually_exclusive_group()
     target_group.add_argument(
         "--into-current",
@@ -582,20 +563,9 @@ def main() -> int:
         help="List tasks unmerged relative to the specified branch instead of the default branch",
     )
     unmerged_parser.add_argument(
-        "--view",
-        choices=["rich", "flat", "tree"],
-        default="rich",
-        help="Presentation mode (default: rich)",
-    )
-    unmerged_parser.add_argument(
         "--fields",
         metavar="CSV",
-        help="Projection fields override (comma-separated, requires --json)",
-    )
-    unmerged_parser.add_argument(
-        "--preset",
-        metavar="NAME",
-        help="Projection preset override (requires --json)",
+        help="Projection fields override (comma-separated; works in text or JSON mode)",
     )
     unmerged_parser.add_argument(
         "--json",
