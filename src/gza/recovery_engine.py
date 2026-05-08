@@ -424,6 +424,18 @@ def _task_lineage_branch_keys(store: SqliteTaskStore, task: DbTask) -> set[str]:
     return keys
 
 
+def _is_independent_follow_up_root(store: SqliteTaskStore, task: DbTask) -> bool:
+    """Return whether the task roots a recovery chain under a non-recovery follow-up."""
+    if not task.based_on or task.id is None:
+        return False
+    parent = store.get(task.based_on)
+    if parent is None:
+        return False
+    if parent.task_type == task.task_type:
+        return _classify_recovery_edge(parent, task) is None
+    return True
+
+
 def _is_resolved_by_landed_lineage(
     store: SqliteTaskStore,
     task: DbTask,
@@ -455,16 +467,18 @@ def _is_resolved_by_landed_lineage(
     if not branch_keys:
         return False
 
-    recovery_snapshot = _build_recovery_chain_snapshot(store, task)
-    recovery_ancestor_ids = set(recovery_snapshot.ancestor_ids[:-1])
-
     from .query import build_lineage, resolve_lineage_root
+
+    recovery_snapshot = _build_recovery_chain_snapshot(store, task)
+    independent_follow_up_root_id = (
+        recovery_snapshot.root_task.id if _is_independent_follow_up_root(store, recovery_snapshot.root_task) else None
+    )
 
     lineage = build_lineage(store, resolve_lineage_root(store, task))
     for lineage_task in lineage:
         if lineage_task.id == task.id or lineage_task.merge_status != "merged":
             continue
-        if lineage_task.id in recovery_ancestor_ids:
+        if lineage_task.id == independent_follow_up_root_id:
             continue
         if branch_keys & _task_lineage_branch_keys(store, lineage_task):
             return True
