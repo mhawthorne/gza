@@ -1494,6 +1494,29 @@ class TestBuildStepTimeline:
         assert "new_block" in steps[0]["message_text"]
         assert steps[1]["message_text"] == "Second step"
 
+    def test_claude_timeline_keeps_unknown_blocks_when_mixed_with_text(self) -> None:
+        """Mixed assistant blocks should preserve fallback detail in the same step."""
+        entries = [
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_mixed",
+                    "content": [
+                        {"type": "text", "text": "Known text"},
+                        {"type": "new_block", "payload": "SHOULD_SHOW"},
+                    ],
+                },
+            }
+        ]
+
+        steps = _build_step_timeline(entries, provider="claude")
+
+        assert len(steps) == 1
+        assert steps[0]["message_text"] == "Known text"
+        assert len(steps[0]["substeps"]) == 1
+        assert steps[0]["substeps"][0]["detail"].startswith("[event:assistant]")
+        assert "new_block" in steps[0]["substeps"][0]["detail"]
+
 
 def test_live_log_printer_uses_formatter_console_for_stream_output(monkeypatch: pytest.MonkeyPatch) -> None:
     """_LiveLogPrinter should use StreamOutputFormatter() and route stream prints via formatter console."""
@@ -1678,6 +1701,54 @@ def test_live_log_printer_handles_provider_without_model_echo(monkeypatch: pytes
         "Warning: provider did not echo model; configured=gpt-5.3-codex" in line
         for line in console_lines
     )
+
+
+def test_live_log_printer_claude_routine_system_metadata_does_not_clear_provider_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gza.providers.output_formatter as output_formatter
+
+    console_lines: list[str] = []
+
+    class _FakeConsole:
+        def print(self, *args: Any, **_kwargs: Any) -> None:
+            if args:
+                console_lines.append(str(args[0]))
+
+    class _FakeFormatter:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.console = _FakeConsole()
+
+        def print_agent_message(self, _text: str, **_kwargs: Any) -> None:
+            return None
+
+        def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_error(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(output_formatter, "StreamOutputFormatter", _FakeFormatter)
+    monkeypatch.setattr(output_formatter, "truncate_text", lambda text, _max_length: text)
+
+    printer = _LiveLogPrinter()
+    printer.process({"type": "gza", "subtype": "info", "message": "Provider: Claude, Model: claude-opus-4-6"})
+    printer.process({"type": "system", "subtype": "init", "model": "claude-opus-4-6"})
+    printer.process({"type": "system", "subtype": "session", "message": "routine metadata", "session_id": "sess_123"})
+    printer.process({"type": "gza", "subtype": "info", "message": "Still running"})
+
+    assert any(
+        "Model parity: configured=claude-opus-4-6; provider=claude-opus-4-6" in line
+        for line in console_lines
+    )
+    assert not any("provider=(not echoed by provider)" in line for line in console_lines)
+    assert not any("Warning: provider did not echo model" in line for line in console_lines)
 
 
 def test_live_log_printer_parses_gemini_init_event(monkeypatch: pytest.MonkeyPatch) -> None:

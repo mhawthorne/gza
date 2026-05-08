@@ -128,6 +128,31 @@ def test_claude_renderer_falls_back_for_unknown_assistant_blocks() -> None:
     assert renderer.suppressed_count == 0
 
 
+def test_claude_renderer_keeps_unknown_blocks_when_mixed_with_text() -> None:
+    renderer = get_log_renderer("claude")
+    entry = {
+        "type": "assistant",
+        "message": {
+            "id": "msg_mixed",
+            "content": [
+                {"type": "text", "text": "Known text"},
+                {"type": "new_block", "payload": "SHOULD_SHOW"},
+            ],
+        },
+    }
+
+    log_rendered = renderer.handle_log(entry, live=False)
+    tv_rendered = renderer.handle_tv(entry)
+
+    assert log_rendered.starts_step is True
+    assert log_rendered.log_lines[0] == "Known text"
+    assert any(line.startswith("[event:assistant]") for line in log_rendered.log_lines[1:])
+    assert any("new_block" in line for line in log_rendered.log_lines[1:])
+    assert tv_rendered.tv_lines[0] == "Known text"
+    assert any(line.startswith("event:assistant") for line in tv_rendered.tv_lines[1:])
+    assert any("new_block" in line for line in tv_rendered.tv_lines[1:])
+
+
 def test_claude_renderer_keeps_non_init_system_errors_visible() -> None:
     renderer = get_log_renderer("claude")
     entry = {
@@ -162,6 +187,30 @@ def test_claude_renderer_suppresses_non_init_system_session_events() -> None:
     assert log_rendered.log_lines == []
     assert tv_rendered.tv_lines == []
     assert renderer.suppressed_count == 2
+
+
+def test_claude_renderer_routine_system_metadata_does_not_clear_provider_model() -> None:
+    renderer = get_log_renderer("claude")
+
+    renderer.handle_log(
+        {"type": "gza", "subtype": "info", "message": "Provider: Claude, Model: claude-opus-4-6"},
+        live=False,
+    )
+    init_rendered = renderer.handle_log({"type": "system", "subtype": "init", "model": "claude-opus-4-6"}, live=False)
+    renderer.handle_log(
+        {"type": "system", "subtype": "session", "session_id": "sess_123", "message": "routine metadata"},
+        live=False,
+    )
+    rendered = renderer.handle_log({"type": "gza", "subtype": "info", "message": "Still running"}, live=False)
+
+    assert renderer._provider_model == "claude-opus-4-6"
+    assert any(
+        "Model parity: configured=claude-opus-4-6; provider=claude-opus-4-6" in line
+        for line in init_rendered.log_lines
+    )
+    assert not any("Model parity:" in line for line in rendered.log_lines)
+    assert not any("provider=(not echoed by provider)" in line for line in rendered.log_lines)
+    assert not any("Warning: provider did not echo model" in line for line in rendered.log_lines)
 
 
 def test_unknown_event_verbose_mode_expands_json_payload() -> None:

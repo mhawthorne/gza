@@ -166,7 +166,9 @@ class ClaudeLogRenderer:
 
     def _render_system(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         subtype = entry.get("subtype", "")
-        self._provider_model = normalize_model_name(entry.get("model"))
+        provider_model = normalize_model_name(entry.get("model"))
+        if provider_model:
+            self._provider_model = provider_model
         if subtype == "init":
             self._parity_ready = True
             line = f"Session initialized (model: {self._provider_model or 'unknown'})"
@@ -203,6 +205,7 @@ class ClaudeLogRenderer:
         tool_found = False
         content_items = message_content_items(entry)
         unknown_block_found = False
+        unknown_block_types: list[str] = []
         for item in content_items:
             item_type = item.get("type")
             if item_type == "text":
@@ -225,6 +228,8 @@ class ClaudeLogRenderer:
                     log_lines.append(f"[green]\\[tool: {rich_escape(name)}][/green] {rich_escape(summarize_tool_detail(name, tool_input))}")
             elif item:
                 unknown_block_found = True
+                if item_type not in (None, ""):
+                    unknown_block_types.append(str(item_type))
 
         starts_step = False
         if isinstance(message_id, str) and message_id:
@@ -250,11 +255,15 @@ class ClaudeLogRenderer:
 
         if not text_found and not tool_found:
             if unknown_block_found:
-                rendered = self._render_unknown(entry, tv=tv)
+                rendered = self._render_unknown_assistant(entry, tv=tv, unknown_block_types=unknown_block_types)
                 rendered.starts_step = starts_step
                 return rendered
             self.suppressed_count += 1
             return RenderedLines(starts_step=starts_step)
+        if unknown_block_found:
+            fallback = self._render_unknown_assistant(entry, tv=tv, unknown_block_types=unknown_block_types)
+            log_lines.extend(fallback.log_lines)
+            tv_lines.extend(fallback.tv_lines)
         return RenderedLines(log_lines=log_lines, tv_lines=tv_lines, starts_step=starts_step)
 
     def _is_routine_system_event(self, entry: dict[str, Any]) -> bool:
@@ -325,6 +334,18 @@ class ClaudeLogRenderer:
         if self.verbose:
             lines.extend(rich_escape(line) for line in pretty_json_lines(entry))
         return RenderedLines(log_lines=lines)
+
+    def _render_unknown_assistant(
+        self,
+        entry: dict[str, Any],
+        *,
+        tv: bool,
+        unknown_block_types: list[str],
+    ) -> RenderedLines:
+        if tv and unknown_block_types:
+            block_types = ",".join(dict.fromkeys(unknown_block_types))
+            return RenderedLines(tv_lines=[f"event:assistant block={block_types}"])
+        return self._render_unknown(entry, tv=tv)
 
 def sync_keychain_credentials() -> bool:
     """Extract Claude OAuth credentials from macOS Keychain and write to ~/.claude/.credentials.json.
