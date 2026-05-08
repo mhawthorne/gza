@@ -81,6 +81,7 @@ from ..task_query import (
     TaskQueryResult as _TaskQueryResult,
     TaskQueryService as _TaskQueryService,
     TaskRow as _TaskRow,
+    _is_shared_branch_descendant_query as _is_query_shared_branch_descendant,
     apply_projection_values as _apply_query_projection_values,
     parse_csv as _parse_csv,
     projection_fields as _projection_fields,

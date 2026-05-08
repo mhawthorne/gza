@@ -74,6 +74,7 @@ setup_case() {
     export CASE_DIR
     export PATH="$CASE_DIR/bin:$ORIGINAL_PATH"
     export FAKE_GIT_LOG="$CASE_DIR/git.log"
+    export FAKE_UV_LOG="$CASE_DIR/uv.log"
     export FAKE_TIMEOUT_LOG="$CASE_DIR/timeout.log"
     export FAKE_CODEX_LOG="$CASE_DIR/codex.log"
     export FAKE_CLAUDE_LOG="$CASE_DIR/claude.log"
@@ -82,6 +83,7 @@ setup_case() {
     export FAKE_HAS_STAGED_CHANGES=1
     mkdir -p "$CASE_DIR/bin"
     : >"$FAKE_GIT_LOG"
+    : >"$FAKE_UV_LOG"
     : >"$FAKE_TIMEOUT_LOG"
     : >"$FAKE_CODEX_LOG"
     : >"$FAKE_CLAUDE_LOG"
@@ -120,6 +122,42 @@ echo "Unsupported fake git invocation: git $*" >&2
 exit 2
 EOF
     chmod +x "$CASE_DIR/bin/git"
+
+    cat >"$CASE_DIR/bin/uv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf 'uv %s\n' "$*" >>"$FAKE_UV_LOG"
+
+if [[ "${1:-}" != "run" || "${2:-}" != "python" ]]; then
+    echo "Unsupported fake uv invocation: uv $*" >&2
+    exit 2
+fi
+
+output_file="${6:-}"
+
+case "${FAKE_UV_MODE:-codex_cmd}" in
+    bootstrap_fail)
+        echo "builder exploded" >&2
+        exit 42
+        ;;
+    missing_launcher_cmd)
+        printf 'missing-launcher\0--wrapper-flag\0codex\0'
+        ;;
+    codex_cmd)
+        printf 'timeout\0'
+        printf '7m\0codex\0exec\0--json\0--dangerously-bypass-approvals-and-sandbox\0--skip-git-repo-check\0-C\0/workspace\0check_for_update_on_startup=false\0-m\0gpt-5.4\0-c\0model_reasoning_effort=high\0--output-last-message\0%s\0-\0' "$output_file"
+        ;;
+    empty_cmd)
+        exit 0
+        ;;
+    *)
+        echo "Unsupported FAKE_UV_MODE=${FAKE_UV_MODE}" >&2
+        exit 2
+        ;;
+esac
+EOF
+    chmod +x "$CASE_DIR/bin/uv"
 
     cat >"$CASE_DIR/bin/timeout" <<'EOF'
 #!/usr/bin/env bash
@@ -251,11 +289,42 @@ test_help_mentions_codex_default() {
     assert_contains "$RUN_OUTPUT" "--claude  Use Claude" "help should document the Claude override"
 }
 
+test_codex_builder_failure_reports_bootstrap_error() {
+    setup_case
+    export FAKE_UV_MODE="bootstrap_fail"
+
+    run_script --codex
+
+    [[ "$RUN_STATUS" -eq 1 ]] || fail "bootstrap failure should exit 1, got $RUN_STATUS"
+    assert_contains "$RUN_OUTPUT" "builder exploded" "bootstrap stderr should be preserved"
+    assert_contains "$RUN_OUTPUT" "Error: Failed to build Codex command." "empty builder output should still be identified"
+    assert_contains "$RUN_OUTPUT" "Failed to build the Codex command." "bootstrap failure should be reported distinctly"
+    assert_not_contains "$RUN_OUTPUT" "Failed to launch Codex because" "bootstrap failure must not be mislabeled as launcher failure"
+    [[ ! -s "$FAKE_TIMEOUT_LOG" ]] || fail "bootstrap failure should not invoke the timeout launcher"
+    [[ ! -s "$FAKE_CODEX_LOG" ]] || fail "bootstrap failure should not launch codex"
+}
+
+test_codex_missing_launcher_reports_distinct_error() {
+    setup_case
+    export FAKE_UV_MODE="missing_launcher_cmd"
+
+    run_script --codex
+
+    [[ "$RUN_STATUS" -eq 1 ]] || fail "missing launcher should exit 1, got $RUN_STATUS"
+    assert_contains "$RUN_OUTPUT" "Launcher command 'missing-launcher' for Codex commit message generation is not available." "missing launcher should be identified before launch"
+    assert_contains "$RUN_OUTPUT" "Failed to launch Codex because 'missing-launcher' is unavailable." "launcher failure should be reported distinctly"
+    assert_not_contains "$RUN_OUTPUT" "Generated with Codex" "missing launcher should not produce a commit message"
+    [[ ! -s "$FAKE_TIMEOUT_LOG" ]] || fail "missing launcher should not invoke timeout"
+    [[ ! -s "$FAKE_CODEX_LOG" ]] || fail "missing launcher should not launch codex"
+}
+
 test_default_provider_uses_codex
 test_explicit_claude_provider_uses_legacy_path
 test_explicit_codex_provider_works
 test_conflicting_provider_flags_fail
 test_no_staged_changes_preserved
 test_help_mentions_codex_default
+test_codex_builder_failure_reports_bootstrap_error
+test_codex_missing_launcher_reports_distinct_error
 
 echo "generate_commit_msg_harness: ok"
