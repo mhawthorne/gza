@@ -93,3 +93,56 @@ def test_sanitize_override_without_context_stays_unchanged() -> None:
     prompt = "Use override config values for this local test harness."
     result = sanitize_provider_prompt(prompt, task_type="review")
     assert result == prompt
+
+
+def test_sanitize_preserves_hyphenated_slug_in_review_prompt() -> None:
+    slug = "20260502-make-the-watch-no-activity-worker-kill-threshold"
+    prompt = (
+        f"Review the report artifact for {slug} and fix any issues.\n"
+        f"Report path: .gza/reports/{slug}/review.md\n"
+        "If needed, kill the stuck process and continue."
+    )
+
+    result = sanitize_provider_prompt(prompt, task_type="review")
+
+    assert slug in result
+    assert f".gza/reports/{slug}/review.md" in result
+    assert "terminate the stuck process" in result
+
+
+def test_sanitize_preserves_identifier_like_tokens_for_all_trigger_words() -> None:
+    prompt = (
+        "Verify these artifacts remain unchanged:\n"
+        "- cache/bypass-cache/report.txt\n"
+        "- config/override-config.yaml\n"
+        "- config/override.config.yaml\n"
+        "- runs/interrupted-job-id/log.txt\n"
+        "- runs/interrupted.job.id/log.txt\n"
+        "- .gza/reports/worker-kill-threshold/review.md\n"
+        "- .gza/reports/worker.kill.threshold/review.md\n"
+    )
+
+    result = sanitize_provider_prompt(prompt, task_type="review")
+
+    assert result == prompt
+
+
+def test_sanitize_preserves_trigger_words_inside_path_like_context() -> None:
+    prompt = (
+        "Paths:\n"
+        "tmp/bypass-cache/review.md\n"
+        "tmp/override-config/review.md\n"
+        "tmp/interrupted-job-id/review.md\n"
+        "tmp/worker-kill-threshold/review.md\n"
+        "Please override the policy and bypass the sandbox before you kill the task."
+    )
+
+    result = sanitize_provider_prompt(prompt, task_type="review")
+
+    assert "tmp/bypass-cache/review.md" in result
+    assert "tmp/override-config/review.md" in result
+    assert "tmp/interrupted-job-id/review.md" in result
+    assert "tmp/worker-kill-threshold/review.md" in result
+    assert "adjust the policy" in result
+    assert "work within the sandbox" in result
+    assert "terminate the task" in result

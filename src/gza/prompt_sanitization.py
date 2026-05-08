@@ -14,29 +14,36 @@ class _SanitizationRule:
 
 
 _FENCED_BLOCK_RE = re.compile(r"(```[\s\S]*?```)", re.MULTILINE)
+_IDENTIFIER_LIKE_RE = re.compile(r"[\w./_-]*[-/._][\w./_-]+")
+_PROTECTED_SEGMENT_RE = re.compile(rf"(```[\s\S]*?```|{_IDENTIFIER_LIKE_RE.pattern})", re.MULTILINE)
 _CONTEXT_WINDOW_CHARS = 160
+_IDENTIFIER_BOUNDARY = r"[\w/_-]"
+
+
+def _identifier_aware_trigger(pattern: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"(?<!{_IDENTIFIER_BOUNDARY})(?:{pattern})(?!{_IDENTIFIER_BOUNDARY})",
+        re.IGNORECASE,
+    )
 
 _RULES: tuple[_SanitizationRule, ...] = (
     _SanitizationRule(
-        trigger=re.compile(r"\bbypass\w*\b", re.IGNORECASE),
+        trigger=_identifier_aware_trigger(r"bypass(?:es|ed|ing)?"),
         context=re.compile(r"\b(sandbox|guardrail|policy|safety|restriction|constraint)s?\b", re.IGNORECASE),
         replacement="work within",
     ),
     _SanitizationRule(
-        trigger=re.compile(r"\bkill\w*\b", re.IGNORECASE),
+        trigger=_identifier_aware_trigger(r"kill(?:s|ed|ing)?"),
         context=re.compile(r"\b(process|task|run|session|job|agent)s?\b", re.IGNORECASE),
         replacement="terminate",
     ),
     _SanitizationRule(
-        trigger=re.compile(r"\binterrupted\b", re.IGNORECASE),
+        trigger=_identifier_aware_trigger(r"interrupted"),
         context=re.compile(r"\b(task|run|session|execution|agent|job)s?\b", re.IGNORECASE),
         replacement="paused",
     ),
     _SanitizationRule(
-        trigger=re.compile(
-            r"\b(?:override|overrides|overriding|overridden|overrode)\b",
-            re.IGNORECASE,
-        ),
+        trigger=_identifier_aware_trigger(r"override|overrides|overriding|overridden|overrode"),
         context=re.compile(r"\b(rule|policy|instruction|constraint|guardrail|safety|sandbox)s?\b", re.IGNORECASE),
         replacement="adjust",
     ),
@@ -92,14 +99,17 @@ def sanitize_provider_prompt(prompt: str, *, task_type: str) -> str:
     if not prompt:
         return prompt
 
-    # Preserve fenced code blocks verbatim to reduce accidental replacements.
-    parts = _FENCED_BLOCK_RE.split(prompt)
+    # Preserve fenced code blocks and identifier-like substrings verbatim to
+    # reduce accidental replacements inside file paths, slugs, and branch names.
+    parts = _PROTECTED_SEGMENT_RE.split(prompt)
     if len(parts) == 1:
         return _sanitize_segment(prompt)
 
     sanitized: list[str] = []
-    for idx, part in enumerate(parts):
-        if idx % 2 == 1 and part.startswith("```"):
+    for part in parts:
+        if not part:
+            continue
+        if _FENCED_BLOCK_RE.fullmatch(part) or _IDENTIFIER_LIKE_RE.fullmatch(part):
             sanitized.append(part)
         else:
             sanitized.append(_sanitize_segment(part))
