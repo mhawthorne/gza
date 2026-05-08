@@ -9219,6 +9219,45 @@ class TestUnmergedUnifiedQueryOutput:
         assert backfilled_unit is not None
         assert backfilled_unit.state == "unmerged"
 
+    def test_unmerged_default_target_keeps_selected_target_specific_merge_unit(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        store, task, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Main target task")
+        assert task.id is not None
+
+        main_unit = store.get_or_create_merge_unit_for_task(task, "main")
+        release_unit = store.get_or_create_merge_unit_for_task(task, "release")
+
+        assert main_unit is not None
+        assert release_unit is not None
+        assert main_unit.id != release_unit.id
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=True,
+            fields="id,prompt,merge_unit_id,target_branch",
+        )
+
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        payload = json.loads(captured.out)
+        assert payload == [
+            {
+                "id": task.id,
+                "prompt": "Main target task",
+                "merge_unit_id": main_unit.id,
+                "target_branch": "main",
+            }
+        ]
+
     def test_unmerged_live_target_json_fields_use_live_state_not_default_target_unit(
         self,
         tmp_path: Path,

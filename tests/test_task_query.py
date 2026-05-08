@@ -163,6 +163,38 @@ def test_unmerged_preset_uses_lineage_scope_and_unmerged_default_projection() ->
     assert query.presentation.mode == "flat"
 
 
+def test_unmerged_merge_unit_filter_preserves_selected_target_specific_unit(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    task = store.add("target-specific unit", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/target-specific-unit"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    assert task.id is not None
+
+    main_unit = store.get_or_create_merge_unit_for_task(task, "main")
+    release_unit = store.get_or_create_merge_unit_for_task(task, "release")
+
+    assert main_unit is not None
+    assert release_unit is not None
+    assert main_unit.id != release_unit.id
+
+    service = TaskQueryService(store)
+    query = TaskQueryPresets.unmerged(
+        branch_owner_ids=(task.id,),
+        merge_unit_ids=(main_unit.id,),
+        task_ids=(task.id,),
+        limit=None,
+        mode="flat",
+    )
+
+    result = service.run(query)
+
+    assert [row.owner_task.id for row in result.rows if hasattr(row, "owner_task")] == [task.id]
+
+
 def test_incomplete_date_field_created_vs_effective_affects_lineage_selection(tmp_path: Path) -> None:
     store = _store(tmp_path)
 

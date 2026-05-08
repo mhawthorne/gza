@@ -3762,6 +3762,30 @@ class SqliteTaskStore:
             ).fetchone()
         return self._row_to_merge_unit(row)
 
+    def task_is_attached_to_merge_unit_ids(self, task_id: str, merge_unit_ids: tuple[str, ...]) -> bool:
+        """Return whether a task is attached to any active merge unit in ``merge_unit_ids``."""
+        if not self.supports_merge_units() or not merge_unit_ids:
+            return False
+        placeholders = ",".join("?" for _ in merge_unit_ids)
+        params: list[object] = [self._project_id, task_id, *merge_unit_ids]
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT 1
+                FROM merge_unit_tasks mut
+                JOIN merge_units mu
+                  ON mu.project_id = mut.project_id
+                 AND mu.id = mut.merge_unit_id
+                WHERE mut.project_id = ?
+                  AND mut.task_id = ?
+                  AND mu.superseded_by_unit_id IS NULL
+                  AND mu.id IN ({placeholders})
+                LIMIT 1
+                """,
+                tuple(params),
+            ).fetchone()
+        return row is not None
+
     def _related_branch_tasks_for_merge_unit(self, task: Task, branch_tasks: list[Task]) -> list[Task]:
         """Return same-branch tasks that are provably part of the same work line."""
         if task.id is None:

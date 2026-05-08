@@ -670,13 +670,11 @@ class TaskQueryService:
             ]
 
         if query.merge_unit_ids is not None:
-            allowed_units = set(query.merge_unit_ids)
             filtered = [
                 task
                 for task in filtered
                 if task.id is not None
-                and (unit := self._store.resolve_merge_unit_for_task(task.id)) is not None
-                and unit.id in allowed_units
+                and self._store.task_is_attached_to_merge_unit_ids(task.id, query.merge_unit_ids)
             ]
 
         if query.groups is not None or query.tag_filters is not None or query.exclude_tag_filters is not None:
