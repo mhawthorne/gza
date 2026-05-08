@@ -3,7 +3,9 @@ from pathlib import Path
 
 import pytest
 
+import gza.recovery_engine as recovery_engine
 from gza.recovery_engine import (
+    _MergeContext,
     decide_failed_task_recovery,
     get_completed_recovery_descendant,
     get_failed_recovery_needs_attention_reason,
@@ -38,6 +40,26 @@ def _completed_impl(store, *, merge_status: str):
     task.completed_at = datetime.now(UTC)
     store.update(task)
     return task
+
+
+class _StubMergeGit:
+    def __init__(self, *, merged_branches: set[str] | None = None) -> None:
+        self.merged_branches = merged_branches or set()
+
+    def branch_exists(self, branch: str) -> bool:
+        return bool(branch)
+
+    def is_merged(self, branch: str, into: str) -> bool:
+        return into == "main" and branch in self.merged_branches
+
+
+def _stub_merge_context(monkeypatch: pytest.MonkeyPatch, *, merged_branches: set[str] | None = None) -> None:
+    git = _StubMergeGit(merged_branches=merged_branches)
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=git, default_branch="main"),
+    )
 
 
 def _failed_sidequest(store, *, task_type: str, impl_id: str, reason: str):
@@ -119,6 +141,197 @@ def test_recovery_engine_keeps_failed_sidequests_visible_when_target_impl_is_not
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert decision.reason_code != "resolved_by_merged_target"
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+
+def test_list_failed_tasks_for_recovery_filters_failed_impl_when_landed_work_is_already_on_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch, merged_branches={"feature/landed-work"})
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/landed-work"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    unrelated = store.add("Still failed", task_type="plan")
+    assert unrelated.id is not None
+    unrelated.status = "failed"
+    unrelated.failure_reason = "INFRASTRUCTURE_ERROR"
+    unrelated.completed_at = datetime.now(UTC)
+    store.update(unrelated)
+
+    assert is_chain_resolved_by_recovery(store, failed) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [unrelated.id]
+
+
+def test_list_failed_tasks_for_recovery_keeps_failed_task_without_landed_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/unmerged-work"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    failed_retry = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    assert failed_retry.id is not None
+    failed_retry.status = "failed"
+    failed_retry.failure_reason = "MAX_TURNS"
+    failed_retry.session_id = "sess-retry"
+    failed_retry.branch = "feature/unmerged-work-retry"
+    failed_retry.completed_at = datetime.now(UTC)
+    store.update(failed_retry)
+
+    assert is_chain_resolved_by_recovery(store, failed) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id, failed_retry.id]
+
+
+def test_list_failed_tasks_for_recovery_filters_failed_descendant_when_merged_ancestor_shares_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
+
+    merged_ancestor = _completed_impl(store, merge_status="merged")
+    assert merged_ancestor.id is not None
+    merged_ancestor.branch = "feature/shared-lineage"
+    store.update(merged_ancestor)
+
+    failed_descendant = store.add("Failed retry", task_type="implement", based_on=merged_ancestor.id)
+    assert failed_descendant.id is not None
+    failed_descendant.status = "failed"
+    failed_descendant.failure_reason = "MAX_TURNS"
+    failed_descendant.session_id = "sess-descendant"
+    failed_descendant.branch = merged_ancestor.branch
+    failed_descendant.completed_at = datetime.now(UTC)
+    store.update(failed_descendant)
+
+    assert is_chain_resolved_by_recovery(store, failed_descendant) is False
+    assert list_failed_tasks_for_recovery(store) == []
+
+
+def test_list_failed_tasks_for_recovery_keeps_failed_descendant_under_merged_manual_follow_up_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
+
+    root = _completed_impl(store, merge_status="unmerged")
+    assert root.id is not None
+    root.branch = "feature/root"
+    store.update(root)
+
+    manual_follow_up = store.add("Manual follow-up implement", task_type="implement", based_on=root.id)
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "completed"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    manual_follow_up.merge_status = "merged"
+    manual_follow_up.completed_at = datetime.now(UTC)
+    store.update(manual_follow_up)
+
+    failed_descendant = store.add(manual_follow_up.prompt, task_type="implement", based_on=manual_follow_up.id)
+    assert failed_descendant.id is not None
+    failed_descendant.status = "failed"
+    failed_descendant.failure_reason = "MAX_TURNS"
+    failed_descendant.session_id = manual_follow_up.session_id
+    failed_descendant.branch = manual_follow_up.branch
+    failed_descendant.completed_at = datetime.now(UTC)
+    store.update(failed_descendant)
+
+    assert is_chain_resolved_by_recovery(store, failed_descendant) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed_descendant.id]
+
+
+def test_list_failed_tasks_for_recovery_keeps_failed_fix_under_merged_cross_type_follow_up_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
+
+    root = _completed_impl(store, merge_status="unmerged")
+    assert root.id is not None
+    root.branch = "feature/root"
+    store.update(root)
+
+    completed_fix = store.add("Completed fix", task_type="fix", based_on=root.id, same_branch=True)
+    assert completed_fix.id is not None
+    completed_fix.status = "completed"
+    completed_fix.session_id = "sess-fix"
+    completed_fix.branch = root.branch
+    completed_fix.merge_status = "merged"
+    completed_fix.completed_at = datetime.now(UTC)
+    store.update(completed_fix)
+
+    failed_fix = store.add(completed_fix.prompt, task_type="fix", based_on=completed_fix.id, same_branch=True)
+    assert failed_fix.id is not None
+    failed_fix.status = "failed"
+    failed_fix.failure_reason = "MAX_TURNS"
+    failed_fix.session_id = completed_fix.session_id
+    failed_fix.branch = completed_fix.branch
+    failed_fix.completed_at = datetime.now(UTC)
+    store.update(failed_fix)
+
+    assert is_chain_resolved_by_recovery(store, failed_fix) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed_fix.id]
+
+
+def test_list_failed_tasks_for_recovery_keeps_same_branch_failed_improve_under_merged_impl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch, merged_branches={"feature/merged-impl"})
+
+    impl = _completed_impl(store, merge_status="merged")
+    assert impl.id is not None
+    impl.branch = "feature/merged-impl"
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "GIT_ERROR"
+    failed_improve.branch = impl.branch
+    failed_improve.completed_at = datetime.now(UTC)
+    store.update(failed_improve)
+
+    assert is_resolved_by_merged_target(store, failed_improve) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed_improve.id]
 
 
 def test_recovery_engine_resumable_with_session_chooses_resume(tmp_path: Path) -> None:

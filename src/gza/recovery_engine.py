@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal
 
+from .config import Config, ConfigError
 from .db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from .dependency_preconditions import get_unmerged_dependency_precondition
 from .failed_task_ordering import sort_failed_tasks
 from .failure_policy import is_resumable_failure_reason
+from .git import Git, GitError
 
 _ACTIONABLE_TYPES = {"implement", "plan", "explore", "fix", "internal", "review", "improve", "rebase"}
 _MANUAL_ONLY_REASONS = {
@@ -90,6 +93,13 @@ class _RecoveryChainSnapshot:
     deeper_descendants: tuple[DbTask, ...]
     terminal_descendants: tuple[DbTask, ...]
     completed_terminal_descendant: DbTask | None
+
+
+@dataclass
+class _MergeContext:
+    git: Git | None
+    default_branch: str | None
+    branch_resolution: dict[str, bool] = field(default_factory=dict)
 
 
 def _matches_shared_recovery_payload(parent: DbTask, child: DbTask) -> bool:
@@ -376,8 +386,103 @@ def is_resolved_by_merged_target(store: SqliteTaskStore, task: DbTask) -> bool:
     """Return whether a failed side-quest task is obsolete because its target impl merged."""
     if task.id is None or task.status != "failed" or task.task_type not in _MERGED_TARGET_RESOLUTION_TYPES:
         return False
+    if task.task_type == "improve" and task.same_branch:
+        # Same-branch improve tasks can represent real post-merge follow-up work.
+        return False
     target_task = _resolve_merged_target_task(store, task)
     return target_task is not None and target_task.merge_status == "merged"
+
+
+def _load_merge_context(project_dir: Path | None = None) -> _MergeContext:
+    try:
+        config = Config.load(project_dir or Path.cwd(), discover=True)
+        git = Git(config.project_dir)
+        return _MergeContext(git=git, default_branch=git.default_branch())
+    except (ConfigError, GitError, OSError, ValueError):
+        return _MergeContext(git=None, default_branch=None)
+
+
+def _project_dir_for_store(store: SqliteTaskStore) -> Path | None:
+    project_root = getattr(store, "_project_root", None)
+    if isinstance(project_root, Path):
+        return project_root
+    db_parent = store.db_path.parent
+    if db_parent.name == ".gza":
+        candidate = db_parent.parent
+        if (candidate / "gza.yaml").exists():
+            return candidate
+    return None
+
+
+def _task_lineage_branch_keys(store: SqliteTaskStore, task: DbTask) -> set[str]:
+    keys: set[str] = set()
+    if task.branch:
+        keys.add(task.branch)
+    target_task = _resolve_merged_target_task(store, task)
+    if target_task is not None and target_task.branch:
+        keys.add(target_task.branch)
+    return keys
+
+
+def _is_independent_follow_up_root(store: SqliteTaskStore, task: DbTask) -> bool:
+    """Return whether the task roots a recovery chain under a non-recovery follow-up."""
+    if not task.based_on or task.id is None:
+        return False
+    parent = store.get(task.based_on)
+    if parent is None:
+        return False
+    if parent.task_type == task.task_type:
+        return _classify_recovery_edge(parent, task) is None
+    return True
+
+
+def _is_resolved_by_landed_lineage(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    merge_context: _MergeContext,
+) -> bool:
+    if task.id is None or task.status != "failed":
+        return False
+
+    if task.task_type == "improve" and task.same_branch:
+        # Same-branch improve tasks can represent real post-merge follow-up work.
+        return False
+
+    if merge_context.git is not None and merge_context.default_branch is not None and task.branch:
+        try:
+            branch_merged = merge_context.branch_resolution.get(task.branch)
+            if branch_merged is None:
+                branch_merged = merge_context.git.branch_exists(task.branch) and merge_context.git.is_merged(
+                    task.branch,
+                    merge_context.default_branch,
+                )
+                merge_context.branch_resolution[task.branch] = branch_merged
+            if branch_merged:
+                return True
+        except GitError:
+            pass
+
+    branch_keys = _task_lineage_branch_keys(store, task)
+    if not branch_keys:
+        return False
+
+    from .query import build_lineage, resolve_lineage_root
+
+    recovery_snapshot = _build_recovery_chain_snapshot(store, task)
+    independent_follow_up_root_id = (
+        recovery_snapshot.root_task.id if _is_independent_follow_up_root(store, recovery_snapshot.root_task) else None
+    )
+
+    lineage = build_lineage(store, resolve_lineage_root(store, task))
+    for lineage_task in lineage:
+        if lineage_task.id == task.id or lineage_task.merge_status != "merged":
+            continue
+        if lineage_task.id == independent_follow_up_root_id:
+            continue
+        if branch_keys & _task_lineage_branch_keys(store, lineage_task):
+            return True
+    return False
 
 
 def resolve_recovery_planning_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
@@ -400,6 +505,7 @@ def list_failed_tasks_for_recovery(
     tags: tuple[str, ...] | None = None,
     any_tag: bool = False,
 ) -> list[DbTask]:
+    merge_context = _load_merge_context(_project_dir_for_store(store))
     failed = [task for task in store.get_all() if task.status == "failed"]
     if tags:
         from .task_query import normalize_tag_filters, task_matches_tag_filters
@@ -412,6 +518,7 @@ def list_failed_tasks_for_recovery(
         ]
     failed = [task for task in failed if not is_chain_resolved_by_recovery(store, task)]
     failed = [task for task in failed if not is_resolved_by_merged_target(store, task)]
+    failed = [task for task in failed if not _is_resolved_by_landed_lineage(store, task, merge_context=merge_context)]
     return sort_failed_tasks(failed)
 
 
