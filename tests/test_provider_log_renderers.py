@@ -6,6 +6,7 @@ from pathlib import Path
 from gza.cli.log import _LiveLogPrinter
 from gza.cli.tv import _scan_log
 from gza.providers.log_renderers import get_log_renderer
+from gza.providers.log_rendering import RenderStats
 
 from tests.cli.conftest import make_store, setup_config
 from tests.helpers.cli import run_gza
@@ -125,6 +126,39 @@ def test_claude_renderer_falls_back_for_unknown_assistant_blocks() -> None:
     assert log_rendered.log_lines[0].startswith("[event:assistant]")
     assert "new_block" in log_rendered.log_lines[0]
     assert tv_rendered.tv_lines[0].startswith("event:assistant")
+    assert renderer.suppressed_count == 0
+
+
+def test_claude_renderer_keeps_user_text_content_visible() -> None:
+    renderer = get_log_renderer("claude")
+    entry = {
+        "type": "user",
+        "message": {"content": "please continue"},
+    }
+
+    log_rendered = renderer.handle_log(entry, live=False)
+    tv_rendered = renderer.handle_tv(entry)
+
+    assert log_rendered.log_lines == ["user: please continue"]
+    assert tv_rendered.tv_lines == ["user: please continue"]
+    assert renderer.suppressed_count == 0
+
+
+def test_claude_renderer_falls_back_for_unknown_user_blocks() -> None:
+    renderer = get_log_renderer("claude")
+    entry = {
+        "type": "user",
+        "message": {
+            "content": [{"type": "new_block", "payload": "visible"}],
+        },
+    }
+
+    log_rendered = renderer.handle_log(entry, live=False)
+    tv_rendered = renderer.handle_tv(entry)
+
+    assert log_rendered.log_lines[0].startswith("[event:user]")
+    assert "new_block" in log_rendered.log_lines[0]
+    assert tv_rendered.tv_lines[0].startswith("event:user")
     assert renderer.suppressed_count == 0
 
 
@@ -254,3 +288,35 @@ def test_gza_log_prints_suppressed_footer_and_verbose_unknown_payload(tmp_path: 
     assert result.returncode == 0
     assert "routine events suppressed" in result.stdout
     assert '"alpha": 1' in result.stdout
+
+
+def test_gza_log_unknown_provider_returns_clear_cli_error(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Unknown provider log task")
+    task.status = "completed"
+    task.provider = "mistral"
+    task.provider_is_explicit = True
+    task.log_file = ".gza/logs/unknown-provider.log"
+    store.update(task)
+
+    log_path = tmp_path / ".gza" / "logs" / "unknown-provider.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text('{"type":"assistant","message":{"id":"msg_1","content":"hello"}}\n')
+
+    result = run_gza("log", str(task.id), "--project", str(tmp_path))
+
+    assert result.returncode == 1
+    assert "Error: unknown provider for log rendering: mistral" in result.stdout
+    assert "Traceback" not in result.stdout
+    assert "Traceback" not in result.stderr
+
+
+def test_tv_scan_unknown_provider_returns_visible_error_line(tmp_path: Path) -> None:
+    log_path = tmp_path / "unknown-provider.jsonl"
+    log_path.write_text('{"type":"assistant","message":{"id":"msg_1","content":"hello"}}\n')
+
+    lines, stats = _scan_log(log_path, 10, "mistral")
+
+    assert lines == ["Error: unknown provider for log rendering: mistral"]
+    assert stats == RenderStats()

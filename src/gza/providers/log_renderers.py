@@ -10,6 +10,14 @@ from .gemini import GeminiLogRenderer
 from .log_rendering import ProviderLogRenderer
 
 
+class UnknownLogProviderError(ValueError):
+    """Raised when task-backed log rendering requests an unsupported provider."""
+
+    def __init__(self, provider: str) -> None:
+        self.provider = provider
+        super().__init__(f"unknown provider for log rendering: {provider}")
+
+
 class MixedLegacyLogRenderer:
     """Fallback renderer for worker-only/startup logs without task metadata."""
 
@@ -71,4 +79,4 @@ def get_log_renderer(
         return CodexLogRenderer(configured_model=configured_model, verbose=verbose)
     if normalized == "gemini":
         return GeminiLogRenderer(configured_model=configured_model, verbose=verbose)
-    raise ValueError(f"Unknown provider for log rendering: {provider}")
+    raise UnknownLogProviderError(provider)

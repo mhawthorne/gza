@@ -284,24 +284,52 @@ class ClaudeLogRenderer:
     def _render_user(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         log_lines: list[str] = []
         tv_lines: list[str] = []
+        unknown_block_found = False
         for item in message_content_items(entry):
-            if item.get("type") != "tool_result":
-                continue
-            result = item.get("content", "")
-            if isinstance(result, str):
-                result = result.replace("\\n", "\n").replace("\\t", "\t")
-            is_error = bool(item.get("is_error", False))
-            rendered = str(result).strip()
-            if not rendered:
-                continue
-            if tv:
-                prefix = "tool_error" if is_error else "tool_output"
-                tv_lines.append(f"{prefix} {rendered}")
-            else:
-                if is_error:
-                    log_lines.append(f"[red]{rich_escape(rendered)}[/red]")
+            item_type = item.get("type")
+            if item_type == "tool_result":
+                result = item.get("content", "")
+                if isinstance(result, str):
+                    result = result.replace("\\n", "\n").replace("\\t", "\t")
+                is_error = bool(item.get("is_error", False))
+                rendered = str(result).strip()
+                if not rendered:
+                    continue
+                if tv:
+                    prefix = "tool_error" if is_error else "tool_output"
+                    tv_lines.append(f"{prefix} {rendered}")
                 else:
-                    log_lines.append(rich_escape(rendered))
+                    if is_error:
+                        log_lines.append(f"[red]{rich_escape(rendered)}[/red]")
+                    else:
+                        log_lines.append(rich_escape(rendered))
+                continue
+
+            if item_type == "text":
+                text = item.get("text", "")
+                if isinstance(text, str) and text.strip():
+                    rendered_text = text.strip()
+                    prefix = "user: "
+                    if tv:
+                        tv_lines.append(f"{prefix}{rendered_text}")
+                    else:
+                        log_lines.append(rich_escape(f"{prefix}{rendered_text}"))
+                    continue
+
+            if item:
+                unknown_block_found = True
+
+        if log_lines or tv_lines:
+            if unknown_block_found:
+                fallback = self._render_unknown(entry, tv=tv)
+                log_lines.extend(fallback.log_lines)
+                tv_lines.extend(fallback.tv_lines)
+            return RenderedLines(log_lines=log_lines, tv_lines=tv_lines)
+
+        if unknown_block_found:
+            return self._render_unknown(entry, tv=tv)
+
+        self.suppressed_count += 1
         return RenderedLines(log_lines=log_lines, tv_lines=tv_lines)
 
     def _render_result(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:

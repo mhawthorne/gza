@@ -18,7 +18,7 @@ import gza.colors as _colors
 from ..config import Config
 from ..console import console, format_duration, shorten_prompt, truncate
 from ..db import SqliteTaskStore, Task as DbTask
-from ..providers.log_renderers import get_log_renderer
+from ..providers.log_renderers import UnknownLogProviderError, get_log_renderer
 from ..providers.log_rendering import RenderStats
 from ..providers.output_formatter import format_token_count
 from ..workers import WorkerRegistry
@@ -51,7 +51,10 @@ def _themed_console() -> Console:
 
 def _scan_log(log_path: Path, n: int, provider: str | None, configured_model: str | None = None) -> tuple[list[str], RenderStats]:
     """Read the last *n* display lines and accumulate stats from a JSONL task log."""
-    renderer = get_log_renderer(provider, configured_model=configured_model, verbose=False)
+    try:
+        renderer = get_log_renderer(provider, configured_model=configured_model, verbose=False)
+    except UnknownLogProviderError as exc:
+        return [f"Error: {exc}"], RenderStats()
     if not log_path.exists():
         return ["(log file not found)"], renderer.stats
 

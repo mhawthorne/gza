@@ -21,7 +21,7 @@ from ..colors import (
 from ..config import Config
 from ..console import console, format_duration
 from ..db import SqliteTaskStore, Task as DbTask
-from ..providers.log_renderers import get_log_renderer
+from ..providers.log_renderers import UnknownLogProviderError, get_log_renderer
 from ..providers.log_rendering import (
     message_content_items as provider_message_content_items,
     result_step_count as provider_result_step_count,
@@ -474,6 +474,11 @@ def _print_failure_focus(task: DbTask, log_path: Path, config: Config) -> None:
     )
 
 
+def _print_unknown_log_provider_error(exc: UnknownLogProviderError) -> None:
+    """Emit a stable operator-facing error for unsupported task log providers."""
+    print(f"Error: {exc}")
+
+
 def cmd_log(args: argparse.Namespace) -> int:
     """Display the log for a task or worker."""
     config = Config.load(args.project_dir)
@@ -637,52 +642,56 @@ def cmd_log(args: argparse.Namespace) -> int:
         _sep = f"[{_lc()}]" + "━" * 70 + f"[/{_lc()}]"
 
         timeline_mode = getattr(args, "timeline_mode", None)
-        if timeline_mode and entries:
-            _display_step_timeline(
-                entries,
-                verbose=timeline_mode == "verbose",
-                provider=provider_name,
-                configured_model=configured_model,
-            )
-        elif entries:
-            printer = _LiveLogPrinter(
-                live=False,
-                provider=provider_name,
-                configured_model=configured_model,
-                verbose=bool(getattr(args, "verbose", False)),
-            )
-            any_printed = False
-            for entry in entries:
-                any_printed = printer.process(entry) or any_printed
-            if not any_printed:
-                if log_data:
-                    if "result" in log_data:
-                        console.print(rich_escape(log_data["result"]), soft_wrap=True)
+        try:
+            if timeline_mode and entries:
+                _display_step_timeline(
+                    entries,
+                    verbose=timeline_mode == "verbose",
+                    provider=provider_name,
+                    configured_model=configured_model,
+                )
+            elif entries:
+                printer = _LiveLogPrinter(
+                    live=False,
+                    provider=provider_name,
+                    configured_model=configured_model,
+                    verbose=bool(getattr(args, "verbose", False)),
+                )
+                any_printed = False
+                for entry in entries:
+                    any_printed = printer.process(entry) or any_printed
+                if not any_printed:
+                    if log_data:
+                        if "result" in log_data:
+                            console.print(rich_escape(log_data["result"]), soft_wrap=True)
+                        else:
+                            subtype = log_data.get("subtype", "unknown")
+                            console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
+                            if log_data.get("errors"):
+                                console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
                     else:
-                        subtype = log_data.get("subtype", "unknown")
-                        console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
-                        if log_data.get("errors"):
-                            console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
+                        console.print("No displayable log entries found.", soft_wrap=True)
+            elif log_data:
+                # Extract and display the result field (which contains markdown)
+                if "result" in log_data:
+                    console.print(rich_escape(log_data["result"]), soft_wrap=True)
                 else:
-                    console.print("No displayable log entries found.", soft_wrap=True)
-        elif log_data:
-            # Extract and display the result field (which contains markdown)
-            if "result" in log_data:
-                console.print(rich_escape(log_data["result"]), soft_wrap=True)
+                    # No result - show the subtype (e.g., error_max_turns)
+                    subtype = log_data.get("subtype", "unknown")
+                    console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
+                    if log_data.get("errors"):
+                        console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
             else:
-                # No result - show the subtype (e.g., error_max_turns)
-                subtype = log_data.get("subtype", "unknown")
-                console.print(f"Run ended with: {rich_escape(subtype)}", soft_wrap=True)
-                if log_data.get("errors"):
-                    console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
-        else:
-            # No result entry yet - show compact step timeline
-            _display_step_timeline(
-                entries,
-                verbose=False,
-                provider=provider_name,
-                configured_model=configured_model,
-            )
+                # No result entry yet - show compact step timeline
+                _display_step_timeline(
+                    entries,
+                    verbose=False,
+                    provider=provider_name,
+                    configured_model=configured_model,
+                )
+        except UnknownLogProviderError as exc:
+            _print_unknown_log_provider_error(exc)
+            return 1
 
         if entries and timeline_mode is None:
             suppressed_count = printer.renderer.suppressed_count if "printer" in locals() else 0
@@ -822,6 +831,9 @@ def _tail_log_file(
             )
         return 0
 
+    except UnknownLogProviderError as exc:
+        _print_unknown_log_provider_error(exc)
+        return 1
     except KeyboardInterrupt:
         return 0
     except Exception as e:
