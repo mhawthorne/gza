@@ -1377,7 +1377,7 @@ gza extract SOURCE --files-from FILE [options]
 
 The drafted extract prompt leads with the best available description of the work itself. Task-based extraction prefers specific source-task prompt content after filtering generated extraction scaffolding and provenance boilerplate, branch-based extraction falls back to selected diff/file context, and commit-based extraction uses commit subjects when they provide a clearer summary. Source task IDs, branch/base refs, and commit SHAs remain in the prompt as secondary provenance context.
 
-At run time, branch/task-based extracted tasks re-derive their selected patch from the current `source_base_ref...source_branch` diff before seeding the worktree. Commit-based extracted tasks re-derive their patch from the stored committed revisions in manifest order. If that refreshed diff is empty, the task completes successfully without invoking the agent.
+At run time, branch/task-based extracted tasks re-derive their selected patch from the current `source_base_ref...source_branch` diff before seeding the worktree. Commit-based extracted tasks re-derive their patch from the stored committed revisions in manifest order. If that refreshed diff is empty, or if the refreshed selected-path patch is already present on the current base and only later selected-path edits remain, the task completes successfully without invoking the agent.
 
 ### advance
 

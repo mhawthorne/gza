@@ -855,6 +855,81 @@ def test_run_completes_without_provider_when_selected_extraction_scope_is_alread
     assert mock_provider.run.call_count == 0
 
 
+def test_run_completes_without_provider_when_selected_source_changes_are_subset_of_current_base(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "test.db"
+    store = SqliteTaskStore(db_path, prefix="testproject")
+    task = store.add("Extracted task", task_type="implement")
+    task.slug = "20260508-already-merged-selected-subset"
+    store.update(task)
+
+    patch_text = (
+        "diff --git a/src/file.py b/src/file.py\n"
+        "index e69de29..8c7e5a6 100644\n"
+        "--- a/src/file.py\n"
+        "+++ b/src/file.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+print('line a')\n"
+    )
+    current_base_delta = (
+        "diff --git a/src/file.py b/src/file.py\n"
+        "index e69de29..1b83abc 100644\n"
+        "--- a/src/file.py\n"
+        "+++ b/src/file.py\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+print('line a')\n"
+        "+print('line b')\n"
+    )
+    _write_bundle(
+        tmp_path,
+        task.id,
+        task.slug,
+        patch_text=patch_text,
+        source_branch="feature/source",
+    )
+
+    config = _build_config(tmp_path, db_path)
+
+    mock_provider = Mock()
+    mock_provider.name = "TestProvider"
+    mock_provider.check_credentials.return_value = True
+    mock_provider.verify_credentials.return_value = True
+
+    mock_main_git = Mock()
+    mock_main_git.default_branch.return_value = "main"
+    mock_main_git.branch_exists.return_value = False
+    mock_main_git.worktree_list.return_value = []
+    mock_main_git.worktree_add.return_value = config.worktree_path / task.slug
+    mock_main_git.count_commits_ahead.return_value = 0
+    mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+    mock_worktree_git = Mock()
+    mock_worktree_git.ref_exists.side_effect = [True, True]
+    mock_worktree_git.get_diff_patch_for_paths.side_effect = [patch_text, current_base_delta]
+    mock_worktree_git.reverse_check_patch_file_result.return_value = GitApplyResult(
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+
+    with (
+        patch("gza.runner.get_provider", return_value=mock_provider),
+        patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
+        patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+        patch("gza.runner.load_dotenv"),
+    ):
+        rc = run(config, task_id=task.id)
+
+    assert rc == 0
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+    assert refreshed.completion_reason == EXTRACTION_ALREADY_MERGED_COMPLETION_REASON
+    assert mock_provider.run.call_count == 0
+    mock_worktree_git.apply_patch_file_result.assert_not_called()
+
+
 def test_run_marks_failed_when_extraction_manifest_identity_mismatches_task(tmp_path: Path) -> None:
     db_path = tmp_path / "test.db"
     store = SqliteTaskStore(db_path, prefix="testproject")

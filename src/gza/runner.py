@@ -2391,6 +2391,16 @@ def _seed_extraction_bundle_if_present(
             "selected.runtime.patch",
             current_patch_text,
         )
+        reverse_check_result = worktree_git.reverse_check_patch_file_result(runtime_patch_path)
+        if reverse_check_result.returncode == 0:
+            return _already_merged_extraction_seed_result(
+                task,
+                log_file,
+                message=(
+                    "Extraction source changes are already present on selected paths; "
+                    f"marking task {task.id} {EXTRACTION_ALREADY_MERGED_COMPLETION_REASON}"
+                ),
+            )
         apply_result = worktree_git.apply_patch_file_result(runtime_patch_path)
         if apply_result.returncode != 0:
             if _apply_left_relevant_conflicts(worktree_git, set(current_touched_paths)):

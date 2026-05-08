@@ -625,6 +625,15 @@ class Git:
             stderr=result.stderr,
         )
 
+    def reverse_check_patch_file_result(self, patch_file: Path) -> GitApplyResult:
+        """Check whether a patch is already present by reverse-applying it in check mode."""
+        result = self._run("apply", "--check", "--reverse", str(patch_file), check=False)
+        return GitApplyResult(
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+
     def apply_patch_file(self, patch_file: Path) -> None:
         """Apply a patch file with ``git apply --3way``."""
         result = self.apply_patch_file_result(patch_file)
