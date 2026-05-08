@@ -245,6 +245,19 @@ def test_configuration_docs_describe_comments_only_improve_path() -> None:
     assert "improve still runs using comments-only feedback" in config_content
 
 
+def test_configuration_docs_cover_unmerged_conflict_output_and_color_override() -> None:
+    """Unmerged docs should mention the conflict output line and matching color override field."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    config_content = (docs_root / "configuration.md").read_text()
+
+    required_snippets = [
+        "| Unmerged | `review_approved`, `review_followups`, `review_changes`, `review_discussion`, `review_none`, `merge_conflicts` |",
+        "When live merge analysis detects unresolved conflicts, a dedicated `merge: has conflicts` line.",
+    ]
+    for snippet in required_snippets:
+        assert snippet in config_content
+
+
 def test_docker_docs_describe_digest_based_rebuild_freshness() -> None:
     """Docker docs should reflect digest-label freshness checks, not mtime heuristics."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"

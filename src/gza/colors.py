@@ -186,6 +186,7 @@ class UnmergedColors:
     review_changes: str = default_color
     review_discussion: str = default_color
     review_none: str = default_color
+    merge_conflicts: str = default_color
 
 
 _UNMERGED_FIELD_VALUE_COLOR_KEYS: dict[str, dict[str, str]] = {
@@ -195,6 +196,9 @@ _UNMERGED_FIELD_VALUE_COLOR_KEYS: dict[str, dict[str, str]] = {
         "⚠ changes requested": "review_changes",
         "💬 needs discussion": "review_discussion",
         "no review": "review_none",
+    },
+    "has_conflicts": {
+        "has conflicts": "merge_conflicts",
     }
 }
 
@@ -397,6 +401,7 @@ _THEME_MINIMAL = Theme(
         "review_none": yellow_warning,
         "review_approved": green_success,
         "review_followups": green_success,
+        "merge_conflicts": red_error,
     },
     task_stream={
         "step_header": f"{pink_light} bold",

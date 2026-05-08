@@ -214,6 +214,13 @@ def _render_rich(result: TaskQueryResult) -> str:
             if values.get("has_conflicts"):
                 branch_bits.append("has conflicts")
             lines.append(f"branch: {', '.join(branch_bits)}")
+            if values.get("has_conflicts"):
+                conflicts_text = _style_unmerged_field_value(
+                    "has_conflicts",
+                    "has conflicts",
+                    "has conflicts",
+                )
+                lines.append(f"merge: {conflicts_text}")
 
         pr_url = values.get("pr_url")
         if pr_url:

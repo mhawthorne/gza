@@ -144,7 +144,7 @@ From highest to lowest:
 | Status | `completed`, `failed`, `pending`, `in_progress`, `unmerged`, `dropped`, `stale`, `unknown`, `running` |
 | Work output | `step_header`, `assistant_text`, `tool_use`, `error`, `todo_pending`, `todo_in_progress`, `todo_completed` |
 | Show | `section`, `status_pending`, `status_running`, `status_completed`, `status_failed`, `status_default` |
-| Unmerged | `review_approved`, `review_changes`, `review_discussion`, `review_none` |
+| Unmerged | `review_approved`, `review_followups`, `review_changes`, `review_discussion`, `review_none`, `merge_conflicts` |
 | Lineage | `task_type`, `annotation`, `connector`, `type_label`, `relationship`, `target_highlight` |
 | Next | `type`, `blocked`, `index` |
 
@@ -1009,6 +1009,7 @@ During execution, the command logs concise progress for the refresh, query, and 
 
 For each unmerged implementation in the default text view, output includes:
 - Branch diff/commit summary.
+- When live merge analysis detects unresolved conflicts, a dedicated `merge: has conflicts` line.
 - A `lineage:` branch-rendered tree showing only the selected branch-owner task and its descendants.
 - A `review:` freshness classification:
   - `no review` when no completed review exists.

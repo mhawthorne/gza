@@ -97,7 +97,8 @@ def test_unmerged_colors_dict_keys() -> None:
     from gza.colors import UNMERGED_COLORS_DICT
 
     expected_keys = {"task_id", "prompt", "stats", "branch", "date",
-                     "review_approved", "review_followups", "review_changes", "review_discussion", "review_none"}
+                     "review_approved", "review_followups", "review_changes", "review_discussion", "review_none",
+                     "merge_conflicts"}
     assert set(UNMERGED_COLORS_DICT.keys()) == expected_keys
 
 
@@ -108,6 +109,7 @@ def test_unmerged_review_verdict_field_value_color_uses_themed_singleton() -> No
         c.set_theme("minimal")
         assert c.get_unmerged_field_value_color("review_verdict", "✓ approved") == c.UNMERGED_COLORS.review_approved
         assert c.get_unmerged_field_value_color("review_verdict", "⚠ changes requested") == c.UNMERGED_COLORS.review_changes
+        assert c.get_unmerged_field_value_color("has_conflicts", "has conflicts") == c.UNMERGED_COLORS.merge_conflicts
     finally:
         c.set_theme(None)
 

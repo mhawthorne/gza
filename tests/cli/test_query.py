@@ -47,6 +47,7 @@ class _FastUnmergedGit:
         self._branches: set[str] = set()
         self._refs: set[str] = set()
         self._merged: dict[tuple[str, str | None], bool] = {}
+        self._can_merge: dict[tuple[str, str | None], bool] = {}
         self._numstat = "1\t0\tfeature.txt\n"
         self._fetch_error: GitError | None = None
         self.fetch_calls: list[str] = []
@@ -76,7 +77,7 @@ class _FastUnmergedGit:
         return self._numstat
 
     def can_merge(self, branch: str, into: str | None = None) -> bool:
-        return True
+        return self._can_merge.get((branch, into), True)
 
     def fetch(self, remote: str = "origin") -> None:
         self.fetch_calls.append(remote)
@@ -7922,6 +7923,38 @@ class TestUnmergedUnifiedQueryOutput:
         assert "lineage:" in captured.out
         assert "branch:" in captured.out
         assert "review: reviewed [✓ approved]" in " ".join(captured.out.split())
+
+    def test_unmerged_default_text_surfaces_conflicts_on_own_line(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _store, task, _git = _setup_unmerged_env_fast(
+            tmp_path,
+            task_prompt="Conflicting unmerged branch",
+            branch="feature/conflicting-unmerged-branch",
+        )
+        fake_git = _FastUnmergedGit()
+        fake_git._can_merge[("feature/conflicting-unmerged-branch", "main")] = False
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=False,
+            fields=None,
+        )
+
+        result = query_cli.cmd_unmerged(args, git=fake_git)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert f"⚡ {task.id}" in captured.out
+        assert "branch: feature/conflicting-unmerged-branch" in captured.out
+        assert "has conflicts" in captured.out
+        assert "merge: has conflicts" in captured.out
 
     def test_unmerged_json_empty_results_returns_empty_array_without_human_message(
         self,

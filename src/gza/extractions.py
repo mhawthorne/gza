@@ -366,6 +366,12 @@ def _describe_source_objective(
             assert commit_summary is not None
             return commit_summary
 
+    if source.source_branch and source.source_task_id is None:
+        branch_summary = _humanize_branch_name(source.source_branch)
+        if branch_summary:
+            assert branch_summary is not None
+            return branch_summary
+
     topic_hint = _best_topic_hint(source)
     diff_objective = _describe_diff_objective(
         selected_paths=selected_paths,
