@@ -3,8 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from gza.git import Git
+import gza.recovery_engine as recovery_engine
 from gza.recovery_engine import (
+    _MergeContext,
     decide_failed_task_recovery,
     get_completed_recovery_descendant,
     get_failed_recovery_needs_attention_reason,
@@ -41,15 +42,24 @@ def _completed_impl(store, *, merge_status: str):
     return task
 
 
-def _init_git_repo(tmp_path: Path) -> Git:
-    git = Git(tmp_path)
-    git._run("init", "-b", "main")
-    git._run("config", "user.name", "Test User")
-    git._run("config", "user.email", "test@example.com")
-    (tmp_path / "README.md").write_text("initial\n")
-    git._run("add", "README.md")
-    git._run("commit", "-m", "Initial commit")
-    return git
+class _StubMergeGit:
+    def __init__(self, *, merged_branches: set[str] | None = None) -> None:
+        self.merged_branches = merged_branches or set()
+
+    def branch_exists(self, branch: str) -> bool:
+        return bool(branch)
+
+    def is_merged(self, branch: str, into: str) -> bool:
+        return into == "main" and branch in self.merged_branches
+
+
+def _stub_merge_context(monkeypatch: pytest.MonkeyPatch, *, merged_branches: set[str] | None = None) -> None:
+    git = _StubMergeGit(merged_branches=merged_branches)
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=git, default_branch="main"),
+    )
 
 
 def _failed_sidequest(store, *, task_type: str, impl_id: str, reason: str):
@@ -137,10 +147,9 @@ def test_list_failed_tasks_for_recovery_filters_failed_impl_when_landed_work_is_
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.chdir(tmp_path)
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    git = _init_git_repo(tmp_path)
+    _stub_merge_context(monkeypatch, merged_branches={"feature/landed-work"})
 
     failed = store.add("Failed implementation", task_type="implement")
     assert failed.id is not None
@@ -150,27 +159,6 @@ def test_list_failed_tasks_for_recovery_filters_failed_impl_when_landed_work_is_
     failed.branch = "feature/landed-work"
     failed.completed_at = datetime.now(UTC)
     store.update(failed)
-
-    git._run("checkout", "-b", failed.branch)
-    (tmp_path / "landed.txt").write_text("landed\n")
-    git._run("add", "landed.txt")
-    git._run("commit", "-m", "Add landed work")
-    git._run("checkout", "main")
-    git._run("merge", "--no-ff", failed.branch, "-m", "Merge landed work")
-
-    merged_descendant = store.add(failed.prompt, task_type="implement", based_on=failed.id)
-    assert merged_descendant.id is not None
-    merged_descendant.status = "completed"
-    merged_descendant.merge_status = "merged"
-    merged_descendant.branch = failed.branch
-    merged_descendant.completed_at = datetime.now(UTC)
-    store.update(merged_descendant)
-
-    pending_descendant = store.add(failed.prompt, task_type="implement", based_on=failed.id)
-    assert pending_descendant.id is not None
-    pending_descendant.status = "pending"
-    pending_descendant.branch = "feature/pending-recovery"
-    store.update(pending_descendant)
 
     unrelated = store.add("Still failed", task_type="plan")
     assert unrelated.id is not None
@@ -187,10 +175,9 @@ def test_list_failed_tasks_for_recovery_keeps_failed_task_without_landed_lineage
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.chdir(tmp_path)
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    git = _init_git_repo(tmp_path)
+    _stub_merge_context(monkeypatch)
 
     failed = store.add("Failed implementation", task_type="implement")
     assert failed.id is not None
@@ -200,12 +187,6 @@ def test_list_failed_tasks_for_recovery_keeps_failed_task_without_landed_lineage
     failed.branch = "feature/unmerged-work"
     failed.completed_at = datetime.now(UTC)
     store.update(failed)
-
-    git._run("checkout", "-b", failed.branch)
-    (tmp_path / "unmerged.txt").write_text("unmerged\n")
-    git._run("add", "unmerged.txt")
-    git._run("commit", "-m", "Add unmerged work")
-    git._run("checkout", "main")
 
     failed_retry = store.add(failed.prompt, task_type="implement", based_on=failed.id)
     assert failed_retry.id is not None
@@ -224,9 +205,9 @@ def test_list_failed_tasks_for_recovery_keeps_same_branch_failed_improve_under_m
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.chdir(tmp_path)
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch, merged_branches={"feature/merged-impl"})
 
     impl = _completed_impl(store, merge_status="merged")
     assert impl.id is not None
@@ -249,6 +230,7 @@ def test_list_failed_tasks_for_recovery_keeps_same_branch_failed_improve_under_m
     assert failed_improve.id is not None
     failed_improve.status = "failed"
     failed_improve.failure_reason = "GIT_ERROR"
+    failed_improve.branch = impl.branch
     failed_improve.completed_at = datetime.now(UTC)
     store.update(failed_improve)
 

@@ -433,6 +433,10 @@ def _is_resolved_by_landed_lineage(
     if task.id is None or task.status != "failed":
         return False
 
+    if task.task_type == "improve" and task.same_branch:
+        # Same-branch improve tasks can represent real post-merge follow-up work.
+        return False
+
     if merge_context.git is not None and merge_context.default_branch is not None and task.branch:
         try:
             branch_merged = merge_context.branch_resolution.get(task.branch)
@@ -446,9 +450,6 @@ def _is_resolved_by_landed_lineage(
                 return True
         except GitError:
             pass
-
-    if task.task_type == "improve" and task.same_branch:
-        return False
 
     branch_keys = _task_lineage_branch_keys(store, task)
     if not branch_keys:
