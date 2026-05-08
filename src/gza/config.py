@@ -294,6 +294,8 @@ def _deep_merge_dicts(base: dict, override: dict, source_map: dict[str, str], pa
     merged = copy.deepcopy(base)
     for key, value in override.items():
         path = f"{path_prefix}.{key}" if path_prefix else key
+        if value is None and isinstance(merged.get(key), dict):
+            continue
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _deep_merge_dicts(merged[key], value, source_map, path)
             continue
