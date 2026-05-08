@@ -2,6 +2,7 @@
 
 
 import importlib
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,14 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 
 from .conftest import run_gza, setup_config
+
+
+def _normalized_markdown_section(path: Path, heading: str) -> str:
+    """Return a whitespace-normalized level-3 markdown section by heading."""
+    pattern = rf"^### {re.escape(heading)}\n(?P<section>.*?)(?=^### |\Z)"
+    match = re.search(pattern, path.read_text(), re.MULTILINE | re.DOTALL)
+    assert match is not None, f"Missing docs section: ### {heading}"
+    return " ".join(match.group(0).split())
 
 
 class TestHelpOutput:
@@ -301,7 +310,7 @@ class TestHelpOutput:
 
         assert help_result.returncode == 0
         normalized_help = " ".join(help_result.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        docs_text = _normalized_markdown_section(Path("docs/configuration.md"), "edit")
 
         assert "Non-pending tasks may only use tag mutation flags" in normalized_help
         assert "Non-pending tasks may only use tag mutation flags" in docs_text
@@ -312,7 +321,16 @@ class TestHelpOutput:
             assert flag in normalized_help
             assert flag in docs_text
 
-        for flag in ("--based-on", "--depends-on", "--review", "--pr", "--prompt-file", "--model"):
+        for flag in (
+            "--based-on",
+            "--depends-on",
+            "--review",
+            "--pr",
+            "--prompt-file",
+            "--model",
+            "--provider",
+            "--no-learnings",
+        ):
             assert flag in normalized_help
             assert flag in docs_text
 
