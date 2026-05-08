@@ -20,7 +20,9 @@ To minimize false positives, replacements require both a trigger term and a near
 Implementation notes:
 
 - Replacements are case-insensitive.
-- `bypass*` and `kill*` match whole-word families via prefix patterns (for example: `bypass`, `bypasses`, `bypassing`, `kill`, `kills`, `killing`).
+- `bypass*` and `kill*` match whole-word families via explicit inflection patterns (for example: `bypass`, `bypasses`, `bypassing`, `kill`, `kills`, `killing`).
 - `override*` currently matches: `override`, `overrides`, `overriding`, `overridden`, `overrode`.
+- Trigger matching is identifier-aware: terms connected to other characters by `-`, `/`, `.`, or `_` are not rewritten.
 - Fenced code blocks are preserved verbatim to avoid rewriting command/code examples.
+- Identifier-like substrings that look like slugs, branch names, or file paths are preserved verbatim to avoid corrupting task metadata in prompts.
 - If context terms are not present near a trigger match, no replacement is performed for that match.
