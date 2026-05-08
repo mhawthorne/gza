@@ -9,6 +9,7 @@ from ..db import (
     KNOWN_EXECUTION_MODES,
     InvalidTaskIdError,
     ManualMigrationRequired,
+    MergeTargetResolutionError,
     SchemaIntegrityError,
     SqliteTaskStore,
     check_migration_status,
@@ -2562,6 +2563,9 @@ def main() -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     except InvalidTaskIdError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except MergeTargetResolutionError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     except SchemaIntegrityError as e:

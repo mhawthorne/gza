@@ -14,6 +14,7 @@ import pytest
 from gza.db import (
     SCHEMA_VERSION,
     ManualMigrationRequired,
+    MergeTargetResolutionError,
     SchemaIntegrityError,
     SqliteTaskStore,
     StepRef,
@@ -1990,7 +1991,7 @@ class TestMergeStatus:
     ) -> None:
         """Store-level merge-unit writes and reads should honor the configured default target."""
         store = SqliteTaskStore(tmp_path / "test.db")
-        monkeypatch.setattr(store, "default_merge_target", lambda: "trunk")
+        monkeypatch.setattr(store, "default_merge_target", lambda *, strict=False: "trunk")
 
         task = store.add(prompt="Implement feature", task_type="implement")
         store.mark_completed(task, has_commits=True, branch="feature/trunk-target")
@@ -2010,6 +2011,57 @@ class TestMergeStatus:
         assert refreshed_trunk_unit.state == "merged"
         assert refreshed_main_unit is None
         assert store.get_unmerged() == []
+
+    def test_set_merge_status_without_target_updates_default_target_unit_only(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Compatibility writes without a target must resolve through the real default target."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        monkeypatch.setattr(store, "default_merge_target", lambda *, strict=False: "main")
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(task, has_commits=True, branch="feature/multi-target", target_branch="main")
+
+        assert task.id is not None
+        main_unit = store.resolve_merge_unit_for_task(task.id, "main")
+        assert main_unit is not None
+        release_unit = store.get_or_create_merge_unit_for_task(task, "release")
+        assert release_unit is not None
+
+        store.set_merge_unit_state(main_unit.id, "unmerged")
+        store.set_merge_unit_state(release_unit.id, "unmerged")
+
+        store.set_merge_status(task.id, "merged")
+
+        refreshed_main_unit = store.resolve_merge_unit_for_task(task.id, "main")
+        refreshed_release_unit = store.resolve_merge_unit_for_task(task.id, "release")
+        refreshed_task = store.get(task.id)
+        assert refreshed_main_unit is not None
+        assert refreshed_release_unit is not None
+        assert refreshed_task is not None
+        assert refreshed_main_unit.state == "merged"
+        assert refreshed_release_unit.state == "unmerged"
+        assert refreshed_task.merge_status == "merged"
+
+    def test_mark_completed_without_explicit_target_raises_when_project_default_branch_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Project-backed write paths must not silently persist merge truth under main."""
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        store = SqliteTaskStore(tmp_path / "test.db", project_root=project_root)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        with patch("gza.git.Git.default_branch", side_effect=RuntimeError("git failure")):
+            with pytest.raises(MergeTargetResolutionError, match="Could not determine default merge target"):
+                store.mark_completed(task, has_commits=True, branch="feature/strict-default")
+
+        assert task.id is not None
+        assert store.resolve_merge_unit_for_task(task.id, "main") is None
+        assert store.resolve_merge_unit_for_task(task.id) is None
 
     def test_get_unmerged_backfills_legacy_actionable_row_when_merge_units_exist(self, tmp_path: Path) -> None:
         """Legacy unmerged rows should remain visible until lazy merge-unit backfill attaches them."""

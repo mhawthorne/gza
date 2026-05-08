@@ -31,6 +31,7 @@ __all__ = [
     "KNOWN_EXECUTION_MODES",
     "InvalidTaskIdError",
     "ManualMigrationRequired",
+    "MergeTargetResolutionError",
     "SchemaIntegrityError",
     "Task",
     "MergeUnit",
@@ -97,6 +98,10 @@ class InvalidTaskIdError(ValueError):
 
 class SchemaIntegrityError(RuntimeError):
     """Raised when persisted DB artifacts are internally inconsistent."""
+
+
+class MergeTargetResolutionError(RuntimeError):
+    """Raised when write paths cannot determine the real default merge target."""
 
 
 class _ClosingSqliteConnection(sqlite3.Connection):
@@ -2140,18 +2145,31 @@ class SqliteTaskStore:
         with self._connect() as conn:
             return _table_exists(conn, "merge_units") and _table_exists(conn, "merge_unit_tasks")
 
-    def default_merge_target(self) -> str:
-        """Best-effort default merge target branch for stored merge units."""
+    def default_merge_target(self, *, strict: bool = False) -> str:
+        """Resolve the default merge target branch for stored merge units.
+
+        Rootless/test stores retain an explicit ``main`` fallback. Real project-backed
+        write paths can pass ``strict=True`` to require Git default-branch resolution
+        instead of silently persisting merge truth under an assumed target.
+        """
         project_root = self._project_root
         if isinstance(project_root, Path):
             try:
                 from .git import Git
 
                 default_branch = Git(project_root).default_branch()
-            except Exception:
+            except Exception as exc:
+                if strict:
+                    raise MergeTargetResolutionError(
+                        f"Could not determine default merge target for {project_root}: {exc}"
+                    ) from exc
                 default_branch = None
             if isinstance(default_branch, str) and default_branch:
                 return default_branch
+            if strict:
+                raise MergeTargetResolutionError(
+                    f"Could not determine default merge target for {project_root}: Git returned no default branch"
+                )
         return "main"
 
     def _ensure_db(self) -> None:
@@ -4321,9 +4339,12 @@ class SqliteTaskStore:
         if self.supports_merge_units():
             task = self.get(task_id)
             if task is not None:
-                requested_target = target_branch if isinstance(target_branch, str) else None
-                unit = self.resolve_merge_unit_for_task(task_id, requested_target)
-                effective_target = unit.target_branch if unit is not None else (requested_target or self.default_merge_target())
+                effective_target = (
+                    target_branch
+                    if isinstance(target_branch, str) and target_branch
+                    else self.default_merge_target(strict=True)
+                )
+                unit = self.resolve_merge_unit_for_task(task_id, effective_target)
                 if unit is None:
                     unit = self.get_or_create_merge_unit_for_task(task, effective_target)
                 if unit is not None:
@@ -5263,7 +5284,8 @@ class SqliteTaskStore:
         task.diff_lines_removed = diff_lines_removed
         self.update(task)
         if has_commits and task.branch and task.id is not None and self.supports_merge_units():
-            unit = self.get_or_create_merge_unit_for_task(task, target_branch or self.default_merge_target())
+            effective_target = target_branch or self.default_merge_target(strict=True)
+            unit = self.get_or_create_merge_unit_for_task(task, effective_target)
             if unit is not None:
                 self.attach_task_to_merge_unit(
                     task.id,
