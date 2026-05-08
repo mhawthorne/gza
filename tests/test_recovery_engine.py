@@ -5,6 +5,8 @@ import pytest
 
 import gza.recovery_engine as recovery_engine
 from gza.git import GitError
+from gza.db import MergeTargetResolutionError
+from gza.git import GitError
 from gza.recovery_engine import (
     _MergeContext,
     decide_failed_task_recovery,
@@ -175,6 +177,39 @@ def test_recovery_engine_uses_merge_context_target_branch_for_merge_units(
 
     _stub_merge_context(monkeypatch, default_branch="main")
     assert is_resolved_by_merged_target(store, failed) is True
+
+
+def test_recovery_engine_surfaces_target_resolution_failure_for_merged_target_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl = _completed_impl(store, merge_status="unmerged")
+    assert impl.id is not None
+    impl.branch = "feature/recovery-resolution"
+    store.update(impl)
+
+    main_unit = store.get_or_create_merge_unit_for_task(impl, "main")
+    release_unit = store.get_or_create_merge_unit_for_task(impl, "release")
+    assert main_unit is not None
+    assert release_unit is not None
+    store.set_merge_unit_state(main_unit.id, "merged")
+    store.set_merge_unit_state(release_unit.id, "unmerged")
+
+    failed = _failed_sidequest(store, task_type="review", impl_id=impl.id, reason="MISSING_REPORT_ARTIFACT")
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(
+            git=None,
+            default_branch=None,
+            resolution_error="git default-branch failure",
+        ),
+    )
+
+    with pytest.raises(MergeTargetResolutionError, match="recovery decisions"):
+        is_resolved_by_merged_target(store, failed)
 
 
 def test_list_failed_tasks_for_recovery_filters_failed_impl_when_landed_work_is_already_on_main(
@@ -988,6 +1023,45 @@ def test_recovery_engine_prerequisite_unmerged_uses_release_merge_context_target
 
     assert decision.action == "skip"
     assert decision.reason_code == "dependency_not_ready"
+
+
+def test_recovery_engine_dependency_target_resolution_failure_does_not_fall_back_to_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    store.mark_completed(dependency, has_commits=True, branch="feature/dep-resolution")
+    assert dependency.id is not None
+
+    main_unit = store.get_or_create_merge_unit_for_task(dependency, "main")
+    release_unit = store.get_or_create_merge_unit_for_task(dependency, "release")
+    assert main_unit is not None
+    assert release_unit is not None
+    store.set_merge_unit_state(main_unit.id, "merged")
+    store.set_merge_unit_state(release_unit.id, "unmerged")
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(
+            git=None,
+            default_branch=None,
+            resolution_error="git default-branch failure",
+        ),
+    )
+
+    with pytest.raises(MergeTargetResolutionError, match="recovery decisions"):
+        decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
 
 
 def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:

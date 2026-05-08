@@ -410,6 +410,15 @@ class MergeUnit:
     superseded_by_unit_id: str | None = None
 
 
+def _task_is_actionable_merge_unit_member(task: "Task", unit: MergeUnit) -> bool:
+    """Return whether the task is a mergeable representative for ``unit``."""
+    if task.task_type not in {"task", "implement", "improve", "fix", "rebase"}:
+        return False
+    if task.status not in {"completed", "unmerged"}:
+        return False
+    return task.branch == unit.source_branch
+
+
 @dataclass
 class TaskStats:
     """Statistics from a task run."""
@@ -3733,6 +3742,47 @@ class SqliteTaskStore:
             return owner_candidates[0]
         return branch_tasks[0] if branch_tasks else None
 
+    def resolve_merge_unit_representative_task(
+        self,
+        unit: MergeUnit,
+        *,
+        preferred_task_id: str | None = None,
+        require_actionable: bool = False,
+    ) -> Task | None:
+        """Return the best task row to act on for a merge unit.
+
+        Compatibility ownership stays on ``owner_task_id`` / task-row merge status.
+        Operational read and merge paths should instead prefer an actionable
+        code-bearing member, especially when the compatibility owner is historical
+        and failed.
+        """
+        tasks = self.list_tasks_for_merge_unit(unit.id)
+        actionable_members = [
+            task for task in tasks if _task_is_actionable_merge_unit_member(task, unit)
+        ]
+        if preferred_task_id is not None:
+            preferred = next((task for task in actionable_members if task.id == preferred_task_id), None)
+            if preferred is not None:
+                return preferred
+        owner = self._legacy_merge_status_owner_for_unit(unit)
+        if owner is not None and _task_is_actionable_merge_unit_member(owner, unit):
+            return owner
+        if actionable_members:
+            return max(
+                actionable_members,
+                key=lambda task: (
+                    task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC),
+                    task_id_numeric_key(task.id),
+                ),
+            )
+        if require_actionable:
+            return None
+        if owner is not None:
+            return owner
+        if preferred_task_id is not None:
+            return next((task for task in tasks if task.id == preferred_task_id), None)
+        return tasks[0] if tasks else None
+
     def attach_task_to_merge_unit(self, task_id: str, merge_unit_id: str, role: str) -> None:
         """Attach a task row to a merge unit."""
         if not self.supports_merge_units():
@@ -4144,12 +4194,15 @@ class SqliteTaskStore:
         """
         if self.supports_merge_units():
             units = self._get_unmerged_merge_units_with_legacy_fallback(target_branch or self.default_merge_target())
-            owner_ids = [
-                owner.id
+            representative_ids = [
+                representative.id
                 for unit in units
-                if (owner := self._legacy_merge_status_owner_for_unit(unit)) is not None and owner.id is not None
+                if (
+                    representative := self.resolve_merge_unit_representative_task(unit, require_actionable=True)
+                ) is not None
+                and representative.id is not None
             ]
-            return [task for task_id in owner_ids if (task := self.get(task_id)) is not None]
+            return [task for task_id in representative_ids if (task := self.get(task_id)) is not None]
         with self._connect() as conn:
             cur = conn.execute(
                 """

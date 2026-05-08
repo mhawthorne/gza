@@ -295,6 +295,59 @@ def test_merge_all_backfills_legacy_unmerged_owner_when_units_exist(tmp_path: Pa
     assert unit.state == "merged"
 
 
+def test_merge_all_uses_completed_retry_when_merge_unit_owner_failed(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.completed_at = datetime.now(UTC)
+    failed.branch = "feature/merge-retry"
+    failed.has_commits = True
+    failed.merge_status = "unmerged"
+    store.update(failed)
+
+    retry = store.add("Completed retry", task_type="implement", based_on=failed.id)
+    store.mark_completed(retry, has_commits=True, branch="feature/merge-retry")
+    assert retry.id is not None
+
+    fake_git = _MergeGit(tmp_path)
+    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
+        result = run_gza("merge", "--all", "--project", str(tmp_path), cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert fake_git.merged == [("feature/merge-retry", False)]
+
+
+def test_merge_explicit_retry_task_id_uses_actionable_member_when_owner_failed(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.completed_at = datetime.now(UTC)
+    failed.branch = "feature/explicit-retry"
+    failed.has_commits = True
+    failed.merge_status = "unmerged"
+    store.update(failed)
+
+    retry = store.add("Completed retry", task_type="implement", based_on=failed.id)
+    store.mark_completed(retry, has_commits=True, branch="feature/explicit-retry")
+    assert retry.id is not None
+
+    fake_git = _MergeGit(tmp_path)
+    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
+        result = run_gza("merge", str(retry.id), "--project", str(tmp_path), cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert fake_git.merged == [("feature/explicit-retry", False)]
+    unit = store.resolve_merge_unit_for_task(retry.id, "main")
+    assert unit is not None
+    assert unit.merged_by_task_id == retry.id
+
+
 def test_merge_valid_and_missing_explicit_task_ids_report_missing_without_partial_merge(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

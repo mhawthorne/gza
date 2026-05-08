@@ -2087,6 +2087,33 @@ class TestMergeStatus:
         assert unit.state == "unmerged"
         assert {member.id for member in store.list_tasks_for_merge_unit(unit.id)} == {task.id}
 
+    def test_get_unmerged_prefers_actionable_merge_unit_member_over_failed_owner(self, tmp_path: Path) -> None:
+        """Unit-backed reads should surface the mergeable member, not a failed historical owner."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        failed = store.add(prompt="Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.completed_at = datetime.now(UTC)
+        failed.branch = "feature/recovered-work"
+        failed.has_commits = True
+        failed.merge_status = "unmerged"
+        store.update(failed)
+
+        recovery = store.add(prompt="Completed retry", task_type="implement", based_on=failed.id)
+        store.mark_completed(recovery, has_commits=True, branch="feature/recovered-work")
+        assert recovery.id is not None
+
+        unit = store.resolve_merge_unit_for_task(recovery.id, "main")
+        assert unit is not None
+        assert unit.owner_task_id == failed.id
+        assert store._legacy_merge_status_owner_for_unit(unit).id == failed.id
+
+        assert [task.id for task in store.get_unmerged("main")] == [recovery.id]
+        representative = store.resolve_merge_unit_representative_task(unit, require_actionable=True)
+        assert representative is not None
+        assert representative.id == recovery.id
+
     def test_merge_unit_backfill_attaches_existing_branchless_reviews_with_review_role(self, tmp_path: Path) -> None:
         """Backfilling an implementation unit should attach existing branchless reviews."""
         db_path = tmp_path / "test.db"

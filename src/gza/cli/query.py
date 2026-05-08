@@ -1883,9 +1883,9 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
             if store.supports_merge_units():
                 selected_tasks = []
                 for unit in store.get_unmerged_merge_units(target_branch):
-                    owner = store._legacy_merge_status_owner_for_unit(unit)
-                    if owner is not None and owner.status == "completed":
-                        selected_tasks.append(owner)
+                    representative = store.resolve_merge_unit_representative_task(unit, require_actionable=True)
+                    if representative is not None:
+                        selected_tasks.append(representative)
             else:
                 selected_tasks = [task for task in store.get_unmerged(target_branch) if task.status == "completed"]
     except sqlite3.OperationalError as exc:

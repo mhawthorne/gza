@@ -413,6 +413,13 @@ def _resolve_merge_target_task(
         unit = store.get_or_create_merge_unit_for_task(task, target_branch)
     if unit is None:
         return task
+    representative = store.resolve_merge_unit_representative_task(
+        unit,
+        preferred_task_id=task.id,
+        require_actionable=True,
+    )
+    if representative is not None:
+        return representative
     owner = store._legacy_merge_status_owner_for_unit(unit)
     return owner or task
 
