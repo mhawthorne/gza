@@ -26,9 +26,12 @@ from .base import (
 from .log_rendering import (
     RenderedLines,
     RenderStats,
+    configured_model_from_gza_info,
     error_lines,
     generic_log_summary,
     generic_tv_summary,
+    model_parity_lines,
+    normalize_model_name,
     pretty_json_lines,
     text_to_lines,
     tool_one_liner,
@@ -80,6 +83,8 @@ class GeminiLogRenderer:
         self.stats = RenderStats()
         self.suppressed_count = 0
         self._provider_model: str | None = None
+        self._parity_ready = False
+        self._last_parity_signature: tuple[str | None, str | None] | None = None
 
     def handle_log(self, entry: dict[str, Any], *, live: bool) -> RenderedLines:
         return self._handle(entry, tv=False)
@@ -102,11 +107,13 @@ class GeminiLogRenderer:
                 return RenderedLines(tv_lines=[generic_tv_summary(entry)])
             return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in error_lines(entry.get("message", ""))])
         if event_type == "init":
-            model = entry.get("model")
-            if isinstance(model, str) and model.strip():
-                self._provider_model = model.strip()
+            self._provider_model = normalize_model_name(entry.get("model"))
+            self._parity_ready = True
             line = f"Session initialized (model: {self._provider_model or 'unknown'})"
-            return RenderedLines(log_lines=[line] if not tv else [], tv_lines=[line] if tv else [])
+            log_lines = [line] if not tv else []
+            if not tv:
+                log_lines.extend(self._model_parity_lines())
+            return RenderedLines(log_lines=log_lines, tv_lines=[line] if tv else [])
         if event_type == "message":
             return self._render_message(entry, tv=tv)
         if event_type == "tool_use":
@@ -120,17 +127,29 @@ class GeminiLogRenderer:
     def _render_gza(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         subtype = entry.get("subtype", "")
         message = entry.get("message", "")
-        if subtype == "info" and isinstance(message, str):
-            prefix = "Provider:"
-            if message.strip().startswith(prefix):
-                _, _, model = message.partition("Model:")
-                model_value = model.strip()
-                if model_value:
-                    self.configured_model = model_value
+        if subtype == "info":
+            model_value = configured_model_from_gza_info(message)
+            if model_value:
+                self.configured_model = model_value
         if not message:
             return RenderedLines()
         line = f"[gza:{subtype}] {message}" if subtype else f"[gza] {message}"
-        return RenderedLines(log_lines=[rich_escape(line)] if not tv else [], tv_lines=[line] if tv else [])
+        log_lines = [rich_escape(line)] if not tv else []
+        if not tv:
+            log_lines.extend(self._model_parity_lines())
+        return RenderedLines(log_lines=log_lines, tv_lines=[line] if tv else [])
+
+    def _model_parity_lines(self) -> list[str]:
+        if not self._parity_ready:
+            return []
+        signature = (
+            normalize_model_name(self.configured_model),
+            normalize_model_name(self._provider_model),
+        )
+        if signature == self._last_parity_signature:
+            return []
+        self._last_parity_signature = signature
+        return model_parity_lines(*signature)
 
     def _render_message(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         role = entry.get("role")

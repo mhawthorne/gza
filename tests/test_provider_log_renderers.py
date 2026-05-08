@@ -52,6 +52,30 @@ def test_codex_renderer_accumulates_tv_tokens_from_usage_fixture() -> None:
     assert "event:weird.codex" in joined
 
 
+def test_codex_renderer_counts_distinct_usage_events_with_identical_token_values() -> None:
+    renderer = get_log_renderer("codex", configured_model="gpt-5.3-codex")
+
+    renderer.handle_log(
+        {
+            "type": "turn.completed",
+            "event_id": "evt-1",
+            "usage": {"input_tokens": 20, "output_tokens": 8, "cached_input_tokens": 4},
+        },
+        live=False,
+    )
+    renderer.handle_log(
+        {
+            "type": "turn.error",
+            "event_id": "evt-2",
+            "usage": {"input_tokens": 20, "output_tokens": 8, "cached_input_tokens": 4},
+        },
+        live=False,
+    )
+
+    assert renderer.stats.input_tokens == 48
+    assert renderer.stats.output_tokens == 16
+
+
 def test_gemini_renderer_suppresses_routine_events_and_keeps_unknowns_visible() -> None:
     renderer = get_log_renderer("gemini")
     tv_lines: list[str] = []

@@ -24,6 +24,9 @@ class MixedLegacyLogRenderer:
     def _ensure_delegate(self, entry: dict[str, Any]) -> ProviderLogRenderer:
         if self._delegate is not None:
             return self._delegate
+        generic_model = getattr(self._generic, "configured_model", None)
+        if isinstance(generic_model, str) and generic_model.strip():
+            self._configured_model = generic_model.strip()
         event_type = entry.get("type")
         if event_type in {"system", "assistant", "user"}:
             self._delegate = ClaudeLogRenderer(configured_model=self._configured_model, verbose=self._verbose)

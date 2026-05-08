@@ -35,6 +35,42 @@ class ProviderLogRenderer(Protocol):
     def handle_tv(self, entry: dict[str, Any]) -> RenderedLines: ...
 
 
+def normalize_model_name(model: str | None) -> str | None:
+    """Normalize empty model values to None."""
+    if not isinstance(model, str):
+        return None
+    normalized = model.strip()
+    return normalized or None
+
+
+def configured_model_from_gza_info(message: object) -> str | None:
+    """Extract configured model from the shared gza provider info line."""
+    if not isinstance(message, str):
+        return None
+    prefix = "Provider:"
+    if not message.strip().startswith(prefix):
+        return None
+    _, _, model = message.partition("Model:")
+    return normalize_model_name(model)
+
+
+def model_parity_lines(configured_model: str | None, provider_model: str | None) -> list[str]:
+    """Render configured-vs-provider model parity status for log surfaces."""
+    configured = normalize_model_name(configured_model)
+    if configured is None:
+        return []
+    provider = normalize_model_name(provider_model)
+    provider_display = provider or "(not echoed by provider)"
+    lines = [f"Model parity: configured={configured}; provider={provider_display}"]
+    if provider is None:
+        lines.append(f"Warning: provider did not echo model; configured={configured}")
+    elif provider != configured:
+        lines.append(
+            f"Warning: provider model mismatch; configured={configured}; provider={provider}"
+        )
+    return lines
+
+
 def result_step_count(result_entry: dict[str, Any]) -> int | None:
     """Resolve a result entry's step count using step-first fallback."""
     num_steps = result_entry.get("num_steps")
@@ -212,4 +248,3 @@ def generic_tv_summary(entry: dict[str, Any], *, max_value_chars: int = 80) -> s
 def pretty_json_lines(entry: dict[str, Any]) -> list[str]:
     """Pretty JSON lines for verbose fallback rendering."""
     return json.dumps(entry, ensure_ascii=True, indent=2, sort_keys=True).splitlines()
-

@@ -1511,6 +1511,12 @@ def test_live_log_printer_renders_gza_info_and_init_events(monkeypatch: pytest.M
 
     assert any("Provider: Claude, Model: claude-opus-4-6" in line for line in console_lines)
     assert any("Session initialized" in line for line in console_lines)
+    assert any(
+        "Model parity: configured=claude-opus-4-6; provider=claude-opus-4-6" in line
+        for line in console_lines
+    )
+    assert not any("Warning: provider model mismatch" in line for line in console_lines)
+    assert not any("Warning: provider did not echo model" in line for line in console_lines)
 
 
 def test_live_log_printer_keeps_provider_info_visible_when_models_differ(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1551,6 +1557,15 @@ def test_live_log_printer_keeps_provider_info_visible_when_models_differ(monkeyp
 
     assert any("Provider: Claude, Model: claude-opus-4-6" in line for line in console_lines)
     assert any("Session initialized (model: claude-sonnet-4-5)" in line for line in console_lines)
+    assert any(
+        "Model parity: configured=claude-opus-4-6; provider=claude-sonnet-4-5" in line
+        for line in console_lines
+    )
+    assert any(
+        "Warning: provider model mismatch; configured=claude-opus-4-6; provider=claude-sonnet-4-5"
+        in line
+        for line in console_lines
+    )
 
 
 def test_live_log_printer_handles_provider_without_model_echo(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1591,6 +1606,14 @@ def test_live_log_printer_handles_provider_without_model_echo(monkeypatch: pytes
 
     assert any("Provider: Codex, Model: gpt-5.3-codex" in line for line in console_lines)
     assert any("Session started (thread: thread_abc)" in line for line in console_lines)
+    assert any(
+        "Model parity: configured=gpt-5.3-codex; provider=(not echoed by provider)" in line
+        for line in console_lines
+    )
+    assert any(
+        "Warning: provider did not echo model; configured=gpt-5.3-codex" in line
+        for line in console_lines
+    )
 
 
 def test_live_log_printer_parses_gemini_init_event(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1631,6 +1654,15 @@ def test_live_log_printer_parses_gemini_init_event(monkeypatch: pytest.MonkeyPat
 
     assert any("Provider: Gemini, Model: gemini-2.5-pro" in line for line in console_lines)
     assert any("Session initialized (model: gemini-2.5-flash)" in line for line in console_lines)
+    assert any(
+        "Model parity: configured=gemini-2.5-pro; provider=gemini-2.5-flash" in line
+        for line in console_lines
+    )
+    assert any(
+        "Warning: provider model mismatch; configured=gemini-2.5-pro; provider=gemini-2.5-flash"
+        in line
+        for line in console_lines
+    )
 
 
 def test_live_log_printer_renders_top_level_error_entries(monkeypatch: pytest.MonkeyPatch) -> None:

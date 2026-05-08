@@ -25,9 +25,12 @@ from .base import (
 from .log_rendering import (
     RenderedLines,
     RenderStats,
+    configured_model_from_gza_info,
     error_lines,
     generic_log_summary,
     generic_tv_summary,
+    model_parity_lines,
+    normalize_model_name,
     pretty_json_lines,
     strip_shell_wrapper,
     text_to_lines,
@@ -103,7 +106,8 @@ class CodexLogRenderer:
         self.verbose = verbose
         self.stats = RenderStats()
         self.suppressed_count = 0
-        self._usage_seen: set[tuple[int, int, int]] = set()
+        self._parity_ready = False
+        self._last_parity_signature: tuple[str | None, str | None] | None = None
 
     def handle_log(self, entry: dict[str, Any], *, live: bool) -> RenderedLines:
         return self._handle(entry, tv=False)
@@ -129,8 +133,12 @@ class CodexLogRenderer:
         if event_type == "thread.started":
             thread_id = entry.get("thread_id")
             if thread_id:
+                self._parity_ready = True
                 line = f"Session started (thread: {thread_id})"
-                return RenderedLines(log_lines=[line] if not tv else [], tv_lines=[line] if tv else [])
+                log_lines = [line] if not tv else []
+                if not tv:
+                    log_lines.extend(self._model_parity_lines())
+                return RenderedLines(log_lines=log_lines, tv_lines=[line] if tv else [])
             return self._render_unknown(entry, tv=tv)
         if event_type == "turn.started":
             self.suppressed_count += 1
@@ -148,17 +156,17 @@ class CodexLogRenderer:
     def _render_gza(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         subtype = entry.get("subtype", "")
         message = entry.get("message", "")
-        if subtype == "info" and isinstance(message, str):
-            prefix = "Provider:"
-            if message.strip().startswith(prefix):
-                _, _, model = message.partition("Model:")
-                model_value = model.strip()
-                if model_value:
-                    self.configured_model = model_value
+        if subtype == "info":
+            model_value = configured_model_from_gza_info(message)
+            if model_value:
+                self.configured_model = model_value
         if not message:
             return RenderedLines()
         line = f"[gza:{subtype}] {message}" if subtype else f"[gza] {message}"
-        return RenderedLines(log_lines=[rich_escape(line)] if not tv else [], tv_lines=[line] if tv else [])
+        log_lines = [rich_escape(line)] if not tv else []
+        if not tv:
+            log_lines.extend(self._model_parity_lines())
+        return RenderedLines(log_lines=log_lines, tv_lines=[line] if tv else [])
 
     def _maybe_accumulate_usage(self, entry: dict[str, Any]) -> None:
         event_type = entry.get("type")
@@ -172,10 +180,6 @@ class CodexLogRenderer:
         input_tokens = _as_nonnegative_int(usage.get("input_tokens"))
         output_tokens = _as_nonnegative_int(usage.get("output_tokens"))
         cached_tokens = _as_nonnegative_int(usage.get("cached_input_tokens"))
-        key = (input_tokens, output_tokens, cached_tokens)
-        if key in self._usage_seen:
-            return
-        self._usage_seen.add(key)
         self.stats.input_tokens += input_tokens + cached_tokens
         self.stats.output_tokens += output_tokens
         self.stats.cost_usd = calculate_cost(
@@ -183,6 +187,15 @@ class CodexLogRenderer:
             self.stats.output_tokens,
             self.configured_model or "",
         )
+
+    def _model_parity_lines(self) -> list[str]:
+        if not self._parity_ready:
+            return []
+        signature = (normalize_model_name(self.configured_model), None)
+        if signature == self._last_parity_signature:
+            return []
+        self._last_parity_signature = signature
+        return model_parity_lines(*signature)
 
     def _render_item_completed(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         item = entry.get("item", {})
