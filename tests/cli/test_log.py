@@ -882,6 +882,120 @@ class TestLogCommand:
         assert "[S1.1] tool_call Bash ls -la" in result.stdout
         assert "[Step S2] Listed files." in result.stdout
 
+    def test_log_steps_keeps_unknown_provider_events_visible(self, tmp_path: Path):
+        """--steps should surface unknown provider events through renderer fallbacks."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Unknown event timeline task")
+        task.status = "completed"
+        task.provider = "claude"
+        task.provider_is_explicit = True
+        task.log_file = ".gza/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "test.log").write_text(
+            "\n".join(
+                json.dumps(line)
+                for line in [
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg_1",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Investigating"}],
+                        },
+                    },
+                    {"type": "mystery", "message": "still visible in timeline", "alpha": 1},
+                ]
+            )
+        )
+
+        result = run_gza("log", str(task.id), "--steps-verbose", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "[Step S1] Investigating" in result.stdout
+        assert "[S1.1] [event:mystery]" in result.stdout
+        assert "message=still visible in timeline" in result.stdout
+
+    @pytest.mark.parametrize("flag", ["--steps", "--steps-verbose"])
+    def test_log_steps_modes_print_suppressed_footer(self, tmp_path: Path, flag: str):
+        """Explicit timeline modes should report suppressed routine events in a footer."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Timeline suppression footer task")
+        task.status = "completed"
+        task.provider = "claude"
+        task.provider_is_explicit = True
+        task.log_file = ".gza/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "test.log").write_text(
+            "\n".join(
+                json.dumps(line)
+                for line in [
+                    {"type": "system", "subtype": "session", "message": "routine session metadata"},
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg_1",
+                            "content": [{"type": "text", "text": "Visible step"}],
+                        },
+                    },
+                ]
+            )
+        )
+
+        result = run_gza("log", str(task.id), flag, "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "[Step S1] Visible step" in result.stdout
+        assert "routine session metadata" not in result.stdout
+        assert "1 routine events suppressed" in result.stdout
+
+    def test_log_replay_suppressed_empty_claude_assistant_has_no_blank_header(self, tmp_path: Path):
+        """Formatted replay should not create a phantom step for suppressed empty assistant events."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Suppressed empty assistant replay task")
+        task.status = "completed"
+        task.provider = "claude"
+        task.provider_is_explicit = True
+        task.log_file = ".gza/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "test.log").write_text(
+            "\n".join(
+                json.dumps(line)
+                for line in [
+                    {"type": "assistant", "message": {"id": "msg_empty", "content": []}},
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg_visible",
+                            "content": [{"type": "text", "text": "Visible step"}],
+                        },
+                    },
+                ]
+            )
+        )
+
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "| Step 1 |" in result.stdout
+        assert "| Step 2 |" not in result.stdout
+        assert "Visible step" in result.stdout
+        assert "1 routine events suppressed" in result.stdout
+
     def test_log_by_task_id_invalid_format(self, tmp_path: Path):
         """Log command rejects non-decimal full-ID formats."""
         setup_config(tmp_path)
@@ -1430,6 +1544,73 @@ class TestBuildStepTimeline:
         assert len(steps) == 1
         assert steps[0]["message_text"] == "[gza:info] Task: #1 slug"
 
+    def test_claude_timeline_uses_renderer_step_boundaries(self) -> None:
+        """Timeline step starts should follow renderer starts_step behavior."""
+        entries = [
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_unknown",
+                    "content": [{"type": "new_block", "payload": "visible"}],
+                },
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_text",
+                    "content": [{"type": "text", "text": "Second step"}],
+                },
+            },
+        ]
+
+        steps = _build_step_timeline(entries, provider="claude")
+
+        assert len(steps) == 2
+        assert steps[0]["message_text"].startswith("[event:assistant]")
+        assert "new_block" in steps[0]["message_text"]
+        assert steps[1]["message_text"] == "Second step"
+
+    def test_claude_timeline_keeps_unknown_blocks_when_mixed_with_text(self) -> None:
+        """Mixed assistant blocks should preserve fallback detail in the same step."""
+        entries = [
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_mixed",
+                    "content": [
+                        {"type": "text", "text": "Known text"},
+                        {"type": "new_block", "payload": "SHOULD_SHOW"},
+                    ],
+                },
+            }
+        ]
+
+        steps = _build_step_timeline(entries, provider="claude")
+
+        assert len(steps) == 1
+        assert steps[0]["message_text"] == "Known text"
+        assert len(steps[0]["substeps"]) == 1
+        assert steps[0]["substeps"][0]["detail"].startswith("[event:assistant]")
+        assert "new_block" in steps[0]["substeps"][0]["detail"]
+
+    def test_claude_timeline_skips_suppressed_empty_assistant_steps(self) -> None:
+        """Suppressed empty assistant events should not create blank timeline steps."""
+        entries = [
+            {"type": "assistant", "message": {"id": "msg_empty", "content": []}},
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_visible",
+                    "content": [{"type": "text", "text": "Visible step"}],
+                },
+            },
+        ]
+
+        steps = _build_step_timeline(entries, provider="claude")
+
+        assert len(steps) == 1
+        assert steps[0]["message_text"] == "Visible step"
+
 
 def test_live_log_printer_uses_formatter_console_for_stream_output(monkeypatch: pytest.MonkeyPatch) -> None:
     """_LiveLogPrinter should use StreamOutputFormatter() and route stream prints via formatter console."""
@@ -1473,10 +1654,9 @@ def test_live_log_printer_uses_formatter_console_for_stream_output(monkeypatch: 
     assert any("\\[result] warning:" in line for line in printed)
 
 
-def test_live_log_printer_renders_claude_model_parity_when_models_match(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_log_printer_renders_gza_info_and_init_events(monkeypatch: pytest.MonkeyPatch) -> None:
     import gza.providers.output_formatter as output_formatter
 
-    agent_messages: list[str] = []
     console_lines: list[str] = []
 
     class _FakeConsole:
@@ -1488,8 +1668,8 @@ def test_live_log_printer_renders_claude_model_parity_when_models_match(monkeypa
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.console = _FakeConsole()
 
-        def print_agent_message(self, text: str, **_kwargs: Any) -> None:
-            agent_messages.append(text)
+        def print_agent_message(self, _text: str, **_kwargs: Any) -> None:
+            return None
 
         def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1510,15 +1690,19 @@ def test_live_log_printer_renders_claude_model_parity_when_models_match(monkeypa
     printer.process({"type": "gza", "subtype": "info", "message": "Provider: Claude, Model: claude-opus-4-6"})
     printer.process({"type": "system", "subtype": "init", "model": "claude-opus-4-6"})
 
-    assert "Claude model parity: configured=claude-opus-4-6, provider_reported=claude-opus-4-6" in agent_messages
-    assert not any("WARNING: Model mismatch" in line for line in console_lines)
-    assert not any("provider did not echo model" in line for line in agent_messages)
+    assert any("Provider: Claude, Model: claude-opus-4-6" in line for line in console_lines)
+    assert any("Session initialized" in line for line in console_lines)
+    assert any(
+        "Model parity: configured=claude-opus-4-6; provider=claude-opus-4-6" in line
+        for line in console_lines
+    )
+    assert not any("Warning: provider model mismatch" in line for line in console_lines)
+    assert not any("Warning: provider did not echo model" in line for line in console_lines)
 
 
-def test_live_log_printer_warns_on_model_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_log_printer_keeps_provider_info_visible_when_models_differ(monkeypatch: pytest.MonkeyPatch) -> None:
     import gza.providers.output_formatter as output_formatter
 
-    agent_messages: list[str] = []
     console_lines: list[str] = []
 
     class _FakeConsole:
@@ -1530,8 +1714,8 @@ def test_live_log_printer_warns_on_model_mismatch(monkeypatch: pytest.MonkeyPatc
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.console = _FakeConsole()
 
-        def print_agent_message(self, text: str, **_kwargs: Any) -> None:
-            agent_messages.append(text)
+        def print_agent_message(self, _text: str, **_kwargs: Any) -> None:
+            return None
 
         def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1552,25 +1736,35 @@ def test_live_log_printer_warns_on_model_mismatch(monkeypatch: pytest.MonkeyPatc
     printer.process({"type": "gza", "subtype": "info", "message": "Provider: Claude, Model: claude-opus-4-6"})
     printer.process({"type": "system", "subtype": "init", "model": "claude-sonnet-4-5"})
 
-    assert "Claude model parity: configured=claude-opus-4-6, provider_reported=claude-sonnet-4-5" in agent_messages
-    assert any("WARNING: Model mismatch (claude-opus-4-6 != claude-sonnet-4-5)" in line for line in console_lines)
+    assert any("Provider: Claude, Model: claude-opus-4-6" in line for line in console_lines)
+    assert any("Session initialized (model: claude-sonnet-4-5)" in line for line in console_lines)
+    assert any(
+        "Model parity: configured=claude-opus-4-6; provider=claude-sonnet-4-5" in line
+        for line in console_lines
+    )
+    assert any(
+        "Warning: provider model mismatch; configured=claude-opus-4-6; provider=claude-sonnet-4-5"
+        in line
+        for line in console_lines
+    )
 
 
-def test_live_log_printer_notes_when_provider_does_not_echo_model(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_log_printer_handles_provider_without_model_echo(monkeypatch: pytest.MonkeyPatch) -> None:
     import gza.providers.output_formatter as output_formatter
 
-    agent_messages: list[str] = []
+    console_lines: list[str] = []
 
     class _FakeConsole:
-        def print(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
+        def print(self, *args: Any, **_kwargs: Any) -> None:
+            if args:
+                console_lines.append(str(args[0]))
 
     class _FakeFormatter:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.console = _FakeConsole()
 
-        def print_agent_message(self, text: str, **_kwargs: Any) -> None:
-            agent_messages.append(text)
+        def print_agent_message(self, _text: str, **_kwargs: Any) -> None:
+            return None
 
         def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1591,13 +1785,23 @@ def test_live_log_printer_notes_when_provider_does_not_echo_model(monkeypatch: p
     printer.process({"type": "gza", "subtype": "info", "message": "Provider: Codex, Model: gpt-5.3-codex"})
     printer.process({"type": "thread.started", "thread_id": "thread_abc"})
 
-    assert "Codex model parity: configured=gpt-5.3-codex, provider_reported=(provider did not echo model)" in agent_messages
+    assert any("Provider: Codex, Model: gpt-5.3-codex" in line for line in console_lines)
+    assert any("Session started (thread: thread_abc)" in line for line in console_lines)
+    assert any(
+        "Model parity: configured=gpt-5.3-codex; provider=(not echoed by provider)" in line
+        for line in console_lines
+    )
+    assert any(
+        "Warning: provider did not echo model; configured=gpt-5.3-codex" in line
+        for line in console_lines
+    )
 
 
-def test_live_log_printer_parses_gemini_init_model_for_parity(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_log_printer_claude_routine_system_metadata_does_not_clear_provider_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import gza.providers.output_formatter as output_formatter
 
-    agent_messages: list[str] = []
     console_lines: list[str] = []
 
     class _FakeConsole:
@@ -1609,8 +1813,54 @@ def test_live_log_printer_parses_gemini_init_model_for_parity(monkeypatch: pytes
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.console = _FakeConsole()
 
-        def print_agent_message(self, text: str, **_kwargs: Any) -> None:
-            agent_messages.append(text)
+        def print_agent_message(self, _text: str, **_kwargs: Any) -> None:
+            return None
+
+        def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_error(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(output_formatter, "StreamOutputFormatter", _FakeFormatter)
+    monkeypatch.setattr(output_formatter, "truncate_text", lambda text, _max_length: text)
+
+    printer = _LiveLogPrinter()
+    printer.process({"type": "gza", "subtype": "info", "message": "Provider: Claude, Model: claude-opus-4-6"})
+    printer.process({"type": "system", "subtype": "init", "model": "claude-opus-4-6"})
+    printer.process({"type": "system", "subtype": "session", "message": "routine metadata", "session_id": "sess_123"})
+    printer.process({"type": "gza", "subtype": "info", "message": "Still running"})
+
+    assert any(
+        "Model parity: configured=claude-opus-4-6; provider=claude-opus-4-6" in line
+        for line in console_lines
+    )
+    assert not any("provider=(not echoed by provider)" in line for line in console_lines)
+    assert not any("Warning: provider did not echo model" in line for line in console_lines)
+
+
+def test_live_log_printer_parses_gemini_init_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gza.providers.output_formatter as output_formatter
+
+    console_lines: list[str] = []
+
+    class _FakeConsole:
+        def print(self, *args: Any, **_kwargs: Any) -> None:
+            if args:
+                console_lines.append(str(args[0]))
+
+    class _FakeFormatter:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.console = _FakeConsole()
+
+        def print_agent_message(self, _text: str, **_kwargs: Any) -> None:
+            return None
 
         def print_step_header(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1631,18 +1881,28 @@ def test_live_log_printer_parses_gemini_init_model_for_parity(monkeypatch: pytes
     printer.process({"type": "gza", "subtype": "info", "message": "Provider: Gemini, Model: gemini-2.5-pro"})
     printer.process({"type": "init", "model": "gemini-2.5-flash"})
 
-    assert "Gemini model parity: configured=gemini-2.5-pro, provider_reported=gemini-2.5-flash" in agent_messages
-    assert any("WARNING: Model mismatch (gemini-2.5-pro != gemini-2.5-flash)" in line for line in console_lines)
+    assert any("Provider: Gemini, Model: gemini-2.5-pro" in line for line in console_lines)
+    assert any("Session initialized (model: gemini-2.5-flash)" in line for line in console_lines)
+    assert any(
+        "Model parity: configured=gemini-2.5-pro; provider=gemini-2.5-flash" in line
+        for line in console_lines
+    )
+    assert any(
+        "Warning: provider model mismatch; configured=gemini-2.5-pro; provider=gemini-2.5-flash"
+        in line
+        for line in console_lines
+    )
 
 
 def test_live_log_printer_renders_top_level_error_entries(monkeypatch: pytest.MonkeyPatch) -> None:
     import gza.providers.output_formatter as output_formatter
 
-    error_lines: list[str] = []
+    console_lines: list[str] = []
 
     class _FakeConsole:
-        def print(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
+        def print(self, *args: Any, **_kwargs: Any) -> None:
+            if args:
+                console_lines.append(str(args[0]))
 
     class _FakeFormatter:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -1657,8 +1917,8 @@ def test_live_log_printer_renders_top_level_error_entries(monkeypatch: pytest.Mo
         def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
             return None
 
-        def print_error(self, message: str, **_kwargs: Any) -> None:
-            error_lines.append(message)
+        def print_error(self, _message: str, **_kwargs: Any) -> None:
+            return None
 
         def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1669,13 +1929,13 @@ def test_live_log_printer_renders_top_level_error_entries(monkeypatch: pytest.Mo
     printer = _LiveLogPrinter()
     printer.process({"type": "error", "message": "invalid_request_error: missing model"})
 
-    assert error_lines == ["[error] invalid_request_error: missing model"]
+    assert console_lines == [r"[red]\[error] invalid_request_error: missing model[/red]"]
 
 
 def test_live_log_printer_unwraps_nested_error_payloads(monkeypatch: pytest.MonkeyPatch) -> None:
     import gza.providers.output_formatter as output_formatter
 
-    error_lines: list[str] = []
+    console_lines: list[str] = []
     payload = json.dumps(
         {
             "error": {
@@ -1686,8 +1946,9 @@ def test_live_log_printer_unwraps_nested_error_payloads(monkeypatch: pytest.Monk
     )
 
     class _FakeConsole:
-        def print(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
+        def print(self, *args: Any, **_kwargs: Any) -> None:
+            if args:
+                console_lines.append(str(args[0]))
 
     class _FakeFormatter:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -1702,8 +1963,8 @@ def test_live_log_printer_unwraps_nested_error_payloads(monkeypatch: pytest.Monk
         def print_tool_event(self, *_args: Any, **_kwargs: Any) -> None:
             return None
 
-        def print_error(self, message: str, **_kwargs: Any) -> None:
-            error_lines.append(message)
+        def print_error(self, _message: str, **_kwargs: Any) -> None:
+            return None
 
         def print_todo(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1714,7 +1975,7 @@ def test_live_log_printer_unwraps_nested_error_payloads(monkeypatch: pytest.Monk
     printer = _LiveLogPrinter()
     printer.process({"type": "error", "message": payload})
 
-    assert error_lines == [
-        "[error] The model `gpt-missing` does not exist",
-        f"[error] payload: {payload}",
+    assert console_lines == [
+        r"[red]\[error] The model `gpt-missing` does not exist[/red]",
+        f"[red]\\[error] payload: {payload}[/red]",
     ]

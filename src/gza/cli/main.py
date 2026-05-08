@@ -1277,6 +1277,11 @@ def main() -> int:
         help="Show raw JSON lines instead of formatted output",
     )
     log_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Expand generic unknown events with pretty JSON while keeping normal curated rendering",
+    )
+    log_parser.add_argument(
         "--failure", "-F",
         action="store_true",
         help="Show failure-focused diagnostics (failed tasks only): reason, summary, agent explanation, and last verify/result context",

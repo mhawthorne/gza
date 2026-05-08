@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import time
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,7 +18,8 @@ import gza.colors as _colors
 from ..config import Config
 from ..console import console, format_duration, shorten_prompt, truncate
 from ..db import SqliteTaskStore, Task as DbTask
-from ..log_events import is_new_step
+from ..providers.log_renderers import UnknownLogProviderError, get_log_renderer
+from ..providers.log_rendering import RenderStats
 from ..providers.output_formatter import format_token_count
 from ..workers import WorkerRegistry
 from ._common import get_store, resolve_id
@@ -29,12 +29,6 @@ from .log import _resolve_task_log_path
 _sleep = time.sleep
 _get_terminal_size = os.get_terminal_size
 
-
-@dataclass
-class _LogStats:
-    step_count: int = 0
-    total_tokens: int = 0
-    cost_usd: float = 0.0
 
 # Sensible upper bound — beyond this the rows become unreadable.
 MAX_SLOTS = 8
@@ -55,19 +49,21 @@ def _themed_console() -> Console:
     return Console(theme=build_rich_theme(), highlight=True)
 
 
-def _scan_log(log_path: Path, n: int) -> tuple[list[str], _LogStats]:
+def _scan_log(log_path: Path, n: int, provider: str | None, configured_model: str | None = None) -> tuple[list[str], RenderStats]:
     """Read the last *n* display lines and accumulate stats from a JSONL task log."""
-    stats = _LogStats()
+    try:
+        renderer = get_log_renderer(provider, configured_model=configured_model, verbose=False)
+    except UnknownLogProviderError as exc:
+        return [f"Error: {exc}"], RenderStats()
     if not log_path.exists():
-        return ["(log file not found)"], stats
+        return ["(log file not found)"], renderer.stats
 
     try:
         with open(log_path) as f:
             raw_lines = f.readlines()
     except OSError:
-        return ["(unable to read log)"], stats
+        return ["(unable to read log)"], renderer.stats
 
-    seen_msg_ids: set[str] = set()
     display: list[str] = []
     for raw in raw_lines:
         raw = raw.strip()
@@ -82,139 +78,15 @@ def _scan_log(log_path: Path, n: int) -> tuple[list[str], _LogStats]:
             display.append(truncate(str(entry), 200))
             continue
 
-        prev_steps = stats.step_count
-        _accumulate_stats(entry, stats, seen_msg_ids)
-        if stats.step_count > prev_steps and display:
+        prev_steps = renderer.stats.step_count
+        rendered = renderer.handle_tv(entry)
+        if rendered.starts_step and renderer.stats.step_count > prev_steps and display:
             display.append("")
-        display.extend(_summarize_entry(entry))
+        display.extend(rendered.tv_lines)
 
     if not display:
         display = ["(no log output)"]
-    return display[-n:], stats
-
-
-def _accumulate_stats(entry: dict, stats: _LogStats, seen_msg_ids: set[str]) -> None:
-    """Update running stats from a single log entry (mirrors ``_LiveLogPrinter``)."""
-    is_step = is_new_step(entry, seen_msg_ids)
-    if is_step:
-        stats.step_count += 1
-    etype = entry.get("type")
-    if etype == "assistant" and is_step:
-        usage = (entry.get("message") or {}).get("usage", {}) or {}
-        stats.total_tokens += usage.get("input_tokens", 0) or 0
-        stats.total_tokens += usage.get("cache_creation_input_tokens", 0) or 0
-        stats.total_tokens += usage.get("cache_read_input_tokens", 0) or 0
-        stats.total_tokens += usage.get("output_tokens", 0) or 0
-    elif etype == "result":
-        # Final cost, when provider emits it.
-        cost = entry.get("total_cost_usd") or entry.get("cost_usd")
-        if isinstance(cost, (int, float)):
-            stats.cost_usd = float(cost)
-
-
-def _summarize_entry(entry: dict) -> list[str]:
-    """Turn a single JSON log entry into zero or more display lines.
-
-    Handles both provider log formats:
-    - Codex/OpenAI: ``item.completed`` with ``agent_message`` / ``command_execution``
-    - Claude: ``assistant`` with ``content`` blocks (``text`` / ``tool_use``)
-    """
-    etype = entry.get("type")
-
-    # --- Codex / OpenAI format ---
-    if etype == "item.completed":
-        item = entry.get("item", {})
-        if not isinstance(item, dict):
-            return []
-        itype = item.get("type")
-        if itype == "agent_message":
-            text = item.get("text", "")
-            if isinstance(text, str) and text.strip():
-                return _text_to_lines(text)
-            return []
-        if itype == "command_execution":
-            cmd = item.get("command", "")
-            lines: list[str] = []
-            if cmd:
-                short = _strip_shell_wrapper(cmd)
-                lines.append(f"→ $ {truncate(short, 120)}")
-            output = item.get("aggregated_output", "")
-            if isinstance(output, str) and output.strip():
-                for ol in output.strip().splitlines()[-3:]:
-                    if ol.strip():
-                        lines.append(f"  {truncate(ol.strip(), 120)}")
-            return lines
-        return []
-
-    # --- Claude format ---
-    if etype == "assistant":
-        message = entry.get("message", {})
-        content = message.get("content", [])
-        lines = []
-        if isinstance(content, str):
-            lines.extend(_text_to_lines(content))
-        elif isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "text":
-                    text = block.get("text", "").strip()
-                    if text:
-                        lines.extend(_text_to_lines(text))
-                elif block.get("type") == "tool_use":
-                    name = block.get("name", "tool")
-                    inp = block.get("input", {})
-                    lines.append(f"→ {_tool_one_liner(name, inp)}")
-        return lines
-
-    if etype == "gza":
-        msg = entry.get("message", "")
-        subtype = entry.get("subtype", "")
-        prefix = f"[gza:{subtype}]" if subtype else "[gza]"
-        return [f"{prefix} {msg}"] if msg else []
-
-    if etype == "system":
-        subtype = entry.get("subtype", "")
-        if subtype == "init":
-            model = entry.get("model", "unknown")
-            return [f"Session initialized (model: {model})"]
-
-    return []
-
-
-def _text_to_lines(text: str, max_lines: int = 6) -> list[str]:
-    """Extract the last *max_lines* non-empty lines from a block of text."""
-    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
-    lines = lines[-max_lines:]
-    return [line[:200] for line in lines]
-
-
-def _strip_shell_wrapper(cmd: str) -> str:
-    """Strip ``/bin/bash -lc '...'`` wrapper to show the inner command."""
-    for prefix in ('/bin/bash -lc "', "/bin/bash -lc '", '/bin/sh -c "', "/bin/sh -c '"):
-        if cmd.startswith(prefix):
-            inner = cmd[len(prefix):]
-            if inner and inner[-1] in ('"', "'"):
-                inner = inner[:-1]
-            return inner
-    return cmd
-
-
-def _tool_one_liner(name: str, inp: dict) -> str:
-    """Compact tool-use summary."""
-    if name == "Bash":
-        cmd = str(inp.get("command", ""))
-        return f"$ {truncate(cmd, 120)}" if cmd else "$ (bash)"
-    if name in ("Read", "Edit", "Write"):
-        path = str(inp.get("file_path", ""))
-        return f"{name} {path}"
-    if name == "Grep":
-        pattern = str(inp.get("pattern", ""))
-        path = str(inp.get("path", ""))
-        return f"Grep {truncate(pattern, 40)} [{path}]"
-    if name == "Glob":
-        return f"Glob {inp.get('pattern', '')}"
-    return name
+    return display[-n:], renderer.stats
 
 
 def _task_elapsed_seconds(task: DbTask) -> float | None:
@@ -260,9 +132,9 @@ def _build_task_panel(
     # Render lines through a themed console so Rich highlighting applies
     # (numbers, paths, strings pick up the gza rich theme overrides).
     if log_path and log_path.exists():
-        lines, log_stats = _scan_log(log_path, n_lines)
+        lines, log_stats = _scan_log(log_path, n_lines, task.provider, task.model)
     else:
-        lines, log_stats = ["(no log available)"], _LogStats()
+        lines, log_stats = ["(no log available)"], RenderStats()
 
     # --- subtitle with metadata ---
     parts: list[str] = []
@@ -278,8 +150,9 @@ def _build_task_panel(
     if steps:
         parts.append(f"[{rc.value}]{steps} steps[/{rc.value}]")
 
-    if log_stats.total_tokens:
-        parts.append(f"[{rc.value}]{format_token_count(log_stats.total_tokens)}[/{rc.value}]")
+    total_tokens = log_stats.input_tokens + log_stats.output_tokens
+    if total_tokens:
+        parts.append(f"[{rc.value}]{format_token_count(total_tokens)}[/{rc.value}]")
 
     cost = task.cost_usd if task.cost_usd is not None else log_stats.cost_usd
     if cost:
