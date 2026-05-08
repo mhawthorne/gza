@@ -445,6 +445,15 @@ def _merge_single_task(
         print("Error: --resolve requires --rebase")
         return 1
 
+    if not args.rebase and not git.can_merge(task.branch, current_branch):
+        print(
+            f"Error: Branch '{task.branch}' has conflicts against '{current_branch}' "
+            "and cannot be merged cleanly."
+        )
+        print(f"Run: uv run gza rebase {task.id} --resolve")
+        print(f"Or preview the lifecycle action with: uv run gza advance {task.id} --dry-run")
+        return 1
+
     # Perform the merge or rebase
     try:
         if args.rebase:
