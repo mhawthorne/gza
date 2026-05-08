@@ -186,6 +186,7 @@ class TestCreateReviewTask:
         store = MagicMock()
         store.get_reviews_for_task.return_value = existing_reviews or []
         store.add.return_value = _task(id=99, task_type="review")
+        store.default_merge_target.return_value = "main"
         return store
 
     def test_rejects_non_implement_task(self):
@@ -292,6 +293,19 @@ class TestCreateReviewTask:
         call_kwargs = store.add.call_args[1]
         assert call_kwargs["depends_on"] == "gza-12"
         assert call_kwargs["based_on"] == "gza-12"
+
+    def test_attaches_review_to_requested_target_merge_unit(self):
+        store = self._mock_store()
+        impl = _task(id="gza-12")
+        unit = MagicMock()
+        unit.target_branch = "release"
+        store.resolve_merge_unit_for_task.return_value = unit
+
+        create_review_task(store, impl, prompt_mode="auto", target_branch="release")
+
+        store.resolve_merge_unit_for_task.assert_called_once_with("gza-12", "release")
+        review_task = store.add.return_value
+        store.get_or_create_merge_unit_for_task.assert_called_once_with(review_task, "release")
 
 
 class TestFollowupTasks:

@@ -7193,6 +7193,52 @@ class TestIterateCommand:
             result = cmd_iterate(args)
         assert result == 0
 
+    def test_iterate_uses_current_target_branch_for_merge_unit_suppression(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        assert impl.id is not None
+
+        main_unit = store.get_or_create_merge_unit_for_task(impl, "main")
+        release_unit = store.get_or_create_merge_unit_for_task(impl, "release")
+        assert main_unit is not None
+        assert release_unit is not None
+        store.set_merge_unit_state(main_unit.id, "merged")
+        store.set_merge_unit_state(release_unit.id, "unmerged")
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "release"
+        mock_git.can_merge.return_value = True
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 0
+        assert "already merged" not in output
+        assert f"[dry-run] Would iterate implementation {impl.id}" in output
+
     def test_latest_review_needs_discussion_blocks(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch

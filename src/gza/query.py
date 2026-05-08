@@ -273,11 +273,23 @@ def _has_successful_retry_descendant(store: SqliteTaskStore, task: Task) -> bool
     return any(child.status == "completed" for child in _iter_retry_descendants(store, task))
 
 
-def _has_merged_retry_descendant(store: SqliteTaskStore, task: Task) -> bool:
+def _has_merged_retry_descendant(
+    store: SqliteTaskStore,
+    task: Task,
+    *,
+    target_branch: str | None = None,
+) -> bool:
     """Return True when any same-type retry descendant has merge_status='merged'."""
     return any(
         (
-            (unit.state if (child.id is not None and (unit := store.resolve_merge_unit_for_task(child.id)) is not None) else child.merge_status)
+            (
+                unit.state
+                if (
+                    child.id is not None
+                    and (unit := store.resolve_merge_unit_for_task(child.id, target_branch)) is not None
+                )
+                else child.merge_status
+            )
             == "merged"
         )
         for child in _iter_retry_descendants(store, task)
@@ -312,11 +324,16 @@ def _resolve_effective_shared_branch_retry_head(store: SqliteTaskStore, root_tas
     )
 
 
-def _is_effective_shared_branch_lineage_merged(store: SqliteTaskStore, root_task: Task) -> bool:
+def _is_effective_shared_branch_lineage_merged(
+    store: SqliteTaskStore,
+    root_task: Task,
+    *,
+    target_branch: str | None = None,
+) -> bool:
     """Return merge truth for shared-branch descendants under a canonical root."""
     effective_head = _resolve_effective_shared_branch_retry_head(store, root_task)
     if effective_head.id is not None:
-        unit = store.resolve_merge_unit_for_task(effective_head.id)
+        unit = store.resolve_merge_unit_for_task(effective_head.id, target_branch)
         if unit is not None:
             return unit.state == "merged"
     return effective_head.merge_status == "merged"
@@ -362,7 +379,12 @@ def _prune_lineage_tree_to_ids(tree: TaskLineageNode, keep_ids: set[str]) -> Tas
     return filtered
 
 
-def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[IncompleteLineage]:
+def query_incomplete(
+    store: SqliteTaskStore,
+    f: HistoryFilter,
+    *,
+    target_branch: str | None = None,
+) -> list[IncompleteLineage]:
     """Return unresolved lineages grouped by canonical root for attention workflows."""
     filtered = HistoryFilter(
         limit=None,
@@ -409,7 +431,7 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
             continue
         root_merged = effective_shared_merge_by_root.get(root.id)
         if root_merged is None:
-            root_merged = _is_effective_shared_branch_lineage_merged(store, root)
+            root_merged = _is_effective_shared_branch_lineage_merged(store, root, target_branch=target_branch)
             effective_shared_merge_by_root[root.id] = root_merged
         shared_descendant = _is_shared_branch_descendant(task, root)
 
@@ -419,7 +441,7 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
         else:
             if task.merge_status == "merged":
                 continue
-            if _has_merged_retry_descendant(store, task):
+            if _has_merged_retry_descendant(store, task, target_branch=target_branch):
                 continue
 
         unresolved_by_root.setdefault(root.id, []).append(task)

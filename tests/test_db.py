@@ -1983,6 +1983,34 @@ class TestMergeStatus:
         assert unit.target_branch == "master"
         assert [candidate.id for candidate in store.get_unmerged("master")] == [task.id]
 
+    def test_default_target_branch_apis_use_store_default_merge_target_not_main(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Store-level merge-unit writes and reads should honor the configured default target."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        monkeypatch.setattr(store, "default_merge_target", lambda: "trunk")
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(task, has_commits=True, branch="feature/trunk-target")
+
+        assert task.id is not None
+        trunk_unit = store.resolve_merge_unit_for_task(task.id, "trunk")
+        main_unit = store.resolve_merge_unit_for_task(task.id, "main")
+        assert trunk_unit is not None
+        assert main_unit is None
+        assert [candidate.id for candidate in store.get_unmerged()] == [task.id]
+
+        store.set_merge_status(task.id, "merged")
+
+        refreshed_trunk_unit = store.resolve_merge_unit_for_task(task.id, "trunk")
+        refreshed_main_unit = store.resolve_merge_unit_for_task(task.id, "main")
+        assert refreshed_trunk_unit is not None
+        assert refreshed_trunk_unit.state == "merged"
+        assert refreshed_main_unit is None
+        assert store.get_unmerged() == []
+
     def test_merge_unit_backfill_attaches_existing_branchless_reviews_with_review_role(self, tmp_path: Path) -> None:
         """Backfilling an implementation unit should attach existing branchless reviews."""
         db_path = tmp_path / "test.db"

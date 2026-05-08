@@ -380,9 +380,9 @@ def _build_auto_merge_args(
     )
 
 
-def _task_merge_unit_state(store: SqliteTaskStore, task: DbTask) -> str | None:
+def _task_merge_unit_state(store: SqliteTaskStore, task: DbTask, *, target_branch: str | None) -> str | None:
     if task.id is not None:
-        unit = store.resolve_merge_unit_for_task(task.id)
+        unit = store.resolve_merge_unit_for_task(task.id, target_branch)
         if unit is not None:
             return unit.state
     return task.merge_status
@@ -1041,7 +1041,11 @@ def _run_task_backed_rebase(
         if target_parent_id:
             store.invalidate_review_state(target_parent_id)
             parent = store.get(target_parent_id)
-            if parent and parent.id is not None and _task_merge_unit_state(store, parent) == "merged":
+            if parent and parent.id is not None and _task_merge_unit_state(
+                store,
+                parent,
+                target_branch=rebase_target,
+            ) == "merged":
                 store.set_merge_status(parent.id, "unmerged", target_branch=rebase_target)
 
         if resolved_by_provider:
@@ -1312,11 +1316,10 @@ def cmd_pr(args: argparse.Namespace) -> int:
         return 1
 
     # Check merge_status before requiring gh (local DB check, no external dependencies)
-    if _task_merge_unit_state(store, task) == "merged":
+    default_branch = git.default_branch()
+    if _task_merge_unit_state(store, task, target_branch=default_branch) == "merged":
         print(f"Error: Task {task.id} is already marked as merged")
         return 1
-
-    default_branch = git.default_branch()
 
     result = ensure_task_pr(
         task,

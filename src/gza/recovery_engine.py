@@ -410,8 +410,10 @@ def is_resolved_by_merged_target(store: SqliteTaskStore, task: DbTask) -> bool:
     target_task = _resolve_merged_target_task(store, task)
     if target_task is None:
         return False
+    merge_context = _load_merge_context(_project_dir_for_store(store))
+    target_branch = merge_context.default_branch or store.default_merge_target()
     if target_task.id is not None:
-        unit = store.resolve_merge_unit_for_task(target_task.id)
+        unit = store.resolve_merge_unit_for_task(target_task.id, target_branch)
         if unit is not None:
             return unit.state == "merged"
     return target_task.merge_status == "merged"
@@ -524,7 +526,8 @@ def _is_resolved_by_landed_lineage(
             continue
         merge_state = lineage_task.merge_status
         if lineage_task.id is not None:
-            unit = store.resolve_merge_unit_for_task(lineage_task.id)
+            target_branch = merge_context.default_branch or store.default_merge_target()
+            unit = store.resolve_merge_unit_for_task(lineage_task.id, target_branch)
             if unit is not None:
                 merge_state = unit.state
         if merge_state != "merged":

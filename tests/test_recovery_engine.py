@@ -44,22 +44,28 @@ def _completed_impl(store, *, merge_status: str):
 
 
 class _StubMergeGit:
-    def __init__(self, *, merged_branches: set[str] | None = None) -> None:
+    def __init__(self, *, merged_branches: set[str] | None = None, default_branch: str = "main") -> None:
         self.merged_branches = merged_branches or set()
+        self.default_branch = default_branch
 
     def branch_exists(self, branch: str) -> bool:
         return bool(branch)
 
     def is_merged(self, branch: str, into: str) -> bool:
-        return into == "main" and branch in self.merged_branches
+        return into == self.default_branch and branch in self.merged_branches
 
 
-def _stub_merge_context(monkeypatch: pytest.MonkeyPatch, *, merged_branches: set[str] | None = None) -> None:
-    git = _StubMergeGit(merged_branches=merged_branches)
+def _stub_merge_context(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    merged_branches: set[str] | None = None,
+    default_branch: str = "main",
+) -> None:
+    git = _StubMergeGit(merged_branches=merged_branches, default_branch=default_branch)
     monkeypatch.setattr(
         recovery_engine,
         "_load_merge_context",
-        lambda _project_dir=None: _MergeContext(git=git, default_branch="main"),
+        lambda _project_dir=None: _MergeContext(git=git, default_branch=default_branch),
     )
 
 
@@ -142,6 +148,33 @@ def test_recovery_engine_keeps_failed_sidequests_visible_when_target_impl_is_not
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert decision.reason_code != "resolved_by_merged_target"
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+
+def test_recovery_engine_uses_merge_context_target_branch_for_merge_units(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl = _completed_impl(store, merge_status="unmerged")
+    assert impl.id is not None
+    impl.branch = "feature/recovery-target-specific"
+    store.update(impl)
+    main_unit = store.get_or_create_merge_unit_for_task(impl, "main")
+    release_unit = store.get_or_create_merge_unit_for_task(impl, "release")
+    assert main_unit is not None
+    assert release_unit is not None
+    store.set_merge_unit_state(main_unit.id, "merged")
+    store.set_merge_unit_state(release_unit.id, "unmerged")
+
+    failed = _failed_sidequest(store, task_type="review", impl_id=impl.id, reason="MISSING_REPORT_ARTIFACT")
+
+    _stub_merge_context(monkeypatch, default_branch="release")
+    assert is_resolved_by_merged_target(store, failed) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+    _stub_merge_context(monkeypatch, default_branch="main")
+    assert is_resolved_by_merged_target(store, failed) is True
 
 
 def test_list_failed_tasks_for_recovery_filters_failed_impl_when_landed_work_is_already_on_main(

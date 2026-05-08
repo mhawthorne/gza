@@ -2115,7 +2115,13 @@ def post_review_to_pr(
         print(f"Warning: Failed to post review to PR: {e}")
 
 
-def _create_and_run_review_task(completed_task: Task, config: Config, store: SqliteTaskStore) -> int:
+def _create_and_run_review_task(
+    completed_task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    *,
+    target_branch: str | None = None,
+) -> int:
     """Create and immediately execute a review task for a completed implementation.
 
     Returns:
@@ -2136,6 +2142,7 @@ def _create_and_run_review_task(completed_task: Task, config: Config, store: Sql
         review_task = create_review_task(
             store, review_target, prompt_mode="auto",
             project_prefix=config.project_prefix or None,
+            target_branch=target_branch,
         )
     except DuplicateReviewError as e:
         review_task = e.active_review
@@ -3390,7 +3397,7 @@ def _complete_code_task(
     if task.task_type == "fix":
         root_impl = _resolve_root_implementation_for_fix(task, store)
         if root_impl is not None and root_impl.id is not None:
-            root_impl_unit = store.resolve_merge_unit_for_task(root_impl.id)
+            root_impl_unit = store.resolve_merge_unit_for_task(root_impl.id, default_branch)
             fix_was_merged_before_run = (
                 (root_impl_unit.state if root_impl_unit is not None else root_impl.merge_status) == "merged"
             )
@@ -3416,6 +3423,7 @@ def _complete_code_task(
         worktree_git,
         branch_name,
         stats,
+        target_branch=default_branch,
         fix_commits_ahead_before_run=fix_commits_ahead_before_run,
         fix_default_branch=fix_default_branch,
         fix_was_merged_before_run=fix_was_merged_before_run,
@@ -3430,6 +3438,7 @@ def _post_complete_code_task(
     branch_name: str,
     stats: TaskStats,
     *,
+    target_branch: str | None = None,
     fix_commits_ahead_before_run: int | None = None,
     fix_default_branch: str | None = None,
     fix_was_merged_before_run: bool = False,
@@ -3452,14 +3461,14 @@ def _post_complete_code_task(
             # when publishing those commits still needs operator intervention.
             refreshed_impl = store.get(impl_ancestor.id)
             refreshed_unit = (
-                store.resolve_merge_unit_for_task(refreshed_impl.id)
+                store.resolve_merge_unit_for_task(refreshed_impl.id, target_branch)
                 if refreshed_impl and refreshed_impl.id is not None
                 else None
             )
             if refreshed_impl and refreshed_impl.id is not None and (
                 refreshed_unit.state if refreshed_unit is not None else refreshed_impl.merge_status
             ) == "merged":
-                store.set_merge_status(refreshed_impl.id, "unmerged", target_branch=worktree_git.default_branch())
+                store.set_merge_status(refreshed_impl.id, "unmerged", target_branch=target_branch)
         if task.create_review:
             improve_follow_up_ready = _sync_completed_improve_branch_for_live_pr(task, store, worktree_git)
         if improve_follow_up_ready and impl_ancestor and impl_ancestor.id is not None:
@@ -3474,11 +3483,13 @@ def _post_complete_code_task(
     if task.task_type == "rebase" and task.based_on:
         store.invalidate_review_state(task.based_on)
         parent = store.get(task.based_on)
-        parent_unit = store.resolve_merge_unit_for_task(parent.id) if parent and parent.id is not None else None
+        parent_unit = (
+            store.resolve_merge_unit_for_task(parent.id, target_branch) if parent and parent.id is not None else None
+        )
         if parent and parent.id is not None and (
             parent_unit.state if parent_unit is not None else parent.merge_status
         ) == "merged":
-            store.set_merge_status(parent.id, "unmerged", target_branch=worktree_git.default_branch())
+            store.set_merge_status(parent.id, "unmerged", target_branch=target_branch)
 
     # Rebase tasks run provider-side conflict resolution in the worktree.
     # Force-push from the host runner so SSH/auth follows host environment.
@@ -3491,6 +3502,7 @@ def _post_complete_code_task(
             store,
             worktree_git,
             branch_name,
+            target_branch=target_branch,
             fix_commits_ahead_before_run=fix_commits_ahead_before_run,
             fix_default_branch=fix_default_branch,
             fix_was_merged_before_run=fix_was_merged_before_run,
@@ -3520,7 +3532,9 @@ def _post_complete_code_task(
                     "Warning: Skipping auto-review until the improve branch is safely published."
                 )
             return 0
-        return _create_and_run_review_task(task, config, store)
+        if target_branch is None:
+            return _create_and_run_review_task(task, config, store)
+        return _create_and_run_review_task(task, config, store, target_branch=target_branch)
 
     return 0
 
@@ -3531,6 +3545,7 @@ def _handle_fix_follow_up_review(
     worktree_git: Git,
     branch_name: str,
     *,
+    target_branch: str | None,
     fix_commits_ahead_before_run: int | None,
     fix_default_branch: str | None,
     fix_was_merged_before_run: bool = False,
@@ -3580,14 +3595,18 @@ def _handle_fix_follow_up_review(
 
     store.clear_review_state(root_impl_id)
     refreshed_impl = store.get(root_impl_id)
-    refreshed_unit = store.resolve_merge_unit_for_task(refreshed_impl.id) if refreshed_impl and refreshed_impl.id is not None else None
+    refreshed_unit = (
+        store.resolve_merge_unit_for_task(refreshed_impl.id, target_branch)
+        if refreshed_impl and refreshed_impl.id is not None
+        else None
+    )
     if refreshed_impl and refreshed_impl.id is not None and (
         refreshed_unit.state if refreshed_unit is not None else refreshed_impl.merge_status
     ) == "merged":
         store.set_merge_status(refreshed_impl.id, "unmerged", target_branch=default_branch)
 
     try:
-        review_task = create_review_task(store, root_impl, prompt_mode="auto")
+        review_task = create_review_task(store, root_impl, prompt_mode="auto", target_branch=target_branch)
     except DuplicateReviewError as exc:
         active = exc.active_review
         print(
@@ -3652,18 +3671,22 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
     task.completion_reason = None
     target_branch: str | None = None
     if task.branch and task.has_commits:
-        existing_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
+        default_branch = git.default_branch()
+        target_branch = default_branch if isinstance(default_branch, str) and default_branch else None
+        existing_unit = (
+            store.resolve_merge_unit_for_task(task.id, target_branch) if task.id is not None and target_branch else None
+        )
         if existing_unit is not None:
             target_branch = existing_unit.target_branch
         elif task.based_on:
             parent = store.get(task.based_on)
-            parent_unit = store.resolve_merge_unit_for_task(parent.id) if parent and parent.id is not None else None
+            parent_unit = (
+                store.resolve_merge_unit_for_task(parent.id, target_branch)
+                if parent and parent.id is not None and target_branch
+                else None
+            )
             if parent_unit is not None:
                 target_branch = parent_unit.target_branch
-        if target_branch is None:
-            default_branch = git.default_branch()
-            if isinstance(default_branch, str) and default_branch:
-                target_branch = default_branch
     store.mark_completed(
         task,
         branch=task.branch,
@@ -3683,6 +3706,7 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
         git,
         task.branch,
         stats,
+        target_branch=target_branch,
     )
 
 

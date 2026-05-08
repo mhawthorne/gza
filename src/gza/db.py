@@ -2142,6 +2142,16 @@ class SqliteTaskStore:
 
     def default_merge_target(self) -> str:
         """Best-effort default merge target branch for stored merge units."""
+        project_root = self._project_root
+        if isinstance(project_root, Path):
+            try:
+                from .git import Git
+
+                default_branch = Git(project_root).default_branch()
+            except Exception:
+                default_branch = None
+            if isinstance(default_branch, str) and default_branch:
+                return default_branch
         return "main"
 
     def _ensure_db(self) -> None:

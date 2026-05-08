@@ -95,6 +95,7 @@ def create_review_task(
     provider: str | None = None,
     prompt_mode: Literal["cli", "auto"] = "cli",
     project_prefix: str | None = None,
+    target_branch: str | None = None,
 ) -> Task:
     """Create a review task for a completed implementation task.
 
@@ -137,7 +138,8 @@ def create_review_task(
         model=model,
         provider=provider,
     )
-    impl_unit = store.resolve_merge_unit_for_task(impl_task.id)
+    effective_target = target_branch or store.default_merge_target()
+    impl_unit = store.resolve_merge_unit_for_task(impl_task.id, effective_target)
     if impl_unit is not None:
         store.get_or_create_merge_unit_for_task(review_task, impl_unit.target_branch)
     return review_task
