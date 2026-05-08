@@ -686,12 +686,14 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
     per_commit = bool(getattr(args, "per_commit", False))
     if per_commit:
+        commit_subjects = resolved_source.source_commit_subjects
         sources = [
             SourceSelection(
                 source_task_id=None,
                 source_commits=(commit,),
+                source_commit_subjects=((commit_subjects[index],) if index < len(commit_subjects) else ()),
             )
-            for commit in resolved_source.source_commits
+            for index, commit in enumerate(resolved_source.source_commits)
         ]
     else:
         sources = [resolved_source]

@@ -161,6 +161,7 @@ def test_resolve_source_selection_commit_source_resolves_in_order(tmp_path: Path
     git = MagicMock(spec=Git)
     git.ref_exists.return_value = True
     git.rev_parse.side_effect = ["a" * 40, "b" * 40]
+    git.get_commit_subject.side_effect = ["Improve auth retries", "Tighten extract validation"]
 
     source = resolve_source_selection(
         store,
@@ -174,6 +175,7 @@ def test_resolve_source_selection_commit_source_resolves_in_order(tmp_path: Path
     assert source == SourceSelection(
         source_task_id=None,
         source_commits=("a" * 40, "b" * 40),
+        source_commit_subjects=("Improve auth retries", "Tighten extract validation"),
     )
 
 
@@ -182,6 +184,7 @@ def test_resolve_source_selection_commit_source_rejects_duplicates_after_resolut
     git = MagicMock(spec=Git)
     git.ref_exists.return_value = True
     git.rev_parse.side_effect = ["a" * 40, "a" * 40]
+    git.get_commit_subject.return_value = "Duplicate subject"
 
     with pytest.raises(ExtractionError, match="Duplicate source commit selected"):
         resolve_source_selection(
@@ -238,7 +241,7 @@ def test_write_extraction_bundle_and_bundle_roundtrip(tmp_path: Path) -> None:
     assert (copied / "manifest.json").exists()
 
 
-def test_plan_extraction_branch_source_uses_branch_name_in_prompt() -> None:
+def test_plan_extraction_branch_source_prefers_diff_description_over_branch_provenance() -> None:
     git = MagicMock(spec=Git)
     source = SourceSelection(
         source_task_id=None,
@@ -258,7 +261,135 @@ def test_plan_extraction_branch_source_uses_branch_name_in_prompt() -> None:
 
     draft = plan_extraction(git, source, ("src/module.py",), operator_prompt=None)
 
-    assert draft.prompt.startswith("Carry over: auth cleanup\n")
+    assert draft.prompt.startswith("Carry over: add auth cleanup module\n")
+
+
+def test_plan_extraction_task_source_prefers_specific_body_line_over_vague_title() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+        source_task_prompt=(
+            "Carry over: agent sessions\n\n"
+            "Implement session reuse for resumed agents.\n"
+            "Preserve existing session cleanup behavior.\n"
+        ),
+        source_task_slug="20260427-agent-sessions",
+    )
+    git.get_diff_name_status.return_value = "M\tsrc/agent_sessions.py\n"
+    git.get_diff_numstat.return_value = "3\t1\tsrc/agent_sessions.py\n"
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/src/agent_sessions.py b/src/agent_sessions.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/agent_sessions.py\n"
+        "+++ b/src/agent_sessions.py\n"
+        "@@ -1 +1,3 @@\n"
+        "+reuse_session = True\n"
+    )
+
+    draft = plan_extraction(git, source, ("src/agent_sessions.py",), operator_prompt=None)
+
+    assert draft.prompt.startswith("Carry over: Implement session reuse for resumed agents\n")
+
+
+def test_plan_extraction_task_source_prefers_specific_carry_over_prompt_over_generic_diff_title() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+        source_task_prompt="Carry over: Add tenant-aware retry state to extraction resume flow",
+        source_task_slug="20260507-retry-state",
+    )
+    git.get_diff_name_status.return_value = "M\tsrc/runner.py\n"
+    git.get_diff_numstat.return_value = "4\t2\tsrc/runner.py\n"
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/src/runner.py b/src/runner.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/runner.py\n"
+        "+++ b/src/runner.py\n"
+        "@@ -1 +1,4 @@\n"
+        "+retry_state = True\n"
+    )
+
+    draft = plan_extraction(git, source, ("src/runner.py",), operator_prompt=None)
+
+    assert draft.prompt.startswith("Carry over: Add tenant-aware retry state to extraction resume flow\n")
+    assert not draft.prompt.startswith("Carry over: update runner module\n")
+
+
+def test_plan_extraction_task_source_generated_prompt_boilerplate_falls_back_to_diff_objective() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+        source_task_prompt=(
+            "Carry over: agent sessions\n\n"
+            "Source: task gza-999 (source task prompt).\n\n"
+            "Original task prompt:\n"
+            "Carry over: agent sessions\n\n"
+            "Selected files (1):\n"
+            "- src/agent_sessions.py\n\n"
+            "Observed source diff metadata:\n"
+            "- M: src/agent_sessions.py (+5/-1)\n\n"
+            "Validate the seeded patch in this worktree, finish any missing integration, run required verification, and produce the normal task summary.\n"
+        ),
+        source_task_slug="20260507-agent-sessions",
+    )
+    git.get_diff_name_status.return_value = "M\tsrc/agent_sessions.py\n"
+    git.get_diff_numstat.return_value = "5\t1\tsrc/agent_sessions.py\n"
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/src/agent_sessions.py b/src/agent_sessions.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/agent_sessions.py\n"
+        "+++ b/src/agent_sessions.py\n"
+        "@@ -1 +1,5 @@\n"
+        "+reuse_session = True\n"
+    )
+
+    draft = plan_extraction(git, source, ("src/agent_sessions.py",), operator_prompt=None)
+
+    assert draft.prompt.startswith("Carry over: update agent sessions module\n")
+    assert not draft.prompt.startswith("Carry over: Validate the seeded patch")
+
+
+def test_plan_extraction_task_source_generated_prompt_preserves_specific_original_objective() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+        source_task_prompt=(
+            "Carry over: agent sessions\n\n"
+            "Source: task gza-999 (source task prompt).\n\n"
+            "Original task prompt:\n"
+            "Implement session reuse for resumed agents.\n"
+            "Preserve existing session cleanup behavior.\n\n"
+            "Selected files (1):\n"
+            "- src/agent_sessions.py\n\n"
+            "Observed source diff metadata:\n"
+            "- M: src/agent_sessions.py (+5/-1)\n\n"
+            "Validate the seeded patch in this worktree, finish any missing integration, run required verification, and produce the normal task summary.\n"
+        ),
+        source_task_slug="20260507-agent-sessions",
+    )
+    git.get_diff_name_status.return_value = "M\tsrc/agent_sessions.py\n"
+    git.get_diff_numstat.return_value = "5\t1\tsrc/agent_sessions.py\n"
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/src/agent_sessions.py b/src/agent_sessions.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/agent_sessions.py\n"
+        "+++ b/src/agent_sessions.py\n"
+        "@@ -1 +1,5 @@\n"
+        "+reuse_session = True\n"
+    )
+
+    draft = plan_extraction(git, source, ("src/agent_sessions.py",), operator_prompt=None)
+
+    assert draft.prompt.startswith("Carry over: Implement session reuse for resumed agents\n")
+    assert not draft.prompt.startswith("Carry over: Validate the seeded patch")
 
 
 def test_plan_extraction_commit_source_preserves_commit_order() -> None:
@@ -266,6 +397,7 @@ def test_plan_extraction_commit_source_preserves_commit_order() -> None:
     source = SourceSelection(
         source_task_id=None,
         source_commits=("a" * 40, "b" * 40),
+        source_commit_subjects=("Improve first path handling", "Tighten second path validation"),
     )
     git.get_commit_name_status.side_effect = [
         "M\tsrc/first.py\n",
@@ -293,10 +425,34 @@ def test_plan_extraction_commit_source_preserves_commit_order() -> None:
     draft = plan_extraction(git, source, ("src/first.py", "src/second.py"), operator_prompt=None)
 
     assert "commits in extraction order" in draft.prompt
+    assert "Source commit subjects:" in draft.prompt
     assert draft.patch.index("diff --git a/src/first.py b/src/first.py") < draft.patch.index(
         "diff --git a/src/second.py b/src/second.py"
     )
     assert draft.touched_paths == ("src/first.py", "src/second.py")
+
+
+def test_plan_extraction_single_commit_source_uses_commit_subject_for_prompt_title() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
+        source_task_id=None,
+        source_commits=("a" * 40,),
+        source_commit_subjects=("Improve agent session persistence",),
+    )
+    git.get_commit_name_status.return_value = "M\tsrc/agent_sessions.py\n"
+    git.get_commit_numstat.return_value = "2\t1\tsrc/agent_sessions.py\n"
+    git.get_commit_patch_for_paths.return_value = (
+        "diff --git a/src/agent_sessions.py b/src/agent_sessions.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/agent_sessions.py\n"
+        "+++ b/src/agent_sessions.py\n"
+        "@@ -1 +1,2 @@\n"
+        "+persisted = True\n"
+    )
+
+    draft = plan_extraction(git, source, ("src/agent_sessions.py",), operator_prompt=None)
+
+    assert draft.prompt.startswith("Carry over: Improve agent session persistence\n")
 
 
 def test_parse_file_summaries_braced_rename_numstat() -> None:
