@@ -8014,15 +8014,104 @@ class TestUnmergedUnifiedQueryOutput:
         rendered = enriched.render("rich")
         assert f"[{query_cli._colors.UNMERGED_COLORS.review_approved}]✓ approved[/{query_cli._colors.UNMERGED_COLORS.review_approved}]" in rendered
 
+    @pytest.mark.parametrize(
+        ("verdict_text", "score", "badge_text"),
+        [
+            ("APPROVED", 91, "✓ approved"),
+            ("CHANGES_REQUESTED", 34, "⚠ changes requested"),
+        ],
+    )
+    def test_unmerged_scored_review_badge_keeps_single_score_and_verdict_theme(
+        self,
+        tmp_path: Path,
+        verdict_text: str,
+        score: int,
+        badge_text: str,
+    ) -> None:
+        store, task, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Scored verdict task")
+        review = store.add("Review scored verdict", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.depends_on = task.id
+        review.output_content = f"Verdict: {verdict_text}"
+        review.review_score = score
+        store.update(review)
+
+        config = query_cli.Config.load(tmp_path)
+        store = query_cli.get_store(config, open_mode="readwrite")
+        service = query_cli._TaskQueryService(store)
+        query = query_cli._TaskQueryPresets.unmerged(
+            branch_owner_ids=(task.id,),
+            task_ids=(task.id,),
+            limit=5,
+            mode="rich",
+            projection=query_cli._TaskProjectionSpec(preset=query_cli._TaskProjectionPreset.UNMERGED_DEFAULT),
+        )
+        result = service.run(query)
+        enriched = query_cli._enrich_unmerged_result(
+            result,
+            store=store,
+            config=config,
+            git_client=_FastUnmergedGit(),
+            target_branch="main",
+            default_branch="main",
+        )
+
+        rendered = enriched.render("rich")
+        color = query_cli._colors.get_unmerged_field_value_color("review_verdict", badge_text)
+        assert color is not None
+        assert rendered.count(f"({score})") == 1
+        assert f"[{color}]{badge_text} ({score})[/{color}]" in rendered
+
     def test_unmerged_progress_logs_counts_for_refresh_query_and_render(self, tmp_path: Path) -> None:
         setup_unmerged_env(tmp_path, task_prompt="Progress task")
 
         result = run_gza("unmerged", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert re.search(r"Progress: refreshing canonical merge truth for \d+ candidate tasks", result.stdout)
-        assert re.search(r"Progress: running unmerged query over \d+ task rows for \d+ selected branches", result.stdout)
-        assert re.search(r"Progress: rendering \d+ row\(s\) from \d+ filtered result\(s\) as rich", result.stdout)
+        assert "Progress:" not in result.stdout
+        assert re.search(r"Progress: refreshing canonical merge truth for \d+ candidate tasks", result.stderr)
+        assert re.search(r"Progress: running unmerged query over \d+ task rows for \d+ selected branches", result.stderr)
+        assert re.search(r"Progress: rendering \d+ row\(s\) from \d+ filtered result\(s\) as rich", result.stderr)
+
+    def test_unmerged_descendants_only_lineage_excludes_depends_on_only_child(self, tmp_path: Path) -> None:
+        store, impl, _git = setup_unmerged_env(tmp_path, task_prompt="Owner implementation")
+        impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        store.update(impl)
+
+        review = store.add("Review owner", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        review.depends_on = impl.id
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review)
+
+        improve = store.add("Improve owner", task_type="improve")
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        improve.based_on = impl.id
+        improve.depends_on = review.id
+        improve.branch = "feature/test"
+        improve.same_branch = True
+        store.update(improve)
+
+        depends_only_impl = store.add("Depends-only implement noise", task_type="implement")
+        depends_only_impl.status = "completed"
+        depends_only_impl.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
+        depends_only_impl.depends_on = impl.id
+        depends_only_impl.branch = "feature/test"
+        depends_only_impl.same_branch = True
+        store.update(depends_only_impl)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert impl.id in normalized
+        assert review.id in normalized
+        assert improve.id in normalized
+        assert "Depends-only implement noise" not in normalized
+        assert depends_only_impl.id not in normalized
 
     def test_unmerged_shows_descendants_only_lineage_without_ancestors(self, tmp_path: Path) -> None:
         from gza.git import Git
