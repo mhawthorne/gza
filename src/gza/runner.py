@@ -2998,7 +2998,7 @@ def _check_dependency_merge_precondition(
     default_branch: str,
 ) -> tuple[Task | None, str | None, str | None]:
     """Return unmet dependency merge prerequisite or a git operational error."""
-    dep = get_unmerged_dependency_precondition(store, task)
+    dep = get_unmerged_dependency_precondition(store, task, default_branch)
     if dep is None:
         return (None, None, None)
     return (dep, default_branch, None)

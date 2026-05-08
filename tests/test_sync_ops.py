@@ -338,10 +338,62 @@ def test_sync_branch_cohorts_creates_target_specific_merge_unit_without_mutating
         refreshed_main_unit.diff_lines_removed,
     ) == (99, 999, 111)
     assert refreshed_master_unit.state == "unmerged"
+
+
+def test_sync_branch_cohorts_keeps_historical_reused_branch_unit_merged(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    historical = _completed_branch_task(store, "Historical task", "feature/reused")
+    assert historical.id is not None
+    historical_unit = store.get_or_create_merge_unit_for_task(historical, "main")
+    assert historical_unit is not None
+    store.set_merge_unit_state(historical_unit.id, "merged")
+
+    unrelated = _completed_branch_task(store, "Unrelated task", "feature/reused")
+    assert unrelated.id is not None
+    unrelated_unit = store.get_or_create_merge_unit_for_task(unrelated, "main")
+    assert unrelated_unit is not None
+    assert unrelated_unit.id != historical_unit.id
+
+    cohorts = build_unmerged_branch_cohorts(store, "main")
+    assert len(cohorts) == 1
+    assert cohorts[0].merge_unit_id == unrelated_unit.id
+    assert {task.id for task in cohorts[0].code_tasks} == {unrelated.id}
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        cohorts,
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=False,
+    )
+
+    assert partial is False
+    assert results[0].merge_status == "unmerged"
+
+    refreshed_historical = store.get(historical.id)
+    refreshed_unrelated = store.get(unrelated.id)
+    refreshed_historical_unit = store.resolve_merge_unit_for_task(historical.id, "main")
+    refreshed_unrelated_unit = store.resolve_merge_unit_for_task(unrelated.id, "main")
+    assert refreshed_historical is not None
+    assert refreshed_unrelated is not None
+    assert refreshed_historical_unit is not None
+    assert refreshed_unrelated_unit is not None
+    assert refreshed_historical_unit.state == "merged"
+    assert refreshed_historical.merge_status == "merged"
+    assert refreshed_unrelated_unit.state == "unmerged"
+    assert refreshed_unrelated.merge_status == "unmerged"
     assert (
-        refreshed_master_unit.diff_files_changed,
-        refreshed_master_unit.diff_lines_added,
-        refreshed_master_unit.diff_lines_removed,
+        refreshed_unrelated_unit.diff_files_changed,
+        refreshed_unrelated_unit.diff_lines_added,
+        refreshed_unrelated_unit.diff_lines_removed,
     ) == (1, 2, 1)
 
 

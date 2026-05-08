@@ -1383,7 +1383,11 @@ def cmd_sync(args: argparse.Namespace) -> int:
     preliminary_results: list = []
     if args.task_ids:
         resolved_ids = [resolve_id(config, task_id) for task_id in args.task_ids]
-        cohorts, preliminary_results = build_branch_cohorts_for_task_ids(store, resolved_ids)
+        cohorts, preliminary_results = build_branch_cohorts_for_task_ids(
+            store,
+            resolved_ids,
+            target_branch=default_branch,
+        )
     else:
         cohorts = build_default_branch_cohorts(store, target_branch=default_branch)
 
