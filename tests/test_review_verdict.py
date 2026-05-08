@@ -10,6 +10,7 @@ from gza.review_verdict import (
     parse_review_report,
     parse_review_template,
     parse_review_verdict,
+    validate_review_report_contract,
 )
 
 
@@ -42,6 +43,7 @@ class TestParseReviewReport:
             "## Blockers\n\n"
             "### B1 API error handling\n"
             "Evidence: missing branch\n"
+            "Open-state citation: `src/api.py:12-18`\n"
             "Impact: crashes\n"
             "Required fix: handle error path\n"
             "Required tests: add regression\n\n"
@@ -62,6 +64,7 @@ class TestParseReviewReport:
         followup = report.findings[1]
         assert blocker.id == "B1"
         assert blocker.severity == "BLOCKER"
+        assert blocker.open_state_citation == "`src/api.py:12-18`"
         assert blocker.fix_or_followup == "handle error path"
         assert followup.id == "F1"
         assert followup.severity == "FOLLOWUP"
@@ -83,6 +86,76 @@ class TestParseReviewReport:
         assert report.format_version == "legacy"
         assert len(report.findings) == 1
         assert report.findings[0].severity == "BLOCKER"
+
+    def test_legacy_report_without_open_state_citation_still_parses(self) -> None:
+        content = (
+            "## Summary\n\n- Legacy format.\n\n"
+            "## Must-Fix\n\n"
+            "### M1 Missing guard\n"
+            "Evidence: old format body\n"
+            "Required fix: add missing guard\n\n"
+            "## Suggestions\n\n"
+            "### S1\n"
+            "Suggestion: do another thing\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        report = parse_review_report(content)
+        assert report.findings[0].open_state_citation is None
+
+
+class TestValidateReviewReportContract:
+    def test_flags_missing_open_state_citations_for_blockers(self) -> None:
+        content = (
+            "## Summary\n\n- Looks good.\n\n"
+            "## Blockers\n\n"
+            "### B1 Missing citation\n"
+            "Evidence: branch lacks guard\n"
+            "Impact: crash\n"
+            "Required fix: add guard\n"
+            "Required tests: regression\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        validation = validate_review_report_contract(content)
+        assert validation.blockers_missing_open_state_citation == ("B1",)
+        assert validation.blockers_with_malformed_open_state_citation == ()
+
+    def test_accepts_path_line_and_path_range_citations(self) -> None:
+        content = (
+            "## Summary\n\n- Looks good.\n\n"
+            "## Blockers\n\n"
+            "### B1 Valid citations\n"
+            "Evidence: issue still open\n"
+            "Open-state citation: `src/cli.py:41`, src/runner.py:120-133\n"
+            "Impact: crash\n"
+            "Required fix: add guard\n"
+            "Required tests: regression\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        validation = validate_review_report_contract(content)
+        assert validation.blockers_missing_open_state_citation == ()
+        assert validation.blockers_with_malformed_open_state_citation == ()
+
+    def test_flags_malformed_open_state_citations(self) -> None:
+        content = (
+            "## Summary\n\n- Looks good.\n\n"
+            "## Blockers\n\n"
+            "### B1 Bad citation\n"
+            "Evidence: issue still open\n"
+            "Open-state citation: src/runner.py\n"
+            "Impact: crash\n"
+            "Required fix: add guard\n"
+            "Required tests: regression\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        validation = validate_review_report_contract(content)
+        assert validation.blockers_missing_open_state_citation == ()
+        assert validation.blockers_with_malformed_open_state_citation == ("B1",)
 
 
 def _template_review(

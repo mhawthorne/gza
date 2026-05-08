@@ -68,6 +68,7 @@ class ReviewFinding:
     impact: str | None
     fix_or_followup: str | None
     tests: str | None
+    open_state_citation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,21 @@ class ReviewOutcome:
 
     verdict: str | None
     followup_findings: tuple[ReviewFinding, ...]
+
+
+@dataclass(frozen=True)
+class ReviewContractValidation:
+    """Non-fatal validation warnings for the canonical review output contract."""
+
+    blockers_missing_open_state_citation: tuple[str, ...] = ()
+    blockers_with_malformed_open_state_citation: tuple[str, ...] = ()
+
+    @property
+    def has_warnings(self) -> bool:
+        return bool(
+            self.blockers_missing_open_state_citation
+            or self.blockers_with_malformed_open_state_citation
+        )
 
 
 @dataclass(frozen=True)
@@ -180,7 +196,7 @@ def _parse_finding_entries(
         title = heading_parts[1].strip() if len(heading_parts) > 1 else heading.strip()
         parsed = _parse_fields(
             body,
-            labels=["Evidence", "Impact", fix_label, tests_label],
+            labels=["Evidence", "Open-state citation", "Impact", fix_label, tests_label],
         )
         finding = ReviewFinding(
             id=finding_id,
@@ -191,6 +207,7 @@ def _parse_finding_entries(
             impact=parsed.get("Impact"),
             fix_or_followup=parsed.get(fix_label),
             tests=parsed.get(tests_label),
+            open_state_citation=parsed.get("Open-state citation"),
         )
         findings.append(finding)
     return findings
@@ -387,6 +404,36 @@ def parse_review_report(content: str | None) -> ParsedReviewReport:
 def parse_review_verdict(content: str | None) -> str | None:
     """Extract a normalized review verdict from markdown content."""
     return parse_review_report(content).verdict
+
+
+_OPEN_STATE_CITATION_TOKEN_PATTERN = re.compile(r"`?[^,\s`]+:\d+(?:-\d+)?`?")
+
+
+def _has_valid_open_state_citation_shape(citation: str) -> bool:
+    tokens = [token.strip() for token in citation.split(",") if token.strip()]
+    if not tokens:
+        return False
+    return all(_OPEN_STATE_CITATION_TOKEN_PATTERN.fullmatch(token) for token in tokens)
+
+
+def validate_review_report_contract(content: str | None) -> ReviewContractValidation:
+    """Return non-fatal review contract warnings for blocker citation requirements."""
+    report = parse_review_report(content)
+    missing: list[str] = []
+    malformed: list[str] = []
+    for finding in report.findings:
+        if finding.severity != "BLOCKER":
+            continue
+        citation = (finding.open_state_citation or "").strip()
+        if not citation:
+            missing.append(finding.id)
+            continue
+        if not _has_valid_open_state_citation_shape(citation):
+            malformed.append(finding.id)
+    return ReviewContractValidation(
+        blockers_missing_open_state_citation=tuple(missing),
+        blockers_with_malformed_open_state_citation=tuple(malformed),
+    )
 
 
 def summarize_review_report(report: ParsedReviewReport) -> ReviewOutcome:

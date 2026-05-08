@@ -64,6 +64,7 @@ from .review_verdict import (
     parse_review_report,
     parse_review_template,
     parse_review_verdict,
+    validate_review_report_contract,
 )
 from .sync_ops import resolve_branch_pr
 from .task_slug import (
@@ -747,7 +748,7 @@ def get_task_output_paths(
 DIFF_SMALL_THRESHOLD = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
 DIFF_MEDIUM_THRESHOLD = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
 REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
-REVIEW_IMPROVE_LINEAGE_LIMIT = 4
+REVIEW_IMPROVE_LINEAGE_LIMIT = 5
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 COMMIT_SUBJECT_MAX_CHARS = 72
 
@@ -1235,44 +1236,52 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
     included = prior_improves[:REVIEW_IMPROVE_LINEAGE_LIMIT]
     omitted_count = max(0, len(prior_improves) - len(included))
     n_cycles = len(prior_improves)
-
-    # Build lineage chain (oldest first for readability)
-    chronological = sorted(
-        prior_improves,
-        key=lambda t: (t.created_at or datetime.min.replace(tzinfo=UTC), task_id_numeric_key(t.id)),
+    latest_improve = prior_improves[0]
+    latest_review_task = store.get(latest_improve.depends_on) if latest_improve.depends_on else None
+    latest_review_report = (
+        parse_review_report(_get_task_output(latest_review_task, project_dir))
+        if latest_review_task is not None
+        else None
     )
-    chain_parts = []
-    for improve in chronological:
-        review_ref = f"Review {improve.depends_on}" if improve.depends_on else "Review ?"
-        chain_parts.append(f"{review_ref} → Improve {improve.id}")
-    lineage_chain = " → ".join(chain_parts)
-
-    cycle_note = (
-        f"This implementation has been through {n_cycles} prior review/improve cycle(s)"
-        + (
-            f" (showing {len(included)} most recent, {omitted_count} older omitted)"
-            if omitted_count
-            else ""
-        )
-        + ". Use `uv run gza show <id>` to inspect prior review findings or improve task prompts."
-        " Use `cat <report_file>` to read full review reports."
-    )
+    state_parts = [
+        f"prior cycles: {n_cycles}",
+        f"latest review: {latest_improve.depends_on or 'unknown'}",
+        f"verdict={latest_review_report.verdict if latest_review_report is not None and latest_review_report.verdict else 'unknown'}",
+        f"score={latest_review_task.review_score if latest_review_task is not None and latest_review_task.review_score is not None else 'unknown'}",
+        f"latest improve: {latest_improve.id or 'unknown'}",
+        f"status={latest_improve.status or 'unknown'}",
+    ]
+    if omitted_count:
+        state_parts.append(f"older cycles omitted: {omitted_count}")
 
     lines = [
         "## Improve Lineage Context",
         "",
-        cycle_note,
-        f"Lineage: {lineage_chain}",
+        "Prior cycle history is coordination context only; it is not evidence that any blocker is still open.",
+        "Current state: " + ", ".join(state_parts) + ".",
         "",
     ]
 
-    for improve in included:
-        review_ref = f"review {improve.depends_on}" if improve.depends_on else "review ?"
-        content = _get_task_output(improve, project_dir)
-        summary = _compact_output_summary(content) if content else ""
-        if not summary:
-            summary = "No summary content available."
-        lines.append(f"- Improve {improve.id} ({review_ref}): {summary}")
+    for index, improve in enumerate(included, start=1):
+        cycle_number = n_cycles - (index - 1)
+        review_task_for_cycle = store.get(improve.depends_on) if improve.depends_on else None
+        review_report = (
+            parse_review_report(_get_task_output(review_task_for_cycle, project_dir))
+            if review_task_for_cycle is not None
+            else None
+        )
+        verdict = review_report.verdict if review_report is not None else None
+        score = (
+            review_task_for_cycle.review_score
+            if review_task_for_cycle is not None and review_task_for_cycle.review_score is not None
+            else "unknown"
+        )
+        completed = improve.completed_at.isoformat() if improve.completed_at is not None else "unknown"
+        lines.append(
+            f"- cycle {cycle_number}: review {improve.depends_on or '?'} "
+            f"verdict={verdict or 'unknown'} score={score} -> "
+            f"improve {improve.id or '?'} status={improve.status or 'unknown'} completed={completed}"
+        )
 
     return "\n".join(lines)
 
@@ -4210,6 +4219,22 @@ def _run_non_code_task(
         output_content = report_path.read_text()
         if task.task_type == "review":
             task.review_score = compute_review_score(parse_review_template(output_content))
+            contract_validation = validate_review_report_contract(output_content)
+            if contract_validation.blockers_missing_open_state_citation:
+                blocker_ids = ", ".join(contract_validation.blockers_missing_open_state_citation)
+                warning_message = (
+                    f"Review contract warning: blockers missing open-state citations: {blocker_ids}"
+                )
+                logger.warning(warning_message)
+                console.print(f"[yellow]{warning_message}[/yellow]")
+            if contract_validation.blockers_with_malformed_open_state_citation:
+                blocker_ids = ", ".join(contract_validation.blockers_with_malformed_open_state_citation)
+                warning_message = (
+                    "Review contract warning: blockers with malformed open-state citations: "
+                    f"{blocker_ids}"
+                )
+                logger.warning(warning_message)
+                console.print(f"[yellow]{warning_message}[/yellow]")
 
         # Clean up non-code worktree on success — report has been copied back, no further use
         if git:

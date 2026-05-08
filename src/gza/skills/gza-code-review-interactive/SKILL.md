@@ -88,7 +88,7 @@ Keep this review stack-agnostic. If project verification instructions are missin
 ## Blockers
 
 <Use ### B1, ### B2, ... for blockers. If none, write "None.">
-<Each blocker should include Evidence:, Impact:, Required fix:, Required tests:>
+<Each blocker should include Evidence:, Open-state citation:, Impact:, Required fix:, Required tests:>
 <Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
 <Treat unexplained deviations from the provided plan or request as BLOCKER.>
 <Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.>
@@ -96,6 +96,9 @@ Keep this review stack-agnostic. If project verification instructions are missin
 <If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.>
 <Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.>
 <For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.>
+<Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.>
+<Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.>
+<Open-state citation must contain one or more current-source references in `path:line` or `path:start-end` form; backticked citations and comma-separated multiple citations are allowed.>
 
 ## Follow-Ups
 

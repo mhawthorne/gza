@@ -35,6 +35,7 @@ Section requirements:
     - ...
   - Each blocker item must include these labeled fields:
     - Evidence:
+    - Open-state citation:
     - Impact:
     - Required fix:
     - Required tests: (name targeted regression coverage tied to the failure mode; avoid generic test asks)
@@ -75,5 +76,8 @@ Blocking discipline:
 - If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.
 - Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.
 - For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.
+- Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.
+- Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.
+- `Open-state citation:` must contain one or more current-source references in `path:line` or `path:start-end` form; backticked citations and comma-separated multiple citations are allowed.
 
 Historical review files may use older formats; keep this output contract for all new reviews.

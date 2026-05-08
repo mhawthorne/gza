@@ -614,8 +614,8 @@ class TestReviewContextFromChain:
         assert "Additional changed files not expanded inline: 1" in context
         mock_git.get_diff.assert_not_called()
 
-    def test_review_context_includes_compact_improve_lineage(self, tmp_path: Path):
-        """Review context includes compact summaries for prior improve runs."""
+    def test_review_context_includes_metadata_only_improve_lineage(self, tmp_path: Path):
+        """Review context includes metadata-only rows for prior improve runs."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -667,13 +667,15 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(review3, store, tmp_path, git=None)
 
         assert "## Improve Lineage Context" in context
-        assert f"Improve {improve1.id} (review {review1.id})" in context
-        assert f"Improve {improve2.id} (review {review2.id})" in context
-        assert "Fix flaky tests Tighten input validation Keep this concise" in context
-        assert "What was accomplished Reduced retry loops Added guardrails" in context
+        assert f"cycle 2: review {review2.id}" in context
+        assert f"cycle 1: review {review1.id}" in context
+        assert f"improve {improve1.id}" in context
+        assert f"improve {improve2.id}" in context
+        assert "Fix flaky tests" not in context
+        assert "Reduced retry loops" not in context
 
     def test_review_context_bounds_improve_lineage_and_reports_omitted(self, tmp_path: Path):
-        """Review context includes only recent improves and reports omitted count."""
+        """Review context includes only recent cycle rows and reports omitted count."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -701,20 +703,21 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
         assert "## Improve Lineage Context" in context
-        assert f"showing {REVIEW_IMPROVE_LINEAGE_LIMIT} most recent" in context
-        assert "2 older omitted" in context
+        assert f"prior cycles: {REVIEW_IMPROVE_LINEAGE_LIMIT + 2}" in context
+        assert "older cycles omitted: 2" in context
 
-        # Most recent improves are included in both the lineage chain and detail bullets.
         for improve_id in improve_ids[-REVIEW_IMPROVE_LINEAGE_LIMIT:]:
-            assert f"Improve {improve_id}" in context
+            assert f"improve {improve_id}" in context
 
-        # Older improve IDs appear in the lineage chain line but their summaries are omitted.
+        for improve_id in improve_ids[: len(improve_ids) - REVIEW_IMPROVE_LINEAGE_LIMIT]:
+            assert f"improve {improve_id}" not in context
+
         omitted_count = len(improve_ids) - REVIEW_IMPROVE_LINEAGE_LIMIT
         for idx in range(omitted_count):
             assert f"Improve summary {idx}" not in context
 
     def test_review_context_includes_retry_improves_in_same_chain(self, tmp_path: Path):
-        """Review context includes retry/resume improve attempts chained from prior improves."""
+        """Review context includes retry/resume improve attempts as metadata-only cycle rows."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -752,10 +755,12 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
         assert "## Improve Lineage Context" in context
-        assert f"Improve {improve_a.id} (review {review1.id})" in context
-        assert f"Improve {improve_b.id} (review {review2.id})" in context
-        assert "Direct improve" in context
-        assert "Retry improve" in context
+        assert f"cycle 2: review {review2.id}" in context
+        assert f"cycle 1: review {review1.id}" in context
+        assert f"improve {improve_a.id}" in context
+        assert f"improve {improve_b.id}" in context
+        assert "Direct improve" not in context
+        assert "Retry improve" not in context
 
     def test_review_context_bounds_mixed_direct_and_retry_improves(self, tmp_path: Path):
         """Bounded lineage remains correct with mixed direct and retry/resume improve attempts."""
@@ -790,13 +795,15 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
         assert "## Improve Lineage Context" in context
-        assert f"showing {REVIEW_IMPROVE_LINEAGE_LIMIT} most recent" in context
-        assert "2 older omitted" in context
+        assert f"prior cycles: {REVIEW_IMPROVE_LINEAGE_LIMIT + 2}" in context
+        assert "older cycles omitted: 2" in context
 
         for improve_id in improve_ids[-REVIEW_IMPROVE_LINEAGE_LIMIT:]:
-            assert f"Improve {improve_id}" in context
+            assert f"improve {improve_id}" in context
 
-        # Older improve IDs appear in the lineage chain but their summaries are omitted.
+        for improve_id in improve_ids[: len(improve_ids) - REVIEW_IMPROVE_LINEAGE_LIMIT]:
+            assert f"improve {improve_id}" not in context
+
         omitted_count = len(improve_ids) - REVIEW_IMPROVE_LINEAGE_LIMIT
         for idx in range(omitted_count):
             assert f"Mixed improve summary {idx}" not in context
@@ -836,11 +843,12 @@ class TestReviewContextFromChain:
 
         store = Mock(spec=SqliteTaskStore)
         store.get_all.return_value = [older_improve, later_improve]
+        store.get.return_value = None
 
         context = _build_review_improve_lineage_context(review_task, impl_task, store, tmp_path)
 
-        assert f"Improve {older_improve.id}" in context
-        assert "older improve" in context
+        assert f"improve {older_improve.id}" in context
+        assert "cycle 1:" in context
         assert f"Improve {later_improve.id}" not in context
         assert "later improve" not in context
 
@@ -880,16 +888,17 @@ class TestReviewContextFromChain:
 
         store = Mock(spec=SqliteTaskStore)
         store.get_all.return_value = [older_improve, later_improve]
+        store.get.return_value = None
 
         context = _build_review_improve_lineage_context(review_task, impl_task, store, tmp_path)
 
-        assert f"Improve {older_improve.id}" in context
-        assert "older improve 9" in context
+        assert f"improve {older_improve.id}" in context
+        assert "cycle 1:" in context
         assert f"Improve {later_improve.id}" not in context
         assert "later improve 11" not in context
 
-    def test_review_context_includes_tool_hints_when_prior_cycles_exist(self, tmp_path: Path):
-        """Review context includes uv run gza show / cat hints when prior review/improve cycles exist."""
+    def test_review_context_includes_metadata_only_lineage_when_prior_cycles_exist(self, tmp_path: Path):
+        """Review context includes metadata-only lineage when prior review/improve cycles exist."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -914,12 +923,15 @@ class TestReviewContextFromChain:
         current_review = store.add(prompt="Review current", task_type="review", depends_on=impl_task.id)
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
-        assert "uv run gza show <id>" in context
-        assert "cat <report_file>" in context
-        assert "1 prior review/improve cycle" in context
+        assert "Prior cycle history is coordination context only" in context
+        assert "Current state: prior cycles: 1" in context
+        assert f"latest review: {review1.id}" in context
+        assert f"latest improve: {improve1.id}" in context
+        assert "uv run gza show <id>" not in context
+        assert "cat <report_file>" not in context
 
-    def test_review_context_includes_lineage_chain_with_review_and_improve_ids(self, tmp_path: Path):
-        """Review context includes explicit lineage chain listing review and improve IDs."""
+    def test_review_context_includes_bounded_cycle_rows_without_summary_prose(self, tmp_path: Path):
+        """Review context includes bounded cycle rows and excludes prior improve summary prose."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -939,6 +951,7 @@ class TestReviewContextFromChain:
         )
         improve1.status = "completed"
         improve1.output_content = "- Round 1 fix\n"
+        improve1.completed_at = datetime(2026, 2, 12, 12, 0, 0, tzinfo=UTC)
         store.update(improve1)
 
         review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
@@ -953,18 +966,20 @@ class TestReviewContextFromChain:
         )
         improve2.status = "completed"
         improve2.output_content = "- Round 2 fix\n"
+        improve2.completed_at = datetime(2026, 2, 13, 12, 0, 0, tzinfo=UTC)
         store.update(improve2)
 
         current_review = store.add(prompt="Review current", task_type="review", depends_on=impl_task.id)
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
-        # Lineage chain shows review and improve IDs in order
-        assert f"Review {review1.id}" in context
-        assert f"Improve {improve1.id}" in context
-        assert f"Review {review2.id}" in context
-        assert f"Improve {improve2.id}" in context
-        assert "Lineage:" in context
-        assert "2 prior review/improve cycle" in context
+        assert f"cycle 2: review {review2.id}" in context
+        assert f"cycle 1: review {review1.id}" in context
+        assert f"improve {improve1.id}" in context
+        assert f"improve {improve2.id}" in context
+        assert "Round 1 fix" not in context
+        assert "Round 2 fix" not in context
+        assert "Lineage:" not in context
+        assert "prior cycles: 2" in context
 
     def test_improve_context_marks_unavailable_review_feedback(self, tmp_path: Path):
         """Improve context marks review-feedback unavailability as a blocker."""
@@ -1179,9 +1194,8 @@ class TestReviewContextFromChain:
         first_review = store.add(prompt="Review first", task_type="review", depends_on=impl_task.id)
         context = _build_context_from_chain(first_review, store, tmp_path, git=None)
 
-        assert "uv run gza show <id>" not in context
         assert "prior review/improve cycle" not in context
-        assert "Lineage:" not in context
+        assert "Current state:" not in context
 
     def test_fix_context_includes_repeated_blockers_and_latest_failed_attempt(self, tmp_path: Path):
         """Fix context includes repeated blockers and failed improve/resume lineage evidence."""
@@ -5011,6 +5025,86 @@ class TestNonCodeReportArtifactContract:
         assert refreshed is not None
         assert refreshed.status == "completed"
         assert refreshed.review_score == 67
+
+    def test_completed_review_warns_when_blockers_missing_open_state_citations(self, tmp_path: Path):
+        """Completed reviews warn about missing blocker citations without failing completion."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        review_task = store.add(prompt="Review citation warnings", task_type="review")
+        review_task.slug = "20260213-review-citation-warnings"
+        store.update(review_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 50
+
+        review_text = (
+            "## Summary\n\n"
+            "- Yes - Correctness reviewed\n"
+            "- No - blocker citation missing\n\n"
+            "## Blockers\n\n"
+            "### B1 Add empty-input guard\n"
+            "Evidence: current code still falls through on empty input\n"
+            "Required fix: return early when input is empty\n"
+            "Required tests: add empty-input regression\n\n"
+            "## Follow-Ups\n\n"
+            "None.\n\n"
+            "## Questions / Assumptions\n\n"
+            "None.\n\n"
+            "## Verdict\n\n"
+            "Verdict: CHANGES_REQUESTED\n"
+        )
+
+        def provider_run(_config, _prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            import json as _json
+
+            with open(log_file, "a") as f:
+                f.write(_json.dumps({"type": "result", "subtype": "success", "result": review_text}) + "\n")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=2.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id="session-citation-warning",
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.run.side_effect = provider_run
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        printed_lines: list[str] = []
+
+        def capture_print(*args, **kwargs):
+            printed_lines.append(str(args[0]) if args else "")
+
+        with patch("gza.runner.post_review_to_pr"), patch("gza.runner.console") as mock_runner_console, patch(
+            "gza.console.console"
+        ) as mock_console_console, patch(
+            "gza.runner.maybe_auto_regenerate_learnings", return_value=None
+        ):
+            mock_runner_console.print.side_effect = capture_print
+            mock_console_console.print.side_effect = capture_print
+            exit_code = _run_non_code_task(
+                review_task, config, store, mock_provider, mock_git, resume=False
+            )
+
+        assert exit_code == 0
+        refreshed = store.get(review_task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert "Review contract warning: blockers missing open-state citations: B1" in "\n".join(printed_lines)
 
     def test_missing_report_artifact_recovered_from_interactive_plaintext_log(self, tmp_path: Path):
         """Interactive plaintext output should be captured as result text for artifact recovery."""

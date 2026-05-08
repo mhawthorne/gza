@@ -11,6 +11,7 @@ from gza.prompts import PromptBuilder
 REVIEW_CONTRACT_PARITY_CLAUSES = [
     "The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it.",
     "Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.",
+    "Open-state citation:",
     "Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.",
     "Treat unexplained deviations from the provided plan or request as BLOCKER.",
     "Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.",
@@ -18,6 +19,8 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.",
     "Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.",
     "For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.",
+    "Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.",
+    "Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.",
 ]
 
 REVIEW_SUMMARY_CHECKLIST_COUNT = 6

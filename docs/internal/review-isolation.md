@@ -13,6 +13,9 @@ Review tasks run in isolated git worktrees that only contain git-tracked files.
     - If neither source exists, both sections are intentionally omitted and reviewers should state `No plan or request provided.`
    - Implementation diff context for `main...{impl_branch}` (small/full/excerpted depending on size thresholds)
    - Improve-lineage context when applicable
+     - This is metadata-only coordination context for prior review/improve cycles.
+     - It intentionally excludes prior review prose, improve summaries, and copied blocker text.
+     - Reviewers must prove current blockers from current code/diff, not from lineage history.
    - Explicit blocker markers when linked review/plan output exists but cannot be loaded on the current machine
 3. **Host runner** passes the complete prompt string to Docker/Claude
 4. **Claude** receives all context baked into the prompt
