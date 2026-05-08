@@ -337,6 +337,106 @@ class TestLocalConfigOverrides:
         assert config.source_map["providers.claude.task_types.review.model"] == "local"
         assert config.source_map["providers.claude.task_types.review.max_steps"] == "base"
 
+    def test_local_override_empty_watch_block_preserves_base_watch_config(self, tmp_path: Path):
+        """Empty local watch blocks should not clobber base watch settings."""
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text(
+            Path("gza.yaml").read_text()
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "watch:\n"
+            "  # batch: 1\n"
+            "  # poll: 60\n"
+        )
+
+        config = Config.load(tmp_path)
+
+        assert config.watch.no_activity_timeout == 120
+        assert config.watch.batch == 2
+        assert config.watch.poll == 60
+        assert config.source_map["watch.batch"] == "base"
+        assert config.source_map["watch.poll"] == "base"
+        assert config.source_map["watch.no_activity_timeout"] == "base"
+
+    def test_local_override_partial_watch_section_preserves_unset_base_values(self, tmp_path: Path):
+        """Partial local watch overrides should inherit unset values from the base config."""
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "watch:\n"
+            "  batch: 2\n"
+            "  no_activity_timeout: 120\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "watch:\n"
+            "  poll: 30\n"
+        )
+
+        config = Config.load(tmp_path)
+
+        assert config.watch.batch == 2
+        assert config.watch.poll == 30
+        assert config.watch.no_activity_timeout == 120
+        assert config.source_map["watch.batch"] == "base"
+        assert config.source_map["watch.poll"] == "local"
+        assert config.source_map["watch.no_activity_timeout"] == "base"
+
+    def test_local_override_full_watch_section_still_inherits_other_base_values(self, tmp_path: Path):
+        """Non-empty local watch overrides should still deep-merge with the base config."""
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "watch:\n"
+            "  batch: 2\n"
+            "  poll: 60\n"
+            "  no_activity_timeout: 120\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "watch:\n"
+            "  batch: 9\n"
+            "  poll: 30\n"
+        )
+
+        config = Config.load(tmp_path)
+
+        assert config.watch.batch == 9
+        assert config.watch.poll == 30
+        assert config.watch.no_activity_timeout == 120
+        assert config.source_map["watch.batch"] == "local"
+        assert config.source_map["watch.poll"] == "local"
+        assert config.source_map["watch.no_activity_timeout"] == "base"
+
+    def test_local_override_empty_tmux_block_preserves_base_tmux_config(self, tmp_path: Path):
+        """Empty local tmux blocks should not clobber base tmux settings."""
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "tmux:\n"
+            "  enabled: true\n"
+            "  auto_accept_timeout: 20\n"
+            "  max_idle_timeout: 600\n"
+            "  detach_grace: 10\n"
+            "  terminal_size: [160, 40]\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "tmux:\n"
+            "  # enabled: false\n"
+        )
+
+        config = Config.load(tmp_path)
+
+        assert config.tmux.enabled is True
+        assert config.tmux.auto_accept_timeout == 20
+        assert config.tmux.max_idle_timeout == 600
+        assert config.tmux.detach_grace == 10
+        assert config.tmux.terminal_size == [160, 40]
+        assert config.source_map["tmux.enabled"] == "base"
+        assert config.source_map["tmux.auto_accept_timeout"] == "base"
+
     def test_local_override_guardrails_reject_disallowed_keys(self, tmp_path: Path):
         """Local overrides should reject disallowed keys like project_name."""
         from gza.config import Config, ConfigError
