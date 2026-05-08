@@ -400,7 +400,6 @@ def cmd_history(args: argparse.Namespace) -> int:
 
     status = getattr(args, 'status', None)
     task_type = getattr(args, 'type', None)
-    incomplete = getattr(args, 'incomplete', False)
     days = getattr(args, 'days', None)
     start_date = getattr(args, 'start_date', None)
     end_date = getattr(args, 'end_date', None)
@@ -433,7 +432,6 @@ def cmd_history(args: argparse.Namespace) -> int:
         status_not=getattr(args, "status_not", None),
         task_type=task_type,
         task_type_not=getattr(args, "type_not", None),
-        incomplete=incomplete,
         days=days,
         start_date=start_date,
         end_date=end_date,
@@ -686,7 +684,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     if lineage_depth > 0:
         nodes = query_history_with_lineage(store, f)
         if not nodes and not orphaned:
-            _print_history_empty_message(status, task_type, incomplete, days)
+            _print_history_empty_message(status, task_type, days)
             return 0
         # Show orphaned tasks at the top
         for task in orphaned:
@@ -696,7 +694,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     else:
         recent = query_history(store, f)
         if not recent and not orphaned:
-            _print_history_empty_message(status, task_type, incomplete, days)
+            _print_history_empty_message(status, task_type, days)
             return 0
 
         # Show orphaned tasks at the top so they're immediately visible
@@ -713,16 +711,14 @@ def cmd_history(args: argparse.Namespace) -> int:
 def _print_history_empty_message(
     status: str | None,
     task_type: str | None,
-    incomplete: bool,
     days: int | None,
 ) -> None:
     """Print an appropriate 'no tasks found' message for gza history."""
     status_msg = f" with status '{status}'" if status else ""
     type_msg = f" with type '{task_type}'" if task_type else ""
-    incomplete_msg = " (incomplete only)" if incomplete else ""
     lookback_msg = f" in the last {days} days" if days is not None else ""
     console.print(
-        f"No completed or failed tasks{status_msg}{type_msg}{incomplete_msg}{lookback_msg}"
+        f"No completed or failed tasks{status_msg}{type_msg}{lookback_msg}"
     )
 
 

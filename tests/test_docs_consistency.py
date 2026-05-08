@@ -175,7 +175,7 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
         "| `--related-to-not TASK_ID` | Exclude tasks related to the given lineage |",
         "Positive and negative filters on the same field are applied in order",
         "Replacing `gza incomplete`",
-        "`uv run gza history --incomplete` remains available as a factual unresolved-history filter.",
+        "Keep those domains separate instead of reintroducing a single mixed unresolved-history view.",
         "### tv",
         "gza tv [task_id ...] [options]",
         "### comment",
@@ -215,6 +215,7 @@ def test_summary_docs_and_skill_use_dedicated_triage_surfaces() -> None:
     assert "factual failed-task history" in skill_content
     assert "unresolved failed tasks" not in skill_content
     assert "not a canonical replacement for `gza incomplete`" in skill_content
+    assert "Keep failed history, unmerged work, unimplemented follow-up, and queue state on their dedicated surfaces." in skill_content
 
 
 def test_operator_facing_unmerged_examples_use_uv_run_prefix() -> None:

@@ -621,31 +621,6 @@ class TestHistoryCommand:
         assert "orphaned" not in result.stdout
         assert "Completed task" in result.stdout
 
-    def test_history_incomplete_flag(self, tmp_path: Path):
-        """--incomplete shows failed/unmerged tasks but not completed+merged ones."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        # Failed task (should appear)
-        failed = store.add("Failed task")
-        failed.status = "failed"
-        failed.completed_at = datetime.now(UTC)
-        store.update(failed)
-
-        # Completed + merged (should NOT appear)
-        merged = store.add("Merged task")
-        merged.status = "completed"
-        merged.merge_status = "merged"
-        merged.completed_at = datetime.now(UTC)
-        store.update(merged)
-
-        result = run_gza("history", "--incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Failed task" in result.stdout
-        assert "Merged task" not in result.stdout
-
     def test_history_lookback_days(self, tmp_path: Path):
         """--days excludes old tasks and includes recent ones."""
 
@@ -813,43 +788,6 @@ class TestHistoryCommand:
         assert "└──     [improve]" not in result.stdout
         assert "├──     [improve]" not in result.stdout
         assert "report:" not in result.stdout
-
-    def test_history_incomplete_with_lookback(self, tmp_path: Path):
-        """--incomplete combined with --days applies both filters."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        now = datetime.now(UTC)
-
-        # Recent + incomplete (should appear)
-        recent_failed = store.add("Recent failed")
-        recent_failed.status = "failed"
-        recent_failed.completed_at = now - timedelta(days=1)
-        store.update(recent_failed)
-
-        # Old + incomplete (excluded by lookback)
-        old_failed = store.add("Old failed")
-        old_failed.status = "failed"
-        old_failed.completed_at = now - timedelta(days=30)
-        store.update(old_failed)
-
-        # Recent + complete (excluded by incomplete filter)
-        recent_merged = store.add("Recent merged")
-        recent_merged.status = "completed"
-        recent_merged.merge_status = "merged"
-        recent_merged.completed_at = now - timedelta(days=1)
-        store.update(recent_merged)
-
-        result = run_gza(
-            "history", "--incomplete", "--days", "7",
-            "--project", str(tmp_path)
-        )
-
-        assert result.returncode == 0
-        assert "Recent failed" in result.stdout
-        assert "Old failed" not in result.stdout
-        assert "Recent merged" not in result.stdout
 
     def test_history_last_flag(self, tmp_path: Path):
         """--last limits the number of tasks shown."""

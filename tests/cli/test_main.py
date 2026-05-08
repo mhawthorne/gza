@@ -101,8 +101,8 @@ class TestHelpOutput:
         assert "--status-not" in history_help.stdout
         assert "--type-not" in history_help.stdout
         assert "--tag-not" in history_help.stdout
+        assert "--" + "incomplete" not in history_help.stdout
         assert "--tag/--tag-not values" in history_help.stdout
-
         assert search_help.returncode == 0
         assert "--status-not" in search_help.stdout
         assert "--type-not" in search_help.stdout
@@ -110,6 +110,16 @@ class TestHelpOutput:
         assert "--related-to-not" in search_help.stdout
         assert "--lineage-of-not" in search_help.stdout
         assert "--root-not" in search_help.stdout
+
+    def test_history_rejects_removed_legacy_flag(self, tmp_path):
+        """history should reject the removed legacy flag."""
+        setup_config(tmp_path)
+        legacy_flag = "--" + "incomplete"
+
+        result = run_gza("history", legacy_flag, "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert f"unrecognized arguments: {legacy_flag}" in result.stderr
 
     def test_top_level_help_hides_incomplete_command(self, tmp_path):
         """Top-level help should stop advertising `gza incomplete`."""

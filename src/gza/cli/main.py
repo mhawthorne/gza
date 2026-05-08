@@ -295,14 +295,6 @@ def main() -> int:
         help="Exclude tasks by status (e.g., completed, failed, unmerged)",
     )
     history_parser.add_argument(
-        "--incomplete",
-        action="store_true",
-        help=(
-            "Show only tasks that have not been fully resolved "
-            "(failed tasks, or completed tasks with unmerged commits)"
-        ),
-    )
-    history_parser.add_argument(
         "--lineage-depth",
         type=int,
         dest="lineage_depth",

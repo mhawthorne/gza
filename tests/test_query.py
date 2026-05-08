@@ -116,37 +116,6 @@ class TestQueryHistory:
         store.update(task)
         return task
 
-    def test_incomplete_filters_failed(self, tmp_path: Path):
-        store = self._make_store(tmp_path)
-        self._add_failed(store, "failed task")
-        self._add_completed(store, "merged task", merge_status="merged")
-
-        f = HistoryFilter(incomplete=True, limit=None)
-        results = query_history(store, f)
-        prompts = [t.prompt for t in results]
-        assert "failed task" in prompts
-        assert "merged task" not in prompts
-
-    def test_incomplete_filters_unmerged(self, tmp_path: Path):
-        store = self._make_store(tmp_path)
-        self._add_completed(store, "unmerged task", merge_status="unmerged", has_commits=True)
-        self._add_completed(store, "merged task", merge_status="merged")
-
-        f = HistoryFilter(incomplete=True, limit=None)
-        results = query_history(store, f)
-        prompts = [t.prompt for t in results]
-        assert "unmerged task" in prompts
-        assert "merged task" not in prompts
-
-    def test_incomplete_excludes_no_commit_completed(self, tmp_path: Path):
-        """Non-code tasks (has_commits=False) are considered complete."""
-        store = self._make_store(tmp_path)
-        self._add_completed(store, "explore task", task_type="explore", has_commits=False)
-
-        f = HistoryFilter(incomplete=True, limit=None)
-        results = query_history(store, f)
-        assert len(results) == 0
-
     def test_days_excludes_old_tasks(self, tmp_path: Path):
         store = self._make_store(tmp_path)
         self._add_completed(store, "old task", days_ago=10)
@@ -169,29 +138,29 @@ class TestQueryHistory:
         assert "today task" in prompts
         assert "week ago task" not in prompts
 
-    def test_incomplete_and_lookback_combined(self, tmp_path: Path):
+    def test_failed_status_and_lookback_combined(self, tmp_path: Path):
         store = self._make_store(tmp_path)
-        # recent + incomplete
+        # recent + failed
         self._add_failed(store, "recent failed", days_ago=1)
-        # old + incomplete (excluded by lookback)
+        # old + failed (excluded by lookback)
         self._add_failed(store, "old failed", days_ago=30)
-        # recent + complete (excluded by incomplete filter)
+        # recent + completed (excluded by failed status filter)
         self._add_completed(store, "recent merged", merge_status="merged")
 
-        f = HistoryFilter(incomplete=True, days=7, limit=None)
+        f = HistoryFilter(status="failed", days=7, limit=None)
         results = query_history(store, f)
         prompts = [t.prompt for t in results]
         assert "recent failed" in prompts
         assert "old failed" not in prompts
         assert "recent merged" not in prompts
 
-    def test_limit_applied_after_incomplete_filter(self, tmp_path: Path):
+    def test_failed_status_respects_limit(self, tmp_path: Path):
         store = self._make_store(tmp_path)
         for i in range(5):
             self._add_failed(store, f"failed task {i}")
         self._add_completed(store, "merged task", merge_status="merged")
 
-        f = HistoryFilter(incomplete=True, limit=3)
+        f = HistoryFilter(status="failed", limit=3)
         results = query_history(store, f)
         assert len(results) == 3
 
