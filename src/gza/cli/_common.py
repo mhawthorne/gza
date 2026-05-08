@@ -36,6 +36,7 @@ from ..db import (
     Task as DbTask,
     resolve_task_id,
     task_id_numeric_key,
+    task_owns_merge_status,
 )
 from ..failure_policy import is_resumable_failure_reason
 from ..failure_reasons import mark_task_failed_from_cause
@@ -57,6 +58,35 @@ from ..review_verdict import (
 from ..runner import RunInvocationContext, get_effective_config_for_task, run
 from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
+
+
+def format_task_status_text(task: DbTask) -> str:
+    """Return the inline status label used by lineage-oriented displays."""
+    if task.status == "failed":
+        if task.failure_reason and task.failure_reason != "UNKNOWN":
+            return f"failed ({task.failure_reason})"
+        return "failed"
+    if task.status == "completed" and task.completion_reason:
+        return f"completed ({task.completion_reason})"
+    return task.status or "unknown"
+
+
+def format_task_merge_label(task: DbTask) -> str:
+    """Return the inline merge label for code-owning tasks."""
+    if task.status != "completed":
+        return ""
+    if not task_owns_merge_status(task):
+        return ""
+    if task.merge_status == "merged":
+        return "merged"
+    if task.merge_status == "unmerged":
+        return "unmerged"
+    return ""
+
+
+def get_task_status_color(task: DbTask) -> str:
+    """Return the shared status color for task state displays."""
+    return _colors.LINEAGE_STATUS_COLORS.get(task.status or "", _colors.STATUS_COLORS.unknown)
 
 
 def _stdout_is_tty() -> bool:
@@ -1548,6 +1578,8 @@ def _format_lineage(
     task_id_color: str | None = None,
     *,
     annotate: bool = False,
+    show_status: bool = False,
+    status_color_resolver: Callable[[DbTask], str] | None = None,
     review_verdict_resolver: Callable[[DbTask], str | None] | None = None,
 ) -> str:
     """Format a lineage tree as a multi-line branch rendering."""
@@ -1619,12 +1651,26 @@ def _format_lineage(
         rel_label = _LINEAGE_REL_LABELS.get(relationship, "")
         if rel_label and rel_label != task.task_type:
             rel_suffix = f" [{lc.task_type}]\\[{rel_label}][/{lc.task_type}]"
+        status_suffix = ""
+        if show_status:
+            status_text = format_task_status_text(task)
+            status_color = (
+                status_color_resolver(task)
+                if status_color_resolver is not None
+                else get_task_status_color(task)
+            )
+            status_suffix = f" [{status_color}]{rich_escape(status_text)}[/{status_color}]"
+            merge_label = format_task_merge_label(task)
+            if merge_label:
+                merge_color = _colors.STATUS_COLORS.completed if merge_label == "merged" else _colors.STATUS_COLORS.unmerged
+                status_suffix += f" ([{merge_color}]{merge_label}[/{merge_color}])"
         if task.id is None:
-            return f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]{rel_suffix}{_annotation(task)}"
+            return f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]{rel_suffix}{status_suffix}{_annotation(task)}"
         return (
             f"[{_task_id_color}]{task.id}[/{_task_id_color}]"
             f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]"
             f"{rel_suffix}"
+            f"{status_suffix}"
             f"{_annotation(task)}"
         )
 

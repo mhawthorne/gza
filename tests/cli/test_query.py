@@ -3437,6 +3437,736 @@ class TestShowCommand:
         assert "Warning: Worktree lookup failed:" in output
         assert "simulated os error" in output
 
+    def test_show_recovered_parent_reports_lifecycle_and_lineage_statuses(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Show should answer recovery + review state without extra commands."""
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_root = store.add("Recovered failed implement", task_type="implement")
+        assert failed_root.id is not None
+        failed_root.status = "failed"
+        failed_root.failure_reason = "TIMEOUT"
+        failed_root.session_id = "sess-root"
+        failed_root.branch = "feature/root"
+        failed_root.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        store.update(failed_root)
+
+        resumed = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+        assert resumed.id is not None
+        resumed.status = "completed"
+        resumed.session_id = failed_root.session_id
+        resumed.branch = failed_root.branch
+        resumed.has_commits = True
+        resumed.merge_status = "unmerged"
+        resumed.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        store.update(resumed)
+
+        review = store.add(f"Review {resumed.id}", task_type="review", based_on=resumed.id, depends_on=resumed.id)
+        assert review.id is not None
+        review.status = "in_progress"
+        review.created_at = datetime(2026, 5, 4, 10, 15, 0, tzinfo=UTC)
+        store.update(review)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(failed_root.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert f"Lifecycle: recovered, review in_progress ({review.id})" in output
+        assert "Lineage:" in output
+        assert f"{failed_root.id}[implement] failed (TIMEOUT)" in output
+        assert f"{resumed.id}[implement] [resume] completed (unmerged)" in output
+        assert f"{review.id}[review] in_progress" in output
+
+    def test_show_recovered_parent_reports_completed_and_merged_for_merged_resume(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Recovered parents should not re-plan already merged resume descendants."""
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_root = store.add("Recovered merged implement", task_type="implement")
+        assert failed_root.id is not None
+        failed_root.status = "failed"
+        failed_root.failure_reason = "TIMEOUT"
+        failed_root.session_id = "sess-root"
+        failed_root.branch = "feature/root"
+        failed_root.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        store.update(failed_root)
+
+        resumed = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+        assert resumed.id is not None
+        resumed.status = "completed"
+        resumed.session_id = failed_root.session_id
+        resumed.branch = failed_root.branch
+        resumed.has_commits = True
+        resumed.merge_status = "merged"
+        resumed.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        store.update(resumed)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(failed_root.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Lifecycle: recovered, completed and merged" in output
+        assert "ready for review" not in output
+        assert "Lineage:" in output
+        assert f"{failed_root.id}[implement] failed (TIMEOUT)" in output
+        assert f"{resumed.id}[implement] [resume] completed (merged)" in output
+
+    def test_show_completed_plan_reports_terminal_lifecycle_from_merged_implement_descendant(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Completed plans should summarize landed implement descendants as terminal work."""
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan landed feature", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        store.update(plan)
+
+        implement = store.add("Implement landed feature", task_type="implement", based_on=plan.id)
+        assert implement.id is not None
+        implement.status = "completed"
+        implement.branch = "feature/landed-plan"
+        implement.has_commits = True
+        implement.merge_status = "merged"
+        implement.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        store.update(implement)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(plan.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Lifecycle: completed and merged" in output
+        assert "Lifecycle: recovered, completed and merged" not in output
+        assert "implement task already exists for this plan" not in output
+        assert "lifecycle unavailable" not in output
+
+    def test_show_completed_plan_reports_review_state_from_implement_descendant(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Completed plans should summarize the active implement descendant lifecycle."""
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan reviewed feature", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        store.update(plan)
+
+        implement = store.add("Implement reviewed feature", task_type="implement", based_on=plan.id)
+        assert implement.id is not None
+        implement.status = "completed"
+        implement.branch = "feature/reviewed-plan"
+        implement.has_commits = True
+        implement.merge_status = "unmerged"
+        implement.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        store.update(implement)
+
+        review = store.add(f"Review {implement.id}", task_type="review", based_on=implement.id, depends_on=implement.id)
+        assert review.id is not None
+        review.status = "in_progress"
+        review.created_at = datetime(2026, 5, 4, 10, 15, 0, tzinfo=UTC)
+        store.update(review)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(plan.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert f"Lifecycle: review in_progress ({review.id})" in output
+        assert f"Lifecycle: recovered, review in_progress ({review.id})" not in output
+        assert "implement task already exists for this plan" not in output
+        assert "lifecycle unavailable" not in output
+
+    def test_show_changes_requested_lifecycle_reports_active_improve_id(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Show should surface the concrete active improve task for CHANGES_REQUESTED reviews."""
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement feature", task_type="implement")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        task.branch = "feature/changes-requested"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        review = store.add(f"Review {task.id}", task_type="review", based_on=task.id, depends_on=task.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        review.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        store.update(review)
+
+        improve = store.add("Improve feature", task_type="improve", based_on=task.id, depends_on=review.id)
+        assert improve.id is not None
+        improve.status = "in_progress"
+        improve.created_at = datetime(2026, 5, 4, 10, 15, 0, tzinfo=UTC)
+        store.update(improve)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(task.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert f"Lifecycle: improve in_progress ({improve.id})" in output
+        assert "(unknown)" not in output
+
+    def test_show_fresh_comments_lifecycle_reports_active_improve_id(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Show should surface the concrete active improve task for fresh unresolved comments."""
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement feature", task_type="implement")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        task.branch = "feature/fresh-comments"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        review = store.add(f"Review {task.id}", task_type="review", based_on=task.id, depends_on=task.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.output_content = "Verdict: APPROVED"
+        review.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        store.update(review)
+
+        improve = store.add("Improve fresh comments", task_type="improve", based_on=task.id, depends_on=review.id)
+        assert improve.id is not None
+        improve.status = "in_progress"
+        improve.created_at = datetime(2026, 5, 4, 10, 20, 0, tzinfo=UTC)
+        store.update(improve)
+
+        store.add_comment(task.id, "Need one more tweak from newer unresolved feedback.")
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(task.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert f"Lifecycle: improve in_progress ({improve.id})" in output
+        assert "(unknown)" not in output
+
+    def test_show_lineage_omits_merge_badge_for_failed_code_task_with_stale_merge_status(
+        self, tmp_path: Path
+    ) -> None:
+        """Failed code-task lineage rows should not show merge badges from stale metadata."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implement with stale merge status", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "TIMEOUT"
+        failed.has_commits = True
+        failed.branch = "feature/failed-stale-merge-status"
+        failed.merge_status = "unmerged"
+        failed.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        store.update(failed)
+
+        child = store.add("Follow-up lineage child", task_type="review", based_on=failed.id, depends_on=failed.id)
+        assert child.id is not None
+
+        result = run_gza("show", str(failed.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Lineage:" in result.stdout
+        assert f"{failed.id}[implement] failed (TIMEOUT)" in result.stdout
+        assert f"{failed.id}[implement] failed (TIMEOUT) (unmerged)" not in result.stdout
+
+    def test_show_completed_merged_task_omits_trivial_lifecycle_and_lineage(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Self-only completed+merged tasks should keep show output compact."""
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Merged implement", task_type="implement")
+        assert task.id is not None
+        task.status = "completed"
+        task.has_commits = True
+        task.merge_status = "merged"
+        task.completed_at = datetime(2026, 5, 4, 11, 0, 0, tzinfo=UTC)
+        store.update(task)
+
+        exit_code = cmd_show(
+            argparse.Namespace(
+                project_dir=tmp_path,
+                task_id=str(task.id),
+                prompt=False,
+                path=False,
+                output=False,
+                page=False,
+                full=False,
+                metadata_only=True,
+            )
+        )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Lifecycle:" not in output
+        assert "Lineage:" not in output
+
+    def test_show_failed_recovery_chain_needs_attention_uses_shared_wording(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Exhausted recovery chains should surface the shared needs-attention verdict."""
+        from gza.cli.query import cmd_show
+        from gza.advance_engine import format_needs_attention_lifecycle
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_root = store.add("Exhausted failed implement", task_type="implement")
+        assert failed_root.id is not None
+        failed_root.status = "failed"
+        failed_root.failure_reason = "TIMEOUT"
+        failed_root.session_id = "sess-root"
+        failed_root.branch = "feature/root"
+        failed_root.completed_at = datetime(2026, 5, 4, 12, 0, 0, tzinfo=UTC)
+        store.update(failed_root)
+
+        failed_resume = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+        assert failed_resume.id is not None
+        failed_resume.status = "failed"
+        failed_resume.failure_reason = "TIMEOUT"
+        failed_resume.session_id = failed_root.session_id
+        failed_resume.branch = failed_root.branch
+        failed_resume.completed_at = datetime(2026, 5, 4, 12, 10, 0, tzinfo=UTC)
+        store.update(failed_resume)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(failed_root.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        expected = format_needs_attention_lifecycle(
+            {
+                "type": "skip",
+                "needs_attention_reason": "newer-recovery-descendant-needs-attention",
+                "description": "SKIP: a newer recovery descendant requires manual attention first",
+            }
+        )
+        assert f"Lifecycle: {expected}" in output
+        assert f"{failed_root.id}[implement] failed (TIMEOUT)" in output
+        assert f"{failed_resume.id}[implement] [resume] failed (TIMEOUT)" in output
+
+    def test_show_recovered_needs_attention_lifecycle_uses_failed_color(
+        self, tmp_path: Path
+    ) -> None:
+        """Recovered needs-attention lifecycles must render with attention severity, not recovered green."""
+        from gza.cli.query import cmd_show
+        from gza.advance_engine import with_needs_attention
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_root = store.add("Recovered attention implement", task_type="implement")
+        assert failed_root.id is not None
+        failed_root.status = "failed"
+        failed_root.failure_reason = "TIMEOUT"
+        failed_root.session_id = "sess-root"
+        failed_root.branch = "feature/root"
+        failed_root.completed_at = datetime(2026, 5, 4, 12, 0, 0, tzinfo=UTC)
+        store.update(failed_root)
+
+        resumed = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+        assert resumed.id is not None
+        resumed.status = "completed"
+        resumed.session_id = failed_root.session_id
+        resumed.branch = failed_root.branch
+        resumed.has_commits = True
+        resumed.merge_status = "unmerged"
+        resumed.completed_at = datetime(2026, 5, 4, 12, 10, 0, tzinfo=UTC)
+        store.update(resumed)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        attention_action = with_needs_attention(
+            {"type": "skip", "description": "SKIP: automatic recovery exhausted"},
+            reason="max-resume-attempts-reached",
+        )
+        console = Console(record=True, force_terminal=True, color_system="standard", width=300)
+        show_colors = dict(query_cli.SHOW_COLORS_DICT)
+        show_colors.update(
+            {
+                "heading": "white",
+                "section": "white",
+                "label": "white",
+                "value": "white",
+                "status_running": "blue",
+                "status_completed": "green",
+                "status_failed": "red",
+                "status_default": "white",
+            }
+        )
+
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch("gza.cli.query.determine_next_action", return_value=attention_action),
+            patch.object(query_cli, "console", console),
+            patch.object(query_cli, "SHOW_COLORS_DICT", show_colors),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(failed_root.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        rendered = console.export_text(styles=True, clear=False)
+        plain = console.export_text(clear=False)
+        assert exit_code == 0
+        assert "Lifecycle: recovered, needs attention" in plain
+        assert "reason=max-resume-attempts-reached" in plain
+        assert "automatic recovery exhausted" in plain
+        assert "\x1b[31mrecovered, needs attention" in rendered
+        assert "\x1b[32mrecovered, needs attention" not in rendered
+
+    def test_show_lineage_statuses_reuse_top_level_show_status_colors(self, tmp_path: Path) -> None:
+        """Show lineage status labels should use the same status palette as the top-level Status field."""
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_root = store.add("Failed root", task_type="implement")
+        assert failed_root.id is not None
+        failed_root.status = "failed"
+        failed_root.failure_reason = "TIMEOUT"
+        failed_root.completed_at = datetime(2026, 5, 4, 12, 0, 0, tzinfo=UTC)
+        store.update(failed_root)
+
+        in_progress_child = store.add("Active review", task_type="review", depends_on=failed_root.id)
+        assert in_progress_child.id is not None
+        in_progress_child.status = "in_progress"
+        store.update(in_progress_child)
+
+        completed_child = store.add("Completed resume", task_type="implement", based_on=failed_root.id)
+        assert completed_child.id is not None
+        completed_child.status = "completed"
+        completed_child.has_commits = True
+        completed_child.merge_status = "merged"
+        completed_child.completed_at = datetime(2026, 5, 4, 12, 10, 0, tzinfo=UTC)
+        store.update(completed_child)
+
+        console = Console(record=True, force_terminal=True, color_system="standard", width=300)
+        show_colors = dict(query_cli.SHOW_COLORS_DICT)
+        show_colors.update(
+            {
+                "heading": "white",
+                "section": "white",
+                "label": "white",
+                "value": "white",
+                "task_id": "white",
+                "branch": "white",
+                "status_running": "blue",
+                "status_completed": "green",
+                "status_failed": "red",
+                "status_default": "white",
+            }
+        )
+        lineage_status_colors = {
+            "pending": "white",
+            "in_progress": "magenta",
+            "completed": "cyan",
+            "failed": "yellow",
+            "unknown": "white",
+        }
+
+        with (
+            patch.object(query_cli, "console", console),
+            patch.object(query_cli, "SHOW_COLORS_DICT", show_colors),
+            patch.dict("gza.cli._common._colors.LINEAGE_STATUS_COLORS", lineage_status_colors, clear=True),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(failed_root.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        rendered = console.export_text(styles=True, clear=False)
+        plain = console.export_text(clear=False)
+        assert exit_code == 0
+        assert "Status: failed" in plain
+        assert "Lineage:" in plain
+        assert "\x1b[31mfailed\x1b[0m" in rendered
+        assert "\x1b[31mTIMEOUT\x1b[0m" in rendered
+        assert "\x1b[34min_progress\x1b[0m" in rendered
+        assert "\x1b[32mcompleted\x1b[0m" in rendered
+        assert "\x1b[33mTIMEOUT\x1b[0m" not in rendered
+        assert "\x1b[35min_progress\x1b[0m" not in rendered
+        assert "\x1b[36mcompleted\x1b[0m" not in rendered
+
+    def test_show_reports_lifecycle_unavailable_when_default_branch_resolution_fails(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Show should surface lifecycle classification failures instead of silently degrading."""
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_root = store.add("Recovered failed implement", task_type="implement")
+        assert failed_root.id is not None
+        failed_root.status = "failed"
+        failed_root.failure_reason = "TIMEOUT"
+        failed_root.session_id = "sess-root"
+        failed_root.branch = "feature/root"
+        failed_root.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        store.update(failed_root)
+
+        resumed = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+        assert resumed.id is not None
+        resumed.status = "completed"
+        resumed.session_id = failed_root.session_id
+        resumed.branch = failed_root.branch
+        resumed.has_commits = True
+        resumed.merge_status = "unmerged"
+        resumed.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        store.update(resumed)
+
+        git = MagicMock()
+        git.default_branch.side_effect = GitError("simulated default branch failure")
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(failed_root.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Lifecycle: recovered, lifecycle unavailable - failed to resolve default branch: simulated default branch failure" in output
+        assert "Lifecycle: recovered\n" not in output
+        assert "Lineage:" in output
+        assert f"{failed_root.id}[implement] failed (TIMEOUT)" in output
+        assert f"{resumed.id}[implement] [resume] completed (unmerged)" in output
+
+    def test_show_reports_lifecycle_unavailable_when_lifecycle_classification_fails(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Show should keep rendering lineage when shared lifecycle classification raises."""
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_root = store.add("Recovered failed implement", task_type="implement")
+        assert failed_root.id is not None
+        failed_root.status = "failed"
+        failed_root.failure_reason = "TIMEOUT"
+        failed_root.session_id = "sess-root"
+        failed_root.branch = "feature/root"
+        failed_root.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        store.update(failed_root)
+
+        resumed = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+        assert resumed.id is not None
+        resumed.status = "completed"
+        resumed.session_id = failed_root.session_id
+        resumed.branch = failed_root.branch
+        resumed.has_commits = True
+        resumed.merge_status = "unmerged"
+        resumed.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        store.update(resumed)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.worktree_list.return_value = []
+
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch("gza.cli.query.determine_next_action", side_effect=GitError("simulated lifecycle classification failure")),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(failed_root.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Lifecycle: recovered, lifecycle unavailable - failed to classify lifecycle: simulated lifecycle classification failure" in output
+        assert "Lineage:" in output
+        assert f"{failed_root.id}[implement] failed (TIMEOUT)" in output
+        assert f"{resumed.id}[implement] [resume] completed (unmerged)" in output
+
     def test_show_omits_prunable_worktree_path_for_task_branch(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
@@ -9193,6 +9923,38 @@ class TestLineageCommand:
         assert "EXTRACTION_ALREADY_MERGED" in result.stdout
         normalized = " ".join(result.stdout.split())
         assert "Extraction already merged" in normalized
+
+    def test_lineage_keeps_lineage_status_colors(self, tmp_path: Path) -> None:
+        """Standalone lineage command should keep using lineage status colors."""
+        from gza.cli.query import cmd_lineage
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Failed lineage task", task_type="implement")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "TIMEOUT"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        console = Console(record=True, force_terminal=True, color_system="standard", width=300)
+        show_colors = dict(query_cli.SHOW_COLORS_DICT)
+        show_colors["status_failed"] = "red"
+
+        with (
+            patch.object(query_cli, "console", console),
+            patch.object(query_cli, "SHOW_COLORS_DICT", show_colors),
+            patch.object(query_cli, "get_task_status_color", return_value="yellow"),
+        ):
+            exit_code = cmd_lineage(argparse.Namespace(project_dir=tmp_path, task_id=str(task.id)))
+
+        rendered = console.export_text(styles=True, clear=False)
+        plain = console.export_text(clear=False)
+        assert exit_code == 0
+        assert "failed (TIMEOUT)" in plain
+        assert "\x1b[33mfailed \x1b[0m" in rendered
+        assert "\x1b[31mfailed \x1b[0m" not in rendered
 
     def test_lineage_full_tree(self, tmp_path: Path):
         """Lineage command renders a multi-level tree with parent and children."""

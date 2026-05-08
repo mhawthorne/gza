@@ -868,6 +868,10 @@ gza show <task_id> [options]
 
 `--metadata-only` is incompatible with `--prompt`, `--output`, `--path`, and `--full`.
 
+When a task's lineage extends beyond the selected row, `gza show` also includes:
+- `Lifecycle: ...` directly under `Status:` summarizing the current unit-of-work state using the same shared recovery planning handoff and advance lifecycle classifier as `gza advance`, `gza watch`, and `gza iterate`. For completed plan lineages with implement descendants, `show` summarizes the newest implement descendant instead of the plan-level `implement task already exists` skip, so already-merged implementations render as terminal. Needs-attention lifecycle outcomes reuse the shared `reason=...` policy slug format, and git/default-branch resolution or later shared-classifier Git/context failures are surfaced as an explicit lifecycle-unavailable message instead of guessed fallback state.
+- A `Lineage:` tree where every node includes its current task status, failed-task reason when relevant, and merge state for completed code tasks.
+
 When a task has a branch, `gza show` also reports active worktree information:
 - `Worktree: <path>` when the task branch is currently checked out in an active worktree
 - `Warning: Worktree lookup failed: ...` when git worktree metadata could not be read

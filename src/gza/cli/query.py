@@ -13,7 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -23,14 +23,7 @@ from rich.markup import escape as rich_escape
 
 import gza.colors as _colors
 
-from ..colors import (
-    LINEAGE_STATUS_COLORS as _LINEAGE_STATUS_COLORS,
-    NEXT_COLORS_DICT,
-    PS_STATUS_COLORS,
-    SHOW_COLORS_DICT,
-    UNMERGED_COLORS_DICT,
-    pink,
-)
+from ..colors import NEXT_COLORS_DICT, PS_STATUS_COLORS, SHOW_COLORS_DICT, UNMERGED_COLORS_DICT, pink
 from ..config import Config
 from ..console import (
     MAX_PROMPT_DISPLAY,
@@ -50,6 +43,7 @@ from ..db import (
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git, GitError, active_worktree_path_for_branch
 from ..github import GitHub
+from ..lineage import walk_based_on_descendants
 from ..pr_ops import lookup_task_pr
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
@@ -97,14 +91,18 @@ from ._common import (
     _resolve_task_log_path,
     _spawn_background_worker,
     format_stats,
+    format_task_merge_label,
+    format_task_status_text,
     get_review_score,
     get_review_verdict,
     get_store,
+    get_task_status_color,
     pager_context,
     parse_cli_tag_filters,
     resolve_id,
     validate_cli_tag_values,
 )
+from .advance_engine import classify_advance_action, determine_next_action, format_needs_attention_lifecycle
 
 _LINEAGE_REL_LABELS = _QUERY_LINEAGE_REL_LABELS
 _QueryDateField = Literal["created", "completed", "effective"]
@@ -125,6 +123,142 @@ _INCOMPLETE_DEPRECATION_LINES: tuple[str, ...] = (
     "For dropped-dependency blockers, use `uv run gza next --all`.",
     "After `gza unimplemented` ships, it will replace the temporary `advance --unimplemented` spelling.",
 )
+
+_SHOW_STATUS_COLOR_KEYS: dict[str, str] = {
+    "pending": "status_pending",
+    "in_progress": "status_running",
+    "completed": "status_completed",
+    "failed": "status_failed",
+    "unmerged": "status_pending",
+    "dropped": "status_failed",
+}
+
+
+def _show_status_color(task: DbTask, colors: dict[str, str]) -> str:
+    return colors.get(_SHOW_STATUS_COLOR_KEYS.get(task.status or "", "status_default"), colors["status_default"])
+
+
+def _lineage_has_descendants(lineage_tree: TaskLineageNode) -> bool:
+    return bool(lineage_tree.children)
+
+
+_LifecycleSeverity = Literal["default", "running", "completed", "failed"]
+
+
+@dataclass(frozen=True)
+class _LifecycleSummary:
+    text: str
+    severity: _LifecycleSeverity
+
+
+def _with_recovered_lifecycle_prefix(detail: str, *, recovered: bool, severity: _LifecycleSeverity) -> _LifecycleSummary:
+    return _LifecycleSummary(f"recovered, {detail}" if recovered else detail, severity)
+
+
+def _resolve_show_lifecycle_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    """Return the lineage task whose lifecycle best represents the unit of work."""
+    from ..recovery_engine import resolve_recovery_planning_task
+
+    planning_task = resolve_recovery_planning_task(store, task)
+    if planning_task.task_type != "plan":
+        return planning_task
+
+    implement_descendants = list(walk_based_on_descendants(store, planning_task, task_type="implement"))
+    if not implement_descendants:
+        return planning_task
+
+    return max(
+        implement_descendants,
+        key=lambda descendant: _task_id_numeric_key(descendant.id),
+    )
+
+
+def _summarize_lifecycle(
+    task: DbTask,
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+) -> _LifecycleSummary | None:
+    root_task = _resolve_lineage_root_task(store, task)
+    lineage_tree = _build_lineage_tree_for_root(store, root_task)
+    if not _lineage_has_descendants(lineage_tree):
+        return None
+
+    planning_task = _resolve_show_lifecycle_task(store, task)
+    recovered = task.status == "failed" and planning_task is not task
+
+    if planning_task.status == "pending":
+        detail = f"pending ({planning_task.id} {planning_task.task_type})"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="default")
+    if planning_task.status == "in_progress":
+        detail = f"in progress ({planning_task.id} {planning_task.task_type})"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="running")
+    if planning_task.status == "completed" and planning_task.merge_status == "merged" and task_owns_merge_status(planning_task):
+        detail = "completed and merged"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="completed")
+
+    try:
+        git = Git(config.project_dir)
+        target_branch = git.default_branch()
+    except (GitError, OSError, ValueError) as exc:
+        detail = f"lifecycle unavailable - failed to resolve default branch: {' '.join(str(exc).split())}"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="failed")
+
+    try:
+        action = determine_next_action(config, store, git, planning_task, target_branch)
+    except (GitError, OSError, ValueError) as exc:
+        detail = f"lifecycle unavailable - failed to classify lifecycle: {' '.join(str(exc).split())}"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="failed")
+
+    action_type = str(action.get("type", "skip"))
+    action_class = classify_advance_action(action)
+
+    if action_class == "needs_attention":
+        detail = format_needs_attention_lifecycle(action)
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="failed")
+
+    if action_type == "wait_review":
+        review_task = action.get("review_task")
+        review_id = review_task.id if isinstance(review_task, DbTask) and review_task.id else "unknown"
+        detail = f"review in_progress ({review_id})"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="running")
+    if action_type == "run_review":
+        review_task = action.get("review_task")
+        review_id = review_task.id if isinstance(review_task, DbTask) and review_task.id else "unknown"
+        detail = f"review pending ({review_id})"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="default")
+    if action_type in {"merge", "merge_with_followups"}:
+        if planning_task.merge_status == "merged":
+            detail = "completed and merged"
+        else:
+            detail = "completed, ready to merge"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="completed")
+    if action_type == "needs_rebase":
+        detail = "needs rebase"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="default")
+    if action_type == "wait_improve":
+        improve_task = action.get("improve_task")
+        improve_id = improve_task.id if isinstance(improve_task, DbTask) and improve_task.id else "unknown"
+        detail = f"improve in_progress ({improve_id})"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="running")
+    if action_type == "run_improve":
+        improve_task = action.get("improve_task")
+        improve_id = improve_task.id if isinstance(improve_task, DbTask) and improve_task.id else "unknown"
+        detail = f"improve pending ({improve_id})"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="default")
+    if action_type == "improve":
+        detail = "changes requested"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="default")
+    if action_type == "create_review":
+        detail = "ready for review"
+        return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="default")
+
+    detail = str(action.get("description", "")).strip()
+    if detail.startswith("SKIP: "):
+        detail = detail[6:]
+    if not detail:
+        return _with_recovered_lifecycle_prefix("recovered", recovered=False, severity="completed") if recovered else None
+    return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="default")
 
 
 def _task_lineage_root_id(store: SqliteTaskStore, task_id: str) -> str | None:
@@ -2500,15 +2634,6 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         return 1
     lineage_tree = cast(TaskLineageNode, lineage_tree)
 
-    def _status_text(t: DbTask) -> str:
-        if t.status == "failed":
-            if t.failure_reason and t.failure_reason != "UNKNOWN":
-                return f"failed ({t.failure_reason})"
-            return "failed"
-        if t.status == "completed" and t.completion_reason:
-            return f"completed ({t.completion_reason})"
-        return t.status or "unknown"
-
     def _format_utc_timestamp(value: datetime) -> str:
         ts = value.astimezone(UTC) if value.tzinfo is not None else value
         return f"{ts.strftime('%Y-%m-%d %H:%M:%S')} UTC"
@@ -2527,15 +2652,6 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         else:
             value = t.prompt.split("\n")[0].strip()
         return value[:60] + "…" if len(value) > 60 else value
-
-    def _merge_label_text(t: DbTask) -> str:
-        if not task_owns_merge_status(t):
-            return ""
-        if t.merge_status == "merged":
-            return "[merged]"
-        if t.merge_status == "unmerged":
-            return "[unmerged]"
-        return ""
 
     rows: list[tuple[TaskLineageNode, str]] = []
 
@@ -2572,8 +2688,9 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         type_str = t.task_type or "implement"
         rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
         type_display = f"{type_str} [{rel}]" if rel and rel != type_str else type_str
-        status_text = _status_text(t)
-        merge_text = _merge_label_text(t)
+        status_text = format_task_status_text(t)
+        merge_label = format_task_merge_label(t)
+        merge_text = f"[{merge_label}]" if merge_label else ""
 
         id_width = max(id_width, len(t.id or "-"))
         when_width = max(when_width, len(_format_utc_timestamp(when)) if when else 1)
@@ -2583,7 +2700,6 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         prefix_width = max(prefix_width, len(prefix))
 
     lc = _colors.LINEAGE_COLORS
-    unknown_status_color = _colors.STATUS_COLORS.unknown
     merged_color = _colors.STATUS_COLORS.completed
     unmerged_color = _colors.STATUS_COLORS.unmerged
 
@@ -2597,11 +2713,12 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         type_str = t.task_type or "implement"
         rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
         type_display = f"{type_str} [{rel}]" if rel and rel != type_str else type_str
-        status_text = _status_text(t)
-        merge_text = _merge_label_text(t)
+        status_text = format_task_status_text(t)
+        merge_label = format_task_merge_label(t)
+        merge_text = f"[{merge_label}]" if merge_label else ""
         prompt_text = _prompt_text(t)
 
-        status_color = _LINEAGE_STATUS_COLORS.get(t.status or "", unknown_status_color)
+        status_color = get_task_status_color(t)
         if merge_text == "[merged]":
             merge_color = merged_color
         elif merge_text == "[unmerged]":
@@ -2741,15 +2858,7 @@ def _cmd_show_output(
     SHOW_COLORS = SHOW_COLORS_DICT
     c = SHOW_COLORS
 
-    status_color_map = {
-        "pending": c["status_pending"],
-        "in_progress": c["status_running"],
-        "completed": c["status_completed"],
-        "failed": c["status_failed"],
-        "unmerged": c["status_pending"],
-        "dropped": c["status_failed"],
-    }
-    status_color = status_color_map.get(task.status, c["status_default"])
+    status_color = _show_status_color(task, c)
 
     def _format_utc_timestamp(value: datetime) -> str:
         ts = value.astimezone(UTC) if value.tzinfo is not None else value
@@ -2758,6 +2867,18 @@ def _cmd_show_output(
     console.print(f"[{c['heading']}]Task {task.id}[/{c['heading']}]")
     console.print(f"[{c['section']}]{'=' * 50}[/{c['section']}]")
     console.print(f"[{c['label']}]Status:[/{c['label']}] [{status_color}]{task.status}[/{status_color}]")
+    lifecycle_summary = _summarize_lifecycle(task, config=config, store=store)
+    if lifecycle_summary is not None:
+        lifecycle_color = c["value"]
+        if lifecycle_summary.severity == "failed":
+            lifecycle_color = c["status_failed"]
+        elif lifecycle_summary.severity == "completed":
+            lifecycle_color = c["status_completed"]
+        elif lifecycle_summary.severity == "running":
+            lifecycle_color = c["status_running"]
+        console.print(
+            f"[{c['label']}]Lifecycle:[/{c['label']}] [{lifecycle_color}]{lifecycle_summary.text}[/{lifecycle_color}]"
+        )
     if task.failure_reason:
         console.print(f"[{c['label']}]Failure Reason:[/{c['label']}] [{c['value']}]{task.failure_reason}[/{c['value']}]")
     if task.completion_reason:
@@ -2819,8 +2940,13 @@ def _cmd_show_output(
 
     root_task = _resolve_lineage_root_task(store, task)
     lineage_tree = _build_lineage_tree_for_root(store, root_task)
-    lineage_str = _format_lineage(lineage_tree, c["task_id"])
-    if lineage_str:
+    lineage_str = _format_lineage(
+        lineage_tree,
+        c["task_id"],
+        show_status=True,
+        status_color_resolver=lambda lineage_task: _show_status_color(lineage_task, c),
+    )
+    if _lineage_has_descendants(lineage_tree) and lineage_str:
         console.print(f"[{c['label']}]Lineage:[/{c['label']}]")
         console.print(lineage_str)
 

@@ -239,6 +239,17 @@ def format_needs_attention_entry_for_display(
     return format_needs_attention_entry(task, prompt=prompt, action=action)
 
 
+def format_needs_attention_lifecycle(action: Mapping[str, Any]) -> str:
+    """Render compact shared needs-attention wording for `gza show` lifecycle lines."""
+    description = str(action.get("description", "")).strip()
+    if description.startswith("SKIP: "):
+        description = description[len("SKIP: ") :]
+    reason = get_needs_attention_reason(action) or "needs-attention"
+    if description:
+        return f"needs attention reason={reason} {description}"
+    return f"needs attention reason={reason}"
+
+
 def _review_priority_sort_key(task: DbTask) -> tuple[datetime, int]:
     """Deterministic tie-breaker for active reviews of the same status."""
     created_at = task.created_at or datetime.min
@@ -652,6 +663,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 "SKIP: unresolved comments newer than latest review; "
                 f"improve task {_task_id(ctx.active_improve_running)} is in_progress"
             ),
+            "improve_task": ctx.active_improve_running,
         },
     ),
     AdvanceRule(
@@ -727,6 +739,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=lambda ctx: {
             "type": "wait_improve",
             "description": f"SKIP: improve task {_task_id(ctx.active_improve_running)} is in_progress",
+            "improve_task": ctx.active_improve_running,
         },
     ),
     AdvanceRule(
