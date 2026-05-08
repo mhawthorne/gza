@@ -247,7 +247,7 @@ class _WatchLog:
             with open(self.path, "a") as f:
                 f.write("\n")
             if not self.quiet:
-                print()
+                print(flush=True)
         self._skip_keys_this_cycle.clear()
         self._sticky_attention_this_cycle.clear()
         self._has_emitted_cycle = True
@@ -278,7 +278,7 @@ class _WatchLog:
         with open(self.path, "a") as f:
             f.write(line + "\n")
         if not self.quiet:
-            print(line)
+            print(line, flush=True)
 
 
 def _emit_transition_events(
