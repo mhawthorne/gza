@@ -1,10 +1,11 @@
 """Shared test fixtures."""
 
+import os
 
 import pytest
 
-UNIT_TEST_TIMEOUT_SECONDS = 1
-FUNCTIONAL_TEST_TIMEOUT_SECONDS = 2
+UNIT_TEST_TIMEOUT_SECONDS = int(os.environ.get("GZA_UNIT_TEST_TIMEOUT_SECONDS", "1"))
+FUNCTIONAL_TEST_TIMEOUT_SECONDS = int(os.environ.get("GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS", "2"))
 
 
 def pytest_collection_modifyitems(items):

@@ -34,8 +34,14 @@ def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
     assert pytest_options["timeout_method"] == "signal"
 
     unit_conftest = (repo_root / "tests" / "conftest.py").read_text()
-    assert "UNIT_TEST_TIMEOUT_SECONDS = 1" in unit_conftest
-    assert "FUNCTIONAL_TEST_TIMEOUT_SECONDS = 2" in unit_conftest
+    assert (
+        'UNIT_TEST_TIMEOUT_SECONDS = int(os.environ.get("GZA_UNIT_TEST_TIMEOUT_SECONDS", "1"))'
+        in unit_conftest
+    )
+    assert (
+        'FUNCTIONAL_TEST_TIMEOUT_SECONDS = int(os.environ.get("GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS", "2"))'
+        in unit_conftest
+    )
     assert "pytest.mark.timeout(UNIT_TEST_TIMEOUT_SECONDS, method=\"signal\")" in unit_conftest
     assert "pytest.mark.timeout(FUNCTIONAL_TEST_TIMEOUT_SECONDS, method=\"signal\")" in unit_conftest
 
@@ -79,15 +85,31 @@ def test_functional_subprocess_timeouts_within_watchdog() -> None:
     conftest_module = ast.parse(conftest_path.read_text(), filename=str(conftest_path))
     functional_budget: int | float | None = None
     for node in ast.walk(conftest_module):
-        if (
+        if not (
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
             and node.targets[0].id == "FUNCTIONAL_TEST_TIMEOUT_SECONDS"
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, (int, float))
         ):
+            continue
+        # Direct constant assignment, e.g. `FUNCTIONAL_TEST_TIMEOUT_SECONDS = 2`.
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, (int, float)):
             functional_budget = node.value.value
+            continue
+        # Env-overridable form: `int(os.environ.get("...", "2"))` — pull the literal default.
+        if (
+            isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "int"
+            and len(node.value.args) == 1
+            and isinstance(node.value.args[0], ast.Call)
+            and isinstance(node.value.args[0].func, ast.Attribute)
+            and node.value.args[0].func.attr == "get"
+            and len(node.value.args[0].args) == 2
+            and isinstance(node.value.args[0].args[1], ast.Constant)
+        ):
+            default_literal = node.value.args[0].args[1].value
+            functional_budget = int(default_literal)
     assert functional_budget is not None, "FUNCTIONAL_TEST_TIMEOUT_SECONDS not found in tests/conftest.py"
 
     def has_functional_marker(decorators: list[ast.expr]) -> bool:
