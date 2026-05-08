@@ -34,11 +34,21 @@ def _disable_git_signing(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_rich_color_env(monkeypatch):
-    """Keep Rich color-forcing environment changes from leaking across tests."""
+def _isolate_rich_console(monkeypatch):
+    """Pin Rich console color and width so test assertions are deterministic.
+
+    Why: Rich auto-detects color and wraps to terminal width. Both vary across
+    local terminals and CI, causing assertions on rendered output to flake when
+    ANSI escape codes get inserted or messages wrap mid-token.
+    """
     for name in ("FORCE_COLOR", "TTY_COMPATIBLE", "CLICOLOR_FORCE", "NO_COLOR"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("COLUMNS", "200")
 
+    from gza.cli import query as query_cli
     from gza.console import console
 
-    monkeypatch.setattr(console, "no_color", True)
+    for rich_console in (console, query_cli._stderr_console):
+        monkeypatch.setattr(rich_console, "no_color", True)
+        monkeypatch.setattr(rich_console, "_color_system", None, raising=False)
+        monkeypatch.setattr(rich_console, "_width", 200, raising=False)
