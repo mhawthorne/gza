@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from gza.git import Git
 from gza.recovery_engine import (
     decide_failed_task_recovery,
     get_completed_recovery_descendant,
@@ -38,6 +39,17 @@ def _completed_impl(store, *, merge_status: str):
     task.completed_at = datetime.now(UTC)
     store.update(task)
     return task
+
+
+def _init_git_repo(tmp_path: Path) -> Git:
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "README.md").write_text("initial\n")
+    git._run("add", "README.md")
+    git._run("commit", "-m", "Initial commit")
+    return git
 
 
 def _failed_sidequest(store, *, task_type: str, impl_id: str, reason: str):
@@ -119,6 +131,129 @@ def test_recovery_engine_keeps_failed_sidequests_visible_when_target_impl_is_not
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert decision.reason_code != "resolved_by_merged_target"
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+
+def test_list_failed_tasks_for_recovery_filters_failed_impl_when_landed_work_is_already_on_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = _init_git_repo(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/landed-work"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    git._run("checkout", "-b", failed.branch)
+    (tmp_path / "landed.txt").write_text("landed\n")
+    git._run("add", "landed.txt")
+    git._run("commit", "-m", "Add landed work")
+    git._run("checkout", "main")
+    git._run("merge", "--no-ff", failed.branch, "-m", "Merge landed work")
+
+    merged_descendant = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    assert merged_descendant.id is not None
+    merged_descendant.status = "completed"
+    merged_descendant.merge_status = "merged"
+    merged_descendant.branch = failed.branch
+    merged_descendant.completed_at = datetime.now(UTC)
+    store.update(merged_descendant)
+
+    pending_descendant = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    assert pending_descendant.id is not None
+    pending_descendant.status = "pending"
+    pending_descendant.branch = "feature/pending-recovery"
+    store.update(pending_descendant)
+
+    unrelated = store.add("Still failed", task_type="plan")
+    assert unrelated.id is not None
+    unrelated.status = "failed"
+    unrelated.failure_reason = "INFRASTRUCTURE_ERROR"
+    unrelated.completed_at = datetime.now(UTC)
+    store.update(unrelated)
+
+    assert is_chain_resolved_by_recovery(store, failed) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [unrelated.id]
+
+
+def test_list_failed_tasks_for_recovery_keeps_failed_task_without_landed_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = _init_git_repo(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/unmerged-work"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    git._run("checkout", "-b", failed.branch)
+    (tmp_path / "unmerged.txt").write_text("unmerged\n")
+    git._run("add", "unmerged.txt")
+    git._run("commit", "-m", "Add unmerged work")
+    git._run("checkout", "main")
+
+    failed_retry = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    assert failed_retry.id is not None
+    failed_retry.status = "failed"
+    failed_retry.failure_reason = "MAX_TURNS"
+    failed_retry.session_id = "sess-retry"
+    failed_retry.branch = "feature/unmerged-work-retry"
+    failed_retry.completed_at = datetime.now(UTC)
+    store.update(failed_retry)
+
+    assert is_chain_resolved_by_recovery(store, failed) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id, failed_retry.id]
+
+
+def test_list_failed_tasks_for_recovery_keeps_same_branch_failed_improve_under_merged_impl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = _completed_impl(store, merge_status="merged")
+    assert impl.id is not None
+    impl.branch = "feature/merged-impl"
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "GIT_ERROR"
+    failed_improve.completed_at = datetime.now(UTC)
+    store.update(failed_improve)
+
+    assert is_resolved_by_merged_target(store, failed_improve) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed_improve.id]
 
 
 def test_recovery_engine_resumable_with_session_chooses_resume(tmp_path: Path) -> None:
