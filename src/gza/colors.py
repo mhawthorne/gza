@@ -396,7 +396,7 @@ _THEME_MINIMAL = Theme(
         "review_discussion": blue,
         "review_none": yellow_warning,
         "review_approved": green_success,
-        "review_followups": cyan,
+        "review_followups": green_success,
     },
     task_stream={
         "step_header": f"{pink_light} bold",
