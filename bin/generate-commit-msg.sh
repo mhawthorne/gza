@@ -90,14 +90,25 @@ run_claude() {
     printf '%s\n' "$PROMPT" | claude --model "$CLAUDE_MODEL" --print
 }
 
+LAST_CODEX_INVOCATION_PHASE=""
+
+command_exists() {
+    local command_name="$1"
+
+    if [[ "$command_name" == */* ]]; then
+        [[ -x "$command_name" ]]
+    else
+        command -v "$command_name" >/dev/null 2>&1
+    fi
+}
+
 build_codex_command() {
     local project_root="$1"
     local work_dir="$2"
     local output_file="$3"
-    local cmd_file="$4"
 
     PYTHONPATH="$project_root/src${PYTHONPATH:+:$PYTHONPATH}" \
-        uv run python - "$project_root" "$work_dir" "$output_file" >"$cmd_file" <<'PY'
+        uv run python - "$project_root" "$work_dir" "$output_file" <<'PY'
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -139,23 +150,33 @@ PY
 }
 
 run_codex() {
-    if ! command -v codex >/dev/null 2>&1; then
-        echo "Error: 'codex' CLI not found. Install it with: npm install -g @openai/codex" >&2
-        exit 1
-    fi
-
     local output_file
-    output_file=$(mktemp)
     local cmd_file
+    output_file=$(mktemp)
     cmd_file=$(mktemp)
     trap 'rm -f "$output_file" "$cmd_file"' RETURN
 
-    build_codex_command "$PROJECT_ROOT" "$(pwd)" "$output_file" "$cmd_file"
-
     local -a cmd=()
-    mapfile -d '' -t cmd <"$cmd_file"
+    LAST_CODEX_INVOCATION_PHASE=""
+    if ! build_codex_command "$PROJECT_ROOT" "$(pwd)" "$output_file" >"$cmd_file"; then
+        LAST_CODEX_INVOCATION_PHASE="bootstrap"
+    elif ! mapfile -d '' -t cmd <"$cmd_file"; then
+        LAST_CODEX_INVOCATION_PHASE="bootstrap"
+    fi
+
     if [[ "${#cmd[@]}" -eq 0 || -z "${cmd[0]}" ]]; then
         echo "Error: Failed to build Codex command." >&2
+        LAST_CODEX_INVOCATION_PHASE="bootstrap"
+    fi
+
+    if [[ "$LAST_CODEX_INVOCATION_PHASE" == "bootstrap" ]]; then
+        echo "Failed to build the Codex command." >&2
+        exit 1
+    fi
+
+    if ! command_exists "${cmd[0]}"; then
+        echo "Error: Launcher command '${cmd[0]}' for Codex commit message generation is not available." >&2
+        echo "Failed to launch Codex because '${cmd[0]}' is unavailable." >&2
         exit 1
     fi
 
