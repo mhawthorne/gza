@@ -861,7 +861,10 @@ gza show <task_id> [options]
 | `--prompt` | Print only the fully built prompt text for this task and exit |
 | `--output` | Print only the raw output/report content and exit |
 | `--path` | Print only the report file path and exit |
+| `--metadata-only` | Show the normal metadata/detail view without the `Prompt:` and `Output:` blocks |
 | `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--prompt`, `--output`, and `--path` modes |
+
+`--metadata-only` is incompatible with `--prompt`, `--output`, `--path`, and `--full`.
 
 When a task has a branch, `gza show` also reports active worktree information:
 - `Worktree: <path>` when the task branch is currently checked out in an active worktree

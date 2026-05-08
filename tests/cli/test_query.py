@@ -2769,6 +2769,67 @@ class TestShowCommand:
         assert '"prompt"' not in result.stdout
         assert '"verify_command"' not in result.stdout
 
+    def test_show_metadata_only_hides_prompt_and_output_blocks(self, tmp_path: Path):
+        """--metadata-only should keep the detail view while omitting prompt and output/report content."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Prompt hidden in metadata-only mode")
+        assert task.id is not None
+        task.status = "completed"
+        task.output_content = "report line 1\nreport line 2"
+        store.update(task)
+        store.add_comment(task.id, "Operator note", source="direct")
+
+        result = run_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Task " in result.stdout
+        assert "Status: completed" in result.stdout
+        assert "Comments:" in result.stdout
+        assert "Operator note" in result.stdout
+        assert "Prompt:" not in result.stdout
+        assert "Output:" not in result.stdout
+        assert "Prompt hidden in metadata-only mode" not in result.stdout
+        assert "report line 1" not in result.stdout
+
+    @pytest.mark.parametrize("flag", ["--prompt", "--output", "--path", "--full"])
+    def test_show_metadata_only_rejects_incompatible_flags(self, tmp_path: Path, flag: str):
+        """--metadata-only should fail closed when combined with other show-only output modes."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task for metadata-only conflict")
+        assert task.id is not None
+
+        result = run_gza("show", str(task.id), "--metadata-only", flag, "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert f"Error: --metadata-only cannot be used with {flag}." in result.stdout
+
+    def test_show_metadata_only_rejects_multiple_incompatible_flags_in_stable_order(self, tmp_path: Path):
+        """--metadata-only should report all incompatible flags in a predictable order."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task for multi-flag metadata-only conflict")
+        assert task.id is not None
+
+        result = run_gza(
+            "show",
+            str(task.id),
+            "--metadata-only",
+            "--prompt",
+            "--output",
+            "--path",
+            "--full",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert (
+            "Error: --metadata-only cannot be used with --prompt, --output, --path, --full."
+            in result.stdout
+        )
+
     def test_show_displays_execution_mode_when_set(self, tmp_path: Path):
         """Show command includes execution provenance mode when present."""
         setup_config(tmp_path)
