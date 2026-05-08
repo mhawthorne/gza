@@ -312,6 +312,37 @@ def test_extract_creates_implement_task_and_bundle(tmp_path: Path) -> None:
     assert '"src/extracted.py"' in manifest
 
 
+def test_extract_commit_source_uses_commit_subject_for_seeded_prompt(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    git = _init_repo(tmp_path)
+    store = make_store(tmp_path)
+
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src" / "agent_sessions.py").write_text("persisted = False\n")
+    git._run("add", "src/agent_sessions.py")
+    git._run("commit", "-m", "Improve agent session persistence")
+    commit_sha = git._run("rev-parse", "HEAD").stdout.strip()
+
+    result = run_gza(
+        "extract",
+        "--commit",
+        "HEAD",
+        "src/agent_sessions.py",
+        "--queue",
+        "--project",
+        str(tmp_path),
+    )
+
+    assert result.returncode == 0
+    assert "Created extract implement task" in result.stdout
+    assert f"Source: commit {commit_sha[:12]}" in result.stdout
+
+    new_task = get_latest_task(store, task_type="implement")
+    assert new_task is not None
+    assert new_task.prompt.startswith("Carry over: Improve agent session persistence\n")
+    assert "Source commit subjects:" in new_task.prompt
+
+
 def test_extract_branch_with_single_positional_path_succeeds(tmp_path: Path) -> None:
     setup_config(tmp_path)
     git = _init_repo(tmp_path)

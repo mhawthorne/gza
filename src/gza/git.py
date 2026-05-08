@@ -515,6 +515,11 @@ class Git:
         result = self._run("rev-parse", "--verify", f"{ref}^{{commit}}")
         return result.stdout.strip()
 
+    def get_commit_subject(self, commit_ref: str) -> str:
+        """Get the subject line for a single committed revision."""
+        result = self._run("show", "-s", "--format=%s", commit_ref, check=False)
+        return result.stdout.strip()
+
     def update_ref(self, ref: str, new_oid: str, old_oid: str | None = None) -> None:
         """Update a ref, optionally requiring the current value to match ``old_oid``."""
         args = ["update-ref", ref, new_oid]

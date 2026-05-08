@@ -38,6 +38,7 @@ class SourceSelection:
     source_branch: str | None = None
     source_base_ref: str | None = None
     source_commits: tuple[str, ...] = ()
+    source_commit_subjects: tuple[str, ...] = ()
     source_task_prompt: str | None = None
     source_task_slug: str | None = None
 
@@ -165,6 +166,7 @@ def resolve_source_selection(
 
     if source_commits:
         resolved_commits: list[str] = []
+        commit_subjects: list[str] = []
         seen: set[str] = set()
         for commit_ref in source_commits:
             if not git.ref_exists(commit_ref):
@@ -174,9 +176,11 @@ def resolve_source_selection(
                 raise ExtractionError(f"Duplicate source commit selected: {commit_ref}")
             seen.add(resolved)
             resolved_commits.append(resolved)
+            commit_subjects.append(git.get_commit_subject(resolved))
         return SourceSelection(
             source_task_id=None,
             source_commits=tuple(resolved_commits),
+            source_commit_subjects=tuple(commit_subjects),
         )
 
     assert source_branch is not None
@@ -261,7 +265,11 @@ def draft_extraction_prompt(
     operator_prompt: str | None,
 ) -> str:
     """Draft the implement prompt for an extracted task."""
-    objective = _describe_source_objective(source)
+    objective = _describe_source_objective(
+        source=source,
+        selected_paths=selected_paths,
+        summaries=summaries,
+    )
     if source.source_task_id:
         source_label = f"task {source.source_task_id}"
     elif source.mode == "commit":
@@ -281,6 +289,12 @@ def draft_extraction_prompt(
 
     if source.source_task_prompt:
         lines.extend(["", "Original task prompt:", source.source_task_prompt.strip()])
+
+    if source.source_commit_subjects:
+        lines.extend(["", "Source commit subjects:"])
+        for commit_ref, subject in zip(source.source_commits, source.source_commit_subjects, strict=False):
+            label = subject or "(empty subject)"
+            lines.append(f"- {commit_ref[:12]}: {label}")
 
     lines.extend(["", f"Selected files ({len(selected_paths)}):"])
 
@@ -315,44 +329,68 @@ def draft_extraction_prompt(
     return "\n".join(lines).strip() + "\n"
 
 
-def _describe_source_objective(source: SourceSelection) -> str:
-    """Derive a concise extract title from task metadata or branch identity."""
+def _describe_source_objective(
+    *,
+    source: SourceSelection,
+    selected_paths: tuple[str, ...],
+    summaries: list[FileDiffSummary],
+) -> str:
+    """Derive a concise extract title from source metadata plus diff context."""
     prompt_summary = _summarize_prompt_line(source.source_task_prompt)
-    if prompt_summary:
+    if _is_specific_objective(prompt_summary):
+        assert prompt_summary is not None
         return prompt_summary
+
+    if source.mode == "commit":
+        commit_summary = _describe_commit_subject_objective(source.source_commit_subjects)
+        if _is_specific_objective(commit_summary):
+            assert commit_summary is not None
+            return commit_summary
+
+    topic_hint = _best_topic_hint(source)
+    diff_objective = _describe_diff_objective(
+        selected_paths=selected_paths,
+        summaries=summaries,
+        topic_hint=topic_hint,
+    )
+    if _is_specific_objective(diff_objective):
+        return diff_objective
 
     if source.source_task_slug:
         slug_text = get_task_slug(source.source_task_slug) or source.source_task_slug
         humanized_slug = _humanize_identifier(slug_text)
-        if humanized_slug:
+        if _is_specific_objective(humanized_slug):
+            assert humanized_slug is not None
             return humanized_slug
 
     if source.source_branch:
-        branch_summary = source.source_branch.rsplit("/", 1)[-1]
-        humanized_branch = _humanize_identifier(branch_summary)
-        if humanized_branch:
-            return humanized_branch
+        branch_summary = _humanize_branch_name(source.source_branch)
+        if _is_specific_objective(branch_summary):
+            assert branch_summary is not None
+            return branch_summary
 
-    if source.source_commits:
-        return _describe_commit_objective(source.source_commits)
+    if source.mode == "commit":
+        return _describe_commit_objective(source)
 
-    return "selected source changes"
+    return diff_objective or "selected source changes"
 
 
 def _summarize_prompt_line(prompt: str | None) -> str | None:
-    """Extract a short single-line summary from a task prompt."""
+    """Extract the most specific single-line summary from a task prompt."""
     if not prompt:
         return None
 
+    best_line: str | None = None
+    best_score = float("-inf")
     for raw_line in prompt.splitlines():
-        line = raw_line.strip()
-        if not line:
+        line = _normalize_prompt_candidate(raw_line)
+        if not line or _looks_like_prompt_section_header(line):
             continue
-        line = re.sub(r"^(task|prompt)\s*:\s*", "", line, flags=re.IGNORECASE)
-        line = re.sub(r"\s+", " ", line).strip(" -:.")
-        if line:
-            return line
-    return None
+        score = _objective_specificity_score(line)
+        if score > best_score:
+            best_score = score
+            best_line = line
+    return best_line
 
 
 def _humanize_identifier(value: str) -> str:
@@ -360,6 +398,246 @@ def _humanize_identifier(value: str) -> str:
     normalized = value.replace("/", " ").replace("_", " ").replace("-", " ")
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
+
+
+def _normalize_prompt_candidate(value: str) -> str:
+    line = value.strip()
+    if not line:
+        return ""
+    line = re.sub(r"^[*\-+]\s+", "", line)
+    line = re.sub(r"^\d+\.\s+", "", line)
+    line = re.sub(
+        r"^(task|prompt|title|summary|objective|goal)\s*:\s*",
+        "",
+        line,
+        flags=re.IGNORECASE,
+    )
+    line = re.sub(r"\s+", " ", line).strip(" -:.")
+    return line
+
+
+def _looks_like_prompt_section_header(line: str) -> bool:
+    lowered = line.lower().rstrip(":")
+    return lowered in {
+        "source",
+        "operator intent",
+        "selected files",
+        "observed source diff metadata",
+        "original task prompt",
+        "source commit subjects",
+    }
+
+
+def _is_specific_objective(text: str | None) -> bool:
+    return _objective_specificity_score(text) >= 10
+
+
+def _objective_specificity_score(text: str | None) -> int:
+    if not text:
+        return -100
+
+    lowered = text.lower().strip()
+    if not lowered:
+        return -100
+
+    words = re.findall(r"[a-z0-9]+", lowered)
+    if not words:
+        return -100
+
+    score = min(len(words), 8)
+    if 3 <= len(words) <= 12:
+        score += 6
+    elif len(words) <= 2:
+        score -= 6
+
+    action_verbs = {
+        "add",
+        "allow",
+        "build",
+        "copy",
+        "create",
+        "derive",
+        "ensure",
+        "fix",
+        "generate",
+        "handle",
+        "implement",
+        "improve",
+        "prevent",
+        "preserve",
+        "remove",
+        "rename",
+        "restore",
+        "seed",
+        "support",
+        "update",
+        "validate",
+    }
+    if words[0] in action_verbs:
+        score += 12
+    elif any(word in action_verbs for word in words[:2]):
+        score += 8
+
+    if lowered.startswith("carry over"):
+        score -= 12
+
+    generic_words = {"changes", "work", "task", "tasks", "source", "branch", "commit", "commits"}
+    if len(words) <= 3 and words[-1] in generic_words:
+        score -= 8
+
+    if lowered.endswith(":"):
+        score -= 8
+
+    return score
+
+
+def _best_topic_hint(source: SourceSelection) -> str | None:
+    if source.source_task_slug:
+        slug_text = get_task_slug(source.source_task_slug) or source.source_task_slug
+        humanized_slug = _humanize_identifier(slug_text)
+        if humanized_slug:
+            return humanized_slug
+    if source.source_branch:
+        return _humanize_branch_name(source.source_branch)
+    return None
+
+
+def _humanize_branch_name(branch: str) -> str:
+    return _humanize_identifier(branch.rsplit("/", 1)[-1])
+
+
+def _describe_commit_subject_objective(subjects: tuple[str, ...]) -> str | None:
+    if len(subjects) != 1:
+        return None
+    subject = _normalize_prompt_candidate(subjects[0])
+    return subject or None
+
+
+def _describe_diff_objective(
+    *,
+    selected_paths: tuple[str, ...],
+    summaries: list[FileDiffSummary],
+    topic_hint: str | None,
+) -> str:
+    if len(summaries) == 1:
+        summary = summaries[0]
+        if summary.status == "R" and summary.old_path and summary.new_path:
+            return f"rename {_describe_path_focus(summary.old_path)} to {_describe_path_focus(summary.new_path)}"
+        if summary.status == "C" and summary.old_path and summary.new_path:
+            return f"copy {_describe_path_focus(summary.old_path)} to {_describe_path_focus(summary.new_path)}"
+
+    action = _describe_diff_action(summaries)
+    focus = _describe_selected_focus(selected_paths)
+    if focus in {"module", "config", "doc", "asset", "test", "tests", "file", "files"} and topic_hint:
+        if topic_hint.lower() not in focus.lower():
+            focus = f"{topic_hint} {focus}"
+    if focus == "selected files" and topic_hint:
+        focus = f"{topic_hint} files"
+    return f"{action} {focus}"
+
+
+def _describe_diff_action(summaries: list[FileDiffSummary]) -> str:
+    statuses = {summary.status for summary in summaries}
+    if statuses == {"A"}:
+        return "add"
+    if statuses == {"D"}:
+        return "remove"
+    if statuses == {"R"}:
+        return "rename"
+    if statuses == {"C"}:
+        return "copy"
+    return "update"
+
+
+def _describe_selected_focus(selected_paths: tuple[str, ...]) -> str:
+    if len(selected_paths) == 1:
+        return _describe_path_focus(selected_paths[0])
+    if len(selected_paths) == 2:
+        return " and ".join(_describe_path_focus(path) for path in selected_paths)
+
+    token_phrase = _common_path_token_phrase(selected_paths)
+    if token_phrase:
+        return f"{token_phrase} files"
+
+    shared_dir = _shared_path_directory(selected_paths)
+    if shared_dir:
+        return f"{shared_dir} files"
+
+    return f"{len(selected_paths)} files"
+
+
+def _describe_path_focus(path: str) -> str:
+    path_obj = Path(path)
+    path_parts = [part for part in path_obj.parts[:-1] if part not in {"src", "lib", "app", "tests", "docs", "assets"}]
+    stem = path_obj.stem
+
+    if stem in {"__init__", "index", "main", "module", "config", "settings", "test"} and path_parts:
+        tokens = _tokenize_identifier(path_parts[-1])
+    else:
+        tokens = _tokenize_identifier(stem)
+
+    label = " ".join(tokens).strip()
+    if not label:
+        label = path_obj.name
+
+    suffix = _path_kind_suffix(path_obj)
+    if suffix and suffix not in label.split():
+        label = f"{label} {suffix}"
+    return label
+
+
+def _path_kind_suffix(path: Path) -> str:
+    path_text = path.as_posix()
+    if "/tests/" in f"/{path_text}" or path.name.startswith("test_"):
+        return "tests"
+    if path.suffix in {".md", ".rst"}:
+        return "doc"
+    if path.suffix in {".yml", ".yaml", ".json", ".toml", ".ini"}:
+        return "config"
+    if path.suffix in {".png", ".jpg", ".jpeg", ".gif", ".svg", ".bin"}:
+        return "asset"
+    if path.suffix in {".py", ".js", ".ts", ".tsx", ".jsx", ".rb", ".go", ".rs"}:
+        return "module"
+    return ""
+
+
+def _tokenize_identifier(value: str) -> list[str]:
+    if not value:
+        return []
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+    normalized = re.sub(r"[^A-Za-z0-9]+", " ", normalized)
+    tokens = [token.lower() for token in normalized.split() if token]
+    stopwords = {"src", "lib", "app", "file", "files"}
+    return [token for token in tokens if token not in stopwords]
+
+
+def _common_path_token_phrase(selected_paths: tuple[str, ...]) -> str | None:
+    counts: dict[str, int] = {}
+    for path in selected_paths:
+        seen = set(_tokenize_identifier(Path(path).stem))
+        for token in seen:
+            counts[token] = counts.get(token, 0) + 1
+
+    if not counts:
+        return None
+
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    shared = [token for token, count in ranked if count >= 2]
+    chosen = shared[:2] or [ranked[0][0]]
+    phrase = " ".join(chosen).strip()
+    return phrase or None
+
+
+def _shared_path_directory(selected_paths: tuple[str, ...]) -> str | None:
+    parents = [Path(path).parent.as_posix() for path in selected_paths]
+    common = posixpath.commonpath(parents)
+    if common in {"", "."}:
+        return None
+
+    parts = [part for part in common.split("/") if part and part not in {"src", "lib", "app", "tests", "docs", "assets"}]
+    if not parts:
+        return None
+    return _humanize_identifier(parts[-1])
 
 
 def write_extraction_bundle(
@@ -631,10 +909,14 @@ def _describe_prompt_source_detail(source: SourceSelection) -> str:
     return f"branch `{source.source_branch}` vs `{source.source_base_ref}`"
 
 
-def _describe_commit_objective(source_commits: tuple[str, ...]) -> str:
-    if len(source_commits) == 1:
-        return f"commit {source_commits[0][:12]}"
-    return f"selected changes from {len(source_commits)} commits"
+def _describe_commit_objective(source: SourceSelection) -> str:
+    if len(source.source_commits) == 1:
+        if source.source_commit_subjects:
+            subject = _normalize_prompt_candidate(source.source_commit_subjects[0])
+            if subject:
+                return subject
+        return f"commit {source.source_commits[0][:12]}"
+    return f"selected changes from {len(source.source_commits)} commits"
 
 
 def _parse_file_summaries(
