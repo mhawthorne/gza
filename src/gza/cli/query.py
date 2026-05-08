@@ -2658,6 +2658,15 @@ def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore")
 
 def cmd_show(args: argparse.Namespace) -> int:
     """Show details of a specific task."""
+    incompatible_flags = _show_incompatible_flags(args)
+    if incompatible_flags:
+        print(
+            "Error: --metadata-only cannot be used with "
+            + ", ".join(incompatible_flags)
+            + ".",
+        )
+        return 1
+
     config = Config.load(args.project_dir)
     store = get_store(config, open_mode="query_only")
 
@@ -2691,6 +2700,23 @@ def cmd_show(args: argparse.Namespace) -> int:
 
     with pager_context(getattr(args, 'page', False), config.project_dir):
         return _cmd_show_output(task, args, config, store)
+
+
+def _show_incompatible_flags(args: argparse.Namespace) -> list[str]:
+    """Return incompatible flags when --metadata-only is combined with other show modes."""
+    if not getattr(args, "metadata_only", False):
+        return []
+
+    incompatible_flags: list[str] = []
+    if getattr(args, "prompt", False):
+        incompatible_flags.append("--prompt")
+    if getattr(args, "output", False):
+        incompatible_flags.append("--output")
+    if getattr(args, "path", False):
+        incompatible_flags.append("--path")
+    if getattr(args, "full", False):
+        incompatible_flags.append("--full")
+    return incompatible_flags
 
 
 def _find_active_worktree_path_for_branch(config: Config, branch: str) -> tuple[Path | None, str | None]:
@@ -2798,12 +2824,14 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Lineage:[/{c['label']}]")
         console.print(lineage_str)
 
-    console.print()
-    console.print(f"[{c['label']}]Prompt:[/{c['label']}]")
-    console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
-    console.print(f"[{c['prompt']}]{task.prompt}[/{c['prompt']}]")
-    console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
-    console.print()
+    metadata_only = getattr(args, "metadata_only", False)
+    if not metadata_only:
+        console.print()
+        console.print(f"[{c['label']}]Prompt:[/{c['label']}]")
+        console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
+        console.print(f"[{c['prompt']}]{task.prompt}[/{c['prompt']}]")
+        console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
+        console.print()
     if task.id is not None:
         comments = store.get_comments(task.id)
         if comments:
@@ -2886,7 +2914,7 @@ def _cmd_show_output(
 
     # Display output content using precedence logic (disk version when newer)
     output = _get_task_output(task, config.project_dir)
-    if output:
+    if output and not metadata_only:
         console.print()
         console.print(f"[{c['label']}]Output:[/{c['label']}]")
         console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")

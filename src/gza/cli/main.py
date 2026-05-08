@@ -2160,6 +2160,12 @@ def main() -> int:
         help="Print only the report file path",
     )
     show_parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        default=False,
+        help="Show task metadata/details without the prompt or output/report content blocks",
+    )
+    show_parser.add_argument(
         "--page",
         action="store_true",
         default=False,
