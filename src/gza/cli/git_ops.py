@@ -643,25 +643,15 @@ def cmd_merge(args: argparse.Namespace) -> int:
     use_all = getattr(args, 'all', False)
     if use_all:
         seen_ids = set(task_ids)
-        if store.supports_merge_units():
-            units = reversed(store.get_unmerged_merge_units(default))
-            for unit in units:
-                owner = store._legacy_merge_status_owner_for_unit(unit)
-                if owner is None or owner.id is None or owner.id in seen_ids:
-                    continue
-                if owner.branch and not git.is_merged(owner.branch, current_branch):
-                    task_ids.append(owner.id)
-                    seen_ids.add(owner.id)
-        else:
-            history = store.get_history(limit=None)
-            # Process oldest first (history is newest-first, so reverse it)
-            for task in reversed(history):
-                if task.id in seen_ids:
-                    continue
-                if task.id is not None and task.status in ("completed", "unmerged") and task.branch and task.has_commits:
-                    if task.merge_status != "merged" and not git.is_merged(task.branch, current_branch):
-                        task_ids.append(task.id)
-                        seen_ids.add(task.id)
+        for task in reversed(store.get_unmerged(default)):
+            if task.id is None or task.id in seen_ids or not task.branch:
+                continue
+            if task.status not in ("completed", "unmerged"):
+                continue
+            if git.is_merged(task.branch, current_branch):
+                continue
+            task_ids.append(task.id)
+            seen_ids.add(task.id)
         if not task_ids:
             print("No unmerged done tasks found")
             return 0

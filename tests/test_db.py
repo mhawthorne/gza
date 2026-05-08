@@ -2011,6 +2011,30 @@ class TestMergeStatus:
         assert refreshed_main_unit is None
         assert store.get_unmerged() == []
 
+    def test_get_unmerged_backfills_legacy_actionable_row_when_merge_units_exist(self, tmp_path: Path) -> None:
+        """Legacy unmerged rows should remain visible until lazy merge-unit backfill attaches them."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        task = store.add(prompt="Legacy feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feature/legacy-unmerged"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        assert task.id is not None
+        assert store.supports_merge_units() is True
+        assert store.resolve_merge_unit_for_task(task.id, "main") is None
+
+        unmerged = store.get_unmerged("main")
+
+        assert [candidate.id for candidate in unmerged] == [task.id]
+        unit = store.resolve_merge_unit_for_task(task.id, "main")
+        assert unit is not None
+        assert unit.state == "unmerged"
+        assert {member.id for member in store.list_tasks_for_merge_unit(unit.id)} == {task.id}
+
     def test_merge_unit_backfill_attaches_existing_branchless_reviews_with_review_role(self, tmp_path: Path) -> None:
         """Backfilling an implementation unit should attach existing branchless reviews."""
         db_path = tmp_path / "test.db"

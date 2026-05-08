@@ -12,6 +12,7 @@ import pytest
 
 from gza.cli.git_ops import _execute_merge_action, ensure_watch_main_checkout
 from gza.cli.watch import (
+    _collect_advance_completed_tasks,
     _collect_completed_transition_ids,
     _collect_live_running_state,
     _collect_unhandled_failures,
@@ -72,6 +73,30 @@ def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: P
     assert spawn_iterate.call_args.args[2].id == impl.id
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == plan.id
+
+
+def test_watch_collects_legacy_unmerged_owner_after_lazy_merge_unit_backfill(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    legacy = store.add("Legacy watch branch", task_type="implement")
+    legacy.status = "completed"
+    legacy.completed_at = datetime.now(UTC)
+    legacy.branch = "feature/legacy-watch"
+    legacy.has_commits = True
+    legacy.merge_status = "unmerged"
+    store.update(legacy)
+
+    assert legacy.id is not None
+    assert store.resolve_merge_unit_for_task(legacy.id, "main") is None
+
+    tasks, impl_based_on_ids = _collect_advance_completed_tasks(store, target_branch="main")
+
+    assert legacy.id not in impl_based_on_ids
+    assert [task.id for task in tasks if task.task_type == "implement"] == [legacy.id]
+    unit = store.resolve_merge_unit_for_task(legacy.id, "main")
+    assert unit is not None
+    assert unit.state == "unmerged"
 
 
 def test_watch_cycle_prefers_freshly_bumped_task_over_older_urgent(tmp_path: Path) -> None:

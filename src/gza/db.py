@@ -4096,6 +4096,26 @@ class SqliteTaskStore:
         """Return actionable merge units for the selected target."""
         return self.list_merge_units_for_target(target_branch, states=("unmerged", "blocked", "stale"))
 
+    def _get_unmerged_merge_units_with_legacy_fallback(self, target_branch: str) -> list[MergeUnit]:
+        """Return actionable merge units, lazily backfilling legacy rows when needed."""
+        units_by_id: dict[str, MergeUnit] = {
+            unit.id: unit for unit in self.get_unmerged_merge_units(target_branch)
+        }
+        for task in self._legacy_unmerged_candidates():
+            if task.id is None or not task.branch:
+                continue
+            if self.resolve_merge_unit_for_task(task.id, target_branch) is not None:
+                continue
+            unit = self.get_or_create_merge_unit_for_task(task, target_branch)
+            if unit is None or unit.state not in {"unmerged", "blocked", "stale"}:
+                continue
+            units_by_id.setdefault(unit.id, unit)
+        return sorted(
+            units_by_id.values(),
+            key=lambda unit: (unit.updated_at, unit.id),
+            reverse=True,
+        )
+
     def get_unmerged(self, target_branch: str | None = None) -> list[Task]:
         """Get tasks with unmerged code (merge_status = 'unmerged').
 
@@ -4104,7 +4124,7 @@ class SqliteTaskStore:
         branch. Standalone improve tasks with their own branch are included.
         """
         if self.supports_merge_units():
-            units = self.get_unmerged_merge_units(target_branch or self.default_merge_target())
+            units = self._get_unmerged_merge_units_with_legacy_fallback(target_branch or self.default_merge_target())
             owner_ids = [
                 owner.id
                 for unit in units

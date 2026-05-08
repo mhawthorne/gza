@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+from gza.cli.git_ops import _collect_advance_completed_tasks
 from tests.cli.conftest import make_store, setup_config
 from tests.helpers.cli import run_gza
 
@@ -82,6 +83,30 @@ def test_merge_all_deduplicates_same_branch_merge_unit(tmp_path: Path) -> None:
     assert refreshed_improve.merge_status is None
 
 
+def test_collect_advance_completed_tasks_backfills_legacy_unmerged_owner(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    legacy = store.add("Legacy shared branch", task_type="implement")
+    legacy.status = "completed"
+    legacy.completed_at = datetime.now(UTC)
+    legacy.branch = "feature/legacy-advance"
+    legacy.has_commits = True
+    legacy.merge_status = "unmerged"
+    store.update(legacy)
+
+    assert legacy.id is not None
+    assert store.resolve_merge_unit_for_task(legacy.id, "main") is None
+
+    tasks, impl_based_on_ids = _collect_advance_completed_tasks(store, target_branch="main")
+
+    assert legacy.id not in impl_based_on_ids
+    assert [task.id for task in tasks if task.task_type == "implement"] == [legacy.id]
+    unit = store.resolve_merge_unit_for_task(legacy.id, "main")
+    assert unit is not None
+    assert unit.state == "unmerged"
+
+
 def test_merge_review_task_id_resolves_branchless_review_to_implementation_unit(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -159,6 +184,31 @@ def test_merge_missing_explicit_task_id_fails_closed(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "Error: Task testproject-9999 not found" in result.stdout
     assert fake_git.merged == []
+
+
+def test_merge_all_backfills_legacy_unmerged_owner_when_units_exist(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    legacy = store.add("Legacy merge-all branch", task_type="implement")
+    legacy.status = "completed"
+    legacy.completed_at = datetime.now(UTC)
+    legacy.branch = "feature/legacy-merge-all"
+    legacy.has_commits = True
+    legacy.merge_status = "unmerged"
+    store.update(legacy)
+
+    fake_git = _MergeGit(tmp_path)
+    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
+        result = run_gza("merge", "--all", "--project", str(tmp_path), cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert "No unmerged done tasks found" not in result.stdout
+    assert fake_git.merged == [("feature/legacy-merge-all", False)]
+    assert legacy.id is not None
+    unit = store.resolve_merge_unit_for_task(legacy.id, "main")
+    assert unit is not None
+    assert unit.state == "merged"
 
 
 def test_merge_valid_and_missing_explicit_task_ids_report_missing_without_partial_merge(tmp_path: Path) -> None:
