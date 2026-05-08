@@ -7832,3 +7832,29 @@ class TestSyncCandidates:
 
         assert task.id not in cached_candidate_ids
         assert task.id in uncached_candidate_ids
+
+    def test_get_sync_candidates_unions_merge_units_and_legacy_rows_during_migration(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+        now = datetime.now(UTC)
+
+        unit_task = store.add("Unit-backed task", task_type="implement")
+        unit_task.status = "completed"
+        unit_task.completed_at = now
+        unit_task.branch = "feature/unit-backed"
+        unit_task.has_commits = True
+        unit_task.merge_status = "unmerged"
+        store.update(unit_task)
+        unit = store.get_or_create_merge_unit_for_task(unit_task, "main")
+        assert unit is not None
+
+        legacy_task = store.add("Legacy task", task_type="implement")
+        legacy_task.status = "completed"
+        legacy_task.completed_at = now - timedelta(hours=1)
+        legacy_task.branch = "feature/legacy-only"
+        legacy_task.has_commits = True
+        legacy_task.merge_status = "unmerged"
+        store.update(legacy_task)
+
+        candidate_ids = {task.id for task in store.get_sync_candidates(recent_days=30, target_branch="main")}
+
+        assert candidate_ids == {unit_task.id, legacy_task.id}

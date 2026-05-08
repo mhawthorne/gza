@@ -4019,7 +4019,7 @@ class SqliteTaskStore:
         unit_id: str,
         state: str,
         *,
-        merged_by_task_id: str | None = None,
+        merged_by_task_id: str | None | object = _DB_UNSET,
         merged_at: datetime | None = None,
         pr_number: int | None | object = _DB_UNSET,
         pr_state: str | None | object = _DB_UNSET,
@@ -4042,8 +4042,9 @@ class SqliteTaskStore:
         params: list[object] = [state, now.isoformat()]
         updates.append("merged_at = ?")
         params.append(merged_at_value.isoformat() if merged_at_value is not None else None)
-        updates.append("merged_by_task_id = ?")
-        params.append(merged_by_task_id)
+        if merged_by_task_id is not _DB_UNSET:
+            updates.append("merged_by_task_id = ?")
+            params.append(cast("str | None", merged_by_task_id))
         if pr_number is not _DB_UNSET:
             updates.append("pr_number = ?")
             params.append(pr_number)
@@ -4228,12 +4229,13 @@ class SqliteTaskStore:
         target_branch: str | None = None,
     ) -> list[Task]:
         """Return a bounded set of branch-bearing task rows for `gza sync`."""
+        effective_target = target_branch or self.default_merge_target()
         if self.supports_merge_units():
             recent_cutoff_dt = datetime.now(UTC) - timedelta(days=recent_days)
             sync_cutoff_dt = datetime.now(UTC) - timedelta(seconds=max(cooldown_seconds, 0))
             tasks: list[Task] = []
             seen_ids: set[str] = set()
-            for unit in self.list_merge_units_for_target(target_branch or self.default_merge_target()):
+            for unit in self.list_merge_units_for_target(effective_target):
                 activity_at = unit.merged_at or unit.updated_at or unit.created_at
                 if unit.state != "unmerged":
                     has_open_pr = unit.pr_number is not None and (unit.pr_state is None or unit.pr_state == "open")
@@ -4254,15 +4256,25 @@ class SqliteTaskStore:
                         continue
                     seen_ids.add(task.id)
                     tasks.append(task)
-            if tasks:
-                return sorted(
-                    tasks,
-                    key=lambda task: (
-                        _coalesce_task_timestamp(task.merged_at, task.completed_at, task.created_at),
-                        task_id_numeric_key(task.id),
-                    ),
-                    reverse=True,
-                )
+            for task in self._legacy_sync_candidates(recent_days=recent_days, cooldown_seconds=cooldown_seconds):
+                if task.id is None or task.id in seen_ids:
+                    continue
+                if self.resolve_merge_unit_for_task(task.id, effective_target) is not None:
+                    continue
+                seen_ids.add(task.id)
+                tasks.append(task)
+            return sorted(
+                tasks,
+                key=lambda task: (
+                    _coalesce_task_timestamp(task.merged_at, task.completed_at, task.created_at),
+                    task_id_numeric_key(task.id),
+                ),
+                reverse=True,
+            )
+        return self._legacy_sync_candidates(recent_days=recent_days, cooldown_seconds=cooldown_seconds)
+
+    def _legacy_sync_candidates(self, *, recent_days: int, cooldown_seconds: int) -> list[Task]:
+        """Return legacy task-row sync candidates for migration fallback/union reads."""
         recent_cutoff = (datetime.now(UTC) - timedelta(days=recent_days)).isoformat()
         sync_cutoff = (datetime.now(UTC) - timedelta(seconds=max(cooldown_seconds, 0))).isoformat()
         cooldown_filter = ""
