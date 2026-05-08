@@ -63,6 +63,7 @@ pythonpath = ["."]
 timeout_method = "signal"
 markers = [
     "integration: mark test as integration test (requires credentials and Docker)",
+    "functional: mark test as a functional test that crosses process boundaries",
 ]
 
 [tool.mypy]

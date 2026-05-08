@@ -18,6 +18,7 @@ from .conftest import run_gza, setup_config
 class TestHelpOutput:
     """Tests for CLI help output."""
 
+    @pytest.mark.functional
     def test_commands_displayed_alphabetically(self):
         """Help output should display commands in alphabetical order."""
         result = subprocess.run(
@@ -154,6 +155,7 @@ class TestHelpOutput:
             "project_dir": tmp_path.resolve(),
         }
 
+    @pytest.mark.functional
     def test_advance_help_shows_unimplemented_and_hides_plans_alias(self):
         """advance --help should show --unimplemented/--force and keep --plans hidden."""
         result = subprocess.run(

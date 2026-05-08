@@ -5106,6 +5106,7 @@ class TestMigrationUtilityFunctions:
         assert status_after["current_version"] == SCHEMA_VERSION
 
 
+@pytest.mark.functional
 class TestSharedDbIsolationAndImportGating:
     def test_missing_project_id_uses_distinct_derived_ids_and_isolates_shared_db(
         self, tmp_path: Path

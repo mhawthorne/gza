@@ -788,6 +788,7 @@ class TestLogCommand:
         assert "Task: Running task raw follow" not in output
         assert "ID:" not in output
 
+    @pytest.mark.functional
     def test_log_follow_by_task_not_running_falls_back_to_static_output(self, tmp_path: Path):
         """-t -f should print persisted logs and exit when task is not actively running."""
         import json
@@ -810,7 +811,7 @@ class TestLogCommand:
             ["uv", "run", "gza", "log", str(task.id), "--follow", "--project", str(tmp_path)],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=2,
         )
 
         assert result.returncode == 0

@@ -1,8 +1,8 @@
 ---
 name: gza-code-review-interactive
-description: Review changes on current branch and output a structured review. Optionally post to PR with --pr flag.
-allowed-tools: Bash(git:*), Bash(gh:*), Bash(uv run:*), Read, Agent, AskUserQuestion
-version: 2.3.0
+description: Review changes on current branch and output a structured review. Optionally post to PR with --pr flag, or apply non-blocking follow-ups inline with --apply-followups.
+allowed-tools: Bash(git:*), Bash(gh:*), Bash(uv run:*), Read, Edit, Write, Glob, Grep, Agent, AskUserQuestion
+version: 2.4.0
 public: true
 ---
 
@@ -16,7 +16,8 @@ Requires being on a non-main branch with commits ahead of main. If not, stop and
 ## Arguments
 
 - `--pr` — Post the review as a PR comment (requires an existing PR on the branch)
-- No arguments — Just output the review locally, no PR interaction
+- `--apply-followups` — After the review, apply all non-blocking follow-ups inline without prompting. Has no effect if the verdict is `CHANGES_REQUESTED` (blockers exist) or if the review reports no follow-ups. Without this flag, the skill prompts the user interactively before applying.
+- No arguments — Just output the review locally, no PR interaction. If follow-ups exist, prompt the user once at the end (see Step 6).
 
 ## Process
 
@@ -134,3 +135,48 @@ After the subagent completes:
 - Print a brief summary of findings
 - If changes were requested, tell the user: "Fix the issues above, commit, push, then run `/gza-code-review-interactive` again."
 - If a PR was used, include a link to it
+
+### Step 6: Optionally apply follow-ups
+
+This step exists so the user can fold in non-blocking follow-ups without a manual round-trip. It applies *only* to follow-ups (Section "Follow-Ups", IDs `F1`, `F2`, ...). It never applies blockers — if the verdict is `CHANGES_REQUESTED`, skip this step entirely and tell the user to address blockers manually first.
+
+Skip this step if any of the following is true:
+- Verdict is `CHANGES_REQUESTED` (blockers exist; do not absorb them here).
+- The Follow-Ups section reads "None." or has no `### F#` entries.
+- The user cancels at any prompt.
+
+Otherwise, proceed:
+
+1. **Decide whether to apply.**
+   - If the user invoked the skill with `--apply-followups`, proceed without prompting. Tell the user "Applying N follow-up(s): F1, F2, ..." before starting.
+   - Otherwise, ask the user with `AskUserQuestion`:
+     - Question: `"Apply N follow-up(s) now? (F1, F2, ...)"`
+     - Options: `"Yes, apply all"` / `"No, skip"`
+     - If the user wants partial apply, they can decline and ask in chat (e.g., "apply F1 and F3 only"). Document this in your prompt to the user.
+
+2. **Verify branch state before editing.** Run `git status --porcelain`. If there are uncommitted changes that aren't part of this review, stop and tell the user: "Uncommitted changes detected — commit or stash before applying follow-ups." Do not edit on top of unknown work.
+
+3. **Apply each follow-up inline in this Claude session.** For each `F#`:
+   - Read the relevant files mentioned in the follow-up's `Evidence:` section.
+   - Implement the change described in `Recommended follow-up:`. If the follow-up offers multiple options, pick the smallest reasonable one and tell the user which you chose. If the follow-up requires a judgment call you can't make confidently, skip it and tell the user.
+   - If `Recommended tests:` lists specific assertions, add them.
+   - Tell the user "Applied F#: <one-line summary>" as you go.
+
+4. **Run verify if available.** If `gza.yaml` is present and has a `verify_command`, run it: `uv run gza config | grep verify_command` to find it, then execute. Fix any failures up to 3 iterations. If the project has no `verify_command`, run a sensible default if one is obvious from the project (e.g., `uv run pytest <changed test files>`); otherwise tell the user "No verify_command configured — skipping post-apply verification."
+
+5. **Commit on the current branch.** Stage only the files you changed (do not use `git add -A`). Commit message:
+   ```
+   Apply review follow-ups: F1, F2, ...
+
+   - F1: <one-line summary>
+   - F2: <one-line summary>
+   ```
+   Do not push. Do not amend. Do not merge.
+
+6. **Report apply outcome.** Print which follow-ups were applied, which were skipped (and why), and the new commit SHA.
+
+**Notes on this step:**
+- Never apply blockers automatically. Blockers require human review and may need plan/spec changes that exceed the review's scope.
+- Never auto-apply when uncommitted changes exist on the working tree.
+- This step does not write to the gza task database. It edits files and commits on the current branch only. If the branch is linked to a gza task, the followups commit will appear in its history; nothing else changes.
+- If the apply step fails partway (verify fails, an Edit can't find its target, etc.), stop and tell the user exactly which follow-ups landed and which did not. Do not roll back unless the user asks.

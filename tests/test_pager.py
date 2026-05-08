@@ -100,6 +100,7 @@ def _setup_config(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
 
 
+@pytest.mark.functional
 class TestCliPageFlag:
     """Ensure --page flag is accepted by gza show and gza log."""
 
