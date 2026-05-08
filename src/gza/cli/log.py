@@ -124,6 +124,31 @@ def _message_content_items(entry: dict) -> list[dict]:
     return []
 
 
+def _error_lines(message: object) -> list[str]:
+    """Format provider error payloads for readable log display."""
+    if isinstance(message, str):
+        raw_message = message.strip()
+        if not raw_message:
+            return ["[error]"]
+        try:
+            parsed = json.loads(raw_message)
+        except json.JSONDecodeError:
+            return [f"[error] {raw_message}"]
+        if isinstance(parsed, dict):
+            nested_error = parsed.get("error")
+            if isinstance(nested_error, dict):
+                nested_message = nested_error.get("message")
+                if isinstance(nested_message, str) and nested_message.strip():
+                    nested_message = nested_message.strip()
+                    if nested_message != raw_message:
+                        return [f"[error] {nested_message}", f"[error] payload: {raw_message}"]
+        return [f"[error] {raw_message}"]
+
+    rendered = json.dumps(message, ensure_ascii=True) if isinstance(message, (dict, list)) else str(message)
+    rendered = rendered.strip()
+    return [f"[error] {rendered}" if rendered else "[error]"]
+
+
 def _build_step_timeline(entries: list[dict]) -> list[dict]:
     """Build step-first timeline model from mixed historical log entry shapes."""
     steps: list[dict] = []
@@ -530,6 +555,9 @@ class _LiveLogPrinter:
             message = entry.get("message", "")
             if isinstance(message, str) and message:
                 self._console.print(rich_escape(message), soft_wrap=True)
+        elif entry_type == "error":
+            for line in _error_lines(entry.get("message", "")):
+                self._fmt.print_error(line)
 
     def _print_tool_use(self, content: dict) -> None:
         tool_name = content.get("name", "unknown")
@@ -701,6 +729,8 @@ def _format_log_entry(entry: dict) -> str | None:
         if subtype:
             return f"[{_lc()}]\\[gza:{rich_escape(subtype)}][/{_lc()}] {rich_escape(message)}"
         return f"[{_lc()}]\\[gza][/{_lc()}] {rich_escape(message)}"
+    elif entry_type == "error":
+        return "\n".join(f"[red]{rich_escape(line)}[/red]" for line in _error_lines(entry.get("message", "")))
     elif entry_type == "raw":
         message = entry.get("message", "")
         if message:
