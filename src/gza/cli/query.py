@@ -54,6 +54,7 @@ from ..pr_ops import lookup_task_pr
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
     TaskLineageNode,
+    _is_shared_branch_descendant as _query_is_shared_branch_descendant,
     build_lineage_tree as _build_lineage_tree_for_root,
     flatten_lineage_tree as _flatten_query_lineage_tree,
     get_code_changing_descendants_for_root as _get_code_changing_descendants_for_root_task,
@@ -1037,9 +1038,10 @@ def _unmerged_effective_fields(query: _TaskQuery) -> set[str]:
 
 
 def _resolve_unmerged_branch_owner(store: SqliteTaskStore, task: DbTask) -> DbTask:
-    if task_owns_merge_status(task):
-        return task
-    return _resolve_lineage_root_task(store, task)
+    lineage_root = _resolve_lineage_root_task(store, task)
+    if _query_is_shared_branch_descendant(task, lineage_root):
+        return lineage_root
+    return task
 
 
 def _subtree_fully_merged_on_other_branch(node: TaskLineageNode, owner_branch: str | None) -> bool:
