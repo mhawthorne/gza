@@ -66,16 +66,22 @@ Present the draft prompt and concerns clearly to the user.
 
 ## Step 4: Propose flags
 
-Based on the discussion, suggest the full `uv run gza add` command:
+Based on the discussion, suggest the full `uv run gza add` command. For any multi-line prompt, write the body to a tempfile (`Write` tool, e.g. `/tmp/gza-prompt-<short-name>.md`) and pass `--prompt-file`. Only inline as a positional arg for single-line prompts.
 
 ```
-uv run gza add [FLAGS] "prompt"
+# Single-line:
+uv run gza add [FLAGS] "short prompt"
+
+# Multi-line (the common case for drafted tasks):
+uv run gza add [FLAGS] --prompt-file /tmp/gza-prompt-<short-name>.md
 ```
+
+Do **not** use `"$(cat <<'EOF' ... EOF)"` to inline multi-line prompts — backticks, `$`, parens, and indented code blocks in the body break it, silently mangling the prompt or leaking the body to bash as commands. The tempfile path is always safe.
 
 Flags to consider:
 - `--type` — task (default), explore, plan, implement, review
 - `--review` — auto-create review task after implementation (for significant changes)
-- `--group NAME` — group related tasks together
+- `--tag TAG` — attach a tag to group with related tasks (repeatable)
 - `--depends-on ID` — task cannot start until another completes
 - `--based-on ID` — implementation draws from a previous task's output
 - No flag needed for simple tasks
@@ -87,14 +93,18 @@ Use AskUserQuestion to let the user review the draft:
 Options:
 - **Approve** — run `uv run gza add` as proposed
 - **Refine prompt** — let user provide corrections (ask what to change, then revise and re-present)
-- **Adjust flags** — type, group, or dependencies need changing (ask what, revise, re-present)
+- **Adjust flags** — type, tags, or dependencies need changing (ask what, revise, re-present)
 - **Split into multiple tasks** — break into smaller tasks (draft each separately)
 
 Repeat Steps 3–5 if refinement is needed.
 
 ## Step 6: Run uv run gza add
 
-Once approved, run the command. Show the created task ID and confirm type/group if set.
+Once approved:
+- For a multi-line prompt, `Write` it to `/tmp/gza-prompt-<short-name>.md` and run `uv run gza add ... --prompt-file <path>`.
+- For a single-line prompt, pass it as the positional arg.
+
+Show the created task ID and confirm type/tags if set.
 
 ## Important notes
 
