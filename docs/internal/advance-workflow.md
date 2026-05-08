@@ -136,14 +136,15 @@ The improve flow now defers recovery edge selection to the shared recovery engin
 | `advance_requires_review=true` AND `advance_create_reviews=false` | `skip` — user must run `gza review` manually |
 | `advance_requires_review=false` | `merge` |
 
-### 8. Failed task resumption
+### 8. Failed task recovery
 
-Failed task resume rules run in the same ordered rule engine.
+Failed task recovery rules run in the same ordered rule engine.
 
 | Condition | Action |
 |-----------|--------|
 | Failure is outside the fixed bounded shared policy (for example failed resume descendants or dropped recovery terminals) | `skip` |
-| Otherwise | `resume` — create resume task and spawn worker |
+| Shared failed-task recovery policy returns `resume` | `resume` — create resume task and spawn worker |
+| Shared failed-task recovery policy returns `retry` | `retry` — create retry task and spawn worker |
 
 ## Improve chain semantics
 
@@ -174,6 +175,7 @@ These actions create background workers and count toward the batch limit. The so
 | `run_improve` | Spawns worker for existing pending improve |
 | `create_implement` | Creates implement task for a plan, spawns worker |
 | `resume` | Creates resume task, spawns worker |
+| `retry` | Creates retry task, spawns worker |
 
 ### Direct actions
 
@@ -227,7 +229,7 @@ Rebase tasks need git identity for `git rebase --continue`. The Docker container
 
 ## Output
 
-For worker-spawning actions that first create a child task (`create_review`, `create_implement`, `resume`, `needs_rebase`), operator output must distinguish creation success from worker-launch failure. If creation succeeds but the background worker fails to start, `gza advance` should print both the created task ID and a separate `Failed to start ... worker` line rather than collapsing that state into `✗ Created ...`.
+For worker-spawning actions that first create or reuse a child task (`create_review`, `create_implement`, `resume`, `retry`, `needs_rebase`), operator output must distinguish task selection/creation success from worker-launch failure. If task creation succeeds, or if the executor reuses an existing eligible recovery task, but the background worker fails to start, `gza advance` should print the relevant created/reused task ID and a separate `Failed to start ... worker` line rather than collapsing that state into `✗ Created ...`.
 
 ```
 Will advance N task(s):
