@@ -24,6 +24,25 @@ RUNTIME_PATCH_FILENAMES = frozenset({"selected.runtime.patch"})
 
 _CODE_TASK_TYPES = {"task", "implement", "improve", "fix", "rebase"}
 _DIFF_RE = re.compile(r"^diff --git a/(.+) b/(.+)$")
+_PROMPT_SECTION_HEADERS = frozenset(
+    {
+        "source",
+        "operator intent",
+        "selected files",
+        "observed source diff metadata",
+        "original task prompt",
+        "source commit subjects",
+    }
+)
+_NON_OBJECTIVE_PROMPT_SECTIONS = frozenset(
+    {
+        "source",
+        "selected files",
+        "observed source diff metadata",
+        "source commit subjects",
+        "operator intent",
+    }
+)
 
 
 class ExtractionError(ValueError):
@@ -382,15 +401,50 @@ def _summarize_prompt_line(prompt: str | None) -> str | None:
 
     best_line: str | None = None
     best_score = float("-inf")
-    for raw_line in prompt.splitlines():
-        line = _normalize_prompt_candidate(raw_line)
-        if not line or _looks_like_prompt_section_header(line):
+    for line in _iter_prompt_objective_candidates(prompt):
+        if not line:
             continue
         score = _objective_specificity_score(line)
         if score > best_score:
             best_score = score
             best_line = line
     return best_line
+
+
+def _iter_prompt_objective_candidates(prompt: str) -> list[str]:
+    """Return prompt lines that can legitimately describe the extraction objective."""
+    candidates: list[str] = []
+    current_section = "title"
+
+    for raw_line in prompt.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        normalized_header = _normalize_prompt_header(stripped)
+        if normalized_header:
+            current_section = normalized_header
+            continue
+
+        if current_section in _NON_OBJECTIVE_PROMPT_SECTIONS:
+            continue
+
+        line = _normalize_prompt_candidate(raw_line)
+        if not line or _looks_like_prompt_section_header(line) or _looks_like_prompt_boilerplate(line):
+            continue
+
+        candidates.append(line)
+
+    return candidates
+
+
+def _normalize_prompt_header(value: str) -> str | None:
+    lowered = value.lower().rstrip(":")
+    if lowered in _PROMPT_SECTION_HEADERS:
+        return lowered
+    if lowered.startswith("selected files ("):
+        return "selected files"
+    return None
 
 
 def _humanize_identifier(value: str) -> str:
@@ -419,14 +473,17 @@ def _normalize_prompt_candidate(value: str) -> str:
 
 def _looks_like_prompt_section_header(line: str) -> bool:
     lowered = line.lower().rstrip(":")
-    return lowered in {
-        "source",
-        "operator intent",
-        "selected files",
-        "observed source diff metadata",
-        "original task prompt",
-        "source commit subjects",
-    }
+    return lowered in _PROMPT_SECTION_HEADERS
+
+
+def _looks_like_prompt_boilerplate(line: str) -> bool:
+    lowered = line.lower()
+    return lowered.startswith(
+        (
+            "source:",
+            "validate the seeded patch in this worktree",
+        )
+    )
 
 
 def _is_specific_objective(text: str | None) -> bool:

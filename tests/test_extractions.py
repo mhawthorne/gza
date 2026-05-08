@@ -319,6 +319,79 @@ def test_plan_extraction_task_source_prefers_specific_carry_over_prompt_over_gen
     assert not draft.prompt.startswith("Carry over: update runner module\n")
 
 
+def test_plan_extraction_task_source_generated_prompt_boilerplate_falls_back_to_diff_objective() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+        source_task_prompt=(
+            "Carry over: agent sessions\n\n"
+            "Source: task gza-999 (source task prompt).\n\n"
+            "Original task prompt:\n"
+            "Carry over: agent sessions\n\n"
+            "Selected files (1):\n"
+            "- src/agent_sessions.py\n\n"
+            "Observed source diff metadata:\n"
+            "- M: src/agent_sessions.py (+5/-1)\n\n"
+            "Validate the seeded patch in this worktree, finish any missing integration, run required verification, and produce the normal task summary.\n"
+        ),
+        source_task_slug="20260507-agent-sessions",
+    )
+    git.get_diff_name_status.return_value = "M\tsrc/agent_sessions.py\n"
+    git.get_diff_numstat.return_value = "5\t1\tsrc/agent_sessions.py\n"
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/src/agent_sessions.py b/src/agent_sessions.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/agent_sessions.py\n"
+        "+++ b/src/agent_sessions.py\n"
+        "@@ -1 +1,5 @@\n"
+        "+reuse_session = True\n"
+    )
+
+    draft = plan_extraction(git, source, ("src/agent_sessions.py",), operator_prompt=None)
+
+    assert draft.prompt.startswith("Carry over: update agent sessions module\n")
+    assert not draft.prompt.startswith("Carry over: Validate the seeded patch")
+
+
+def test_plan_extraction_task_source_generated_prompt_preserves_specific_original_objective() -> None:
+    git = MagicMock(spec=Git)
+    source = SourceSelection(
+        source_task_id="gza-1",
+        source_branch="feature/source",
+        source_base_ref="main",
+        source_task_prompt=(
+            "Carry over: agent sessions\n\n"
+            "Source: task gza-999 (source task prompt).\n\n"
+            "Original task prompt:\n"
+            "Implement session reuse for resumed agents.\n"
+            "Preserve existing session cleanup behavior.\n\n"
+            "Selected files (1):\n"
+            "- src/agent_sessions.py\n\n"
+            "Observed source diff metadata:\n"
+            "- M: src/agent_sessions.py (+5/-1)\n\n"
+            "Validate the seeded patch in this worktree, finish any missing integration, run required verification, and produce the normal task summary.\n"
+        ),
+        source_task_slug="20260507-agent-sessions",
+    )
+    git.get_diff_name_status.return_value = "M\tsrc/agent_sessions.py\n"
+    git.get_diff_numstat.return_value = "5\t1\tsrc/agent_sessions.py\n"
+    git.get_diff_patch_for_paths.return_value = (
+        "diff --git a/src/agent_sessions.py b/src/agent_sessions.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/agent_sessions.py\n"
+        "+++ b/src/agent_sessions.py\n"
+        "@@ -1 +1,5 @@\n"
+        "+reuse_session = True\n"
+    )
+
+    draft = plan_extraction(git, source, ("src/agent_sessions.py",), operator_prompt=None)
+
+    assert draft.prompt.startswith("Carry over: Implement session reuse for resumed agents\n")
+    assert not draft.prompt.startswith("Carry over: Validate the seeded patch")
+
+
 def test_plan_extraction_commit_source_preserves_commit_order() -> None:
     git = MagicMock(spec=Git)
     source = SourceSelection(
