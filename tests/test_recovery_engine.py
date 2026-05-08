@@ -926,6 +926,70 @@ def test_recovery_engine_prerequisite_unmerged_retries_after_dependency_merge(tm
     assert ready_decision.reason_code == "PREREQUISITE_UNMERGED"
 
 
+def test_recovery_engine_prerequisite_unmerged_uses_main_merge_context_target_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    store.mark_completed(dependency, has_commits=True, branch="feature/dep-main-ready")
+    assert dependency.id is not None
+
+    main_unit = store.get_or_create_merge_unit_for_task(dependency, "main")
+    release_unit = store.get_or_create_merge_unit_for_task(dependency, "release")
+    assert main_unit is not None
+    assert release_unit is not None
+    store.set_merge_unit_state(main_unit.id, "merged")
+    store.set_merge_unit_state(release_unit.id, "unmerged")
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    _stub_merge_context(monkeypatch, default_branch="main")
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+
+    assert decision.action == "retry"
+    assert decision.reason_code == "PREREQUISITE_UNMERGED"
+
+
+def test_recovery_engine_prerequisite_unmerged_uses_release_merge_context_target_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    store.mark_completed(dependency, has_commits=True, branch="feature/dep-release-blocked")
+    assert dependency.id is not None
+
+    main_unit = store.get_or_create_merge_unit_for_task(dependency, "main")
+    release_unit = store.get_or_create_merge_unit_for_task(dependency, "release")
+    assert main_unit is not None
+    assert release_unit is not None
+    store.set_merge_unit_state(main_unit.id, "merged")
+    store.set_merge_unit_state(release_unit.id, "unmerged")
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    _stub_merge_context(monkeypatch, default_branch="release")
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+
+    assert decision.action == "skip"
+    assert decision.reason_code == "dependency_not_ready"
+
+
 def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
     attempt = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)

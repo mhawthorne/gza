@@ -10,7 +10,7 @@ from typing import Literal
 
 from .config import Config, ConfigError
 from .db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
-from .dependency_preconditions import get_unmerged_dependency_precondition
+from .dependency_preconditions import get_unmerged_dependency_precondition, task_is_merged_for_target
 from .failed_task_ordering import sort_failed_tasks
 from .failure_policy import is_resumable_failure_reason
 from .git import Git, GitError
@@ -400,6 +400,11 @@ def _resolve_merged_target_task(store: SqliteTaskStore, task: DbTask) -> DbTask 
     return None
 
 
+def _effective_merge_target_branch(store: SqliteTaskStore) -> str | None:
+    merge_context = _load_merge_context(_project_dir_for_store(store))
+    return merge_context.default_branch or store.default_merge_target()
+
+
 def is_resolved_by_merged_target(store: SqliteTaskStore, task: DbTask) -> bool:
     """Return whether a failed side-quest task is obsolete because its target impl merged."""
     if task.id is None or task.status != "failed" or task.task_type not in _MERGED_TARGET_RESOLUTION_TYPES:
@@ -410,13 +415,7 @@ def is_resolved_by_merged_target(store: SqliteTaskStore, task: DbTask) -> bool:
     target_task = _resolve_merged_target_task(store, task)
     if target_task is None:
         return False
-    merge_context = _load_merge_context(_project_dir_for_store(store))
-    target_branch = merge_context.default_branch or store.default_merge_target()
-    if target_task.id is not None:
-        unit = store.resolve_merge_unit_for_task(target_task.id, target_branch)
-        if unit is not None:
-            return unit.state == "merged"
-    return target_task.merge_status == "merged"
+    return task_is_merged_for_target(store, target_task, _effective_merge_target_branch(store))
 
 
 def _load_merge_context(project_dir: Path | None = None) -> _MergeContext:
@@ -706,6 +705,7 @@ def decide_failed_task_recovery(
 
     reason = task.failure_reason or "UNKNOWN"
     if reason == "PREREQUISITE_UNMERGED":
+        effective_target_branch = _effective_merge_target_branch(store)
         if task.depends_on and store.resolve_dependency_completion(task) is None:
             return _skip_decision(
                 task_id=task_id,
@@ -714,7 +714,7 @@ def decide_failed_task_recovery(
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,
             )
-        if get_unmerged_dependency_precondition(store, task) is not None:
+        if get_unmerged_dependency_precondition(store, task, effective_target_branch) is not None:
             return _skip_decision(
                 task_id=task_id,
                 reason_code="dependency_not_ready",

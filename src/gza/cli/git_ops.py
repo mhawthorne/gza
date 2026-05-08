@@ -23,6 +23,7 @@ from ..console import (
     shorten_prompt,
 )
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from ..dependency_preconditions import task_is_merged_for_target
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import (
     Git,
@@ -86,6 +87,15 @@ from .advance_executor import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _task_is_already_merged_for_target(
+    store: SqliteTaskStore,
+    task: DbTask,
+    target_branch: str | None,
+) -> bool:
+    """Return whether the selected task is already merged for the effective target."""
+    return task_is_merged_for_target(store, task, target_branch)
 
 
 def _format_needs_attention_line(task: DbTask, action: dict[str, Any]) -> str:
@@ -1873,7 +1883,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
             else:
                 planning_task = resolve_recovery_planning_task(store, task)
                 if planning_task is not task:
-                    tasks = [planning_task] if planning_task.merge_status != 'merged' else []
+                    tasks = [planning_task] if not _task_is_already_merged_for_target(
+                        store, planning_task, default_branch
+                    ) else []
                     failed_tasks = []
                 else:
                     tasks = []
@@ -1882,7 +1894,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if task.status != 'completed':
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
                 return 1
-            if task.merge_status == 'merged':
+            if _task_is_already_merged_for_target(store, task, default_branch):
                 print(f"Task {task_id} is already merged")
                 return 0
             tasks = [task]

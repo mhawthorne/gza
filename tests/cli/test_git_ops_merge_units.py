@@ -59,6 +59,18 @@ class _MergeGit:
         return None
 
 
+class _AdvanceGit:
+    def __init__(self, *, default_branch: str = "main") -> None:
+        self.repo_dir = Path.cwd()
+        self._default_branch = default_branch
+
+    def current_branch(self) -> str:
+        return self._default_branch
+
+    def default_branch(self) -> str:
+        return self._default_branch
+
+
 def test_merge_all_deduplicates_same_branch_merge_unit(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -105,6 +117,78 @@ def test_collect_advance_completed_tasks_backfills_legacy_unmerged_owner(tmp_pat
     unit = store.resolve_merge_unit_for_task(legacy.id, "main")
     assert unit is not None
     assert unit.state == "unmerged"
+
+
+def test_advance_explicit_task_uses_default_target_merge_unit_over_stale_legacy_row(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Advance explicit task", task_type="implement")
+    store.mark_completed(task, has_commits=True, branch="feature/advance-explicit")
+    assert task.id is not None
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    refreshed.merge_status = "merged"
+    store.update(refreshed)
+
+    calls: list[str] = []
+
+    def _fake_determine_next_action(*args, **kwargs):
+        selected_task = args[3]
+        assert selected_task.id is not None
+        calls.append(selected_task.id)
+        return {"type": "skip", "description": "still actionable via merge unit"}
+
+    with (
+        patch("gza.cli.git_ops.Git", lambda _project_dir: _AdvanceGit()),
+        patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine_next_action),
+    ):
+        result = run_gza("advance", task.id, "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert f"Task {task.id} is already merged" not in result.stdout
+    assert calls == [task.id]
+
+
+def test_advance_failed_task_recovery_planning_uses_merge_unit_over_stale_legacy_row(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.branch = "feature/advance-recovery"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    recovery = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    store.mark_completed(recovery, has_commits=True, branch="feature/advance-recovery")
+    assert recovery.id is not None
+
+    refreshed_recovery = store.get(recovery.id)
+    assert refreshed_recovery is not None
+    refreshed_recovery.merge_status = "merged"
+    store.update(refreshed_recovery)
+
+    calls: list[str] = []
+
+    def _fake_determine_next_action(*args, **kwargs):
+        selected_task = args[3]
+        assert selected_task.id is not None
+        calls.append(selected_task.id)
+        return {"type": "skip", "description": "recovery descendant still actionable via merge unit"}
+
+    with (
+        patch("gza.cli.git_ops.Git", lambda _project_dir: _AdvanceGit()),
+        patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine_next_action),
+    ):
+        result = run_gza("advance", failed.id, "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert f"Task {failed.id} is already merged" not in result.stdout
+    assert calls == [recovery.id]
 
 
 def test_merge_review_task_id_resolves_branchless_review_to_implementation_unit(tmp_path: Path) -> None:
