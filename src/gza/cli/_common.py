@@ -523,15 +523,29 @@ def _run_foreground(
         invocation: Optional runner invocation context.
     """
     registry = WorkerRegistry(config.workers_path)
-    worker_id = registry.generate_worker_id()
-
-    worker = WorkerMetadata(
-        worker_id=worker_id,
-        task_id=task_id,
-        pid=os.getpid(),
-        is_background=False,
-    )
-    registry.register(worker)
+    worker_id = os.environ.get("GZA_WORKER_ID")
+    worker_mode = os.environ.get("GZA_WORKER_MODE")
+    worker = None
+    reuse_existing_worker = False
+    if worker_id and worker_mode == "1":
+        worker = registry.ensure_running(
+            WorkerMetadata(
+                worker_id=worker_id,
+                task_id=task_id,
+                pid=os.getpid(),
+                is_background=False,
+            )
+        )
+        reuse_existing_worker = True
+    if worker is None:
+        worker_id = registry.generate_worker_id()
+        worker = WorkerMetadata(
+            worker_id=worker_id,
+            task_id=task_id,
+            pid=os.getpid(),
+            is_background=False,
+        )
+        registry.register(worker)
 
     # Save original signal handlers so we can restore them in the finally block
     original_sigint = signal.getsignal(signal.SIGINT)
@@ -555,7 +569,8 @@ def _run_foreground(
         if resume and task_id is not None:
             rebase_exit_code = _auto_rebase_before_resume(config, task_id)
             if rebase_exit_code != 0:
-                registry.mark_completed(worker_id, exit_code=rebase_exit_code, status="failed")
+                if not reuse_existing_worker:
+                    registry.mark_completed(worker.worker_id, exit_code=rebase_exit_code, status="failed")
                 return rebase_exit_code
         if invocation is None:
             exit_code = run(
@@ -575,10 +590,12 @@ def _run_foreground(
                 invocation=invocation,
             )
         status = "completed" if exit_code == 0 else "failed"
-        registry.mark_completed(worker_id, exit_code=exit_code, status=status)
+        if not reuse_existing_worker:
+            registry.mark_completed(worker.worker_id, exit_code=exit_code, status=status)
         return exit_code
     except KeyboardInterrupt:
-        registry.mark_completed(worker_id, exit_code=130, status="failed")
+        if not reuse_existing_worker:
+            registry.mark_completed(worker.worker_id, exit_code=130, status="failed")
         return 130
     finally:
         signal.signal(signal.SIGINT, original_sigint)
@@ -810,7 +827,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
             startup_log_file=startup_log_rel,
             tmux_session=tmux_session,
         )
-        registry.register(worker_metadata)
+        registry.ensure_running(worker_metadata)
 
         _print_background_worker_started(selected_task, pid=pid, quiet=quiet, resume=resume_mode)
 
@@ -855,6 +872,14 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
     startup_task: DbTask | None = None
     startup_header_written = False
     explicit_task_id = args.task_ids[0] if hasattr(args, "task_ids") and args.task_ids else None
+    if worker_id:
+        registry.ensure_running(
+            WorkerMetadata(
+                worker_id=worker_id,
+                task_id=explicit_task_id,
+                pid=os.getpid(),
+            )
+        )
     if explicit_task_id is None and worker_id:
         meta = registry.get(worker_id)
         if meta and meta.task_id is not None:
@@ -1021,7 +1046,7 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
             pid=proc.pid,
             startup_log_file=startup_log_rel,
         )
-        registry.register(worker)
+        registry.ensure_running(worker)
 
         _print_background_worker_started(task, pid=proc.pid, quiet=quiet, resume=True)
 
@@ -1079,7 +1104,7 @@ def _spawn_background_iterate_worker(
             pid=proc.pid,
             startup_log_file=startup_log_rel,
         )
-        registry.register(worker)
+        registry.ensure_running(worker)
         _print_background_worker_started(impl_task, pid=proc.pid, quiet=quiet)
         return 0
     except Exception as e:

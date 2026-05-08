@@ -17,7 +17,7 @@ from gza.config import Config
 from gza.db import SqliteTaskStore, task_id_numeric_key
 from gza.git import Git
 from gza.query import build_lineage_tree
-from gza.workers import WorkerRegistry
+from gza.workers import WorkerMetadata, WorkerRegistry
 
 from .conftest import (
     get_latest_task,
@@ -10421,6 +10421,66 @@ class TestRunForeground:
         assert w.status == "failed"
         assert w.exit_code == 130
 
+    def test_run_foreground_reuses_registered_worker_context_without_new_registration(self, tmp_path: Path):
+        """Nested worker-mode runs should reuse the existing worker entry and only update task_id."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        first = store.add("First nested task")
+        second = store.add("Second nested task")
+        assert first.id is not None
+        assert second.id is not None
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-nested-iterate",
+                task_id=first.id,
+                pid=os.getpid(),
+                status="running",
+                startup_log_file="w-nested-iterate-startup.log",
+            )
+        )
+
+        with (
+            patch.dict(os.environ, {"GZA_WORKER_ID": "w-nested-iterate", "GZA_WORKER_MODE": "1"}, clear=False),
+            patch("gza.cli.run", return_value=0) as mock_run,
+        ):
+            assert _run_foreground(config, task_id=first.id) == 0
+            assert _run_foreground(config, task_id=second.id) == 0
+
+        assert mock_run.call_count == 2
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        worker = workers[0]
+        assert worker.worker_id == "w-nested-iterate"
+        assert worker.status == "running"
+        assert worker.task_id == second.id
+        assert worker.exit_code is None
+
+    def test_run_foreground_worker_mode_without_existing_metadata_reuses_passed_worker_id(self, tmp_path: Path):
+        """Worker-mode foreground fallback must claim the provided worker_id instead of generating a new one."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Nested worker without parent metadata")
+        assert task.id is not None
+
+        with (
+            patch.dict(os.environ, {"GZA_WORKER_ID": "w-missing-parent-meta", "GZA_WORKER_MODE": "1"}, clear=False),
+            patch("gza.cli.run", return_value=0),
+        ):
+            assert _run_foreground(config, task_id=task.id) == 0
+
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        worker = workers[0]
+        assert worker.worker_id == "w-missing-parent-meta"
+        assert worker.status == "running"
+        assert worker.task_id == task.id
+        assert worker.exit_code is None
+
     def test_run_foreground_signal_calls_mark_completed_once(self, tmp_path: Path):
         """Signal delivery via _cleanup raises KeyboardInterrupt; mark_completed is called exactly once."""
         import signal as signal_mod
@@ -10778,6 +10838,244 @@ class TestForegroundInvocationContextWiring:
 
         assert rc == 0
         assert run_foreground.call_count == 1
+
+    def test_cmd_iterate_worker_id_marks_completed_on_same_registry_entry(self, tmp_path: Path):
+        from unittest.mock import MagicMock
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Iterate pending implementation", task_type="implement")
+        assert impl.id is not None
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-iterate-process",
+                task_id=impl.id,
+                pid=os.getpid(),
+                status="running",
+                startup_log_file="w-iterate-process-startup.log",
+            )
+        )
+
+        def fake_run(_config, task_id, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            invocation = kwargs["invocation"]
+            assert invocation.command == "iterate"
+            assert invocation.execution_mode == "foreground_worker"
+            task.status = "completed"
+            task.branch = "testproject/20260101-impl"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id="w-iterate-process",
+        )
+
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.run", side_effect=fake_run),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                side_effect=[
+                    {"type": "merge", "description": "merge ready"},
+                    {"type": "merge", "description": "merge ready"},
+                ],
+            ),
+        ):
+            rc = cmd_iterate(args)
+
+        assert rc == 0
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        worker = workers[0]
+        assert worker.worker_id == "w-iterate-process"
+        assert worker.status == "completed"
+        assert worker.exit_code == 0
+        assert worker.task_id == impl.id
+
+    def test_background_iterate_spawned_worker_completes_single_registry_entry(self, tmp_path: Path):
+        from unittest.mock import MagicMock
+
+        from gza.cli._common import _spawn_background_iterate_worker
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Iterate pending implementation", task_type="implement")
+        assert impl.id is not None
+
+        spawn_args = argparse.Namespace(
+            no_docker=True,
+            force=False,
+        )
+        iterate_args = argparse.Namespace(
+            project_dir=tmp_path,
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        captured_worker_id: str | None = None
+
+        def fake_spawn(_cmd: list[str], _config: Config, worker_id: str):
+            nonlocal captured_worker_id
+            captured_worker_id = worker_id
+            startup_log = f".gza/workers/{worker_id}-startup.log"
+            mock_proc = MagicMock()
+            mock_proc.pid = os.getpid()
+            return mock_proc, startup_log
+
+        def fake_run(_config, task_id, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            invocation = kwargs["invocation"]
+            assert invocation.command == "iterate"
+            assert invocation.execution_mode == "foreground_worker"
+            task.status = "completed"
+            task.branch = "testproject/20260101-impl"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with patch("gza.cli._common._spawn_detached_worker_process", side_effect=fake_spawn):
+            rc = _spawn_background_iterate_worker(spawn_args, config, impl, max_iterations=1)
+
+        assert rc == 0
+        assert captured_worker_id is not None
+        iterate_args.worker_id = captured_worker_id
+
+        with (
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.run", side_effect=fake_run),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                side_effect=[
+                    {"type": "merge", "description": "merge ready"},
+                    {"type": "merge", "description": "merge ready"},
+                ],
+            ),
+        ):
+            rc = cmd_iterate(iterate_args)
+
+        assert rc == 0
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        worker = workers[0]
+        assert worker.worker_id == captured_worker_id
+        assert worker.pid == os.getpid()
+        assert worker.status == "completed"
+        assert worker.exit_code == 0
+        assert worker.task_id == impl.id
+
+    def test_background_iterate_child_before_parent_register_keeps_single_terminal_entry(self, tmp_path: Path):
+        from unittest.mock import MagicMock
+
+        from gza.cli._common import _spawn_background_iterate_worker
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Iterate child-before-parent-register", task_type="implement")
+        assert impl.id is not None
+
+        spawn_args = argparse.Namespace(
+            no_docker=True,
+            force=False,
+        )
+        iterate_args = argparse.Namespace(
+            project_dir=tmp_path,
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        def fake_run(_config, task_id, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            invocation = kwargs["invocation"]
+            assert invocation.command == "iterate"
+            assert invocation.execution_mode == "foreground_worker"
+            task.status = "completed"
+            task.branch = "testproject/20260101-impl"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        def fake_spawn(_cmd: list[str], _config: Config, worker_id: str):
+            iterate_args.worker_id = worker_id
+            with (
+                patch("gza.cli.get_store", return_value=store),
+                patch("gza.cli.Git", return_value=mock_git),
+                patch("gza.cli.run", side_effect=fake_run),
+                patch(
+                    "gza.cli.execution.determine_next_action",
+                    side_effect=[
+                        {"type": "merge", "description": "merge ready"},
+                        {"type": "merge", "description": "merge ready"},
+                    ],
+                ),
+            ):
+                assert cmd_iterate(iterate_args) == 0
+            mock_proc = MagicMock()
+            mock_proc.pid = os.getpid()
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
+
+        with patch("gza.cli._common._spawn_detached_worker_process", side_effect=fake_spawn):
+            rc = _spawn_background_iterate_worker(spawn_args, config, impl, max_iterations=1)
+
+        assert rc == 0
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        worker = workers[0]
+        assert worker.worker_id == iterate_args.worker_id
+        assert worker.status == "completed"
+        assert worker.exit_code == 0
+        assert worker.task_id == impl.id
 
 
 class TestRunAsWorker:

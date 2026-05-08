@@ -98,6 +98,63 @@ def _foreground_command_invocation(command: str) -> RunInvocationContext:
     )
 
 
+def _run_with_registered_worker(
+    *,
+    config: Config,
+    worker_id: str | None,
+    run_command: Any,
+) -> int:
+    """Run a command inside an already-registered worker process."""
+    if not worker_id:
+        return run_command()
+
+    registry = WorkerRegistry(config.workers_path)
+    previous_worker_id = os.environ.get("GZA_WORKER_ID")
+    previous_worker_mode = os.environ.get("GZA_WORKER_MODE")
+    original_sigint = signal.getsignal(signal.SIGINT)
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+    registry.ensure_running(
+        WorkerMetadata(
+            worker_id=worker_id,
+            task_id=None,
+            pid=os.getpid(),
+        )
+    )
+
+    def _signal_handler(signum, frame):
+        del signum, frame
+        registry.mark_completed(worker_id, exit_code=1, status="failed")
+        sys.exit(1)
+
+    os.environ["GZA_WORKER_ID"] = worker_id
+    os.environ["GZA_WORKER_MODE"] = "1"
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    try:
+        rc = run_command()
+        registry.mark_completed(
+            worker_id,
+            exit_code=rc,
+            status="completed" if rc == 0 else "failed",
+        )
+        return rc
+    except Exception:
+        registry.mark_completed(worker_id, exit_code=1, status="failed")
+        raise
+    finally:
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
+        if previous_worker_id is None:
+            os.environ.pop("GZA_WORKER_ID", None)
+        else:
+            os.environ["GZA_WORKER_ID"] = previous_worker_id
+        if previous_worker_mode is None:
+            os.environ.pop("GZA_WORKER_MODE", None)
+        else:
+            os.environ["GZA_WORKER_MODE"] = previous_worker_mode
+
+
 def _selected_tag_filters(args: argparse.Namespace) -> tuple[tuple[str, ...] | None, bool]:
     return parse_cli_tag_filters(args)
 
@@ -1890,12 +1947,8 @@ class _AdvanceEngineConfigAdapter:
     max_resume_attempts: int
 
 
-def cmd_iterate(args: argparse.Namespace) -> int:
+def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     """Run an automated lifecycle loop for an implementation task."""
-    config = Config.load(args.project_dir)
-    if hasattr(args, 'no_docker') and args.no_docker:
-        config.use_docker = False
-
     store = get_store(config)
     def _int_config(value: object, default: int) -> int:
         return value if isinstance(value, int) else default
@@ -2809,6 +2862,19 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         return 3
     print(f"Iterate blocked: {final_stop_reason}. Manual review required.")
     return 3
+
+
+def cmd_iterate(args: argparse.Namespace) -> int:
+    """Run an automated lifecycle loop for an implementation task."""
+    config = Config.load(args.project_dir)
+    if hasattr(args, 'no_docker') and args.no_docker:
+        config.use_docker = False
+
+    return _run_with_registered_worker(
+        config=config,
+        worker_id=getattr(args, "worker_id", None),
+        run_command=lambda: _cmd_iterate_impl(args, config),
+    )
 
 
 def cmd_resume(args: argparse.Namespace) -> int:

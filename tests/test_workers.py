@@ -296,6 +296,35 @@ def test_registry_mark_completed(temp_workers_dir):
     assert not pid_file.exists()
 
 
+def test_registry_ensure_running_preserves_terminal_status(temp_workers_dir):
+    """Late parent registration must not revert a completed child entry to running."""
+    registry = WorkerRegistry(temp_workers_dir)
+    child_worker = WorkerMetadata(
+        worker_id="w-race-terminal",
+        pid=12347,
+        task_id="gza-3",
+        started_at=datetime.now(UTC).isoformat(),
+        status="running",
+    )
+    registry.register(child_worker)
+    registry.mark_completed("w-race-terminal", exit_code=0, status="completed")
+
+    registry.ensure_running(
+        WorkerMetadata(
+            worker_id="w-race-terminal",
+            pid=12347,
+            task_id="gza-3",
+            startup_log_file=".gza/workers/w-race-terminal-startup.log",
+        )
+    )
+
+    retrieved = registry.get("w-race-terminal")
+    assert retrieved is not None
+    assert retrieved.status == "completed"
+    assert retrieved.exit_code == 0
+    assert retrieved.startup_log_file == ".gza/workers/w-race-terminal-startup.log"
+
+
 def test_registry_remove(temp_workers_dir):
     """Test removing a worker."""
     registry = WorkerRegistry(temp_workers_dir)

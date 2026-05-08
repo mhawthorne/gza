@@ -115,6 +115,71 @@ class WorkerRegistry:
         metadata_path.write_text(json.dumps(worker.to_dict(), indent=2))
         self._pid_path(worker.worker_id).write_text(str(worker.pid))
 
+    def ensure_running(self, worker: WorkerMetadata) -> WorkerMetadata:
+        """Ensure a worker ID is tracked as a single running registry entry.
+
+        If the entry is missing, it is created. If a running entry already exists,
+        it is updated in place. If the entry already reached a terminal state, that
+        terminal state is preserved so later parent bookkeeping cannot regress it.
+        """
+        if worker.pid <= 0:
+            raise ValueError(f"Cannot register worker with non-positive pid: {worker.pid}")
+        if worker.started_at is None:
+            worker.started_at = datetime.now(UTC).isoformat()
+
+        existing = self.get(worker.worker_id)
+        if existing is None:
+            self.register(worker)
+            return worker
+
+        if existing.status in ("completed", "failed"):
+            changed = False
+            if existing.task_id is None and worker.task_id is not None:
+                existing.task_id = worker.task_id
+                changed = True
+            if existing.task_slug is None and worker.task_slug is not None:
+                existing.task_slug = worker.task_slug
+                changed = True
+            if existing.log_file is None and worker.log_file is not None:
+                existing.log_file = worker.log_file
+                changed = True
+            if existing.worktree is None and worker.worktree is not None:
+                existing.worktree = worker.worktree
+                changed = True
+            if existing.startup_log_file is None and worker.startup_log_file is not None:
+                existing.startup_log_file = worker.startup_log_file
+                changed = True
+            if existing.tmux_session is None and worker.tmux_session is not None:
+                existing.tmux_session = worker.tmux_session
+                changed = True
+            if changed:
+                self.update(existing)
+            return existing
+
+        existing.pid = worker.pid
+        if worker.task_id is not None:
+            existing.task_id = worker.task_id
+        if worker.task_slug is not None:
+            existing.task_slug = worker.task_slug
+        if worker.log_file is not None:
+            existing.log_file = worker.log_file
+        if worker.worktree is not None:
+            existing.worktree = worker.worktree
+        if worker.startup_log_file is not None:
+            existing.startup_log_file = worker.startup_log_file
+        existing.is_background = worker.is_background
+        if worker.tmux_session is not None:
+            existing.tmux_session = worker.tmux_session
+        if existing.started_at is None:
+            existing.started_at = worker.started_at
+        existing.status = "running"
+        existing.exit_code = None
+        existing.completion_reason = None
+        existing.completed_at = None
+        self.update(existing)
+        self._pid_path(worker.worker_id).write_text(str(existing.pid))
+        return existing
+
     def update(self, worker: WorkerMetadata) -> None:
         self._metadata_path(worker.worker_id).write_text(json.dumps(worker.to_dict(), indent=2))
 
