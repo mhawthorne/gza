@@ -196,24 +196,7 @@ class ClaudeLogRenderer:
 
     def _render_assistant(self, entry: dict[str, Any], *, live: bool, tv: bool) -> RenderedLines:
         message = entry.get("message", {})
-        starts_step = False
         message_id = message.get("id") if isinstance(message, dict) else None
-        if isinstance(message_id, str) and message_id and message_id not in self._seen_message_ids:
-            self._seen_message_ids.add(message_id)
-            self.stats.step_count += 1
-            starts_step = True
-            usage = message.get("usage", {}) if isinstance(message, dict) else {}
-            if isinstance(usage, dict):
-                self.stats.input_tokens += int(usage.get("input_tokens", 0) or 0)
-                self.stats.input_tokens += int(usage.get("cache_creation_input_tokens", 0) or 0)
-                self.stats.input_tokens += int(usage.get("cache_read_input_tokens", 0) or 0)
-                self.stats.output_tokens += int(usage.get("output_tokens", 0) or 0)
-                self.stats.cost_usd = calculate_cost(
-                    self.stats.input_tokens,
-                    self.stats.output_tokens,
-                    self._provider_model or self.configured_model or "",
-                )
-
         log_lines: list[str] = []
         tv_lines: list[str] = []
         text_found = False
@@ -243,6 +226,28 @@ class ClaudeLogRenderer:
             elif item:
                 unknown_block_found = True
 
+        starts_step = False
+        if isinstance(message_id, str) and message_id:
+            if message_id not in self._seen_message_ids:
+                self._seen_message_ids.add(message_id)
+                starts_step = True
+        elif text_found or tool_found or unknown_block_found:
+            starts_step = True
+
+        if starts_step:
+            self.stats.step_count += 1
+            usage = message.get("usage", {}) if isinstance(message, dict) else {}
+            if isinstance(usage, dict):
+                self.stats.input_tokens += int(usage.get("input_tokens", 0) or 0)
+                self.stats.input_tokens += int(usage.get("cache_creation_input_tokens", 0) or 0)
+                self.stats.input_tokens += int(usage.get("cache_read_input_tokens", 0) or 0)
+                self.stats.output_tokens += int(usage.get("output_tokens", 0) or 0)
+                self.stats.cost_usd = calculate_cost(
+                    self.stats.input_tokens,
+                    self.stats.output_tokens,
+                    self._provider_model or self.configured_model or "",
+                )
+
         if not text_found and not tool_found:
             if unknown_block_found:
                 rendered = self._render_unknown(entry, tv=tv)
@@ -253,12 +258,7 @@ class ClaudeLogRenderer:
         return RenderedLines(log_lines=log_lines, tv_lines=tv_lines, starts_step=starts_step)
 
     def _is_routine_system_event(self, entry: dict[str, Any]) -> bool:
-        subtype = str(entry.get("subtype") or "")
-        if subtype != "metadata":
-            return False
-        if self._has_error_signal(entry):
-            return False
-        return True
+        return not self._has_error_signal(entry)
 
     def _has_error_signal(self, entry: dict[str, Any]) -> bool:
         error_value = entry.get("error")

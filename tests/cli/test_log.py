@@ -882,6 +882,44 @@ class TestLogCommand:
         assert "[S1.1] tool_call Bash ls -la" in result.stdout
         assert "[Step S2] Listed files." in result.stdout
 
+    def test_log_steps_keeps_unknown_provider_events_visible(self, tmp_path: Path):
+        """--steps should surface unknown provider events through renderer fallbacks."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Unknown event timeline task")
+        task.status = "completed"
+        task.provider = "claude"
+        task.provider_is_explicit = True
+        task.log_file = ".gza/logs/test.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "test.log").write_text(
+            "\n".join(
+                json.dumps(line)
+                for line in [
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg_1",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Investigating"}],
+                        },
+                    },
+                    {"type": "mystery", "message": "still visible in timeline", "alpha": 1},
+                ]
+            )
+        )
+
+        result = run_gza("log", str(task.id), "--steps-verbose", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "[Step S1] Investigating" in result.stdout
+        assert "[S1.1] [event:mystery]" in result.stdout
+        assert "message=still visible in timeline" in result.stdout
+
     def test_log_by_task_id_invalid_format(self, tmp_path: Path):
         """Log command rejects non-decimal full-ID formats."""
         setup_config(tmp_path)
@@ -1429,6 +1467,32 @@ class TestBuildStepTimeline:
         steps = _build_step_timeline(entries)
         assert len(steps) == 1
         assert steps[0]["message_text"] == "[gza:info] Task: #1 slug"
+
+    def test_claude_timeline_uses_renderer_step_boundaries(self) -> None:
+        """Timeline step starts should follow renderer starts_step behavior."""
+        entries = [
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_unknown",
+                    "content": [{"type": "new_block", "payload": "visible"}],
+                },
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_text",
+                    "content": [{"type": "text", "text": "Second step"}],
+                },
+            },
+        ]
+
+        steps = _build_step_timeline(entries, provider="claude")
+
+        assert len(steps) == 2
+        assert steps[0]["message_text"].startswith("[event:assistant]")
+        assert "new_block" in steps[0]["message_text"]
+        assert steps[1]["message_text"] == "Second step"
 
 
 def test_live_log_printer_uses_formatter_console_for_stream_output(monkeypatch: pytest.MonkeyPatch) -> None:

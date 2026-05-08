@@ -2,10 +2,12 @@
 
 import argparse
 import json
+import re
 import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from rich.markup import escape as rich_escape
 
@@ -17,14 +19,12 @@ from ..colors import (
     pink,
 )
 from ..config import Config
-from ..console import console, format_duration, truncate
+from ..console import console, format_duration
 from ..db import SqliteTaskStore, Task as DbTask
 from ..providers.log_renderers import get_log_renderer
 from ..providers.log_rendering import (
-    error_lines as provider_error_lines,
     message_content_items as provider_message_content_items,
     result_step_count as provider_result_step_count,
-    summarize_tool_detail as provider_summarize_tool_detail,
 )
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
@@ -45,11 +45,6 @@ def _lc() -> str:
 def _result_step_count(result_entry: dict) -> int | None:
     """Resolve a result entry's step count using step-first fallback."""
     return provider_result_step_count(result_entry)
-
-
-def _summarize_tool_detail(tool_name: str, tool_input: dict) -> str:
-    """Build a compact one-line tool summary for timeline rendering."""
-    return provider_summarize_tool_detail(tool_name, tool_input)
 
 
 def _append_timeline_step(steps: list[dict], message_text: str | None, summary: str | None = None) -> dict:
@@ -91,135 +86,106 @@ def _message_content_items(entry: dict) -> list[dict]:
     return provider_message_content_items(entry)
 
 
-def _error_lines(message: object) -> list[str]:
-    """Format provider error payloads for readable log display."""
-    return provider_error_lines(message)
+_RICH_STYLE_TAG_RE = re.compile(r"\[/?[a-zA-Z0-9_#]+\]")
 
 
-def _build_step_timeline(entries: list[dict]) -> list[dict]:
-    """Build step-first timeline model from mixed historical log entry shapes."""
+def _strip_timeline_markup(line: str) -> str:
+    """Remove renderer Rich style tags while preserving literal bracketed content."""
+    return _RICH_STYLE_TAG_RE.sub("", line).replace("\\[", "[").replace("\\]", "]").strip()
+
+
+def _timeline_detail_from_log_line(entry: dict, line: str) -> str:
+    """Normalize renderer log output into timeline detail text."""
+    cleaned = _strip_timeline_markup(line)
+    if not cleaned:
+        return ""
+
+    if cleaned.startswith("[tool: "):
+        header, _, detail = cleaned.partition("] ")
+        tool_name = header.removeprefix("[tool: ").rstrip("]")
+        item: dict[str, object] = {}
+        if isinstance(entry.get("item"), dict):
+            item = cast(dict[str, object], entry["item"])
+        if entry.get("type") == "item.completed" and item.get("type") == "command_execution":
+            return f"tool_call {tool_name} {detail}".strip()
+        return f"tool_call {detail or tool_name}".strip()
+
+    if entry.get("type") == "user":
+        message = entry.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict) or item.get("type") != "tool_result":
+                        continue
+                    prefix = "tool_error" if item.get("is_error", False) else "tool_output"
+                    return f"{prefix} {cleaned}".strip()
+
+    if entry.get("type") == "item.completed":
+        item_payload = entry.get("item")
+        if isinstance(item_payload, dict) and item_payload.get("type") == "command_execution":
+            exit_code = item_payload.get("exit_code")
+            prefix = "tool_error" if isinstance(exit_code, int) and exit_code != 0 else "tool_output"
+            return f"{prefix} {cleaned}".strip()
+
+    if entry.get("type") in {"tool_output", "tool_error", "tool_retry"}:
+        return f"{entry['type']} {cleaned}".strip()
+
+    return cleaned
+
+
+def _build_step_timeline(
+    entries: list[dict],
+    *,
+    provider: str | None = None,
+    configured_model: str | None = None,
+) -> list[dict]:
+    """Build a step-first timeline from provider renderer output."""
     steps: list[dict] = []
     current_step: dict | None = None
+    renderer = get_log_renderer(provider, configured_model=configured_model, verbose=False)
 
     for entry in entries:
         entry_type = entry.get("type")
+        if entry_type == "gza" and entry.get("subtype") in {"branch", "stats", "outcome"}:
+            continue
 
-        if entry_type == "assistant":
-            content_items = _message_content_items(entry)
-            text_chunks: list[str] = []
-            tool_items: list[dict] = []
-            for item in content_items:
-                item_type = item.get("type")
-                if item_type == "text":
-                    text = item.get("text")
-                    if isinstance(text, str) and text.strip():
-                        text_chunks.append(text.strip())
-                elif item_type == "tool_use":
-                    tool_items.append(item)
+        rendered = renderer.handle_log(entry, live=False)
+        details = [_timeline_detail_from_log_line(entry, line) for line in rendered.log_lines]
+        details = [detail for detail in details if detail]
 
-            if text_chunks:
-                current_step = _append_timeline_step(steps, "\n".join(text_chunks))
-            elif tool_items:
-                current_step = _ensure_current_step(steps, current_step)
+        if entry_type in {"gza", "raw"} and details:
+            current_step = _append_timeline_step(steps, details[0])
+            for detail in details[1:]:
+                _append_substep(current_step, detail)
+            continue
 
-            for item in tool_items:
-                if current_step is None:
-                    current_step = _ensure_current_step(steps, current_step)
-                tool_name = str(item.get("name", "unknown"))
-                tool_input = item.get("input", {})
-                if not isinstance(tool_input, dict):
-                    tool_input = {}
-                _append_substep(current_step, f"tool_call {_summarize_tool_detail(tool_name, tool_input)}")
+        if rendered.starts_step:
+            message_text = details[0] if details else None
+            current_step = _append_timeline_step(steps, message_text)
+            for detail in details[1:]:
+                _append_substep(current_step, detail)
+            continue
 
-        elif entry_type == "user":
-            content_items = _message_content_items(entry)
-            for item in content_items:
-                if item.get("type") != "tool_result":
-                    continue
-                current_step = _ensure_current_step(steps, current_step)
-                is_error = bool(item.get("is_error", False))
-                result_type = "tool_error" if is_error else "tool_output"
-                content = item.get("content", "")
-                if isinstance(content, str):
-                    detail = truncate(content.replace("\\n", "\n"), 120)
-                else:
-                    detail = truncate(json.dumps(content, ensure_ascii=True), 120)
-                _append_substep(current_step, f"{result_type} {detail}".strip())
+        if not details:
+            continue
 
-        elif entry_type == "message":
-            role = entry.get("role")
-            if role == "user":
-                current_step = None
-                continue
-            if role == "assistant":
-                content = entry.get("content", "")
-                if isinstance(content, str) and content.strip() and not entry.get("delta"):
-                    current_step = _append_timeline_step(steps, content.strip())
-
-        elif entry_type == "tool_use":
-            current_step = _ensure_current_step(steps, current_step)
-            tool_name = str(entry.get("tool_name", "unknown"))
-            tool_input = entry.get("tool_input", {})
-            if not isinstance(tool_input, dict):
-                tool_input = {}
-            _append_substep(current_step, f"tool_call {_summarize_tool_detail(tool_name, tool_input)}")
-
-        elif entry_type in {"tool_output", "tool_error", "tool_retry"}:
-            current_step = _ensure_current_step(steps, current_step)
-            payload = {
-                key: value
-                for key, value in entry.items()
-                if key not in {"type", "id", "call_id"}
-            }
-            detail = truncate(json.dumps(payload, ensure_ascii=True), 120)
-            _append_substep(current_step, f"{entry_type} {detail}".strip())
-
-        elif entry_type == "turn.started":
-            current_step = None
-
-        elif entry_type == "gza":
-            subtype = entry.get("subtype", "")
-            if subtype in ("branch", "stats", "outcome"):
-                pass  # metadata only — skip timeline
-            else:
-                message = entry.get("message", "")
-                if message:
-                    label = f"[gza:{subtype}] {message}" if subtype else f"[gza] {message}"
-                    current_step = _append_timeline_step(steps, label)
-
-        elif entry_type == "item.completed":
-            item = entry.get("item", {})
-            if not isinstance(item, dict):
-                continue
-            item_type = item.get("type")
-            if item_type == "agent_message":
-                text = item.get("text")
-                if isinstance(text, str) and text.strip():
-                    current_step = _append_timeline_step(steps, text.strip())
-            elif item_type == "command_execution":
-                current_step = _ensure_current_step(steps, current_step)
-                command = truncate(str(item.get("command", "")), 100)
-                _append_substep(current_step, f"tool_call Bash {command}".strip())
-                if "aggregated_output" in item or "exit_code" in item:
-                    exit_code = item.get("exit_code")
-                    is_error = isinstance(exit_code, int) and exit_code != 0
-                    substep_type = "tool_error" if is_error else "tool_output"
-                    output = str(item.get("aggregated_output", ""))
-                    _append_substep(
-                        current_step,
-                        f"{substep_type} {truncate(output, 120)}".strip(),
-                    )
-        elif entry_type == "raw":
-            message = entry.get("message", "")
-            if isinstance(message, str) and message.strip():
-                current_step = _append_timeline_step(steps, f"[raw] {message.strip()}")
+        current_step = _ensure_current_step(steps, current_step)
+        for detail in details:
+            _append_substep(current_step, detail)
 
     return steps
 
 
-def _display_step_timeline(entries: list[dict], *, verbose: bool) -> None:
+def _display_step_timeline(
+    entries: list[dict],
+    *,
+    verbose: bool,
+    provider: str | None = None,
+    configured_model: str | None = None,
+) -> None:
     """Render a step-first timeline in compact or verbose mode."""
-    steps = _build_step_timeline(entries)
+    steps = _build_step_timeline(entries, provider=provider, configured_model=configured_model)
     if not steps:
         console.print("No step entries found.", soft_wrap=True)
         return
@@ -590,8 +556,11 @@ def cmd_log(args: argparse.Namespace) -> int:
         follow = False  # Can't follow a completed task
 
     if task is not None:
-        provider_name = task.provider or config.get_provider_for_task(task.task_type)
-        configured_model = task.model or config.get_model_for_task(task.task_type, provider_name)
+        provider_name = task.provider
+        if provider_name is not None:
+            configured_model = task.model or config.get_model_for_task(task.task_type, provider_name)
+        else:
+            configured_model = task.model
 
     # Check for raw mode
     raw_mode = hasattr(args, 'raw') and args.raw
@@ -669,7 +638,12 @@ def cmd_log(args: argparse.Namespace) -> int:
 
         timeline_mode = getattr(args, "timeline_mode", None)
         if timeline_mode and entries:
-            _display_step_timeline(entries, verbose=timeline_mode == "verbose")
+            _display_step_timeline(
+                entries,
+                verbose=timeline_mode == "verbose",
+                provider=provider_name,
+                configured_model=configured_model,
+            )
         elif entries:
             printer = _LiveLogPrinter(
                 live=False,
@@ -703,7 +677,12 @@ def cmd_log(args: argparse.Namespace) -> int:
                     console.print(f"[red]Errors:[/red] {rich_escape(str(log_data['errors']))}", soft_wrap=True)
         else:
             # No result entry yet - show compact step timeline
-            _display_step_timeline(entries, verbose=False)
+            _display_step_timeline(
+                entries,
+                verbose=False,
+                provider=provider_name,
+                configured_model=configured_model,
+            )
 
         if entries and timeline_mode is None:
             suppressed_count = printer.renderer.suppressed_count if "printer" in locals() else 0

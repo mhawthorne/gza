@@ -132,7 +132,7 @@ def test_claude_renderer_keeps_non_init_system_errors_visible() -> None:
     renderer = get_log_renderer("claude")
     entry = {
         "type": "system",
-        "subtype": "metadata",
+        "subtype": "session",
         "message": "error from provider metadata sync",
         "error": {"message": "visible failure"},
     }
@@ -141,10 +141,27 @@ def test_claude_renderer_keeps_non_init_system_errors_visible() -> None:
     tv_rendered = renderer.handle_tv(entry)
 
     assert "[event:system]" in log_rendered.log_lines[0]
-    assert "subtype=metadata" in log_rendered.log_lines[0]
+    assert "subtype=session" in log_rendered.log_lines[0]
     assert "error={\"message\": \"visible failure\"}" in log_rendered.log_lines[0]
     assert tv_rendered.tv_lines == ["event:system message=error from provider metadata sync"]
     assert renderer.suppressed_count == 0
+
+
+def test_claude_renderer_suppresses_non_init_system_session_events() -> None:
+    renderer = get_log_renderer("claude")
+    entry = {
+        "type": "system",
+        "subtype": "session",
+        "session_id": "sess_123",
+        "message": "routine session metadata",
+    }
+
+    log_rendered = renderer.handle_log(entry, live=False)
+    tv_rendered = renderer.handle_tv(entry)
+
+    assert log_rendered.log_lines == []
+    assert tv_rendered.tv_lines == []
+    assert renderer.suppressed_count == 2
 
 
 def test_unknown_event_verbose_mode_expands_json_payload() -> None:
