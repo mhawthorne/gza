@@ -50,7 +50,7 @@ Practical examples showing common workflows with Gza.
 | Address feedback | `gza improve <impl_id>` |
 | Resume failed task | `gza resume <task_id>` |
 | Retry from scratch | `gza retry <task_id>` |
-| View unmerged work | `gza unmerged` |
+| View unmerged work | `uv run gza unmerged` |
 | Rebase a branch | `gza rebase <task_id>` |
 | Create PR | `gza pr <task_id>` |
 | Merge to main | `gza merge <task_id> --squash` |

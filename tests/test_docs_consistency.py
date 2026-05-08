@@ -217,6 +217,22 @@ def test_summary_docs_and_skill_use_dedicated_triage_surfaces() -> None:
     assert "not a canonical replacement for `gza incomplete`" in skill_content
 
 
+def test_operator_facing_unmerged_examples_use_uv_run_prefix() -> None:
+    """Operator-facing docs should use the canonical uv-run invocation for unmerged."""
+    repo_root = Path(__file__).resolve().parents[1]
+    operator_docs = [
+        repo_root / "docs" / "examples" / "README.md",
+        repo_root / "docs" / "examples" / "simple-task.md",
+        repo_root / "docs" / "examples" / "rebasing.md",
+        repo_root / "docs" / "quickstart.md",
+    ]
+
+    for path in operator_docs:
+        content = path.read_text()
+        assert "gza unmerged" not in content.replace("uv run gza unmerged", "")
+        assert "uv run gza unmerged" in content
+
+
 def test_configuration_docs_describe_comments_only_improve_path() -> None:
     """Improve docs should reflect comments-only fallback when no review exists."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"

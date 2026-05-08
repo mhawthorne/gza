@@ -122,7 +122,7 @@ Gza creates a git branch, runs the AI agent in Docker, and commits the changes. 
 gza log gza-1
 
 # Check the branch
-gza unmerged
+uv run gza unmerged
 #   gza-1 20260108-fix-the-login-button
 #      Branch: my-app/20260108-fix-the-login-button
 #      +42 -8 across 3 files

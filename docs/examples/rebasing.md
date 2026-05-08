@@ -16,7 +16,7 @@ Rebase the branch first:
 ## Check for conflicts
 
 ```bash
-$ gza unmerged
+$ uv run gza unmerged
 Unmerged branches:
 
   gza-3 20260108-add-user-auth
@@ -92,7 +92,7 @@ PR created: https://github.com/myorg/myapp/pull/145
 If you have several tasks that need rebasing:
 
 ```bash
-$ gza unmerged
+$ uv run gza unmerged
 Unmerged branches:
 
   gza-3 20260108-add-user-auth (needs rebase)
