@@ -113,6 +113,7 @@ class ClaudeLogRenderer:
         self.stats = RenderStats()
         self.suppressed_count = 0
         self._seen_message_ids: set[str] = set()
+        self._seen_usage_message_ids: set[str] = set()
         self._provider_model: str | None = None
         self._parity_ready = False
         self._last_parity_signature: tuple[str | None, str | None] | None = None
@@ -199,6 +200,8 @@ class ClaudeLogRenderer:
     def _render_assistant(self, entry: dict[str, Any], *, live: bool, tv: bool) -> RenderedLines:
         message = entry.get("message", {})
         message_id = message.get("id") if isinstance(message, dict) else None
+        if isinstance(message, dict):
+            self._accumulate_usage_once(message)
         log_lines: list[str] = []
         tv_lines: list[str] = []
         text_found = False
@@ -236,14 +239,10 @@ class ClaudeLogRenderer:
                 starts_step = self._mark_step_start(message_id)
                 rendered = self._render_unknown_assistant(entry, tv=tv, unknown_block_types=unknown_block_types)
                 rendered.starts_step = starts_step
-                if starts_step:
-                    self._accumulate_usage(message)
                 return rendered
             self.suppressed_count += 1
             return RenderedLines()
         starts_step = self._mark_step_start(message_id)
-        if starts_step:
-            self._accumulate_usage(message)
         if unknown_block_found:
             fallback = self._render_unknown_assistant(entry, tv=tv, unknown_block_types=unknown_block_types)
             log_lines.extend(fallback.log_lines)
@@ -259,6 +258,14 @@ class ClaudeLogRenderer:
             return True
         self.stats.step_count += 1
         return True
+
+    def _accumulate_usage_once(self, message: dict[str, Any]) -> None:
+        message_id = message.get("id")
+        if isinstance(message_id, str) and message_id:
+            if message_id in self._seen_usage_message_ids:
+                return
+            self._seen_usage_message_ids.add(message_id)
+        self._accumulate_usage(message)
 
     def _accumulate_usage(self, message: dict[str, Any]) -> None:
         usage = message.get("usage", {})

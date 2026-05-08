@@ -309,7 +309,19 @@ def test_codex_renderer_falls_back_for_command_execution_without_command_or_outp
 
 def test_live_log_printer_does_not_emit_blank_header_for_suppressed_empty_claude_assistant() -> None:
     printer = _LiveLogPrinter(live=False, provider="claude")
-    empty_entry = {"type": "assistant", "message": {"id": "msg_empty", "content": []}}
+    empty_entry = {
+        "type": "assistant",
+        "message": {
+            "id": "msg_empty",
+            "content": [],
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 2,
+                "cache_read_input_tokens": 3,
+                "output_tokens": 5,
+            },
+        },
+    }
 
     with printer._console.capture() as capture:
         seen = printer.process(empty_entry)
@@ -317,6 +329,8 @@ def test_live_log_printer_does_not_emit_blank_header_for_suppressed_empty_claude
     assert capture.get() == ""
     assert seen is False
     assert printer.renderer.stats.step_count == 0
+    assert printer.renderer.stats.input_tokens == 15
+    assert printer.renderer.stats.output_tokens == 5
     assert printer.renderer.suppressed_count == 1
 
     visible_entry = {
@@ -329,6 +343,42 @@ def test_live_log_printer_does_not_emit_blank_header_for_suppressed_empty_claude
     assert "| Step 1 |" in capture.get()
     assert seen is True
     assert printer.renderer.stats.step_count == 1
+
+
+def test_claude_renderer_counts_usage_for_suppressed_empty_assistant_on_log_and_tv() -> None:
+    entry = {
+        "type": "assistant",
+        "message": {
+            "id": "msg_usage_only",
+            "content": [],
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 2,
+                "cache_read_input_tokens": 3,
+                "output_tokens": 5,
+            },
+        },
+    }
+
+    log_renderer = get_log_renderer("claude", configured_model="claude-sonnet-4")
+    tv_renderer = get_log_renderer("claude", configured_model="claude-sonnet-4")
+
+    log_rendered = log_renderer.handle_log(entry, live=False)
+    tv_rendered = tv_renderer.handle_tv(entry)
+
+    assert log_rendered.log_lines == []
+    assert log_rendered.starts_step is False
+    assert log_renderer.stats.step_count == 0
+    assert log_renderer.stats.input_tokens == 15
+    assert log_renderer.stats.output_tokens == 5
+    assert log_renderer.suppressed_count == 1
+
+    assert tv_rendered.tv_lines == []
+    assert tv_rendered.starts_step is False
+    assert tv_renderer.stats.step_count == 0
+    assert tv_renderer.stats.input_tokens == 15
+    assert tv_renderer.stats.output_tokens == 5
+    assert tv_renderer.suppressed_count == 1
 
 
 def test_gza_log_prints_suppressed_footer_and_verbose_unknown_payload(tmp_path: Path) -> None:
