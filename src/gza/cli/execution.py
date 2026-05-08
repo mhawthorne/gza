@@ -1453,12 +1453,12 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
     commit_count = git.count_commits_ahead(task.branch, default_branch)
     if commit_count <= 0:
         print(f"Note: No commits found on branch '{task.branch}' compared to '{default_branch}'")
-        store.mark_completed(task, branch=task.branch, has_commits=False)
+        store.mark_completed(task, branch=task.branch, has_commits=False, target_branch=default_branch)
         _cleanup_worker_registry(config, task_id)
         print(f"✓ Task {task_id} marked as completed")
         return 0
 
-    store.mark_completed(task, branch=task.branch, has_commits=True)
+    store.mark_completed(task, branch=task.branch, has_commits=True, target_branch=default_branch)
     _cleanup_worker_registry(config, task_id)
     print(f"✓ Task {task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
 

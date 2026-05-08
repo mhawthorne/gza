@@ -1970,6 +1970,55 @@ class TestMergeStatus:
         attached_ids = {task.id for task in store.list_tasks_for_merge_unit(impl_unit.id)}
         assert attached_ids == {impl.id, review.id, improve.id}
 
+    def test_mark_completed_with_non_main_target_branch_sets_merge_unit_target(self, tmp_path: Path) -> None:
+        """Completed code tasks should persist merge units against the real default branch."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(task, has_commits=True, branch="feature/master-target", target_branch="master")
+
+        assert task.id is not None
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.target_branch == "master"
+        assert [candidate.id for candidate in store.get_unmerged("master")] == [task.id]
+
+    def test_merge_unit_backfill_attaches_existing_branchless_reviews_with_review_role(self, tmp_path: Path) -> None:
+        """Backfilling an implementation unit should attach existing branchless reviews."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Legacy implement", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        impl.branch = "feature/review-backfill"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        unit = store.get_or_create_merge_unit_for_task(impl, "master")
+        assert unit is not None
+        assert review.id is not None
+        assert store.resolve_merge_unit_for_task(review.id).id == unit.id
+
+        conn = sqlite3.connect(db_path)
+        role_row = conn.execute(
+            """
+            SELECT role
+            FROM merge_unit_tasks
+            WHERE project_id = ? AND merge_unit_id = ? AND task_id = ?
+            """,
+            ("default", unit.id, review.id),
+        ).fetchone()
+        conn.close()
+        assert role_row is not None
+        assert role_row[0] == "review"
+
     def test_reused_branch_creates_new_merge_unit_for_unrelated_work(self, tmp_path: Path) -> None:
         """Unrelated later work on a reused branch must not reopen the historical unit."""
         db_path = tmp_path / "test.db"

@@ -3199,6 +3199,7 @@ def _complete_code_task(
     summary_path: Path,
     summary_dir: Path,
     *,
+    target_branch: str | None = None,
     skip_commit: bool = False,
     create_pr: bool = False,
     fix_commits_ahead_before_run: int | None = None,
@@ -3330,7 +3331,7 @@ def _complete_code_task(
             output_content = summary_content
 
     # Compute diff stats vs. default branch before marking completed
-    default_branch = worktree_git.default_branch()
+    default_branch = target_branch if target_branch is not None else worktree_git.default_branch()
     numstat_output = worktree_git.get_diff_numstat(f"{default_branch}...{branch_name}")
     diff_files, diff_added, diff_removed = parse_diff_numstat(numstat_output)
 
@@ -3406,6 +3407,7 @@ def _complete_code_task(
         diff_files_changed=diff_files,
         diff_lines_added=diff_added,
         diff_lines_removed=diff_removed,
+        target_branch=default_branch,
     )
     return _post_complete_code_task(
         task,
@@ -3457,7 +3459,7 @@ def _post_complete_code_task(
             if refreshed_impl and refreshed_impl.id is not None and (
                 refreshed_unit.state if refreshed_unit is not None else refreshed_impl.merge_status
             ) == "merged":
-                store.set_merge_status(refreshed_impl.id, "unmerged")
+                store.set_merge_status(refreshed_impl.id, "unmerged", target_branch=worktree_git.default_branch())
         if task.create_review:
             improve_follow_up_ready = _sync_completed_improve_branch_for_live_pr(task, store, worktree_git)
         if improve_follow_up_ready and impl_ancestor and impl_ancestor.id is not None:
@@ -3476,7 +3478,7 @@ def _post_complete_code_task(
         if parent and parent.id is not None and (
             parent_unit.state if parent_unit is not None else parent.merge_status
         ) == "merged":
-            store.set_merge_status(parent.id, "unmerged")
+            store.set_merge_status(parent.id, "unmerged", target_branch=worktree_git.default_branch())
 
     # Rebase tasks run provider-side conflict resolution in the worktree.
     # Force-push from the host runner so SSH/auth follows host environment.
@@ -3538,13 +3540,14 @@ def _handle_fix_follow_up_review(
     if root_impl is None or root_impl.id is None:
         return
     root_impl_id = root_impl.id
+    default_branch = fix_default_branch
 
     def _restore_prior_merged_state() -> None:
         if not fix_was_merged_before_run:
             return
         refreshed_impl = store.get(root_impl_id)
         if refreshed_impl is not None and refreshed_impl.id is not None:
-            store.set_merge_status(refreshed_impl.id, "merged")
+            store.set_merge_status(refreshed_impl.id, "merged", target_branch=default_branch)
 
     if fix_commits_ahead_before_run is None:
         _restore_prior_merged_state()
@@ -3552,7 +3555,6 @@ def _handle_fix_follow_up_review(
         print("Warning: Could not determine whether the fix run changed code")
         return
 
-    default_branch = fix_default_branch
     if not default_branch:
         try:
             default_branch = worktree_git.default_branch()
@@ -3582,7 +3584,7 @@ def _handle_fix_follow_up_review(
     if refreshed_impl and refreshed_impl.id is not None and (
         refreshed_unit.state if refreshed_unit is not None else refreshed_impl.merge_status
     ) == "merged":
-        store.set_merge_status(refreshed_impl.id, "unmerged")
+        store.set_merge_status(refreshed_impl.id, "unmerged", target_branch=default_branch)
 
     try:
         review_task = create_review_task(store, root_impl, prompt_mode="auto")
@@ -3648,6 +3650,20 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
 
     task.failure_reason = None
     task.completion_reason = None
+    target_branch: str | None = None
+    if task.branch and task.has_commits:
+        existing_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
+        if existing_unit is not None:
+            target_branch = existing_unit.target_branch
+        elif task.based_on:
+            parent = store.get(task.based_on)
+            parent_unit = store.resolve_merge_unit_for_task(parent.id) if parent and parent.id is not None else None
+            if parent_unit is not None:
+                target_branch = parent_unit.target_branch
+        if target_branch is None:
+            default_branch = git.default_branch()
+            if isinstance(default_branch, str) and default_branch:
+                target_branch = default_branch
     store.mark_completed(
         task,
         branch=task.branch,
@@ -3658,6 +3674,7 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
         diff_files_changed=task.diff_files_changed,
         diff_lines_added=task.diff_lines_added,
         diff_lines_removed=task.diff_lines_removed,
+        target_branch=target_branch,
     )
     return _post_complete_code_task(
         task,
@@ -4017,6 +4034,7 @@ def _run_inner(
             worktree_summary_path,
             summary_path,
             summary_dir,
+            target_branch=default_branch,
             skip_commit=task.task_type == "rebase",
             create_pr=create_pr,
             fix_commits_ahead_before_run=fix_commits_ahead_before_run,

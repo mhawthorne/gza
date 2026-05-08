@@ -670,7 +670,9 @@ def _run_cycle(
     # with no implement child, aligned with gza advance).
     # Merges run first; worker-spawning actions consume available slots.
     isolation_enabled = bool(getattr(config, "main_checkout_isolate", False))
-    merge_candidates, impl_based_on_ids = _collect_advance_completed_tasks(store)
+    git = Git(config.project_dir)
+    target_branch = git.default_branch()
+    merge_candidates, impl_based_on_ids = _collect_advance_completed_tasks(store, target_branch=target_branch)
     if tags:
         merge_candidates = [
             task
@@ -678,9 +680,7 @@ def _run_cycle(
             if task_matches_tag_filters(task_tags=task.tags, tag_filters=tags, any_tag=any_tag)
         ]
     if merge_candidates:
-        git = Git(config.project_dir)
         current_branch = git.current_branch()
-        target_branch = git.default_branch()
         merge_git: Git | None = None
         merge_actions_available = True
         merge_skip_reason = "merge-not-default-branch"

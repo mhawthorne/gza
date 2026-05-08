@@ -466,12 +466,12 @@ def _reconcile_unmerged_tasks(store: SqliteTaskStore, git: Git, default_branch: 
     merged_count = 0
     refreshed_count = 0
 
-    for task in store.get_unmerged():
+    for task in store.get_unmerged(default_branch):
         if task.id is None or not task.branch:
             continue
 
         if git.is_merged(task.branch, default_branch):
-            store.set_merge_status(task.id, "merged")
+            store.set_merge_status(task.id, "merged", target_branch=default_branch)
             merged_count += 1
             continue
 
@@ -1852,13 +1852,13 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
                     f"[/{TASK_COLORS['task_id']}]"
                 )
         else:
-            if needs_merge_status_migration(store):
+            if needs_merge_status_migration(store, target_branch=default_branch):
                 _print_unmerged_status(
                     f"[{TASK_COLORS['task_id']}]Migrating merge status for existing tasks..."
                     f"[/{TASK_COLORS['task_id']}]",
                     to_stderr=use_json,
                 )
-            refresh_cohorts = build_unmerged_branch_cohorts(store)
+            refresh_cohorts = build_unmerged_branch_cohorts(store, default_branch)
             refresh_candidate_count = sum(len(cohort.tasks) for cohort in refresh_cohorts)
             _print_unmerged_progress(
                 f"refreshing canonical merge truth for {refresh_candidate_count} candidate tasks "
@@ -1887,7 +1887,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
                     if owner is not None and owner.status == "completed":
                         selected_tasks.append(owner)
             else:
-                selected_tasks = [task for task in store.get_unmerged() if task.status == "completed"]
+                selected_tasks = [task for task in store.get_unmerged(target_branch) if task.status == "completed"]
     except sqlite3.OperationalError as exc:
         if _is_readonly_snapshot_refresh_error(
             exc,

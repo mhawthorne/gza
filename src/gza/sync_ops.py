@@ -236,17 +236,22 @@ def build_default_branch_cohorts(
     *,
     recent_days: int = 30,
     cooldown_seconds: int = DEFAULT_SYNC_CACHE_SECONDS,
+    target_branch: str | None = None,
 ) -> list[BranchCohort]:
     """Build the bounded default sync cohort set."""
     return build_branch_cohorts_for_tasks(
         store,
-        store.get_sync_candidates(recent_days=recent_days, cooldown_seconds=cooldown_seconds),
+        store.get_sync_candidates(
+            recent_days=recent_days,
+            cooldown_seconds=cooldown_seconds,
+            target_branch=target_branch,
+        ),
     )
 
 
-def build_unmerged_branch_cohorts(store: SqliteTaskStore) -> list[BranchCohort]:
+def build_unmerged_branch_cohorts(store: SqliteTaskStore, target_branch: str | None = None) -> list[BranchCohort]:
     """Build the canonical branch cohort set for daily default-branch unmerged reconciliation."""
-    return build_branch_cohorts_for_tasks(store, store.get_canonical_unmerged_candidates())
+    return build_branch_cohorts_for_tasks(store, store.get_canonical_unmerged_candidates(target_branch))
 
 
 def _remote_branch_ref_for_reconcile(
@@ -489,6 +494,7 @@ def _persist_branch_updates(
     cohorts: list[BranchCohort],
     results: list[BranchSyncResult],
     updates: list[_BranchPersistenceUpdate],
+    target_branch: str,
     *,
     sync_completed_at: datetime | None = None,
 ) -> None:
@@ -501,6 +507,7 @@ def _persist_branch_updates(
         _persist_branch_state(
             store,
             cohort.code_tasks,
+            target_branch,
             merge_status=update.merge_status,
             diff_stats=update.diff_stats,
             pr_number=update.pr_number,
@@ -535,7 +542,7 @@ def reconcile_task_branch_merge_truth(
         include_diff_stats=include_diff_stats,
     )[0]
     if persist and result.skipped_reason is None:
-        _persist_branch_updates(store, [cohort], [result], [_git_reconcile_update(result)])
+        _persist_branch_updates(store, [cohort], [result], [_git_reconcile_update(result)], target_branch)
     return result
 
 
@@ -648,6 +655,7 @@ def sync_branch_cohorts(
             cohorts,
             results,
             updates,
+            default_branch,
             sync_completed_at=datetime.now(UTC),
         )
 
@@ -721,6 +729,7 @@ def refresh_branch_diff_stats(
         _persist_branch_state(
             store,
             cohort.code_tasks,
+            default_branch,
             diff_stats=(files_changed, lines_added, lines_removed),
         )
         results.append(result)
@@ -731,6 +740,7 @@ def refresh_branch_diff_stats(
 def _persist_branch_state(
     store: SqliteTaskStore,
     tasks: tuple[Task, ...],
+    target_branch: str,
     *,
     merge_status: str | None | object = _UNSET,
     diff_stats: tuple[int | None, int | None, int | None] | object = _UNSET,
@@ -751,7 +761,7 @@ def _persist_branch_state(
             assert owner_task_id is not None
             unit = store.resolve_merge_unit_for_task(owner_task_id) or store.get_or_create_merge_unit_for_task(
                 owner_task,
-                store.default_merge_target(),
+                target_branch,
             )
             if unit is not None:
                 diff_tuple = (
