@@ -759,7 +759,7 @@ def _persist_branch_state(
         if owner_task is not None:
             owner_task_id = owner_task.id
             assert owner_task_id is not None
-            unit = store.resolve_merge_unit_for_task(owner_task_id) or store.get_or_create_merge_unit_for_task(
+            unit = store.resolve_merge_unit_for_task(owner_task_id, target_branch) or store.get_or_create_merge_unit_for_task(
                 owner_task,
                 target_branch,
             )

@@ -298,6 +298,53 @@ def test_sync_branch_cohorts_persists_merge_units_for_real_default_branch(tmp_pa
     assert unit.target_branch == "master"
 
 
+def test_sync_branch_cohorts_creates_target_specific_merge_unit_without_mutating_existing_other_target(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/target-specific-sync")
+    assert task.id is not None
+
+    main_unit = store.get_or_create_merge_unit_for_task(task, "main")
+    assert main_unit is not None
+    store.set_merge_unit_state(main_unit.id, "merged", diff_stats=(99, 999, 111))
+
+    git = Mock()
+    git.default_branch.return_value = "master"
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        [BranchCohort(branch=task.branch, tasks=(task,))],
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=False,
+    )
+
+    assert partial is False
+    assert results[0].merge_status == "unmerged"
+
+    refreshed_main_unit = store.resolve_merge_unit_for_task(task.id, "main")
+    refreshed_master_unit = store.resolve_merge_unit_for_task(task.id, "master")
+    assert refreshed_main_unit is not None
+    assert refreshed_master_unit is not None
+    assert refreshed_master_unit.id != refreshed_main_unit.id
+    assert refreshed_main_unit.state == "merged"
+    assert (
+        refreshed_main_unit.diff_files_changed,
+        refreshed_main_unit.diff_lines_added,
+        refreshed_main_unit.diff_lines_removed,
+    ) == (99, 999, 111)
+    assert refreshed_master_unit.state == "unmerged"
+    assert (
+        refreshed_master_unit.diff_files_changed,
+        refreshed_master_unit.diff_lines_added,
+        refreshed_master_unit.diff_lines_removed,
+    ) == (1, 2, 1)
+
+
 def test_sync_branch_cohorts_no_fetch_ignores_cached_origin_default_ref_by_default(tmp_path):
     store = SqliteTaskStore(tmp_path / "test.db")
     task = _completed_branch_task(store, "Task with stale cached origin ref", "feature/stale-origin-proof")

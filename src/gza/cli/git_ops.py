@@ -398,7 +398,7 @@ def _resolve_merge_target_task(
         return None
     if task.id is None:
         return task
-    unit = store.resolve_merge_unit_for_task(task.id)
+    unit = store.resolve_merge_unit_for_task(task.id, target_branch)
     if unit is None:
         unit = store.get_or_create_merge_unit_for_task(task, target_branch)
     if unit is None:
@@ -422,7 +422,7 @@ def _merge_single_task(
     if not task:
         print(f"Error: Task {task_id} not found")
         return 1
-    merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
+    merge_unit = store.resolve_merge_unit_for_task(task.id, target_branch) if task.id is not None else None
 
     # Validate task state
     if task.status not in ("completed", "unmerged"):
@@ -676,9 +676,10 @@ def cmd_merge(args: argparse.Namespace) -> int:
     for raw_task_id in task_ids:
         resolved = _resolve_merge_target_task(store, raw_task_id, default)
         if resolved is None or resolved.id is None:
-            continue
+            print(f"Error: Task {raw_task_id} not found")
+            return 1
         resolved_id = resolved.id
-        resolved_unit = store.resolve_merge_unit_for_task(resolved_id)
+        resolved_unit = store.resolve_merge_unit_for_task(resolved_id, default)
         if resolved_unit is not None:
             if resolved_unit.id in seen_units:
                 continue

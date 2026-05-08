@@ -9166,6 +9166,59 @@ class TestUnmergedUnifiedQueryOutput:
         assert payload[0]["source_branch"] == "feature/test"
         assert payload[0]["target_branch"] == "main"
 
+    def test_unmerged_json_unions_unit_backed_and_legacy_candidates_during_default_refresh(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        unit_task = store.add("Unit-backed task", task_type="implement")
+        unit_task.status = "completed"
+        unit_task.completed_at = datetime.now(UTC)
+        unit_task.branch = "feature/unit-backed"
+        unit_task.has_commits = True
+        unit_task.merge_status = "unmerged"
+        store.update(unit_task)
+        assert unit_task.id is not None
+        existing_unit = store.get_or_create_merge_unit_for_task(unit_task, "main")
+        assert existing_unit is not None
+
+        legacy_task = store.add("Legacy task pending backfill", task_type="implement")
+        legacy_task.status = "completed"
+        legacy_task.completed_at = datetime.now(UTC)
+        legacy_task.branch = "feature/legacy-backfill"
+        legacy_task.has_commits = True
+        legacy_task.merge_status = "unmerged"
+        store.update(legacy_task)
+        assert legacy_task.id is not None
+        assert store.resolve_merge_unit_for_task(legacy_task.id, "main") is None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=0,
+            json=True,
+            fields="id,prompt,merge_unit_id",
+        )
+
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        payload = json.loads(captured.out)
+        assert [row["prompt"] for row in payload] == [
+            "Legacy task pending backfill",
+            "Unit-backed task",
+        ]
+        assert all(row["merge_unit_id"] for row in payload)
+        backfilled_unit = store.resolve_merge_unit_for_task(legacy_task.id, "main")
+        assert backfilled_unit is not None
+        assert backfilled_unit.state == "unmerged"
+
     def test_unmerged_live_target_json_fields_use_live_state_not_default_target_unit(
         self,
         tmp_path: Path,

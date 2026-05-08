@@ -1476,7 +1476,7 @@ def _enrich_unmerged_result(
 
         owner_task = row.owner_task
         merge_unit = (
-            store.resolve_merge_unit_for_task(owner_task.id)
+            store.resolve_merge_unit_for_task(owner_task.id, target_branch)
             if owner_task.id is not None
             else None
         )
@@ -1921,7 +1921,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     for task in selected_tasks:
         if task.id is None:
             continue
-        resolved_unit = store.resolve_merge_unit_for_task(task.id)
+        resolved_unit = store.resolve_merge_unit_for_task(task.id, target_branch)
         if resolved_unit is not None:
             merge_unit_ids_list.append(resolved_unit.id)
     merge_unit_ids = tuple(dict.fromkeys(merge_unit_ids_list))

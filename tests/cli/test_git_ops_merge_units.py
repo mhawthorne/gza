@@ -124,3 +124,40 @@ def test_unmerged_uses_real_default_branch_for_merge_units(tmp_path: Path) -> No
     unit = store.resolve_merge_unit_for_task(impl.id)
     assert unit is not None
     assert unit.target_branch == "master"
+
+
+def test_merge_missing_explicit_task_id_fails_closed(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    make_store(tmp_path)
+
+    fake_git = _MergeGit(tmp_path)
+    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
+        result = run_gza("merge", "testproject-9999", "--project", str(tmp_path), cwd=tmp_path)
+
+    assert result.returncode == 1
+    assert "Error: Task testproject-9999 not found" in result.stdout
+    assert fake_git.merged == []
+
+
+def test_merge_valid_and_missing_explicit_task_ids_report_missing_without_partial_merge(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement shared branch", task_type="implement")
+    store.mark_completed(impl, has_commits=True, branch="feature/shared")
+    assert impl.id is not None
+
+    fake_git = _MergeGit(tmp_path)
+    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
+        result = run_gza(
+            "merge",
+            str(impl.id),
+            "testproject-9999",
+            "--project",
+            str(tmp_path),
+            cwd=tmp_path,
+        )
+
+    assert result.returncode == 1
+    assert "Error: Task testproject-9999 not found" in result.stdout
+    assert fake_git.merged == []
