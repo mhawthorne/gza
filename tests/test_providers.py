@@ -827,6 +827,7 @@ class TestBuildDockerCmd:
         assert 'exec uv run --directory /workspace gza "$@"' not in setup_cmd
         assert 'export PATH="/tmp/gza-shims:/workspace/bin:$PATH"' in setup_cmd
 
+    @pytest.mark.functional
     def test_entrypoint_runs_setup_command_before_cli_handoff(self, tmp_path):
         """Entrypoint must complete docker setup before invoking the provider CLI command."""
         entrypoint = tmp_path / "entrypoint.sh"
@@ -860,6 +861,7 @@ class TestBuildDockerCmd:
         assert marker.exists()
         assert order_log.read_text().splitlines() == ["setup", "cli"]
 
+    @pytest.mark.functional
     def test_entrypoint_prewarm_makes_subsequent_uv_run_noop_for_sync(self, tmp_path):
         """Pre-warm uv sync should avoid lazy install/sync during later uv run calls."""
         entrypoint = tmp_path / "entrypoint.sh"

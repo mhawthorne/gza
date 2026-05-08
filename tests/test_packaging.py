@@ -6,6 +6,8 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+import pytest
+
 
 def test_hatch_vcs_does_not_write_source_version_file() -> None:
     """Editable installs must not require writing src/gza/_version.py."""
@@ -33,7 +35,9 @@ def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
 
     unit_conftest = (repo_root / "tests" / "conftest.py").read_text()
     assert "UNIT_TEST_TIMEOUT_SECONDS = 1" in unit_conftest
+    assert "FUNCTIONAL_TEST_TIMEOUT_SECONDS = 2" in unit_conftest
     assert "pytest.mark.timeout(UNIT_TEST_TIMEOUT_SECONDS, method=\"signal\")" in unit_conftest
+    assert "pytest.mark.timeout(FUNCTIONAL_TEST_TIMEOUT_SECONDS, method=\"signal\")" in unit_conftest
 
     integration_conftest = (repo_root / "tests_integration" / "conftest.py").read_text()
     assert "INTEGRATION_TEST_TIMEOUT_SECONDS = 10" in integration_conftest
@@ -67,6 +71,85 @@ def test_unit_tests_do_not_carry_per_test_pytest_timeout_overrides() -> None:
     assert not timeout_overrides, f"Found timeout overrides in tests/: {timeout_overrides}"
 
 
+def test_functional_subprocess_timeouts_within_watchdog() -> None:
+    """subprocess.run(timeout=N) inside @pytest.mark.functional tests must not exceed the watchdog."""
+    repo_root = Path(__file__).resolve().parents[1]
+    conftest_path = repo_root / "tests" / "conftest.py"
+
+    conftest_module = ast.parse(conftest_path.read_text(), filename=str(conftest_path))
+    functional_budget: int | float | None = None
+    for node in ast.walk(conftest_module):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "FUNCTIONAL_TEST_TIMEOUT_SECONDS"
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, (int, float))
+        ):
+            functional_budget = node.value.value
+    assert functional_budget is not None, "FUNCTIONAL_TEST_TIMEOUT_SECONDS not found in tests/conftest.py"
+
+    def has_functional_marker(decorators: list[ast.expr]) -> bool:
+        for decorator in decorators:
+            target = decorator.func if isinstance(decorator, ast.Call) else decorator
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr == "functional"
+                and isinstance(target.value, ast.Attribute)
+                and target.value.attr == "mark"
+                and isinstance(target.value.value, ast.Name)
+                and target.value.value.id == "pytest"
+            ):
+                return True
+        return False
+
+    inversions: list[str] = []
+    tests_root = repo_root / "tests"
+    for test_file in tests_root.rglob("test_*.py"):
+        module = ast.parse(test_file.read_text(), filename=str(test_file))
+        functional_funcs: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+        for top in module.body:
+            if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if has_functional_marker(top.decorator_list):
+                    functional_funcs.append(top)
+            elif isinstance(top, ast.ClassDef):
+                class_marked = has_functional_marker(top.decorator_list)
+                for child in top.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                        class_marked or has_functional_marker(child.decorator_list)
+                    ):
+                        functional_funcs.append(child)
+
+        for func in functional_funcs:
+            for inner in ast.walk(func):
+                if not isinstance(inner, ast.Call):
+                    continue
+                if not (
+                    isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr == "run"
+                    and isinstance(inner.func.value, ast.Name)
+                    and inner.func.value.id == "subprocess"
+                ):
+                    continue
+                for kw in inner.keywords:
+                    if (
+                        kw.arg == "timeout"
+                        and isinstance(kw.value, ast.Constant)
+                        and isinstance(kw.value.value, (int, float))
+                        and kw.value.value > functional_budget
+                    ):
+                        inversions.append(
+                            f"{test_file}:{inner.lineno} subprocess.run(timeout={kw.value.value}) "
+                            f"> FUNCTIONAL_TEST_TIMEOUT_SECONDS={functional_budget}"
+                        )
+
+    assert not inversions, (
+        "Inner subprocess.run timeouts exceed the functional watchdog; the watchdog will fire first "
+        "and the inner timeout can never trip:\n  " + "\n  ".join(inversions)
+    )
+
+
 def test_unit_test_conftest_assigns_only_central_timeout_marker() -> None:
     """tests/conftest.py should own the unit-suite timeout marker."""
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
@@ -92,7 +175,7 @@ def test_unit_test_conftest_assigns_only_central_timeout_marker() -> None:
         timeout_calls.append(node.lineno)
 
     assert len(collection_hooks) == 1
-    assert len(timeout_calls) == 1
+    assert len(timeout_calls) == 2
 
 
 def _run_bin_tests(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -112,6 +195,10 @@ def _run_bin_tests(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[st
     fake_uv.chmod(0o755)
 
     env = os.environ.copy()
+    # Scrub envs read by bin/tests so assertions exercise its built-in defaults
+    # regardless of how the parent test runner was invoked.
+    env.pop("PYTEST_XDIST_WORKERS", None)
+    env.pop("PYTEST_FAULTHANDLER_TIMEOUT", None)
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["FAKE_UV_LOG"] = str(uv_log)
 
@@ -124,6 +211,7 @@ def _run_bin_tests(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[st
     )
 
 
+@pytest.mark.functional
 def test_bin_tests_default_run_skips_integration_pytest(tmp_path: Path) -> None:
     result = _run_bin_tests(tmp_path)
 
@@ -145,6 +233,7 @@ def test_github_test_workflow_uses_shared_test_script() -> None:
     assert "PYTEST_XDIST_WORKERS" not in workflow_text
 
 
+@pytest.mark.functional
 def test_bin_tests_integration_flag_runs_integration_pytest(tmp_path: Path) -> None:
     long_result = _run_bin_tests(tmp_path / "long", "--integration")
     short_result = _run_bin_tests(tmp_path / "short", "-i")
@@ -155,6 +244,7 @@ def test_bin_tests_integration_flag_runs_integration_pytest(tmp_path: Path) -> N
     assert (tmp_path / "short" / "uv.log").read_text().splitlines()[-1] == "run pytest tests_integration -xv"
 
 
+@pytest.mark.functional
 def test_bin_tests_unknown_argument_exits_with_usage_and_no_invocations(tmp_path: Path) -> None:
     result = _run_bin_tests(tmp_path, "--wat")
     script = Path(__file__).resolve().parents[1] / "bin" / "tests"
