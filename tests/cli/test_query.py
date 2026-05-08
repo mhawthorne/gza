@@ -7687,6 +7687,10 @@ class TestUnmergedImprovedDisplay:
 
 
 class TestUnmergedUnifiedQueryOutput:
+    @pytest.fixture(autouse=True)
+    def _stub_github(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(query_cli, "GitHub", _UnavailableGitHub)
+
     def test_unmerged_view_flat_omits_lineage_heavy_sections(self, tmp_path: Path) -> None:
         store, task, _git = setup_unmerged_env(tmp_path, task_prompt="Flat output task")
 
