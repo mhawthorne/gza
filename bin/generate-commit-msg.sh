@@ -151,12 +151,16 @@ PY
 
 run_codex() {
     local output_file
+    local cmd_file
     output_file=$(mktemp)
-    trap 'rm -f "$output_file"' RETURN
+    cmd_file=$(mktemp)
+    trap 'rm -f "$output_file" "$cmd_file"' RETURN
 
     local -a cmd=()
     LAST_CODEX_INVOCATION_PHASE=""
-    if ! mapfile -d '' -t cmd < <(build_codex_command "$PROJECT_ROOT" "$(pwd)" "$output_file"); then
+    if ! build_codex_command "$PROJECT_ROOT" "$(pwd)" "$output_file" >"$cmd_file"; then
+        LAST_CODEX_INVOCATION_PHASE="bootstrap"
+    elif ! mapfile -d '' -t cmd <"$cmd_file"; then
         LAST_CODEX_INVOCATION_PHASE="bootstrap"
     fi
 

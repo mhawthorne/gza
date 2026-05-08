@@ -141,6 +141,11 @@ case "${FAKE_UV_MODE:-codex_cmd}" in
         echo "builder exploded" >&2
         exit 42
         ;;
+    partial_bootstrap_fail)
+        printf 'timeout\0'
+        echo "builder exploded after partial output" >&2
+        exit 42
+        ;;
     missing_launcher_cmd)
         printf 'missing-launcher\0--wrapper-flag\0codex\0'
         ;;
@@ -318,6 +323,21 @@ test_codex_missing_launcher_reports_distinct_error() {
     [[ ! -s "$FAKE_CODEX_LOG" ]] || fail "missing launcher should not launch codex"
 }
 
+test_codex_partial_builder_failure_reports_bootstrap_error() {
+    setup_case
+    export FAKE_UV_MODE="partial_bootstrap_fail"
+
+    run_script --codex
+
+    [[ "$RUN_STATUS" -eq 1 ]] || fail "partial bootstrap failure should exit 1, got $RUN_STATUS"
+    assert_contains "$RUN_OUTPUT" "builder exploded after partial output" "partial bootstrap stderr should be preserved"
+    assert_contains "$RUN_OUTPUT" "Failed to build the Codex command." "partial bootstrap failure should use the bootstrap diagnostic"
+    assert_not_contains "$RUN_OUTPUT" "Launcher command 'timeout'" "partial bootstrap failure must not be mislabeled as launcher failure"
+    assert_not_contains "$RUN_OUTPUT" "Failed to launch Codex because 'timeout' is unavailable." "partial bootstrap failure must not be mislabeled as launcher failure"
+    [[ ! -s "$FAKE_TIMEOUT_LOG" ]] || fail "partial bootstrap failure should not invoke timeout"
+    [[ ! -s "$FAKE_CODEX_LOG" ]] || fail "partial bootstrap failure should not launch codex"
+}
+
 test_default_provider_uses_codex
 test_explicit_claude_provider_uses_legacy_path
 test_explicit_codex_provider_works
@@ -326,5 +346,6 @@ test_no_staged_changes_preserved
 test_help_mentions_codex_default
 test_codex_builder_failure_reports_bootstrap_error
 test_codex_missing_launcher_reports_distinct_error
+test_codex_partial_builder_failure_reports_bootstrap_error
 
 echo "generate_commit_msg_harness: ok"
