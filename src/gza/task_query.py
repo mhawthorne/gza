@@ -74,8 +74,6 @@ class TaskQuery:
     merge_chain_state: tuple[str, ...] | None = None
     exclude_merge_chain_state: tuple[str, ...] | None = None
     dependency_state: tuple[str, ...] | None = None
-    related_to: str | None = None
-    exclude_related_to: str | None = None
     lineage_of: str | None = None
     exclude_lineage_of: str | None = None
     root_ids: tuple[str, ...] | None = None
@@ -256,8 +254,6 @@ class TaskQueryPresets:
         task_types: tuple[str, ...] | None = None,
         exclude_task_types: tuple[str, ...] | None = None,
         date_filter: DateFilter | None = None,
-        related_to: str | None = None,
-        exclude_related_to: str | None = None,
         lineage_of: str | None = None,
         exclude_lineage_of: str | None = None,
         root_ids: tuple[str, ...] | None = None,
@@ -271,8 +267,6 @@ class TaskQueryPresets:
             exclude_statuses=exclude_statuses,
             task_types=task_types,
             exclude_task_types=exclude_task_types,
-            related_to=related_to,
-            exclude_related_to=exclude_related_to,
             lineage_of=lineage_of,
             exclude_lineage_of=exclude_lineage_of,
             root_ids=root_ids,
@@ -515,8 +509,6 @@ class TaskQueryService:
                     merge_chain_state=query.merge_chain_state,
                     exclude_merge_chain_state=query.exclude_merge_chain_state,
                     dependency_state=query.dependency_state,
-                    related_to=query.related_to,
-                    exclude_related_to=query.exclude_related_to,
                     lineage_of=query.lineage_of,
                     exclude_lineage_of=query.exclude_lineage_of,
                     root_ids=query.root_ids,
@@ -662,29 +654,6 @@ class TaskQueryService:
                         if _resolve_lineage_root(self._store, task).id != root_id
                     ]
 
-        if query.related_to is not None:
-            related_task = self._store.get(query.related_to)
-            if related_task is None:
-                return []
-            root = _resolve_lineage_root(self._store, related_task)
-            related_ids = {
-                task.id
-                for task in _flatten_lineage_tree(_build_lineage_tree(self._store, root, max_depth=None))
-                if task.id is not None
-            }
-            filtered = [task for task in filtered if task.id in related_ids]
-
-        if query.exclude_related_to is not None:
-            related_task = self._store.get(query.exclude_related_to)
-            if related_task is not None:
-                root = _resolve_lineage_root(self._store, related_task)
-                related_ids = {
-                    task.id
-                    for task in _flatten_lineage_tree(_build_lineage_tree(self._store, root, max_depth=None))
-                    if task.id is not None
-                }
-                filtered = [task for task in filtered if task.id not in related_ids]
-
         if query.branch_owner_ids is not None:
             allowed_owners = set(query.branch_owner_ids)
             filtered = [
@@ -742,7 +711,7 @@ class TaskQueryService:
             filtered = [
                 row
                 for row in filtered
-                if (root := _resolve_lineage_root(self._store, row.owner_task)).id in roots
+                if _resolve_lineage_root(self._store, row.owner_task).id in roots
             ]
 
         if query.exclude_root_ids is not None:
@@ -750,7 +719,7 @@ class TaskQueryService:
             filtered = [
                 row
                 for row in filtered
-                if (root := _resolve_lineage_root(self._store, row.owner_task)).id not in excluded_roots
+                if _resolve_lineage_root(self._store, row.owner_task).id not in excluded_roots
             ]
 
         if query.lineage_of is not None:
@@ -772,37 +741,6 @@ class TaskQueryService:
                     row
                     for row in filtered
                     if _resolve_lineage_root(self._store, row.owner_task).id != root_id
-                ]
-
-        if query.related_to is not None:
-            task = self._store.get(query.related_to)
-            if task is None:
-                return []
-            root = _resolve_lineage_root(self._store, task)
-            lineage_ids = {
-                item.id
-                for item in _flatten_lineage_tree(_build_lineage_tree(self._store, root, max_depth=None))
-                if item.id is not None
-            }
-            filtered = [
-                row
-                for row in filtered
-                if any(member.id in lineage_ids for member in row.members)
-            ]
-
-        if query.exclude_related_to is not None:
-            task = self._store.get(query.exclude_related_to)
-            if task is not None:
-                root = _resolve_lineage_root(self._store, task)
-                lineage_ids = {
-                    item.id
-                    for item in _flatten_lineage_tree(_build_lineage_tree(self._store, root, max_depth=None))
-                    if item.id is not None
-                }
-                filtered = [
-                    row
-                    for row in filtered
-                    if not any(member.id in lineage_ids for member in row.members)
                 ]
 
         return filtered

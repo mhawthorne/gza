@@ -461,12 +461,12 @@ def main() -> int:
     search_parser.add_argument(
         "--related-to",
         metavar="TASK_ID",
-        help="Limit matches to tasks in the same lineage as TASK_ID",
+        help="Deprecated alias for --lineage-of",
     )
     search_parser.add_argument(
         "--related-to-not",
         metavar="TASK_ID",
-        help="Exclude matches from the same lineage as TASK_ID",
+        help="Deprecated alias for --lineage-of-not",
     )
     search_parser.add_argument(
         "--lineage-of",

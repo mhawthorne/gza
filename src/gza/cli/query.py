@@ -126,6 +126,65 @@ _INCOMPLETE_DEPRECATION_LINES: tuple[str, ...] = (
     "After `gza unimplemented` ships, it will replace the temporary `advance --unimplemented` spelling.",
 )
 
+
+def _task_lineage_root_id(store: SqliteTaskStore, task_id: str) -> str | None:
+    """Resolve a task selection to its canonical lineage root ID."""
+    task = store.get(task_id)
+    if task is None or task.id is None:
+        return None
+    root = _resolve_lineage_root_task(store, task)
+    return root.id
+
+
+def _coalesce_search_lineage_root_filter(
+    *,
+    store: SqliteTaskStore,
+    canonical_task_id: str | None,
+    deprecated_task_id: str | None,
+) -> tuple[tuple[str, ...] | None, bool]:
+    """Resolve negative lineage selectors to the root IDs they should exclude."""
+    deprecated_used = deprecated_task_id is not None
+    task_ids = [task_id for task_id in (canonical_task_id, deprecated_task_id) if task_id is not None]
+    if not task_ids:
+        return None, deprecated_used
+
+    resolved_root_ids: list[str] = []
+    for task_id in task_ids:
+        root_id = _task_lineage_root_id(store, task_id)
+        if root_id is not None:
+            resolved_root_ids.append(root_id)
+
+    if not resolved_root_ids:
+        return None, deprecated_used
+    return tuple(dict.fromkeys(resolved_root_ids)), deprecated_used
+
+
+def _coalesce_search_lineage_task_filter(
+    *,
+    store: SqliteTaskStore,
+    canonical_task_id: str | None,
+    deprecated_task_id: str | None,
+) -> tuple[str | None, bool, bool]:
+    """Collapse canonical and deprecated positive lineage selectors to one query filter.
+
+    Returns the task ID to pass through ``TaskQuery.lineage_of``, whether the filter is
+    impossible and should force an empty result set, and whether the deprecated alias
+    was used.
+    """
+    deprecated_used = deprecated_task_id is not None
+    task_ids = [task_id for task_id in (canonical_task_id, deprecated_task_id) if task_id is not None]
+    if not task_ids:
+        return None, False, deprecated_used
+    if len(task_ids) == 1:
+        return task_ids[0], False, deprecated_used
+
+    root_ids = {_task_lineage_root_id(store, task_id) for task_id in task_ids}
+    if len(root_ids) != 1 or next(iter(root_ids)) is None:
+        return None, True, deprecated_used
+
+    return canonical_task_id or deprecated_task_id, False, deprecated_used
+
+
 class _UnmergedGit(Protocol):
     def default_branch(self) -> str:
         ...
@@ -777,14 +836,28 @@ def cmd_search(args: argparse.Namespace) -> int:
         start=_parse_cli_date(getattr(args, "start_date", None)),
         end=_parse_cli_date(getattr(args, "end_date", None)),
     )
-    related_to = resolve_id(config, args.related_to) if getattr(args, "related_to", None) else None
-    related_to_not = (
-        resolve_id(config, args.related_to_not) if getattr(args, "related_to_not", None) else None
-    )
     lineage_of = resolve_id(config, args.lineage_of) if getattr(args, "lineage_of", None) else None
     lineage_of_not = (
         resolve_id(config, args.lineage_of_not) if getattr(args, "lineage_of_not", None) else None
     )
+    related_to = resolve_id(config, args.related_to) if getattr(args, "related_to", None) else None
+    related_to_not = (
+        resolve_id(config, args.related_to_not) if getattr(args, "related_to_not", None) else None
+    )
+    lineage_filter_task_id, lineage_filter_impossible, used_related_to = _coalesce_search_lineage_task_filter(
+        store=store,
+        canonical_task_id=lineage_of,
+        deprecated_task_id=related_to,
+    )
+    exclude_lineage_root_ids, used_related_to_not = _coalesce_search_lineage_root_filter(
+        store=store,
+        canonical_task_id=lineage_of_not,
+        deprecated_task_id=related_to_not,
+    )
+    if used_related_to:
+        print("Warning: --related-to is deprecated; use --lineage-of instead.", file=sys.stderr)
+    if used_related_to_not:
+        print("Warning: --related-to-not is deprecated; use --lineage-of-not instead.", file=sys.stderr)
     root_ids = None
     if getattr(args, "root", None):
         parsed_roots = _parse_csv(args.root)
@@ -797,6 +870,10 @@ def cmd_search(args: argparse.Namespace) -> int:
             if parsed_roots_not
             else None
         )
+    if lineage_filter_impossible:
+        root_ids = ()
+    if exclude_lineage_root_ids is not None:
+        exclude_root_ids = tuple(dict.fromkeys((*(exclude_lineage_root_ids or ()), *(exclude_root_ids or ()))))
 
     query = _TaskQueryPresets.search(
         term=term,
@@ -806,10 +883,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         task_types=_parse_csv(getattr(args, "type", None)),
         exclude_task_types=_parse_csv(getattr(args, "type_not", None)),
         date_filter=date_filter,
-        related_to=related_to,
-        exclude_related_to=related_to_not,
-        lineage_of=lineage_of,
-        exclude_lineage_of=lineage_of_not,
+        lineage_of=lineage_filter_task_id,
         root_ids=root_ids,
         exclude_root_ids=exclude_root_ids,
     )

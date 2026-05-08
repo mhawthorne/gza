@@ -575,27 +575,15 @@ def test_search_negative_lineage_filters_exclude_matching_roots(tmp_path: Path) 
 
     service = TaskQueryService(store)
 
-    related_filtered = service.run(
-        TaskQueryPresets.search(
-            "needle",
-            limit=None,
-            exclude_related_to=child_a.id,
-        )
-    )
-    related_prompts = [row.task.prompt for row in related_filtered.rows if hasattr(row, "task")]
-    assert related_prompts == ["needle root b"]
-
     lineage_filtered = service.run(
         TaskQueryPresets.search(
             "needle",
             limit=None,
-            root_ids=(root_a.id, root_b.id),
             exclude_lineage_of=child_a.id,
-            exclude_root_ids=(root_b.id,),
         )
     )
     lineage_prompts = [row.task.prompt for row in lineage_filtered.rows if hasattr(row, "task")]
-    assert lineage_prompts == []
+    assert lineage_prompts == ["needle root b"]
 
 
 def test_lineages_incomplete_exclude_task_types_filters_shared_rollup_path(tmp_path: Path) -> None:

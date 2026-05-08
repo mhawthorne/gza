@@ -108,6 +108,7 @@ class TestHelpOutput:
         assert "--type-not" in search_help.stdout
         assert "--tag-not" in search_help.stdout
         assert "--related-to-not" in search_help.stdout
+        assert "Deprecated alias for --lineage-of" in search_help.stdout
         assert "--lineage-of-not" in search_help.stdout
         assert "--root-not" in search_help.stdout
 

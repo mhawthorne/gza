@@ -1086,10 +1086,10 @@ gza search <term> [options]
 | `--start-date YYYY-MM-DD` | Show only matches on or after this date |
 | `--end-date YYYY-MM-DD` | Show only matches on or before this date |
 | `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `created`) |
-| `--related-to TASK_ID` | Restrict to tasks related to the given lineage |
-| `--related-to-not TASK_ID` | Exclude tasks related to the given lineage |
 | `--lineage-of TASK_ID` | Restrict to the canonical lineage containing TASK_ID |
 | `--lineage-of-not TASK_ID` | Exclude the canonical lineage containing TASK_ID |
+| `--related-to TASK_ID` | Deprecated alias for `--lineage-of` |
+| `--related-to-not TASK_ID` | Deprecated alias for `--lineage-of-not` |
 | `--root CSV` | Restrict by lineage root IDs (comma-separated) |
 | `--root-not CSV` | Exclude lineage root IDs (comma-separated) |
 | `--tag TAG` | Filter by tag (repeatable; all tags required by default) |

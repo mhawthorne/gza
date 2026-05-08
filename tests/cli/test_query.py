@@ -1615,8 +1615,6 @@ class TestSearchCommand:
             "blocked",
             "--root",
             f"{root_keep.id},{root_excluded.id}",
-            "--related-to-not",
-            child_excluded.id,
             "--lineage-of-not",
             child_excluded.id,
             "--project",
@@ -1630,6 +1628,237 @@ class TestSearchCommand:
         assert "needle blocked task" not in result.stdout
         assert "needle root excluded" not in result.stdout
         assert "needle child excluded" not in result.stdout
+
+    def test_search_related_to_alias_warns_and_matches_lineage_of(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("needle root", task_type="implement")
+        assert root.id is not None
+        child = store.add("needle child", task_type="review", based_on=root.id, same_branch=True)
+        sibling_root = store.add("needle other root", task_type="implement")
+
+        deprecated_result = run_gza(
+            "search",
+            "needle",
+            "--related-to",
+            child.id,
+            "--project",
+            str(tmp_path),
+        )
+        canonical_result = run_gza(
+            "search",
+            "needle",
+            "--lineage-of",
+            child.id,
+            "--project",
+            str(tmp_path),
+        )
+
+        assert deprecated_result.returncode == 0
+        assert canonical_result.returncode == 0
+        assert deprecated_result.stdout == canonical_result.stdout
+        assert "needle root" in deprecated_result.stdout
+        assert "needle child" in deprecated_result.stdout
+        assert "needle other root" not in deprecated_result.stdout
+        assert "Warning: --related-to is deprecated; use --lineage-of instead." in deprecated_result.stderr
+        assert canonical_result.stderr == ""
+
+    def test_search_related_to_not_alias_warns_and_matches_lineage_of_not(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("needle root", task_type="implement")
+        assert root.id is not None
+        child = store.add("needle child", task_type="review", based_on=root.id, same_branch=True)
+        keep = store.add("needle keep", task_type="implement")
+
+        deprecated_result = run_gza(
+            "search",
+            "needle",
+            "--related-to-not",
+            child.id,
+            "--project",
+            str(tmp_path),
+        )
+        canonical_result = run_gza(
+            "search",
+            "needle",
+            "--lineage-of-not",
+            child.id,
+            "--project",
+            str(tmp_path),
+        )
+
+        assert deprecated_result.returncode == 0
+        assert canonical_result.returncode == 0
+        assert deprecated_result.stdout == canonical_result.stdout
+        assert "needle root" not in deprecated_result.stdout
+        assert "needle child" not in deprecated_result.stdout
+        assert "needle keep" in deprecated_result.stdout
+        assert "Warning: --related-to-not is deprecated; use --lineage-of-not instead." in deprecated_result.stderr
+        assert canonical_result.stderr == ""
+
+    def test_search_lineage_of_not_and_related_to_not_union_exclusions(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root_a = store.add("needle root a", task_type="implement")
+        assert root_a.id is not None
+        child_a = store.add("needle child a", task_type="review", based_on=root_a.id, same_branch=True)
+        assert child_a.id is not None
+
+        root_b = store.add("needle root b", task_type="implement")
+        assert root_b.id is not None
+        child_b = store.add("needle child b", task_type="review", based_on=root_b.id, same_branch=True)
+        assert child_b.id is not None
+
+        root_keep = store.add("needle keep", task_type="implement")
+        assert root_keep.id is not None
+
+        result = run_gza(
+            "search",
+            "needle",
+            "--lineage-of-not",
+            child_a.id,
+            "--related-to-not",
+            child_b.id,
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "needle root a" not in result.stdout
+        assert "needle child a" not in result.stdout
+        assert "needle root b" not in result.stdout
+        assert "needle child b" not in result.stdout
+        assert "needle keep" in result.stdout
+        assert "Warning: --related-to-not is deprecated; use --lineage-of-not instead." in result.stderr
+
+    def test_search_lineage_of_not_keeps_valid_exclusion_when_related_to_not_missing(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root_excluded = store.add("needle excluded", task_type="implement")
+        assert root_excluded.id is not None
+        child_excluded = store.add(
+            "needle excluded child",
+            task_type="review",
+            based_on=root_excluded.id,
+            same_branch=True,
+        )
+        assert child_excluded.id is not None
+        root_keep = store.add("needle keep", task_type="implement")
+        assert root_keep.id is not None
+
+        result = run_gza(
+            "search",
+            "needle",
+            "--lineage-of-not",
+            child_excluded.id,
+            "--related-to-not",
+            "gza-9999",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "needle excluded" not in result.stdout
+        assert "needle excluded child" not in result.stdout
+        assert "needle keep" in result.stdout
+        assert "Warning: --related-to-not is deprecated; use --lineage-of-not instead." in result.stderr
+
+    def test_search_lineage_of_missing_id_returns_no_matches(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("needle keep", task_type="implement")
+
+        result = run_gza(
+            "search",
+            "needle",
+            "--lineage-of",
+            "gza-9999",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "needle keep" not in result.stdout
+
+    def test_search_related_to_missing_id_warns_and_returns_no_matches(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("needle keep", task_type="implement")
+
+        result = run_gza(
+            "search",
+            "needle",
+            "--related-to",
+            "gza-9999",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "needle keep" not in result.stdout
+        assert "Warning: --related-to is deprecated; use --lineage-of instead." in result.stderr
+
+    def test_search_root_and_lineage_of_different_roots_intersect_to_no_matches(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root_a = store.add("needle root a", task_type="implement")
+        assert root_a.id is not None
+        child_a = store.add("needle child a", task_type="review", based_on=root_a.id, same_branch=True)
+        assert child_a.id is not None
+        root_b = store.add("needle root b", task_type="implement")
+        assert root_b.id is not None
+
+        result = run_gza(
+            "search",
+            "needle",
+            "--root",
+            root_b.id,
+            "--lineage-of",
+            child_a.id,
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "needle root a" not in result.stdout
+        assert "needle child a" not in result.stdout
+        assert "needle root b" not in result.stdout
+
+    def test_search_root_and_related_to_different_roots_intersect_to_no_matches(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root_a = store.add("needle root a", task_type="implement")
+        assert root_a.id is not None
+        child_a = store.add("needle child a", task_type="review", based_on=root_a.id, same_branch=True)
+        assert child_a.id is not None
+        root_b = store.add("needle root b", task_type="implement")
+        assert root_b.id is not None
+
+        result = run_gza(
+            "search",
+            "needle",
+            "--root",
+            root_b.id,
+            "--related-to",
+            child_a.id,
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "needle root a" not in result.stdout
+        assert "needle child a" not in result.stdout
+        assert "needle root b" not in result.stdout
+        assert "Warning: --related-to is deprecated; use --lineage-of instead." in result.stderr
 
     def test_search_negative_filters_override_positive_matches_for_same_field(self, tmp_path: Path):
         setup_config(tmp_path)
