@@ -2785,6 +2785,89 @@ class TestReconciliation:
 
         assert registry.get("w-keep-in-progress") is not None
 
+    def test_prune_terminal_dead_workers_prunes_stale_terminal_worker_even_if_pid_is_alive(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Terminal task workers older than the grace window should be pruned despite PID reuse."""
+        import os
+        from datetime import timedelta
+
+        from gza.cli._common import (
+            WORKER_TERMINAL_PRUNE_GRACE_SECONDS,
+            prune_terminal_dead_workers,
+        )
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Terminal task with reused live PID")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC) - timedelta(seconds=WORKER_TERMINAL_PRUNE_GRACE_SECONDS + 60)
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-stale-live-terminal",
+                task_id=task.id,
+                pid=os.getpid(),
+                status="running",
+            )
+        )
+
+        prune_terminal_dead_workers(config)
+
+        assert registry.get("w-stale-live-terminal") is None
+        assert "Warning: Pruning stale terminal worker w-stale-live-terminal" in capsys.readouterr().err
+
+    def test_prune_terminal_dead_workers_prunes_old_terminal_worker_without_completed_at(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Terminal task workers fall back to worker started_at when completed_at is missing."""
+        import os
+        from datetime import timedelta
+
+        from gza.cli._common import (
+            WORKER_TERMINAL_PRUNE_FALLBACK_GRACE_SECONDS,
+            prune_terminal_dead_workers,
+        )
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Legacy terminal task missing completed_at")
+        task.status = "failed"
+        task.completed_at = None
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-stale-fallback-terminal",
+                task_id=task.id,
+                pid=os.getpid(),
+                status="running",
+                started_at=(
+                    datetime.now(UTC) - timedelta(seconds=WORKER_TERMINAL_PRUNE_FALLBACK_GRACE_SECONDS + 60)
+                ).isoformat(),
+            )
+        )
+
+        prune_terminal_dead_workers(config)
+
+        assert registry.get("w-stale-fallback-terminal") is None
+        assert "Warning: Pruning stale terminal worker w-stale-fallback-terminal" in capsys.readouterr().err
+
     def test_prune_terminal_dead_workers_keeps_live_worker_for_terminal_task(self, tmp_path: Path):
         """Live worker PID for a terminal task must NOT be pruned (is_running guard)."""
         import os
