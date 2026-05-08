@@ -347,6 +347,28 @@ def test_internal_advance_workflow_task_collection_tracks_shared_recovery_policy
     assert "**Resumable failed tasks**" not in task_collection_section
 
 
+def test_internal_advance_workflow_failed_task_recovery_is_not_resume_only() -> None:
+    """Internal advance workflow docs should describe retry as a first-class worker-spawning recovery action."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    internal_content = (docs_root / "internal" / "advance-workflow.md").read_text()
+
+    failed_task_section = internal_content.split("### 8. Failed task recovery", 1)[1].split("## Improve chain semantics", 1)[0]
+    worker_actions_section = internal_content.split("### Worker-spawning actions", 1)[1].split("### Direct actions", 1)[0]
+    output_section = internal_content.split("## Output", 1)[1].split("## Idempotency", 1)[0]
+
+    assert "Failed task recovery rules run in the same ordered rule engine." in failed_task_section
+    assert "| Shared failed-task recovery policy returns `resume` | `resume` — create resume task and spawn worker |" in failed_task_section
+    assert "| Shared failed-task recovery policy returns `retry` | `retry` — create retry task and spawn worker |" in failed_task_section
+    assert "Failed task resume rules run in the same ordered rule engine." not in failed_task_section
+    assert "| Otherwise | `resume` — create resume task and spawn worker |" not in failed_task_section
+
+    assert "| `resume` | Creates resume task, spawns worker |" in worker_actions_section
+    assert "| `retry` | Creates retry task, spawns worker |" in worker_actions_section
+
+    assert "`create_review`, `create_implement`, `resume`, `retry`, `needs_rebase`" in output_section
+    assert "created/reused task ID" in output_section
+
+
 def test_docker_setup_command_docs_describe_prewarm_hook_and_race_avoidance() -> None:
     """Docker config docs should explain pre-warm semantics and why first-use lazy installs race."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"
