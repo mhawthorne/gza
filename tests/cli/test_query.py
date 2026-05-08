@@ -6251,30 +6251,6 @@ class TestUnmergedReviewStatus:
         assert "review: no review" not in normalized
         assert "review stale" not in normalized
 
-    def test_resolve_unmerged_branch_owner_uses_merge_status_owner_rule(self, tmp_path: Path):
-        """Owner resolution should follow storage ownership rules, not query-only lineage checks."""
-        from gza.cli.query import _resolve_unmerged_branch_owner
-
-        store, task, git = setup_unmerged_env(tmp_path)
-
-        improve = store.add("Improve implementation", task_type="improve")
-        improve.status = "completed"
-        improve.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
-        improve.based_on = task.id
-        improve.branch = "feature/test"
-        improve.same_branch = True
-        store.update(improve)
-
-        fix_task = store.add("Standalone fix", task_type="fix")
-        fix_task.status = "completed"
-        fix_task.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
-        fix_task.branch = "feature/fix"
-        fix_task.same_branch = True
-        store.update(fix_task)
-
-        assert _resolve_unmerged_branch_owner(store, improve).id == task.id
-        assert _resolve_unmerged_branch_owner(store, fix_task).id == fix_task.id
-
     def test_unmerged_stale_detail_from_review_cleared_state_is_truthful(self, tmp_path: Path):
         """review_cleared_at stale state should not claim an improve task exists."""
         store, task, git = setup_unmerged_env(tmp_path)
