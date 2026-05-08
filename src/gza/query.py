@@ -32,7 +32,6 @@ class HistoryFilter:
     status_not: str | None = None
     task_type: str | None = None  # 'task' | 'implement' | 'review' | ...
     task_type_not: str | None = None
-    incomplete: bool = False  # Only tasks not yet merged/resolved
     days: int | None = None  # Only tasks within the last N days
     start_date: str | None = None  # Only tasks on or after this date (YYYY-MM-DD)
     end_date: str | None = None  # Only tasks on or before this date (YYYY-MM-DD)
@@ -95,12 +94,7 @@ def is_lineage_complete(task: Task) -> bool:
 
 
 def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
-    """Return a flat filtered task history list.
-
-    When f.incomplete is True, fetches all tasks (ignoring limit) then
-    post-filters in Python, then applies the limit. This is correct at
-    gza scale (typically <1000 tasks).
-    """
+    """Return a flat filtered task history list."""
     service = _TaskQueryService(store)
 
     date_filter = DateFilter(
@@ -130,9 +124,8 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
     exclude_task_types: tuple[str, ...] | None = (f.task_type_not,) if f.task_type_not else None
     lifecycle_state: tuple[str, ...] | None = ("terminal",)
 
-    effective_limit = None if f.incomplete else f.limit
     q = TaskQueryPresets.history(
-        limit=effective_limit,
+        limit=f.limit,
         statuses=statuses,
         task_types=task_types,
         lifecycle_state=lifecycle_state,
@@ -199,11 +192,6 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
     rows = service.run(q).rows
     task_rows = [row for row in rows if isinstance(row, TaskRow)]
     tasks = [row.task for row in task_rows if row.task.task_type != "internal" or f.task_type == "internal"]
-
-    if f.incomplete:
-        tasks = [t for t in tasks if not is_lineage_complete(t)]
-        if f.limit is not None:
-            tasks = tasks[: f.limit]
 
     return tasks
 
@@ -367,7 +355,6 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
         status=None,
         task_type=f.task_type,
         task_type_not=f.task_type_not,
-        incomplete=False,
         days=f.days,
         start_date=f.start_date,
         end_date=f.end_date,

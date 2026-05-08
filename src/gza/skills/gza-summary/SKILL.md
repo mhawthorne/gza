@@ -104,6 +104,6 @@ Keep it concise. If a section has no actionable items, say so briefly and move o
 ## Important notes
 
 - `/gza-summary` is the synthesized recommendation layer. It is not a canonical replacement for `gza incomplete`.
-- `uv run gza history --incomplete` remains a factual unresolved-history filter, not an action-planning summary.
+- Keep failed history, unmerged work, unimplemented follow-up, and queue state on their dedicated surfaces.
 - Prefer gza-native commands in recommendations.
 - Use full prefixed task IDs in every command example.

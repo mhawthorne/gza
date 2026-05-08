@@ -12,7 +12,7 @@ Always use `uv run gza` (not `gza` directly or `python -m gza`).
 gza add "prompt"          # Add a task (default type: implement)
 gza work [-b]             # Run next pending task (-b for background)
 gza next                  # List pending tasks
-gza history [--incomplete]  # List recent/failed/unmerged tasks
+gza history               # List recent completed/failed tasks
 gza advance               # Progress unmerged tasks through lifecycle
 gza lineage <id>          # Show task's ancestor/descendant tree
 gza migrate [--status]    # Run manual DB migrations (e.g. v25/v26 task-ID migrations)

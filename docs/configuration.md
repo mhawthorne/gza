@@ -1043,7 +1043,6 @@ gza history [options]
 | `--tag TAG` | Filter by tag (repeatable; all tags required by default) |
 | `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |
 | `--any-tag` | With repeated `--tag` and/or `--tag-not` values, match any requested tag instead of all |
-| `--incomplete` | Show only unresolved tasks (failed or unmerged) |
 | `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
 | `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `effective`) |
 | `--fields CSV` | Projection fields override for JSON output only (comma-separated; requires `--json`) |
@@ -1064,7 +1063,7 @@ Positive and negative filters on the same field are applied in order: include ma
 | Pending queue state, including dropped-dependency blockers | `uv run gza next` or `uv run gza next --all` (blocked rows include blocker status, so dropped dependencies are called out explicitly) |
 | Synthesized "what should I do next?" triage guidance | `/gza-summary` |
 
-`uv run gza history --incomplete` remains available as a factual unresolved-history filter. It is not the successor to the old mixed-bucket `gza incomplete` workflow.
+Keep those domains separate instead of reintroducing a single mixed unresolved-history view.
 
 ### search
 
