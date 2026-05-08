@@ -408,7 +408,13 @@ def is_resolved_by_merged_target(store: SqliteTaskStore, task: DbTask) -> bool:
         # Same-branch improve tasks can represent real post-merge follow-up work.
         return False
     target_task = _resolve_merged_target_task(store, task)
-    return target_task is not None and target_task.merge_status == "merged"
+    if target_task is None:
+        return False
+    if target_task.id is not None:
+        unit = store.resolve_merge_unit_for_task(target_task.id)
+        if unit is not None:
+            return unit.state == "merged"
+    return target_task.merge_status == "merged"
 
 
 def _load_merge_context(project_dir: Path | None = None) -> _MergeContext:
@@ -514,7 +520,14 @@ def _is_resolved_by_landed_lineage(
 
     lineage = build_lineage(store, resolve_lineage_root(store, task))
     for lineage_task in lineage:
-        if lineage_task.id == task.id or lineage_task.merge_status != "merged":
+        if lineage_task.id == task.id:
+            continue
+        merge_state = lineage_task.merge_status
+        if lineage_task.id is not None:
+            unit = store.resolve_merge_unit_for_task(lineage_task.id)
+            if unit is not None:
+                merge_state = unit.state
+        if merge_state != "merged":
             continue
         if lineage_task.id == independent_follow_up_root_id:
             continue

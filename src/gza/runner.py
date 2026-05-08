@@ -3385,6 +3385,15 @@ def _complete_code_task(
         },
     )
 
+    fix_was_merged_before_run = False
+    if task.task_type == "fix":
+        root_impl = _resolve_root_implementation_for_fix(task, store)
+        if root_impl is not None and root_impl.id is not None:
+            root_impl_unit = store.resolve_merge_unit_for_task(root_impl.id)
+            fix_was_merged_before_run = (
+                (root_impl_unit.state if root_impl_unit is not None else root_impl.merge_status) == "merged"
+            )
+
     # Mark completed — after log entries are flushed so readers see the
     # full log before the status transitions away from in_progress.
     store.mark_completed(
@@ -3407,6 +3416,7 @@ def _complete_code_task(
         stats,
         fix_commits_ahead_before_run=fix_commits_ahead_before_run,
         fix_default_branch=fix_default_branch,
+        fix_was_merged_before_run=fix_was_merged_before_run,
     )
 
 
@@ -3420,6 +3430,7 @@ def _post_complete_code_task(
     *,
     fix_commits_ahead_before_run: int | None = None,
     fix_default_branch: str | None = None,
+    fix_was_merged_before_run: bool = False,
 ) -> int:
     """Run shared post-completion side effects for completed code tasks."""
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
@@ -3438,7 +3449,14 @@ def _post_complete_code_task(
             # improve writes add commits on the shared implementation branch even
             # when publishing those commits still needs operator intervention.
             refreshed_impl = store.get(impl_ancestor.id)
-            if refreshed_impl and refreshed_impl.id is not None and refreshed_impl.merge_status == "merged":
+            refreshed_unit = (
+                store.resolve_merge_unit_for_task(refreshed_impl.id)
+                if refreshed_impl and refreshed_impl.id is not None
+                else None
+            )
+            if refreshed_impl and refreshed_impl.id is not None and (
+                refreshed_unit.state if refreshed_unit is not None else refreshed_impl.merge_status
+            ) == "merged":
                 store.set_merge_status(refreshed_impl.id, "unmerged")
         if task.create_review:
             improve_follow_up_ready = _sync_completed_improve_branch_for_live_pr(task, store, worktree_git)
@@ -3454,7 +3472,10 @@ def _post_complete_code_task(
     if task.task_type == "rebase" and task.based_on:
         store.invalidate_review_state(task.based_on)
         parent = store.get(task.based_on)
-        if parent and parent.id is not None and parent.merge_status == "merged":
+        parent_unit = store.resolve_merge_unit_for_task(parent.id) if parent and parent.id is not None else None
+        if parent and parent.id is not None and (
+            parent_unit.state if parent_unit is not None else parent.merge_status
+        ) == "merged":
             store.set_merge_status(parent.id, "unmerged")
 
     # Rebase tasks run provider-side conflict resolution in the worktree.
@@ -3470,6 +3491,7 @@ def _post_complete_code_task(
             branch_name,
             fix_commits_ahead_before_run=fix_commits_ahead_before_run,
             fix_default_branch=fix_default_branch,
+            fix_was_merged_before_run=fix_was_merged_before_run,
         )
 
     console.print("")
@@ -3509,12 +3531,23 @@ def _handle_fix_follow_up_review(
     *,
     fix_commits_ahead_before_run: int | None,
     fix_default_branch: str | None,
+    fix_was_merged_before_run: bool = False,
 ) -> None:
     """Create a follow-up review task for fix runs when the run added commits."""
     root_impl = _resolve_root_implementation_for_fix(task, store)
     if root_impl is None or root_impl.id is None:
         return
+    root_impl_id = root_impl.id
+
+    def _restore_prior_merged_state() -> None:
+        if not fix_was_merged_before_run:
+            return
+        refreshed_impl = store.get(root_impl_id)
+        if refreshed_impl is not None and refreshed_impl.id is not None:
+            store.set_merge_status(refreshed_impl.id, "merged")
+
     if fix_commits_ahead_before_run is None:
+        _restore_prior_merged_state()
         print("Warning: Could not determine fix commit baseline before run")
         print("Warning: Could not determine whether the fix run changed code")
         return
@@ -3524,6 +3557,7 @@ def _handle_fix_follow_up_review(
         try:
             default_branch = worktree_git.default_branch()
         except GitError as exc:
+            _restore_prior_merged_state()
             print(f"Warning: Could not determine fix commit delta: {exc}")
             print("Warning: Could not determine whether the fix run changed code")
             return
@@ -3531,18 +3565,23 @@ def _handle_fix_follow_up_review(
     try:
         commits_after = worktree_git.count_commits_ahead(branch_name, default_branch)
     except GitError as exc:
+        _restore_prior_merged_state()
         print(f"Warning: Could not determine fix commit delta: {exc}")
         print("Warning: Could not determine whether the fix run changed code")
         return
 
     commits_before = fix_commits_ahead_before_run
     if commits_after <= commits_before:
+        _restore_prior_merged_state()
         print("Fix completed without new commits; no follow-up review was auto-created.")
         return
 
-    store.clear_review_state(root_impl.id)
-    refreshed_impl = store.get(root_impl.id)
-    if refreshed_impl and refreshed_impl.id is not None and refreshed_impl.merge_status == "merged":
+    store.clear_review_state(root_impl_id)
+    refreshed_impl = store.get(root_impl_id)
+    refreshed_unit = store.resolve_merge_unit_for_task(refreshed_impl.id) if refreshed_impl and refreshed_impl.id is not None else None
+    if refreshed_impl and refreshed_impl.id is not None and (
+        refreshed_unit.state if refreshed_unit is not None else refreshed_impl.merge_status
+    ) == "merged":
         store.set_merge_status(refreshed_impl.id, "unmerged")
 
     try:

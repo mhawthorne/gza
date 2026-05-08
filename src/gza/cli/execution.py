@@ -2016,14 +2016,16 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         print(f"Error: Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
         return 1
 
-    if resolved_from_failed_ancestor and impl_task.merge_status == "merged":
+    resolved_merge_unit = store.resolve_merge_unit_for_task(impl_task.id) if impl_task.id is not None else None
+    resolved_merge_state = resolved_merge_unit.state if resolved_merge_unit is not None else impl_task.merge_status
+    if resolved_from_failed_ancestor and resolved_merge_state == "merged":
         print(
             "No remaining iterate action: "
             f"failed implementation {requested_impl_task.id} was fully recovered by merged descendant {impl_task.id}."
         )
         return 0
 
-    if impl_task.merge_status == "merged":
+    if resolved_merge_state == "merged":
         print(f"No remaining iterate action: implementation {impl_task.id} is already merged.")
         return 0
 

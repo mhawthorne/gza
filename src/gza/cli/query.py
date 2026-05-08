@@ -1474,6 +1474,11 @@ def _enrich_unmerged_result(
             continue
 
         owner_task = row.owner_task
+        merge_unit = (
+            store.resolve_merge_unit_for_task(owner_task.id)
+            if owner_task.id is not None
+            else None
+        )
         pruned_tree = _descendants_only_unmerged_lineage_tree(store, owner_task=owner_task)
         members = tuple(_flatten_query_lineage_tree(pruned_tree)) if pruned_tree is not None else row.members
         representative_branch = owner_task.branch
@@ -1687,7 +1692,10 @@ def _enrich_unmerged_result(
                     else None
                 ),
                 "branch": representative_branch,
+                "source_branch": merge_unit.source_branch if merge_unit is not None else representative_branch,
                 "target_branch": target_branch,
+                "merge_unit_id": merge_unit.id if merge_unit is not None else None,
+                "merge_unit_state": merge_unit.state if merge_unit is not None else owner_task.merge_status,
                 "branch_deleted": branch_deleted,
                 "commit_count": commit_count,
                 "files_changed": files_changed,
@@ -1852,7 +1860,14 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
                 if errors:
                     print(f"Error: failed to refresh canonical merge truth: {errors[0]}")
                     return 1
-            selected_tasks = [task for task in store.get_unmerged() if task.status == "completed"]
+            if store.supports_merge_units():
+                selected_tasks = []
+                for unit in store.get_unmerged_merge_units(target_branch):
+                    owner = store._legacy_merge_status_owner_for_unit(unit)
+                    if owner is not None and owner.status == "completed":
+                        selected_tasks.append(owner)
+            else:
+                selected_tasks = [task for task in store.get_unmerged() if task.status == "completed"]
     except sqlite3.OperationalError as exc:
         if _is_readonly_snapshot_refresh_error(
             exc,
@@ -1882,12 +1897,21 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
         return 0
 
     limit = None if getattr(args, "limit", 5) == 0 else getattr(args, "limit", 5)
+    merge_unit_ids_list: list[str] = []
+    for task in selected_tasks:
+        if task.id is None:
+            continue
+        resolved_unit = store.resolve_merge_unit_for_task(task.id)
+        if resolved_unit is not None:
+            merge_unit_ids_list.append(resolved_unit.id)
+    merge_unit_ids = tuple(dict.fromkeys(merge_unit_ids_list))
     projection = _TaskProjectionSpec(
         preset=_TaskProjectionPreset.UNMERGED_DEFAULT,
         fields=projection_fields,
     )
     query = _TaskQueryPresets.unmerged(
         branch_owner_ids=owner_ids,
+        merge_unit_ids=merge_unit_ids or None,
         task_ids=tuple(task.id for task in selected_tasks if task.id is not None),
         limit=limit,
         mode=view_mode,

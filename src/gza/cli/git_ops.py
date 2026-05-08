@@ -378,6 +378,32 @@ def _build_auto_merge_args(
     )
 
 
+def _task_merge_unit_state(store: SqliteTaskStore, task: DbTask) -> str | None:
+    if task.id is not None:
+        unit = store.resolve_merge_unit_for_task(task.id)
+        if unit is not None:
+            return unit.state
+    return task.merge_status
+
+
+def _resolve_merge_target_task(
+    store: SqliteTaskStore,
+    task_id: str,
+) -> DbTask | None:
+    task = store.get(task_id)
+    if task is None:
+        return None
+    if task.id is None or not task.branch:
+        return task
+    unit = store.resolve_merge_unit_for_task(task.id)
+    if unit is None:
+        unit = store.get_or_create_merge_unit_for_task(task, store.default_merge_target())
+    if unit is None:
+        return task
+    owner = store._legacy_merge_status_owner_for_unit(unit)
+    return owner or task
+
+
 def _merge_single_task(
     task_id: str,
     config: Config,
@@ -387,11 +413,12 @@ def _merge_single_task(
     current_branch: str,
 ) -> int:
     """Merge a single task's branch. Returns 0 on success, 1 on failure."""
-    # Get the task
-    task = store.get(task_id)
+    # Resolve selected row to the active merge unit owner when available.
+    task = _resolve_merge_target_task(store, task_id)
     if not task:
         print(f"Error: Task {task_id} not found")
         return 1
+    merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
 
     # Validate task state
     if task.status not in ("completed", "unmerged"):
@@ -409,7 +436,10 @@ def _merge_single_task(
             print("Error: --mark-only cannot be used with --rebase, --squash, or --delete")
             return 1
 
-        store.set_merge_status(task.id, "merged")
+        if merge_unit is not None:
+            store.set_merge_unit_state(merge_unit.id, "merged", merged_by_task_id=task.id)
+        else:
+            store.set_merge_status(task.id, "merged")
         print(f"✓ Marked task {task.id} as merged (branch '{task.branch}' preserved)")
         return 0
 
@@ -507,7 +537,10 @@ def _merge_single_task(
                 print(f"Warning: Could not delete branch: {e}")
 
         if git.repo_dir == config.project_dir:
-            store.set_merge_status(task.id, "merged")
+            if merge_unit is not None:
+                store.set_merge_unit_state(merge_unit.id, "merged", merged_by_task_id=task.id)
+            else:
+                store.set_merge_status(task.id, "merged")
         return 0
 
     except GitError as e:
@@ -552,7 +585,10 @@ def _merge_single_task(
                     print(f"Warning: Could not delete branch: {del_error}")
 
             if git.repo_dir == config.project_dir:
-                store.set_merge_status(task.id, "merged")
+                if merge_unit is not None:
+                    store.set_merge_unit_state(merge_unit.id, "merged", merged_by_task_id=task.id)
+                else:
+                    store.set_merge_status(task.id, "merged")
             return 0
 
         print(f"Error during {operation}: {e}")
@@ -602,23 +638,52 @@ def cmd_merge(args: argparse.Namespace) -> int:
 
     use_all = getattr(args, 'all', False)
     if use_all:
-        # Find all completed/unmerged tasks with branches not yet merged
-        history = store.get_history(limit=None)
         seen_ids = set(task_ids)
-        # Process oldest first (history is newest-first, so reverse it)
-        for task in reversed(history):
-            if task.id in seen_ids:
-                continue
-            if task.id is not None and task.status in ("completed", "unmerged") and task.branch and task.has_commits:
-                if task.merge_status != "merged" and not git.is_merged(task.branch, current_branch):
-                    task_ids.append(task.id)
-                    seen_ids.add(task.id)
+        if store.supports_merge_units():
+            units = reversed(store.get_unmerged_merge_units(store.default_merge_target()))
+            for unit in units:
+                owner = store._legacy_merge_status_owner_for_unit(unit)
+                if owner is None or owner.id is None or owner.id in seen_ids:
+                    continue
+                if owner.branch and not git.is_merged(owner.branch, current_branch):
+                    task_ids.append(owner.id)
+                    seen_ids.add(owner.id)
+        else:
+            history = store.get_history(limit=None)
+            # Process oldest first (history is newest-first, so reverse it)
+            for task in reversed(history):
+                if task.id in seen_ids:
+                    continue
+                if task.id is not None and task.status in ("completed", "unmerged") and task.branch and task.has_commits:
+                    if task.merge_status != "merged" and not git.is_merged(task.branch, current_branch):
+                        task_ids.append(task.id)
+                        seen_ids.add(task.id)
         if not task_ids:
             print("No unmerged done tasks found")
             return 0
     elif not task_ids:
         print("Error: either provide task_id(s) or use --all to merge all unmerged done tasks")
         return 1
+
+    # Deduplicate selected task rows by active merge unit/branch owner.
+    deduped_task_ids: list[str] = []
+    seen_units: set[str] = set()
+    seen_tasks: set[str] = set()
+    for raw_task_id in task_ids:
+        resolved = _resolve_merge_target_task(store, raw_task_id)
+        if resolved is None or resolved.id is None:
+            continue
+        resolved_id = resolved.id
+        resolved_unit = store.resolve_merge_unit_for_task(resolved_id)
+        if resolved_unit is not None:
+            if resolved_unit.id in seen_units:
+                continue
+            seen_units.add(resolved_unit.id)
+        if resolved_id in seen_tasks:
+            continue
+        seen_tasks.add(resolved_id)
+        deduped_task_ids.append(resolved_id)
+    task_ids = deduped_task_ids
 
     # Track success/failure
     merged_tasks = []
@@ -970,7 +1035,7 @@ def _run_task_backed_rebase(
         if target_parent_id:
             store.invalidate_review_state(target_parent_id)
             parent = store.get(target_parent_id)
-            if parent and parent.id is not None and parent.merge_status == "merged":
+            if parent and parent.id is not None and _task_merge_unit_state(store, parent) == "merged":
                 store.set_merge_status(parent.id, "unmerged")
 
         if resolved_by_provider:
@@ -1241,7 +1306,7 @@ def cmd_pr(args: argparse.Namespace) -> int:
         return 1
 
     # Check merge_status before requiring gh (local DB check, no external dependencies)
-    if task.merge_status == "merged":
+    if _task_merge_unit_state(store, task) == "merged":
         print(f"Error: Task {task.id} is already marked as merged")
         return 1
 

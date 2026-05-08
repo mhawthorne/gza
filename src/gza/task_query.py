@@ -80,6 +80,7 @@ class TaskQuery:
     exclude_root_ids: tuple[str, ...] | None = None
     task_ids: tuple[str, ...] | None = None
     branch_owner_ids: tuple[str, ...] | None = None
+    merge_unit_ids: tuple[str, ...] | None = None
     groups: tuple[str, ...] | None = None
     tag_filters: tuple[str, ...] | None = None
     exclude_tag_filters: tuple[str, ...] | None = None
@@ -201,7 +202,10 @@ _PROJECTION_PRESET_FIELDS: dict[str, tuple[str, ...]] = {
         "unresolved_ids",
         "lineage_text",
         "branch",
+        "source_branch",
         "target_branch",
+        "merge_unit_id",
+        "merge_unit_state",
         "branch_deleted",
         "commit_count",
         "files_changed",
@@ -333,6 +337,7 @@ class TaskQueryPresets:
     def unmerged(
         *,
         branch_owner_ids: tuple[str, ...],
+        merge_unit_ids: tuple[str, ...] | None = None,
         task_ids: tuple[str, ...] | None = None,
         limit: int | None = 5,
         mode: PresentationMode = "rich",
@@ -343,6 +348,7 @@ class TaskQueryPresets:
             limit=limit,
             task_ids=task_ids,
             branch_owner_ids=branch_owner_ids,
+            merge_unit_ids=merge_unit_ids,
             projection=projection or ProjectionSpec(preset=TaskProjectionPreset.UNMERGED_DEFAULT),
             presentation=PresentationSpec(mode=mode),
         )
@@ -515,6 +521,7 @@ class TaskQueryService:
                     exclude_root_ids=query.exclude_root_ids,
                     task_ids=query.task_ids,
                     branch_owner_ids=query.branch_owner_ids,
+                    merge_unit_ids=query.merge_unit_ids,
                     groups=query.groups,
                     tag_filters=query.tag_filters,
                     exclude_tag_filters=query.exclude_tag_filters,
@@ -660,6 +667,16 @@ class TaskQueryService:
                 task
                 for task in filtered
                 if self._resolve_branch_owner(task).id in allowed_owners
+            ]
+
+        if query.merge_unit_ids is not None:
+            allowed_units = set(query.merge_unit_ids)
+            filtered = [
+                task
+                for task in filtered
+                if task.id is not None
+                and (unit := self._store.resolve_merge_unit_for_task(task.id)) is not None
+                and unit.id in allowed_units
             ]
 
         if query.groups is not None or query.tag_filters is not None or query.exclude_tag_filters is not None:
@@ -887,6 +904,10 @@ class TaskQueryService:
         return task
 
     def _branch_merge_state(self, owner_task: DbTask) -> str:
+        if owner_task.id is not None:
+            unit = self._store.resolve_merge_unit_for_task(owner_task.id)
+            if unit is not None:
+                return unit.state
         if owner_task.merge_status == "merged":
             return "merged"
         if owner_task.merge_status == "unmerged":

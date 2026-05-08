@@ -8254,11 +8254,14 @@ class TestUnmergedSelectionBehavior:
         result = run_gza("unmerged", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Migrating merge status" in result.stdout
+        assert "Migrating merge status" not in result.stdout
         assert "Legacy deleted local remote survivor task" in result.stdout
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.merge_status == "unmerged"
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == "unmerged"
 
     def test_unmerged_backfills_merge_status(self, tmp_path: Path):
         """Plain unmerged backfills canonical merge_status."""
@@ -8272,7 +8275,7 @@ class TestUnmergedSelectionBehavior:
 
         result = run_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
-        assert "Migrating merge status" in result.stdout
+        assert "Migrating merge status" not in result.stdout
         assert "Old task needing migration" in result.stdout
 
         migrated_task = store.get(task.id)
@@ -8801,7 +8804,7 @@ class TestUnmergedImprovedDisplay:
         assert "Live diff-stat failure task" not in captured.out
 
     def test_unmerged_persists_merge_status_during_default_refresh(self, tmp_path: Path):
-        """Default unmerged persists canonical merge truth."""
+        """Default unmerged persists canonical merge truth through merge units."""
         store, task, _git = setup_unmerged_env(
             tmp_path,
             task_prompt="Legacy merge-status update task",
@@ -8814,10 +8817,13 @@ class TestUnmergedImprovedDisplay:
 
         read_only_view = run_gza("unmerged", "--project", str(tmp_path))
         assert read_only_view.returncode == 0
-        assert "Migrating merge status" in read_only_view.stdout
+        assert "Migrating merge status" not in read_only_view.stdout
         migrated = store.get(task.id)
         assert migrated is not None
         assert migrated.merge_status == "unmerged"
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == "unmerged"
 
     def test_unmerged_shows_diff_stats(self, tmp_path: Path):
         """Unmerged output shows diff stats (files, LOC added/removed)."""
@@ -9132,6 +9138,33 @@ class TestUnmergedUnifiedQueryOutput:
         assert payload == [{"id": payload[0]["id"], "prompt": "JSON output task"}]
         assert "Progress:" in captured.err
         assert "On branch" not in captured.out
+
+    def test_unmerged_json_fields_expose_merge_unit_metadata(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _setup_unmerged_env_fast(tmp_path, task_prompt="Unit metadata task")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=True,
+            fields="id,merge_unit_id,merge_unit_state,source_branch,target_branch",
+        )
+
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        payload = json.loads(captured.out)
+        assert payload[0]["merge_unit_id"].startswith("testproject-mu-")
+        assert payload[0]["merge_unit_state"] == "unmerged"
+        assert payload[0]["source_branch"] == "feature/test"
+        assert payload[0]["target_branch"] == "main"
 
     def test_unmerged_text_fields_support_single_and_multi_projection(
         self,

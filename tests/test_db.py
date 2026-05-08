@@ -1764,6 +1764,11 @@ class TestMergeStatus:
         assert retrieved is not None
         assert retrieved.merge_status == "unmerged"
         assert retrieved.has_commits is True
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.source_branch == "feature/test"
+        assert unit.target_branch == "main"
+        assert unit.state == "unmerged"
 
     def test_mark_completed_same_branch_improve_keeps_merge_status_on_owner_only(self, tmp_path: Path):
         """Completed same-branch improve rows should not own merge state."""
@@ -1926,8 +1931,8 @@ class TestMergeStatus:
         assert refreshed_improve.merge_status is None
         assert needs_merge_status_migration(store) is False
 
-    def test_needs_merge_status_migration_still_flags_merge_owner_rows(self, tmp_path: Path):
-        """Merge-owning legacy rows with commits still require backfill."""
+    def test_needs_merge_status_migration_is_disabled_when_merge_units_are_available(self, tmp_path: Path):
+        """Merge-unit-backed stores no longer report legacy merge-status migration work."""
         from gza.db import needs_merge_status_migration
 
         db_path = tmp_path / "test.db"
@@ -1938,7 +1943,32 @@ class TestMergeStatus:
         assert impl_task.id is not None
         store.set_merge_status(impl_task.id, None)
 
-        assert needs_merge_status_migration(store) is True
+        assert needs_merge_status_migration(store) is False
+
+    def test_same_branch_followups_share_one_merge_unit(self, tmp_path: Path) -> None:
+        """Same-branch improve/fix/review rows attach to the existing merge unit."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/impl")
+        review = store.add("Review feature", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "completed"
+        review.branch = "feature/impl"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        store.mark_completed(improve, has_commits=True, branch="feature/impl")
+
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        review_unit = store.resolve_merge_unit_for_task(review.id)
+        improve_unit = store.resolve_merge_unit_for_task(improve.id)
+        assert impl_unit is not None
+        assert review_unit is not None
+        assert improve_unit is not None
+        assert impl_unit.id == review_unit.id == improve_unit.id
+        attached_ids = {task.id for task in store.list_tasks_for_merge_unit(impl_unit.id)}
+        assert attached_ids == {impl.id, review.id, improve.id}
 
     def test_migrate_merge_status_logs_when_remote_probe_fails(self, tmp_path: Path, caplog: pytest.LogCaptureFixture):
         """Migration logs a warning and defaults safely when origin inspection fails."""
@@ -1973,6 +2003,9 @@ class TestMergeStatus:
         updated = store.get(task.id)
         assert updated is not None
         assert updated.merge_status == "unmerged"
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == "unmerged"
         assert "Could not inspect origin while backfilling merge status" in caplog.text
 
     def test_migrate_merge_status_deleted_local_branch_with_remote_survivor_stays_unmerged(self, tmp_path: Path):
@@ -5085,7 +5118,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -5097,7 +5130,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -7522,7 +7555,7 @@ class TestSharedDbIsolationAndImportGating:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]
 
 
 class TestSyncCandidates:

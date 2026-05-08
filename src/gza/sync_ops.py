@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
-from .db import SqliteTaskStore, Task, task_owns_merge_status
+from .db import _DB_UNSET, SqliteTaskStore, Task, task_owns_merge_status
 from .git import Git, GitError, parse_diff_numstat
 from .github import GitHub, GitHubError, PullRequestDetails
 
@@ -744,6 +744,39 @@ def _persist_branch_state(
     Merge truth is stored only on rows that own merge status; other branch-scoped
     sync fields continue to fan out across the cohort.
     """
+    if store.supports_merge_units():
+        owner_task = next((task for task in tasks if task.id is not None and task_owns_merge_status(task)), None)
+        if owner_task is not None:
+            owner_task_id = owner_task.id
+            assert owner_task_id is not None
+            unit = store.resolve_merge_unit_for_task(owner_task_id) or store.get_or_create_merge_unit_for_task(
+                owner_task,
+                store.default_merge_target(),
+            )
+            if unit is not None:
+                diff_tuple = (
+                    cast("tuple[int | None, int | None, int | None]", diff_stats)
+                    if diff_stats is not _UNSET
+                    else None
+                )
+                store.set_merge_unit_state(
+                    unit.id,
+                    unit.state if merge_status is _UNSET else cast("str | None", merge_status) or "stale",
+                    pr_number=cast(Any, cast("int | None", pr_number) if pr_number is not _UNSET else _DB_UNSET),
+                    pr_state=cast(Any, cast("str | None", pr_state) if pr_state is not _UNSET else _DB_UNSET),
+                    pr_last_synced_at=cast(
+                        Any,
+                        cast("datetime | None", pr_last_synced_at) if pr_last_synced_at is not _UNSET else _DB_UNSET,
+                    ),
+                    sync_last_synced_at=cast(
+                        Any,
+                        cast("datetime | None", sync_last_synced_at)
+                        if sync_last_synced_at is not _UNSET
+                        else _DB_UNSET,
+                    ),
+                    diff_stats=diff_tuple,
+                )
+                return
     for original in tasks:
         task = store.get(original.id) if original.id is not None else None
         if task is None:
