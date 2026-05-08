@@ -66,7 +66,7 @@ $ gza log gza-1 --steps
 ## Check unmerged work
 
 ```bash
-$ gza unmerged
+$ uv run gza unmerged
 Unmerged branches:
 
   gza-1 20260108-fix-the-login-button
