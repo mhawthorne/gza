@@ -59,7 +59,10 @@ def test_unit_tests_do_not_carry_per_test_pytest_timeout_overrides() -> None:
     timeout_overrides: list[str] = []
 
     for test_file in tests_root.rglob("test_*.py"):
-        module = ast.parse(test_file.read_text(), filename=str(test_file))
+        test_source = test_file.read_text()
+        if "pytest.mark.timeout" not in test_source:
+            continue
+        module = ast.parse(test_source, filename=str(test_file))
         for node in ast.walk(module):
             if not isinstance(node, ast.Call):
                 continue
