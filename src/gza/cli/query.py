@@ -23,7 +23,7 @@ from rich.markup import escape as rich_escape
 
 import gza.colors as _colors
 
-from ..colors import NEXT_COLORS_DICT, PS_STATUS_COLORS, SHOW_COLORS_DICT, UNMERGED_COLORS_DICT, pink
+from ..colors import NEXT_COLORS_DICT, PS_STATUS_COLORS, SHOW_COLORS_DICT, pink
 from ..config import Config
 from ..console import (
     MAX_PROMPT_DISPLAY,
@@ -1272,27 +1272,17 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     return 0
 
 
-def _format_review_verdict_label(
-    review_verdict: str | None,
-    colors: dict[str, str],
-) -> tuple[str | None, str | None]:
-    """Return the unmerged review verdict badge and color override."""
-    verdict_label = None
-    review_status_color = None
+def _format_review_verdict_label(review_verdict: str | None) -> str | None:
+    """Return the unmerged review verdict badge label."""
     if review_verdict == "APPROVED":
-        verdict_label = "✓ approved"
-        review_status_color = colors["review_approved"]
-    elif review_verdict == "APPROVED_WITH_FOLLOWUPS":
-        verdict_label = "↺ approved with follow-ups"
-        review_status_color = colors["review_approved"]
-    elif review_verdict == "CHANGES_REQUESTED":
-        verdict_label = "⚠ changes requested"
-        review_status_color = colors["review_changes"]
-    elif review_verdict == "NEEDS_DISCUSSION":
-        verdict_label = "💬 needs discussion"
-        review_status_color = colors["review_discussion"]
-
-    return verdict_label, review_status_color
+        return "✓ approved"
+    if review_verdict == "APPROVED_WITH_FOLLOWUPS":
+        return "↺ approved with follow-ups"
+    if review_verdict == "CHANGES_REQUESTED":
+        return "⚠ changes requested"
+    if review_verdict == "NEEDS_DISCUSSION":
+        return "💬 needs discussion"
+    return None
 
 
 def _print_unmerged_progress(message: str, *, to_stderr: bool = False) -> None:
@@ -1645,10 +1635,7 @@ def _enrich_unmerged_result(
 
         verdict_label = None
         if needs_review_metadata:
-            verdict_label, _verdict_color = _format_review_verdict_label(
-                review_verdict,
-                UNMERGED_COLORS_DICT,
-            )
+            verdict_label = _format_review_verdict_label(review_verdict)
 
         branch_deleted = False
         commit_count: int | None = None

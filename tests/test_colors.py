@@ -108,6 +108,10 @@ def test_unmerged_review_verdict_field_value_color_uses_themed_singleton() -> No
     try:
         c.set_theme("minimal")
         assert c.get_unmerged_field_value_color("review_verdict", "✓ approved") == c.UNMERGED_COLORS.review_approved
+        assert (
+            c.get_unmerged_field_value_color("review_verdict", "↺ approved with follow-ups")
+            == c.UNMERGED_COLORS.review_followups
+        )
         assert c.get_unmerged_field_value_color("review_verdict", "⚠ changes requested") == c.UNMERGED_COLORS.review_changes
         assert c.get_unmerged_field_value_color("has_conflicts", "has conflicts") == c.UNMERGED_COLORS.merge_conflicts
     finally:

@@ -9416,10 +9416,21 @@ class TestUnmergedUnifiedQueryOutput:
         assert f"[{query_cli._colors.UNMERGED_COLORS.review_approved}]✓ approved[/{query_cli._colors.UNMERGED_COLORS.review_approved}]" in rendered
 
     @pytest.mark.parametrize(
-        ("verdict_text", "score", "badge_text"),
+        ("verdict_text", "score", "badge_text", "expected_color_attr"),
         [
-            ("APPROVED", 91, "✓ approved"),
-            ("CHANGES_REQUESTED", 34, "⚠ changes requested"),
+            ("APPROVED", 91, "✓ approved", "review_approved"),
+            (
+                "APPROVED_WITH_FOLLOWUPS",
+                72,
+                "↺ approved with follow-ups",
+                "review_followups",
+            ),
+            (
+                "CHANGES_REQUESTED",
+                34,
+                "⚠ changes requested",
+                "review_changes",
+            ),
         ],
     )
     def test_unmerged_scored_review_badge_keeps_single_score_and_verdict_theme(
@@ -9428,6 +9439,7 @@ class TestUnmergedUnifiedQueryOutput:
         verdict_text: str,
         score: int,
         badge_text: str,
+        expected_color_attr: str,
     ) -> None:
         store, task, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Scored verdict task")
         review = store.add("Review scored verdict", task_type="review")
@@ -9459,10 +9471,9 @@ class TestUnmergedUnifiedQueryOutput:
         )
 
         rendered = enriched.render("rich")
-        color = query_cli._colors.get_unmerged_field_value_color("review_verdict", badge_text)
-        assert color is not None
+        expected_color = getattr(query_cli._colors.UNMERGED_COLORS, expected_color_attr)
         assert rendered.count(f"({score})") == 1
-        assert f"[{color}]{badge_text} ({score})[/{color}]" in rendered
+        assert f"[{expected_color}]{badge_text} ({score})[/{expected_color}]" in rendered
 
     def test_unmerged_progress_logs_counts_for_refresh_query_and_render(
         self,
