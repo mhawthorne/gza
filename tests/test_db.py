@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from gza.db import (
+    DB_UNSET,
     SCHEMA_VERSION,
     ManualMigrationRequired,
     MergeTargetResolutionError,
@@ -2191,6 +2192,48 @@ class TestMergeStatus:
         assert remerged_impl is not None
         assert remerged_impl.merge_status == "merged"
         assert remerged_impl.merged_at == original_merged_at
+
+    def test_set_merge_unit_state_public_db_unset_preserves_existing_optional_fields(
+        self, tmp_path: Path
+    ) -> None:
+        """Public DB_UNSET should leave merge-unit optional fields untouched."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/db-unset")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        synced_at = datetime.now(UTC).replace(microsecond=0)
+        store.set_merge_unit_state(
+            impl_unit.id,
+            "merged",
+            merged_by_task_id=impl.id,
+            pr_number=42,
+            pr_state="open",
+            pr_last_synced_at=synced_at,
+            sync_last_synced_at=synced_at,
+        )
+
+        store.set_merge_unit_state(
+            impl_unit.id,
+            "merged",
+            merged_by_task_id=DB_UNSET,
+            pr_number=DB_UNSET,
+            pr_state=DB_UNSET,
+            pr_last_synced_at=DB_UNSET,
+            sync_last_synced_at=DB_UNSET,
+        )
+
+        refreshed_unit = store.get_merge_unit(impl_unit.id)
+        assert refreshed_unit is not None
+        assert refreshed_unit.merged_by_task_id == impl.id
+        assert refreshed_unit.pr_number == 42
+        assert refreshed_unit.pr_state == "open"
+        assert refreshed_unit.pr_last_synced_at == synced_at
+        assert refreshed_unit.sync_last_synced_at == synced_at
 
     def test_same_branch_improve_reuses_related_merged_unit(self, tmp_path: Path) -> None:
         """A same-lineage same-branch improve task should reopen the existing unit."""

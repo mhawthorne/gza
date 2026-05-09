@@ -27,6 +27,7 @@ def _launch_editor(cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(cmd)
 
 __all__ = [
+    "DB_UNSET",
     "KNOWN_FAILURE_REASONS",
     "KNOWN_EXECUTION_MODES",
     "InvalidTaskIdError",
@@ -89,7 +90,8 @@ _TASK_ID_SEQ_WIDTH = 6
 _FULL_TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
 _TAG_WS_RE = re.compile(r"\s+")
 _MERGE_UNIT_ID_RE = re.compile(r"^(?P<prefix>[a-z0-9]{1,12})-mu-(?P<seq>[0-9]+)$")
-_DB_UNSET = object()
+DB_UNSET = object()
+_DB_UNSET = DB_UNSET
 
 
 class InvalidTaskIdError(ValueError):
@@ -4075,12 +4077,12 @@ class SqliteTaskStore:
         unit_id: str,
         state: str,
         *,
-        merged_by_task_id: str | None | object = _DB_UNSET,
-        merged_at: datetime | None | object = _DB_UNSET,
-        pr_number: int | None | object = _DB_UNSET,
-        pr_state: str | None | object = _DB_UNSET,
-        pr_last_synced_at: datetime | None | object = _DB_UNSET,
-        sync_last_synced_at: datetime | None | object = _DB_UNSET,
+        merged_by_task_id: str | None | object = DB_UNSET,
+        merged_at: datetime | None | object = DB_UNSET,
+        pr_number: int | None | object = DB_UNSET,
+        pr_state: str | None | object = DB_UNSET,
+        pr_last_synced_at: datetime | None | object = DB_UNSET,
+        sync_last_synced_at: datetime | None | object = DB_UNSET,
         diff_stats: tuple[int | None, int | None, int | None] | None = None,
     ) -> None:
         """Update merge-unit state and dual-write compatibility task fields."""
@@ -4091,30 +4093,30 @@ class SqliteTaskStore:
         updates: list[str] = ["state = ?", "updated_at = ?"]
         params: list[object] = [state, now.isoformat()]
         merged_at_value: datetime | None | object = merged_at
-        if merged_at_value is _DB_UNSET:
+        if merged_at_value is DB_UNSET:
             if state == "merged":
                 if current_unit is not None and current_unit.merged_at is not None:
                     merged_at_value = current_unit.merged_at
                 else:
                     merged_at_value = now
-        if merged_at_value is not _DB_UNSET:
+        if merged_at_value is not DB_UNSET:
             typed_merged_at_value = cast("datetime | None", merged_at_value)
             updates.append("merged_at = ?")
             params.append(typed_merged_at_value.isoformat() if typed_merged_at_value is not None else None)
-        if merged_by_task_id is not _DB_UNSET:
+        if merged_by_task_id is not DB_UNSET:
             updates.append("merged_by_task_id = ?")
             params.append(cast("str | None", merged_by_task_id))
-        if pr_number is not _DB_UNSET:
+        if pr_number is not DB_UNSET:
             updates.append("pr_number = ?")
             params.append(pr_number)
-        if pr_state is not _DB_UNSET:
+        if pr_state is not DB_UNSET:
             updates.append("pr_state = ?")
             params.append(pr_state)
-        if pr_last_synced_at is not _DB_UNSET:
+        if pr_last_synced_at is not DB_UNSET:
             typed_pr_last_synced_at = cast("datetime | None", pr_last_synced_at)
             updates.append("pr_last_synced_at = ?")
             params.append(typed_pr_last_synced_at.isoformat() if typed_pr_last_synced_at is not None else None)
-        if sync_last_synced_at is not _DB_UNSET:
+        if sync_last_synced_at is not DB_UNSET:
             typed_sync_last_synced_at = cast("datetime | None", sync_last_synced_at)
             updates.append("sync_last_synced_at = ?")
             params.append(

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
-from .db import _DB_UNSET, SqliteTaskStore, Task, task_owns_merge_status
+from .db import DB_UNSET, SqliteTaskStore, Task, task_owns_merge_status
 from .git import Git, GitError, parse_diff_numstat
 from .github import GitHub, GitHubError, PullRequestDetails
 
@@ -815,17 +815,17 @@ def _persist_branch_state(
             store.set_merge_unit_state(
                 unit.id,
                 unit.state if merge_status is _UNSET else cast("str | None", merge_status) or "stale",
-                pr_number=cast(Any, cast("int | None", pr_number) if pr_number is not _UNSET else _DB_UNSET),
-                pr_state=cast(Any, cast("str | None", pr_state) if pr_state is not _UNSET else _DB_UNSET),
+                pr_number=cast(Any, cast("int | None", pr_number) if pr_number is not _UNSET else DB_UNSET),
+                pr_state=cast(Any, cast("str | None", pr_state) if pr_state is not _UNSET else DB_UNSET),
                 pr_last_synced_at=cast(
                     Any,
-                    cast("datetime | None", pr_last_synced_at) if pr_last_synced_at is not _UNSET else _DB_UNSET,
+                    cast("datetime | None", pr_last_synced_at) if pr_last_synced_at is not _UNSET else DB_UNSET,
                 ),
                 sync_last_synced_at=cast(
                     Any,
                     cast("datetime | None", sync_last_synced_at)
                     if sync_last_synced_at is not _UNSET
-                    else _DB_UNSET,
+                    else DB_UNSET,
                 ),
                 diff_stats=diff_tuple,
             )
