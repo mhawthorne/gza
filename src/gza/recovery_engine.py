@@ -401,8 +401,12 @@ def _resolve_merged_target_task(store: SqliteTaskStore, task: DbTask) -> DbTask 
     return None
 
 
-def _effective_merge_target_branch(store: SqliteTaskStore) -> str | None:
-    merge_context = _load_merge_context(_project_dir_for_store(store))
+def _effective_merge_target_branch(
+    store: SqliteTaskStore,
+    *,
+    merge_context: _MergeContext | None = None,
+) -> str:
+    merge_context = merge_context or _load_merge_context(_project_dir_for_store(store))
     return _resolve_merge_context_target_branch(store, merge_context)
 
 
@@ -500,13 +504,17 @@ def _is_resolved_by_landed_lineage(
         # Same-branch improve tasks can represent real post-merge follow-up work.
         return False
 
-    if merge_context.git is not None and merge_context.default_branch is not None and task.branch:
+    target_branch: str | None = None
+    if task.branch:
+        target_branch = _effective_merge_target_branch(store, merge_context=merge_context)
+
+    if merge_context.git is not None and target_branch is not None and task.branch:
         try:
             branch_merged = merge_context.branch_resolution.get(task.branch)
             if branch_merged is None:
                 branch_merged = merge_context.git.branch_exists(task.branch) and merge_context.git.is_merged(
                     task.branch,
-                    merge_context.default_branch,
+                    target_branch,
                 )
                 merge_context.branch_resolution[task.branch] = branch_merged
             if branch_merged:
@@ -519,7 +527,7 @@ def _is_resolved_by_landed_lineage(
                     "Failed-task recovery could not inspect repository branch reachability; "
                     "landed-branch suppression is disabled for this run: "
                     f"failed to check whether branch '{task.branch}' reached "
-                    f"default branch '{merge_context.default_branch}': {exc}"
+                    f"default branch '{target_branch}': {exc}"
                 ),
             )
             pass
