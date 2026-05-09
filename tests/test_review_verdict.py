@@ -70,6 +70,32 @@ class TestParseReviewReport:
         assert followup.severity == "FOLLOWUP"
         assert followup.fix_or_followup == "validate malformed optional values"
 
+    def test_parses_verify_command_failure_blocker_as_standard_blocker(self) -> None:
+        content = (
+            "## Summary\n\n- Verify failed.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: mypy NameError in query output\n"
+            "Evidence: ```text\nsrc/gza/cli/query.py:823: error: Name \"oops\" is not defined  [name-defined]\n```\n"
+            "Open-state citation: `src/gza/cli/query.py:823`\n"
+            "Impact: the configured verify_command fails, so the branch cannot pass autonomous review.\n"
+            "Required fix: define the referenced name or remove the bad reference so mypy passes.\n"
+            "Required tests: add a targeted regression that exercises the changed query path and keep mypy clean for this file.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        report = parse_review_report(content)
+        assert report.verdict == "CHANGES_REQUESTED"
+        assert report.format_version == "v2"
+        assert len(report.findings) == 1
+        blocker = report.findings[0]
+        assert blocker.id == "B1"
+        assert blocker.severity == "BLOCKER"
+        assert blocker.title == "verify_command failure: mypy NameError in query output"
+        assert "Name \"oops\" is not defined" in (blocker.evidence or "")
+        assert blocker.open_state_citation == "`src/gza/cli/query.py:823`"
+        assert blocker.fix_or_followup == "define the referenced name or remove the bad reference so mypy passes."
+
     def test_legacy_suggestions_not_promoted_to_followups(self) -> None:
         content = (
             "## Summary\n\n- Legacy format.\n\n"

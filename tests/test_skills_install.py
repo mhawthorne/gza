@@ -160,6 +160,48 @@ class TestSkillsInstallClaudeTarget:
         assert "(updated)" in result2.stdout
         assert skill_file.read_text() == original_content
 
+    def test_update_flag_refreshes_gza_task_review_verify_workflow(self, tmp_path: Path):
+        """--update should refresh gza-task-review to the bundled verify-first workflow."""
+        from gza.skills_utils import get_skills_source_path
+
+        setup_config(tmp_path)
+
+        result1 = run_gza("skills-install", "--target", "claude", "gza-task-review", "--project", str(tmp_path))
+        assert result1.returncode == 0
+
+        skill_file = tmp_path / ".claude" / "skills" / "gza-task-review" / "SKILL.md"
+        skill_file.write_text(
+            "---\n"
+            "name: gza-task-review\n"
+            "description: stale\n"
+            "allowed-tools: Bash(uv run:*), Bash(git:*), Bash(gh:*)\n"
+            "version: 1.0.0\n"
+            "public: true\n"
+            "---\n\n"
+            "git log main..<impl_branch> --oneline\n"
+            "git diff main...<impl_branch>\n"
+        )
+
+        result2 = run_gza(
+            "skills-install",
+            "--target",
+            "claude",
+            "--update",
+            "gza-task-review",
+            "--project",
+            str(tmp_path),
+        )
+        assert result2.returncode == 0
+        assert "updated 1" in result2.stdout
+        assert "(updated)" in result2.stdout
+
+        refreshed = skill_file.read_text()
+        bundled = (get_skills_source_path() / "gza-task-review" / "SKILL.md").read_text()
+        assert refreshed == bundled
+        assert "Bash(git:*)" not in refreshed
+        assert "Run `verify_command` from `gza.yaml` as part of every review cycle." in refreshed
+        assert "Pass the result forward as a `## verify_command result` section." in refreshed
+
     def test_overwrite_with_force_flag(self, tmp_path: Path):
         """Existing skills are overwritten with --force flag."""
         setup_config(tmp_path)
@@ -375,9 +417,12 @@ class TestSkillContentValidation:
         assert "store.update(created)" in content
         assert "store.create(" not in content
 
-    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
+    @pytest.mark.parametrize(
+        ("skill_name", "expects_git_import"),
+        [("gza-task-review", False), ("gza-task-improve", True)],
+    )
     def test_manual_review_improve_persistence_snippets_assign_slug_before_show_prompt(
-        self, skill_name: str
+        self, skill_name: str, expects_git_import: bool
     ):
         """Manual persistence snippets should assign/persist slug before calling gza show --prompt."""
         from gza.skills_utils import get_skills_source_path
@@ -385,7 +430,6 @@ class TestSkillContentValidation:
         skill_file = get_skills_source_path() / skill_name / "SKILL.md"
         content = skill_file.read_text()
 
-        assert "from gza.git import Git" in content
         assert "from gza.runner import _compute_slug_override, generate_slug" in content
         assert "if created.slug is None:" in content
         assert "store.update(created)" in content
@@ -393,6 +437,22 @@ class TestSkillContentValidation:
         assert content.find("if created.slug is None:") < content.find(
             "['uv', 'run', 'gza', 'show', '--prompt', created.id]"
         )
+        if expects_git_import:
+            assert "from gza.git import Git" in content
+        else:
+            assert "from gza.git import Git" not in content
+
+    def test_manual_review_skill_persistence_snippet_stays_checkout_neutral(self):
+        """gza-task-review persistence should avoid Git-backed slug collision checks."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-review" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "from gza.git import Git" not in content
+        assert "Git(config.project_dir)" not in content
+        assert "git=None," in content
+        assert "store=store," in content
 
     @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
     def test_manual_review_improve_persistence_snippets_keep_completed_at_as_datetime(
@@ -546,12 +606,11 @@ class TestSkillContentValidation:
         assert "depends_on='<REVIEW_TASK_ID>'" in content
         assert "Use the `review_task_id` already resolved in Step 1" in content
 
-    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
-    def test_manual_review_improve_skills_preserve_starting_checkout(self, skill_name: str):
-        """Manual review/improve skills should restore the user's starting checkout before exit."""
+    def test_manual_improve_skill_preserves_starting_checkout(self):
+        """gza-task-improve should restore the user's starting checkout before exit."""
         from gza.skills_utils import get_skills_source_path
 
-        skill_file = get_skills_source_path() / skill_name / "SKILL.md"
+        skill_file = get_skills_source_path() / "gza-task-improve" / "SKILL.md"
         content = skill_file.read_text()
 
         assert "git symbolic-ref --quiet --short HEAD || git rev-parse --short HEAD" in content
@@ -581,6 +640,47 @@ class TestSkillContentValidation:
         assert "git push -u origin <impl_branch>" in content
         assert "After a successful commit and push" in content
         assert "Push: pushed to <IMPL_BRANCH>" in content
+
+    def test_manual_review_skill_requires_verify_command_every_cycle(self):
+        """gza-task-review should always run verify alongside the code review and fold failures into blockers."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-review" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "Every review cycle must do both the normal code review work and an independent `verify_command` run" in content
+        assert "This is required even when the diff already has obvious code-review blockers; do not skip verify" in content
+        assert "If verify passed, do not add findings just because verify ran." in content
+        assert "If verify failed, synthesize one or more blocking findings" in content
+        assert "verify_command failure" in content
+        assert "Treat verify failures as blocking even if the code review itself would otherwise approve the diff." in content
+
+    def test_manual_review_skill_passes_verify_result_to_subagent(self):
+        """gza-task-review should hand off verify output to the reviewer in canonical context."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-review" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "Pass the result forward as a `## verify_command result` section." in content
+        assert "Independently evaluate the provided `## verify_command result` section in addition to the normal code review." in content
+        assert "Pass the branch name, authoritative diff context, the `## verify_command result` section" in content
+
+    def test_manual_review_skill_forbids_manual_checkout_switching(self):
+        """gza-task-review should avoid forbidden manual checkout/switch instructions while keeping verify guidance."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-review" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "Bash(git:*)" not in content
+        assert "git checkout <impl_branch>" not in content
+        assert "git switch <impl_branch>" not in content
+        assert "git checkout <START_CHECKOUT>" not in content
+        assert "git checkout --detach <START_CHECKOUT>" not in content
+        assert "Do not run `git checkout`, `git switch`, or other manual branch-switching commands as part of this skill." in content
+        assert "Run `verify_command` from `gza.yaml` as part of every review cycle." in content
+        assert "Pass the result forward as a `## verify_command result` section." in content
 
     def test_gza_task_run_no_longer_documents_manual_mark_completed_recovery(self):
         """gza-task-run should route only through run-inline, without manual completion recovery steps."""

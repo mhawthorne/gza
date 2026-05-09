@@ -101,6 +101,21 @@ Use `/gza-task-fix` when an implementation is stuck after repeated `CHANGES_REQU
 
 ---
 
+## gza-task-review
+
+**Run an interactive review for a task branch, including an independent `verify_command` run every cycle.**
+
+Use `/gza-task-review` when the autonomous review/improve loop needs a human-guided review pass or when you want a manual review artifact that `/gza-task-improve` can consume.
+
+**Key behaviors:**
+- Starts from a full prefixed task ID (for example, `gza-1234`) and resolves review/improve tasks back to the implementation branch
+- Runs both the normal code review and the configured `verify_command` from `gza.yaml` on every review cycle
+- Folds verify failures, including timed-out review verify runs, into the canonical `## Blockers` section as clearly labeled `verify_command failure` items
+- Preserves the structured review contract that `/gza-task-improve` and follow-up automation already consume
+- Requires a prepared implementation checkout/worktree or caller-supplied authoritative diff; it does not tell agents to switch branches manually
+
+---
+
 ## gza-task-debug
 
 **Diagnose why a gza task failed — analyzes logs, detects loops, checks diffs, compares baselines, and suggests fixes.**

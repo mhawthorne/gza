@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tomllib
 from collections.abc import Callable
@@ -750,6 +751,8 @@ DIFF_MEDIUM_THRESHOLD = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
 REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
 REVIEW_IMPROVE_LINEAGE_LIMIT = 5
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
+REVIEW_VERIFY_OUTPUT_MAX_CHARS = 4000
+REVIEW_VERIFY_TIMEOUT_SECONDS = 120
 COMMIT_SUBJECT_MAX_CHARS = 72
 
 
@@ -1053,9 +1056,25 @@ def _slug_exists(
     return False
 
 
-def build_prompt(task: Task, config: Config, store: SqliteTaskStore, report_path: Path | None = None, summary_path: Path | None = None, git: Git | None = None) -> str:
+def build_prompt(
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    report_path: Path | None = None,
+    summary_path: Path | None = None,
+    git: Git | None = None,
+    review_verify_result: str | None = None,
+) -> str:
     """Build the prompt for Claude."""
-    return PromptBuilder().build(task, config, store, report_path=report_path, summary_path=summary_path, git=git)
+    return PromptBuilder().build(
+        task,
+        config,
+        store,
+        report_path=report_path,
+        summary_path=summary_path,
+        git=git,
+        review_verify_result=review_verify_result,
+    )
 
 
 def _get_task_output(task: Task, project_dir: Path) -> str | None:
@@ -1134,6 +1153,112 @@ def _truncate_to_word_boundary(text: str, max_chars: int) -> str:
     if not candidate:
         candidate = compact[:cutoff].rstrip()
     return f"{candidate}..."
+
+
+def _decode_subprocess_output(output: str | bytes | None) -> str:
+    """Normalize subprocess output payloads to text."""
+    if output is None:
+        return ""
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return output
+
+
+def _combine_review_verify_output(*parts: str | bytes | None) -> str:
+    """Combine stdout/stderr fragments for review verify reporting."""
+    return "\n".join(
+        text.strip()
+        for text in (_decode_subprocess_output(part) for part in parts)
+        if text.strip()
+    ).strip()
+
+
+def _format_review_verify_failure(
+    command: str,
+    *,
+    exit_status: str,
+    failure: str,
+    output: str | bytes | None = None,
+) -> str:
+    """Format timeout/launch verify failures as prompt context."""
+    trimmed_output = _truncate_to_word_boundary(
+        _combine_review_verify_output(output) or failure,
+        REVIEW_VERIFY_OUTPUT_MAX_CHARS,
+    )
+    return "\n".join(
+        [
+            "## verify_command result",
+            "",
+            f"- Command: `{command}`",
+            "- Status: failed",
+            f"- Exit status: {exit_status}",
+            f"- Failure: {failure}",
+            "",
+            "Failing output (trimmed):",
+            "```text",
+            trimmed_output,
+            "```",
+        ]
+    )
+
+
+def _format_review_verify_result(command: str, result: subprocess.CompletedProcess[str]) -> str:
+    """Format a review-cycle verify result as prompt context."""
+    status = "passed" if result.returncode == 0 else "failed"
+    lines = [
+        "## verify_command result",
+        "",
+        f"- Command: `{command}`",
+        f"- Status: {status}",
+        f"- Exit status: {result.returncode}",
+    ]
+    if result.returncode != 0:
+        trimmed_output = _truncate_to_word_boundary(
+            _combine_review_verify_output(result.stdout, result.stderr) or "(no failing output captured)",
+            REVIEW_VERIFY_OUTPUT_MAX_CHARS,
+        )
+        lines.extend(
+            [
+                "",
+                "Failing output (trimmed):",
+                "```text",
+                trimmed_output,
+                "```",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _run_review_verify_command(
+    verify_command: str,
+    *,
+    cwd: Path,
+    timeout_seconds: int = REVIEW_VERIFY_TIMEOUT_SECONDS,
+) -> str:
+    """Run the configured verify command for an autonomous review cycle."""
+    try:
+        result = subprocess.run(
+            ["bash", "-lc", verify_command],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _format_review_verify_failure(
+            verify_command,
+            exit_status="timed out",
+            failure=f"verify_command timed out after {timeout_seconds}s",
+            output=_combine_review_verify_output(exc.stdout, exc.stderr),
+        )
+    except OSError as exc:
+        return _format_review_verify_failure(
+            verify_command,
+            exit_status="launch failed",
+            failure=f"failed to launch verify_command: {exc}",
+        )
+    return _format_review_verify_result(verify_command, result)
 
 
 def _default_code_task_commit_subject(task_slug: str | None, task_db_id: str | None) -> str:
@@ -1390,6 +1515,7 @@ def _build_context_from_chain(
     project_dir: Path,
     git: Git | None,
     config: Config | None = None,
+    review_verify_result: str | None = None,
 ) -> str:
     """Build context by walking the depends_on and based_on chain."""
     context_parts = []
@@ -1556,6 +1682,10 @@ def _build_context_from_chain(
                 elif impl_task.prompt:
                     context_parts.append("\n## Original request:\n")
                     context_parts.append(impl_task.prompt)
+
+                if review_verify_result:
+                    context_parts.append("\n")
+                    context_parts.append(review_verify_result)
 
                 # Get diff if we have a branch (tiered strategy based on diff size)
                 if impl_task.branch and git:
@@ -4005,15 +4135,6 @@ def _run_non_code_task(
         else:
             prompt_report_path = worktree_report_path
 
-        # Run provider in the worktree
-        if resume:
-            prompt = PromptBuilder().resume_prompt(
-                task_id=task.id,
-                task_slug=task.slug,
-                report_path=prompt_report_path,
-            )
-        else:
-            prompt = build_prompt(task, config, store, report_path=prompt_report_path, git=git)
         # Ensure all bundled skills are available in the worktree
         from .skills_utils import ensure_all_skills
         skills_dir = worktree_path / ".claude" / "skills"
@@ -4029,6 +4150,34 @@ def _run_non_code_task(
 
         if not config.use_docker:
             _create_local_dep_symlinks(config, worktree_path)
+
+        # Run provider in the worktree
+        if resume:
+            prompt = PromptBuilder().resume_prompt(
+                task_id=task.id,
+                task_slug=task.slug,
+                report_path=prompt_report_path,
+            )
+        else:
+            review_verify_result = None
+            verify_command = (
+                config.verify_command
+                if isinstance(config.verify_command, str) and config.verify_command.strip()
+                else None
+            )
+            if task.task_type == "review" and verify_command is not None:
+                review_verify_result = _run_review_verify_command(
+                    verify_command,
+                    cwd=worktree_path,
+                )
+            prompt = build_prompt(
+                task,
+                config,
+                store,
+                report_path=prompt_report_path,
+                git=git,
+                review_verify_result=review_verify_result,
+            )
 
         def _on_session_id_non_code(session_id: str) -> None:
             """Persist session_id as soon as it is first seen during streaming."""

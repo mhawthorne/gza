@@ -21,6 +21,8 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.",
     "Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.",
     "Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.",
+    "If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`;",
+    "If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.",
 ]
 
 REVIEW_SUMMARY_CHECKLIST_COUNT = 6
@@ -314,6 +316,9 @@ class TestPromptBuilderBuild:
         assert "Required fix:" in result
         assert "Required tests:" in result
         assert "repo-rules/learnings pass" in result
+        assert "## verify_command result" in result
+        assert "verify is not a short-circuit" in result
+        assert "verify_command failure" in result
         assert "silent broad-exception fallbacks" in result
         assert "misleading output" in result
         assert "targeted regression tests" in result
@@ -329,6 +334,42 @@ class TestPromptBuilderBuild:
         checklist_lines = re.findall(r"^\s*-\s.+\?$", result, flags=re.MULTILINE)
         assert len(checklist_lines) == REVIEW_SUMMARY_CHECKLIST_COUNT
         assert "Yes/No - ..." in result
+
+    def test_build_review_prompt_includes_supplied_verify_result_context(self, tmp_path: Path):
+        """Review prompts should include structured verify output when runner provides it."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        report_path = Path("/workspace/.gza/reviews/test.md")
+        verify_result = (
+            "## verify_command result\n\n"
+            "- Command: `uv run pytest tests/ -q`\n"
+            "- Status: failed\n"
+            "- Exit status: 1\n\n"
+            "Failing output (trimmed):\n"
+            "```text\nE assert 1 == 2\n```"
+        )
+        result = PromptBuilder().build(
+            review_task,
+            config,
+            store,
+            report_path=report_path,
+            review_verify_result=verify_result,
+        )
+
+        assert verify_result in result
+        assert "verify_command failure" in result
 
     def test_code_review_interactive_skill_uses_canonical_summary_contract(self):
         """Test interactive review skill scaffolding matches canonical Summary requirements."""

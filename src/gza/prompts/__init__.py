@@ -37,6 +37,7 @@ class PromptBuilder:
         report_path: Path | None = None,
         summary_path: Path | None = None,
         git: Git | None = None,
+        review_verify_result: str | None = None,
     ) -> str:
         """Build the full prompt for a task.
 
@@ -88,7 +89,14 @@ class PromptBuilder:
         # Add context from based_on chain (walk up the chain to find plan tasks)
         if task.based_on or task.task_type in ("implement", "review"):
             from gza.runner import _build_context_from_chain
-            context = _build_context_from_chain(task, store, config.project_dir, git, config=config)
+            context = _build_context_from_chain(
+                task,
+                store,
+                config.project_dir,
+                git,
+                config=config,
+                review_verify_result=review_verify_result,
+            )
             if context:
                 base_prompt += "\n\n" + context
 

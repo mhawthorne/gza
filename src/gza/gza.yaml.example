@@ -47,6 +47,7 @@ project_name: my-project
 # work_count: 1
 
 # Shell command run before finishing any task/implement/improve task.
+# Autonomous review cycles also run this in the review worktree and turn failures/timeouts into review blockers.
 # Agents are instructed to run this and fix any errors.
 # Example: 'uv run mypy src/ && uv run pytest tests/ -x -q'
 # verify_command: ""

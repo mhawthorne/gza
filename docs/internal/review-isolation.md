@@ -7,10 +7,15 @@ Review tasks run in isolated git worktrees that only contain git-tracked files.
 1. **Host runner** queries the main database via `store.get()`
 2. **Host runner** calls `build_prompt()` which includes:
    - Spec file content (if the implementation task has a `spec` field)
-  - Ask context from exactly one source when available:
+   - Ask context from exactly one source when available:
     - `## Original plan:` when a linked plan exists
     - `## Original request:` fallback when no linked plan exists
     - If neither source exists, both sections are intentionally omitted and reviewers should state `No plan or request provided.`
+   - `## verify_command result` when `verify_command` is configured for the project
+     - The host runner executes the literal command once per autonomous review cycle in the review worktree.
+     - The prompt includes pass/fail status, exit status, and trimmed failing output when non-zero.
+     - Hung review verification is bounded to 120 seconds; timeouts are converted into a failed `## verify_command result` section with timeout evidence and any partial output captured so the review still runs.
+     - Reviews must keep doing the normal code review in the same cycle; verify failure is additional blocker evidence, not a short-circuit.
    - Implementation diff context for `main...{impl_branch}` (small/full/excerpted depending on size thresholds)
    - Improve-lineage context when applicable
      - This is metadata-only coordination context for prior review/improve cycles.

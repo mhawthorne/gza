@@ -2759,8 +2759,8 @@ def cmd_lineage(args: argparse.Namespace) -> int:
 def _show_built_prompt(task: DbTask, config: "Config", store: "SqliteTaskStore") -> int:
     """Build and print only the full prompt text for a task.
 
-    Uses the same build_prompt() path as background execution, so the output
-    text is identical to what a background worker would receive.
+    Uses the shared build_prompt() path used by background execution. Autonomous
+    review runs may append runtime verify output during actual execution.
     """
     from ..git import Git
     from ..runner import build_prompt, get_task_output_paths
