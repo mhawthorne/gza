@@ -455,6 +455,68 @@ def test_sync_branch_cohorts_pr_merged_marks_merge_status_without_git_phase(tmp_
     assert refreshed.pr_state == "merged"
 
 
+def test_sync_branch_cohorts_pr_only_clears_stale_non_owner_merge_status_when_owner_baseline_matches(
+    tmp_path,
+):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    parent = _completed_branch_task(store, "Parent task", "feature/pr-only-normalize")
+    parent.merge_status = "merged"
+    parent.merged_at = datetime.now(UTC) - timedelta(days=7)
+    parent.pr_number = 112
+    store.update(parent)
+
+    child = store.add("Improve task", task_type="improve", based_on=parent.id)
+    child.status = "completed"
+    child.completed_at = datetime.now(UTC)
+    child.branch = "feature/pr-only-normalize"
+    child.has_commits = True
+    child.merge_status = "unmerged"
+    child.merged_at = datetime.now(UTC) - timedelta(days=2)
+    child.same_branch = True
+    store.update(child)
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+
+    gh = Mock()
+    gh.is_available.return_value = True
+    gh.get_pr_details.return_value = PullRequestDetails(
+        url="https://github.com/o/r/pull/112",
+        number=112,
+        state="merged",
+        base_ref_name="main",
+    )
+    gh.discover_pr_by_branch.return_value = None
+
+    with patch("gza.sync_ops.GitHub", return_value=gh):
+        results, partial = sync_branch_cohorts(
+            store,
+            git,
+            [
+                BranchCohort(
+                    branch="feature/pr-only-normalize",
+                    tasks=tuple(store.get_tasks_for_branch("feature/pr-only-normalize")),
+                )
+            ],
+            include_git=False,
+            include_pr=True,
+            dry_run=False,
+            fetch_remote=False,
+        )
+
+    assert partial is False
+    assert results[0].merge_status == "merged"
+    refreshed_parent = store.get(parent.id)
+    refreshed_child = store.get(child.id)
+    assert refreshed_parent is not None
+    assert refreshed_child is not None
+    assert refreshed_parent.merge_status == "merged"
+    assert refreshed_child.merge_status is None
+    assert refreshed_child.merged_at is None
+
+
 def test_sync_branch_cohorts_prefers_discovered_open_pr_over_closed_cached_pr(tmp_path):
     store = SqliteTaskStore(tmp_path / "test.db")
     task = _completed_branch_task(store, "Task with replaced PR", "feature/reused-pr")

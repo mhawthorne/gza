@@ -43,6 +43,13 @@ class BranchCohort:
         return tuple(task for task in self.code_tasks if task_owns_merge_status(task))
 
     @property
+    def has_non_owner_merge_status_rows(self) -> bool:
+        return any(
+            task.merge_status is not None and not task_owns_merge_status(task)
+            for task in self.code_tasks
+        )
+
+    @property
     def representative_task(self) -> Task:
         ordered = sorted(
             self.tasks,
@@ -464,7 +471,7 @@ def _enrich_branch_pr_state(
     return _BranchPersistenceUpdate(
         merge_status=(
             desired_merge_status
-            if desired_merge_status != baseline_merge_status
+            if desired_merge_status != baseline_merge_status or cohort.has_non_owner_merge_status_rows
             else _UNSET
         ),
         pr_number=(
