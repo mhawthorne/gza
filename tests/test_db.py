@@ -1445,20 +1445,20 @@ class TestGetReviewsForTask:
     """Tests for get_reviews_for_task method."""
 
     def test_get_reviews_for_task_returns_matching_reviews(self, tmp_path: Path):
-        """Test that get_reviews_for_task returns reviews that depend on the given task."""
+        """Test that get_reviews_for_task returns reviews linked to the given task."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
         # Create an implementation task
         impl_task = store.add("Add feature", task_type="implement")
 
-        # Create review tasks that depend on it
-        review1 = store.add("First review", task_type="review", depends_on=impl_task.id)
+        # Create review tasks linked via both canonical and legacy relations.
+        review1 = store.add("First review", task_type="review", based_on=impl_task.id)
         review2 = store.add("Second review", task_type="review", depends_on=impl_task.id)
 
         # Create unrelated review
         other_impl = store.add("Other feature", task_type="implement")
-        other_review = store.add("Other review", task_type="review", depends_on=other_impl.id)
+        other_review = store.add("Other review", task_type="review", based_on=other_impl.id)
 
         # Get reviews for impl_task
         reviews = store.get_reviews_for_task(impl_task.id)
@@ -1533,6 +1533,27 @@ class TestGetReviewsForTask:
         # Completed review comes first, incomplete (NULL completed_at) comes last
         assert reviews[0].id == completed_review.id
         assert reviews[1].id == incomplete_review.id
+
+    def test_get_reviews_for_task_prefers_based_on_over_conflicting_depends_on(self, tmp_path: Path):
+        """A review with both links belongs to its canonical based_on implementation."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        canonical_impl = store.add("Canonical impl", task_type="implement")
+        legacy_impl = store.add("Legacy impl", task_type="implement")
+
+        review = store.add(
+            "Imported review",
+            task_type="review",
+            based_on=canonical_impl.id,
+            depends_on=legacy_impl.id,
+        )
+
+        canonical_reviews = store.get_reviews_for_task(canonical_impl.id)
+        legacy_reviews = store.get_reviews_for_task(legacy_impl.id)
+
+        assert [task.id for task in canonical_reviews] == [review.id]
+        assert legacy_reviews == []
 
     def test_get_hydrates_legacy_naive_timestamps_as_utc_aware(self, tmp_path: Path):
         """Legacy rows without an offset should load as UTC-aware datetimes."""

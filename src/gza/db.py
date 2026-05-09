@@ -4694,9 +4694,11 @@ class SqliteTaskStore:
             return {row[0] for row in cur.fetchall()}
 
     def get_reviews_for_task(self, task_id: str) -> list[Task]:
-        """Get all review tasks that depend on the given task, ordered by completed_at DESC.
+        """Get all review tasks for the given implementation, ordered by completed_at DESC.
 
-        Reviews are ordered by completed_at so that the most recently completed
+        `based_on` is the canonical review-to-implementation link. Older rows may
+        have only `depends_on`, so keep that as a fallback only when `based_on` is
+        missing. Reviews are ordered by completed_at so the most recently completed
         review is first (reviews[0]). Incomplete reviews (completed_at IS NULL) sort
         last. This ensures the staleness check in cmd_unmerged compares against the
         review that completed most recently, not merely the one created most recently.
@@ -4705,10 +4707,15 @@ class SqliteTaskStore:
             cur = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE project_id = ? AND task_type = 'review' AND depends_on = ?
+                WHERE project_id = ?
+                  AND task_type = 'review'
+                  AND (
+                    based_on = ?
+                    OR (based_on IS NULL AND depends_on = ?)
+                  )
                 ORDER BY completed_at DESC NULLS LAST
                 """,
-                (self._project_id, task_id),
+                (self._project_id, task_id, task_id),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 

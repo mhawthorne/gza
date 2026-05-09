@@ -8120,6 +8120,36 @@ class TestUnmergedReviewStatus:
         assert marker_idx > latest_idx
         assert not (older_idx < marker_idx < latest_idx)
 
+    def test_unmerged_prefers_latest_based_on_only_review_for_badge_and_lineage(self, tmp_path: Path):
+        """Latest imported review should drive both the summary badge and lineage marker."""
+        store, impl, git = setup_unmerged_env(tmp_path)
+
+        older_review = store.add("Older review", task_type="review")
+        older_review.status = "completed"
+        older_review.completed_at = datetime(2026, 2, 12, 9, 0, tzinfo=UTC)
+        older_review.depends_on = impl.id
+        older_review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(older_review)
+
+        latest_review = store.add("Imported latest review", task_type="review")
+        latest_review.status = "completed"
+        latest_review.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        latest_review.based_on = impl.id
+        latest_review.depends_on = None
+        latest_review.output_content = "Verdict: APPROVED_WITH_FOLLOWUPS"
+        store.update(latest_review)
+
+        result = run_gza("unmerged", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        normalized = " ".join(result.stdout.split())
+        assert "review: reviewed [↺ approved with follow-ups]" in normalized
+        assert "⚠ changes requested" not in normalized
+
+        latest_idx = normalized.index(f"{latest_review.id}")
+        latest_marker_idx = normalized.index("approved_with_followups ← latest")
+        assert latest_marker_idx > latest_idx
+
 
 class TestUnmergedSelectionBehavior:
     """Tests for `gza unmerged` task selection behavior."""

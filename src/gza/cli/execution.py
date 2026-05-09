@@ -1579,6 +1579,13 @@ def _latest_completed_review_for_impl(store: SqliteTaskStore, impl_task_id: str)
     return reviews[0] if reviews else None
 
 
+def _review_targets_implementation(review_task: DbTask, impl_task_id: str) -> bool:
+    """Return whether a review is canonically linked to the implementation."""
+    if review_task.based_on is not None:
+        return review_task.based_on == impl_task_id
+    return review_task.depends_on == impl_task_id
+
+
 def cmd_improve(args: argparse.Namespace) -> int:
     """Create an improve task based on an implementation task and its most recent review."""
     config = Config.load(args.project_dir)
@@ -1614,9 +1621,10 @@ def cmd_improve(args: argparse.Namespace) -> int:
                 f"Error: Task {resolved_review_id} is a {review_task.task_type} task, not a review."
             )
             return 1
-        if review_task.depends_on != impl_task.id:
+        if not _review_targets_implementation(review_task, impl_task.id):
             print(
-                f"Error: Review {resolved_review_id} reviews task {review_task.depends_on}, "
+                f"Error: Review {resolved_review_id} reviews task "
+                f"{review_task.based_on or review_task.depends_on}, "
                 f"not implementation {impl_task.id}."
             )
             return 1

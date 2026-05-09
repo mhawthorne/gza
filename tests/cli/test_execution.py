@@ -4261,6 +4261,31 @@ class TestImproveCommand:
         assert result.returncode == 1
         assert f"reviews task {impl_b.id}" in result.stdout
 
+    def test_improve_review_id_flag_accepts_based_on_only_review(self, tmp_path: Path):
+        """Imported reviews linked only via based_on remain selectable explicitly."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Feature A", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        imported_review = store.add("Imported review", task_type="review", based_on=impl_task.id)
+        imported_review.status = "completed"
+        imported_review.completed_at = datetime.now(UTC)
+        store.update(imported_review)
+
+        result = run_gza(
+            "improve", str(impl_task.id),
+            "--review-id", str(imported_review.id),
+            "--queue",
+            "--project", str(tmp_path),
+        )
+
+        assert result.returncode == 0, result.stdout
+        assert f"Review: {imported_review.id}" in result.stdout
+
     def test_improve_review_id_flag_rejects_non_review_task(self, tmp_path: Path):
         """--review-id must point at a review task, not an implement/improve task."""
         setup_config(tmp_path)
