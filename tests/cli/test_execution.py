@@ -6,6 +6,7 @@ import io
 import os
 import re
 import signal as signal_mod
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -28,6 +29,21 @@ from .conftest import (
     setup_db_with_tasks,
     setup_git_repo_with_task_branch,
 )
+
+
+@contextmanager
+def _clear_foreground_worker_env():
+    """Isolate standalone foreground-worker tests from inherited worker ownership."""
+    with patch.dict(
+        os.environ,
+        {
+            "GZA_WORKER_ID": "",
+            "GZA_WORKER_MODE": "",
+            "GZA_REUSE_WORKER_OWNER": "",
+        },
+        clear=False,
+    ):
+        yield
 
 
 class TestAddCommand:
@@ -10474,7 +10490,10 @@ class TestRunForeground:
         workers_path = config.workers_path
         workers_path.mkdir(parents=True, exist_ok=True)
 
-        with patch("gza.cli.run", return_value=0) as mock_run:
+        with (
+            _clear_foreground_worker_env(),
+            patch("gza.cli.run", return_value=0) as mock_run,
+        ):
             rc = _run_foreground(config, task_id=task.id)
 
         assert rc == 0
@@ -10506,7 +10525,10 @@ class TestRunForeground:
 
         config.workers_path.mkdir(parents=True, exist_ok=True)
 
-        with patch("gza.cli.run", return_value=1):
+        with (
+            _clear_foreground_worker_env(),
+            patch("gza.cli.run", return_value=1),
+        ):
             rc = _run_foreground(config, task_id=task.id)
 
         assert rc == 1
@@ -10528,7 +10550,10 @@ class TestRunForeground:
 
         config.workers_path.mkdir(parents=True, exist_ok=True)
 
-        with patch("gza.cli.run", return_value=1):
+        with (
+            _clear_foreground_worker_env(),
+            patch("gza.cli.run", return_value=1),
+        ):
             rc = _run_foreground(config, task_id=task.id)
 
         assert rc == 1
@@ -10548,7 +10573,10 @@ class TestRunForeground:
 
         config.workers_path.mkdir(parents=True, exist_ok=True)
 
-        with patch("gza.cli.run", return_value=0) as mock_run:
+        with (
+            _clear_foreground_worker_env(),
+            patch("gza.cli.run", return_value=0) as mock_run,
+        ):
             rc = _run_foreground(config, task_id=task.id, resume=True, open_after=True)
 
         assert rc == 0
@@ -10571,6 +10599,7 @@ class TestRunForeground:
         config.workers_path.mkdir(parents=True, exist_ok=True)
 
         with (
+            _clear_foreground_worker_env(),
             patch("gza.cli._auto_rebase_before_resume", return_value=0) as mock_rebase,
             patch("gza.cli.run", return_value=0) as mock_run,
         ):
@@ -10598,6 +10627,7 @@ class TestRunForeground:
         workers_path.mkdir(parents=True, exist_ok=True)
 
         with (
+            _clear_foreground_worker_env(),
             patch("gza.cli._auto_rebase_before_resume", return_value=1) as mock_rebase,
             patch("gza.cli.run") as mock_run,
         ):
@@ -10664,7 +10694,10 @@ class TestRunForeground:
 
         config.workers_path.mkdir(parents=True, exist_ok=True)
 
-        with patch("gza.cli.run", side_effect=KeyboardInterrupt):
+        with (
+            _clear_foreground_worker_env(),
+            patch("gza.cli.run", side_effect=KeyboardInterrupt),
+        ):
             rc = _run_foreground(config, task_id=task.id)
 
         assert rc == 130
@@ -10719,8 +10752,8 @@ class TestRunForeground:
         assert worker.task_id == task.id
         assert worker.exit_code == 0
 
-    def test_run_foreground_worker_mode_without_existing_metadata_reuses_passed_worker_id(self, tmp_path: Path):
-        """Ambient worker-mode env without an outer owner must still complete the reused worker."""
+    def test_run_foreground_worker_mode_without_existing_metadata_completes_even_with_outer_owner_marker(self, tmp_path: Path):
+        """Ambient worker-mode fallback must complete the worker unless a real outer registration exists."""
         setup_config(tmp_path)
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -10728,7 +10761,15 @@ class TestRunForeground:
         assert task.id is not None
 
         with (
-            patch.dict(os.environ, {"GZA_WORKER_ID": "w-missing-parent-meta", "GZA_WORKER_MODE": "1"}, clear=False),
+            patch.dict(
+                os.environ,
+                {
+                    "GZA_WORKER_ID": "w-missing-parent-meta",
+                    "GZA_WORKER_MODE": "1",
+                    "GZA_REUSE_WORKER_OWNER": "outer",
+                },
+                clear=False,
+            ),
             patch("gza.cli.run", return_value=0),
         ):
             assert _run_foreground(config, task_id=task.id) == 0
@@ -10762,7 +10803,10 @@ class TestRunForeground:
             installed_handlers[signum] = handler
             return original_signal(signum, handler)
 
-        with patch("gza.cli.signal.signal", side_effect=capture_signal):
+        with (
+            _clear_foreground_worker_env(),
+            patch("gza.cli.signal.signal", side_effect=capture_signal),
+        ):
             with patch("gza.workers.WorkerRegistry.mark_completed") as mock_mark:
                 def run_then_signal(*args, **kwargs):
                     # Simulate SIGINT arriving while run() is executing

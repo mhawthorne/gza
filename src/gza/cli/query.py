@@ -108,6 +108,44 @@ _LINEAGE_REL_LABELS = _QUERY_LINEAGE_REL_LABELS
 _QueryDateField = Literal["created", "completed", "effective"]
 _PresentationMode = Literal["flat", "blocks", "grouped", "lineage", "tree", "one_line", "json", "rich"]
 _stderr_console = Console(highlight=False, stderr=True)
+_HISTORY_PROJECTION_FIELDS: tuple[str, ...] = _projection_fields(
+    _TaskProjectionSpec(preset=_TaskProjectionPreset.HISTORY_DEFAULT),
+    scope="tasks",
+)
+_SEARCH_PROJECTION_FIELDS: tuple[str, ...] = _projection_fields(
+    _TaskProjectionSpec(preset=_TaskProjectionPreset.SEARCH_DEFAULT),
+    scope="tasks",
+)
+_TASK_FIELDS_WITHOUT_NEXT_ACTION: tuple[str, ...] = tuple(
+    field_name
+    for field_name in _HISTORY_PROJECTION_FIELDS
+    if field_name not in {"next_action", "next_action_reason", "next_action_owner_id"}
+)
+_HISTORY_EXPLICIT_PROJECTION_FIELDS: tuple[str, ...] = _TASK_FIELDS_WITHOUT_NEXT_ACTION
+_SEARCH_EXPLICIT_PROJECTION_FIELDS: tuple[str, ...] = _TASK_FIELDS_WITHOUT_NEXT_ACTION
+_INCOMPLETE_PROJECTION_FIELDS: tuple[str, ...] = _projection_fields(
+    _TaskProjectionSpec(preset=_TaskProjectionPreset.INCOMPLETE_SUMMARY),
+    scope="lineages",
+)
+_INCOMPLETE_BLOCKED_DROPPED_PROJECTION_FIELDS: tuple[str, ...] = (
+    "id",
+    "prompt",
+    "status",
+    "task_type",
+    "blocked",
+    "blocking_id",
+    "blocking_status",
+)
+_GROUPS_PROJECTION_FIELDS: tuple[str, ...] = (
+    "group",
+    "total",
+    "pending",
+    "in_progress",
+    "completed",
+    "failed",
+    "unmerged",
+    "dropped",
+)
 
 _INCOMPLETE_DEPRECATION_LINES: tuple[str, ...] = (
     "Error: `gza incomplete` is deprecated and no longer supported.",
@@ -381,6 +419,8 @@ def _collect_incomplete_legacy_args(args: argparse.Namespace) -> tuple[str, ...]
         legacy_args.extend(["--days", str(args.days)])
     if getattr(args, "date_field", None):
         legacy_args.extend(["--date-field", str(args.date_field)])
+    if getattr(args, "fields", None):
+        legacy_args.extend(["--fields", str(args.fields)])
     return tuple(legacy_args)
 
 
@@ -598,8 +638,13 @@ def cmd_history(args: argparse.Namespace) -> int:
     end_date = getattr(args, 'end_date', None)
     date_field = cast(_QueryDateField, getattr(args, 'date_field', "effective"))
     lineage_depth = getattr(args, 'lineage_depth', 0)
-    projection_fields = _parse_csv(getattr(args, "fields", None))
-    projection_preset = getattr(args, "preset", None)
+    projection_fields = _validate_projection_fields(
+        _parse_csv(getattr(args, "fields", None)),
+        command_name="gza history",
+        allowed_fields=_HISTORY_EXPLICIT_PROJECTION_FIELDS,
+    )
+    if getattr(args, "fields", None) is not None and projection_fields is None:
+        return 2
     use_json = bool(getattr(args, "json", False))
     try:
         tags = validate_cli_tag_values(tuple(getattr(args, "tags", None) or ()))
@@ -608,10 +653,6 @@ def cmd_history(args: argparse.Namespace) -> int:
         print(f"Error: {exc}")
         return 1
     any_tag = bool(getattr(args, "any_tag", False))
-
-    if not use_json and (projection_fields is not None or projection_preset):
-        print("error: --fields and --preset require --json for gza history", file=sys.stderr)
-        return 2
 
     # If a date-based filter is active and --last/-n wasn't explicitly provided,
     # don't cap results with the default limit.
@@ -635,30 +676,37 @@ def cmd_history(args: argparse.Namespace) -> int:
         any_tag=any_tag,
     )
 
-    if use_json:
+    if use_json or projection_fields is not None:
         selected_tasks = query_history(store, f)
+        if not selected_tasks:
+            if use_json:
+                print("[]")
+            else:
+                _print_history_empty_message(status, task_type, days)
+            return 0
+
         selected_ids = [task.id for task in selected_tasks if task.id is not None]
         if not selected_ids:
-            print("[]")
+            if use_json:
+                print("[]")
+            else:
+                _print_history_empty_message(status, task_type, days)
             return 0
 
         query = _TaskQuery(
             scope="tasks",
             limit=None,
             projection=_TaskProjectionSpec(
-                preset=projection_preset or "history_default",
+                preset=_TaskProjectionPreset.HISTORY_DEFAULT,
                 fields=projection_fields,
             ),
-            presentation=_TaskPresentationSpec(mode="json"),
+            presentation=_TaskPresentationSpec(mode="json" if use_json else "blocks"),
         )
         all_rows = tuple(row for row in service.run(query).rows if isinstance(row, _TaskRow))
         rows_by_id = {row.task.id: row for row in all_rows if row.task.id is not None}
         ordered_rows = tuple(rows_by_id[task_id] for task_id in selected_ids if task_id in rows_by_id)
         result = _TaskQueryResult(query=query, rows=ordered_rows)
-
-        import json
-
-        print(json.dumps(result.to_json(), indent=2, default=str))
+        _render_projection_result(result, use_json=use_json)
         return 0
 
     c = TASK_COLORS
@@ -949,8 +997,13 @@ def cmd_search(args: argparse.Namespace) -> int:
     service = _TaskQueryService(store)
     term = args.term
     limit = None if args.last == 0 else args.last
-    projection_fields = _parse_csv(getattr(args, "fields", None))
-    projection_preset = getattr(args, "preset", None)
+    projection_fields = _validate_projection_fields(
+        _parse_csv(getattr(args, "fields", None)),
+        command_name="gza search",
+        allowed_fields=_SEARCH_EXPLICIT_PROJECTION_FIELDS,
+    )
+    if getattr(args, "fields", None) is not None and projection_fields is None:
+        return 2
     use_json = bool(getattr(args, "json", False))
     try:
         tags = validate_cli_tag_values(tuple(getattr(args, "tags", None) or ()))
@@ -959,10 +1012,6 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(f"Error: {exc}")
         return 1
     any_tag = bool(getattr(args, "any_tag", False))
-
-    if not use_json and (projection_fields is not None or projection_preset):
-        print("error: --fields and --preset require --json for gza search", file=sys.stderr)
-        return 2
 
     date_filter = _TaskDateFilter(
         field=cast(_QueryDateField, getattr(args, "date_field", "created")),
@@ -1027,21 +1076,27 @@ def cmd_search(args: argparse.Namespace) -> int:
         exclude_tag_filters=tags_not or None,
         any_tag=any_tag,
     )
-    if projection_preset or projection_fields is not None:
+    if projection_fields is not None:
         query = replace(
             query,
             projection=_TaskProjectionSpec(
-                preset=projection_preset or query.projection.preset,
+                preset=query.projection.preset,
                 fields=projection_fields,
             ),
+            presentation=_TaskPresentationSpec(mode="json" if use_json else "blocks"),
         )
     result = service.run(query)
     matches = [row.task for row in result.rows if isinstance(row, _TaskRow)]
 
     if use_json:
-        import json
+        _render_projection_result(result, use_json=True)
+        return 0
 
-        print(json.dumps(result.to_json(), indent=2, default=str))
+    if projection_fields is not None:
+        if not result.rows:
+            console.print(f"No tasks found matching '{term}'")
+            return 0
+        _render_projection_result(result, use_json=False)
         return 0
 
     total_matches = result.total_count or 0
@@ -1110,6 +1165,18 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     blocked_by_dropped_only = bool(getattr(args, "blocked_by_dropped", False))
     mode = cast(_PresentationMode, "tree" if getattr(args, "tree", False) else "one_line")
     task_type_filter: str | None = getattr(args, "type", None)
+    allowed_projection_fields = (
+        _INCOMPLETE_BLOCKED_DROPPED_PROJECTION_FIELDS
+        if blocked_by_dropped_only
+        else _INCOMPLETE_PROJECTION_FIELDS
+    )
+    projection_fields = _validate_projection_fields(
+        _parse_csv(getattr(args, "fields", None)),
+        command_name="gza incomplete",
+        allowed_fields=allowed_projection_fields,
+    )
+    if getattr(args, "fields", None) is not None and projection_fields is None:
+        return 2
     date_filter = _TaskDateFilter(
         field=cast(_QueryDateField, getattr(args, "date_field", "effective")),
         days=getattr(args, "days", None),
@@ -1122,10 +1189,8 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             task_types=(task_type_filter,) if task_type_filter else None,
             dependency_state=("blocked_by_dropped_dep",),
             date_filter=date_filter,
-            projection=_TaskProjectionSpec(
-                fields=("id", "prompt", "status", "task_type", "blocking_id")
-            ),
-            presentation=_TaskPresentationSpec(mode="flat"),
+            projection=_TaskProjectionSpec(fields=projection_fields or ("id", "prompt", "status", "task_type", "blocking_id")),
+            presentation=_TaskPresentationSpec(mode="json" if getattr(args, "json", False) else "blocks"),
         )
     else:
         query = _TaskQueryPresets.incomplete(
@@ -1134,6 +1199,17 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             date_filter=date_filter,
             mode=mode,
         )
+        if projection_fields is not None:
+            query = replace(
+                query,
+                projection=_TaskProjectionSpec(
+                    preset=query.projection.preset,
+                    fields=projection_fields,
+                ),
+                presentation=_TaskPresentationSpec(
+                    mode="json" if getattr(args, "json", False) else "blocks"
+                ),
+            )
 
     target_branch: str | None = None
     git: Git | None = None
@@ -1147,9 +1223,7 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
 
     result = service.run(query, config=config, git=git, target_branch=target_branch)
     if getattr(args, "json", False):
-        import json
-
-        print(json.dumps(result.to_json(), indent=2, default=str))
+        _render_projection_result(result, use_json=True)
         return 0
 
     if not result.rows:
@@ -1157,6 +1231,10 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             console.print("No pending tasks blocked by dropped dependencies")
         else:
             console.print("No unresolved task lineages")
+        return 0
+
+    if projection_fields is not None:
+        _render_projection_result(result, use_json=False)
         return 0
 
     if blocked_by_dropped_only:
@@ -1316,23 +1394,47 @@ def _descendants_only_unmerged_lineage_tree(
 
 def _validate_unmerged_projection_fields(fields: tuple[str, ...] | None) -> tuple[str, ...] | None:
     """Validate requested unmerged projection fields."""
-    if fields is None:
-        return None
-    allowed = set(
-        _projection_fields(
+    return _validate_projection_fields(
+        fields,
+        command_name="gza unmerged",
+        allowed_fields=_projection_fields(
             _TaskProjectionSpec(preset=_TaskProjectionPreset.UNMERGED_DEFAULT),
             scope="lineages",
-        )
+        ),
     )
+
+
+def _validate_projection_fields(
+    fields: tuple[str, ...] | None,
+    *,
+    command_name: str,
+    allowed_fields: tuple[str, ...],
+) -> tuple[str, ...] | None:
+    """Validate requested projection fields for a specific command."""
+    if fields is None:
+        return None
+    allowed = set(allowed_fields)
     invalid = tuple(field_name for field_name in fields if field_name not in allowed)
     if invalid:
         noun = "field" if len(invalid) == 1 else "fields"
         print(
-            f"error: unknown {noun} for gza unmerged: {', '.join(invalid)}",
+            f"error: unknown {noun} for {command_name}: {', '.join(invalid)}\n"
+            f"valid fields: {', '.join(allowed_fields)}",
             file=sys.stderr,
         )
         return None
     return fields
+
+
+def _render_projection_result(result: _TaskQueryResult, *, use_json: bool) -> None:
+    """Render an explicit projection result in either text or JSON mode."""
+    rendered = result.render(cast(_PresentationMode, "json" if use_json else "blocks"))
+    if not rendered:
+        return
+    if use_json:
+        print(rendered)
+    else:
+        console.print(rendered)
 
 
 def _enrich_unmerged_result(
@@ -1848,12 +1950,59 @@ def cmd_groups(args: argparse.Namespace) -> int:
     """List all tags with task counts (compatibility alias: groups)."""
     config = Config.load(args.project_dir)
     store = get_store(config, open_mode="query_only")
+    projection_fields = _validate_projection_fields(
+        _parse_csv(getattr(args, "fields", None)),
+        command_name="gza groups",
+        allowed_fields=_GROUPS_PROJECTION_FIELDS,
+    )
+    if getattr(args, "fields", None) is not None and projection_fields is None:
+        return 2
+    use_json = bool(getattr(args, "json", False))
 
-    print("Warning: 'gza groups' is deprecated; use 'gza groups list'.")
+    if use_json or projection_fields is not None:
+        print("Warning: 'gza groups' is deprecated; use 'gza groups list'.", file=sys.stderr)
+    else:
+        print("Warning: 'gza groups' is deprecated; use 'gza groups list'.")
     groups = store.get_groups()
 
     if not groups:
-        print("No tasks found")
+        if use_json:
+            print("[]")
+        else:
+            print("No tasks found")
+        return 0
+
+    if use_json or projection_fields is not None:
+        query = _TaskQuery(
+            scope="tasks",
+            limit=None,
+            projection=_TaskProjectionSpec(fields=projection_fields or _GROUPS_PROJECTION_FIELDS),
+            presentation=_TaskPresentationSpec(mode="json" if use_json else "blocks"),
+        )
+        rows: tuple[_TaskRow, ...] = tuple(
+            _TaskRow(
+                task=DbTask(id=None, prompt=group_name, group=group_name, tags=(group_name,)),
+                values=_apply_query_projection_values(
+                    {
+                        "group": group_name,
+                        "total": sum(status_counts.values()),
+                        "pending": status_counts.get("pending", 0),
+                        "in_progress": status_counts.get("in_progress", 0),
+                        "completed": status_counts.get("completed", 0),
+                        "failed": status_counts.get("failed", 0),
+                        "unmerged": status_counts.get("unmerged", 0),
+                        "dropped": status_counts.get("dropped", 0),
+                    },
+                    query.projection,
+                    scope="tasks",
+                ),
+            )
+            for group_name, status_counts in sorted(groups.items())
+        )
+        _render_projection_result(
+            _TaskQueryResult(query=query, rows=rows, total_count=len(rows)),
+            use_json=use_json,
+        )
         return 0
 
     # Sort groups by name

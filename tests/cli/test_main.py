@@ -101,16 +101,31 @@ class TestHelpOutput:
         assert "--status-not" in history_help.stdout
         assert "--type-not" in history_help.stdout
         assert "--tag-not" in history_help.stdout
+        assert "--preset" not in history_help.stdout
+        assert "works in text or JSON mode" in history_help.stdout
         assert "--" + "incomplete" not in history_help.stdout
         assert "--tag/--tag-not values" in history_help.stdout
         assert search_help.returncode == 0
         assert "--status-not" in search_help.stdout
         assert "--type-not" in search_help.stdout
         assert "--tag-not" in search_help.stdout
+        assert "--preset" not in search_help.stdout
+        assert "works in text or JSON mode" in search_help.stdout
         assert "--related-to-not" in search_help.stdout
         assert "Deprecated alias for --lineage-of" in search_help.stdout
         assert "--lineage-of-not" in search_help.stdout
         assert "--root-not" in search_help.stdout
+
+    def test_history_and_search_reject_removed_preset_flag(self, tmp_path):
+        setup_config(tmp_path)
+
+        history_result = run_gza("history", "--preset", "json_minimal", "--project", str(tmp_path))
+        search_result = run_gza("search", "needle", "--preset", "json_minimal", "--project", str(tmp_path))
+
+        assert history_result.returncode == 2
+        assert "unrecognized arguments: --preset json_minimal" in history_result.stderr
+        assert search_result.returncode == 2
+        assert "unrecognized arguments: --preset json_minimal" in search_result.stderr
 
     def test_history_rejects_removed_legacy_flag(self, tmp_path):
         """history should reject the removed legacy flag."""
@@ -122,35 +137,31 @@ class TestHelpOutput:
         assert result.returncode == 2
         assert f"unrecognized arguments: {legacy_flag}" in result.stderr
 
-    def test_top_level_help_hides_incomplete_command(self, tmp_path):
-        """Top-level help should stop advertising `gza incomplete`."""
+    def test_top_level_help_shows_incomplete_command(self, tmp_path):
+        """Top-level help should advertise `gza incomplete`."""
         setup_config(tmp_path)
 
         result = run_gza("--help", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "incomplete" not in result.stdout
+        assert "incomplete" in result.stdout
 
-    def test_incomplete_command_returns_deprecation_guidance(self, tmp_path):
-        """Legacy `gza incomplete` should print directed replacements and fail closed."""
+    def test_incomplete_command_help_describes_live_projection_surface(self, tmp_path):
+        """`gza incomplete --help` should show the live projection options."""
         setup_config(tmp_path)
 
         result = run_gza("incomplete", "--help", "--project", str(tmp_path))
 
-        assert result.returncode == 2
-        output = result.stdout + result.stderr
-        assert "invalid choice" not in output
-        assert "deprecated and no longer supported" in output
-        assert "uv run gza unmerged" in output
-        assert "uv run gza advance --unimplemented" in output
-        assert "uv run gza history --status failed" in output
-        assert "factual failed-task history" in output
-        assert "uv run gza watch --restart-failed --dry-run" in output
-        assert "uv run gza next --all" in output
-        assert "/gza-summary" in output
+        assert result.returncode == 0
+        assert "Show unresolved task lineages that still need attention" in result.stdout
+        assert "--fields" in result.stdout
+        assert "--json" in result.stdout
+        assert "--blocked-by-dropped" in result.stdout
+        assert "deprecated and no longer supported" not in result.stdout
+        assert result.stderr == ""
 
-    def test_incomplete_command_dispatches_through_hidden_parser(self, tmp_path, monkeypatch):
-        """`gza incomplete` should dispatch through parsed `args.command`, not a raw argv trapdoor."""
+    def test_incomplete_command_dispatches_through_live_parser(self, tmp_path, monkeypatch):
+        """`gza incomplete` should dispatch through parsed `args.command` to the live handler."""
         setup_config(tmp_path)
 
         cli_main_module = importlib.import_module("gza.cli.main")
@@ -159,19 +170,19 @@ class TestHelpOutput:
 
         def fake_cmd(args):
             captured["command"] = args.command
-            captured["legacy_help"] = args.legacy_help
+            captured["fields"] = args.fields
             captured["project_dir"] = args.project_dir
-            return 2
+            return 0
 
-        monkeypatch.setattr(cli_main_module, "cmd_incomplete_deprecated", fake_cmd)
+        monkeypatch.setattr(cli_main_module, "cmd_incomplete", fake_cmd)
 
-        with patch.object(sys, "argv", ["gza", "incomplete", "--help", "--project", str(tmp_path)]):
+        with patch.object(sys, "argv", ["gza", "incomplete", "--fields", "id", "--project", str(tmp_path)]):
             result = cli_main_module.main()
 
-        assert result == 2
+        assert result == 0
         assert captured == {
             "command": "incomplete",
-            "legacy_help": True,
+            "fields": "id",
             "project_dir": tmp_path.resolve(),
         }
 
@@ -574,6 +585,8 @@ class TestHelpOutput:
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
         assert "### groups" in docs_text
         assert "gza groups" in docs_text
+        assert "--fields CSV" in docs_text
+        assert "--json" in docs_text
 
         result = run_gza("groups", "--project", str(tmp_path))
 

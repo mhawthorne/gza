@@ -128,7 +128,7 @@ Use `/gza-task-debug` when a task has failed and you need to understand why befo
 
 **Synthesize operator triage guidance from the canonical gza surfaces.**
 
-Use `/gza-summary` when you want a synthesized "what should I do next?" view without reviving `gza incomplete` as a mixed-bucket CLI command.
+Use `/gza-summary` when you want a synthesized "what should I do next?" view that sits above the factual CLI surfaces such as `gza incomplete`, `gza next --all`, and `gza history --status failed`.
 
 **Key behaviors:**
 - Runs `uv run gza history --status failed`, `uv run gza advance --unimplemented`, `uv run gza unmerged`, and `uv run gza next --all`

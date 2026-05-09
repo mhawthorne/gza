@@ -1031,6 +1031,11 @@ gza groups
 
 `gza groups` remains an aggregate group-count summary command (`gza groups list`), separate from task/lineage query presentation.
 
+| Option | Description |
+|--------|-------------|
+| `--fields CSV` | Projection fields override for aggregate group rows. In text mode, one field prints bare values and multiple fields print `field: value` blocks |
+| `--json` | Output aggregate group rows as structured JSON objects |
+
 ### history
 
 List recent completed or failed tasks.
@@ -1056,25 +1061,40 @@ gza history [options]
 | `--any-tag` | With repeated `--tag` and/or `--tag-not` values, match any requested tag instead of all |
 | `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
 | `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `effective`) |
-| `--fields CSV` | Projection fields override for JSON output only (comma-separated; requires `--json`) |
-| `--preset NAME` | Projection preset override for JSON output only (requires `--json`) |
+| `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
 | `--json` | Output JSON rows from the unified query API |
 
 Positive and negative filters on the same field are applied in order: include matches for the positive flag first, then drop anything matching the corresponding `--...-not` flag. If the same value appears in both, the negative filter wins and that row is excluded.
 
-#### Replacing `gza incomplete`
+### incomplete
 
-`gza incomplete` is deprecated and removed from the documented CLI surface. Use a dedicated command for the specific domain you want:
+Show unresolved task lineages that still need attention.
 
-| Old need | Use now |
+```bash
+gza incomplete [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--last N`, `-n N` | Show last N unresolved rows (default: 5; use `0` for all) |
+| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
+| `--days N` | Show only unresolved rows from the last N days |
+| `--date-field FIELD` | Date field for `--days`: `created`, `completed`, or `effective` (default: `effective`) |
+| `--tree` | Render unresolved lineages as trees instead of one-line summaries |
+| `--verbose` | In one-line mode, show owner task details beneath each unresolved lineage |
+| `--blocked-by-dropped` | Switch to pending tasks blocked by dropped dependencies instead of unresolved lineages |
+| `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
+| `--json` | Output JSON rows from the unified query API |
+
+Use `gza incomplete` for unresolved lineage triage. Use the more specific command surfaces when you want one domain only:
+
+| Need | Command |
 |--------|-------------|
 | Unmerged code work | `uv run gza unmerged` |
-| Completed `plan`/`explore` work without implementation | `uv run gza advance --unimplemented` (temporary spelling until `uv run gza unimplemented` lands) |
-| Failed-task recovery decisions | Start with factual failed-task history from `uv run gza history --status failed`; use the failed-task recovery workflow, and optionally `uv run gza watch --restart-failed --dry-run` when you need the recovery decision surface |
-| Pending queue state, including dropped-dependency blockers | `uv run gza next` or `uv run gza next --all` (blocked rows include blocker status, so dropped dependencies are called out explicitly) |
-| Synthesized "what should I do next?" triage guidance | `/gza-summary` |
-
-Keep those domains separate instead of reintroducing a single mixed unresolved-history view.
+| Completed `plan`/`explore` work without implementation | `uv run gza advance --unimplemented` |
+| Failed-task history | `uv run gza history --status failed` |
+| Pending queue state | `uv run gza next` or `uv run gza next --all` |
+| Synthesized next-step guidance | `/gza-summary` |
 
 ### search
 
@@ -1105,8 +1125,7 @@ gza search <term> [options]
 | `--tag TAG` | Filter by tag (repeatable; all tags required by default) |
 | `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |
 | `--any-tag` | With repeated `--tag` and/or `--tag-not` values, match any requested tag instead of all |
-| `--fields CSV` | Projection fields override for JSON output only (comma-separated; requires `--json`) |
-| `--preset NAME` | Projection preset override for JSON output only (requires `--json`) |
+| `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
 | `--json` | Output JSON rows from the unified query API |
 
 Text output ends with a summary footer such as `Showing results 1-9 out of 55`.

@@ -519,21 +519,86 @@ class TestHistoryCommand:
         assert internal_task.id in ids
         assert public_task.id not in ids
 
-    def test_history_fields_override_requires_json(self, tmp_path: Path):
+    def test_history_text_fields_multi_field_uses_generic_blocks(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
-        store.add("history projection test", task_type="implement")
+        task = store.add("history projection test", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
 
         result = run_gza(
             "history",
+            "--fields",
+            "id,prompt",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert f"id: {task.id}" in result.stdout
+        assert "prompt: history projection test" in result.stdout
+
+    def test_history_text_fields_single_field_prints_bare_values(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("history bare value", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("history", "--fields", "id", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == task.id
+
+    def test_history_json_fields_override_limits_projection(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("history json projection", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza(
+            "history",
+            "--json",
             "--fields",
             "id,status",
             "--project",
             str(tmp_path),
         )
 
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload == [{"id": task.id, "status": "completed"}]
+
+    def test_history_unknown_fields_list_valid_choices(self, tmp_path: Path):
+        setup_config(tmp_path)
+        make_store(tmp_path).add("history unknown field", task_type="implement")
+
+        result = run_gza("history", "--fields", "id,nope", "--project", str(tmp_path))
+
         assert result.returncode == 2
-        assert "--fields and --preset require --json for gza history" in result.stderr
+        assert "unknown field for gza history: nope" in result.stderr
+        assert "valid fields:" in result.stderr
+        assert "id" in result.stderr
+
+    def test_history_rejects_next_action_projection_field(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("history next action unsupported", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("history", "--fields", "next_action", "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "unknown field for gza history: next_action" in result.stderr
+        assert "valid fields:" in result.stderr
+        assert "id" in result.stderr
+        assert "next_action" not in result.stderr.split("valid fields:", 1)[1]
 
     def test_history_shows_task_type_labels(self, tmp_path: Path):
         """History command displays task type labels for all task types."""
@@ -1511,22 +1576,56 @@ class TestSearchCommand:
         for row in payload:
             assert set(row.keys()) == {"id", "status"}
 
-    def test_search_fields_override_requires_json(self, tmp_path: Path):
+    def test_search_text_fields_multi_field_uses_generic_blocks(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
-        store.add("needle projection test", task_type="implement")
+        task = store.add("needle projection test", task_type="implement")
 
         result = run_gza(
             "search",
             "needle",
             "--fields",
-            "id,status",
+            "id,prompt",
             "--project",
             str(tmp_path),
         )
 
+        assert result.returncode == 0
+        assert f"id: {task.id}" in result.stdout
+        assert "prompt: needle projection test" in result.stdout
+
+    def test_search_text_fields_single_field_prints_bare_values(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("needle bare value", task_type="implement")
+
+        result = run_gza("search", "needle", "--fields", "id", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == task.id
+
+    def test_search_unknown_fields_list_valid_choices(self, tmp_path: Path):
+        setup_config(tmp_path)
+        make_store(tmp_path).add("needle unknown field", task_type="implement")
+
+        result = run_gza("search", "needle", "--fields", "id,nope", "--project", str(tmp_path))
+
         assert result.returncode == 2
-        assert "--fields and --preset require --json for gza search" in result.stderr
+        assert "unknown field for gza search: nope" in result.stderr
+        assert "valid fields:" in result.stderr
+        assert "id" in result.stderr
+
+    def test_search_rejects_next_action_projection_field(self, tmp_path: Path):
+        setup_config(tmp_path)
+        make_store(tmp_path).add("needle next action unsupported", task_type="implement")
+
+        result = run_gza("search", "needle", "--fields", "next_action", "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "unknown field for gza search: next_action" in result.stderr
+        assert "valid fields:" in result.stderr
+        assert "id" in result.stderr
+        assert "next_action" not in result.stderr.split("valid fields:", 1)[1]
 
     def test_search_tag_filter_is_case_insensitive_with_json_text_parity(self, tmp_path: Path):
         """search --tag should match regardless of filter case in text and JSON outputs."""
@@ -4833,6 +4932,63 @@ class TestGroupsCommand:
         assert result.returncode == 0
         assert "release" in result.stdout
         assert "backlog" in result.stdout
+
+    def test_groups_text_fields_multi_field_uses_generic_blocks(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Release task", tags=("release",))
+
+        result = run_gza("groups", "list", "--fields", "group,total", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "group: release" in result.stdout
+        assert "total: 1" in result.stdout
+        assert "Warning: 'gza groups' is deprecated" in result.stderr
+
+    def test_groups_text_fields_single_field_prints_bare_values(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Release task", tags=("release",))
+
+        result = run_gza("groups", "--fields", "group", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == "release"
+        assert "Warning: 'gza groups' is deprecated" in result.stderr
+
+    def test_groups_json_fields_override_limits_projection(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Release task", tags=("release",))
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza(
+            "groups",
+            "list",
+            "--json",
+            "--fields",
+            "group,completed",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == [{"group": "release", "completed": 1}]
+        assert "Warning: 'gza groups' is deprecated" in result.stderr
+
+    def test_groups_unknown_fields_list_valid_choices(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Release task", tags=("release",))
+
+        result = run_gza("groups", "list", "--fields", "group,nope", "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "unknown field for gza groups: nope" in result.stderr
+        assert "valid fields:" in result.stderr
+        assert "group" in result.stderr
         assert "Release prompt" not in result.stdout
         assert "Backlog prompt" not in result.stdout
 
@@ -10501,67 +10657,155 @@ class TestPsSortKey:
 
 
 class TestIncompleteCommand:
-    """Tests for the deprecated `gza incomplete` compatibility stub."""
+    """Tests for the incomplete projection surface."""
 
-    def test_incomplete_json_fails_closed_with_deprecation_message(self, tmp_path: Path):
-        setup_config(tmp_path)
-
-        result = run_gza("incomplete", "--json", "--project", str(tmp_path))
-
-        assert result.returncode == 2
-        assert result.stdout == ""
-        assert "invalid choice" not in result.stderr
-        assert "deprecated and no longer supported" in result.stderr
-        assert "uv run gza unmerged" in result.stderr
-
-    def test_incomplete_blocked_by_dropped_points_to_next_all(self, tmp_path: Path):
-        setup_config(tmp_path)
-
-        result = run_gza(
-            "incomplete",
-            "--blocked-by-dropped",
-            "--project",
-            str(tmp_path),
+    @staticmethod
+    def _incomplete_args(
+        tmp_path: Path,
+        *,
+        fields: str | None,
+        json: bool = False,
+    ) -> argparse.Namespace:
+        return argparse.Namespace(
+            project_dir=tmp_path,
+            last=5,
+            blocked_by_dropped=False,
+            tree=False,
+            type=None,
+            days=None,
+            date_field="effective",
+            json=json,
+            verbose=False,
+            fields=fields,
         )
 
-        assert result.returncode == 2
-        assert "invalid choice" not in result.stderr
-        assert "unrecognized arguments" not in result.stderr
-        assert "uv run gza next --all" in result.stderr
-        assert "dropped-dependency blockers" in result.stderr
-
-    def test_incomplete_reports_ignored_legacy_args(self, tmp_path: Path):
+    def test_incomplete_text_fields_multi_field_uses_generic_blocks(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
         setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("needs follow-up", task_type="implement")
+        task.status = "failed"
+        task.completed_at = datetime.now(UTC)
+        task.failure_reason = "TEST_FAILURE"
+        store.update(task)
 
-        result = run_gza(
-            "incomplete",
-            "--last",
-            "0",
-            "--tree",
-            "--project",
-            str(tmp_path),
-        )
+        result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields="id,prompt"))
 
-        assert result.returncode == 2
-        assert "invalid choice" not in result.stderr
-        assert "Ignoring legacy arguments" in result.stderr
-        assert "--last" in result.stderr
-        assert "--tree" in result.stderr
+        captured = capsys.readouterr()
+        assert result == 0
+        assert f"id: {task.id}" in captured.out
+        assert "prompt: needs follow-up" in captured.out
 
-    def test_incomplete_verbose_routes_to_deprecation_stub(self, tmp_path: Path):
+    def test_incomplete_text_fields_single_field_prints_bare_values(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
         setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("bare incomplete value", task_type="implement")
+        task.status = "failed"
+        task.completed_at = datetime.now(UTC)
+        task.failure_reason = "TEST_FAILURE"
+        store.update(task)
 
-        result = run_gza(
-            "incomplete",
-            "--verbose",
-            "--project",
-            str(tmp_path),
-        )
+        result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields="id"))
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert captured.out.strip() == task.id
+
+    def test_incomplete_json_fields_override_limits_projection(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("json incomplete value", task_type="implement")
+        task.status = "failed"
+        task.completed_at = datetime.now(UTC)
+        task.failure_reason = "TEST_FAILURE"
+        store.update(task)
+
+        result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields="id,status", json=True))
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert json.loads(captured.out) == [{"id": task.id, "status": "failed"}]
+
+    def test_incomplete_unknown_fields_list_valid_choices(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        make_store(tmp_path).add("unknown incomplete field", task_type="implement")
+
+        result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields="id,nope"))
+
+        captured = capsys.readouterr()
+        assert result == 2
+        assert "unknown field for gza incomplete: nope" in captured.err
+        assert "valid fields:" in captured.err
+        assert "id" in captured.err
+
+    def test_incomplete_cli_text_single_field_prints_bare_values(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("cli bare incomplete value", task_type="implement")
+        task.status = "failed"
+        task.completed_at = datetime.now(UTC)
+        task.failure_reason = "TEST_FAILURE"
+        store.update(task)
+
+        result = run_gza("incomplete", "--fields", "id", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == task.id
+        assert result.stderr == ""
+
+    def test_incomplete_cli_text_multi_field_uses_blocks(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("cli block incomplete value", task_type="implement")
+        task.status = "failed"
+        task.completed_at = datetime.now(UTC)
+        task.failure_reason = "TEST_FAILURE"
+        store.update(task)
+
+        result = run_gza("incomplete", "--fields", "id,prompt", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"id: {task.id}" in result.stdout
+        assert "prompt: cli block incomplete value" in result.stdout
+        assert result.stderr == ""
+
+    def test_incomplete_cli_json_fields_emit_projection_objects(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("cli json incomplete value", task_type="implement")
+        task.status = "failed"
+        task.completed_at = datetime.now(UTC)
+        task.failure_reason = "TEST_FAILURE"
+        store.update(task)
+
+        result = run_gza("incomplete", "--json", "--fields", "id,status", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == [{"id": task.id, "status": "failed"}]
+        assert result.stderr == ""
+
+    def test_incomplete_cli_unknown_fields_list_valid_choices(self, tmp_path: Path):
+        setup_config(tmp_path)
+        make_store(tmp_path).add("cli unknown incomplete field", task_type="implement")
+
+        result = run_gza("incomplete", "--fields", "id,nope", "--project", str(tmp_path))
 
         assert result.returncode == 2
-        assert result.stdout == ""
-        assert "invalid choice" not in result.stderr
-        assert "unrecognized arguments" not in result.stderr
-        assert "Ignoring legacy arguments: --verbose" in result.stderr
-        assert "deprecated and no longer supported" in result.stderr
-        assert "uv run gza unmerged" in result.stderr
+        assert "unknown field for gza incomplete: nope" in result.stderr
+        assert "valid fields:" in result.stderr
+        assert "id" in result.stderr

@@ -603,8 +603,9 @@ def _run_foreground(
     worker_mode = os.environ.get("GZA_WORKER_MODE")
     worker = None
     reuse_existing_worker = False
-    outer_worker_owns_completion = os.environ.get(_REUSE_WORKER_OWNER_ENV) == _REUSE_WORKER_OWNER_OUTER
+    reused_registered_worker = False
     if worker_id and worker_mode == "1":
+        reused_registered_worker = registry.get(worker_id) is not None
         worker = registry.ensure_running(
             WorkerMetadata(
                 worker_id=worker_id,
@@ -614,6 +615,9 @@ def _run_foreground(
             )
         )
         reuse_existing_worker = True
+    outer_worker_owns_completion = reused_registered_worker and (
+        os.environ.get(_REUSE_WORKER_OWNER_ENV) == _REUSE_WORKER_OWNER_OUTER
+    )
     if worker is None:
         worker_id = registry.generate_worker_id()
         worker = WorkerMetadata(

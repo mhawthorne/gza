@@ -75,7 +75,7 @@ from .query import (
     cmd_group_rename,
     cmd_groups,
     cmd_history,
-    cmd_incomplete_deprecated,
+    cmd_incomplete,
     cmd_kill,
     cmd_lineage,
     cmd_next,
@@ -314,12 +314,7 @@ def main() -> int:
     history_parser.add_argument(
         "--fields",
         metavar="CSV",
-        help="Projection fields override (comma-separated, requires --json)",
-    )
-    history_parser.add_argument(
-        "--preset",
-        metavar="NAME",
-        help="Projection preset override (requires --json)",
+        help="Projection fields override (comma-separated; works in text or JSON mode)",
     )
     history_parser.add_argument(
         "--json",
@@ -327,73 +322,65 @@ def main() -> int:
         help="Output JSON rows from the unified query API",
     )
 
-    # hidden deprecated incomplete command
+    # incomplete command
     incomplete_parser = subparsers.add_parser(
         "incomplete",
-        help=argparse.SUPPRESS,
-        add_help=False,
+        help="Show unresolved task lineages that still need attention",
+        description="Show unresolved task lineages that still need attention",
     )
     add_common_args(incomplete_parser)
-    incomplete_parser.add_argument(
-        "-h",
-        "--help",
-        action="store_true",
-        dest="legacy_help",
-        help=argparse.SUPPRESS,
-    )
+    incomplete_parser.set_defaults(last=5)
     incomplete_parser.add_argument(
         "--json",
         action="store_true",
-        help=argparse.SUPPRESS,
+        help="Output JSON rows from the unified query API",
     )
     incomplete_parser.add_argument(
         "--verbose",
         action="store_true",
-        help=argparse.SUPPRESS,
+        help="Show owner task details under each unresolved lineage entry",
     )
     incomplete_parser.add_argument(
         "--blocked-by-dropped",
         action="store_true",
         dest="blocked_by_dropped",
-        help=argparse.SUPPRESS,
+        help="Show pending tasks blocked by dropped dependencies instead of unresolved lineages",
     )
     incomplete_parser.add_argument(
         "--last",
         "-n",
-        type=int,
+        type=_parse_non_negative_int,
         metavar="N",
-        help=argparse.SUPPRESS,
+        help="Show last N unresolved rows (default: 5, 0 for all)",
     )
     incomplete_parser.add_argument(
         "--tree",
         action="store_true",
-        help=argparse.SUPPRESS,
+        help="Render unresolved lineages as trees instead of one-line summaries",
     )
     incomplete_parser.add_argument(
         "--type",
         type=str,
         choices=["explore", "plan", "implement", "review", "improve", "fix", "rebase", "internal"],
-        help=argparse.SUPPRESS,
+        help="Filter by task type",
     )
     incomplete_parser.add_argument(
         "--days",
-        type=int,
+        type=_parse_non_negative_int,
         metavar="N",
-        help=argparse.SUPPRESS,
+        help="Show only unresolved rows from the last N days",
     )
     incomplete_parser.add_argument(
         "--date-field",
         choices=["created", "completed", "effective"],
-        help=argparse.SUPPRESS,
+        default="effective",
+        help="Date field used by --days filters (default: effective)",
     )
-    # Keep the deprecated parser choice available for parsing, but remove its
-    # pseudo-action so top-level help does not advertise it during the
-    # compatibility window.
-    subparsers._choices_actions = [
-        action
-        for action in subparsers._choices_actions
-        if getattr(action, "dest", None) != "incomplete"
-    ]
+    incomplete_parser.add_argument(
+        "--fields",
+        metavar="CSV",
+        help="Projection fields override (comma-separated; works in text or JSON mode)",
+    )
 
     # search command
     search_parser = subparsers.add_parser(
@@ -491,12 +478,7 @@ def main() -> int:
     search_parser.add_argument(
         "--fields",
         metavar="CSV",
-        help="Projection fields override (comma-separated, requires --json)",
-    )
-    search_parser.add_argument(
-        "--preset",
-        metavar="NAME",
-        help="Projection preset override (requires --json)",
+        help="Projection fields override (comma-separated; works in text or JSON mode)",
     )
     search_parser.add_argument(
         "--json",
@@ -2226,9 +2208,29 @@ def main() -> int:
     # groups command
     groups_parser = subparsers.add_parser("groups", help="Deprecated tag-management commands")
     add_common_args(groups_parser)
+    groups_parser.add_argument(
+        "--fields",
+        metavar="CSV",
+        help="Projection fields override for aggregate group rows (comma-separated; works in text or JSON mode)",
+    )
+    groups_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output aggregate group rows as JSON",
+    )
     groups_subparsers = groups_parser.add_subparsers(dest="groups_action")
     groups_list_parser = groups_subparsers.add_parser("list", help="List tags with task counts")
     add_common_args(groups_list_parser)
+    groups_list_parser.add_argument(
+        "--fields",
+        metavar="CSV",
+        help="Projection fields override for aggregate group rows (comma-separated; works in text or JSON mode)",
+    )
+    groups_list_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output aggregate group rows as JSON",
+    )
     groups_rename_parser = groups_subparsers.add_parser("rename", help="Rename a tag across all attached tasks")
     groups_rename_parser.add_argument(
         "old_group",
@@ -2399,7 +2401,7 @@ def main() -> int:
     )
     add_common_args(migrate_parser)
 
-    visible_commands = sorted(name for name in subparsers.choices if name != "incomplete")
+    visible_commands = sorted(subparsers.choices)
     subparsers.metavar = "{" + ",".join(visible_commands) + "}"
 
     args = parser.parse_args()
@@ -2459,7 +2461,7 @@ def main() -> int:
         elif args.command == "history":
             return cmd_history(args)
         elif args.command == "incomplete":
-            return cmd_incomplete_deprecated(args)
+            return cmd_incomplete(args)
         elif args.command == "search":
             return cmd_search(args)
         elif args.command == "unmerged":
