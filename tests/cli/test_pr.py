@@ -462,3 +462,8 @@ class TestPrCommand:
         assert internal_tasks[0].status == "failed"
         assert internal_tasks[0].failure_reason == "UNKNOWN"
         assert mock_mark_failed.call_count == 1
+        assert mock_mark_failed.call_args.kwargs["task"].id == internal_tasks[0].id
+        assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "UNKNOWN"
+        stderr = capsys.readouterr().err
+        assert internal_tasks[0].id is not None
+        assert f"PR description internal task {internal_tasks[0].id} failed" in stderr
