@@ -8,6 +8,21 @@ from pathlib import Path
 
 import pytest
 
+_PYTEST_TIMEOUT_DECORATOR = "@pytest.mark." "timeout"
+
+
+def _find_timeout_decorator_occurrences(root: Path) -> list[str]:
+    """Return every file/line under root that contains a timeout decorator."""
+    occurrences: list[str] = []
+    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+        if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+            continue
+        file_text = path.read_text(encoding="utf-8", errors="ignore")
+        for lineno, line in enumerate(file_text.splitlines(), start=1):
+            if _PYTEST_TIMEOUT_DECORATOR in line:
+                occurrences.append(f"{path.relative_to(root)}:{lineno}")
+    return occurrences
+
 
 def test_hatch_vcs_does_not_write_source_version_file() -> None:
     """Editable installs must not require writing src/gza/_version.py."""
@@ -54,30 +69,35 @@ def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
 
 
 def test_unit_tests_do_not_carry_per_test_pytest_timeout_overrides() -> None:
-    """Unit tests should rely on the central suite timeout fixture."""
+    """Unit tests should not carry timeout decorators anywhere under tests/."""
     tests_root = Path(__file__).resolve().parents[1] / "tests"
-    timeout_overrides: list[str] = []
-
-    for test_file in tests_root.rglob("test_*.py"):
-        test_source = test_file.read_text()
-        if "pytest.mark.timeout" not in test_source:
-            continue
-        module = ast.parse(test_source, filename=str(test_file))
-        for node in ast.walk(module):
-            if not isinstance(node, ast.Call):
-                continue
-            if not (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "timeout"
-                and isinstance(node.func.value, ast.Attribute)
-                and node.func.value.attr == "mark"
-                and isinstance(node.func.value.value, ast.Name)
-                and node.func.value.value.id == "pytest"
-            ):
-                continue
-            timeout_overrides.append(f"{test_file}:{node.lineno}")
+    timeout_overrides = _find_timeout_decorator_occurrences(tests_root)
 
     assert not timeout_overrides, f"Found timeout overrides in tests/: {timeout_overrides}"
+
+
+def test_timeout_decorator_scan_covers_all_files_under_tests_tree(tmp_path: Path) -> None:
+    """The timeout-decorator guard should catch non-test helper files too."""
+    tests_root = tmp_path / "tests"
+    (tests_root / "cli").mkdir(parents=True)
+    (tests_root / "helpers").mkdir()
+    (tests_root / "cli" / "conftest.py").write_text(
+        "import pytest\n\n"
+        + _PYTEST_TIMEOUT_DECORATOR
+        + "(5, method='signal')\n"
+        "def pytest_collection_modifyitems(items):\n"
+        "    return None\n"
+    )
+    (tests_root / "helpers" / "timeout_notes.txt").write_text(
+        "Do not add "
+        + _PYTEST_TIMEOUT_DECORATOR
+        + " to helper modules.\n"
+    )
+
+    assert _find_timeout_decorator_occurrences(tests_root) == [
+        "cli/conftest.py:3",
+        "helpers/timeout_notes.txt:1",
+    ]
 
 
 def test_functional_subprocess_timeouts_within_watchdog() -> None:
