@@ -276,9 +276,11 @@ def _run_bin_tests(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[st
     fake_uv.chmod(0o755)
 
     env = os.environ.copy()
-    # Scrub envs read by bin/tests so assertions exercise its built-in defaults
-    # regardless of how the parent test runner was invoked.
-    env.pop("PYTEST_XDIST_WORKERS", None)
+    # Pin envs read by bin/tests so assertions are host-independent. The script's
+    # default worker count is derived from CPU count, which varies by machine; we
+    # exercise the literal-passthrough path here and leave default-derivation to
+    # its own test.
+    env["PYTEST_XDIST_WORKERS"] = "auto"
     env.pop("PYTEST_FAULTHANDLER_TIMEOUT", None)
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["FAKE_UV_LOG"] = str(uv_log)
@@ -311,18 +313,74 @@ def test_github_test_workflow_uses_shared_test_script() -> None:
     workflow_text = workflow.read_text()
 
     assert "run: ./bin/tests" in workflow_text
-    assert "PYTEST_XDIST_WORKERS" not in workflow_text
+    # CI pins workers to `auto` because bin/tests now defaults to ~75% of cores so
+    # busy laptops have headroom for Docker / gza / etc. CI runners aren't busy
+    # with anything else, so they should saturate.
+    assert 'PYTEST_XDIST_WORKERS: "auto"' in workflow_text
 
 
 @pytest.mark.functional
-def test_bin_tests_integration_flag_runs_integration_pytest(tmp_path: Path) -> None:
-    long_result = _run_bin_tests(tmp_path / "long", "--integration")
-    short_result = _run_bin_tests(tmp_path / "short", "-i")
+def test_bin_tests_defaults_workers_to_three_quarters_of_cores(tmp_path: Path) -> None:
+    """bin/tests should default to ~75% of cores when PYTEST_XDIST_WORKERS is unset.
 
-    assert long_result.returncode == 0
-    assert short_result.returncode == 0
-    assert (tmp_path / "long" / "uv.log").read_text().splitlines()[-1] == "run pytest tests_integration -xv"
-    assert (tmp_path / "short" / "uv.log").read_text().splitlines()[-1] == "run pytest tests_integration -xv"
+    Why: dev laptops run Docker, gza, etc. alongside the test suite — saturating
+    every core (`-n auto`) starves those siblings and trips the functional-test
+    watchdog under fork/exec contention. CI overrides via env to keep `auto`.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "bin" / "tests"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uv = fake_bin / "uv"
+    uv_log = tmp_path / "uv.log"
+    uv_log.write_text("")
+    fake_uv.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >>\"$FAKE_UV_LOG\"\n"
+        "exit 0\n"
+    )
+    fake_uv.chmod(0o755)
+
+    # Stub getconf to report a deterministic core count. The script reads CPU count
+    # via `getconf _NPROCESSORS_ONLN`; intercepting that is the cleanest way to
+    # assert the percentage formula without depending on the host's actual cores.
+    fake_getconf = fake_bin / "getconf"
+    fake_getconf.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "_NPROCESSORS_ONLN" ]; then echo 16; exit 0; fi\n'
+        'exec /usr/bin/getconf "$@"\n'
+    )
+    fake_getconf.chmod(0o755)
+
+    env = os.environ.copy()
+    env.pop("PYTEST_XDIST_WORKERS", None)
+    env.pop("PYTEST_FAULTHANDLER_TIMEOUT", None)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["FAKE_UV_LOG"] = str(uv_log)
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    pytest_invocation = (tmp_path / "uv.log").read_text().splitlines()[-1]
+    # 16 cores * 3 / 4 = 12 workers
+    assert pytest_invocation == (
+        "run pytest tests/ -n 12 --dist loadscope -x -o faulthandler_timeout=2"
+    )
+
+
+@pytest.mark.functional
+@pytest.mark.parametrize("flag", ["--integration", "-i"])
+def test_bin_tests_integration_flag_runs_integration_pytest(tmp_path: Path, flag: str) -> None:
+    result = _run_bin_tests(tmp_path, flag)
+
+    assert result.returncode == 0
+    assert (tmp_path / "uv.log").read_text().splitlines()[-1] == "run pytest tests_integration -xv"
 
 
 @pytest.mark.functional

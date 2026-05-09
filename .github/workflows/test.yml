@@ -31,4 +31,5 @@ jobs:
         env:
           GZA_UNIT_TEST_TIMEOUT_SECONDS: "2"
           GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS: "4"
+          PYTEST_XDIST_WORKERS: "auto"
         run: ./bin/tests

@@ -1565,7 +1565,12 @@ def _resolve_unimplemented_source_targets(
 
         if child_targets:
             result = child_targets
-        elif current.task_type in task_types and current.id not in impl_source_ids and not has_implement_in_subtree:
+        elif (
+            current.task_type in task_types
+            and current.id not in impl_source_ids
+            and not has_implement_in_subtree
+            and current.status not in {"failed", "dropped"}
+        ):
             result = [current]
         else:
             result = []

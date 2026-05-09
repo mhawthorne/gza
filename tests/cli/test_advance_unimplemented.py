@@ -305,6 +305,160 @@ class TestAdvanceUnimplementedCommand:
         assert implement_tasks[0].depends_on == latest_descendant.id
         assert implement_tasks[0].prompt.startswith(f"Implement findings from task {latest_descendant.id}")
 
+    def test_advance_unimplemented_skips_failed_sibling_when_other_sibling_implemented(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """Failed plan sibling should not surface when a sibling resume reached implementation.
+
+        Mirrors gza-2520: root failed plan with two children — a failed resume (no descendants)
+        and a completed resume whose subtree carries the implement work. The failed sibling is a
+        dead-end; the implementation already exists via the successful sibling.
+        """
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Plan the merge truth replacement", task_type="plan")
+        _set_task_times(
+            store,
+            root,
+            created_at=datetime(2026, 5, 8, 7, 11, tzinfo=UTC),
+            status="failed",
+        )
+
+        failed_resume = store.add("Plan the merge truth replacement", task_type="plan", based_on=root.id)
+        _set_task_times(
+            store,
+            failed_resume,
+            created_at=datetime(2026, 5, 8, 7, 17, tzinfo=UTC),
+            status="failed",
+        )
+
+        completed_resume = store.add("Plan the merge truth replacement", task_type="plan", based_on=root.id)
+        _set_task_times(
+            store,
+            completed_resume,
+            created_at=datetime(2026, 5, 8, 16, 47, tzinfo=UTC),
+            completed_at=datetime(2026, 5, 8, 17, 0, tzinfo=UTC),
+            status="completed",
+        )
+
+        impl = store.add("Implement merge truth", task_type="implement", based_on=completed_resume.id)
+        _set_task_times(
+            store,
+            impl,
+            created_at=datetime(2026, 5, 8, 17, 46, tzinfo=UTC),
+            completed_at=datetime(2026, 5, 8, 18, 0, tzinfo=UTC),
+            status="completed",
+        )
+
+        rc = _run_unimplemented(tmp_path, store)
+        output = capsys.readouterr().out
+
+        assert rc == 0
+        assert str(failed_resume.id) not in output
+        assert str(root.id) not in output
+        assert str(completed_resume.id) not in output
+        assert "No plan/explore lineages without implementation tasks." in output
+
+    def test_advance_unimplemented_skips_dropped_sibling_when_other_sibling_implemented(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """Dropped plan sibling means abandoned — never surface even with no implement nearby.
+
+        Mirrors gza-719: a dropped retry exists alongside a sibling chain that did reach
+        implementation. The dropped row is explicitly abandoned and should not be listed.
+        """
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Design symlink creation", task_type="plan")
+        _set_task_times(
+            store,
+            root,
+            created_at=datetime(2026, 4, 8, 21, 45, tzinfo=UTC),
+            status="failed",
+        )
+
+        failed_retry = store.add("Design symlink creation", task_type="plan", based_on=root.id)
+        _set_task_times(
+            store,
+            failed_retry,
+            created_at=datetime(2026, 4, 8, 22, 3, tzinfo=UTC),
+            status="failed",
+        )
+
+        completed_retry = store.add("Design symlink creation", task_type="plan", based_on=failed_retry.id)
+        _set_task_times(
+            store,
+            completed_retry,
+            created_at=datetime(2026, 4, 8, 22, 7, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 8, 22, 30, tzinfo=UTC),
+            status="completed",
+        )
+
+        impl = store.add("Implement symlinks", task_type="implement", based_on=completed_retry.id)
+        _set_task_times(
+            store,
+            impl,
+            created_at=datetime(2026, 4, 9, 3, 48, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 9, 4, 0, tzinfo=UTC),
+            status="completed",
+        )
+
+        dropped_retry = store.add("Design symlink creation", task_type="plan", based_on=root.id)
+        _set_task_times(
+            store,
+            dropped_retry,
+            created_at=datetime(2026, 4, 8, 22, 41, tzinfo=UTC),
+            status="dropped",
+        )
+
+        rc = _run_unimplemented(tmp_path, store)
+        output = capsys.readouterr().out
+
+        assert rc == 0
+        assert str(dropped_retry.id) not in output
+        assert "No plan/explore lineages without implementation tasks." in output
+
+    def test_advance_unimplemented_skips_dropped_leaf_with_no_implement_anywhere(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """A dropped leaf is abandoned even when no sibling carried the work to implementation.
+
+        Dropped means the user explicitly walked away from this row. It should never surface
+        as "needs manual implementation" — surfacing a completed ancestor is fine if one exists.
+        """
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        completed_ancestor = store.add("Explore the thing", task_type="explore")
+        _set_task_times(
+            store,
+            completed_ancestor,
+            created_at=datetime(2026, 4, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 1, 1, tzinfo=UTC),
+            status="completed",
+        )
+
+        dropped_descendant = store.add(
+            "Plan the thing",
+            task_type="plan",
+            based_on=completed_ancestor.id,
+        )
+        _set_task_times(
+            store,
+            dropped_descendant,
+            created_at=datetime(2026, 4, 2, tzinfo=UTC),
+            status="dropped",
+        )
+
+        rc = _run_unimplemented(tmp_path, store)
+        output = capsys.readouterr().out
+
+        assert rc == 0
+        assert str(dropped_descendant.id) not in output
+        assert str(completed_ancestor.id) in output
+
     def test_advance_unimplemented_keeps_sibling_source_branches(self, tmp_path: Path, capsys) -> None:
         setup_config(tmp_path)
         store = make_store(tmp_path)
