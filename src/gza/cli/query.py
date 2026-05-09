@@ -2883,7 +2883,7 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Failure Reason:[/{c['label']}] [{c['value']}]{task.failure_reason}[/{c['value']}]")
     if task.completion_reason:
         console.print(f"[{c['label']}]Completion Reason:[/{c['label']}] [{c['value']}]{task.completion_reason}[/{c['value']}]")
-    if task.merge_status:
+    if task.merge_status and task_owns_merge_status(task):
         console.print(f"[{c['label']}]Merge Status:[/{c['label']}] [{c['value']}]{task.merge_status}[/{c['value']}]")
     console.print(f"[{c['label']}]Type:[/{c['label']}] [{c['value']}]{task.task_type}[/{c['value']}]")
     if task.execution_mode:
