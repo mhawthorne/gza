@@ -582,6 +582,31 @@ class TestSkillContentValidation:
         assert "After a successful commit and push" in content
         assert "Push: pushed to <IMPL_BRANCH>" in content
 
+    def test_manual_review_skill_requires_verify_command_every_cycle(self):
+        """gza-task-review should always run verify alongside the code review and fold failures into blockers."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-review" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "Every review cycle must do both the normal code review work and an independent `verify_command` run" in content
+        assert "This is required even when the diff already has obvious code-review blockers; do not skip verify" in content
+        assert "If verify passed, do not add findings just because verify ran." in content
+        assert "If verify failed, synthesize one or more blocking findings" in content
+        assert "verify_command failure" in content
+        assert "Treat verify failures as blocking even if the code review itself would otherwise approve the diff." in content
+
+    def test_manual_review_skill_passes_verify_result_to_subagent(self):
+        """gza-task-review should hand off verify output to the reviewer in canonical context."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-review" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "Pass the result forward as a `## verify_command result` section." in content
+        assert "Independently evaluate the provided `## verify_command result` section in addition to the normal code review." in content
+        assert "Pass the branch name, authoritative diff context, the `## verify_command result` section" in content
+
     def test_gza_task_run_no_longer_documents_manual_mark_completed_recovery(self):
         """gza-task-run should route only through run-inline, without manual completion recovery steps."""
         from gza.skills_utils import get_skills_source_path

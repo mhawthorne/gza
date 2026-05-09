@@ -1,6 +1,6 @@
 ---
 name: gza-task-review
-description: Run an interactive code review for a gza task's implementation branch, producing structured review output compatible with gza-task-improve
+description: Run an interactive code review for a gza task's implementation branch, always running verify_command and producing structured review output compatible with gza-task-improve
 allowed-tools: Bash(uv run:*), Bash(git:*), Bash(gh:*), Read, Glob, Grep, Agent, AskUserQuestion
 version: 1.0.0
 public: true
@@ -8,7 +8,7 @@ public: true
 
 # Gza Task Review
 
-Run an interactive code review for a specific gza task. Produces structured review output that `/gza-task-improve` can consume. Use this when automated review cycles are exhausted, or when you want to review a task interactively.
+Run an interactive code review for a specific gza task. Every review cycle must do both the normal code review work and an independent `verify_command` run from `gza.yaml`; verify is not a short-circuit. Produces structured review output that `/gza-task-improve` can consume. Use this when automated review cycles are exhausted, or when you want to review a task interactively.
 
 ## Inputs
 
@@ -79,7 +79,7 @@ Replace `<TASK_ID>` with the actual full prefixed task ID.
 
 If the task is not found, stop and tell the user.
 
-### Step 2: Verify branch state
+### Step 2: Verify branch state and switch to the implementation checkout
 
 Check that the implementation branch exists and has commits:
 
@@ -90,6 +90,14 @@ git log main..<impl_branch> --oneline
 If no commits, stop — there's nothing to review.
 
 If there's an existing review, inform the user and ask if they want to proceed with a fresh review.
+
+To run `verify_command` against the actual implementation and let the reviewer inspect current source, make `<impl_branch>` the active checkout/worktree now:
+
+```bash
+git checkout <impl_branch>
+```
+
+If the branch is checked out in another worktree, inform the user and ask whether to use the existing worktree path or create a new worktree. If `<START_CHECKOUT>` already equals `<impl_branch>`, do not switch away and back unnecessarily.
 
 ### Step 3: Get task context
 
@@ -117,7 +125,22 @@ git diff main...<impl_branch>
 ```
 Pass this diff to the subagent as `## Implementation diff context`.
 
-### Step 6: Run the review
+### Step 6: Run verify_command
+
+Run `verify_command` from `gza.yaml` as part of every review cycle. This is required even when the diff already has obvious code-review blockers; do not skip verify just because the code review may fail.
+
+- If `verify_command` is empty or unset, note that verify is not configured and continue with the code review.
+- If `verify_command` is configured, run it from the project root while `<impl_branch>` is checked out.
+- Capture the exit status and keep a trimmed diagnostic excerpt for the reviewer. If the output is huge, keep the most useful failing excerpt (for example, the failing tool header plus the first ~120 lines and last ~40 lines).
+- Do not fix the branch during review. The point here is to independently detect verify failures and fold them into the review findings.
+
+Pass the result forward as a `## verify_command result` section. Include:
+- The literal configured command
+- Whether it passed or failed
+- The exit status when it failed
+- The trimmed stdout/stderr excerpt when it failed
+
+### Step 7: Run the review
 
 Spawn a **general-purpose Agent** subagent to perform the review. Give it this prompt:
 
@@ -140,6 +163,14 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 **Step 3.5**: When you need to verify behavior that isn't visible in the diff (for example, whether a CLI command exists, how a called function works, or what a referenced method does), use Read, Grep, or Glob to check the current codebase. Do not guess.
 
 **Step 4**: Review the diff against the provided ask context (`## Original plan:` or `## Original request:`). Evaluate whether the implementation actually achieves that ask, not just whether the code is clean.
+
+**Step 4.5**: Independently evaluate the provided `## verify_command result` section in addition to the normal code review. Both signals matter every cycle.
+
+- If verify passed, do not add findings just because verify ran.
+- If verify failed, synthesize one or more blocking findings alongside the code-review findings. Clearly label each verify-driven blocker title with `verify_command failure` so humans and `/gza-task-improve` can distinguish them from code-quality blockers.
+- Prefer one blocker per failing tool or distinct root cause when that makes the improve work clearer.
+- Put the trimmed verify output in `Evidence:`. If the verify output already contains `path:line` locations (for example mypy/ruff/pytest file references), use those in `Open-state citation:`. If it does not, inspect the referenced current source and add current-source citations that prove the failure is still open.
+- Treat verify failures as blocking even if the code review itself would otherwise approve the diff.
 
 **Step 5**: Write a structured review with these sections:
 
@@ -183,6 +214,7 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 ## Verdict
 
 <Brief justification>
+<Verdict is blocking if either the code review or verify produced blocker findings.>
 Verdict: APPROVED|APPROVED_WITH_FOLLOWUPS|CHANGES_REQUESTED|NEEDS_DISCUSSION
 ```
 
@@ -199,9 +231,9 @@ If no PR number is provided, just output the review directly.
 
 ---
 
-Pass the branch name, authoritative diff context, and the canonical ask context section (exactly one of `## Original plan:` or `## Original request:` when available) to the subagent, plus PR number if `--pr` was used.
+Pass the branch name, authoritative diff context, the `## verify_command result` section, and the canonical ask context section (exactly one of `## Original plan:` or `## Original request:` when available) to the subagent, plus PR number if `--pr` was used.
 
-### Step 7: Persist review output (required)
+### Step 8: Persist review output (required)
 
 After the review agent returns markdown, always persist it as a canonical review artifact and completed review task row.
 
@@ -267,7 +299,7 @@ print(f'Review saved as task #{created.id} ({created.report_file})')
 "
 ```
 
-### Step 8: Report back
+### Step 9: Report back
 
 After the subagent completes:
 - Print the review verdict (APPROVED / APPROVED_WITH_FOLLOWUPS / CHANGES_REQUESTED / NEEDS_DISCUSSION)
@@ -279,7 +311,9 @@ After the subagent completes:
 ## Important notes
 
 - **Ask-adherence is mandatory** — use the Summary checklist item for `## Original plan:` or `## Original request:` to confirm the implementation matches the requested behavior, and treat unexplained deviations as blocker findings.
+- **Verify is part of review, not a separate gate** — run `verify_command` every cycle in addition to the normal code review, and fold any failures into the same structured blocker list.
 - **Structured output matters** — the review format (B1, B2, F1, F2) must be compatible with `/gza-task-improve` and follow-up automation.
+- **Clearly label verify-driven blockers** — titles should include `verify_command failure`, and `Evidence:` should carry the trimmed failing output so improve can act on it without rerunning history reconstruction.
 - **Don't duplicate existing reviews** — if there's already a recent review, inform the user and ask before creating another one.
 - **Use authoritative diff context** — do not reconstruct or expand the diff in the reviewing subagent; only use provided diff context plus unchanged-source reads for verification.
 - **Preserve the user's checkout** — `/gza-task-review` should be checkout-neutral. If you switch branches for any reason, restore the starting checkout before returning control to the user.
