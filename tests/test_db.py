@@ -1771,6 +1771,27 @@ class TestMergeStatus:
         assert unit.target_branch == "main"
         assert unit.state == "unmerged"
 
+    def test_mark_completed_explore_with_commits_owns_unit_and_is_unmerged(self, tmp_path: Path) -> None:
+        """Explore tasks with commits should own merge state and appear in unmerged views."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Explore merge behavior", task_type="explore")
+        store.mark_completed(task, has_commits=True, branch="feature/explore-merge")
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.merge_status == "unmerged"
+        assert retrieved.has_commits is True
+
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.owner_task_id == task.id
+        assert unit.source_branch == "feature/explore-merge"
+        assert unit.state == "unmerged"
+
+        assert [candidate.id for candidate in store.get_unmerged()] == [task.id]
+
     def test_mark_completed_same_branch_improve_keeps_merge_status_on_owner_only(self, tmp_path: Path):
         """Completed same-branch improve rows should not own merge state."""
         db_path = tmp_path / "test.db"
