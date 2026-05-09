@@ -62,7 +62,16 @@ class IncompleteLineage:
     latest_unresolved_at: datetime
 
 
-def is_lineage_complete(task: Task) -> bool:
+def _authoritative_merge_state(task: Task, *, store: SqliteTaskStore | None) -> str | None:
+    """Return canonical merge state for a task when storage context is available."""
+    if store is not None and task.id is not None:
+        unit = store.resolve_merge_unit_for_task(task.id)
+        if unit is not None:
+            return unit.state
+    return task.merge_status
+
+
+def is_lineage_complete(task: Task, *, store: SqliteTaskStore | None = None) -> bool:
     """Return True if task represents a fully-resolved outcome (no action needed).
 
     A task is considered complete when:
@@ -75,20 +84,13 @@ def is_lineage_complete(task: Task) -> bool:
     - status is 'completed' AND merge_status is 'unmerged', OR
     - status is 'completed' AND has_commits is True AND merge_status is None
       (committed but merge not tracked yet)
+
+    When a store is supplied, attached merge-unit state takes precedence over
+    compatibility task-row ``merge_status``.
     """
-    merge_state = task.merge_status
-    if getattr(task, "id", None) is not None:
-        unit = None
-        try:
-            # query.py helpers accept a bare task today, so only use task-row state here.
-            # Merge-aware callers should prefer TaskQuery/CLI paths that resolve units first.
-            unit = None
-        except Exception:
-            unit = None
-        if unit is not None:
-            merge_state = unit.state
-    if task.status == "failed":
+    if task.status in {"failed", "pending", "in_progress", "dropped"}:
         return False
+    merge_state = _authoritative_merge_state(task, store=store)
     if task.status == "completed":
         if merge_state == "merged":
             return True
@@ -100,7 +102,9 @@ def is_lineage_complete(task: Task) -> bool:
             return False
         # has_commits=True but merge_status is None: treat as incomplete
         return False
-    # 'unmerged' legacy status or any unexpected status
+    if task.status == "unmerged":
+        return merge_state == "merged"
+    # Any unexpected status remains incomplete.
     return False
 
 
@@ -339,11 +343,11 @@ def _is_effective_shared_branch_lineage_merged(
     return effective_head.merge_status == "merged"
 
 
-def _get_unresolved_terminal_kind(task: Task) -> str | None:
+def _get_unresolved_terminal_kind(task: Task, *, store: SqliteTaskStore | None = None) -> str | None:
     """Return unresolved terminal kind for attention queries, else None."""
     if task.status not in {"failed", "completed", "unmerged", "dropped"}:
         return None
-    if is_lineage_complete(task):
+    if is_lineage_complete(task, store=store):
         return None
     if task.status == "failed":
         return "failed"
@@ -412,7 +416,7 @@ def query_incomplete(
         if task.id is None:
             continue
 
-        unresolved_kind = _get_unresolved_terminal_kind(task)
+        unresolved_kind = _get_unresolved_terminal_kind(task, store=store)
         if unresolved_kind is None:
             continue
 
@@ -439,7 +443,7 @@ def query_incomplete(
             if root_merged:
                 continue
         else:
-            if task.merge_status == "merged":
+            if is_lineage_complete(task, store=store):
                 continue
             if _has_merged_retry_descendant(store, task, target_branch=target_branch):
                 continue

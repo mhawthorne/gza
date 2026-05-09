@@ -79,6 +79,62 @@ def test_incomplete_preset_projects_next_action_fields(tmp_path: Path) -> None:
     assert "missing config/git context" in str(row.values["next_action_reason"])
 
 
+def test_lifecycle_incomplete_prefers_merged_unit_state_over_stale_task_row(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    task = store.add("stale task-row merge status", task_type="implement")
+    store.mark_completed(task, has_commits=True, branch="feature/stale-task-row-status")
+    assert task.id is not None
+
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "merged")
+
+    task = store.get(task.id)
+    assert task is not None
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            statuses=("completed",),
+            lifecycle_state=("incomplete",),
+            limit=None,
+        )
+    )
+
+    assert result.rows == ()
+
+
+def test_lifecycle_complete_excludes_pending_review_attached_to_merged_unit(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    root = store.add("merged implement", task_type="implement")
+    store.mark_completed(root, has_commits=True, branch="feature/merged-pending-review")
+    assert root.id is not None
+
+    review = store.add("pending review", task_type="review", based_on=root.id, depends_on=root.id)
+    assert review.id is not None
+
+    unit = store.resolve_merge_unit_for_task(root.id)
+    assert unit is not None
+    attached_unit = store.get_or_create_merge_unit_for_task(review)
+    assert attached_unit is not None
+    assert attached_unit.id == unit.id
+    store.set_merge_unit_state(unit.id, "merged")
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            lifecycle_state=("complete",),
+            limit=None,
+        )
+    )
+
+    prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
+    assert "merged implement" in prompts
+    assert "pending review" not in prompts
+
+
 def test_merge_chain_unmerged_matches_legacy_unmerged_status(tmp_path: Path) -> None:
     store = _store(tmp_path)
     legacy = store.add("legacy unmerged", task_type="implement")
@@ -98,6 +154,35 @@ def test_merge_chain_unmerged_matches_legacy_unmerged_status(tmp_path: Path) -> 
 
     prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
     assert "legacy unmerged" in prompts
+
+
+def test_merge_chain_unmerged_hides_legacy_unmerged_status_when_unit_is_merged(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    task = store.add("legacy unmerged status with merged unit", task_type="implement")
+    store.mark_completed(task, has_commits=True, branch="feature/legacy-unmerged-merged-unit")
+    assert task.id is not None
+
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "merged")
+
+    task = store.get(task.id)
+    assert task is not None
+    task.status = "unmerged"
+    task.merge_status = None
+    store.update(task)
+
+    service = TaskQueryService(store)
+    query = TaskQuery(
+        statuses=("completed", "unmerged"),
+        merge_chain_state=("unmerged",),
+        lifecycle_state=("terminal",),
+        limit=None,
+    )
+    result = service.run(query)
+
+    prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
+    assert "legacy unmerged status with merged unit" not in prompts
 
 
 def test_projection_fields_override_applies_to_task_and_lineage_json(tmp_path: Path) -> None:

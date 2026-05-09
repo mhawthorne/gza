@@ -72,9 +72,67 @@ class TestIsLineageComplete:
         task = _make_task(status="unmerged", has_commits=True, merge_status=None)
         assert is_lineage_complete(task) is False
 
+    def test_store_merged_unit_overrides_legacy_unmerged_status(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("legacy unmerged status but merged unit", task_type="implement")
+        store.mark_completed(task, has_commits=True, branch="feature/legacy-unmerged-status")
+        assert task.id is not None
+
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged")
+
+        task = store.get(task.id)
+        assert task is not None
+        task.status = "unmerged"
+        task.merge_status = None
+        store.update(task)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert is_lineage_complete(refreshed, store=store) is True
+
+    def test_store_merged_unit_does_not_override_failed_status(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("failed task with merged unit", task_type="implement")
+        store.mark_completed(task, has_commits=True, branch="feature/failed-task-merged-unit")
+        task = store.get(task.id)
+        assert task is not None
+        task.status = "failed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        assert task.id is not None
+
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged")
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert is_lineage_complete(refreshed, store=store) is False
+
     def test_pending_status_is_incomplete(self):
         task = _make_task(status="pending")
         assert is_lineage_complete(task) is False
+
+    def test_store_merge_unit_state_overrides_stale_task_row(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("merged by unit", task_type="implement")
+        store.mark_completed(task, has_commits=True, branch="feature/merged-by-unit")
+        assert task.id is not None
+
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged")
+
+        task = store.get(task.id)
+        assert task is not None
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert is_lineage_complete(refreshed, store=store) is True
 
 
 class TestQueryHistory:
@@ -435,6 +493,24 @@ class TestQueryIncomplete:
         unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
         assert unresolved_ids == {root.id, improve.id}
 
+    def test_stale_unmerged_task_row_hidden_when_merge_unit_is_merged(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("implement root", task_type="implement")
+        store.mark_completed(root, has_commits=True, branch="feature/stale-merged-root")
+        assert root.id is not None
+
+        unit = store.resolve_merge_unit_for_task(root.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged")
+
+        root = store.get(root.id)
+        assert root is not None
+        root.merge_status = "unmerged"
+        store.update(root)
+
+        assert query_incomplete(store, HistoryFilter(limit=None)) == []
+
     def test_retry_chain_failed_failed_completed_keeps_only_latest_unresolved(self, tmp_path: Path):
         store = self._store(tmp_path)
 
@@ -473,6 +549,51 @@ class TestQueryIncomplete:
         assert lineages[0].root.id == root.id
         unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
         assert unresolved_ids == {root.id}
+
+    def test_legacy_unmerged_status_hidden_when_merge_unit_is_merged(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("legacy unmerged but merged unit", task_type="implement")
+        store.mark_completed(root, has_commits=True, branch="feature/legacy-status-merged-unit")
+        assert root.id is not None
+
+        unit = store.resolve_merge_unit_for_task(root.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged")
+
+        root = store.get(root.id)
+        assert root is not None
+        root.status = "unmerged"
+        root.merge_status = None
+        store.update(root)
+
+        assert query_incomplete(store, HistoryFilter(limit=None)) == []
+
+    def test_failed_review_attached_to_merged_unit_remains_visible(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("implement root", task_type="implement")
+        store.mark_completed(root, has_commits=True, branch="feature/merged-root-failed-review")
+        assert root.id is not None
+
+        review = store.add("review failed", task_type="review", based_on=root.id, depends_on=root.id)
+        review.status = "failed"
+        review.completed_at = datetime.now(UTC)
+        review.has_commits = False
+        store.update(review)
+        assert review.id is not None
+
+        unit = store.resolve_merge_unit_for_task(root.id)
+        assert unit is not None
+        attached_unit = store.get_or_create_merge_unit_for_task(review)
+        assert attached_unit is not None
+        assert attached_unit.id == unit.id
+        store.set_merge_unit_state(unit.id, "merged")
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {review.id}
 
     def test_dropped_root_task_remains_visible(self, tmp_path: Path):
         store = self._store(tmp_path)

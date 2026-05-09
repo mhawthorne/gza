@@ -928,12 +928,12 @@ class TaskQueryService:
             return True
         if "terminal" in lifecycle and task.status in {"completed", "failed", "unmerged", "dropped"}:
             return True
-        if "complete" in lifecycle and _is_lineage_complete(task):
+        if "complete" in lifecycle and _is_lineage_complete(self._store, task):
             return True
         if "incomplete" in lifecycle:
             if task.status in {"pending", "in_progress"}:
                 return True
-            if not _is_lineage_complete(task):
+            if not _is_lineage_complete(self._store, task):
                 return True
         return False
 
@@ -962,10 +962,16 @@ class TaskQueryService:
     def _matches_merge_chain_state(self, task: DbTask, merge_states: set[str]) -> bool:
         owner = self._resolve_branch_owner(task)
         owner_state = self._branch_merge_state(owner)
+        task_unit = self._store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
         if "merged" in merge_states and owner_state == "merged":
             return True
         if "unmerged" in merge_states and (
-            owner_state == "unmerged" or task.status == "unmerged"
+            owner_state == "unmerged"
+            or (
+                task.status == "unmerged"
+                and task_unit is None
+                and owner_state != "merged"
+            )
         ):
             return True
         if "needs_merge" in merge_states and owner_state == "needs_merge":
@@ -1154,10 +1160,10 @@ def _get_reviews_for_root(store: SqliteTaskStore, root_task: DbTask) -> list[DbT
     return get_reviews_for_root(store, root_task)
 
 
-def _is_lineage_complete(task: DbTask) -> bool:
+def _is_lineage_complete(store: SqliteTaskStore, task: DbTask) -> bool:
     from gza.query import is_lineage_complete
 
-    return is_lineage_complete(task)
+    return is_lineage_complete(task, store=store)
 
 
 __all__ = [
