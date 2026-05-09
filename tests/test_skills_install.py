@@ -160,6 +160,48 @@ class TestSkillsInstallClaudeTarget:
         assert "(updated)" in result2.stdout
         assert skill_file.read_text() == original_content
 
+    def test_update_flag_refreshes_gza_task_review_verify_workflow(self, tmp_path: Path):
+        """--update should refresh gza-task-review to the bundled verify-first workflow."""
+        from gza.skills_utils import get_skills_source_path
+
+        setup_config(tmp_path)
+
+        result1 = run_gza("skills-install", "--target", "claude", "gza-task-review", "--project", str(tmp_path))
+        assert result1.returncode == 0
+
+        skill_file = tmp_path / ".claude" / "skills" / "gza-task-review" / "SKILL.md"
+        skill_file.write_text(
+            "---\n"
+            "name: gza-task-review\n"
+            "description: stale\n"
+            "allowed-tools: Bash(uv run:*), Bash(git:*), Bash(gh:*)\n"
+            "version: 1.0.0\n"
+            "public: true\n"
+            "---\n\n"
+            "git log main..<impl_branch> --oneline\n"
+            "git diff main...<impl_branch>\n"
+        )
+
+        result2 = run_gza(
+            "skills-install",
+            "--target",
+            "claude",
+            "--update",
+            "gza-task-review",
+            "--project",
+            str(tmp_path),
+        )
+        assert result2.returncode == 0
+        assert "updated 1" in result2.stdout
+        assert "(updated)" in result2.stdout
+
+        refreshed = skill_file.read_text()
+        bundled = (get_skills_source_path() / "gza-task-review" / "SKILL.md").read_text()
+        assert refreshed == bundled
+        assert "Bash(git:*)" not in refreshed
+        assert "Run `verify_command` from `gza.yaml` as part of every review cycle." in refreshed
+        assert "Pass the result forward as a `## verify_command result` section." in refreshed
+
     def test_overwrite_with_force_flag(self, tmp_path: Path):
         """Existing skills are overwritten with --force flag."""
         setup_config(tmp_path)
