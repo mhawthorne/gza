@@ -9849,6 +9849,71 @@ class TestRunnerStoreMetadata:
 class TestProviderPromptSanitization:
     """Runner should sanitize provider-facing review/improve prompts only."""
 
+    def test_fresh_review_prompt_includes_failed_verify_result_from_runner(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        impl.status = "completed"
+        impl.slug = "20260212-implement-feature-x"
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        task = store.add(prompt="Review feature X", task_type="review", depends_on=impl.id)
+        task.slug = "20260213-review-feature-x"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        config.model = None
+        config.max_steps = 10
+        config.timeout_minutes = 10
+        config.verify_command = "printf 'lint failed\\n' && exit 7"
+
+        captured_prompts: list[str] = []
+
+        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_prompts.append(prompt)
+            report_dir = work_dir / ".gza" / "reviews"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=0)
+        git.get_diff_numstat.return_value = ""
+        git.get_diff.return_value = ""
+        git.get_diff_stat.return_value = ""
+
+        with patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        assert exit_code == 0
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]
+        assert "## verify_command result" in prompt
+        assert "- Status: failed" in prompt
+        assert "- Exit status: 7" in prompt
+        assert "lint failed" in prompt
+        assert "## Original request:" in prompt
+
     def test_review_prompt_sent_to_provider_is_sanitized(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl = store.add(prompt="Implement feature X", task_type="implement")
@@ -9968,6 +10033,83 @@ class TestProviderPromptSanitization:
         assert len(captured_prompts) == 1
         assert "paused" in captured_prompts[0].lower()
         assert "interrupted" not in captured_prompts[0].lower()
+
+    @pytest.mark.parametrize(
+        ("task_type", "resume"),
+        [
+            ("explore", False),
+            ("review", True),
+        ],
+    )
+    def test_review_verify_hook_only_runs_for_fresh_reviews(self, tmp_path: Path, task_type: str, resume: bool):
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        depends_on = None
+        if task_type == "review":
+            impl = store.add(prompt="Implement feature X", task_type="implement")
+            impl.status = "completed"
+            impl.slug = "20260212-implement-feature-x"
+            impl.branch = "gza/20260212-implement-feature-x"
+            store.update(impl)
+            depends_on = impl.id
+
+        task = store.add(prompt=f"{task_type.title()} feature X", task_type=task_type, depends_on=depends_on)
+        task.slug = f"20260213-{task_type}-feature-x"
+        if resume:
+            task.session_id = f"resume-{task_type}-session"
+            store.mark_failed(task, log_file=f"logs/{task_type}.log", stats=None)
+        else:
+            store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        config.verify_command = "printf 'should not run\\n' && exit 9"
+
+        captured_prompts: list[str] = []
+
+        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_prompts.append(prompt)
+            report_subdir = "reviews" if task_type == "review" else "explorations"
+            report_dir = work_dir / ".gza" / report_subdir
+            report_dir.mkdir(parents=True, exist_ok=True)
+            title = "Review" if task_type == "review" else "Exploration"
+            verdict = "\n\nVerdict: APPROVED" if task_type == "review" else "\n\nFindings here."
+            (report_dir / f"{task.slug}.md").write_text(f"# {title}{verdict}")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=0)
+        git.get_diff_numstat.return_value = ""
+        git.get_diff.return_value = ""
+        git.get_diff_stat.return_value = ""
+
+        with patch("gza.runner._run_review_verify_command") as mock_review_verify, \
+             patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(task, config, store, provider, git, resume=resume)
+
+        assert exit_code == 0
+        mock_review_verify.assert_not_called()
+        assert len(captured_prompts) == 1
+        assert "## verify_command result" not in captured_prompts[0]
 
     def test_improve_resume_prompt_sent_to_provider_is_sanitized(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
