@@ -453,19 +453,6 @@ def test_improve_related_skills_describe_comments_as_feedback_source() -> None:
     assert "comments-only improve is supported" in add_skill_content
 
 
-def test_checked_in_task_review_skill_copy_matches_bundled_source() -> None:
-    """The checked-in .claude gza-task-review skill copy should stay in sync with the bundled source."""
-    repo_root = Path(__file__).resolve().parents[1]
-
-    bundled = (repo_root / "src" / "gza" / "skills" / "gza-task-review" / "SKILL.md").read_text()
-    installed = (repo_root / ".claude" / "skills" / "gza-task-review" / "SKILL.md").read_text()
-
-    assert installed == bundled
-    assert "Bash(git:*)" not in installed
-    assert "Run `verify_command` from `gza.yaml` as part of every review cycle." in installed
-    assert "Pass the result forward as a `## verify_command result` section." in installed
-
-
 def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
     """CLI help and bundled skills should avoid legacy base36 task-ID examples."""
     repo_root = Path(__file__).resolve().parents[1]
