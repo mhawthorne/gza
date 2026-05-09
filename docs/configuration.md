@@ -1088,6 +1088,8 @@ gza incomplete [options]
 
 Use `gza incomplete` for unresolved lineage triage. Use the more specific command surfaces when you want one domain only:
 
+Default text output stays to one wrapped line per lineage: the owner prompt is reduced to its first non-empty line and truncated, and `| unresolved: ...` appears only when multiple unresolved tasks remain for the same owner, summarized as task IDs plus failure/completion status.
+
 | Need | Command |
 |--------|-------------|
 | Unmerged code work | `uv run gza unmerged` |

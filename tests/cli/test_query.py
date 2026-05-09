@@ -14,6 +14,7 @@ import pytest
 from rich.console import Console
 
 from gza.cli import query as query_cli
+from gza.console import truncate
 from gza.git import GitError
 from gza.pr_ops import LookupTaskPrResult
 from gza.sync_ops import BranchSyncResult
@@ -11105,3 +11106,35 @@ class TestIncompleteCommand:
         assert "unknown field for gza incomplete: nope" in result.stderr
         assert "valid fields:" in result.stderr
         assert "id" in result.stderr
+
+    def test_incomplete_cli_default_one_line_is_compact_per_lineage(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Root context prompt that should stay hidden", task_type="plan")
+        root.status = "completed"
+        root.completed_at = datetime.now(UTC)
+        store.update(root)
+
+        first_line = "Follow-up first line " + ("x" * 120)
+        failed = store.add(
+            f"\n\n{first_line}\nFull prompt body that should not render",
+            task_type="implement",
+            based_on=root.id,
+        )
+        failed.status = "failed"
+        failed.completed_at = datetime.now(UTC)
+        failed.failure_reason = "PREREQUISITE_UNMERGED"
+        store.update(failed)
+
+        result = run_gza("incomplete", "-n", "0", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        assert len(lines) == 1
+        assert truncate(first_line, 100) in lines[0]
+        assert "Full prompt body that should not render" not in lines[0]
+        assert root.prompt not in lines[0]
+        assert "| context:" not in lines[0]
+        assert "| unresolved:" not in lines[0]
+        assert result.stderr == ""
