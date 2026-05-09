@@ -10,6 +10,7 @@ import pytest
 from gza.cli._common import resolve_improve_action
 from gza.cli.advance_executor import (
     AdvanceActionExecutionContext,
+    AdvanceActionExecutionResult,
     build_improve_needs_attention_result,
     execute_advance_action,
     resolve_execution_needs_attention,
@@ -453,6 +454,97 @@ def test_create_review_skip_propagates_message_without_spawning(tmp_path: Path) 
 
     assert result.status == "skip"
     assert result.message == "SKIP: review already pending"
+
+
+def test_create_review_can_route_through_iterate_before_creating_child(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/create-review-iterate")
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    spawned: list[tuple[str, str]] = []
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_create_review=lambda _task: pytest.fail("plain review creation should not run"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task_id, _kind: pytest.fail("plain worker should not run"),
+        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda task_obj, kind: spawned.append((str(task_obj.id), kind)) or 0,
+        prefer_iterate_for_action=lambda task, _action: task,
+    )
+
+    result = execute_advance_action(task=impl, action={"type": "create_review"}, context=context)
+
+    assert result.status == "success"
+    assert result.handled_task_id == impl.id
+    assert result.worker_label == "iterate"
+    assert spawned == [(impl.id, "iterate")]
+
+
+def test_run_improve_can_return_fail_closed_iterate_skip_result(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/run-improve-iterate-skip")
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    improve = store.add(
+        "Improve feature",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+
+    expected = AdvanceActionExecutionResult(
+        action_type="run_improve",
+        status="skip",
+        message=f"{impl.id}: iterate already running for implementation chain",
+        worker_label="iterate",
+        guarded_pending_task_id=improve.id,
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task_id, _kind: pytest.fail("plain worker should not run"),
+        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("iterate spawn should not run"),
+        prefer_iterate_for_action=lambda _task, _action: expected,
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={"type": "run_improve", "improve_task": improve},
+        context=context,
+    )
+
+    assert result == expected
 
 
 @pytest.mark.parametrize(

@@ -23,6 +23,7 @@ from gza.cli.watch import (
     _format_wake_message,
     _run_cycle,
     _task_snapshot,
+    _watch_iterate_impl_target,
     _WatchLog,
     cmd_watch,
 )
@@ -1575,10 +1576,6 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
         store.set_merge_status(root.id, "unmerged")
 
     review_task = None
-    if action_type == "create_review":
-        review_task = store.add("Pending review", task_type="review", depends_on=root.id)
-        assert review_task.id is not None
-
     if action_type == "improve":
         review_task = store.add("Completed review", task_type="review", depends_on=root.id)
         assert review_task.id is not None
@@ -1630,30 +1627,34 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
         )
 
     assert result.work_done is False
-    if action_type == "create_implement":
+    if action_type in {"create_review", "improve", "create_implement"}:
         assert spawn_iterate.call_count == 1
-        assert spawn_worker.call_count == 0
-        created_children = [
-            task for task in store.get_all() if task.task_type == "implement" and task.depends_on == root.id
-        ]
-        assert len(created_children) == 1
-        child_id = str(created_children[0].id)
+        if action_type == "create_implement":
+            assert spawn_worker.call_count == 0
+            created_children = [
+                task for task in store.get_all() if task.task_type == "implement" and task.depends_on == root.id
+            ]
+            assert len(created_children) == 1
+            child_id = str(created_children[0].id)
+        else:
+            assert spawn_worker.call_count == 0
+            child_id = str(root.id)
+            if action_type == "create_review":
+                assert create_review.call_count == 0
+            else:
+                improved_children = [
+                    task for task in store.get_all() if task.task_type == "improve" and task.depends_on == review_task.id
+                ]
+                assert improved_children == []
     else:
         assert spawn_worker.call_count == 1
-        if action_type == "create_review":
-            assert create_review.call_count == 1
-            assert review_task is not None
-            child_id = str(review_task.id)
-        elif action_type == "needs_rebase":
+        if action_type == "needs_rebase":
             assert create_rebase.call_count == 1
             assert rebase_task is not None
             child_id = str(rebase_task.id)
         else:
-            improved_children = [
-                task for task in store.get_based_on_children(root.id) if task.task_type == "improve"
-            ]
-            assert len(improved_children) == 1
-            child_id = str(improved_children[0].id)
+            assert review_task is not None
+            child_id = str(review_task.id)
 
     log_lines = log_path.read_text().splitlines()
     assert any("START_FAILED" in line and child_id in line for line in log_lines)
@@ -3283,7 +3284,7 @@ def test_watch_cycle_starts_pending_review_with_plain_worker(tmp_path: Path) -> 
 
 
 def test_watch_cycle_advances_create_review_action(tmp_path: Path) -> None:
-    """Completed unmerged implement with no review should queue and run review."""
+    """Completed unmerged implement with no review should launch iterate on the impl."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -3294,9 +3295,6 @@ def test_watch_cycle_advances_create_review_action(tmp_path: Path) -> None:
     impl.branch = "feature/create-review"
     store.update(impl)
     store.set_merge_status(impl.id, "unmerged")
-
-    review = MagicMock()
-    review.id = "test-review-id"
 
     config = Config.load(tmp_path)
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
@@ -3309,15 +3307,9 @@ def test_watch_cycle_advances_create_review_action(tmp_path: Path) -> None:
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch(
-            "gza.cli.watch._prepare_create_review_action",
-            return_value=SimpleNamespace(
-                status="created",
-                review_task=review,
-                message=f"✓ Created review task {review.id}",
-            ),
-        ) as create_review,
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -3329,15 +3321,14 @@ def test_watch_cycle_advances_create_review_action(tmp_path: Path) -> None:
         )
 
     assert result.work_done is True
-    assert create_review.call_count == 1
-    assert spawn_worker.call_count == 1
-    assert spawn_worker.call_args.kwargs["task_id"] == review.id
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
 
 
 def test_watch_cycle_creates_exactly_one_closing_review_after_completed_improve_without_review_clear(
     tmp_path: Path,
 ) -> None:
-    """Watch should queue the shared closing review from lineage state alone."""
+    """Watch should route the shared closing review action through iterate on the impl."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -3374,21 +3365,13 @@ def test_watch_cycle_creates_exactly_one_closing_review_after_completed_improve_
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
     git.can_merge.return_value = True
-    closing_review = SimpleNamespace(id="testproject-closing-review")
-
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch(
-            "gza.cli.watch._prepare_create_review_action",
-            return_value=SimpleNamespace(
-                status="created",
-                review_task=closing_review,
-                message=f"✓ Created review task {closing_review.id}",
-            ),
-        ) as create_review,
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -3400,9 +3383,8 @@ def test_watch_cycle_creates_exactly_one_closing_review_after_completed_improve_
         )
 
     assert result.work_done is True
-    assert create_review.call_count == 1
-    assert spawn_worker.call_count == 1
-    assert spawn_worker.call_args.kwargs["task_id"] == closing_review.id
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
 
 
 def test_watch_cycle_creates_implement_from_completed_plan_with_iterate_mode(tmp_path: Path) -> None:
@@ -3501,7 +3483,7 @@ def test_watch_cycle_does_not_double_start_pending_child_started_in_advance_step
 
 
 def test_watch_cycle_advances_run_improve_action(tmp_path: Path) -> None:
-    """Completed task with pending improve child should run improve worker."""
+    """Completed task with pending improve child should launch iterate on the impl."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -3539,8 +3521,10 @@ def test_watch_cycle_advances_run_improve_action(tmp_path: Path) -> None:
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "run_improve", "improve_task": improve}),
         patch("gza.cli.git_ops.get_review_verdict", return_value="CHANGES_REQUESTED"),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -3552,12 +3536,12 @@ def test_watch_cycle_advances_run_improve_action(tmp_path: Path) -> None:
         )
 
     assert result.work_done is True
-    assert spawn_worker.call_count == 1
-    assert spawn_worker.call_args.kwargs["task_id"] == improve.id
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
 
 
-def test_watch_cycle_max_resume_attempts_zero_logs_sticky_attention(tmp_path: Path) -> None:
-    """Disabled automatic improve recovery should repeat as ATTENTION in watch."""
+def test_watch_cycle_improve_action_with_disabled_auto_recovery_routes_to_iterate(tmp_path: Path) -> None:
+    """Watch should hand failed-improve recovery state to iterate instead of stopping locally."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -3602,8 +3586,9 @@ def test_watch_cycle_max_resume_attempts_zero_logs_sticky_attention(tmp_path: Pa
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
-        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -3614,32 +3599,15 @@ def test_watch_cycle_max_resume_attempts_zero_logs_sticky_attention(tmp_path: Pa
             log=log,
             max_recovery_attempts=0,
         )
-        _run_cycle(
-            config=config,
-            store=store,
-            batch=1,
-            max_iterations=10,
-            dry_run=False,
-            log=log,
-            max_recovery_attempts=0,
-        )
-
-    assert result.work_done is False
-    assert spawn_worker.call_count == 0
-    assert spawn_resume_worker.call_count == 0
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
     log_text = log_path.read_text()
-    assert log_text.count("ATTENTION") == 2
-    assert "SKIP      " not in log_text
-    assert "automatic improve recovery is disabled (max_resume_attempts=0)" in log_text
-    assert (
-        f'{failed_improve.id} improve "Improve feature" reason=automatic-recovery-disabled '
-        f"automatic improve recovery is disabled (max_resume_attempts=0) for "
-        f"{impl.id} + {review.id}; latest failed improve: {failed_improve.id}. "
-        f"Run uv run gza fix {impl.id}"
-    ) in log_text
+    assert "ATTENTION" not in log_text
+    assert f"{impl.id} iterate" in log_text
 
 
-def test_watch_cycle_failed_improve_non_attention_skip_stays_out_of_attention_log(
+def test_watch_cycle_failed_improve_dry_run_routes_through_iterate(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -3703,8 +3671,8 @@ def test_watch_cycle_failed_improve_non_attention_skip_stays_out_of_attention_lo
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
-        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
     ):
         _ = _run_cycle(
             config=config,
@@ -3715,15 +3683,13 @@ def test_watch_cycle_failed_improve_non_attention_skip_stays_out_of_attention_lo
             log=log,
             max_recovery_attempts=1,
         )
-    assert spawn_worker.call_count == 0
-    assert spawn_resume_worker.call_count == 0
     log_text = log_path.read_text()
     assert "ATTENTION" not in log_text
-    assert "START     (resume) improve" in log_text
+    assert f"START     {impl.id} iterate [dry-run]" in log_text
 
 
-def test_watch_cycle_improve_creation_includes_unresolved_comments_in_prompt(tmp_path: Path) -> None:
-    """Watch-created improve prompts should include unresolved comments when present."""
+def test_watch_cycle_improve_action_routes_to_iterate_without_creating_local_child(tmp_path: Path) -> None:
+    """Watch should leave improve creation details to iterate."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -3743,7 +3709,8 @@ def test_watch_cycle_improve_creation_includes_unresolved_comments_in_prompt(tmp
     store.update(review)
 
     config = Config.load(tmp_path)
-    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
@@ -3753,7 +3720,8 @@ def test_watch_cycle_improve_creation_includes_unresolved_comments_in_prompt(tmp
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -3765,13 +3733,15 @@ def test_watch_cycle_improve_creation_includes_unresolved_comments_in_prompt(tmp
         )
 
     assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
     improves = store.get_improve_tasks_for(impl.id, review.id)
-    assert len(improves) == 1
-    assert "unresolved comments" in improves[0].prompt
+    assert improves == []
+    assert f"{impl.id} iterate" in log_path.read_text()
 
 
-def test_watch_cycle_improve_action_resumes_failed_improve_chain(tmp_path: Path) -> None:
-    """Improve advance action should resume a resumable failed improve instead of creating a new sibling."""
+def test_watch_cycle_improve_action_routes_failed_chain_to_iterate(tmp_path: Path) -> None:
+    """Watch should route failed improve chains to iterate instead of resuming them directly."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -3804,7 +3774,8 @@ def test_watch_cycle_improve_action_resumes_failed_improve_chain(tmp_path: Path)
     store.update(failed_improve)
 
     config = Config.load(tmp_path)
-    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
@@ -3814,8 +3785,9 @@ def test_watch_cycle_improve_action_resumes_failed_improve_chain(tmp_path: Path)
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
-        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -3827,19 +3799,15 @@ def test_watch_cycle_improve_action_resumes_failed_improve_chain(tmp_path: Path)
         )
 
     improves = [t for t in store.get_all() if t.task_type == "improve"]
-    resumed = [t for t in improves if t.id != failed_improve.id]
-    assert len(resumed) == 1
-    assert resumed[0].based_on == failed_improve.id
+    assert [t.id for t in improves] == [failed_improve.id]
     assert result.work_done is True
-    assert spawn_resume_worker.call_count == 1
-    assert spawn_worker.call_count == 0
-
-    direct_siblings = [t for t in improves if t.based_on == impl.id]
-    assert len(direct_siblings) == 1
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
+    assert f"{impl.id} iterate" in log_path.read_text()
 
 
-def test_watch_cycle_improve_action_stops_manual_review_failures(tmp_path: Path) -> None:
-    """Improve advance action should stop cleanly when the latest failed improve requires manual review."""
+def test_watch_cycle_improve_action_with_manual_review_failure_routes_to_iterate(tmp_path: Path) -> None:
+    """Watch should not surface failed-improve manual-review stops before iterate runs."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -3871,7 +3839,8 @@ def test_watch_cycle_improve_action_stops_manual_review_failures(tmp_path: Path)
     store.update(failed_improve)
 
     config = Config.load(tmp_path)
-    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
@@ -3881,8 +3850,9 @@ def test_watch_cycle_improve_action_stops_manual_review_failures(tmp_path: Path)
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
-        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -3895,20 +3865,15 @@ def test_watch_cycle_improve_action_stops_manual_review_failures(tmp_path: Path)
 
     improves = [t for t in store.get_all() if t.task_type == "improve"]
     assert [t.id for t in improves] == [failed_improve.id]
-    assert result.work_done is False
-    assert spawn_worker.call_count == 0
-    assert spawn_resume_worker.call_count == 0
-    log_text = log.path.read_text()
-    assert "requires manual review" in log_text
-    assert (
-        f'{failed_improve.id} improve "Improve attempt" reason=manual-failure-reason '
-        f"latest failed improve {failed_improve.id} requires manual review "
-        "(TEST_FAILURE requires manual intervention)"
-    ) in log_text
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    log_text = log_path.read_text()
+    assert "ATTENTION" not in log_text
+    assert f"{impl.id} iterate" in log_text
 
 
-def test_watch_cycle_improve_action_repeats_attention_for_attempt_cap_manual_stop(tmp_path: Path) -> None:
-    """Attempt-cap improve stops should repeat as ATTENTION while the failed chain remains unrecoverable."""
+def test_watch_cycle_attempt_capped_improve_chain_routes_to_iterate(tmp_path: Path) -> None:
+    """Watch should hand attempt-capped improve chains to iterate instead of stopping locally."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -3955,8 +3920,9 @@ def test_watch_cycle_improve_action_repeats_attention_for_attempt_cap_manual_sto
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
-        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume_worker,
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -3966,23 +3932,13 @@ def test_watch_cycle_improve_action_repeats_attention_for_attempt_cap_manual_sto
             dry_run=False,
             log=log,
         )
-        _run_cycle(
-            config=config,
-            store=store,
-            batch=1,
-            max_iterations=10,
-            dry_run=False,
-            log=log,
-        )
 
-    assert result.work_done is False
+    assert result.work_done is True
     assert _task_count(store) == before_count
-    assert spawn_worker.call_count == 0
-    assert spawn_resume_worker.call_count == 0
+    assert spawn_iterate.call_count == 1
     text = log_path.read_text()
-    assert text.count("ATTENTION") == 2
-    assert "SKIP      " not in text
-    assert "requires manual review" in text
+    assert "ATTENTION" not in text
+    assert f"{impl.id} iterate" in text
 
 
 def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
@@ -4151,7 +4107,10 @@ def test_watch_cycle_dry_run_does_not_create_tasks_for_task_creating_advance_act
     if action_type == "needs_rebase":
         assert create_rebase.call_count == 0
     log_lines = log_path.read_text().splitlines()
-    assert any("[dry-run]" in line and expected_fragment in line for line in log_lines)
+    if action_type in {"create_review", "improve"}:
+        assert any(f"{root.id} iterate [dry-run]" in line for line in log_lines)
+    else:
+        assert any("[dry-run]" in line and expected_fragment in line for line in log_lines)
     if action_type == "create_implement":
         assert any(f"(new) implement for {root.id} [dry-run]" in line for line in log_lines)
 
@@ -4473,7 +4432,7 @@ def test_watch_cycle_clears_attention_reminder_when_next_action_changes(tmp_path
 
 
 def test_watch_cycle_off_default_branch_still_runs_non_merge_advance_actions(tmp_path: Path, capsys) -> None:
-    """Off default branch should only block merge actions, not worker-spawning actions."""
+    """Off default branch should only block merge actions, not iterate launches."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -4484,9 +4443,6 @@ def test_watch_cycle_off_default_branch_still_runs_non_merge_advance_actions(tmp
     impl.branch = "feature/off-default-review"
     store.update(impl)
     store.set_merge_status(impl.id, "unmerged")
-
-    review = MagicMock()
-    review.id = "test-review-id"
 
     config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
@@ -4500,15 +4456,9 @@ def test_watch_cycle_off_default_branch_still_runs_non_merge_advance_actions(tmp
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
-        patch(
-            "gza.cli.watch._prepare_create_review_action",
-            return_value=SimpleNamespace(
-                status="created",
-                review_task=review,
-                message=f"✓ Created review task {review.id}",
-            ),
-        ) as create_review,
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -4521,15 +4471,60 @@ def test_watch_cycle_off_default_branch_still_runs_non_merge_advance_actions(tmp
 
     output = capsys.readouterr().out
     assert result.work_done is True
-    assert create_review.call_count == 1
-    assert spawn_worker.call_count == 1
-    assert spawn_worker.call_args.kwargs["task_id"] == review.id
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
     assert "must be run from the default branch" not in output
     assert "merge actions skipped: not on default branch" not in log_path.read_text()
 
 
+def test_watch_cycle_create_review_routes_impl_chain_through_iterate(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/create-review-iterate"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and f"{impl.id} iterate" in line
+        for line in log_path.read_text().splitlines()
+    )
+
+
 def test_watch_review_spawn_logs_start_and_review_transition_logs_verdict(tmp_path: Path) -> None:
-    """Review workers should log START; REVIEW is only for completed verdict transitions."""
+    """Standalone review fallback should log START; REVIEW is only for completed verdict transitions."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -4541,7 +4536,7 @@ def test_watch_review_spawn_logs_start_and_review_transition_logs_verdict(tmp_pa
     store.update(impl)
     store.set_merge_status(impl.id, "unmerged")
 
-    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    review = store.add("Review feature", task_type="review")
     assert review.id is not None
 
     config = Config.load(tmp_path)
@@ -4586,7 +4581,108 @@ def test_watch_review_spawn_logs_start_and_review_transition_logs_verdict(tmp_pa
 
     review_lines = [line for line in log_path.read_text().splitlines() if " REVIEW " in line]
     assert len(review_lines) == 1
-    assert f"{review.id} for {impl.id}: APPROVED" in review_lines[0]
+
+
+def test_watch_cycle_run_review_routes_impl_chain_through_iterate(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/run-review-iterate"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Pending review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "run_review", "review_task": review}),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and f"{impl.id} iterate" in line
+        for line in log_path.read_text().splitlines()
+    )
+
+
+def test_watch_cycle_improve_routes_impl_chain_through_iterate_without_creating_child(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/improve-iterate"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    before_count = _task_count(store)
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert _task_count(store) == before_count
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and f"{impl.id} iterate" in line
+        for line in log_path.read_text().splitlines()
+    )
 
 
 def test_watch_cycle_dedupes_merge_not_default_skip_across_cycles(tmp_path: Path) -> None:
@@ -6763,7 +6859,7 @@ def test_cmd_watch_interrupts_sleep_promptly_on_signal(tmp_path: Path) -> None:
 
 
 def test_watch_cycle_logs_create_review_validation_skip(tmp_path: Path) -> None:
-    """watch should log create_review validation failures instead of silently continuing."""
+    """Watch should bypass local create_review validation and route through iterate."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -6787,7 +6883,8 @@ def test_watch_cycle_logs_create_review_validation_skip(tmp_path: Path) -> None:
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
-        patch("gza.cli.git_ops._create_review_task", side_effect=ValueError("review blocked by validation")),
+        patch("gza.cli.git_ops._create_review_task", side_effect=AssertionError("local review creation should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         _run_cycle(
             config=config,
@@ -6799,12 +6896,12 @@ def test_watch_cycle_logs_create_review_validation_skip(tmp_path: Path) -> None:
         )
 
     text = log_path.read_text()
-    assert "SKIP" in text
-    assert "review blocked by validation" in text
+    assert spawn_iterate.call_count == 1
+    assert f"{impl.id} iterate" in text
 
 
 def test_watch_cycle_run_review_spawn_failure_not_retried_in_step3(tmp_path: Path) -> None:
-    """A run_review spawn failure must not let the same task be relaunched from step 3."""
+    """A routed run_review iterate spawn failure must not let the pending review relaunch from step 3."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -6833,8 +6930,9 @@ def test_watch_cycle_run_review_spawn_failure_not_retried_in_step3(tmp_path: Pat
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value=action),
-        # First call fails (run_review in step 1), second would be step 3
-        patch("gza.cli.watch._spawn_background_worker", side_effect=[1, 0]) as spawn_worker,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        # First call fails (iterate in step 1), second would be a bad step-3 plain pickup
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=[1, 0]) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -6846,17 +6944,17 @@ def test_watch_cycle_run_review_spawn_failure_not_retried_in_step3(tmp_path: Pat
         )
 
     # Spawn should only be attempted once (step 1), not retried in step 3
-    assert spawn_worker.call_count == 1
+    assert spawn_iterate.call_count == 1
     assert result.work_done is False
 
     log_lines = log_path.read_text().splitlines()
-    review_id = str(review.id)
-    assert any("START_FAILED" in line and review_id in line for line in log_lines)
-    assert not any(line.split(maxsplit=2)[1] == "START" and f"{review_id}" in line for line in log_lines)
+    impl_id = str(impl.id)
+    assert any("START_FAILED" in line and impl_id in line for line in log_lines)
+    assert not any(line.split(maxsplit=2)[1] == "START" and f"{review.id} review" in line for line in log_lines)
 
 
 def test_watch_cycle_run_improve_spawn_failure_not_retried_in_step3(tmp_path: Path) -> None:
-    """A run_improve spawn failure must not let the same task be relaunched from step 3."""
+    """A routed run_improve iterate spawn failure must not let the pending improve relaunch from step 3."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -6899,8 +6997,9 @@ def test_watch_cycle_run_improve_spawn_failure_not_retried_in_step3(tmp_path: Pa
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value=action),
         patch("gza.cli.git_ops.get_review_verdict", return_value="CHANGES_REQUESTED"),
-        # First call fails (run_improve in step 1), second would be step 3
-        patch("gza.cli.watch._spawn_background_worker", side_effect=[1, 0]) as spawn_worker,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        # First call fails (iterate in step 1), second would be a bad step-3 plain pickup
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=[1, 0]) as spawn_iterate,
     ):
         result = _run_cycle(
             config=config,
@@ -6912,10 +7011,126 @@ def test_watch_cycle_run_improve_spawn_failure_not_retried_in_step3(tmp_path: Pa
         )
 
     # Spawn should only be attempted once (step 1), not retried in step 3
-    assert spawn_worker.call_count == 1
+    assert spawn_iterate.call_count == 1
     assert result.work_done is False
 
     log_lines = log_path.read_text().splitlines()
-    improve_id = str(improve.id)
-    assert any("START_FAILED" in line and improve_id in line for line in log_lines)
-    assert not any(line.split(maxsplit=2)[1] == "START" and f"{improve_id}" in line for line in log_lines)
+    impl_id = str(impl.id)
+    assert any("START_FAILED" in line and impl_id in line for line in log_lines)
+    assert not any(line.split(maxsplit=2)[1] == "START" and f"{improve.id} improve" in line for line in log_lines)
+
+
+def test_watch_cycle_run_improve_routes_retry_chain_through_root_impl_iterate(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/run-improve-iterate"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "MAX_TURNS"
+    failed_improve.session_id = "sess-improve"
+    failed_improve.completed_at = datetime.now(UTC)
+    store.update(failed_improve)
+
+    retry_improve = store.add(
+        "Pending retry improve",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=failed_improve.id,
+        same_branch=True,
+    )
+    assert retry_improve.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+    git.can_merge.return_value = True
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "run_improve", "improve_task": retry_improve}),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and f"{impl.id} iterate" in line
+        for line in log_path.read_text().splitlines()
+    )
+
+
+def test_watch_iterate_helper_skips_duplicate_impl_worker_for_pending_child(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/duplicate-iterate"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    improve = store.add(
+        "Pending improve",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+
+    result = _watch_iterate_impl_target(
+        store=store,
+        task=impl,
+        action={"type": "run_improve", "improve_task": improve},
+        running_task_ids={impl.id},
+    )
+
+    assert result is not None
+    assert result.status == "skip"
+    assert result.message == f"{impl.id}: iterate already running for implementation chain"
+    assert result.worker_label == "iterate"
+    assert result.guarded_pending_task_id == improve.id

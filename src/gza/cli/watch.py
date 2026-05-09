@@ -10,8 +10,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeVar
+from typing import Literal, TypeVar
 
+from .. import lineage
 from ..config import Config
 from ..console import prompt_available_width, shorten_prompt
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
@@ -56,6 +57,7 @@ from .advance_engine import (
 )
 from .advance_executor import (
     AdvanceActionExecutionContext,
+    AdvanceActionExecutionResult,
     execute_advance_action,
     resolve_execution_needs_attention,
 )
@@ -73,6 +75,7 @@ from .git_ops import (
 
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
+_WATCH_ITERATE_ROUTED_ACTIONS = frozenset({"create_review", "run_review", "improve", "run_improve"})
 T = TypeVar("T")
 
 
@@ -116,6 +119,140 @@ def _failed_recovery_attention_action(
         decision,
         max_recovery_attempts=max_recovery_attempts,
     )
+
+
+def _watch_iterate_result(
+    *,
+    action_type: str,
+    status: Literal["skip", "error"],
+    message: str,
+    guarded_pending_task_id: str | None = None,
+) -> AdvanceActionExecutionResult:
+    return AdvanceActionExecutionResult(
+        action_type=action_type,
+        status=status,
+        message=message,
+        guarded_pending_task_id=guarded_pending_task_id,
+        worker_label="iterate",
+    )
+
+
+def _watch_iterate_impl_target(
+    *,
+    store: SqliteTaskStore,
+    task: DbTask,
+    action: dict[str, object],
+    running_task_ids: set[str],
+) -> DbTask | AdvanceActionExecutionResult | None:
+    action_type = str(action.get("type", "skip"))
+    if action_type not in _WATCH_ITERATE_ROUTED_ACTIONS:
+        return None
+
+    guarded_pending_task_id: str | None = None
+    impl_task: DbTask | None = None
+
+    if action_type in {"create_review", "improve"}:
+        if task.task_type != "implement" or task.id is None:
+            return None
+        impl_task = task
+    elif action_type == "run_review":
+        review_task = action.get("review_task")
+        if not isinstance(review_task, DbTask) or review_task.id is None:
+            return _watch_iterate_result(
+                action_type=action_type,
+                status="skip",
+                message="missing review task",
+            )
+        guarded_pending_task_id = review_task.id
+        if review_task.depends_on is None:
+            return None
+        impl_task = store.get(review_task.depends_on)
+        if impl_task is None or impl_task.id is None:
+            return _watch_iterate_result(
+                action_type=action_type,
+                status="error",
+                message=f"review task {review_task.id} points to missing implementation {review_task.depends_on}",
+                guarded_pending_task_id=guarded_pending_task_id,
+            )
+        if impl_task.task_type != "implement":
+            return _watch_iterate_result(
+                action_type=action_type,
+                status="skip",
+                message=(
+                    f"review task {review_task.id} points to non-implementation task "
+                    f"{review_task.depends_on}"
+                ),
+                guarded_pending_task_id=guarded_pending_task_id,
+            )
+        if task.id is not None and impl_task.id != task.id:
+            return _watch_iterate_result(
+                action_type=action_type,
+                status="skip",
+                message=(
+                    f"review task {review_task.id} resolves to {impl_task.id}, "
+                    f"not completed task {task.id}"
+                ),
+                guarded_pending_task_id=guarded_pending_task_id,
+            )
+    else:
+        improve_task = action.get("improve_task")
+        if not isinstance(improve_task, DbTask) or improve_task.id is None:
+            return _watch_iterate_result(
+                action_type=action_type,
+                status="skip",
+                message="missing improve task",
+            )
+        guarded_pending_task_id = improve_task.id
+        impl_task, resolve_error = lineage.resolve_impl_task(store, improve_task.id)
+        if impl_task is None:
+            if "has no based_on implementation task" in str(resolve_error):
+                return None
+            return _watch_iterate_result(
+                action_type=action_type,
+                status="skip",
+                message=resolve_error or f"unable to resolve implementation for {improve_task.id}",
+                guarded_pending_task_id=guarded_pending_task_id,
+            )
+        if task.id is not None and impl_task.id != task.id:
+            return _watch_iterate_result(
+                action_type=action_type,
+                status="skip",
+                message=(
+                    f"improve task {improve_task.id} resolves to {impl_task.id}, "
+                    f"not completed task {task.id}"
+                ),
+                guarded_pending_task_id=guarded_pending_task_id,
+            )
+
+    if impl_task is None or impl_task.id is None:
+        return None
+    if impl_task.task_type != "implement":
+        return None
+    if impl_task.status not in {"completed", "pending"}:
+        return _watch_iterate_result(
+            action_type=action_type,
+            status="skip",
+            message=(
+                f"{impl_task.id}: iterate routing requires implementation status "
+                f"completed or pending (found {impl_task.status})"
+            ),
+            guarded_pending_task_id=guarded_pending_task_id,
+        )
+    if impl_task.merge_status == "merged":
+        return _watch_iterate_result(
+            action_type=action_type,
+            status="skip",
+            message=f"{impl_task.id}: implementation chain already merged; not starting iterate",
+            guarded_pending_task_id=guarded_pending_task_id,
+        )
+    if impl_task.id in running_task_ids:
+        return _watch_iterate_result(
+            action_type=action_type,
+            status="skip",
+            message=f"{impl_task.id}: iterate already running for implementation chain",
+            guarded_pending_task_id=guarded_pending_task_id,
+        )
+    return impl_task
 
 
 @dataclass(frozen=True)
@@ -645,6 +782,7 @@ def _run_cycle(
         prune_terminal_dead_workers(config)
 
     live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
+    running_task_id_set = set(running_task_ids)
     pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
     running = len(live_pids)
     slots = max(0, batch - running)
@@ -811,6 +949,12 @@ def _run_cycle(
             spawn_worker=_watch_spawn_worker,
             spawn_resume_worker=_watch_spawn_resume_worker,
             spawn_iterate_worker=_watch_spawn_iterate,
+            prefer_iterate_for_action=lambda task, action: _watch_iterate_impl_target(
+                store=store,
+                task=task,
+                action=action,
+                running_task_ids=running_task_id_set,
+            ),
         )
 
         for task, action in action_plan:
@@ -976,8 +1120,11 @@ def _run_cycle(
 
             exec_result = execute_advance_action(task=task, action=action, context=executor_context)
             child_id = exec_result.handled_task_id
+            guarded_pending_task_id = exec_result.guarded_pending_task_id
 
             if exec_result.status == "skip":
+                if guarded_pending_task_id is not None:
+                    step1_handled_child_task_ids.add(str(guarded_pending_task_id))
                 message = exec_result.message
                 if action_type == "improve" and task.id is not None:
                     message = f"{task.id}: {message}"
@@ -996,6 +1143,8 @@ def _run_cycle(
                 continue
 
             if exec_result.status == "error":
+                if guarded_pending_task_id is not None:
+                    step1_handled_child_task_ids.add(str(guarded_pending_task_id))
                 if not exec_result.attempted_spawn and task.id is not None:
                     log.emit(
                         "ERROR",
@@ -1014,7 +1163,12 @@ def _run_cycle(
                 continue
 
             if exec_result.status == "dry_run":
-                if action_type == "create_review" and task.id is not None:
+                if guarded_pending_task_id is not None:
+                    step1_handled_child_task_ids.add(str(guarded_pending_task_id))
+                if exec_result.worker_label == "iterate" and child_id is not None:
+                    log.emit("START", f"{child_id} iterate [dry-run]")
+                    started_task_ids.add(str(child_id))
+                elif action_type == "create_review" and task.id is not None:
                     log.emit("START", f"(new) review for {task.id} [dry-run]")
                 elif action_type == "run_review" and child_id is not None:
                     log.emit("START", f"{child_id} review [dry-run]")
@@ -1038,11 +1192,19 @@ def _run_cycle(
                 work_done = True
                 continue
 
-            if child_id is not None and action_type in {"create_review", "improve", "create_implement", "needs_rebase"}:
+            if (
+                child_id is not None
+                and exec_result.worker_label != "iterate"
+                and action_type in {"create_review", "improve", "create_implement", "needs_rebase"}
+            ):
                 step1_handled_child_task_ids.add(str(child_id))
+            if guarded_pending_task_id is not None:
+                step1_handled_child_task_ids.add(str(guarded_pending_task_id))
 
             if exec_result.status == "success" and child_id is not None:
-                if action_type in {"create_review", "run_review"}:
+                if exec_result.worker_label == "iterate":
+                    log.emit("START", f"{child_id} iterate")
+                elif action_type in {"create_review", "run_review"}:
                     log.emit("START", f"{child_id} review")
                 elif action_type in {"improve", "run_improve"}:
                     log.emit("START", f"{child_id} improve")

@@ -168,10 +168,10 @@ These actions create background workers and count toward the batch limit. The so
 | Action | What it does |
 |--------|-------------|
 | `needs_rebase` | Creates rebase task via `_create_rebase_task()`, spawns worker |
-| `create_review` | Creates review task, spawns worker |
-| `run_review` | Spawns worker for existing pending review |
-| `improve` | Creates improve task, spawns worker |
-| `run_improve` | Spawns worker for existing pending improve |
+| `create_review` | `gza advance`: creates review task, spawns worker. `gza watch`: for unmerged implementation chains, launches `gza iterate <impl>` and lets iterate create/reuse the review work internally. |
+| `run_review` | `gza advance`: spawns worker for existing pending review. `gza watch`: for unmerged implementation chains, launches `gza iterate <impl>` instead of the child review directly. |
+| `improve` | `gza advance`: creates/resumes/retries improve work directly. `gza watch`: for unmerged implementation chains, launches `gza iterate <impl>` and lets iterate choose the improve action. |
+| `run_improve` | `gza advance`: spawns worker for existing pending improve. `gza watch`: for unmerged implementation chains, launches `gza iterate <impl>` instead of the child improve directly. |
 | `create_implement` | Creates implement task for a plan, spawns worker |
 | `resume` | Creates resume task, spawns worker |
 | `retry` | Creates retry task, spawns worker |
@@ -204,6 +204,7 @@ When `--batch N` is specified:
 - Worker-spawning actions are skipped once `workers_started >= N`
 - Merge actions are not subject to the batch limit
 - `--new` mode fills remaining batch slots with pending tasks from the queue
+- In `gza watch`, a routed iterate launch holds one slot for the whole implementation review/improve chain. This preserves the existing one-slot-per-process accounting but can reduce interleaving fairness at higher batch sizes because iterate may execute multiple inner review/improve steps before releasing that slot.
 
 ## Rebase Flow
 
@@ -271,7 +272,7 @@ In interactive mode, the same `Needs attention` section is part of the plan prev
 
 ## Watch integration
 
-`gza watch` reuses the same advance executor and improve-resolution helpers described above; it does not maintain a separate improve retry policy.
+`gza watch` reuses the same advance executor and improve-resolution helpers described above; it does not maintain a separate improve retry policy. For `create_review`, `run_review`, `improve`, and `run_improve` on unmerged implementation chains, watch resolves the root implementation first and launches `gza iterate <impl>` before any child review/improve side effects occur. Iterate then owns child creation, reuse, recovery, and immediate follow-on steps inside its loop.
 
 Watch renders human-needed advance outcomes (`needs_discussion`, `max_cycles_reached`, failed-task recovery states that now require an operator decision, and improve-recovery stop reasons) as sticky `ATTENTION` log lines instead of deduped `SKIP` lines. The reminder reuses the same formatted task line as the `advance` needs-attention section, including the stable `reason=...` policy slug and the shared single-line shortened prompt. It repeats while the task still resolves to that manual-attention next action, then disappears once the next action changes. Ordinary watch skip/wait lines remain deduped across cycles.
 

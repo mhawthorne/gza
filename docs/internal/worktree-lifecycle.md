@@ -88,6 +88,8 @@ Git enforces that a branch can only be checked out in one worktree at a time. Wh
 - The review worktree directory is removed when an improve starts
 - Only the most recent task in a chain has an active worktree
 
+Post-approval comment handling in `gza watch` now re-enters the implementation chain through `gza iterate <impl>`. That outer iterate wrapper does not change worktree ownership by itself; the active worktree is still selected and rotated by the inner review/improve task that iterate chooses to run.
+
 ## Cleanup safety
 
 `gza clean --worktrees` only removes **orphaned** worktree directories — directories in the worktree path that are not tracked by `git worktree list`. These are leftover directories from worktrees that git has already pruned.

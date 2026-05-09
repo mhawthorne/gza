@@ -39,6 +39,10 @@ class AdvanceActionExecutionContext:
     spawn_worker: Callable[[str, str], int]
     spawn_resume_worker: Callable[[str, str], int]
     spawn_iterate_worker: Callable[[DbTask, str], int]
+    prefer_iterate_for_action: Callable[
+        [DbTask, dict[str, Any]],
+        DbTask | AdvanceActionExecutionResult | None,
+    ] | None = None
     spawn_iterate_recovery: Callable[[DbTask, Literal["resume", "retry"]], int] | None = None
     create_retry_task: Callable[[DbTask], DbTask] | None = None
 
@@ -62,6 +66,8 @@ class AdvanceActionExecutionResult:
     failed_improve: DbTask | None = None
     attention_type: str | None = None
     attention_reason: str | None = None
+    worker_label: str | None = None
+    guarded_pending_task_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -220,7 +226,69 @@ def _spawn_result(
         created_task=created_task,
         improve_mode=improve_mode,
         failed_improve=failed_improve,
+        worker_label=worker_label,
     )
+
+
+_ITERATE_ROUTABLE_ACTIONS = frozenset({"create_review", "run_review", "improve", "run_improve"})
+
+
+def _maybe_route_action_through_iterate(
+    *,
+    task: DbTask,
+    action: dict[str, Any],
+    action_type: str,
+    context: AdvanceActionExecutionContext,
+) -> AdvanceActionExecutionResult | None:
+    if action_type not in _ITERATE_ROUTABLE_ACTIONS or context.prefer_iterate_for_action is None:
+        return None
+
+    preferred = context.prefer_iterate_for_action(task, action)
+    if preferred is None:
+        return None
+    if isinstance(preferred, AdvanceActionExecutionResult):
+        return preferred
+    if preferred.id is None:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="error",
+            message="iterate routing selected implementation with no task id",
+        )
+
+    guarded_pending_task_id: str | None = None
+    if action_type == "run_review":
+        review_task = action.get("review_task")
+        if isinstance(review_task, DbTask):
+            guarded_pending_task_id = review_task.id
+    elif action_type == "run_improve":
+        improve_task = action.get("improve_task")
+        if isinstance(improve_task, DbTask):
+            guarded_pending_task_id = improve_task.id
+
+    if context.dry_run:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="dry_run",
+            message=action.get("description", "Run iterate"),
+            worker_consuming=True,
+            work_done=True,
+            handled_task_id=preferred.id,
+            created_task=preferred,
+            worker_label="iterate",
+            guarded_pending_task_id=guarded_pending_task_id,
+        )
+
+    rc = context.spawn_iterate_worker(preferred, "iterate")
+    result = _spawn_result(
+        action_type=action_type,
+        rc=rc,
+        handled_task_id=preferred.id,
+        worker_label="iterate",
+        created_task=preferred,
+    )
+    result.guarded_pending_task_id = guarded_pending_task_id
+    result.success_message = f"Started iterate for {preferred.id}"
+    return result
 
 
 def execute_advance_action(
@@ -238,6 +306,15 @@ def execute_advance_action(
             status="unsupported",
             message=f"unsupported action: {action_type}",
         )
+
+    iterate_routed_result = _maybe_route_action_through_iterate(
+        task=task,
+        action=action,
+        action_type=action_type,
+        context=context,
+    )
+    if iterate_routed_result is not None:
+        return iterate_routed_result
 
     if action_type == "create_review":
         if task.id is None:
