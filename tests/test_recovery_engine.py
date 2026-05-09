@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import gza.recovery_engine as recovery_engine
+from gza.git import GitError
 from gza.recovery_engine import (
     _MergeContext,
     decide_failed_task_recovery,
@@ -199,6 +200,57 @@ def test_list_failed_tasks_for_recovery_keeps_failed_task_without_landed_lineage
 
     assert is_chain_resolved_by_recovery(store, failed) is False
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id, failed_retry.id]
+
+
+def test_list_failed_tasks_for_recovery_emits_one_warning_when_branch_reachability_probe_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    class _BrokenMergeGit:
+        def branch_exists(self, branch: str) -> bool:
+            return bool(branch)
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            raise GitError("simulated reachability failure")
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=_BrokenMergeGit(), default_branch="main"),
+    )
+
+    first = store.add("Failed implementation A", task_type="implement")
+    assert first.id is not None
+    first.status = "failed"
+    first.failure_reason = "MAX_TURNS"
+    first.session_id = "sess-a"
+    first.branch = "feature/a"
+    first.completed_at = datetime.now(UTC)
+    store.update(first)
+
+    second = store.add("Failed implementation B", task_type="implement")
+    assert second.id is not None
+    second.status = "failed"
+    second.failure_reason = "MAX_TURNS"
+    second.session_id = "sess-b"
+    second.branch = "feature/b"
+    second.completed_at = datetime.now(UTC)
+    store.update(second)
+
+    warnings: list[str] = []
+    failed = list_failed_tasks_for_recovery(store, warnings=warnings)
+
+    assert {task.id for task in failed} == {first.id, second.id}
+    assert len(warnings) == 1
+    assert warnings[0].startswith(
+        "Failed-task recovery could not inspect repository branch reachability; "
+        "landed-branch suppression is disabled for this run: "
+        "failed to check whether branch 'feature/"
+    )
+    assert "reached default branch 'main': simulated reachability failure" in warnings[0]
 
 
 def test_list_failed_tasks_for_recovery_filters_failed_descendant_when_merged_ancestor_shares_branch(

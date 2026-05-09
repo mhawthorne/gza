@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,8 @@ from .dependency_preconditions import get_unmerged_dependency_precondition
 from .failed_task_ordering import sort_failed_tasks
 from .failure_policy import is_resumable_failure_reason
 from .git import Git, GitError
+
+logger = logging.getLogger(__name__)
 
 _ACTIONABLE_TYPES = {"implement", "plan", "explore", "fix", "internal", "review", "improve", "rebase"}
 _MANUAL_ONLY_REASONS = {
@@ -100,6 +103,21 @@ class _MergeContext:
     git: Git | None
     default_branch: str | None
     branch_resolution: dict[str, bool] = field(default_factory=dict)
+    repository_inspection_warnings: list[str] = field(default_factory=list)
+    _warning_keys: set[str] = field(default_factory=set)
+
+
+def _record_repository_inspection_warning(
+    merge_context: _MergeContext,
+    *,
+    key: str,
+    message: str,
+) -> None:
+    if key in merge_context._warning_keys:
+        return
+    merge_context._warning_keys.add(key)
+    merge_context.repository_inspection_warnings.append(message)
+    logger.debug(message)
 
 
 def _matches_shared_recovery_payload(parent: DbTask, child: DbTask) -> bool:
@@ -398,8 +416,18 @@ def _load_merge_context(project_dir: Path | None = None) -> _MergeContext:
         config = Config.load(project_dir or Path.cwd(), discover=True)
         git = Git(config.project_dir)
         return _MergeContext(git=git, default_branch=git.default_branch())
-    except (ConfigError, GitError, OSError, ValueError):
-        return _MergeContext(git=None, default_branch=None)
+    except (ConfigError, GitError, OSError, ValueError) as exc:
+        merge_context = _MergeContext(git=None, default_branch=None)
+        _record_repository_inspection_warning(
+            merge_context,
+            key="merge-context-load",
+            message=(
+                "Failed-task recovery could not inspect repository branch reachability; "
+                "landed-branch suppression is disabled for this run: "
+                f"failed to load repository default-branch context: {exc}"
+            ),
+        )
+        return merge_context
 
 
 def _project_dir_for_store(store: SqliteTaskStore) -> Path | None:
@@ -460,7 +488,17 @@ def _is_resolved_by_landed_lineage(
                 merge_context.branch_resolution[task.branch] = branch_merged
             if branch_merged:
                 return True
-        except GitError:
+        except GitError as exc:
+            _record_repository_inspection_warning(
+                merge_context,
+                key="branch-reachability-check",
+                message=(
+                    "Failed-task recovery could not inspect repository branch reachability; "
+                    "landed-branch suppression is disabled for this run: "
+                    f"failed to check whether branch '{task.branch}' reached "
+                    f"default branch '{merge_context.default_branch}': {exc}"
+                ),
+            )
             pass
 
     branch_keys = _task_lineage_branch_keys(store, task)
@@ -504,6 +542,7 @@ def list_failed_tasks_for_recovery(
     *,
     tags: tuple[str, ...] | None = None,
     any_tag: bool = False,
+    warnings: list[str] | None = None,
 ) -> list[DbTask]:
     merge_context = _load_merge_context(_project_dir_for_store(store))
     failed = [task for task in store.get_all() if task.status == "failed"]
@@ -519,6 +558,8 @@ def list_failed_tasks_for_recovery(
     failed = [task for task in failed if not is_chain_resolved_by_recovery(store, task)]
     failed = [task for task in failed if not is_resolved_by_merged_target(store, task)]
     failed = [task for task in failed if not _is_resolved_by_landed_lineage(store, task, merge_context=merge_context)]
+    if warnings is not None:
+        warnings.extend(merge_context.repository_inspection_warnings)
     return sort_failed_tasks(failed)
 
 

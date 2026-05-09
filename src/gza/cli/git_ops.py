@@ -1785,6 +1785,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
 
     failed_tasks: list[DbTask] = []
+    failed_task_recovery_warnings: list[str] = []
 
     # Determine which tasks to advance
     if task_id is not None:
@@ -1825,7 +1826,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             tasks = [t for t in tasks if t.task_type == 'implement']
 
         if not no_resume_failed:
-            failed_tasks = list_failed_tasks_for_recovery(store)
+            failed_tasks = list_failed_tasks_for_recovery(store, warnings=failed_task_recovery_warnings)
             if advance_type == 'plan':
                 failed_tasks = [t for t in failed_tasks if t.task_type == 'plan']
             elif advance_type == 'implement':
@@ -2020,6 +2021,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print()
 
     if dry_run:
+        for warning in failed_task_recovery_warnings:
+            print(f"Warning: {warning}", file=sys.stderr)
         if preview_actionable_rows:
             print(f"Would advance {len(preview_actionable_rows)} task(s):\n")
             for task, action, description in preview_actionable_rows:

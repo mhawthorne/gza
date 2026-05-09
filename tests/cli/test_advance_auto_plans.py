@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from gza.cli.git_ops import cmd_advance
+from gza.git import GitError
+from gza.recovery_engine import _MergeContext
 
 from tests.cli.conftest import make_store, setup_config
 
@@ -142,6 +144,47 @@ def test_advance_type_implement_filters_to_implements_only(tmp_path: Path, capsy
     assert str(impl.id) in output
     assert "Create closing review" in output
     assert "Create and start implement" not in output
+
+
+def test_advance_dry_run_warns_once_when_failed_task_branch_reachability_is_unavailable(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Recover failed work", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/recovery-warning"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    class _BrokenMergeGit:
+        def branch_exists(self, branch: str) -> bool:
+            return bool(branch)
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            raise GitError("simulated reachability failure")
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch(
+            "gza.recovery_engine._load_merge_context",
+            lambda _project_dir=None: _MergeContext(git=_BrokenMergeGit(), default_branch="main"),
+        ),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, dry_run=True))
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Would advance 1 task(s):" in captured.out
+    assert str(failed.id) in captured.out
+    assert "Resume failed task (MAX_TURNS)" in captured.out
+    assert captured.err.count("Warning: Failed-task recovery could not inspect repository branch reachability;") == 1
+    assert "simulated reachability failure" in captured.err
 
 
 def test_advance_create_implement_respects_batch_limit(tmp_path: Path, capsys) -> None:
