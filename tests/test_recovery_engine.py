@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 import gza.recovery_engine as recovery_engine
-from gza.git import GitError
+from gza.config import ConfigError
 from gza.db import MergeTargetResolutionError
 from gza.git import GitError
 from gza.recovery_engine import (
@@ -255,10 +255,33 @@ def test_list_failed_tasks_for_recovery_emits_one_warning_when_branch_reachabili
     assert len(warnings) == 1
     assert warnings[0].startswith(
         "Failed-task recovery could not inspect repository branch reachability; "
-        "landed-branch suppression is disabled for this run: "
+        "git branch reachability suppression is unavailable for this run, but "
+        "metadata-based same-lineage merged-task suppression may still apply: "
         "failed to check whether branch 'feature/"
     )
     assert "reached default branch 'main': simulated reachability failure" in warnings[0]
+
+
+def test_load_merge_context_warning_says_metadata_based_lineage_suppression_may_still_apply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        recovery_engine.Config,
+        "load",
+        staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(ConfigError("simulated config failure"))),
+    )
+
+    merge_context = recovery_engine._load_merge_context(tmp_path)
+
+    assert merge_context.git is None
+    assert merge_context.default_branch is None
+    assert merge_context.repository_inspection_warnings == [
+        "Failed-task recovery could not inspect repository branch reachability; "
+        "git branch reachability suppression is unavailable for this run, but "
+        "metadata-based same-lineage merged-task suppression may still apply: "
+        "failed to load repository default-branch context: simulated config failure"
+    ]
 
 
 def test_list_failed_tasks_for_recovery_raises_when_project_default_merge_target_cannot_be_resolved(

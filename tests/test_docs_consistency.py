@@ -375,7 +375,10 @@ def test_internal_advance_workflow_task_collection_tracks_shared_recovery_policy
     assert "store.list_failed_tasks_for_recovery(...)" in task_collection_section
     assert "decide_failed_task_recovery(...)" in task_collection_section
     assert "resume`, `retry`, or manual review required" in task_collection_section
-    assert "advance --dry-run` surfaces one warning and keeps the failed rows visible" in task_collection_section
+    assert "advance --dry-run` surfaces one warning that only git branch reachability suppression is unavailable for this run" in task_collection_section
+    assert "metadata-based same-lineage merged-task suppression may still apply" in task_collection_section
+    assert "failed-row visibility remains conservative only for the git-reachability decision" in task_collection_section
+    assert "keeps the failed rows visible" not in task_collection_section
     assert "failure_reason IN ('MAX_STEPS', 'MAX_TURNS')" not in task_collection_section
     assert "session_id IS NOT NULL" not in task_collection_section
     assert "**Resumable failed tasks**" not in task_collection_section

@@ -121,6 +121,15 @@ def _record_repository_inspection_warning(
     logger.debug(message)
 
 
+def _branch_reachability_warning(detail: str) -> str:
+    return (
+        "Failed-task recovery could not inspect repository branch reachability; "
+        "git branch reachability suppression is unavailable for this run, but "
+        "metadata-based same-lineage merged-task suppression may still apply: "
+        f"{detail}"
+    )
+
+
 def _matches_shared_recovery_payload(parent: DbTask, child: DbTask) -> bool:
     """Return whether the child still matches the payload copied by recovery helpers."""
     return (
@@ -433,11 +442,7 @@ def _load_merge_context(project_dir: Path | None = None) -> _MergeContext:
         _record_repository_inspection_warning(
             merge_context,
             key="merge-context-load",
-            message=(
-                "Failed-task recovery could not inspect repository branch reachability; "
-                "landed-branch suppression is disabled for this run: "
-                f"failed to load repository default-branch context: {exc}"
-            ),
+            message=_branch_reachability_warning(f"failed to load repository default-branch context: {exc}"),
         )
         return merge_context
 
@@ -523,9 +528,7 @@ def _is_resolved_by_landed_lineage(
             _record_repository_inspection_warning(
                 merge_context,
                 key="branch-reachability-check",
-                message=(
-                    "Failed-task recovery could not inspect repository branch reachability; "
-                    "landed-branch suppression is disabled for this run: "
+                message=_branch_reachability_warning(
                     f"failed to check whether branch '{task.branch}' reached "
                     f"default branch '{target_branch}': {exc}"
                 ),

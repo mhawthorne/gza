@@ -193,6 +193,8 @@ def test_advance_dry_run_warns_once_when_failed_task_branch_reachability_is_unav
     assert str(failed.id) in captured.out
     assert "Resume failed task (MAX_TURNS)" in captured.out
     assert captured.err.count("Warning: Failed-task recovery could not inspect repository branch reachability;") == 1
+    assert "git branch reachability suppression is unavailable for this run" in captured.err
+    assert "metadata-based same-lineage merged-task suppression may still apply" in captured.err
     assert "simulated reachability failure" in captured.err
 
 
