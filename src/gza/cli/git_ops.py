@@ -328,13 +328,14 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     results, skipped = refresh_branch_diff_stats(store, git, tasks_to_refresh)
     refreshed = 0
     for result in results:
-        if result.skipped_reason == "no branch":
+        if result.skipped_reason is not None:
             task_id = result.task_ids[0] if result.task_ids else "<unknown>"
-            console.print(f"[dim]{task_id}: no branch, skipping[/dim]")
-            continue
-        if result.skipped_reason == "branch no longer exists":
-            task_id = result.task_ids[0] if result.task_ids else "<unknown>"
-            console.print(f"[dim]{task_id} {result.branch}: branch no longer exists, skipping[/dim]")
+            if result.skipped_reason == "no branch":
+                console.print(f"[dim]{task_id}: no branch, skipping[/dim]")
+            elif result.skipped_reason == "branch no longer exists":
+                console.print(f"[dim]{task_id} {result.branch}: branch no longer exists, skipping[/dim]")
+            else:
+                console.print(f"[dim]{task_id}: {result.skipped_reason}, skipping[/dim]")
             continue
         refreshed += 1
         task_label = ",".join(result.task_ids) if result.task_ids else result.branch

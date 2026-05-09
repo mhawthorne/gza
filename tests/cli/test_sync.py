@@ -318,3 +318,79 @@ def test_sync_reports_when_default_candidates_are_cache_filtered(tmp_path, capsy
     assert rc == 0
     output = capsys.readouterr().out
     assert "default sync cache is still warm" in output
+
+
+def test_sync_counts_mismatched_target_branch_merge_unit_as_skipped(tmp_path, capsys):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_branch_task(store, "Retargeted task", "feature/retargeted-default")
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    assert unit.target_branch == "main"
+    store.set_merge_unit_state(unit.id, "merged")
+
+    git = Mock()
+    git.default_branch.return_value = "release"
+    git.fetch.return_value = None
+    git.ref_exists.return_value = False
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_ids=[task.id],
+        dry_run=False,
+        git_only=True,
+        pr_only=False,
+        no_fetch=False,
+    )
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        patch("gza.cli.git_ops.Git", return_value=git),
+    ):
+        rc = cmd_sync(args)
+
+    assert rc == 0
+    refreshed_task = store.get(task.id)
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_task is not None
+    assert refreshed_unit is not None
+    assert refreshed_task.merge_status == "merged"
+    assert refreshed_unit.state == "merged"
+    output = capsys.readouterr().out
+    assert f"{task.id}: skipped (merge unit targets 'main', not requested target 'release')" in output
+    assert "Synced 0 branch(es), skipped 1, errors 0." in output
+
+
+def test_sync_all_mismatched_targets_returns_success_without_fetch_or_github(tmp_path, capsys):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_branch_task(store, "Retargeted task", "feature/retargeted-default")
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    assert unit.target_branch == "main"
+
+    git = Mock()
+    git.default_branch.return_value = "release"
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_ids=[task.id],
+        dry_run=False,
+        git_only=False,
+        pr_only=False,
+        no_fetch=False,
+    )
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        patch("gza.cli.git_ops.Git", return_value=git),
+        patch("gza.sync_ops.GitHub") as github_cls,
+    ):
+        rc = cmd_sync(args)
+
+    assert rc == 0
+    git.fetch.assert_not_called()
+    github_cls.assert_not_called()
+    output = capsys.readouterr().out
+    assert f"{task.id}: skipped (merge unit targets 'main', not requested target 'release')" in output
+    assert "Synced 0 branch(es), skipped 1, errors 0." in output

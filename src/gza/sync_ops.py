@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
-from .db import DB_UNSET, SqliteTaskStore, Task, task_owns_merge_status
+from .db import DB_UNSET, MergeUnit, SqliteTaskStore, Task, task_owns_merge_status
 from .git import Git, GitError, parse_diff_numstat
 from .github import GitHub, GitHubError, PullRequestDetails
 
@@ -544,6 +544,8 @@ def _persist_branch_updates(
     for cohort, result, update in zip(cohorts, results, updates, strict=True):
         if not result.ok:
             continue
+        if result.skipped_reason is not None:
+            continue
         if not cohort.code_tasks:
             continue
         _persist_branch_state(
@@ -562,6 +564,78 @@ def _persist_branch_updates(
         )
 
 
+def _resolve_persist_merge_unit(
+    store: SqliteTaskStore,
+    tasks: tuple[Task, ...],
+    *,
+    merge_unit_id: str | None,
+    allow_create: bool,
+) -> tuple[MergeUnit | None, bool]:
+    """Resolve the merge unit that would receive canonical branch-state updates."""
+    had_existing_unit = False
+    unit = store.get_merge_unit(merge_unit_id) if merge_unit_id is not None else None
+    if unit is not None:
+        had_existing_unit = True
+    if unit is None:
+        owner_task = next((task for task in tasks if task.id is not None and task_owns_merge_status(task)), None)
+        if owner_task is not None:
+            owner_task_id = owner_task.id
+            assert owner_task_id is not None
+            existing_unit = store.resolve_merge_unit_for_task(owner_task_id)
+            if existing_unit is not None:
+                had_existing_unit = True
+                unit = existing_unit
+            elif allow_create:
+                unit = store.get_or_create_merge_unit_for_task(owner_task)
+    return unit, had_existing_unit
+
+
+def _target_branch_mismatch_result(
+    store: SqliteTaskStore,
+    cohort: BranchCohort,
+    *,
+    target_branch: str,
+) -> BranchSyncResult | None:
+    """Return a skipped result when canonical merge state targets a different branch."""
+    if not store.supports_merge_units():
+        return None
+    unit, had_existing_unit = _resolve_persist_merge_unit(
+        store,
+        cohort.code_tasks,
+        merge_unit_id=cohort.merge_unit_id,
+        allow_create=False,
+    )
+    if unit is None or not had_existing_unit or unit.target_branch == target_branch:
+        return None
+    return BranchSyncResult(
+        branch=cohort.branch,
+        task_ids=tuple(task.id for task in cohort.code_tasks if task.id is not None),
+        skipped_reason=(
+            f"merge unit targets '{unit.target_branch}', not requested target '{target_branch}'"
+        ),
+    )
+
+
+def _partition_target_mismatch_cohorts(
+    store: SqliteTaskStore,
+    cohorts: list[BranchCohort],
+    *,
+    target_branch: str,
+) -> tuple[dict[int, BranchSyncResult], list[int], list[BranchCohort]]:
+    """Split cohorts into skipped off-target results and eligible cohorts."""
+    results_by_index: dict[int, BranchSyncResult] = {}
+    eligible_indices: list[int] = []
+    eligible_cohorts: list[BranchCohort] = []
+    for idx, cohort in enumerate(cohorts):
+        mismatch = _target_branch_mismatch_result(store, cohort, target_branch=target_branch)
+        if mismatch is not None:
+            results_by_index[idx] = mismatch
+            continue
+        eligible_indices.append(idx)
+        eligible_cohorts.append(cohort)
+    return results_by_index, eligible_indices, eligible_cohorts
+
+
 def reconcile_task_branch_merge_truth(
     store: SqliteTaskStore,
     git: Git,
@@ -577,6 +651,9 @@ def reconcile_task_branch_merge_truth(
         return preliminary
     if cohort is None:
         return BranchSyncResult(branch=f"<missing:{task_id}>", task_ids=(task_id,), skipped_reason="no branch cohort")
+    mismatch = _target_branch_mismatch_result(store, cohort, target_branch=target_branch)
+    if mismatch is not None:
+        return mismatch
 
     result = reconcile_branch_merge_truth(
         git,
@@ -604,12 +681,20 @@ def sync_branch_cohorts(
     """Reconcile branch cohorts against git and optional GitHub state."""
     partial_failure = False
     default_branch = git.default_branch()
+    results_by_index, eligible_indices, eligible_cohorts = _partition_target_mismatch_cohorts(
+        store,
+        cohorts,
+        target_branch=default_branch,
+    )
+
+    _emit_progress(progress, f"Syncing {len(cohorts)} branch cohort(s)")
+    if not eligible_cohorts:
+        return [results_by_index[idx] for idx in range(len(cohorts))], False
+
     remote_default_ref: str | None = None
     remote_default_candidate = f"origin/{default_branch}"
     fetched_this_run = False
     fetch_error: str | None = None
-
-    _emit_progress(progress, f"Syncing {len(cohorts)} branch cohort(s)")
 
     has_origin_remote = True
     remote_exists = getattr(git, "remote_exists", None)
@@ -637,7 +722,7 @@ def sync_branch_cohorts(
     if include_git:
         results = reconcile_branch_merge_truth(
             git,
-            cohorts,
+            eligible_cohorts,
             target_branch=default_branch,
             include_diff_stats=True,
             remote_target_ref=remote_default_ref,
@@ -648,7 +733,7 @@ def sync_branch_cohorts(
                 branch=cohort.branch,
                 task_ids=tuple(task.id for task in cohort.code_tasks if task.id is not None),
             )
-            for cohort in cohorts
+            for cohort in eligible_cohorts
         ]
 
     for result in results:
@@ -674,8 +759,8 @@ def sync_branch_cohorts(
             for result in results:
                 result.errors.append("GitHub CLI (gh) is not installed or not authenticated")
 
-    total = len(cohorts)
-    for idx, (cohort, result) in enumerate(zip(cohorts, results, strict=True)):
+    total = len(eligible_cohorts)
+    for idx, (cohort, result) in enumerate(zip(eligible_cohorts, results, strict=True)):
         _emit_progress(progress, f"[{idx + 1}/{total}] {cohort.branch}")
         if include_pr and gh_available and gh is not None:
             if result.skipped_reason is not None:
@@ -695,17 +780,21 @@ def sync_branch_cohorts(
     if not dry_run:
         _persist_branch_updates(
             store,
-            cohorts,
+            eligible_cohorts,
             results,
             updates,
             default_branch,
             sync_completed_at=datetime.now(UTC),
         )
 
-    for result in results:
+    for idx, result in zip(eligible_indices, results, strict=True):
+        results_by_index[idx] = result
+    ordered_results = [results_by_index[idx] for idx in range(len(cohorts))]
+
+    for result in ordered_results:
         partial_failure = partial_failure or not result.ok
 
-    return results, partial_failure
+    return ordered_results, partial_failure
 
 
 def summarize_git_reconcile(results: list[BranchSyncResult]) -> tuple[int, int]:
@@ -754,7 +843,13 @@ def refresh_branch_diff_stats(
         eligible_tasks.append(task)
 
     cohorts = build_branch_cohorts_for_tasks(store, eligible_tasks)
-    for cohort in cohorts:
+    mismatch_results, eligible_indices, eligible_cohorts = _partition_target_mismatch_cohorts(
+        store,
+        cohorts,
+        target_branch=default_branch,
+    )
+    ordered_results: dict[int, BranchSyncResult] = dict(mismatch_results)
+    for idx, cohort in zip(eligible_indices, eligible_cohorts, strict=True):
         result = BranchSyncResult(
             branch=cohort.branch,
             task_ids=tuple(task.id for task in cohort.code_tasks if task.id is not None),
@@ -773,7 +868,8 @@ def refresh_branch_diff_stats(
             merge_unit_id=cohort.merge_unit_id,
             diff_stats=(files_changed, lines_added, lines_removed),
         )
-        results.append(result)
+        ordered_results[idx] = result
+    results.extend(ordered_results[idx] for idx in range(len(cohorts)))
     skipped = sum(1 for result in results if result.skipped_reason is not None)
     return results, skipped
 
@@ -797,16 +893,15 @@ def _persist_branch_state(
     sync fields continue to fan out across the cohort.
     """
     if store.supports_merge_units():
-        unit = store.get_merge_unit(merge_unit_id) if merge_unit_id is not None else None
-        if unit is None:
-            owner_task = next((task for task in tasks if task.id is not None and task_owns_merge_status(task)), None)
-            if owner_task is not None:
-                owner_task_id = owner_task.id
-                assert owner_task_id is not None
-                unit = store.resolve_merge_unit_for_task(
-                    owner_task_id) or store.get_or_create_merge_unit_for_task(
-                    owner_task)
+        unit, had_existing_unit = _resolve_persist_merge_unit(
+            store,
+            tasks,
+            merge_unit_id=merge_unit_id,
+            allow_create=True,
+        )
         if unit is not None:
+            if had_existing_unit and unit.target_branch != target_branch:
+                return
             diff_tuple = (
                 cast("tuple[int | None, int | None, int | None]", diff_stats)
                 if diff_stats is not _UNSET

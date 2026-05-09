@@ -12,6 +12,7 @@ from gza.sync_ops import (
     build_branch_cohorts_for_task_ids,
     build_task_branch_cohort,
     build_unmerged_branch_cohorts,
+    refresh_branch_diff_stats,
     reconcile_branch_merge_truth,
     reconcile_task_branch_merge_truth,
     sync_branch_cohorts,
@@ -297,6 +298,152 @@ def test_sync_branch_cohorts_persists_merge_units(tmp_path):
     unit = store.resolve_merge_unit_for_task(task.id)
     assert unit is not None
     assert unit.state == "unmerged"
+
+
+def test_sync_branch_cohorts_skips_persisting_mismatched_target_branch_merge_unit(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/retargeted-default")
+    assert task.id is not None
+
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    assert unit.target_branch == "main"
+    store.set_merge_unit_state(unit.id, "merged")
+
+    before_task = store.get(task.id)
+    before_unit = store.get_merge_unit(unit.id)
+    assert before_task is not None
+    assert before_unit is not None
+    assert before_task.merge_status == "merged"
+    assert before_unit.state == "merged"
+
+    git = Mock()
+    git.default_branch.return_value = "release"
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        [BranchCohort(branch=task.branch, tasks=(task,), merge_unit_id=unit.id)],
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=False,
+    )
+
+    assert partial is False
+    assert results[0].skipped_reason == "merge unit targets 'main', not requested target 'release'"
+    assert results[0].reconciled is False
+    assert results[0].merge_status is None
+
+    refreshed_task = store.get(task.id)
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_task is not None
+    assert refreshed_unit is not None
+    assert refreshed_task.merge_status == "merged"
+    assert refreshed_task.diff_files_changed is None
+    assert refreshed_task.sync_last_synced_at is None
+    assert refreshed_unit.state == "merged"
+    assert refreshed_unit.diff_files_changed is None
+    assert refreshed_unit.sync_last_synced_at is None
+
+
+def test_sync_branch_cohorts_all_mismatched_targets_skip_without_fetch_or_github(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/retargeted-default")
+    assert task.id is not None
+
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    assert unit.target_branch == "main"
+
+    git = Mock()
+    git.default_branch.return_value = "release"
+
+    with patch("gza.sync_ops.GitHub") as github_cls:
+        results, partial = sync_branch_cohorts(
+            store,
+            git,
+            [BranchCohort(branch=task.branch, tasks=(task,), merge_unit_id=unit.id)],
+            include_git=True,
+            include_pr=True,
+            dry_run=False,
+            fetch_remote=True,
+        )
+
+    assert partial is False
+    assert results[0].skipped_reason == "merge unit targets 'main', not requested target 'release'"
+    git.fetch.assert_not_called()
+    github_cls.assert_not_called()
+
+
+def test_reconcile_task_branch_merge_truth_skips_mismatched_target_branch_merge_unit(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/scoped-retarget")
+    assert task.id is not None
+
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    assert unit.target_branch == "main"
+    store.set_merge_unit_state(unit.id, "merged")
+
+    git = Mock()
+
+    result = reconcile_task_branch_merge_truth(
+        store,
+        git,
+        task.id,
+        target_branch="release",
+        include_diff_stats=True,
+        persist=True,
+    )
+
+    assert result.skipped_reason == "merge unit targets 'main', not requested target 'release'"
+    assert result.reconciled is False
+    git.branch_exists.assert_not_called()
+
+    refreshed_task = store.get(task.id)
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_task is not None
+    assert refreshed_unit is not None
+
+
+def test_refresh_branch_diff_stats_skips_mismatched_target_branch_merge_unit(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/retargeted-default")
+    assert task.id is not None
+
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    assert unit.target_branch == "main"
+    store.set_merge_unit_state(unit.id, "merged", diff_stats=(9, 99, 11))
+    before_task = store.get(task.id)
+    assert before_task is not None
+
+    git = Mock()
+    git.default_branch.return_value = "release"
+    git.branch_exists.return_value = True
+
+    results, skipped = refresh_branch_diff_stats(store, git, [task])
+
+    assert skipped == 1
+    assert len(results) == 1
+    assert results[0].skipped_reason == "merge unit targets 'main', not requested target 'release'"
+    assert results[0].diff_files_changed is None
+    git.get_diff_numstat.assert_not_called()
+
+    refreshed_task = store.get(task.id)
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_task is not None
+    assert refreshed_unit is not None
+    assert refreshed_task.diff_files_changed == before_task.diff_files_changed
+    assert refreshed_unit.diff_files_changed == 9
+    assert refreshed_task.merge_status == "merged"
+    assert refreshed_task.sync_last_synced_at is None
+    assert refreshed_unit.state == "merged"
+    assert refreshed_unit.sync_last_synced_at is None
 
 
 def test_build_default_branch_cohorts_unions_merge_units_and_legacy_branches_without_duplicates(tmp_path):
