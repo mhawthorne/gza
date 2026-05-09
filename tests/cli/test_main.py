@@ -638,7 +638,7 @@ class TestHelpOutput:
         assert "--depends-on" not in result.stdout
 
     def test_extract_help_and_docs_describe_commit_mode(self, tmp_path):
-        """`extract --help` and docs should document commit-based extraction and ordering semantics."""
+        """`extract --help` and docs should document commit-based extraction and background ordering semantics."""
         setup_config(tmp_path)
 
         help_result = run_gza("extract", "--help", "--project", str(tmp_path))
@@ -652,11 +652,13 @@ class TestHelpOutput:
         assert "Committed git revision to extract from" in help_text
         assert "applied in the order provided" in help_text
         assert "create one extracted task per selected commit" in help_text
+        assert "with --background, workers still start in parallel" in help_text
 
         assert "--commit REV" in docs_text
         assert "--per-commit" in docs_text
         assert "applied in the order provided" in docs_text
         assert "one extracted task per selected commit" in docs_text
+        assert "execution starts in parallel rather than as a serialized commit-by-commit run" in docs_text
 
 class TestReconciliationWarnings:
     """Tests for reconciliation failure visibility during CLI dispatch."""

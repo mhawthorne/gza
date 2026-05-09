@@ -1359,7 +1359,7 @@ gza extract SOURCE --files-from FILE [options]
 | `PATH ...` | Repo-relative selected files to extract; omit to extract all changed files from the source diff |
 | `--branch BRANCH` | Source branch to extract from (alternative to `SOURCE`; defaults to current branch when omitted) |
 | `--commit REV` | Committed git revision to extract from (repeatable; applied in the order provided) |
-| `--per-commit` | With `--commit`: create one extracted task per selected commit, preserving the provided commit order |
+| `--per-commit` | With `--commit`: create one extracted task per selected commit, preserving the provided commit order for task creation; with `--background`, workers still start in parallel |
 | `--files-from FILE` | Read newline-delimited selected files from file |
 | `--prompt TEXT` | Additional operator intent appended to the drafted prompt |
 | `--review` | Auto-create review task on completion |
@@ -1377,7 +1377,7 @@ gza extract SOURCE --files-from FILE [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when running the extracted implement task |
 
-`gza extract` accepts exactly one source selector: `SOURCE`, `--branch BRANCH`, or one or more `--commit REV` flags. When multiple commits are provided, extraction applies them in the exact order given on the command line. Without `--per-commit`, that ordered commit set becomes one extraction bundle and one implement task. With `--per-commit`, `gza extract` creates one extracted implement task per selected commit, still preserving the provided order.
+`gza extract` accepts exactly one source selector: `SOURCE`, `--branch BRANCH`, or one or more `--commit REV` flags. When multiple commits are provided, extraction applies them in the exact order given on the command line. Without `--per-commit`, that ordered commit set becomes one extraction bundle and one implement task. With `--per-commit`, `gza extract` creates one extracted implement task per selected commit, still preserving the provided order for task creation and extraction manifests. If `--background` is also set, those extracted tasks are then handed to the generic background worker spawner, so execution starts in parallel rather than as a serialized commit-by-commit run.
 
 The drafted extract prompt leads with the best available description of the work itself. Task-based extraction prefers specific source-task prompt content after filtering generated extraction scaffolding and provenance boilerplate, branch-based extraction falls back to selected diff/file context, and commit-based extraction uses commit subjects when they provide a clearer summary. Source task IDs, branch/base refs, and commit SHAs remain in the prompt as secondary provenance context.
 

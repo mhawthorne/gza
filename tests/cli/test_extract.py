@@ -4,7 +4,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from gza.db import SqliteTaskStore
+from gza.db import SqliteTaskStore, Task
 from gza.extractions import ExtractionDraft, ExtractionError, FileDiffSummary, SourceSelection
 from gza.git import Git
 
@@ -18,6 +18,8 @@ def _args(project_dir: Path, **overrides: object) -> Namespace:
         "max_turns": None,
         "source": None,
         "branch": None,
+        "commits": None,
+        "per_commit": False,
         "paths": (),
         "files_from": None,
         "prompt": None,
@@ -184,47 +186,59 @@ def test_extract_bundle_write_failure_marks_failed_task_when_delete_fails(tmp_pa
     assert failed_task.failure_reason == "EXTRACTION_BUNDLE_WRITE_FAILED"
 
 
-def test_extract_bundle_write_failure_marks_failed_task_when_delete_fails(tmp_path: Path) -> None:
+def test_extract_per_commit_background_preserves_task_id_order_but_uses_parallel_spawner(tmp_path: Path) -> None:
     from gza.cli.execution import cmd_extract
 
     setup_config(tmp_path)
-    store = make_store(tmp_path)
     source = SourceSelection(
         source_task_id=None,
-        source_branch="feature/source",
-        source_base_ref="main",
+        source_commits=("aaa111", "bbb222"),
+        source_commit_subjects=("First commit", "Second commit"),
     )
-    draft = _draft(source=source)
+    draft_one = _draft(
+        source=SourceSelection(
+            source_task_id=None,
+            source_commits=("aaa111",),
+            source_commit_subjects=("First commit",),
+        )
+    )
+    draft_two = _draft(
+        source=SourceSelection(
+            source_task_id=None,
+            source_commits=("bbb222",),
+            source_commit_subjects=("Second commit",),
+        )
+    )
     git = MagicMock(spec=Git)
-    git.branch_exists.return_value = False
-
-    def _refuse_delete(self: SqliteTaskStore, task_id: str) -> bool:
-        del task_id
-        return False
+    created_tasks = [
+        Task(id="gza-101", prompt="First extracted task"),
+        Task(id="gza-102", prompt="Second extracted task"),
+    ]
 
     with (
         patch("gza.cli.execution.Git", return_value=git),
         patch("gza.cli.execution.resolve_source_selection", return_value=source),
-        patch("gza.cli.execution.normalize_selected_paths", return_value=("src/extracted.py",)),
-        patch("gza.cli.execution.plan_extraction", return_value=draft),
-        patch("gza.cli.execution.generate_slug", return_value="20260427-target"),
+        patch("gza.cli.execution.infer_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", side_effect=[draft_one, draft_two]),
         patch(
-            "gza.cli.execution.write_extraction_bundle",
-            side_effect=ExtractionError("bundle write failed"),
+            "gza.cli.execution._create_extract_task",
+            side_effect=[(created_tasks[0], tmp_path / "bundle-one"), (created_tasks[1], tmp_path / "bundle-two")],
         ),
-        patch.object(SqliteTaskStore, "delete", _refuse_delete),
+        patch("gza.cli.execution._print_extraction_plan_summary"),
+        patch("gza.cli.execution._spawn_background_worker") as mock_spawn_one,
+        patch("gza.cli.execution._spawn_background_workers", return_value=0) as mock_spawn_many,
     ):
         rc = cmd_extract(
             _args(
                 tmp_path,
-                branch="feature/source",
-                paths=("src/extracted.py",),
-                queue=True,
+                commits=["aaa111", "bbb222"],
+                per_commit=True,
+                background=True,
             )
         )
 
-    assert rc == 1
-    failed_task = get_latest_task(store, task_type="implement")
-    assert failed_task is not None
-    assert failed_task.status == "failed"
-    assert failed_task.failure_reason == "EXTRACTION_BUNDLE_WRITE_FAILED"
+    assert rc == 0
+    mock_spawn_one.assert_not_called()
+    mock_spawn_many.assert_called_once()
+    worker_args = mock_spawn_many.call_args.args[0]
+    assert worker_args.task_ids == ["gza-101", "gza-102"]

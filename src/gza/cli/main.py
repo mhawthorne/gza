@@ -1975,7 +1975,10 @@ def main() -> int:
     extract_parser.add_argument(
         "--per-commit",
         action="store_true",
-        help="With --commit: create one extracted task per selected commit, preserving the provided commit order",
+        help=(
+            "With --commit: create one extracted task per selected commit, preserving the provided "
+            "commit order for task creation; with --background, workers still start in parallel"
+        ),
     )
     extract_parser.add_argument(
         "--files-from",
