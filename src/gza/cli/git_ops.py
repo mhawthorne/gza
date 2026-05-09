@@ -23,7 +23,7 @@ from ..console import (
     shorten_prompt,
 )
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
-from ..dependency_preconditions import task_is_merged_for_target
+from ..dependency_preconditions import task_is_merged
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import (
     Git,
@@ -89,13 +89,9 @@ from .advance_executor import (
 logger = logging.getLogger(__name__)
 
 
-def _task_is_already_merged_for_target(
-    store: SqliteTaskStore,
-    task: DbTask,
-    target_branch: str | None,
-) -> bool:
-    """Return whether the selected task is already merged for the effective target."""
-    return task_is_merged_for_target(store, task, target_branch)
+def _task_is_already_merged(store: SqliteTaskStore, task: DbTask) -> bool:
+    """Return whether the selected task is already merged."""
+    return task_is_merged(store, task)
 
 
 def _format_needs_attention_line(task: DbTask, action: dict[str, Any]) -> str:
@@ -274,7 +270,7 @@ def _collect_advance_completed_tasks(
     """
     impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
 
-    all_unmerged = store.get_unmerged(target_branch)
+    all_unmerged = store.get_unmerged()
     tasks = [t for t in all_unmerged if t.status == 'completed']
 
     if advance_type != 'implement':
@@ -300,7 +296,6 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
     git = Git(config.project_dir)
-    default_branch = git.default_branch()
 
     if args.task_id is not None:
         # Single task by ID
@@ -312,7 +307,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         tasks_to_refresh = [task]
     else:
         # All unmerged tasks (optionally including failed tasks with branches)
-        all_unmerged = store.get_unmerged(default_branch)
+        all_unmerged = store.get_unmerged()
         tasks_to_refresh = [t for t in all_unmerged if t.status == "completed"]
         if getattr(args, 'include_failed', False):
             all_tasks = store.get_history(limit=None, status='failed')
@@ -392,7 +387,7 @@ def _build_auto_merge_args(
 
 def _task_merge_unit_state(store: SqliteTaskStore, task: DbTask, *, target_branch: str | None) -> str | None:
     if task.id is not None:
-        unit = store.resolve_merge_unit_for_task(task.id, target_branch)
+        unit = store.resolve_merge_unit_for_task(task.id)
         if unit is not None:
             return unit.state
     return task.merge_status
@@ -408,9 +403,9 @@ def _resolve_merge_target_task(
         return None
     if task.id is None:
         return task
-    unit = store.resolve_merge_unit_for_task(task.id, target_branch)
+    unit = store.resolve_merge_unit_for_task(task.id)
     if unit is None:
-        unit = store.get_or_create_merge_unit_for_task(task, target_branch)
+        unit = store.get_or_create_merge_unit_for_task(task)
     if unit is None:
         return task
     representative = store.resolve_merge_unit_representative_task(
@@ -439,7 +434,7 @@ def _merge_single_task(
     if not task:
         print(f"Error: Task {task_id} not found")
         return 1
-    merge_unit = store.resolve_merge_unit_for_task(task.id, target_branch) if task.id is not None else None
+    merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
 
     # Validate task state
     if task.status not in ("completed", "unmerged"):
@@ -460,7 +455,7 @@ def _merge_single_task(
         if merge_unit is not None:
             store.set_merge_unit_state(merge_unit.id, "merged", merged_by_task_id=task.id)
         else:
-            store.set_merge_status(task.id, "merged", target_branch=target_branch)
+            store.set_merge_status(task.id, "merged")
         print(f"✓ Marked task {task.id} as merged (branch '{task.branch}' preserved)")
         return 0
 
@@ -561,7 +556,7 @@ def _merge_single_task(
             if merge_unit is not None:
                 store.set_merge_unit_state(merge_unit.id, "merged", merged_by_task_id=task.id)
             else:
-                store.set_merge_status(task.id, "merged", target_branch=target_branch)
+                store.set_merge_status(task.id, "merged")
         return 0
 
     except GitError as e:
@@ -609,7 +604,7 @@ def _merge_single_task(
                 if merge_unit is not None:
                     store.set_merge_unit_state(merge_unit.id, "merged", merged_by_task_id=task.id)
                 else:
-                    store.set_merge_status(task.id, "merged", target_branch=target_branch)
+                    store.set_merge_status(task.id, "merged")
             return 0
 
         print(f"Error during {operation}: {e}")
@@ -660,7 +655,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
     use_all = getattr(args, 'all', False)
     if use_all:
         seen_ids = set(task_ids)
-        for task in reversed(store.get_unmerged(default)):
+        for task in reversed(store.get_unmerged()):
             if task.id is None or task.id in seen_ids or not task.branch:
                 continue
             if task.status not in ("completed", "unmerged"):
@@ -686,7 +681,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
             print(f"Error: Task {raw_task_id} not found")
             return 1
         resolved_id = resolved.id
-        resolved_unit = store.resolve_merge_unit_for_task(resolved_id, default)
+        resolved_unit = store.resolve_merge_unit_for_task(resolved_id)
         if resolved_unit is not None:
             if resolved_unit.id in seen_units:
                 continue
@@ -1041,7 +1036,6 @@ def _run_task_backed_rebase(
             log_file=log_file_storage,
             output_content=output_content,
             has_commits=has_commits,
-            target_branch=rebase_target,
         )
 
         target_parent_id = parent_task_id or rebase_task.based_on
@@ -1053,7 +1047,7 @@ def _run_task_backed_rebase(
                 parent,
                 target_branch=rebase_target,
             ) == "merged":
-                store.set_merge_status(parent.id, "unmerged", target_branch=rebase_target)
+                store.set_merge_status(parent.id, "unmerged")
 
         if resolved_by_provider:
             logger.info(f"✓ Successfully rebased {branch} with provider assistance")
@@ -1385,7 +1379,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config)
     git = Git(config.project_dir)
-    default_branch = git.default_branch()
 
     include_git = not getattr(args, "pr_only", False)
     include_pr = not getattr(args, "git_only", False)
@@ -1396,13 +1389,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
         cohorts, preliminary_results = build_branch_cohorts_for_task_ids(
             store,
             resolved_ids,
-            target_branch=default_branch,
         )
     else:
-        cohorts = build_default_branch_cohorts(store, target_branch=default_branch)
+        cohorts = build_default_branch_cohorts(store)
 
     if not cohorts and not preliminary_results:
-        if not args.task_ids and store.get_sync_candidates(recent_days=30, cooldown_seconds=0, target_branch=default_branch):
+        if not args.task_ids and store.get_sync_candidates(recent_days=30, cooldown_seconds=0):
             cache_minutes = max(DEFAULT_SYNC_CACHE_SECONDS // 60, 1)
             print(f"No sync candidates: default sync cache is still warm ({cache_minutes}m cooldown).")
         else:
@@ -1751,7 +1743,7 @@ def _execute_merge_action(
         and execution_git.branch_exists(task.branch)
         and execution_git.is_merged(task.branch, execution_branch)
     ):
-        store.set_merge_status(task.id, "merged", target_branch=target_branch)
+        store.set_merge_status(task.id, "merged")
         return _MergeActionResult(
             rc=0,
             created_followups=created_followups,
@@ -1771,7 +1763,7 @@ def _execute_merge_action(
     if rc == 0 and merge_git is not None and merge_git.repo_dir != git.repo_dir:
         try:
             _promote_isolated_merge_to_target_branch(git, execution_git, target_branch)
-            store.set_merge_status(task.id, "merged", target_branch=target_branch)
+            store.set_merge_status(task.id, "merged")
         except GitError as exc:
             print(f"Error finalizing isolated merge success: {exc}")
             rc = 1
@@ -1890,8 +1882,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
             else:
                 planning_task = resolve_recovery_planning_task(store, task)
                 if planning_task is not task:
-                    tasks = [planning_task] if not _task_is_already_merged_for_target(
-                        store, planning_task, default_branch
+                    tasks = [planning_task] if not _task_is_already_merged(
+                        store, planning_task
                     ) else []
                     failed_tasks = []
                 else:
@@ -1901,7 +1893,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if task.status != 'completed':
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
                 return 1
-            if _task_is_already_merged_for_target(store, task, default_branch):
+            if _task_is_already_merged(store, task):
                 print(f"Task {task_id} is already merged")
                 return 0
             tasks = [task]

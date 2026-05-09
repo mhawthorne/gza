@@ -1371,7 +1371,6 @@ def _create_review_task(
     impl_task: DbTask,
     model: str | None = None,
     provider: str | None = None,
-    target_branch: str | None = None,
 ) -> DbTask:
     """Create a review task for an implementation task.
 
@@ -1384,7 +1383,6 @@ def _create_review_task(
         prompt_mode="cli",
         model=model,
         provider=provider,
-        target_branch=target_branch,
     )
 
 

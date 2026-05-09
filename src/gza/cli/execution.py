@@ -1453,12 +1453,12 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
     commit_count = git.count_commits_ahead(task.branch, default_branch)
     if commit_count <= 0:
         print(f"Note: No commits found on branch '{task.branch}' compared to '{default_branch}'")
-        store.mark_completed(task, branch=task.branch, has_commits=False, target_branch=default_branch)
+        store.mark_completed(task, branch=task.branch, has_commits=False)
         _cleanup_worker_registry(config, task_id)
         print(f"✓ Task {task_id} marked as completed")
         return 0
 
-    store.mark_completed(task, branch=task.branch, has_commits=True, target_branch=default_branch)
+    store.mark_completed(task, branch=task.branch, has_commits=True)
     _cleanup_worker_registry(config, task_id)
     print(f"✓ Task {task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
 
@@ -2062,7 +2062,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         return 1
 
     resolved_merge_unit = (
-        store.resolve_merge_unit_for_task(impl_task.id, target_branch) if impl_task.id is not None else None
+        store.resolve_merge_unit_for_task(impl_task.id) if impl_task.id is not None else None
     )
     resolved_merge_state = resolved_merge_unit.state if resolved_merge_unit is not None else impl_task.merge_status
     if resolved_from_failed_ancestor and resolved_merge_state == "merged":

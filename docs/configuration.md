@@ -973,7 +973,7 @@ gza merge <task_id> [task_id...] [options]
 | `--rebase` | Rebase onto current branch instead of merging |
 | `--delete` | Delete the branch after successful merge |
 | `--remote` | Fetch from origin and rebase against remote (requires --rebase) |
-| `--mark-only` | Mark branch as merged without performing actual merge (deletes branch) |
+| `--mark-only` | Mark branch as merged without performing the git merge or deleting the branch |
 | `--resolve` | Auto-resolve conflicts using AI when rebasing (requires --rebase) |
 
 `gza merge` only performs the local git merge/rebase path and updates local merge state. Merge units are the canonical persisted merge-truth model; compatibility task-row `merge_status` is dual-written from the selected unit during the migration window. Task selectors resolve through merge-unit membership first, so `uv run gza merge <review-task-id>` and same-branch follow-up task IDs merge the shared implementation branch/unit they belong to. It does not reconcile GitHub PR state. After merge, run `uv run gza sync` to refresh cached PR metadata and close any stale still-open PRs when remote default-branch state proves the changes already landed.

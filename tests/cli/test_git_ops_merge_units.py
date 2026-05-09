@@ -108,13 +108,13 @@ def test_collect_advance_completed_tasks_backfills_legacy_unmerged_owner(tmp_pat
     store.update(legacy)
 
     assert legacy.id is not None
-    assert store.resolve_merge_unit_for_task(legacy.id, "main") is None
+    assert store.resolve_merge_unit_for_task(legacy.id) is None
 
     tasks, impl_based_on_ids = _collect_advance_completed_tasks(store, target_branch="main")
 
     assert legacy.id not in impl_based_on_ids
     assert [task.id for task in tasks if task.task_type == "implement"] == [legacy.id]
-    unit = store.resolve_merge_unit_for_task(legacy.id, "main")
+    unit = store.resolve_merge_unit_for_task(legacy.id)
     assert unit is not None
     assert unit.state == "unmerged"
 
@@ -216,45 +216,26 @@ def test_merge_review_task_id_resolves_branchless_review_to_implementation_unit(
     assert store.resolve_merge_unit_for_task(review.id).id == store.resolve_merge_unit_for_task(impl.id).id
 
 
-def test_unmerged_uses_real_default_branch_for_merge_units(tmp_path: Path) -> None:
+def test_unmerged_lists_merge_unit_owner(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
-    impl = store.add("Implement master-target branch", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch="feature/master-target", target_branch="master")
+    impl = store.add("Implement feature", task_type="implement")
+    store.mark_completed(impl, has_commits=True, branch="feature/master-target")
     assert impl.id is not None
 
     fake_git = _MergeGit(tmp_path, default_branch="master")
-    with patch("gza.cli.query.Git", lambda project_dir: fake_git):
+    with (
+        patch("gza.cli.query.Git", lambda project_dir: fake_git),
+        patch("gza.github.GitHub.is_available", return_value=False),
+    ):
         result = run_gza("unmerged", "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 0
     assert impl.id in result.stdout
     unit = store.resolve_merge_unit_for_task(impl.id)
     assert unit is not None
-    assert unit.target_branch == "master"
-
-
-def test_pr_uses_requested_default_branch_merge_unit_state(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add("Implement release-target branch", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch="feature/release-target", target_branch="main")
-    assert impl.id is not None
-
-    main_unit = store.get_or_create_merge_unit_for_task(impl, "main")
-    release_unit = store.get_or_create_merge_unit_for_task(impl, "release")
-    assert main_unit is not None
-    assert release_unit is not None
-    store.set_merge_unit_state(main_unit.id, "merged")
-    store.set_merge_unit_state(release_unit.id, "unmerged")
-
-    fake_git = _MergeGit(tmp_path, default_branch="release")
-    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = run_gza("pr", str(impl.id), "--project", str(tmp_path), cwd=tmp_path)
-
-    assert "already marked as merged" not in result.stdout
+    assert unit.state == "unmerged"
 
 
 def test_merge_missing_explicit_task_id_fails_closed(tmp_path: Path) -> None:
@@ -290,7 +271,7 @@ def test_merge_all_backfills_legacy_unmerged_owner_when_units_exist(tmp_path: Pa
     assert "No unmerged done tasks found" not in result.stdout
     assert fake_git.merged == [("feature/legacy-merge-all", False)]
     assert legacy.id is not None
-    unit = store.resolve_merge_unit_for_task(legacy.id, "main")
+    unit = store.resolve_merge_unit_for_task(legacy.id)
     assert unit is not None
     assert unit.state == "merged"
 
@@ -343,7 +324,7 @@ def test_merge_explicit_retry_task_id_uses_actionable_member_when_owner_failed(t
 
     assert result.returncode == 0
     assert fake_git.merged == [("feature/explicit-retry", False)]
-    unit = store.resolve_merge_unit_for_task(retry.id, "main")
+    unit = store.resolve_merge_unit_for_task(retry.id)
     assert unit is not None
     assert unit.merged_by_task_id == retry.id
 

@@ -7206,8 +7206,8 @@ class TestIterateCommand:
         impl = self._make_completed_impl(store)
         assert impl.id is not None
 
-        main_unit = store.get_or_create_merge_unit_for_task(impl, "main")
-        release_unit = store.get_or_create_merge_unit_for_task(impl, "release")
+        main_unit = store.get_or_create_merge_unit_for_task(impl)
+        release_unit = store.get_or_create_merge_unit_for_task(impl)
         assert main_unit is not None
         assert release_unit is not None
         store.set_merge_unit_state(main_unit.id, "merged")

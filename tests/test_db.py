@@ -1971,80 +1971,6 @@ class TestMergeStatus:
         attached_ids = {task.id for task in store.list_tasks_for_merge_unit(impl_unit.id)}
         assert attached_ids == {impl.id, review.id, improve.id}
 
-    def test_mark_completed_with_non_main_target_branch_sets_merge_unit_target(self, tmp_path: Path) -> None:
-        """Completed code tasks should persist merge units against the real default branch."""
-        store = SqliteTaskStore(tmp_path / "test.db")
-
-        task = store.add(prompt="Implement feature", task_type="implement")
-        store.mark_completed(task, has_commits=True, branch="feature/master-target", target_branch="master")
-
-        assert task.id is not None
-        unit = store.resolve_merge_unit_for_task(task.id)
-        assert unit is not None
-        assert unit.target_branch == "master"
-        assert [candidate.id for candidate in store.get_unmerged("master")] == [task.id]
-
-    def test_default_target_branch_apis_use_store_default_merge_target_not_main(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Store-level merge-unit writes and reads should honor the configured default target."""
-        store = SqliteTaskStore(tmp_path / "test.db")
-        monkeypatch.setattr(store, "default_merge_target", lambda *, strict=False: "trunk")
-
-        task = store.add(prompt="Implement feature", task_type="implement")
-        store.mark_completed(task, has_commits=True, branch="feature/trunk-target")
-
-        assert task.id is not None
-        trunk_unit = store.resolve_merge_unit_for_task(task.id, "trunk")
-        main_unit = store.resolve_merge_unit_for_task(task.id, "main")
-        assert trunk_unit is not None
-        assert main_unit is None
-        assert [candidate.id for candidate in store.get_unmerged()] == [task.id]
-
-        store.set_merge_status(task.id, "merged")
-
-        refreshed_trunk_unit = store.resolve_merge_unit_for_task(task.id, "trunk")
-        refreshed_main_unit = store.resolve_merge_unit_for_task(task.id, "main")
-        assert refreshed_trunk_unit is not None
-        assert refreshed_trunk_unit.state == "merged"
-        assert refreshed_main_unit is None
-        assert store.get_unmerged() == []
-
-    def test_set_merge_status_without_target_updates_default_target_unit_only(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Compatibility writes without a target must resolve through the real default target."""
-        store = SqliteTaskStore(tmp_path / "test.db")
-        monkeypatch.setattr(store, "default_merge_target", lambda *, strict=False: "main")
-
-        task = store.add(prompt="Implement feature", task_type="implement")
-        store.mark_completed(task, has_commits=True, branch="feature/multi-target", target_branch="main")
-
-        assert task.id is not None
-        main_unit = store.resolve_merge_unit_for_task(task.id, "main")
-        assert main_unit is not None
-        release_unit = store.get_or_create_merge_unit_for_task(task, "release")
-        assert release_unit is not None
-
-        store.set_merge_unit_state(main_unit.id, "unmerged")
-        store.set_merge_unit_state(release_unit.id, "unmerged")
-
-        store.set_merge_status(task.id, "merged")
-
-        refreshed_main_unit = store.resolve_merge_unit_for_task(task.id, "main")
-        refreshed_release_unit = store.resolve_merge_unit_for_task(task.id, "release")
-        refreshed_task = store.get(task.id)
-        assert refreshed_main_unit is not None
-        assert refreshed_release_unit is not None
-        assert refreshed_task is not None
-        assert refreshed_main_unit.state == "merged"
-        assert refreshed_release_unit.state == "unmerged"
-        assert refreshed_task.merge_status == "merged"
-
     def test_mark_completed_without_explicit_target_raises_when_project_default_branch_fails(
         self,
         tmp_path: Path,
@@ -2060,7 +1986,7 @@ class TestMergeStatus:
                 store.mark_completed(task, has_commits=True, branch="feature/strict-default")
 
         assert task.id is not None
-        assert store.resolve_merge_unit_for_task(task.id, "main") is None
+        assert store.resolve_merge_unit_for_task(task.id) is None
         assert store.resolve_merge_unit_for_task(task.id) is None
 
     def test_get_unmerged_backfills_legacy_actionable_row_when_merge_units_exist(self, tmp_path: Path) -> None:
@@ -2077,12 +2003,12 @@ class TestMergeStatus:
 
         assert task.id is not None
         assert store.supports_merge_units() is True
-        assert store.resolve_merge_unit_for_task(task.id, "main") is None
+        assert store.resolve_merge_unit_for_task(task.id) is None
 
-        unmerged = store.get_unmerged("main")
+        unmerged = store.get_unmerged()
 
         assert [candidate.id for candidate in unmerged] == [task.id]
-        unit = store.resolve_merge_unit_for_task(task.id, "main")
+        unit = store.resolve_merge_unit_for_task(task.id)
         assert unit is not None
         assert unit.state == "unmerged"
         assert {member.id for member in store.list_tasks_for_merge_unit(unit.id)} == {task.id}
@@ -2104,12 +2030,12 @@ class TestMergeStatus:
         store.mark_completed(recovery, has_commits=True, branch="feature/recovered-work")
         assert recovery.id is not None
 
-        unit = store.resolve_merge_unit_for_task(recovery.id, "main")
+        unit = store.resolve_merge_unit_for_task(recovery.id)
         assert unit is not None
         assert unit.owner_task_id == failed.id
         assert store._legacy_merge_status_owner_for_unit(unit).id == failed.id
 
-        assert [task.id for task in store.get_unmerged("main")] == [recovery.id]
+        assert [task.id for task in store.get_unmerged()] == [recovery.id]
         representative = store.resolve_merge_unit_representative_task(unit, require_actionable=True)
         assert representative is not None
         assert representative.id == recovery.id
@@ -2132,7 +2058,7 @@ class TestMergeStatus:
         review.completed_at = datetime.now(UTC)
         store.update(review)
 
-        unit = store.get_or_create_merge_unit_for_task(impl, "master")
+        unit = store.get_or_create_merge_unit_for_task(impl)
         assert unit is not None
         assert review.id is not None
         assert store.resolve_merge_unit_for_task(review.id).id == unit.id
@@ -7923,7 +7849,7 @@ class TestSyncCandidates:
         unit_task.has_commits = True
         unit_task.merge_status = "unmerged"
         store.update(unit_task)
-        unit = store.get_or_create_merge_unit_for_task(unit_task, "main")
+        unit = store.get_or_create_merge_unit_for_task(unit_task)
         assert unit is not None
 
         legacy_task = store.add("Legacy task", task_type="implement")
@@ -7934,6 +7860,6 @@ class TestSyncCandidates:
         legacy_task.merge_status = "unmerged"
         store.update(legacy_task)
 
-        candidate_ids = {task.id for task in store.get_sync_candidates(recent_days=30, target_branch="main")}
+        candidate_ids = {task.id for task in store.get_sync_candidates(recent_days=30)}
 
         assert candidate_ids == {unit_task.id, legacy_task.id}

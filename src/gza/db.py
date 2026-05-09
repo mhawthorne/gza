@@ -177,7 +177,7 @@ def task_owns_merge_status(task: "Task") -> bool:
     Same-branch follow-up task types update an owning implementation branch
     rather than introducing independent merge truth for their own rows.
     """
-    if task.task_type not in {"task", "implement", "improve", "fix", "rebase"}:
+    if task.task_type not in {"task", "implement", "improve", "fix", "rebase", "explore"}:
         return False
     return not (task.task_type in {"improve", "fix", "rebase"} and task.based_on is not None)
 
@@ -412,7 +412,7 @@ class MergeUnit:
 
 def _task_is_actionable_merge_unit_member(task: "Task", unit: MergeUnit) -> bool:
     """Return whether the task is a mergeable representative for ``unit``."""
-    if task.task_type not in {"task", "implement", "improve", "fix", "rebase"}:
+    if task.task_type not in {"task", "implement", "improve", "fix", "rebase", "explore"}:
         return False
     if task.status not in {"completed", "unmerged"}:
         return False
@@ -2080,6 +2080,8 @@ class SqliteTaskStore:
         self._query_only_table_exists: dict[str, bool] = {}
         self._query_only_columns: dict[str, set[str]] = {}
         self._write_pragmas_applied = False
+        self._supports_merge_units_cache: bool | None = None
+        self._default_merge_target_cache: str | None = None
         if self._open_mode == "query_only":
             self._ensure_db_query_only()
         else:
@@ -2151,8 +2153,12 @@ class SqliteTaskStore:
             return self._query_only_table_exists.get("merge_units", False) and self._query_only_table_exists.get(
                 "merge_unit_tasks", False
             )
+        if self._supports_merge_units_cache is not None:
+            return self._supports_merge_units_cache
         with self._connect() as conn:
-            return _table_exists(conn, "merge_units") and _table_exists(conn, "merge_unit_tasks")
+            result = _table_exists(conn, "merge_units") and _table_exists(conn, "merge_unit_tasks")
+        self._supports_merge_units_cache = result
+        return result
 
     def default_merge_target(self, *, strict: bool = False) -> str:
         """Resolve the default merge target branch for stored merge units.
@@ -2161,6 +2167,8 @@ class SqliteTaskStore:
         write paths can pass ``strict=True`` to require Git default-branch resolution
         instead of silently persisting merge truth under an assumed target.
         """
+        if self._default_merge_target_cache is not None:
+            return self._default_merge_target_cache
         project_root = self._project_root
         if isinstance(project_root, Path):
             try:
@@ -2174,11 +2182,13 @@ class SqliteTaskStore:
                     ) from exc
                 default_branch = None
             if isinstance(default_branch, str) and default_branch:
+                self._default_merge_target_cache = default_branch
                 return default_branch
             if strict:
                 raise MergeTargetResolutionError(
                     f"Could not determine default merge target for {project_root}: Git returned no default branch"
                 )
+        self._default_merge_target_cache = "main"
         return "main"
 
     def _ensure_db(self) -> None:
@@ -3799,23 +3809,16 @@ class SqliteTaskStore:
                 (self._project_id, merge_unit_id, task_id, role, now),
             )
 
-    def resolve_merge_unit_for_task(
-        self,
-        task_id: str,
-        target_branch: str | None = None,
-    ) -> MergeUnit | None:
-        """Resolve the active merge unit attached to a task row."""
+    def resolve_merge_unit_for_task(self, task_id: str) -> MergeUnit | None:
+        """Resolve the active merge unit attached to a task row.
+
+        Each task has at most one active (non-superseded) merge unit.
+        """
         if not self.supports_merge_units():
             return None
-        effective_target = target_branch if isinstance(target_branch, str) else None
-        params: list[object] = [self._project_id, task_id]
-        target_filter = ""
-        if effective_target is not None:
-            target_filter = "AND mu.target_branch = ?"
-            params.append(effective_target)
         with self._connect() as conn:
             row = conn.execute(
-                f"""
+                """
                 SELECT mu.*
                 FROM merge_unit_tasks mut
                 JOIN merge_units mu
@@ -3824,19 +3827,10 @@ class SqliteTaskStore:
                 WHERE mut.project_id = ?
                   AND mut.task_id = ?
                   AND mu.superseded_by_unit_id IS NULL
-                  {target_filter}
-                ORDER BY CASE mu.state
-                    WHEN 'unmerged' THEN 0
-                    WHEN 'blocked' THEN 1
-                    WHEN 'stale' THEN 2
-                    WHEN 'merged' THEN 3
-                    ELSE 4
-                END,
-                mu.updated_at DESC,
-                mu.id DESC
+                ORDER BY mu.updated_at DESC, mu.id DESC
                 LIMIT 1
                 """,
-                tuple(params),
+                (self._project_id, task_id),
             ).fetchone()
         return self._row_to_merge_unit(row)
 
@@ -3902,13 +3896,12 @@ class SqliteTaskStore:
     def _resolve_related_merge_unit(
         self,
         related_branch_tasks: list[Task],
-        target_branch: str,
     ) -> MergeUnit | None:
         """Resolve an existing merge unit only from proven related same-branch tasks."""
         for branch_task in reversed(related_branch_tasks):
             if branch_task.id is None:
                 continue
-            active_unit = self.resolve_merge_unit_for_task(branch_task.id, target_branch)
+            active_unit = self.resolve_merge_unit_for_task(branch_task.id)
             if active_unit is not None and active_unit.superseded_by_unit_id is None:
                 return active_unit
         return None
@@ -3944,11 +3937,7 @@ class SqliteTaskStore:
                 continue
             self.attach_task_to_merge_unit(review_task.id, unit.id, "review")
 
-    def _attach_branchless_review_to_merge_unit(
-        self,
-        task: Task,
-        target_branch: str,
-    ) -> MergeUnit | None:
+    def _attach_branchless_review_to_merge_unit(self, task: Task) -> MergeUnit | None:
         """Attach a branchless review row to the implementation unit it reviews."""
         if task.id is None or task.task_type != "review":
             return None
@@ -3958,34 +3947,35 @@ class SqliteTaskStore:
             linked_task = self.get(linked_id)
             if linked_task is None or linked_task.id is None:
                 continue
-            unit = self.resolve_merge_unit_for_task(linked_task.id, target_branch)
+            unit = self.resolve_merge_unit_for_task(linked_task.id)
             if unit is None and linked_task.branch:
-                unit = self.get_or_create_merge_unit_for_task(linked_task, target_branch)
+                unit = self.get_or_create_merge_unit_for_task(linked_task)
             if unit is not None:
                 self.attach_task_to_merge_unit(task.id, unit.id, "review")
                 return unit
         return None
 
-    def get_or_create_merge_unit_for_task(
-        self,
-        task: Task,
-        target_branch: str,
-    ) -> MergeUnit | None:
-        """Resolve or backfill the merge unit associated with a task."""
+    def get_or_create_merge_unit_for_task(self, task: Task) -> MergeUnit | None:
+        """Resolve or backfill the merge unit associated with a task.
+
+        Each task has at most one merge unit (single-unit-per-task model). The
+        unit is created against the project's default merge target.
+        """
         if not self.supports_merge_units():
             return None
         if task.id is None:
             return None
-        existing = self.resolve_merge_unit_for_task(task.id, target_branch)
+        existing = self.resolve_merge_unit_for_task(task.id)
         if existing is not None:
             return existing
         if not task.branch:
-            return self._attach_branchless_review_to_merge_unit(task, target_branch)
+            return self._attach_branchless_review_to_merge_unit(task)
 
+        target_branch = self.default_merge_target(strict=True)
         same_branch_tasks = self.get_tasks_for_branch(task.branch)
         related_branch_tasks = self._related_branch_tasks_for_merge_unit(task, same_branch_tasks)
-        active_unit = self._resolve_related_merge_unit(related_branch_tasks, target_branch)
-        if active_unit is None or active_unit.target_branch != target_branch:
+        active_unit = self._resolve_related_merge_unit(related_branch_tasks)
+        if active_unit is None:
             owner_task = next((branch_task for branch_task in related_branch_tasks if task_owns_merge_status(branch_task)), task)
             active_unit = self.create_merge_unit(
                 source_branch=task.branch,
@@ -4006,15 +3996,14 @@ class SqliteTaskStore:
         self.dual_write_legacy_merge_status(active_unit.id)
         return active_unit
 
-    def list_merge_units_for_target(
+    def list_active_merge_units(
         self,
-        target_branch: str,
         states: tuple[str, ...] | None = None,
     ) -> list[MergeUnit]:
-        """List merge units for a target branch."""
+        """List active (non-superseded) merge units, optionally filtered by state."""
         if not self.supports_merge_units():
             return []
-        params: list[object] = [self._project_id, target_branch]
+        params: list[object] = [self._project_id]
         where_state = ""
         if states:
             where_state = f" AND state IN ({','.join('?' for _ in states)})"
@@ -4025,7 +4014,6 @@ class SqliteTaskStore:
                 SELECT *
                 FROM merge_units
                 WHERE project_id = ?
-                  AND target_branch = ?
                   AND superseded_by_unit_id IS NULL
                   {where_state}
                 ORDER BY updated_at DESC, id DESC
@@ -4161,21 +4149,19 @@ class SqliteTaskStore:
                 (head_sha, base_sha, now, self._project_id, unit_id),
             )
 
-    def get_unmerged_merge_units(self, target_branch: str) -> list[MergeUnit]:
-        """Return actionable merge units for the selected target."""
-        return self.list_merge_units_for_target(target_branch, states=("unmerged", "blocked", "stale"))
+    def get_unmerged_merge_units(self) -> list[MergeUnit]:
+        """Return actionable merge units."""
+        return self.list_active_merge_units(states=("unmerged", "blocked", "stale"))
 
-    def _get_unmerged_merge_units_with_legacy_fallback(self, target_branch: str) -> list[MergeUnit]:
+    def _get_unmerged_merge_units_with_legacy_fallback(self) -> list[MergeUnit]:
         """Return actionable merge units, lazily backfilling legacy rows when needed."""
         units_by_id: dict[str, MergeUnit] = {
-            unit.id: unit for unit in self.get_unmerged_merge_units(target_branch)
+            unit.id: unit for unit in self.get_unmerged_merge_units()
         }
         for task in self._legacy_unmerged_candidates():
             if task.id is None or not task.branch:
                 continue
-            if self.resolve_merge_unit_for_task(task.id, target_branch) is not None:
-                continue
-            unit = self.get_or_create_merge_unit_for_task(task, target_branch)
+            unit = self.get_or_create_merge_unit_for_task(task)
             if unit is None or unit.state not in {"unmerged", "blocked", "stale"}:
                 continue
             units_by_id.setdefault(unit.id, unit)
@@ -4185,7 +4171,7 @@ class SqliteTaskStore:
             reverse=True,
         )
 
-    def get_unmerged(self, target_branch: str | None = None) -> list[Task]:
+    def get_unmerged(self) -> list[Task]:
         """Get tasks with unmerged code (merge_status = 'unmerged').
 
         Excludes improve and rebase tasks that have a parent (based_on)
@@ -4193,16 +4179,20 @@ class SqliteTaskStore:
         branch. Standalone improve tasks with their own branch are included.
         """
         if self.supports_merge_units():
-            units = self._get_unmerged_merge_units_with_legacy_fallback(target_branch or self.default_merge_target())
-            representative_ids = [
-                representative.id
-                for unit in units
-                if (
-                    representative := self.resolve_merge_unit_representative_task(unit, require_actionable=True)
-                ) is not None
-                and representative.id is not None
-            ]
-            return [task for task_id in representative_ids if (task := self.get(task_id)) is not None]
+            units = self._get_unmerged_merge_units_with_legacy_fallback()
+            representatives: list[Task] = []
+            for unit in units:
+                rep = self.resolve_merge_unit_representative_task(unit, require_actionable=True)
+                if rep is not None:
+                    representatives.append(rep)
+            representatives.sort(
+                key=lambda task: (
+                    task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC),
+                    task_id_numeric_key(task.id),
+                ),
+                reverse=True,
+            )
+            return representatives
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -4241,19 +4231,17 @@ class SqliteTaskStore:
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
-    def get_canonical_unmerged_candidates(self, target_branch: str | None = None) -> list[Task]:
+    def get_canonical_unmerged_candidates(self) -> list[Task]:
         """Return canonical default-branch unmerged refresh candidates.
 
         Includes legacy completed code-bearing rows whose ``merge_status`` has not
         been backfilled yet so the shared reconciliation path can migrate them
         using the same merge-truth rules as current rows.
         """
-        effective_target = target_branch or self.default_merge_target()
         candidates: list[Task] = []
         seen_candidate_keys: set[tuple[str, str | None]] = set()
         if self.supports_merge_units():
-            units = self.get_unmerged_merge_units(effective_target)
-            for unit in units:
+            for unit in self.get_unmerged_merge_units():
                 for task in self.list_tasks_for_merge_unit(unit.id):
                     if task.id is None:
                         continue
@@ -4268,15 +4256,15 @@ class SqliteTaskStore:
             candidate_key = (task.id, task.branch)
             if candidate_key in seen_candidate_keys:
                 continue
-            if self.supports_merge_units() and self.resolve_merge_unit_for_task(task.id, effective_target) is not None:
+            if self.supports_merge_units() and self.resolve_merge_unit_for_task(task.id) is not None:
                 continue
             seen_candidate_keys.add(candidate_key)
             candidates.append(task)
         return candidates
 
-    def get_merge_status_backfill_candidates(self, target_branch: str | None = None) -> list[Task]:
+    def get_merge_status_backfill_candidates(self) -> list[Task]:
         """Return merge-owning legacy rows that still need merge_status backfill."""
-        return [task for task in self.get_canonical_unmerged_candidates(target_branch) if task.merge_status is None]
+        return [task for task in self.get_canonical_unmerged_candidates() if task.merge_status is None]
 
     def get_tasks_for_branch(self, branch: str) -> list[Task]:
         """Return all task rows attached to a branch, oldest first."""
@@ -4297,16 +4285,14 @@ class SqliteTaskStore:
         recent_days: int = 30,
         *,
         cooldown_seconds: int = 0,
-        target_branch: str | None = None,
     ) -> list[Task]:
         """Return a bounded set of branch-bearing task rows for `gza sync`."""
-        effective_target = target_branch or self.default_merge_target()
         if self.supports_merge_units():
             recent_cutoff_dt = datetime.now(UTC) - timedelta(days=recent_days)
             sync_cutoff_dt = datetime.now(UTC) - timedelta(seconds=max(cooldown_seconds, 0))
             tasks: list[Task] = []
             seen_ids: set[str] = set()
-            for unit in self.list_merge_units_for_target(effective_target):
+            for unit in self.list_active_merge_units():
                 activity_at = unit.merged_at or unit.updated_at or unit.created_at
                 if unit.state != "unmerged":
                     has_open_pr = unit.pr_number is not None and (unit.pr_state is None or unit.pr_state == "open")
@@ -4330,7 +4316,7 @@ class SqliteTaskStore:
             for task in self._legacy_sync_candidates(recent_days=recent_days, cooldown_seconds=cooldown_seconds):
                 if task.id is None or task.id in seen_ids:
                     continue
-                if self.resolve_merge_unit_for_task(task.id, effective_target) is not None:
+                if self.resolve_merge_unit_for_task(task.id) is not None:
                     continue
                 seen_ids.add(task.id)
                 tasks.append(task)
@@ -4381,25 +4367,14 @@ class SqliteTaskStore:
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
-    def set_merge_status(
-        self,
-        task_id: str,
-        merge_status: str | None,
-        *,
-        target_branch: str | None = None,
-    ) -> None:
+    def set_merge_status(self, task_id: str, merge_status: str | None) -> None:
         """Set the merge_status for a task. Records merged_at when setting to 'merged'."""
         if self.supports_merge_units():
             task = self.get(task_id)
             if task is not None:
-                effective_target = (
-                    target_branch
-                    if isinstance(target_branch, str) and target_branch
-                    else self.default_merge_target(strict=True)
-                )
-                unit = self.resolve_merge_unit_for_task(task_id, effective_target)
+                unit = self.resolve_merge_unit_for_task(task_id)
                 if unit is None:
-                    unit = self.get_or_create_merge_unit_for_task(task, effective_target)
+                    unit = self.get_or_create_merge_unit_for_task(task)
                 if unit is not None:
                     state = "merged" if merge_status == "merged" else ("unmerged" if merge_status is not None else "stale")
                     self.set_merge_unit_state(unit.id, state, merged_by_task_id=task_id if state == "merged" else None)
@@ -5304,7 +5279,6 @@ class SqliteTaskStore:
         diff_lines_added: int | None = None,
         diff_lines_removed: int | None = None,
         completion_reason: str | None = None,
-        target_branch: str | None = None,
     ) -> None:
         """Mark a task as completed."""
         task.status = "completed"
@@ -5337,8 +5311,7 @@ class SqliteTaskStore:
         task.diff_lines_removed = diff_lines_removed
         self.update(task)
         if has_commits and task.branch and task.id is not None and self.supports_merge_units():
-            effective_target = target_branch or self.default_merge_target(strict=True)
-            unit = self.get_or_create_merge_unit_for_task(task, effective_target)
+            unit = self.get_or_create_merge_unit_for_task(task)
             if unit is not None:
                 self.attach_task_to_merge_unit(
                     task.id,
@@ -5434,11 +5407,11 @@ class SqliteTaskStore:
 
 # === Merge status migration ===
 
-def needs_merge_status_migration(store: "SqliteTaskStore", *, target_branch: str | None = None) -> bool:
+def needs_merge_status_migration(store: "SqliteTaskStore") -> bool:
     """Check if any tasks need merge_status backfilled."""
     if store.supports_merge_units():
         return False
-    return bool(store.get_merge_status_backfill_candidates(target_branch))
+    return bool(store.get_merge_status_backfill_candidates())
 
 
 def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
@@ -5457,9 +5430,9 @@ def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
     assert isinstance(git, GitClass)
 
     default_branch = git.default_branch()
-    candidate_tasks = store.get_merge_status_backfill_candidates(default_branch)
+    candidate_tasks = store.get_merge_status_backfill_candidates()
     if store.supports_merge_units():
-        candidate_tasks = store.get_canonical_unmerged_candidates(default_branch)
+        candidate_tasks = store.get_canonical_unmerged_candidates()
 
     remote_default_ref: str | None = None
     remote_exists = getattr(git, "remote_exists", None)
@@ -5518,14 +5491,14 @@ def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
                 )
                 merge_status = "unmerged"
         if store.supports_merge_units() and task.branch:
-            unit = store.get_or_create_merge_unit_for_task(task, default_branch)
+            unit = store.get_or_create_merge_unit_for_task(task)
             if unit is not None:
                 store.set_merge_unit_state(
                     unit.id,
                     merge_status if merge_status is not None else "stale",
                 )
                 continue
-        store.set_merge_status(task.id, merge_status, target_branch=default_branch)
+        store.set_merge_status(task.id, merge_status)
 
 
 # === Editor support ===

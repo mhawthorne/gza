@@ -286,7 +286,7 @@ def _has_merged_retry_descendant(
                 unit.state
                 if (
                     child.id is not None
-                    and (unit := store.resolve_merge_unit_for_task(child.id, target_branch)) is not None
+                    and (unit := store.resolve_merge_unit_for_task(child.id)) is not None
                 )
                 else child.merge_status
             )
@@ -333,7 +333,7 @@ def _is_effective_shared_branch_lineage_merged(
     """Return merge truth for shared-branch descendants under a canonical root."""
     effective_head = _resolve_effective_shared_branch_retry_head(store, root_task)
     if effective_head.id is not None:
-        unit = store.resolve_merge_unit_for_task(effective_head.id, target_branch)
+        unit = store.resolve_merge_unit_for_task(effective_head.id)
         if unit is not None:
             return unit.state == "merged"
     return effective_head.merge_status == "merged"

@@ -88,13 +88,13 @@ def test_watch_collects_legacy_unmerged_owner_after_lazy_merge_unit_backfill(tmp
     store.update(legacy)
 
     assert legacy.id is not None
-    assert store.resolve_merge_unit_for_task(legacy.id, "main") is None
+    assert store.resolve_merge_unit_for_task(legacy.id) is None
 
     tasks, impl_based_on_ids = _collect_advance_completed_tasks(store, target_branch="main")
 
     assert legacy.id not in impl_based_on_ids
     assert [task.id for task in tasks if task.task_type == "implement"] == [legacy.id]
-    unit = store.resolve_merge_unit_for_task(legacy.id, "main")
+    unit = store.resolve_merge_unit_for_task(legacy.id)
     assert unit is not None
     assert unit.state == "unmerged"
 

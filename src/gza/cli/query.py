@@ -466,12 +466,12 @@ def _reconcile_unmerged_tasks(store: SqliteTaskStore, git: Git, default_branch: 
     merged_count = 0
     refreshed_count = 0
 
-    for task in store.get_unmerged(default_branch):
+    for task in store.get_unmerged():
         if task.id is None or not task.branch:
             continue
 
         if git.is_merged(task.branch, default_branch):
-            store.set_merge_status(task.id, "merged", target_branch=default_branch)
+            store.set_merge_status(task.id, "merged")
             merged_count += 1
             continue
 
@@ -1463,10 +1463,9 @@ def _enrich_unmerged_result(
     )
     needs_pr_metadata = "pr_url" in effective_fields
     gh: GitHub | None = None
-    gh_available = False
+    gh_available: bool | None = None
     if needs_pr_metadata:
         gh = GitHub()
-        gh_available = gh.is_available()
     rows: list[_TaskRow | _LineageRow] = []
 
     for row in result.rows:
@@ -1476,7 +1475,7 @@ def _enrich_unmerged_result(
 
         owner_task = row.owner_task
         merge_unit = (
-            store.resolve_merge_unit_for_task(owner_task.id, target_branch)
+            store.resolve_merge_unit_for_task(owner_task.id)
             if owner_task.id is not None
             else None
         )
@@ -1669,6 +1668,8 @@ def _enrich_unmerged_result(
 
         pr_url: str | None = None
         if needs_pr_metadata and gh is not None:
+            if gh_available is None:
+                gh_available = gh.is_available()
             pr_lookup = lookup_task_pr(
                 representative_task,
                 gh=gh,
@@ -1852,13 +1853,13 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
                     f"[/{TASK_COLORS['task_id']}]"
                 )
         else:
-            if needs_merge_status_migration(store, target_branch=default_branch):
+            if needs_merge_status_migration(store):
                 _print_unmerged_status(
                     f"[{TASK_COLORS['task_id']}]Migrating merge status for existing tasks..."
                     f"[/{TASK_COLORS['task_id']}]",
                     to_stderr=use_json,
                 )
-            refresh_cohorts = build_unmerged_branch_cohorts(store, default_branch)
+            refresh_cohorts = build_unmerged_branch_cohorts(store)
             refresh_candidate_count = sum(len(cohort.tasks) for cohort in refresh_cohorts)
             _print_unmerged_progress(
                 f"refreshing canonical merge truth for {refresh_candidate_count} candidate tasks "
@@ -1882,12 +1883,12 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
                     return 1
             if store.supports_merge_units():
                 selected_tasks = []
-                for unit in store.get_unmerged_merge_units(target_branch):
+                for unit in store.get_unmerged_merge_units():
                     representative = store.resolve_merge_unit_representative_task(unit, require_actionable=True)
                     if representative is not None:
                         selected_tasks.append(representative)
             else:
-                selected_tasks = [task for task in store.get_unmerged(target_branch) if task.status == "completed"]
+                selected_tasks = [task for task in store.get_unmerged() if task.status == "completed"]
     except sqlite3.OperationalError as exc:
         if _is_readonly_snapshot_refresh_error(
             exc,
@@ -1921,7 +1922,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     for task in selected_tasks:
         if task.id is None:
             continue
-        resolved_unit = store.resolve_merge_unit_for_task(task.id, target_branch)
+        resolved_unit = store.resolve_merge_unit_for_task(task.id)
         if resolved_unit is not None:
             merge_unit_ids_list.append(resolved_unit.id)
     merge_unit_ids = tuple(dict.fromkeys(merge_unit_ids_list))

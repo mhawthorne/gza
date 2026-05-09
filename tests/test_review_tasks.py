@@ -294,18 +294,17 @@ class TestCreateReviewTask:
         assert call_kwargs["depends_on"] == "gza-12"
         assert call_kwargs["based_on"] == "gza-12"
 
-    def test_attaches_review_to_requested_target_merge_unit(self):
+    def test_attaches_review_to_implementation_merge_unit(self):
         store = self._mock_store()
         impl = _task(id="gza-12")
         unit = MagicMock()
-        unit.target_branch = "release"
         store.resolve_merge_unit_for_task.return_value = unit
 
-        create_review_task(store, impl, prompt_mode="auto", target_branch="release")
+        create_review_task(store, impl, prompt_mode="auto")
 
-        store.resolve_merge_unit_for_task.assert_called_once_with("gza-12", "release")
+        store.resolve_merge_unit_for_task.assert_called_once_with("gza-12")
         review_task = store.add.return_value
-        store.get_or_create_merge_unit_for_task.assert_called_once_with(review_task, "release")
+        store.get_or_create_merge_unit_for_task.assert_called_once_with(review_task)
 
 
 class TestFollowupTasks:

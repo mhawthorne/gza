@@ -9765,34 +9765,6 @@ class TestDependencyMergePrecondition:
         assert target_branch == "main"
         assert git_error is None
 
-    def test_dependency_merge_precondition_uses_runner_default_branch_target(self, tmp_path: Path):
-        store = SqliteTaskStore(tmp_path / "test.db")
-        dependency = store.add("Dependency", task_type="implement")
-        store.mark_completed(dependency, has_commits=True, branch="feature/dependency")
-        assert dependency.id is not None
-
-        main_unit = store.get_or_create_merge_unit_for_task(dependency, "main")
-        release_unit = store.get_or_create_merge_unit_for_task(dependency, "release")
-        assert main_unit is not None
-        assert release_unit is not None
-        store.set_merge_unit_state(main_unit.id, "merged")
-        store.set_merge_unit_state(release_unit.id, "unmerged")
-
-        downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
-        git = Mock()
-
-        dep, target_branch, git_error = _check_dependency_merge_precondition(
-            downstream,
-            store,
-            git,
-            default_branch="main",
-        )
-
-        assert dep is None
-        assert target_branch is None
-        assert git_error is None
-
-
 class TestGetPlanForTask:
     def test_finds_plan_via_depends_on_only(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")

@@ -785,7 +785,7 @@ class TaskQueryService:
             "queue_position": task.queue_position,
             "lineage_root_id": root.id,
             "branch_owner_id": branch_owner.id,
-            "branch_merge_state": self._branch_merge_state(branch_owner, target_branch=target_branch),
+            "branch_merge_state": self._branch_merge_state(branch_owner),
             "shares_owner_branch": _is_shared_branch_descendant_query(task, root),
             "review_verdict": review_verdict,
             "comments_count": comments_count,
@@ -842,7 +842,7 @@ class TaskQueryService:
             "queue_position": owner.queue_position,
             "lineage_root_id": root.id,
             "branch_owner_id": owner.id,
-            "branch_merge_state": self._branch_merge_state(owner, target_branch=target_branch),
+            "branch_merge_state": self._branch_merge_state(owner),
             "shares_owner_branch": False,
             "review_verdict": self._latest_review_verdict(owner),
             "comments_count": len(self._store.get_comments(owner.id)) if owner.id else 0,
@@ -901,9 +901,9 @@ class TaskQueryService:
             return root
         return task
 
-    def _branch_merge_state(self, owner_task: DbTask, *, target_branch: str | None) -> str:
+    def _branch_merge_state(self, owner_task: DbTask) -> str:
         if owner_task.id is not None:
-            unit = self._store.resolve_merge_unit_for_task(owner_task.id, target_branch)
+            unit = self._store.resolve_merge_unit_for_task(owner_task.id)
             if unit is not None:
                 return unit.state
         if owner_task.merge_status == "merged":
@@ -961,7 +961,7 @@ class TaskQueryService:
 
     def _matches_merge_chain_state(self, task: DbTask, merge_states: set[str]) -> bool:
         owner = self._resolve_branch_owner(task)
-        owner_state = self._branch_merge_state(owner, target_branch=None)
+        owner_state = self._branch_merge_state(owner)
         if "merged" in merge_states and owner_state == "merged":
             return True
         if "unmerged" in merge_states and (

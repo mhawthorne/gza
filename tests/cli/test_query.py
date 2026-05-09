@@ -9182,7 +9182,7 @@ class TestUnmergedUnifiedQueryOutput:
         unit_task.merge_status = "unmerged"
         store.update(unit_task)
         assert unit_task.id is not None
-        existing_unit = store.get_or_create_merge_unit_for_task(unit_task, "main")
+        existing_unit = store.get_or_create_merge_unit_for_task(unit_task)
         assert existing_unit is not None
 
         legacy_task = store.add("Legacy task pending backfill", task_type="implement")
@@ -9193,7 +9193,7 @@ class TestUnmergedUnifiedQueryOutput:
         legacy_task.merge_status = "unmerged"
         store.update(legacy_task)
         assert legacy_task.id is not None
-        assert store.resolve_merge_unit_for_task(legacy_task.id, "main") is None
+        assert store.resolve_merge_unit_for_task(legacy_task.id) is None
 
         args = argparse.Namespace(
             project_dir=tmp_path,
@@ -9215,48 +9215,9 @@ class TestUnmergedUnifiedQueryOutput:
             "Unit-backed task",
         ]
         assert all(row["merge_unit_id"] for row in payload)
-        backfilled_unit = store.resolve_merge_unit_for_task(legacy_task.id, "main")
+        backfilled_unit = store.resolve_merge_unit_for_task(legacy_task.id)
         assert backfilled_unit is not None
         assert backfilled_unit.state == "unmerged"
-
-    def test_unmerged_default_target_keeps_selected_target_specific_merge_unit(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        store, task, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Main target task")
-        assert task.id is not None
-
-        main_unit = store.get_or_create_merge_unit_for_task(task, "main")
-        release_unit = store.get_or_create_merge_unit_for_task(task, "release")
-
-        assert main_unit is not None
-        assert release_unit is not None
-        assert main_unit.id != release_unit.id
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=True,
-            fields="id,prompt,merge_unit_id,target_branch",
-        )
-
-        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
-
-        captured = capsys.readouterr()
-        assert result == 0
-        payload = json.loads(captured.out)
-        assert payload == [
-            {
-                "id": task.id,
-                "prompt": "Main target task",
-                "merge_unit_id": main_unit.id,
-                "target_branch": "main",
-            }
-        ]
 
     def test_unmerged_default_refresh_ignores_historical_merged_unit_when_branch_is_reused(
         self,
@@ -9274,7 +9235,7 @@ class TestUnmergedUnifiedQueryOutput:
         historical.merge_status = "unmerged"
         store.update(historical)
         assert historical.id is not None
-        historical_unit = store.get_or_create_merge_unit_for_task(historical, "main")
+        historical_unit = store.get_or_create_merge_unit_for_task(historical)
         assert historical_unit is not None
         store.set_merge_unit_state(historical_unit.id, "merged")
 
@@ -9286,7 +9247,7 @@ class TestUnmergedUnifiedQueryOutput:
         unrelated.merge_status = "unmerged"
         store.update(unrelated)
         assert unrelated.id is not None
-        unrelated_unit = store.get_or_create_merge_unit_for_task(unrelated, "main")
+        unrelated_unit = store.get_or_create_merge_unit_for_task(unrelated)
         assert unrelated_unit is not None
         assert unrelated_unit.id != historical_unit.id
 
@@ -9314,8 +9275,8 @@ class TestUnmergedUnifiedQueryOutput:
 
         refreshed_historical = store.get(historical.id)
         refreshed_unrelated = store.get(unrelated.id)
-        refreshed_historical_unit = store.resolve_merge_unit_for_task(historical.id, "main")
-        refreshed_unrelated_unit = store.resolve_merge_unit_for_task(unrelated.id, "main")
+        refreshed_historical_unit = store.resolve_merge_unit_for_task(historical.id)
+        refreshed_unrelated_unit = store.resolve_merge_unit_for_task(unrelated.id)
         assert refreshed_historical is not None
         assert refreshed_unrelated is not None
         assert refreshed_historical_unit is not None
@@ -9365,7 +9326,7 @@ class TestUnmergedUnifiedQueryOutput:
             {
                 "id": retry.id,
                 "prompt": "Completed retry",
-                "merge_unit_id": store.resolve_merge_unit_for_task(retry.id, "main").id,
+                "merge_unit_id": store.resolve_merge_unit_for_task(retry.id).id,
             }
         ]
 
@@ -9376,7 +9337,7 @@ class TestUnmergedUnifiedQueryOutput:
     ) -> None:
         store, task, git = _setup_unmerged_env_fast(tmp_path, task_prompt="Live target unit metadata task")
         assert task.id is not None
-        unit = store.get_or_create_merge_unit_for_task(task, "main")
+        unit = store.get_or_create_merge_unit_for_task(task)
         assert unit is not None
         store.set_merge_unit_state(unit.id, "merged")
 
@@ -9406,7 +9367,7 @@ class TestUnmergedUnifiedQueryOutput:
     ) -> None:
         store, task, git = _setup_unmerged_env_fast(tmp_path, task_prompt="Live target text metadata task")
         assert task.id is not None
-        unit = store.get_or_create_merge_unit_for_task(task, "main")
+        unit = store.get_or_create_merge_unit_for_task(task)
         assert unit is not None
         store.set_merge_unit_state(unit.id, "merged")
 
