@@ -383,6 +383,25 @@ class TestLocalConfigOverrides:
         assert config.source_map["watch.poll"] == "local"
         assert config.source_map["watch.no_activity_timeout"] == "base"
 
+    def test_local_override_leaf_null_still_overrides_watch_value(self, tmp_path: Path):
+        """Leaf null overrides should remain explicit local overrides."""
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "watch:\n"
+            "  max_idle: 30\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "watch:\n"
+            "  max_idle: null\n"
+        )
+
+        config = Config.load(tmp_path)
+
+        assert config.watch.max_idle is None
+        assert config.source_map["watch.max_idle"] == "local"
+
     def test_local_override_full_watch_section_still_inherits_other_base_values(self, tmp_path: Path):
         """Non-empty local watch overrides should still deep-merge with the base config."""
         from gza.config import Config
