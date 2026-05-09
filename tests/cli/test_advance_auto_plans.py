@@ -61,6 +61,15 @@ def _create_completed_implement(store, prompt="Implement feature", based_on=None
     task.merge_status = "unmerged"
     task.has_commits = True
     store.update(task)
+    assert task.id is not None
+    unit = store.create_merge_unit(
+        source_branch=task.branch,
+        target_branch="main",
+        owner_task_id=task.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+    store.dual_write_legacy_merge_status(unit.id)
     return task
 
 

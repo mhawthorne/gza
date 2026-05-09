@@ -272,6 +272,16 @@ def _collect_advance_completed_tasks(
 
     all_unmerged = store.get_unmerged()
     tasks = [t for t in all_unmerged if t.status == 'completed']
+    if isinstance(target_branch, str):
+        filtered_tasks: list[DbTask] = []
+        for task in tasks:
+            unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
+            if unit is None:
+                unit = store.get_or_create_merge_unit_for_task(task)
+            if unit is not None and unit.target_branch != target_branch:
+                continue
+            filtered_tasks.append(task)
+        tasks = filtered_tasks
 
     if advance_type != 'implement':
         completed_plans = store.get_history(limit=None, status='completed', task_type='plan')
@@ -1808,7 +1818,6 @@ def cmd_advance(args: argparse.Namespace) -> int:
     def _prompt_avail(task_id: str | None) -> int:
         return prompt_available_width(prefix=len(task_id or "") + 4)  # "  #NNN "
     git = Git(config.project_dir)
-    default_branch = git.default_branch()
 
     dry_run: bool = args.dry_run
     auto: bool = getattr(args, 'auto', False)
@@ -1865,6 +1874,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     failed_tasks: list[DbTask] = []
     failed_task_recovery_warnings: list[str] = []
+    target_branch: str | None = None
 
     # Determine which tasks to advance
     if task_id is not None:
@@ -1898,10 +1908,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 return 0
             tasks = [task]
     else:
+        target_branch = git.current_branch()
         tasks, impl_based_on_ids = _collect_advance_completed_tasks(
             store,
             advance_type=advance_type,
-            target_branch=default_branch,
+            target_branch=target_branch,
         )
 
         # Apply failed-task filters after completed-task type filtering above.
@@ -1940,7 +1951,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     # Use the currently checked-out branch as the target for conflict checks,
     # merge execution, and rebase task creation.
-    target_branch = git.current_branch()
+    if target_branch is None:
+        target_branch = git.current_branch()
     use_iterate_mode = _advance_uses_iterate(config)
 
     def _worker_args() -> argparse.Namespace:
