@@ -38,6 +38,23 @@ def test_agents_document_pytest_hang_triage_rules() -> None:
         assert snippet in agents_content
 
 
+def test_tests_integration_module_guidance_avoids_stale_test_paths() -> None:
+    """Integration test module docstrings should not point at the removed tests/test_integration.py path."""
+    repo_root = Path(__file__).resolve().parents[1]
+    integration_tests_root = repo_root / "tests_integration"
+
+    stale_references: list[str] = []
+    for path in sorted(integration_tests_root.glob("*.py")):
+        content = path.read_text()
+        if "tests/test_integration.py" in content:
+            stale_references.append(str(path.relative_to(repo_root)))
+
+    assert not stale_references, (
+        "Found stale tests/test_integration.py guidance under tests_integration/: "
+        + ", ".join(stale_references)
+    )
+
+
 def test_configuration_docs_require_full_prefixed_ids_for_strict_commands() -> None:
     """Strict-ID command reference entries should consistently require full prefixed IDs."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"

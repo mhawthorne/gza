@@ -3,7 +3,8 @@
 These tests require valid credentials and Docker, so they're marked
 as integration tests and skipped by default.
 
-Run with: uv run pytest tests/test_integration.py -v -m integration
+Run with: uv run pytest tests_integration/test_docker.py -v -m integration
+Or: bin/tests --integration
 """
 
 import os
