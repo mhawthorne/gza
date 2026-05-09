@@ -4139,19 +4139,34 @@ class SqliteTaskStore:
             )
         self.dual_write_legacy_merge_status(unit_id)
 
-    def refresh_merge_unit_head(self, unit_id: str, head_sha: str | None, base_sha: str | None) -> None:
+    def refresh_merge_unit_head(
+        self,
+        unit_id: str,
+        head_sha: str | None | object = DB_UNSET,
+        base_sha: str | None | object = DB_UNSET,
+    ) -> None:
         """Update stored branch-head metadata for a merge unit."""
         if not self.supports_merge_units():
             return
+        updates = ["updated_at = ?"]
+        params: list[Any] = [datetime.now(UTC).isoformat()]
+        if head_sha is not DB_UNSET:
+            normalized_head_sha = head_sha if isinstance(head_sha, str) and head_sha else None
+            updates.append("head_sha = ?")
+            params.append(normalized_head_sha)
+        if base_sha is not DB_UNSET:
+            normalized_base_sha = base_sha if isinstance(base_sha, str) and base_sha else None
+            updates.append("base_sha = ?")
+            params.append(normalized_base_sha)
+        if len(updates) == 1:
+            return
         now = datetime.now(UTC).isoformat()
+        params[0] = now
+        params.extend([self._project_id, unit_id])
         with self._connect() as conn:
             conn.execute(
-                """
-                UPDATE merge_units
-                SET head_sha = ?, base_sha = ?, updated_at = ?
-                WHERE project_id = ? AND id = ?
-                """,
-                (head_sha, base_sha, now, self._project_id, unit_id),
+                f"UPDATE merge_units SET {', '.join(updates)} WHERE project_id = ? AND id = ?",
+                tuple(params),
             )
 
     def get_unmerged_merge_units(self) -> list[MergeUnit]:
@@ -5297,6 +5312,8 @@ class SqliteTaskStore:
         diff_files_changed: int | None = None,
         diff_lines_added: int | None = None,
         diff_lines_removed: int | None = None,
+        head_sha: str | None | object = DB_UNSET,
+        base_sha: str | None | object = DB_UNSET,
         completion_reason: str | None = None,
     ) -> None:
         """Mark a task as completed."""
@@ -5337,6 +5354,7 @@ class SqliteTaskStore:
                     unit.id,
                     "owner" if task.id == unit.owner_task_id else merge_unit_membership_role(task),
                 )
+                self.refresh_merge_unit_head(unit.id, head_sha, base_sha)
                 self.set_merge_unit_state(
                     unit.id,
                     "unmerged",

@@ -22,7 +22,7 @@ from ..console import (
     prompt_available_width,
     shorten_prompt,
 )
-from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from ..db import DB_UNSET, SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..dependency_preconditions import task_is_merged
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import (
@@ -87,6 +87,30 @@ from .advance_executor import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _best_effort_git_ref_sha(git: Git, ref: str | None) -> str | None:
+    """Resolve a ref SHA when available without failing the caller on missing refs."""
+    if not ref:
+        return None
+
+    def _normalize(value: object) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
+    if callable(rev_parse_if_exists):
+        try:
+            return _normalize(rev_parse_if_exists(ref))
+        except GitError:
+            return None
+
+    rev_parse = getattr(git, "rev_parse", None)
+    if callable(rev_parse):
+        try:
+            return _normalize(rev_parse(ref))
+        except GitError:
+            return None
+    return None
 
 
 def _task_is_already_merged(store: SqliteTaskStore, task: DbTask) -> bool:
@@ -343,6 +367,8 @@ def cmd_refresh(args: argparse.Namespace) -> int:
             f"{task_label} {result.branch}: +{result.diff_lines_added} -{result.diff_lines_removed} "
             f"in {result.diff_files_changed} files"
         )
+        if result.warnings:
+            console.print(f"[yellow]Warning:[/yellow] {'; '.join(result.warnings)}")
 
     print(f"\nRefreshed {refreshed} task(s), skipped {skipped}.")
     return 0
@@ -1041,12 +1067,16 @@ def _run_task_backed_rebase(
             output_content = f"Resolved conflicts and rebased '{branch}' onto '{rebase_target}'."
 
         has_commits = _branch_has_commits(config, branch)
+        head_sha = _best_effort_git_ref_sha(worktree_git, branch)
+        base_sha = _best_effort_git_ref_sha(worktree_git, rebase_target)
         store.mark_completed(
             rebase_task,
             branch=branch,
             log_file=log_file_storage,
             output_content=output_content,
             has_commits=has_commits,
+            head_sha=head_sha if head_sha is not None else DB_UNSET,
+            base_sha=base_sha if base_sha is not None else DB_UNSET,
         )
 
         target_parent_id = parent_task_id or rebase_task.based_on
@@ -1456,6 +1486,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
             parts.append(f"pr={pr_num}:{result.pr_state or 'unknown'}")
         if result.actions:
             parts.append(", ".join(result.actions))
+        if result.warnings:
+            parts.append(f"warnings: {'; '.join(result.warnings)}")
         if result.errors:
             parts.append(f"errors: {'; '.join(result.errors)}")
         print(" | ".join(parts))

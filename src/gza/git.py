@@ -531,6 +531,13 @@ class Git:
         result = self._run("rev-parse", "--verify", f"{ref}^{{commit}}")
         return result.stdout.strip()
 
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        """Resolve a ref to its commit SHA when it exists."""
+        result = self._run("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+
     def get_commit_subject(self, commit_ref: str) -> str:
         """Get the subject line for a single committed revision."""
         result = self._run("show", "-s", "--format=%s", commit_ref, check=False)

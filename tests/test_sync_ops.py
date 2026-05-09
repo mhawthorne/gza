@@ -8,13 +8,13 @@ from gza.git import GitError
 from gza.github import GitHubError, PullRequestDetails
 from gza.sync_ops import (
     BranchCohort,
-    build_default_branch_cohorts,
     build_branch_cohorts_for_task_ids,
+    build_default_branch_cohorts,
     build_task_branch_cohort,
     build_unmerged_branch_cohorts,
-    refresh_branch_diff_stats,
     reconcile_branch_merge_truth,
     reconcile_task_branch_merge_truth,
+    refresh_branch_diff_stats,
     sync_branch_cohorts,
 )
 
@@ -136,6 +136,10 @@ def test_reconcile_task_branch_merge_truth_persists_branch_state(tmp_path):
     git.branch_exists.return_value = True
     git.is_merged.return_value = False
     git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/scoped-sync": "head-sync-123",
+        "main": "base-sync-456",
+    }.get(ref)
 
     result = reconcile_task_branch_merge_truth(
         store,
@@ -151,6 +155,10 @@ def test_reconcile_task_branch_merge_truth_persists_branch_state(tmp_path):
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.diff_files_changed == 1
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    assert unit.head_sha == "head-sync-123"
+    assert unit.base_sha == "base-sync-456"
 
 
 def test_sync_branch_cohorts_normalizes_same_branch_rows(tmp_path):
@@ -281,6 +289,10 @@ def test_sync_branch_cohorts_persists_merge_units(tmp_path):
     git.branch_exists.return_value = True
     git.is_merged.return_value = False
     git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/master-target-sync": "head-master-123",
+        "master": "base-master-456",
+    }.get(ref)
 
     results, partial = sync_branch_cohorts(
         store,
@@ -298,6 +310,44 @@ def test_sync_branch_cohorts_persists_merge_units(tmp_path):
     unit = store.resolve_merge_unit_for_task(task.id)
     assert unit is not None
     assert unit.state == "unmerged"
+    assert unit.head_sha == "head-master-123"
+    assert unit.base_sha == "base-master-456"
+
+
+def test_reconcile_task_branch_merge_truth_preserves_existing_base_sha_on_partial_resolution(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/partial-provenance")
+    assert task.id is not None
+
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, "head-old-123", "base-old-456")
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/partial-provenance": "head-new-789",
+        "main": None,
+    }.get(ref)
+
+    result = reconcile_task_branch_merge_truth(
+        store,
+        git,
+        task.id,
+        target_branch="main",
+        include_diff_stats=True,
+        persist=True,
+    )
+
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.head_sha == "head-new-789"
+    assert refreshed_unit.base_sha == "base-old-456"
+    assert result.warnings == [
+        "degraded merge-unit provenance: could not resolve base SHA for 'main'; preserving any stored base_sha"
+    ]
 
 
 def test_sync_branch_cohorts_skips_persisting_mismatched_target_branch_merge_unit(tmp_path):
@@ -444,6 +494,68 @@ def test_refresh_branch_diff_stats_skips_mismatched_target_branch_merge_unit(tmp
     assert refreshed_task.sync_last_synced_at is None
     assert refreshed_unit.state == "merged"
     assert refreshed_unit.sync_last_synced_at is None
+
+
+def test_refresh_branch_diff_stats_preserves_existing_base_sha_on_partial_resolution(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/refresh-partial-base")
+    assert task.id is not None
+
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, "head-old-123", "base-old-456")
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/refresh-partial-base": "head-new-789",
+        "main": None,
+    }.get(ref)
+
+    results, skipped = refresh_branch_diff_stats(store, git, [task])
+
+    assert skipped == 0
+    assert len(results) == 1
+    assert results[0].warnings == [
+        "degraded merge-unit provenance: could not resolve base SHA for 'main'; preserving any stored base_sha"
+    ]
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.head_sha == "head-new-789"
+    assert refreshed_unit.base_sha == "base-old-456"
+
+
+def test_refresh_branch_diff_stats_preserves_existing_head_sha_on_partial_resolution(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/refresh-partial-head")
+    assert task.id is not None
+
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, "head-old-123", "base-old-456")
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/refresh-partial-head": None,
+        "main": "base-new-789",
+    }.get(ref)
+
+    results, skipped = refresh_branch_diff_stats(store, git, [task])
+
+    assert skipped == 0
+    assert len(results) == 1
+    assert results[0].warnings == [
+        "degraded merge-unit provenance: could not resolve head SHA for 'feature/refresh-partial-head'; preserving any stored head_sha"
+    ]
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.head_sha == "head-old-123"
+    assert refreshed_unit.base_sha == "base-new-789"
 
 
 def test_build_default_branch_cohorts_unions_merge_units_and_legacy_branches_without_duplicates(tmp_path):

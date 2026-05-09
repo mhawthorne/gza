@@ -1391,6 +1391,20 @@ class TestExtractionGitHelpers:
                 check=False,
             )
 
+    def test_rev_parse_if_exists_returns_sha_or_none(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="abc123\n", stderr=""),
+                MagicMock(returncode=1, stdout="", stderr=""),
+            ]
+
+            assert git.rev_parse_if_exists("main") == "abc123"
+            assert git.rev_parse_if_exists("missing") is None
+
     def test_resolve_merge_source_ref_prefers_local_branch(self, tmp_path: Path):
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()

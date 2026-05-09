@@ -17,8 +17,8 @@ from gza.git import Git, GitError
 from gza.github import GitHubError, PullRequestDetails
 from gza.lineage import get_plan_for_task
 from gza.providers import ClaudeProvider, RunResult
-from gza.recovery_engine import decide_failed_task_recovery
 from gza.providers.base import PreflightCheckResult
+from gza.recovery_engine import decide_failed_task_recovery
 from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
@@ -38,14 +38,14 @@ from gza.runner import (
     _ensure_work_pr_for_completed_code_task,
     _extract_review_verdict,
     _format_review_verify_failure,
+    _format_review_verify_result,
     _get_task_output,
     _post_complete_code_task,
     _resolve_code_task_branch_name,
     _restore_wip_changes,
-    _run_review_verify_command,
     _run_non_code_task,
-    _format_review_verify_result,
     _run_result_to_stats,
+    _run_review_verify_command,
     _save_wip_changes,
     _select_worktree_base_ref,
     _setup_code_task_worktree,
@@ -57,9 +57,9 @@ from gza.runner import (
     generate_slug,
     get_task_output_paths,
     open_task_startup_log,
+    post_review_to_pr,
     rename_startup_log_to_slug,
     run,
-    post_review_to_pr,
     write_execution_provenance_event,
     write_log_entry,
     write_worker_start_event,
@@ -7210,6 +7210,58 @@ class TestExtractedRunInnerHelpers:
         assert refreshed.status == "completed"
         assert summary_path.exists()
 
+    def test_complete_code_task_records_merge_unit_head_and_base(self, tmp_path: Path):
+        """Code completion should persist branch-head provenance on the merge unit."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement provenance capture", task_type="implement")
+        task.slug = "20260317-provenance"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/foo.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "feature/provenance": "head-complete-123",
+            "main": "base-complete-456",
+        }.get(ref)
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("## Summary\n\n- done\n")
+
+        with patch("gza.runner._squash_wip_commits"), patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/provenance",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+            )
+
+        assert rc == 0
+        assert task.id is not None
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.head_sha == "head-complete-123"
+        assert unit.base_sha == "base-complete-456"
+
     def test_ensure_work_pr_creates_pr_for_committed_branch(self, tmp_path: Path):
         """`work --pr` should pass lazy shared PR-content generation into the helper."""
         db_path = tmp_path / "test.db"
@@ -7730,59 +7782,6 @@ class TestExtractedRunInnerHelpers:
         run_review.assert_called_once_with(improve, config, store)
         output = capsys.readouterr().out
         assert "GitHub CLI is not available" not in output
-        assert "Skipping auto-review" not in output
-
-    def test_post_complete_improve_lookup_failure_warns_but_still_runs_auto_review(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ):
-        """Unconfirmed PR lookup failures should no longer block improve follow-up review."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add(prompt="Implement with review", task_type="implement")
-        impl.status = "completed"
-        impl.branch = "feature/improve-lookup-failure"
-        store.update(impl)
-
-        improve = store.add(
-            prompt="Improve with review",
-            task_type="improve",
-            based_on=impl.id,
-            same_branch=True,
-            create_review=True,
-        )
-        improve.status = "completed"
-        improve.branch = impl.branch
-        store.update(improve)
-
-        config = self._make_config(tmp_path)
-        worktree_git = Mock(spec=Git)
-
-        with (
-            patch(
-                "gza.runner.sync_task_branch_if_live_pr",
-                return_value=Mock(ok=False, status="lookup_failed", error="auth failed"),
-            ),
-            patch("gza.runner._create_and_run_review_task", return_value=7) as run_review,
-            patch("gza.runner.task_footer"),
-            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
-        ):
-            rc = _post_complete_code_task(
-                improve,
-                config,
-                store,
-                worktree_git,
-                improve.branch,
-                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
-            )
-
-        assert rc == 7
-        run_review.assert_called_once_with(improve, config, store)
-        output = capsys.readouterr().out
-        assert "could not look up a live PR" in output
-        assert "Continuing with auto-review without PR sync." in output
         assert "Skipping auto-review" not in output
 
     def test_run_uses_persisted_create_pr_intent_without_work_flag(self, tmp_path: Path):

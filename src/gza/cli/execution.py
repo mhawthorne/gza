@@ -1503,7 +1503,13 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
         print(f"✓ Task {task_id} marked as completed")
         return 0
 
-    store.mark_completed(task, branch=task.branch, has_commits=True)
+    store.mark_completed(
+        task,
+        branch=task.branch,
+        has_commits=True,
+        head_sha=git.rev_parse_if_exists(task.branch),
+        base_sha=git.rev_parse_if_exists(default_branch),
+    )
     _cleanup_worker_registry(config, task_id)
     print(f"✓ Task {task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
 

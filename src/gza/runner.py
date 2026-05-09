@@ -3338,6 +3338,8 @@ def _complete_code_task(
     default_branch = target_branch if target_branch is not None else worktree_git.default_branch()
     numstat_output = worktree_git.get_diff_numstat(f"{default_branch}...{branch_name}")
     diff_files, diff_added, diff_removed = parse_diff_numstat(numstat_output)
+    head_sha = worktree_git.rev_parse_if_exists(branch_name)
+    base_sha = worktree_git.rev_parse_if_exists(default_branch)
 
     # Keep branch context on the in-memory task so PR ensure can run before
     # the final completed-state DB transition.
@@ -3411,6 +3413,8 @@ def _complete_code_task(
         diff_files_changed=diff_files,
         diff_lines_added=diff_added,
         diff_lines_removed=diff_removed,
+        head_sha=head_sha,
+        base_sha=base_sha,
     )
     return _post_complete_code_task(
         task,
@@ -3666,6 +3670,8 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
     task.failure_reason = None
     task.completion_reason = None
     target_branch: str | None = git.default_branch() if task.branch and task.has_commits else None
+    head_sha = git.rev_parse_if_exists(task.branch) if task.branch and task.has_commits else None
+    base_sha = git.rev_parse_if_exists(target_branch) if target_branch and task.has_commits else None
     store.mark_completed(
         task,
         branch=task.branch,
@@ -3676,6 +3682,8 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
         diff_files_changed=task.diff_files_changed,
         diff_lines_added=task.diff_lines_added,
         diff_lines_removed=task.diff_lines_removed,
+        head_sha=head_sha,
+        base_sha=base_sha,
     )
     return _post_complete_code_task(
         task,

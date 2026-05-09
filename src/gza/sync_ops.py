@@ -75,10 +75,13 @@ class BranchSyncResult:
     diff_lines_removed: int | None = None
     pr_number: int | None = None
     pr_state: str | None = None
+    head_sha: str | None = None
+    base_sha: str | None = None
     fetch_attempted: bool = False
     fetch_succeeded: bool = False
     reconciled: bool = False
     actions: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -311,6 +314,33 @@ def _remote_branch_ref_for_reconcile(
     return None
 
 
+def _best_effort_rev_parse(git: Git, ref: str | None) -> tuple[str | None, str | None]:
+    """Return a commit SHA for ``ref`` plus any unexpected-resolution warning."""
+    if not ref:
+        return None, None
+
+    def _normalize(value: object) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
+    if callable(rev_parse_if_exists):
+        try:
+            return _normalize(rev_parse_if_exists(ref)), None
+        except GitError:
+            return None, None
+        except Exception as exc:
+            return None, f"unexpected error resolving ref '{ref}': {exc}"
+    rev_parse = getattr(git, "rev_parse", None)
+    if callable(rev_parse):
+        try:
+            return _normalize(rev_parse(ref)), None
+        except GitError:
+            return None, None
+        except Exception as exc:
+            return None, f"unexpected error resolving ref '{ref}': {exc}"
+    return None, None
+
+
 def reconcile_branch_merge_truth(
     git: Git,
     cohorts: list[BranchCohort],
@@ -363,6 +393,25 @@ def reconcile_branch_merge_truth(
             result.merge_status = desired_merge_status
             continue
 
+        result.head_sha, head_warning = _best_effort_rev_parse(git, reconcile_ref)
+        result.base_sha, base_warning = _best_effort_rev_parse(git, remote_target_ref or target_branch)
+        if head_warning is not None:
+            result.warnings.append(head_warning)
+        if base_warning is not None:
+            result.warnings.append(base_warning)
+        if (result.head_sha is None) ^ (result.base_sha is None):
+            if result.head_sha is None:
+                result.warnings.append(
+                    f"degraded merge-unit provenance: could not resolve head SHA for '{cohort.branch}'; "
+                    "preserving any stored head_sha"
+                )
+            else:
+                target_ref = remote_target_ref or target_branch
+                result.warnings.append(
+                    f"degraded merge-unit provenance: could not resolve base SHA for '{target_ref}'; "
+                    "preserving any stored base_sha"
+                )
+
         if remote_merged is True or target_merged is True:
             desired_merge_status = "merged"
             _mark_merged(result)
@@ -392,11 +441,30 @@ class _BranchPersistenceUpdate:
     pr_number: int | None | object = _UNSET
     pr_state: str | None | object = _UNSET
     pr_last_synced_at: datetime | None | object = _UNSET
+    head_sha: str | None | object = _UNSET
+    base_sha: str | None | object = _UNSET
+
+
+def _provenance_persistence_update(
+    *,
+    head_sha: str | None,
+    base_sha: str | None,
+) -> _BranchPersistenceUpdate:
+    """Persist only resolved provenance fields so degraded refreshes preserve stored SHAs."""
+    update = _BranchPersistenceUpdate()
+    if head_sha is not None:
+        update.head_sha = head_sha
+    if base_sha is not None:
+        update.base_sha = base_sha
+    return update
 
 
 def _git_reconcile_update(result: BranchSyncResult) -> _BranchPersistenceUpdate:
     """Translate a git-reconcile result into branch-state persistence fields."""
-    update = _BranchPersistenceUpdate()
+    update = _provenance_persistence_update(
+        head_sha=result.head_sha,
+        base_sha=result.base_sha,
+    )
     if result.merge_status is not None:
         update.merge_status = result.merge_status
     if "refreshed diff stats" in result.actions:
@@ -423,6 +491,10 @@ def _merge_persistence_update(
         base.pr_state = overlay.pr_state
     if overlay.pr_last_synced_at is not _UNSET:
         base.pr_last_synced_at = overlay.pr_last_synced_at
+    if overlay.head_sha is not _UNSET:
+        base.head_sha = overlay.head_sha
+    if overlay.base_sha is not _UNSET:
+        base.base_sha = overlay.base_sha
     return base
 
 
@@ -558,6 +630,8 @@ def _persist_branch_updates(
             pr_number=update.pr_number,
             pr_state=update.pr_state,
             pr_last_synced_at=update.pr_last_synced_at,
+            head_sha=update.head_sha,
+            base_sha=update.base_sha,
             sync_last_synced_at=(
                 sync_completed_at if sync_completed_at is not None else _UNSET
             ),
@@ -860,13 +934,36 @@ def refresh_branch_diff_stats(
         result.diff_files_changed = files_changed
         result.diff_lines_added = lines_added
         result.diff_lines_removed = lines_removed
+        result.head_sha, head_warning = _best_effort_rev_parse(git, cohort.branch)
+        result.base_sha, base_warning = _best_effort_rev_parse(git, default_branch)
+        if head_warning is not None:
+            result.warnings.append(head_warning)
+        if base_warning is not None:
+            result.warnings.append(base_warning)
+        if (result.head_sha is None) ^ (result.base_sha is None):
+            if result.head_sha is None:
+                result.warnings.append(
+                    f"degraded merge-unit provenance: could not resolve head SHA for '{cohort.branch}'; "
+                    "preserving any stored head_sha"
+                )
+            else:
+                result.warnings.append(
+                    f"degraded merge-unit provenance: could not resolve base SHA for '{default_branch}'; "
+                    "preserving any stored base_sha"
+                )
         result.actions.append("refreshed diff stats")
+        provenance_update = _provenance_persistence_update(
+            head_sha=result.head_sha,
+            base_sha=result.base_sha,
+        )
         _persist_branch_state(
             store,
             cohort.code_tasks,
             default_branch,
             merge_unit_id=cohort.merge_unit_id,
             diff_stats=(files_changed, lines_added, lines_removed),
+            head_sha=provenance_update.head_sha,
+            base_sha=provenance_update.base_sha,
         )
         ordered_results[idx] = result
     results.extend(ordered_results[idx] for idx in range(len(cohorts)))
@@ -885,6 +982,8 @@ def _persist_branch_state(
     pr_number: int | None | object = _UNSET,
     pr_state: str | None | object = _UNSET,
     pr_last_synced_at: datetime | None | object = _UNSET,
+    head_sha: str | None | object = _UNSET,
+    base_sha: str | None | object = _UNSET,
     sync_last_synced_at: datetime | None | object = _UNSET,
 ) -> None:
     """Write normalized branch-scoped sync state back to each code-bearing row.
@@ -902,6 +1001,12 @@ def _persist_branch_state(
         if unit is not None:
             if had_existing_unit and unit.target_branch != target_branch:
                 return
+            if head_sha is not _UNSET or base_sha is not _UNSET:
+                store.refresh_merge_unit_head(
+                    unit.id,
+                    DB_UNSET if head_sha is _UNSET else cast("str | None", head_sha),
+                    DB_UNSET if base_sha is _UNSET else cast("str | None", base_sha),
+                )
             diff_tuple = (
                 cast("tuple[int | None, int | None, int | None]", diff_stats)
                 if diff_stats is not _UNSET

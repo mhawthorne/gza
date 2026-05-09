@@ -1781,7 +1781,13 @@ class TestMergeStatus:
         store = SqliteTaskStore(db_path)
 
         task = store.add(prompt="Test task")
-        store.mark_completed(task, has_commits=True, branch="feature/test")
+        store.mark_completed(
+            task,
+            has_commits=True,
+            branch="feature/test",
+            head_sha="abc123",
+            base_sha="def456",
+        )
 
         retrieved = store.get(task.id)
         assert retrieved is not None
@@ -1792,6 +1798,37 @@ class TestMergeStatus:
         assert unit.source_branch == "feature/test"
         assert unit.target_branch == "main"
         assert unit.state == "unmerged"
+        assert unit.head_sha == "abc123"
+        assert unit.base_sha == "def456"
+
+    def test_refresh_merge_unit_head_preserves_omitted_sha_and_allows_explicit_clear(self, tmp_path: Path) -> None:
+        """Merge-unit SHA updates should be patch-like unless callers explicitly clear a field."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        store.mark_completed(
+            task,
+            has_commits=True,
+            branch="feature/test",
+            head_sha="abc123",
+            base_sha="def456",
+        )
+        assert task.id is not None
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+
+        store.refresh_merge_unit_head(unit.id, "head456", DB_UNSET)
+        refreshed = store.get_merge_unit(unit.id)
+        assert refreshed is not None
+        assert refreshed.head_sha == "head456"
+        assert refreshed.base_sha == "def456"
+
+        store.refresh_merge_unit_head(unit.id, DB_UNSET, None)
+        cleared = store.get_merge_unit(unit.id)
+        assert cleared is not None
+        assert cleared.head_sha == "head456"
+        assert cleared.base_sha is None
 
     def test_mark_completed_explore_with_commits_owns_unit_and_is_unmerged(self, tmp_path: Path) -> None:
         """Explore tasks with commits should own merge state and appear in unmerged views."""
