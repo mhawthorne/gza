@@ -41,7 +41,9 @@ from gza.runner import (
     _post_complete_code_task,
     _resolve_code_task_branch_name,
     _restore_wip_changes,
+    _run_review_verify_command,
     _run_non_code_task,
+    _format_review_verify_result,
     _run_result_to_stats,
     _save_wip_changes,
     _select_worktree_base_ref,
@@ -493,6 +495,40 @@ class TestReviewContextFromChain:
         assert full_prompt in context
         assert "## Original plan:" not in context
 
+    def test_review_context_includes_verify_result_when_provided(self, tmp_path: Path):
+        """Autonomous review context should thread structured verify output into the prompt."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        verify_result = (
+            "## verify_command result\n\n"
+            "- Command: `uv run pytest tests/ -q`\n"
+            "- Status: failed\n"
+            "- Exit status: 1\n\n"
+            "Failing output (trimmed):\n"
+            "```text\nE assert 1 == 2\n```"
+        )
+        context = _build_context_from_chain(
+            review_task,
+            store,
+            tmp_path,
+            git=None,
+            review_verify_result=verify_result,
+        )
+
+        assert verify_result in context
+        assert "## Original request:" in context
+
     def test_review_context_omits_ask_sections_when_no_plan_or_prompt(self, tmp_path: Path):
         """If implementation has neither plan chain nor prompt, ask sections are omitted."""
         db_path = tmp_path / "test.db"
@@ -513,6 +549,37 @@ class TestReviewContextFromChain:
 
         assert "## Original plan:" not in context
         assert "## Original request:" not in context
+
+    def test_format_review_verify_result_omits_failure_blocker_text_for_pass(self):
+        """Passing verify should not inject failure-specific blocker content into context."""
+        result = _format_review_verify_result(
+            "uv run pytest tests/ -q",
+            subprocess.CompletedProcess(
+                args=["bash", "-lc", "uv run pytest tests/ -q"],
+                returncode=0,
+                stdout="all good\n",
+                stderr="",
+            ),
+        )
+
+        assert "## verify_command result" in result
+        assert "- Status: passed" in result
+        assert "verify_command failure" not in result
+        assert "Failing output (trimmed):" not in result
+
+    def test_run_review_verify_command_captures_failed_output(self, tmp_path: Path):
+        """Autonomous review verify should record command, status, exit code, and trimmed output."""
+        result = _run_review_verify_command(
+            "printf 'lint failed\\n' && exit 7",
+            cwd=tmp_path,
+        )
+
+        assert "## verify_command result" in result
+        assert "- Command: `printf 'lint failed\\n' && exit 7`" in result
+        assert "- Status: failed" in result
+        assert "- Exit status: 7" in result
+        assert "Failing output (trimmed):" in result
+        assert "lint failed" in result
 
     def test_review_context_includes_changed_files_diffstat_and_diff(self, tmp_path: Path):
         """Review context should include changed files, diffstat, and inline diff."""

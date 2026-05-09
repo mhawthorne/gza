@@ -199,6 +199,8 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 <For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.>
 <Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.>
 <Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.>
+<If `## verify_command result` shows a failed run, add one or more blocker items whose titles clearly include `verify_command failure`; use the trimmed failing output as Evidence and keep doing the normal code review in the same review.>
+<If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.>
 <Open-state citation must contain one or more current-source references in `path:line` or `path:start-end` form; backticked citations and comma-separated multiple citations are allowed.>
 
 ## Follow-Ups

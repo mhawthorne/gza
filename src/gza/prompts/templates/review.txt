@@ -1,11 +1,12 @@
 This is a review task. Write your review to:
   {report_path}
 
-Your prompt may include these context sections: `## Specification`, exactly one of `## Original plan:` or `## Original request:`, implementation diff context, and improve-lineage context.
+Your prompt may include these context sections: `## Specification`, exactly one of `## Original plan:` or `## Original request:`, `## verify_command result`, implementation diff context, and improve-lineage context.
 The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it. You may read unchanged source files when surrounding context is needed to judge correctness (for example, checking call-sites, invariants, or pre-hunk class/function behavior).
 
 Project-specific guidance:
 - Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.
+- Independently evaluate any provided `## verify_command result` section in addition to the normal code review; verify is not a short-circuit and both signals matter each cycle.
 - Keep this review stack-agnostic. If project verification instructions are missing, state that explicitly in assumptions/risks.
 
 Output format contract (use this exact section order and exact headings):
@@ -66,6 +67,8 @@ Severity discipline:
 - BLOCKER findings go in `## Blockers` and are the only gating findings.
 - FOLLOWUP findings go in `## Follow-Ups` and are actionable but non-gating.
 - Omit NIT findings from the canonical output entirely (do not add a nits section).
+- If `## verify_command result` shows a failed run, add one or more blocker items whose titles clearly include `verify_command failure`; use the trimmed failing output as Evidence and keep doing the normal code review in the same review.
+- If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.
 
 Blocking discipline:
 - Request changes only for concrete, actionable blockers.
