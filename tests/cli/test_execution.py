@@ -10758,7 +10758,6 @@ class TestRunForeground:
     def test_run_foreground_nested_registered_worker_defers_completion_to_outer_owner(self, tmp_path: Path):
         """Nested worker-mode runs must leave completion bookkeeping to the outer wrapper."""
         from gza.cli.execution import _run_with_registered_worker
-
         setup_config(tmp_path)
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
