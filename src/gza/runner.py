@@ -752,6 +752,7 @@ REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
 REVIEW_IMPROVE_LINEAGE_LIMIT = 5
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 REVIEW_VERIFY_OUTPUT_MAX_CHARS = 4000
+REVIEW_VERIFY_TIMEOUT_SECONDS = 120
 COMMIT_SUBJECT_MAX_CHARS = 72
 
 
@@ -1154,6 +1155,53 @@ def _truncate_to_word_boundary(text: str, max_chars: int) -> str:
     return f"{candidate}..."
 
 
+def _decode_subprocess_output(output: str | bytes | None) -> str:
+    """Normalize subprocess output payloads to text."""
+    if output is None:
+        return ""
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return output
+
+
+def _combine_review_verify_output(*parts: str | bytes | None) -> str:
+    """Combine stdout/stderr fragments for review verify reporting."""
+    return "\n".join(
+        text.strip()
+        for text in (_decode_subprocess_output(part) for part in parts)
+        if text.strip()
+    ).strip()
+
+
+def _format_review_verify_failure(
+    command: str,
+    *,
+    exit_status: str,
+    failure: str,
+    output: str | bytes | None = None,
+) -> str:
+    """Format timeout/launch verify failures as prompt context."""
+    trimmed_output = _truncate_to_word_boundary(
+        _combine_review_verify_output(output) or failure,
+        REVIEW_VERIFY_OUTPUT_MAX_CHARS,
+    )
+    return "\n".join(
+        [
+            "## verify_command result",
+            "",
+            f"- Command: `{command}`",
+            "- Status: failed",
+            f"- Exit status: {exit_status}",
+            f"- Failure: {failure}",
+            "",
+            "Failing output (trimmed):",
+            "```text",
+            trimmed_output,
+            "```",
+        ]
+    )
+
+
 def _format_review_verify_result(command: str, result: subprocess.CompletedProcess[str]) -> str:
     """Format a review-cycle verify result as prompt context."""
     status = "passed" if result.returncode == 0 else "failed"
@@ -1165,11 +1213,8 @@ def _format_review_verify_result(command: str, result: subprocess.CompletedProce
         f"- Exit status: {result.returncode}",
     ]
     if result.returncode != 0:
-        combined_output = "\n".join(
-            output.strip() for output in (result.stdout, result.stderr) if output and output.strip()
-        ).strip()
         trimmed_output = _truncate_to_word_boundary(
-            combined_output or "(no failing output captured)",
+            _combine_review_verify_output(result.stdout, result.stderr) or "(no failing output captured)",
             REVIEW_VERIFY_OUTPUT_MAX_CHARS,
         )
         lines.extend(
@@ -1188,15 +1233,31 @@ def _run_review_verify_command(
     verify_command: str,
     *,
     cwd: Path,
+    timeout_seconds: int = REVIEW_VERIFY_TIMEOUT_SECONDS,
 ) -> str:
     """Run the configured verify command for an autonomous review cycle."""
-    result = subprocess.run(
-        ["bash", "-lc", verify_command],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["bash", "-lc", verify_command],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _format_review_verify_failure(
+            verify_command,
+            exit_status="timed out",
+            failure=f"verify_command timed out after {timeout_seconds}s",
+            output=_combine_review_verify_output(exc.stdout, exc.stderr),
+        )
+    except OSError as exc:
+        return _format_review_verify_failure(
+            verify_command,
+            exit_status="launch failed",
+            failure=f"failed to launch verify_command: {exc}",
+        )
     return _format_review_verify_result(verify_command, result)
 
 

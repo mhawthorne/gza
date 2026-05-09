@@ -109,7 +109,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("tmux.max_idle_timeout", "float", 300.0, "Max idle seconds before tmux session is considered stuck."),
     ConfigKeySpec("tmux.terminal_size", "list[int]", [200, 50], "Tmux terminal dimensions `[cols, rows]`."),
     ConfigKeySpec("use_docker", "bool", True, "Run providers in Docker."),
-    ConfigKeySpec("verify_command", "str", "", "Project verification command used before completion."),
+    ConfigKeySpec("verify_command", "str", "", "Project verification command used before completion and during autonomous review cycles."),
     ConfigKeySpec("watch.batch", "int", 5, "Default concurrent worker target for `gza watch`."),
     ConfigKeySpec("watch.failure_backoff_initial", "int", 60, "Initial cooldown after a non-auto-resumable watch failure."),
     ConfigKeySpec("watch.failure_backoff_max", "int", 3600, "Maximum cooldown after consecutive non-auto-resumable watch failures."),

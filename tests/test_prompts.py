@@ -21,7 +21,7 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.",
     "Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.",
     "Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.",
-    "If `## verify_command result` shows a failed run, add one or more blocker items whose titles clearly include `verify_command failure`;",
+    "If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`;",
     "If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.",
 ]
 

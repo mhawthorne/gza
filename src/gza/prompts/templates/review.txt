@@ -67,7 +67,7 @@ Severity discipline:
 - BLOCKER findings go in `## Blockers` and are the only gating findings.
 - FOLLOWUP findings go in `## Follow-Ups` and are actionable but non-gating.
 - Omit NIT findings from the canonical output entirely (do not add a nits section).
-- If `## verify_command result` shows a failed run, add one or more blocker items whose titles clearly include `verify_command failure`; use the trimmed failing output as Evidence and keep doing the normal code review in the same review.
+- If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`; use the trimmed failing output as Evidence and keep doing the normal code review in the same review.
 - If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.
 
 Blocking discipline:

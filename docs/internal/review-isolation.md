@@ -14,6 +14,7 @@ Review tasks run in isolated git worktrees that only contain git-tracked files.
    - `## verify_command result` when `verify_command` is configured for the project
      - The host runner executes the literal command once per autonomous review cycle in the review worktree.
      - The prompt includes pass/fail status, exit status, and trimmed failing output when non-zero.
+     - Hung review verification is bounded to 120 seconds; timeouts are converted into a failed `## verify_command result` section with timeout evidence and any partial output captured so the review still runs.
      - Reviews must keep doing the normal code review in the same cycle; verify failure is additional blocker evidence, not a short-circuit.
    - Implementation diff context for `main...{impl_branch}` (small/full/excerpted depending on size thresholds)
    - Improve-lineage context when applicable

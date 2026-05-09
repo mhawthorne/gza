@@ -37,6 +37,7 @@ from gza.runner import (
     _create_and_run_review_task,
     _ensure_work_pr_for_completed_code_task,
     _extract_review_verdict,
+    _format_review_verify_failure,
     _get_task_output,
     _post_complete_code_task,
     _resolve_code_task_branch_name,
@@ -580,6 +581,45 @@ class TestReviewContextFromChain:
         assert "- Exit status: 7" in result
         assert "Failing output (trimmed):" in result
         assert "lint failed" in result
+
+    def test_format_review_verify_failure_labels_timeout(self):
+        """Timeout formatter should preserve failure status and timeout evidence."""
+        result = _format_review_verify_failure(
+            "uv run pytest tests/ -q",
+            exit_status="timed out",
+            failure="verify_command timed out after 120s",
+            output="partial pytest output\nstill running\n",
+        )
+
+        assert "## verify_command result" in result
+        assert "- Status: failed" in result
+        assert "- Exit status: timed out" in result
+        assert "- Failure: verify_command timed out after 120s" in result
+        assert "partial pytest output" in result
+
+    def test_run_review_verify_command_reports_timeout(self, tmp_path: Path):
+        """Timed-out autonomous review verify should become a failed verify section."""
+        with patch(
+            "gza.runner.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd=["bash", "-lc", "uv run pytest tests/ -q"],
+                timeout=120,
+                output="partial pytest output\n",
+                stderr="still running\n",
+            ),
+        ):
+            result = _run_review_verify_command(
+                "uv run pytest tests/ -q",
+                cwd=tmp_path,
+                timeout_seconds=120,
+            )
+
+        assert "## verify_command result" in result
+        assert "- Status: failed" in result
+        assert "- Exit status: timed out" in result
+        assert "verify_command timed out after 120s" in result
+        assert "partial pytest output" in result
+        assert "still running" in result
 
     def test_review_context_includes_changed_files_diffstat_and_diff(self, tmp_path: Path):
         """Review context should include changed files, diffstat, and inline diff."""
@@ -9912,6 +9952,81 @@ class TestProviderPromptSanitization:
         assert "- Status: failed" in prompt
         assert "- Exit status: 7" in prompt
         assert "lint failed" in prompt
+        assert "## Original request:" in prompt
+
+    def test_fresh_review_prompt_still_runs_provider_after_verify_timeout(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        impl.status = "completed"
+        impl.slug = "20260212-implement-feature-x"
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        task = store.add(prompt="Review feature X", task_type="review", depends_on=impl.id)
+        task.slug = "20260213-review-feature-x"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        config.model = None
+        config.max_steps = 10
+        config.timeout_minutes = 10
+        config.verify_command = "uv run pytest tests/ -q"
+
+        captured_prompts: list[str] = []
+
+        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_prompts.append(prompt)
+            report_dir = work_dir / ".gza" / "reviews"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=0)
+        git.get_diff_numstat.return_value = ""
+        git.get_diff.return_value = ""
+        git.get_diff_stat.return_value = ""
+
+        with patch(
+            "gza.runner.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd=["bash", "-lc", config.verify_command],
+                timeout=120,
+                output="partial pytest output\n",
+                stderr="still running\n",
+            ),
+        ), patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        assert exit_code == 0
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]
+        assert "## verify_command result" in prompt
+        assert "- Status: failed" in prompt
+        assert "- Exit status: timed out" in prompt
+        assert "verify_command timed out after 120s" in prompt
+        assert "partial pytest output" in prompt
+        assert "still running" in prompt
         assert "## Original request:" in prompt
 
     def test_review_prompt_sent_to_provider_is_sanitized(self, tmp_path: Path):

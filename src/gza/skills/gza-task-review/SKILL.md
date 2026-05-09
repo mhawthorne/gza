@@ -132,6 +132,7 @@ Run `verify_command` from `gza.yaml` as part of every review cycle. This is requ
 - If `verify_command` is empty or unset, note that verify is not configured and continue with the code review.
 - If `verify_command` is configured, run it from the project root while `<impl_branch>` is checked out.
 - Capture the exit status and keep a trimmed diagnostic excerpt for the reviewer. If the output is huge, keep the most useful failing excerpt (for example, the failing tool header plus the first ~120 lines and last ~40 lines).
+- If the verify run hangs, stop it after a bounded wait and pass the timeout forward as a failed `## verify_command result` with timeout evidence and any partial output captured so the review still happens in the same cycle.
 - Do not fix the branch during review. The point here is to independently detect verify failures and fold them into the review findings.
 
 Pass the result forward as a `## verify_command result` section. Include:
@@ -199,7 +200,7 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 <For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.>
 <Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.>
 <Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.>
-<If `## verify_command result` shows a failed run, add one or more blocker items whose titles clearly include `verify_command failure`; use the trimmed failing output as Evidence and keep doing the normal code review in the same review.>
+<If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`; use the trimmed failing output as Evidence and keep doing the normal code review in the same review.>
 <If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.>
 <Open-state citation must contain one or more current-source references in `path:line` or `path:start-end` form; backticked citations and comma-separated multiple citations are allowed.>
 
