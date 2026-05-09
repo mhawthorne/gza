@@ -3,6 +3,7 @@
 import argparse
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from gza.cli.git_ops import cmd_advance
@@ -139,7 +140,7 @@ def test_advance_type_implement_filters_to_implements_only(tmp_path: Path, capsy
     output = capsys.readouterr().out
     assert rc == 0
     assert str(impl.id) in output
-    assert "Merge" in output
+    assert "Create closing review" in output
     assert "Create and start implement" not in output
 
 
@@ -165,3 +166,55 @@ def test_advance_create_implement_respects_batch_limit(tmp_path: Path, capsys) -
     assert rc == 0
     assert len(spawn_calls) == 1
     assert "batch limit reached" in output
+
+
+def test_advance_creates_exactly_one_closing_review_after_completed_improve(
+    tmp_path: Path, capsys
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = _create_completed_implement(store)
+    stale_review = store.add("Old review", task_type="review", depends_on=impl.id)
+    assert stale_review.id is not None
+    stale_review.status = "completed"
+    stale_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    stale_review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    store.update(stale_review)
+
+    improve = store.add(
+        "Improve feature",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=stale_review.id,
+        same_branch=True,
+    )
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(improve)
+
+    impl.review_cleared_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(impl)
+
+    closing_review = SimpleNamespace(id="testproject-closing-review")
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch(
+            "gza.cli.git_ops._prepare_create_review_action",
+            return_value=SimpleNamespace(
+                status="created",
+                review_task=closing_review,
+                message=f"Created review task {closing_review.id}",
+            ),
+        ) as create_review,
+        patch("gza.cli.git_ops._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        rc = cmd_advance(_advance_args(tmp_path))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert create_review.call_count == 1
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == closing_review.id
+    assert f"Created review task {closing_review.id}" in output

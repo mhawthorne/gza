@@ -69,6 +69,7 @@ class AdvanceContext:
     active_improve_pending: DbTask | None = None
     has_improve_after_review: bool = False
     has_fresh_unresolved_comments_since_latest_review: bool = False
+    closing_review_action: dict[str, Any] | None = None
 
     failed_recovery_decision: FailedRecoveryDecision | None = None
     failed_recovery_attention_reason: str | None = None
@@ -266,11 +267,85 @@ def _normalize_time(value: datetime | None) -> datetime:
     return value
 
 
+def _task_event_time(task: DbTask) -> datetime:
+    """Return the best available lifecycle timestamp for ordering tasks."""
+    return _normalize_time(task.completed_at or task.created_at)
+
+
 def _latest_unresolved_comment_time(store: SqliteTaskStore, task_id: str) -> datetime | None:
     unresolved_comments = store.get_comments(task_id, unresolved_only=True)
     if not unresolved_comments:
         return None
     return max(_normalize_time(comment.created_at) for comment in unresolved_comments)
+
+
+def resolve_closing_review_action(
+    *,
+    task: DbTask,
+    reviews: list[DbTask],
+    latest_completed_review: DbTask | None,
+    latest_completed_code_change: DbTask | None,
+) -> dict[str, Any] | None:
+    """Return the invariant-enforcing closing review action for a lineage, if any.
+
+    The lifecycle invariant is satisfied once the newest completed code-change task
+    is followed by at least one review task in any state. Pending reviews should be
+    run, in-progress reviews should be waited on, and completed/failed reviews
+    already satisfy the invariant for automatic lifecycle loops.
+    """
+    if (
+        task.task_type != "implement"
+        or task.status != "completed"
+        or not task.branch
+        or latest_completed_code_change is None
+    ):
+        return None
+
+    latest_code_change_time = _task_event_time(latest_completed_code_change)
+    needs_closing_review = latest_completed_review is None or (
+        latest_completed_review.completed_at is not None
+        and latest_code_change_time > _normalize_time(latest_completed_review.completed_at)
+    )
+    if not needs_closing_review:
+        return None
+
+    if latest_completed_review is None:
+        follow_on_reviews = list(reviews)
+    else:
+        follow_on_reviews = [
+            review
+            for review in reviews
+            if _task_event_time(review) > latest_code_change_time
+        ]
+
+    if follow_on_reviews:
+        active_follow_on_review = _select_active_review(follow_on_reviews)
+        if active_follow_on_review is not None and active_follow_on_review.status == "pending":
+            return {
+                "type": "run_review",
+                "description": (
+                    f"Run pending closing review {_task_id(active_follow_on_review)}"
+                ),
+                "review_task": active_follow_on_review,
+            }
+        if active_follow_on_review is not None and active_follow_on_review.status == "in_progress":
+            return {
+                "type": "wait_review",
+                "description": (
+                    f"SKIP: closing review {_task_id(active_follow_on_review)} is in_progress"
+                ),
+                "review_task": active_follow_on_review,
+            }
+        return None
+
+    if latest_completed_code_change.id == task.id:
+        description = "Create closing review (latest implementation has no review yet)"
+    else:
+        description = "Create closing review (code changed since the last review)"
+    return {
+        "type": "create_review",
+        "description": description,
+    }
 
 
 def _select_active_review(reviews: list[DbTask]) -> DbTask | None:
@@ -310,6 +385,7 @@ def _resolve_review_state(
     DbTask | None,
     bool,
     bool,
+    dict[str, Any] | None,
 ]:
     """Resolve review/improve lineage state for the implementation root task."""
     reviews = get_reviews_for_root(store, task)
@@ -332,6 +408,16 @@ def _resolve_review_state(
     active_improve_pending: DbTask | None = None
     has_improve_after_review = False
     has_fresh_unresolved_comments_since_latest_review = False
+    latest_completed_code_change: DbTask | None = None
+    completed_descendant_code_changes = [
+        t
+        for t in get_code_changing_descendants_for_root(store, task)
+        if t.status == "completed"
+    ]
+    if completed_descendant_code_changes:
+        latest_completed_code_change = max(completed_descendant_code_changes, key=_task_event_time)
+    elif task.status == "completed" and latest_completed_review is None:
+        latest_completed_code_change = task
 
     if latest_completed_review is not None:
         review_report = get_review_report(Path(config.project_dir), latest_completed_review)
@@ -353,19 +439,21 @@ def _resolve_review_state(
         active_improve_running = next((t for t in improve_tasks if t.status == "in_progress"), None)
         active_improve_pending = next((t for t in improve_tasks if t.status == "pending"), None)
 
-        if review_cleared and latest_completed_review.completed_at is not None:
-            code_changing = [
-                t
-                for t in get_code_changing_descendants_for_root(store, task)
-                if t.status == "completed" and t.completed_at is not None
-            ]
-            if code_changing:
-                latest_code_change = max(code_changing, key=lambda t: t.completed_at or datetime.min)
-                if latest_code_change.completed_at is not None:
-                    has_improve_after_review = latest_code_change.completed_at > latest_completed_review.completed_at
+        if latest_completed_review.completed_at is not None and latest_completed_code_change is not None:
+            has_improve_after_review = (
+                _task_event_time(latest_completed_code_change)
+                > _normalize_time(latest_completed_review.completed_at)
+            )
 
         if review_verdict == "CHANGES_REQUESTED":
             completed_review_cycles = count_completed_review_cycles(store, task.id)
+
+    closing_review_action = resolve_closing_review_action(
+        task=task,
+        reviews=reviews,
+        latest_completed_review=latest_completed_review,
+        latest_completed_code_change=latest_completed_code_change,
+    )
 
     return (
         reviews,
@@ -380,6 +468,7 @@ def _resolve_review_state(
         active_improve_pending,
         has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review,
+        closing_review_action,
     )
 
 
@@ -483,6 +572,7 @@ def resolve_advance_context(
         active_improve_pending,
         has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review,
+        closing_review_action,
 ) = _resolve_review_state(config, store, task)
 
     rebase_invalidates_review = False
@@ -520,6 +610,7 @@ def resolve_advance_context(
         active_improve_pending=active_improve_pending,
         has_improve_after_review=has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review=has_fresh_unresolved_comments_since_latest_review,
+        closing_review_action=closing_review_action,
         is_resumable_failed_task=is_resumable_failed,
         has_resume_children=has_resume_children,
         resume_chain_depth=resume_chain_depth,
@@ -606,27 +697,9 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=lambda ctx: {"type": "create_review", "description": "Create review (code changed by rebase since last review)"},
     ),
     AdvanceRule(
-        name="cleared_run_pending_review",
-        matches=lambda ctx: ctx.review_cleared and ctx.active_review is not None and ctx.active_review.status == "pending",
-        action=lambda ctx: {
-            "type": "run_review",
-            "description": f"Spawn worker for pending review {_task_id(ctx.active_review)}",
-            "review_task": ctx.active_review,
-        },
-    ),
-    AdvanceRule(
-        name="cleared_wait_review",
-        matches=lambda ctx: ctx.review_cleared and ctx.active_review is not None and ctx.active_review.status == "in_progress",
-        action=lambda ctx: {
-            "type": "wait_review",
-            "description": f"SKIP: review {_task_id(ctx.active_review)} is in_progress",
-            "review_task": ctx.active_review,
-        },
-    ),
-    AdvanceRule(
-        name="cleared_needs_rereview",
-        matches=lambda ctx: ctx.review_cleared and ctx.latest_completed_review is not None and ctx.has_improve_after_review,
-        action=lambda ctx: {"type": "create_review", "description": "Create review (code changed since last review)"},
+        name="closing_review_invariant",
+        matches=lambda ctx: ctx.closing_review_action is not None,
+        action=lambda ctx: dict(ctx.closing_review_action or {}),
     ),
     AdvanceRule(
         name="review_pending",

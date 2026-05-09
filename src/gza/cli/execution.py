@@ -39,7 +39,10 @@ from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git
 from ..lineage import resolve_impl_task
 from ..prompts import PromptBuilder
-from ..query import get_base_task_slug as _get_base_task_slug
+from ..query import (
+    get_base_task_slug as _get_base_task_slug,
+    get_code_changing_descendants_for_root,
+)
 from ..recovery_engine import (
     FailedRecoveryDecision,
     decide_failed_task_recovery,
@@ -49,6 +52,8 @@ from ..review_verdict import get_review_report
 from ..runner import RunInvocationContext, generate_slug, run
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
+    _REUSE_WORKER_OWNER_ENV,
+    _REUSE_WORKER_OWNER_OUTER,
     DuplicateReviewError,
     _allow_pr_required_retry,
     _create_improve_task,
@@ -80,6 +85,7 @@ from .advance_engine import (
     classify_advance_action,
     determine_next_action,
     format_needs_attention_entry_for_display,
+    resolve_closing_review_action,
 )
 from .advance_executor import (
     build_failed_recovery_needs_attention_result,
@@ -111,6 +117,7 @@ def _run_with_registered_worker(
     registry = WorkerRegistry(config.workers_path)
     previous_worker_id = os.environ.get("GZA_WORKER_ID")
     previous_worker_mode = os.environ.get("GZA_WORKER_MODE")
+    previous_reuse_worker_owner = os.environ.get(_REUSE_WORKER_OWNER_ENV)
     original_sigint = signal.getsignal(signal.SIGINT)
     original_sigterm = signal.getsignal(signal.SIGTERM)
     registry.ensure_running(
@@ -128,6 +135,7 @@ def _run_with_registered_worker(
 
     os.environ["GZA_WORKER_ID"] = worker_id
     os.environ["GZA_WORKER_MODE"] = "1"
+    os.environ[_REUSE_WORKER_OWNER_ENV] = _REUSE_WORKER_OWNER_OUTER
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
@@ -153,6 +161,10 @@ def _run_with_registered_worker(
             os.environ.pop("GZA_WORKER_MODE", None)
         else:
             os.environ["GZA_WORKER_MODE"] = previous_worker_mode
+        if previous_reuse_worker_owner is None:
+            os.environ.pop(_REUSE_WORKER_OWNER_ENV, None)
+        else:
+            os.environ[_REUSE_WORKER_OWNER_ENV] = previous_reuse_worker_owner
 
 
 def _selected_tag_filters(args: argparse.Namespace) -> tuple[tuple[str, ...] | None, bool]:
@@ -2408,6 +2420,181 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         max_resume_attempts=max_resume_attempts,
     )
 
+    def _current_impl_task() -> DbTask:
+        assert impl_task is not None
+        return impl_task
+
+    def _latest_completed_code_change() -> DbTask | None:
+        current_impl_task = _current_impl_task()
+        if _latest_completed_review() is None:
+            return current_impl_task if current_impl_task.status == "completed" else None
+        completed_changes = [
+            candidate
+            for candidate in get_code_changing_descendants_for_root(store, current_impl_task)
+            if candidate.status == "completed"
+        ]
+        if not completed_changes:
+            return None
+        return max(
+            completed_changes,
+            key=lambda candidate: (
+                candidate.completed_at or candidate.created_at or datetime.min,
+                task_id_numeric_key(candidate.id),
+            ),
+        )
+
+    def _resolve_forced_closing_review_action() -> dict[str, Any] | None:
+        current_impl_task = _current_impl_task()
+        return resolve_closing_review_action(
+            task=current_impl_task,
+            reviews=store.get_reviews_for_task(impl_task_key),
+            latest_completed_review=_latest_completed_review(),
+            latest_completed_code_change=_latest_completed_code_change(),
+        )
+
+    def _run_forced_closing_review(iteration_index: int) -> bool:
+        nonlocal final_status, final_stop_reason, final_attention_action, final_attention_task
+        closing_action = _resolve_forced_closing_review_action()
+        if closing_action is None:
+            return False
+
+        action_type = closing_action["type"]
+        if action_type == "wait_review":
+            review_task = closing_action.get("review_task")
+            print("\nClosing review already in progress before termination.")
+            final_status = "blocked"
+            final_stop_reason = "review_in_progress"
+            if isinstance(review_task, DbTask):
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration_index,
+                    task_type="review",
+                    task=review_task,
+                    status="in_progress",
+                )
+            else:
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration_index,
+                    task_type="review",
+                    task=None,
+                    status="in_progress",
+                )
+            return True
+
+        if action_type not in {"create_review", "run_review"}:
+            return False
+
+        print("\nClosing review required before termination.")
+        current_impl_task = _current_impl_task()
+        action_task: DbTask | None = None
+        if action_type == "create_review":
+            try:
+                action_task = _create_review_task(store, current_impl_task)
+            except DuplicateReviewError as e:
+                action_task = e.active_review
+                assert action_task.id is not None
+                if action_task.status == "in_progress":
+                    final_status = "blocked"
+                    final_stop_reason = "review_in_progress"
+                    _append_summary_row(
+                        summary_rows,
+                        iteration_index=iteration_index,
+                        task_type="review",
+                        task=action_task,
+                        status="in_progress",
+                    )
+                    return True
+                if action_task.status != "pending":
+                    final_status = "blocked"
+                    final_stop_reason = "review_failed"
+                    _append_summary_row(
+                        summary_rows,
+                        iteration_index=iteration_index,
+                        task_type="review",
+                        task=action_task,
+                        status="failed",
+                    )
+                    return True
+            except ValueError as e:
+                final_status = "blocked"
+                final_stop_reason = "review_failed"
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration_index,
+                    task_type="review",
+                    task=None,
+                    status="failed",
+                    failure_reason=str(e),
+                )
+                return True
+        else:
+            maybe_review_task = closing_action.get("review_task")
+            if isinstance(maybe_review_task, DbTask):
+                action_task = maybe_review_task
+
+        if action_task is None:
+            return False
+
+        assert action_task.id is not None
+        action_task, rc, terminal_skip_decision = _run_task_with_recovery(action_task)
+        if rc != 0:
+            final_status = "blocked"
+            attention_result = None
+            if terminal_skip_decision is not None:
+                attention_result = build_failed_recovery_needs_attention_result(
+                    store=store,
+                    failed_task=action_task,
+                    recovery_decision=terminal_skip_decision,
+                    max_resume_attempts=effective_max_resume_attempts,
+                )
+            if attention_result is not None:
+                attention = resolve_execution_needs_attention(action_task, attention_result)
+                if attention is not None:
+                    final_attention_action = attention.action
+                    final_attention_task = attention.task
+            final_stop_reason = "review_failed"
+            _append_summary_row(
+                summary_rows,
+                iteration_index=iteration_index,
+                task_type="review",
+                task=action_task,
+                status="failed",
+                failure_reason=f"exit code {rc}",
+            )
+            return True
+
+        assert action_task.id is not None
+        action_task = store.get(action_task.id) or action_task
+        verdict = get_review_verdict(config, action_task)
+        _append_summary_row(
+            summary_rows,
+            iteration_index=iteration_index,
+            task_type="review",
+            task=action_task,
+            verdict=verdict,
+        )
+        if verdict == "APPROVED_WITH_FOLLOWUPS":
+            materialized = _materialize_followup_tasks(action_task, iteration_index=iteration_index)
+            if not materialized:
+                final_status = "blocked"
+                final_stop_reason = "needs_discussion"
+                return True
+            final_status = "approved"
+            final_stop_reason = "approved_with_followups"
+            return True
+        if verdict == "APPROVED":
+            final_status = "approved"
+            final_stop_reason = "approved"
+            return True
+        if verdict in {"NEEDS_DISCUSSION", None}:
+            final_status = "blocked"
+            final_stop_reason = "needs_discussion" if verdict == "NEEDS_DISCUSSION" else "no_verdict"
+            return True
+        final_status = "blocked"
+        final_stop_reason = "closing_review_completed"
+        return True
+
     while iteration < max_iterations:
         action = determine_next_action(
             engine_config,
@@ -2794,6 +2981,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             # Count full change+review cycles by completed review actions.
             iteration += 1
         impl_task = store.get(impl_task.id) or impl_task
+
+    if final_status in {"approved", "merge_ready", "maxed_out"}:
+        _run_forced_closing_review(iteration)
 
     iterate_wall_seconds = time.monotonic() - iterate_started_at
     total_steps = sum(row.steps or 0 for row in summary_rows)

@@ -3309,6 +3309,77 @@ def test_watch_cycle_advances_create_review_action(tmp_path: Path) -> None:
     assert spawn_worker.call_args.kwargs["task_id"] == review.id
 
 
+def test_watch_cycle_creates_exactly_one_closing_review_after_completed_improve_without_review_clear(
+    tmp_path: Path,
+) -> None:
+    """Watch should queue the shared closing review from lineage state alone."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    impl.branch = "feature/watch-closing-review"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    stale_review = store.add("Old review", task_type="review", depends_on=impl.id)
+    assert stale_review.id is not None
+    stale_review.status = "completed"
+    stale_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    stale_review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    store.update(stale_review)
+
+    improve = store.add(
+        "Improve feature",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=stale_review.id,
+        same_branch=True,
+    )
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(improve)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+    git.can_merge.return_value = True
+    closing_review = SimpleNamespace(id="testproject-closing-review")
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            return_value=SimpleNamespace(
+                status="created",
+                review_task=closing_review,
+                message=f"✓ Created review task {closing_review.id}",
+            ),
+        ) as create_review,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert create_review.call_count == 1
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == closing_review.id
+
+
 def test_watch_cycle_creates_implement_from_completed_plan_with_iterate_mode(tmp_path: Path) -> None:
     """Completed plan without implement child should create implement and start iterate."""
     setup_config(tmp_path)

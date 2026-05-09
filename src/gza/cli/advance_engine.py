@@ -21,6 +21,7 @@ from gza.advance_engine import (
     is_needs_attention_action,
     is_resumable_failed_task,
     resolve_advance_context,
+    resolve_closing_review_action,
     with_needs_attention,
 )
 from gza.db import SqliteTaskStore, Task as DbTask
@@ -57,6 +58,7 @@ __all__ = [
     "classify_advance_action",
     "determine_next_action",
     "is_resumable_failed_task",
+    "resolve_closing_review_action",
     "failed_recovery_decision_to_action",
     "failed_recovery_decision_to_attention_action",
     "format_needs_attention_entry",

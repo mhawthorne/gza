@@ -32,7 +32,12 @@ NON_CONFIG_ROOT_KEYS = {
 
 
 CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
-    ConfigKeySpec("advance_create_reviews", "bool", True, "Auto-create review tasks in lifecycle flows."),
+    ConfigKeySpec(
+        "advance_create_reviews",
+        "bool",
+        True,
+        "Auto-create review tasks in lifecycle flows; the final closing review after a completed write is always enforced.",
+    ),
     ConfigKeySpec("advance_mode", "str", "default", "Mode selector for `gza advance` behavior."),
     ConfigKeySpec("advance_requires_review", "bool", True, "Require review before merge in lifecycle flows."),
     ConfigKeySpec("branch_mode", "str", "multi", "Git branch mode: `single` or `multi`."),

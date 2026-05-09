@@ -5,11 +5,14 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from gza.advance_engine import (
     WORKER_CONSUMING_ACTIONS,
     classify_advance_action,
     evaluate_advance_rules,
     failed_recovery_decision_to_action,
+    resolve_closing_review_action,
     resolve_advance_context,
 )
 from gza.recovery_engine import decide_failed_task_recovery
@@ -239,11 +242,11 @@ def test_completed_fix_after_changes_requested_requires_fresh_review(tmp_path: P
     assert action["type"] == "create_review", action
 
 
-def test_completed_improve_without_review_clear_does_not_promote_to_review_actions(
+def test_completed_improve_without_review_clear_creates_closing_review(
     tmp_path: Path,
     monkeypatch,
 ):
-    """An unpublished completed improve must not advance into create/run review actions."""
+    """A completed improve newer than the latest review must create a closing review."""
     from gza import advance_engine as advance_engine_module
 
     store = _make_store(tmp_path)
@@ -288,8 +291,117 @@ def test_completed_improve_without_review_clear_does_not_promote_to_review_actio
     )
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
-    assert action["type"] == "improve", action
-    assert action["type"] not in {"create_review", "run_review"}
+    assert action["type"] == "create_review", action
+    assert action["description"] == "Create closing review (code changed since the last review)"
+
+
+@pytest.mark.parametrize(
+    ("closing_review_status", "expected_action_type"),
+    [
+        ("pending", "run_review"),
+        ("in_progress", "wait_review"),
+        ("completed", None),
+        ("failed", None),
+    ],
+)
+def test_closing_review_invariant_does_not_create_duplicate_review(
+    tmp_path: Path,
+    closing_review_status: str,
+    expected_action_type: str | None,
+) -> None:
+    store = _make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    impl.branch = "feat/closing-review-dedupe"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    stale_review = store.add("Old review", task_type="review", depends_on=impl.id)
+    assert stale_review.id is not None
+    stale_review.status = "completed"
+    stale_review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    store.update(stale_review)
+
+    improve = store.add(
+        "Improve feature",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=stale_review.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(improve)
+
+    impl.review_cleared_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(impl)
+
+    closing_review = store.add("Closing review", task_type="review", depends_on=impl.id)
+    assert closing_review.id is not None
+    closing_review.status = closing_review_status
+    closing_review.created_at = datetime(2026, 1, 4, tzinfo=UTC)
+    if closing_review_status in {"completed", "failed"}:
+        closing_review.completed_at = datetime(2026, 1, 4, tzinfo=UTC)
+    store.update(closing_review)
+
+    action = resolve_closing_review_action(
+        task=impl,
+        reviews=store.get_reviews_for_task(impl.id),
+        latest_completed_review=stale_review,
+        latest_completed_code_change=improve,
+    )
+
+    if expected_action_type is None:
+        assert action is None
+    else:
+        assert action is not None
+        assert action["type"] == expected_action_type
+        assert action.get("review_task").id == closing_review.id
+
+
+def test_failed_improve_does_not_require_closing_review(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    impl.branch = "feat/failed-improve-no-closing-review"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(failed_improve)
+
+    action = resolve_closing_review_action(
+        task=impl,
+        reviews=store.get_reviews_for_task(impl.id),
+        latest_completed_review=review,
+        latest_completed_code_change=impl,
+    )
+
+    assert action is None
 
 
 def test_unmerged_view_shows_fix_after_review_as_stale(tmp_path: Path):

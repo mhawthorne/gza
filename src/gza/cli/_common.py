@@ -59,6 +59,9 @@ from ..runner import RunInvocationContext, get_effective_config_for_task, run
 from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
 
+_REUSE_WORKER_OWNER_ENV = "GZA_REUSE_WORKER_OWNER"
+_REUSE_WORKER_OWNER_OUTER = "outer"
+
 
 def format_task_status_text(task: DbTask) -> str:
     """Return the inline status label used by lineage-oriented displays."""
@@ -600,6 +603,7 @@ def _run_foreground(
     worker_mode = os.environ.get("GZA_WORKER_MODE")
     worker = None
     reuse_existing_worker = False
+    outer_worker_owns_completion = os.environ.get(_REUSE_WORKER_OWNER_ENV) == _REUSE_WORKER_OWNER_OUTER
     if worker_id and worker_mode == "1":
         worker = registry.ensure_running(
             WorkerMetadata(
@@ -642,7 +646,7 @@ def _run_foreground(
         if resume and task_id is not None:
             rebase_exit_code = _auto_rebase_before_resume(config, task_id)
             if rebase_exit_code != 0:
-                if not reuse_existing_worker:
+                if not reuse_existing_worker or not outer_worker_owns_completion:
                     registry.mark_completed(worker.worker_id, exit_code=rebase_exit_code, status="failed")
                 return rebase_exit_code
         if invocation is None:
@@ -663,11 +667,11 @@ def _run_foreground(
                 invocation=invocation,
             )
         status = "completed" if exit_code == 0 else "failed"
-        if not reuse_existing_worker:
+        if not reuse_existing_worker or not outer_worker_owns_completion:
             registry.mark_completed(worker.worker_id, exit_code=exit_code, status=status)
         return exit_code
     except KeyboardInterrupt:
-        if not reuse_existing_worker:
+        if not reuse_existing_worker or not outer_worker_owns_completion:
             registry.mark_completed(worker.worker_id, exit_code=130, status="failed")
         return 130
     finally:
