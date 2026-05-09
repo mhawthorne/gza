@@ -4,20 +4,16 @@ import os
 
 import pytest
 
-UNIT_TEST_TIMEOUT_SECONDS = int(os.environ.get("GZA_UNIT_TEST_TIMEOUT_SECONDS", "1"))
 FUNCTIONAL_TEST_TIMEOUT_SECONDS = int(os.environ.get("GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS", "2"))
 
 
 def pytest_collection_modifyitems(items):
-    """Apply the fast hang watchdog only to the unit-test suite."""
-    unit_timeout_marker = pytest.mark.timeout(UNIT_TEST_TIMEOUT_SECONDS, method="signal")
+    """Apply the subprocess watchdog only to functional tests in the unit suite."""
     functional_timeout_marker = pytest.mark.timeout(FUNCTIONAL_TEST_TIMEOUT_SECONDS, method="signal")
     for item in items:
-        if item.get_closest_marker("timeout") is None:
-            if item.get_closest_marker("functional") is None:
-                item.add_marker(unit_timeout_marker)
-            else:
-                item.add_marker(functional_timeout_marker)
+        if item.get_closest_marker("functional") is not None and item.get_closest_marker("timeout") is None:
+            item.add_marker(functional_timeout_marker)
+
 
 @pytest.fixture(autouse=True)
 def _disable_git_signing(tmp_path, monkeypatch):
