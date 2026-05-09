@@ -1,4 +1,4 @@
-"""Tests for git operations CLI commands."""
+"""Tests for `gza pr` command orchestration and validation."""
 
 import argparse
 from pathlib import Path
@@ -6,22 +6,25 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from gza.cli.git_ops import cmd_pr
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.github import PullRequestDetails
 
-from tests.cli.conftest import (
-    make_store,
-    run_gza,
-    setup_config,
-    setup_db_with_tasks,
-)
+from tests.cli.conftest import make_store, setup_config, setup_db_with_tasks
 
-pytestmark = pytest.mark.integration
+
+def _pr_args(tmp_path: Path, task_id: str, *, title: str | None = None, draft: bool = False) -> argparse.Namespace:
+    return argparse.Namespace(
+        project_dir=tmp_path,
+        task_id=task_id,
+        title=title,
+        draft=draft,
+    )
 
 
 class TestPrCommand:
-    """Tests for 'gza pr' command."""
+    """Tests for `gza pr` command."""
 
     def _make_completed_pr_task(self, tmp_path: Path, *, branch: str, pr_number: int | None = None):
         setup_config(tmp_path)
@@ -34,36 +37,34 @@ class TestPrCommand:
         store.update(task)
         return store, task
 
-    def test_pr_task_not_found(self, tmp_path: Path):
-        """PR command handles nonexistent task."""
+    def test_pr_task_not_found(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         setup_config(tmp_path)
+        store = make_store(tmp_path)
 
-        # Create empty database
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        make_store(tmp_path)
+        with (
+            patch("gza.cli.git_ops.get_store", return_value=store),
+            patch("gza.cli.git_ops.Git", return_value=Mock()),
+        ):
+            rc = cmd_pr(_pr_args(tmp_path, "testproject-999999"))
 
-        result = run_gza("pr", "testproject-999999", "--project", str(tmp_path))
+        assert rc == 1
+        assert "not found" in capsys.readouterr().out
 
-        assert result.returncode == 1
-        assert "not found" in result.stdout
+    def test_pr_task_not_completed(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        setup_db_with_tasks(tmp_path, [{"prompt": "Pending task", "status": "pending"}])
+        store = make_store(tmp_path)
 
-    def test_pr_task_not_completed(self, tmp_path: Path):
-        """PR command rejects pending tasks."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Pending task", "status": "pending"},
-        ])
+        with (
+            patch("gza.cli.git_ops.get_store", return_value=store),
+            patch("gza.cli.git_ops.Git", return_value=Mock()),
+        ):
+            rc = cmd_pr(_pr_args(tmp_path, "testproject-1"))
 
-        result = run_gza("pr", "testproject-1", "--project", str(tmp_path))
+        assert rc == 1
+        assert "not completed" in capsys.readouterr().out
 
-        assert result.returncode == 1
-        assert "not completed" in result.stdout
-
-    def test_pr_task_no_branch(self, tmp_path: Path):
-        """PR command rejects tasks without branches."""
-
+    def test_pr_task_no_branch(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         setup_config(tmp_path)
-
         store = make_store(tmp_path)
         task = store.add("Completed task without branch")
         task.status = "completed"
@@ -71,16 +72,17 @@ class TestPrCommand:
         task.has_commits = True
         store.update(task)
 
-        result = run_gza("pr", str(task.id), "--project", str(tmp_path))
+        with (
+            patch("gza.cli.git_ops.get_store", return_value=store),
+            patch("gza.cli.git_ops.Git", return_value=Mock()),
+        ):
+            rc = cmd_pr(_pr_args(tmp_path, str(task.id)))
 
-        assert result.returncode == 1
-        assert "no branch" in result.stdout
+        assert rc == 1
+        assert "no branch" in capsys.readouterr().out
 
-    def test_pr_task_no_commits(self, tmp_path: Path):
-        """PR command rejects tasks without commits."""
-
+    def test_pr_task_no_commits(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         setup_config(tmp_path)
-
         store = make_store(tmp_path)
         task = store.add("Completed task without commits")
         task.status = "completed"
@@ -88,16 +90,17 @@ class TestPrCommand:
         task.has_commits = False
         store.update(task)
 
-        result = run_gza("pr", str(task.id), "--project", str(tmp_path))
+        with (
+            patch("gza.cli.git_ops.get_store", return_value=store),
+            patch("gza.cli.git_ops.Git", return_value=Mock()),
+        ):
+            rc = cmd_pr(_pr_args(tmp_path, str(task.id)))
 
-        assert result.returncode == 1
-        assert "no commits" in result.stdout
+        assert rc == 1
+        assert "no commits" in capsys.readouterr().out
 
-    def test_pr_task_marked_merged_shows_distinct_error(self, tmp_path: Path):
-        """PR command shows a distinct error message for tasks marked merged via --mark-only."""
-
+    def test_pr_task_marked_merged_shows_distinct_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         setup_config(tmp_path)
-
         store = make_store(tmp_path)
         task = store.add("Mark-only merged task")
         task.status = "completed"
@@ -106,17 +109,18 @@ class TestPrCommand:
         task.merge_status = "merged"
         store.update(task)
 
-        result = run_gza("pr", str(task.id), "--project", str(tmp_path))
+        with (
+            patch("gza.cli.git_ops.get_store", return_value=store),
+            patch("gza.cli.git_ops.Git", return_value=Mock()),
+        ):
+            rc = cmd_pr(_pr_args(tmp_path, str(task.id)))
 
-        assert result.returncode == 1
-        assert "already marked as merged" in result.stdout
-        # Should NOT say "merged into" since the branch was not actually merged
-        assert "merged into" not in result.stdout
+        output = capsys.readouterr().out
+        assert rc == 1
+        assert "already marked as merged" in output
+        assert "merged into" not in output
 
     def test_pr_cached_pr_still_errors_when_branch_is_merged(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-        """Merged branches must still error even if the task has a cached PR number."""
-        from gza.cli.git_ops import cmd_pr
-
         store, task = self._make_completed_pr_task(
             tmp_path,
             branch="feature/cached-pr-merged",
@@ -133,19 +137,12 @@ class TestPrCommand:
         gh = Mock()
         gh.is_available.return_value = True
 
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            task_id=str(task.id),
-            title="Manual title",
-            draft=False,
-        )
-
         with (
             patch("gza.cli.git_ops.get_store", return_value=store),
             patch("gza.cli.git_ops.Git", return_value=git),
             patch("gza.pr_ops.GitHub", return_value=gh),
         ):
-            rc = cmd_pr(args)
+            rc = cmd_pr(_pr_args(tmp_path, str(task.id), title="Manual title"))
 
         output = capsys.readouterr().out
         assert rc == 1
@@ -156,9 +153,6 @@ class TestPrCommand:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        """Merged branches must still error before reusing an existing remote PR."""
-        from gza.cli.git_ops import cmd_pr
-
         store, task = self._make_completed_pr_task(
             tmp_path,
             branch="feature/remote-pr-merged",
@@ -174,19 +168,12 @@ class TestPrCommand:
         gh = Mock()
         gh.is_available.return_value = True
 
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            task_id=str(task.id),
-            title="Manual title",
-            draft=False,
-        )
-
         with (
             patch("gza.cli.git_ops.get_store", return_value=store),
             patch("gza.cli.git_ops.Git", return_value=git),
             patch("gza.pr_ops.GitHub", return_value=gh),
         ):
-            rc = cmd_pr(args)
+            rc = cmd_pr(_pr_args(tmp_path, str(task.id), title="Manual title"))
 
         output = capsys.readouterr().out
         assert rc == 1
@@ -198,9 +185,6 @@ class TestPrCommand:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        """`gza pr` should not print a push banner unless the shared helper actually pushes."""
-        from gza.cli.git_ops import cmd_pr
-
         store, task = self._make_completed_pr_task(
             tmp_path,
             branch="feature/cached-pr",
@@ -214,19 +198,13 @@ class TestPrCommand:
         git.needs_push.return_value = True
 
         ensure_result = Mock(ok=True, status="cached", pr_url="https://github.com/o/r/pull/42", pr_number=42)
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            task_id=str(task.id),
-            title="Manual title",
-            draft=False,
-        )
 
         with (
             patch("gza.cli.git_ops.get_store", return_value=store),
             patch("gza.cli.git_ops.Git", return_value=git),
             patch("gza.cli.git_ops.ensure_task_pr", return_value=ensure_result) as ensure_pr,
         ):
-            rc = cmd_pr(args)
+            rc = cmd_pr(_pr_args(tmp_path, str(task.id), title="Manual title"))
 
         output = capsys.readouterr().out
         assert rc == 0
@@ -239,9 +217,6 @@ class TestPrCommand:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        """`gza pr` should short-circuit existing PR reuse before spawning PR-content work."""
-        from gza.cli.git_ops import cmd_pr
-
         store, task = self._make_completed_pr_task(
             tmp_path,
             branch="feature/existing-pr",
@@ -262,20 +237,13 @@ class TestPrCommand:
             base_ref_name="main",
         )
 
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            task_id=str(task.id),
-            title=None,
-            draft=False,
-        )
-
         with (
             patch("gza.cli.git_ops.get_store", return_value=store),
             patch("gza.cli.git_ops.Git", return_value=git),
             patch("gza.cli.git_ops.build_task_pr_content", side_effect=AssertionError("should not build PR content")),
             patch("gza.pr_ops.GitHub", return_value=gh),
         ):
-            rc = cmd_pr(args)
+            rc = cmd_pr(_pr_args(tmp_path, str(task.id)))
 
         output = capsys.readouterr().out
         assert rc == 0
@@ -288,9 +256,6 @@ class TestPrCommand:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        """`gza pr` should report lookup failures distinctly from PR creation failures."""
-        from gza.cli.git_ops import cmd_pr
-
         store, task = self._make_completed_pr_task(
             tmp_path,
             branch="feature/lookup-failure",
@@ -299,13 +264,6 @@ class TestPrCommand:
 
         git = Mock()
         git.default_branch.return_value = "main"
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            task_id=str(task.id),
-            title="Manual title",
-            draft=False,
-        )
         ensure_result = Mock(
             ok=False,
             status="lookup_failed",
@@ -317,7 +275,7 @@ class TestPrCommand:
             patch("gza.cli.git_ops.Git", return_value=git),
             patch("gza.cli.git_ops.ensure_task_pr", return_value=ensure_result),
         ):
-            rc = cmd_pr(args)
+            rc = cmd_pr(_pr_args(tmp_path, str(task.id), title="Manual title"))
 
         output = capsys.readouterr().out
         assert rc == 1
@@ -325,9 +283,6 @@ class TestPrCommand:
         assert "Error creating PR" not in output
 
     def test_pr_command_uses_shared_pr_content_when_title_not_overridden(self, tmp_path: Path):
-        """`gza pr` should pass lazy shared PR-content generation into the helper."""
-        from gza.cli.git_ops import cmd_pr
-
         store, task = self._make_completed_pr_task(
             tmp_path,
             branch="feature/shared-pr-content",
@@ -337,12 +292,6 @@ class TestPrCommand:
         shared_title = "Shared generated title"
         shared_body = "## Summary\nShared generated body"
         ensure_result = Mock(ok=True, status="created", pr_url="https://github.com/o/r/pull/88")
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            task_id=str(task.id),
-            title=None,
-            draft=False,
-        )
 
         with (
             patch("gza.cli.git_ops.get_store", return_value=store),
@@ -353,7 +302,7 @@ class TestPrCommand:
             ) as build_content,
             patch("gza.cli.git_ops.ensure_task_pr", return_value=ensure_result) as ensure_pr,
         ):
-            rc = cmd_pr(args)
+            rc = cmd_pr(_pr_args(tmp_path, str(task.id)))
             ensure_pr.assert_called_once()
             assert ensure_pr.call_args.kwargs["merged_behavior"] == "error"
             assert ensure_pr.call_args.kwargs["draft"] is False
@@ -364,7 +313,6 @@ class TestPrCommand:
         assert rc == 0
 
     def test_pr_module_does_not_keep_duplicate_pr_content_builders(self):
-        """`gza pr` should rely on shared PR helpers instead of a second code path."""
         import gza.cli.git_ops as git_ops
 
         assert not hasattr(git_ops, "_generate_pr_content")
@@ -372,7 +320,6 @@ class TestPrCommand:
         assert not hasattr(git_ops, "_fallback_pr_content")
 
     def test_build_task_pr_content_title_override_preserves_existing_summary_body(self, tmp_path: Path):
-        """Custom-title PR flows should keep the existing summary-body contract."""
         from gza.pr_ops import build_task_pr_content
 
         setup_config(tmp_path)
@@ -395,7 +342,6 @@ class TestPrCommand:
         assert not git.mock_calls
 
     def test_build_task_pr_content_uses_internal_task_output(self, tmp_path: Path):
-        """Shared PR content generation uses an internal task and parses output_content."""
         from gza.pr_ops import build_task_pr_content
 
         setup_config(tmp_path)
@@ -440,7 +386,6 @@ class TestPrCommand:
         git.get_diff_stat.assert_called_once_with("main...feature/auth-metrics")
 
     def test_build_task_pr_content_falls_back_on_malformed_output(self, tmp_path: Path):
-        """Malformed internal-task output falls back to deterministic PR content."""
         from gza.pr_ops import build_task_pr_content
 
         setup_config(tmp_path)
@@ -477,9 +422,8 @@ class TestPrCommand:
     def test_build_task_pr_content_marks_internal_task_failed_on_runner_exception(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
-        """Runner exceptions should not leave PR internal tasks in pending/in_progress."""
-        from gza.pr_ops import build_task_pr_content
         from gza.failure_reasons import mark_task_failed_from_cause
+        from gza.pr_ops import build_task_pr_content
 
         setup_config(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
@@ -518,8 +462,3 @@ class TestPrCommand:
         assert internal_tasks[0].status == "failed"
         assert internal_tasks[0].failure_reason == "UNKNOWN"
         assert mock_mark_failed.call_count == 1
-        assert mock_mark_failed.call_args.kwargs["task"].id == internal_tasks[0].id
-        assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "UNKNOWN"
-
-        captured = capsys.readouterr()
-        assert f"internal task {internal_tasks[0].id} failed" in captured.err

@@ -1,0 +1,167 @@
+"""Tests for auto-advancing completed plans via `gza advance`."""
+
+import argparse
+from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from gza.cli.git_ops import cmd_advance
+
+from tests.cli.conftest import make_store, setup_config
+
+
+def _advance_args(tmp_path: Path, **overrides) -> argparse.Namespace:
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_id=None,
+        dry_run=False,
+        auto=True,
+        max=None,
+        batch=None,
+        no_docker=True,
+        force=False,
+        plans=False,
+        unimplemented=False,
+        create=False,
+        no_resume_failed=False,
+        max_resume_attempts=None,
+        advance_type=None,
+        new=False,
+        max_review_cycles=None,
+        squash_threshold=None,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _mock_git(*, current_branch: str = "main", can_merge: bool = True) -> Mock:
+    git = Mock()
+    git.current_branch.return_value = current_branch
+    git.can_merge.return_value = can_merge
+    return git
+
+
+def _create_completed_plan(store, prompt="Design the feature"):
+    plan = store.add(prompt, task_type="plan")
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+    return plan
+
+
+def _create_completed_implement(store, prompt="Implement feature", based_on=None):
+    task = store.add(prompt, task_type="implement", based_on=based_on)
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = f"feature/{task.id}"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+    return task
+
+
+def test_advance_creates_implement_for_completed_plan(tmp_path: Path, capsys) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    plan = _create_completed_plan(store, "Design auth system")
+    plan.slug = "20260305-design-auth-system-2"
+    store.update(plan)
+
+    spawn_calls: list[str | None] = []
+
+    def fake_spawn(_worker_args, _config, task_id=None, **_kw):
+        spawn_calls.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops._spawn_background_worker", side_effect=fake_spawn),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path))
+
+    assert rc == 0
+    assert "Created implement task" in capsys.readouterr().out
+    impl_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+    assert len(impl_tasks) == 1
+    assert impl_tasks[0].depends_on == plan.id
+    assert impl_tasks[0].based_on is None
+    assert impl_tasks[0].prompt == f"Implement plan from task {plan.id}: design-auth-system"
+    assert spawn_calls == [impl_tasks[0].id]
+
+
+def test_advance_skips_plan_with_existing_implement(tmp_path: Path, capsys) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    plan = _create_completed_plan(store, "Design auth system")
+    store.add("Implement auth", task_type="implement", based_on=plan.id)
+
+    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
+        rc = cmd_advance(_advance_args(tmp_path, task_id=plan.id, dry_run=True))
+
+    assert rc == 0
+    assert "implement task already exists" in capsys.readouterr().out
+
+
+def test_advance_type_plan_filters_to_plans_only(tmp_path: Path, capsys) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "advance_requires_review: false\n"
+    )
+    store = make_store(tmp_path)
+    plan = _create_completed_plan(store, "Design feature X")
+    _create_completed_implement(store)
+
+    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
+        rc = cmd_advance(_advance_args(tmp_path, dry_run=True, advance_type="plan"))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert str(plan.id) in output
+    assert "Create and start implement" in output
+    assert "Merge" not in output
+
+
+def test_advance_type_implement_filters_to_implements_only(tmp_path: Path, capsys) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "advance_requires_review: false\n"
+    )
+    store = make_store(tmp_path)
+    _create_completed_plan(store, "Design feature X")
+    impl = _create_completed_implement(store)
+
+    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
+        rc = cmd_advance(_advance_args(tmp_path, dry_run=True, advance_type="implement"))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert str(impl.id) in output
+    assert "Merge" in output
+    assert "Create and start implement" not in output
+
+
+def test_advance_create_implement_respects_batch_limit(tmp_path: Path, capsys) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _create_completed_plan(store, "Plan A")
+    _create_completed_plan(store, "Plan B")
+
+    spawn_calls: list[str | None] = []
+
+    def fake_spawn(_worker_args, _config, task_id=None, **_kw):
+        spawn_calls.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops._spawn_background_worker", side_effect=fake_spawn),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, batch=1))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert len(spawn_calls) == 1
+    assert "batch limit reached" in output

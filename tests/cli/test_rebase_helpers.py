@@ -4,13 +4,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import pytest
-
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.providers.base import RunResult
-
-pytestmark = pytest.mark.integration
 
 
 def _new_config(tmp_path: Path, provider: str = "codex", use_docker: bool = True) -> Config:

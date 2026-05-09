@@ -4,14 +4,10 @@ import argparse
 from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock, patch
 
-import pytest
-
 from gza.cli.git_ops import cmd_sync
 from gza.sync_ops import BranchSyncResult
 
 from tests.cli.conftest import make_store, setup_config
-
-pytestmark = pytest.mark.integration
 
 
 def _completed_branch_task(store, prompt: str, branch: str):

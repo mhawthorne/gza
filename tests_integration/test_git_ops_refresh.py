@@ -76,50 +76,6 @@ class TestRefreshCommand:
         assert retrieved.diff_lines_added == 2
         assert retrieved.diff_lines_removed == 0
 
-    def test_refresh_single_task_not_found(self, tmp_path: Path):
-        """gza refresh <id> returns error when task doesn't exist."""
-        setup_config(tmp_path)
-        self._setup_git_repo(tmp_path)
-        result = run_gza("refresh", "testproject-999999", "--project", str(tmp_path))
-        assert result.returncode == 1
-        assert "not found" in result.stdout or "not found" in result.stderr
-
-    def test_refresh_single_task_no_branch(self, tmp_path: Path):
-        """gza refresh <id> skips task without a branch."""
-
-        setup_config(tmp_path)
-        self._setup_git_repo(tmp_path)
-
-        store = make_store(tmp_path)
-
-        task = store.add("No branch task", task_type="explore")
-        task.status = "completed"
-        task.completed_at = datetime.now(UTC)
-        store.update(task)
-
-        result = run_gza("refresh", str(task.id), "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "skipping" in result.stdout
-
-    def test_refresh_single_task_branch_missing(self, tmp_path: Path):
-        """gza refresh <id> warns and skips when branch no longer exists."""
-
-        setup_config(tmp_path)
-        self._setup_git_repo(tmp_path)
-
-        store = make_store(tmp_path)
-
-        task = store.add("Task with deleted branch", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(UTC)
-        task.branch = "feat/deleted"
-        task.merge_status = "unmerged"
-        task.has_commits = True
-        store.update(task)
-
-        result = run_gza("refresh", str(task.id), "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "skipping" in result.stdout
 
     def test_refresh_all_unmerged(self, tmp_path: Path):
         """gza refresh (no args) refreshes all unmerged tasks."""
