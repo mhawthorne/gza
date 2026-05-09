@@ -1543,3 +1543,41 @@ class TestExtractionGitHelpers:
         assert result.stdout == "stdout"
         assert result.stderr == "stderr"
         mock_run.assert_called_once_with("apply", "--check", "--reverse", str(patch_file), check=False)
+
+    def test_reverse_check_patch_file_result_accepts_selected_subset_already_on_base(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        git._run("init", "-b", "main")
+        git._run("config", "user.email", "test@example.com")
+        git._run("config", "user.name", "Test User")
+
+        source_file = repo_dir / "src" / "file.py"
+        source_file.parent.mkdir(parents=True, exist_ok=True)
+        source_file.write_text("print('anchor')\n")
+        git._run("add", "src/file.py")
+        git._run("commit", "-m", "base")
+
+        git._run("checkout", "-b", "feature/source")
+        source_file.write_text("print('line a')\nprint('anchor')\n")
+        git._run("add", "src/file.py")
+        git._run("commit", "-m", "add line a")
+
+        patch_text = git.get_diff_patch_for_paths("main...feature/source", ("src/file.py",), binary=True)
+        patch_file = repo_dir / "selected.patch"
+        patch_file.write_text(patch_text)
+        assert "+print('line a')" in patch_text
+        assert "+print('line b')" not in patch_text
+
+        git._run("checkout", "main")
+        source_file.write_text("print('line a')\nprint('anchor')\nprint('line b')\n")
+        git._run("add", "src/file.py")
+        git._run("commit", "-m", "add line a and later line b on main")
+        current_base_delta = git.get_diff_patch_for_paths("main..feature/source", ("src/file.py",), binary=True)
+
+        result = git.reverse_check_patch_file_result(patch_file)
+
+        assert current_base_delta.strip()
+        assert result.returncode == 0
+        assert source_file.read_text() == "print('line a')\nprint('anchor')\nprint('line b')\n"

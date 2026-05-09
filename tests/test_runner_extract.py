@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 from gza.config import Config
 from gza.db import SqliteTaskStore, TaskStats
-from gza.git import GitApplyResult, GitError
+from gza.git import Git, GitApplyResult, GitError
 from gza.providers import RunResult
 from gza.runner import (
     EXTRACTION_ALREADY_MERGED_COMPLETION_REASON,
@@ -78,6 +78,36 @@ def _write_bundle(
     )
     (bundle_dir / "selected.patch").write_text(patch_text)
     (bundle_dir / "prompt.md").write_text("seed prompt\n")
+
+
+def _init_repo_for_selected_subset_already_merged(tmp_path: Path) -> str:
+    repo_git = Git(tmp_path)
+    repo_git._run("init", "-b", "main")
+    repo_git._run("config", "user.email", "test@example.com")
+    repo_git._run("config", "user.name", "Test User")
+
+    source_file = tmp_path / "src" / "file.py"
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    source_file.write_text("print('anchor')\n")
+    repo_git._run("add", "src/file.py")
+    repo_git._run("commit", "-m", "base")
+
+    repo_git._run("checkout", "-b", "feature/source")
+    source_file.write_text("print('line a')\nprint('anchor')\n")
+    repo_git._run("add", "src/file.py")
+    repo_git._run("commit", "-m", "add line a")
+
+    patch_text = repo_git.get_diff_patch_for_paths("main...feature/source", ("src/file.py",), binary=True)
+
+    repo_git._run("checkout", "main")
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    source_file.write_text("print('line a')\nprint('anchor')\nprint('line b')\n")
+    repo_git._run("add", "src/file.py")
+    repo_git._run("commit", "-m", "add line a and line b later on main")
+
+    return patch_text
+
+
 def test_seed_extraction_bundle_applies_patch_and_returns_paths(tmp_path: Path) -> None:
     task_store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
     task = task_store.add("Extracted task", task_type="implement")
@@ -864,23 +894,9 @@ def test_run_completes_without_provider_when_selected_source_changes_are_subset_
     task.slug = "20260508-already-merged-selected-subset"
     store.update(task)
 
-    patch_text = (
-        "diff --git a/src/file.py b/src/file.py\n"
-        "index e69de29..8c7e5a6 100644\n"
-        "--- a/src/file.py\n"
-        "+++ b/src/file.py\n"
-        "@@ -0,0 +1 @@\n"
-        "+print('line a')\n"
-    )
-    current_base_delta = (
-        "diff --git a/src/file.py b/src/file.py\n"
-        "index e69de29..1b83abc 100644\n"
-        "--- a/src/file.py\n"
-        "+++ b/src/file.py\n"
-        "@@ -0,0 +1,2 @@\n"
-        "+print('line a')\n"
-        "+print('line b')\n"
-    )
+    patch_text = _init_repo_for_selected_subset_already_merged(tmp_path)
+    assert "+print('line a')" in patch_text
+    assert "+print('line b')" not in patch_text
     _write_bundle(
         tmp_path,
         task.id,
@@ -904,22 +920,34 @@ def test_run_completes_without_provider_when_selected_source_changes_are_subset_
     mock_main_git.count_commits_ahead.return_value = 0
     mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
 
-    mock_worktree_git = Mock()
-    mock_worktree_git.ref_exists.side_effect = [True, True]
-    mock_worktree_git.get_diff_patch_for_paths.side_effect = [patch_text, current_base_delta]
-    mock_worktree_git.reverse_check_patch_file_result.return_value = GitApplyResult(
-        returncode=0,
-        stdout="",
-        stderr="",
+    worktree_path = config.worktree_path / task.slug
+    repo_git = Git(tmp_path)
+    repo_git.worktree_add(worktree_path, "feature/already-merged-selected-subset", "main")
+    worktree_git = Git(worktree_path)
+    current_base_delta = worktree_git.get_diff_patch_for_paths(
+        "main..feature/source",
+        ("src/file.py",),
+        binary=True,
+    )
+    reverse_check = patch.object(
+        worktree_git,
+        "reverse_check_patch_file_result",
+        wraps=worktree_git.reverse_check_patch_file_result,
     )
 
-    with (
-        patch("gza.runner.get_provider", return_value=mock_provider),
-        patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
-        patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
-        patch("gza.runner.load_dotenv"),
-    ):
-        rc = run(config, task_id=task.id)
+    assert current_base_delta.strip()
+    assert (worktree_path / "src" / "file.py").read_text() == (
+        "print('line a')\nprint('anchor')\nprint('line b')\n"
+    )
+
+    with reverse_check as mock_reverse_check:
+        with (
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
+            patch("gza.runner.Git", side_effect=[mock_main_git, worktree_git]),
+            patch("gza.runner.load_dotenv"),
+        ):
+            rc = run(config, task_id=task.id)
 
     assert rc == 0
     refreshed = store.get(task.id)
@@ -927,7 +955,10 @@ def test_run_completes_without_provider_when_selected_source_changes_are_subset_
     assert refreshed.status == "completed"
     assert refreshed.completion_reason == EXTRACTION_ALREADY_MERGED_COMPLETION_REASON
     assert mock_provider.run.call_count == 0
-    mock_worktree_git.apply_patch_file_result.assert_not_called()
+    assert mock_reverse_check.call_count == 1
+    assert (worktree_path / "src" / "file.py").read_text() == (
+        "print('line a')\nprint('anchor')\nprint('line b')\n"
+    )
 
 
 def test_run_marks_failed_when_extraction_manifest_identity_mismatches_task(tmp_path: Path) -> None:
