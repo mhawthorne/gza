@@ -2109,6 +2109,45 @@ class TestMergeStatus:
         assert refreshed_original.merge_status == "merged"
         assert refreshed_original.merged_at == original_merged_at
 
+    def test_set_merge_unit_state_preserves_merged_at_across_unmerge_remerge_cycle(self, tmp_path: Path) -> None:
+        """Unmerge/re-merge should keep the original merge timestamp on the unit and owner projection."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/remerge")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        store.set_merge_unit_state(impl_unit.id, "merged")
+        merged_unit = store.get_merge_unit(impl_unit.id)
+        assert merged_unit is not None
+        assert merged_unit.merged_at is not None
+        original_merged_at = merged_unit.merged_at
+
+        store.set_merge_unit_state(impl_unit.id, "unmerged")
+        unmerged_unit = store.get_merge_unit(impl_unit.id)
+        assert unmerged_unit is not None
+        assert unmerged_unit.state == "unmerged"
+        assert unmerged_unit.merged_at == original_merged_at
+
+        unmerged_impl = store.get(impl.id)
+        assert unmerged_impl is not None
+        assert unmerged_impl.merge_status == "unmerged"
+        assert unmerged_impl.merged_at is None
+
+        store.set_merge_unit_state(impl_unit.id, "merged")
+        remerged_unit = store.get_merge_unit(impl_unit.id)
+        assert remerged_unit is not None
+        assert remerged_unit.state == "merged"
+        assert remerged_unit.merged_at == original_merged_at
+
+        remerged_impl = store.get(impl.id)
+        assert remerged_impl is not None
+        assert remerged_impl.merge_status == "merged"
+        assert remerged_impl.merged_at == original_merged_at
+
     def test_same_branch_improve_reuses_related_merged_unit(self, tmp_path: Path) -> None:
         """A same-lineage same-branch improve task should reopen the existing unit."""
         db_path = tmp_path / "test.db"

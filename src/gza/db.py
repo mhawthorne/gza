@@ -4076,7 +4076,7 @@ class SqliteTaskStore:
         state: str,
         *,
         merged_by_task_id: str | None | object = _DB_UNSET,
-        merged_at: datetime | None = None,
+        merged_at: datetime | None | object = _DB_UNSET,
         pr_number: int | None | object = _DB_UNSET,
         pr_state: str | None | object = _DB_UNSET,
         pr_last_synced_at: datetime | None | object = _DB_UNSET,
@@ -4088,16 +4088,19 @@ class SqliteTaskStore:
             return
         now = datetime.now(UTC)
         current_unit = self.get_merge_unit(unit_id)
-        merged_at_value = merged_at
-        if state == "merged":
-            if merged_at_value is None and current_unit is not None and current_unit.state == "merged" and current_unit.merged_at is not None:
-                merged_at_value = current_unit.merged_at
-            elif merged_at_value is None:
-                merged_at_value = now
         updates: list[str] = ["state = ?", "updated_at = ?"]
         params: list[object] = [state, now.isoformat()]
-        updates.append("merged_at = ?")
-        params.append(merged_at_value.isoformat() if merged_at_value is not None else None)
+        merged_at_value: datetime | None | object = merged_at
+        if merged_at_value is _DB_UNSET:
+            if state == "merged":
+                if current_unit is not None and current_unit.merged_at is not None:
+                    merged_at_value = current_unit.merged_at
+                else:
+                    merged_at_value = now
+        if merged_at_value is not _DB_UNSET:
+            typed_merged_at_value = cast("datetime | None", merged_at_value)
+            updates.append("merged_at = ?")
+            params.append(typed_merged_at_value.isoformat() if typed_merged_at_value is not None else None)
         if merged_by_task_id is not _DB_UNSET:
             updates.append("merged_by_task_id = ?")
             params.append(cast("str | None", merged_by_task_id))
