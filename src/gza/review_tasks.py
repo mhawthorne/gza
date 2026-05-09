@@ -128,7 +128,7 @@ def create_review_task(
         review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
     inherited_tags = impl_task.tags or (() if impl_task.group is None else (impl_task.group,))
 
-    return store.add(
+    review_task = store.add(
         prompt=review_prompt,
         task_type="review",
         depends_on=impl_task.id,
@@ -137,6 +137,10 @@ def create_review_task(
         model=model,
         provider=provider,
     )
+    impl_unit = store.resolve_merge_unit_for_task(impl_task.id)
+    if impl_unit is not None:
+        store.get_or_create_merge_unit_for_task(review_task)
+    return review_task
 
 
 def build_followup_prompt_prefix(review_task_id: str, impl_task_id: str, finding_id: str) -> str:

@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Literal
 
 from .config import Config, ConfigError
-from .db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
-from .dependency_preconditions import get_unmerged_dependency_precondition
+from .db import MergeTargetResolutionError, SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from .dependency_preconditions import get_unmerged_dependency_precondition, task_is_merged
 from .failed_task_ordering import sort_failed_tasks
 from .failure_policy import is_resumable_failure_reason
 from .git import Git, GitError
@@ -102,6 +102,7 @@ class _RecoveryChainSnapshot:
 class _MergeContext:
     git: Git | None
     default_branch: str | None
+    resolution_error: str | None = None
     branch_resolution: dict[str, bool] = field(default_factory=dict)
     repository_inspection_warnings: list[str] = field(default_factory=list)
     _warning_keys: set[str] = field(default_factory=set)
@@ -400,6 +401,11 @@ def _resolve_merged_target_task(store: SqliteTaskStore, task: DbTask) -> DbTask 
     return None
 
 
+def _effective_merge_target_branch(store: SqliteTaskStore) -> str | None:
+    merge_context = _load_merge_context(_project_dir_for_store(store))
+    return _resolve_merge_context_target_branch(store, merge_context)
+
+
 def is_resolved_by_merged_target(store: SqliteTaskStore, task: DbTask) -> bool:
     """Return whether a failed side-quest task is obsolete because its target impl merged."""
     if task.id is None or task.status != "failed" or task.task_type not in _MERGED_TARGET_RESOLUTION_TYPES:
@@ -408,7 +414,9 @@ def is_resolved_by_merged_target(store: SqliteTaskStore, task: DbTask) -> bool:
         # Same-branch improve tasks can represent real post-merge follow-up work.
         return False
     target_task = _resolve_merged_target_task(store, task)
-    return target_task is not None and target_task.merge_status == "merged"
+    if target_task is None:
+        return False
+    return task_is_merged(store, target_task)
 
 
 def _load_merge_context(project_dir: Path | None = None) -> _MergeContext:
@@ -417,7 +425,7 @@ def _load_merge_context(project_dir: Path | None = None) -> _MergeContext:
         git = Git(config.project_dir)
         return _MergeContext(git=git, default_branch=git.default_branch())
     except (ConfigError, GitError, OSError, ValueError) as exc:
-        merge_context = _MergeContext(git=None, default_branch=None)
+        merge_context = _MergeContext(git=None, default_branch=None, resolution_error=str(exc))
         _record_repository_inspection_warning(
             merge_context,
             key="merge-context-load",
@@ -428,6 +436,21 @@ def _load_merge_context(project_dir: Path | None = None) -> _MergeContext:
             ),
         )
         return merge_context
+
+
+def _resolve_merge_context_target_branch(
+    store: SqliteTaskStore,
+    merge_context: _MergeContext,
+) -> str:
+    if merge_context.default_branch:
+        return merge_context.default_branch
+    project_dir = _project_dir_for_store(store)
+    if project_dir is None:
+        return store.default_merge_target(strict=False)
+    detail = merge_context.resolution_error or "Git returned no default branch"
+    raise MergeTargetResolutionError(
+        f"Could not determine default merge target for recovery decisions in {project_dir}: {detail}"
+    )
 
 
 def _project_dir_for_store(store: SqliteTaskStore) -> Path | None:
@@ -514,7 +537,14 @@ def _is_resolved_by_landed_lineage(
 
     lineage = build_lineage(store, resolve_lineage_root(store, task))
     for lineage_task in lineage:
-        if lineage_task.id == task.id or lineage_task.merge_status != "merged":
+        if lineage_task.id == task.id:
+            continue
+        merge_state = lineage_task.merge_status
+        if lineage_task.id is not None:
+            unit = store.resolve_merge_unit_for_task(lineage_task.id)
+            if unit is not None:
+                merge_state = unit.state
+        if merge_state != "merged":
             continue
         if lineage_task.id == independent_follow_up_root_id:
             continue

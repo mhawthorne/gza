@@ -76,16 +76,27 @@ def is_lineage_complete(task: Task) -> bool:
     - status is 'completed' AND has_commits is True AND merge_status is None
       (committed but merge not tracked yet)
     """
+    merge_state = task.merge_status
+    if getattr(task, "id", None) is not None:
+        unit = None
+        try:
+            # query.py helpers accept a bare task today, so only use task-row state here.
+            # Merge-aware callers should prefer TaskQuery/CLI paths that resolve units first.
+            unit = None
+        except Exception:
+            unit = None
+        if unit is not None:
+            merge_state = unit.state
     if task.status == "failed":
         return False
     if task.status == "completed":
-        if task.merge_status == "merged":
+        if merge_state == "merged":
             return True
         # Non-code tasks (explore/plan/review) produce no commits; treat as complete
         if not task.has_commits:
             return True
         # Code-producing tasks need explicit merge confirmation
-        if task.merge_status == "unmerged":
+        if merge_state == "unmerged":
             return False
         # has_commits=True but merge_status is None: treat as incomplete
         return False
@@ -262,10 +273,25 @@ def _has_successful_retry_descendant(store: SqliteTaskStore, task: Task) -> bool
     return any(child.status == "completed" for child in _iter_retry_descendants(store, task))
 
 
-def _has_merged_retry_descendant(store: SqliteTaskStore, task: Task) -> bool:
+def _has_merged_retry_descendant(
+    store: SqliteTaskStore,
+    task: Task,
+    *,
+    target_branch: str | None = None,
+) -> bool:
     """Return True when any same-type retry descendant has merge_status='merged'."""
     return any(
-        child.merge_status == "merged"
+        (
+            (
+                unit.state
+                if (
+                    child.id is not None
+                    and (unit := store.resolve_merge_unit_for_task(child.id)) is not None
+                )
+                else child.merge_status
+            )
+            == "merged"
+        )
         for child in _iter_retry_descendants(store, task)
         if child.task_type == task.task_type
     )
@@ -298,9 +324,18 @@ def _resolve_effective_shared_branch_retry_head(store: SqliteTaskStore, root_tas
     )
 
 
-def _is_effective_shared_branch_lineage_merged(store: SqliteTaskStore, root_task: Task) -> bool:
+def _is_effective_shared_branch_lineage_merged(
+    store: SqliteTaskStore,
+    root_task: Task,
+    *,
+    target_branch: str | None = None,
+) -> bool:
     """Return merge truth for shared-branch descendants under a canonical root."""
     effective_head = _resolve_effective_shared_branch_retry_head(store, root_task)
+    if effective_head.id is not None:
+        unit = store.resolve_merge_unit_for_task(effective_head.id)
+        if unit is not None:
+            return unit.state == "merged"
     return effective_head.merge_status == "merged"
 
 
@@ -344,7 +379,12 @@ def _prune_lineage_tree_to_ids(tree: TaskLineageNode, keep_ids: set[str]) -> Tas
     return filtered
 
 
-def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[IncompleteLineage]:
+def query_incomplete(
+    store: SqliteTaskStore,
+    f: HistoryFilter,
+    *,
+    target_branch: str | None = None,
+) -> list[IncompleteLineage]:
     """Return unresolved lineages grouped by canonical root for attention workflows."""
     filtered = HistoryFilter(
         limit=None,
@@ -391,7 +431,7 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
             continue
         root_merged = effective_shared_merge_by_root.get(root.id)
         if root_merged is None:
-            root_merged = _is_effective_shared_branch_lineage_merged(store, root)
+            root_merged = _is_effective_shared_branch_lineage_merged(store, root, target_branch=target_branch)
             effective_shared_merge_by_root[root.id] = root_merged
         shared_descendant = _is_shared_branch_descendant(task, root)
 
@@ -401,7 +441,7 @@ def query_incomplete(store: SqliteTaskStore, f: HistoryFilter) -> list[Incomplet
         else:
             if task.merge_status == "merged":
                 continue
-            if _has_merged_retry_descendant(store, task):
+            if _has_merged_retry_descendant(store, task, target_branch=target_branch):
                 continue
 
         unresolved_by_root.setdefault(root.id, []).append(task)

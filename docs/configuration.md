@@ -973,14 +973,14 @@ gza merge <task_id> [task_id...] [options]
 | `--rebase` | Rebase onto current branch instead of merging |
 | `--delete` | Delete the branch after successful merge |
 | `--remote` | Fetch from origin and rebase against remote (requires --rebase) |
-| `--mark-only` | Mark branch as merged without performing actual merge (deletes branch) |
+| `--mark-only` | Mark branch as merged without performing the git merge or deleting the branch |
 | `--resolve` | Auto-resolve conflicts using AI when rebasing (requires --rebase) |
 
-`gza merge` only performs the local git merge/rebase path and updates local task `merge_status`. It does not reconcile GitHub PR state. After merge, run `uv run gza sync` to refresh cached PR metadata and close any stale still-open PRs when remote default-branch state proves the changes already landed.
+`gza merge` only performs the local git merge/rebase path and updates local merge state. Merge units are the canonical persisted merge-truth model; compatibility task-row `merge_status` is dual-written from the selected unit during the migration window. Task selectors resolve through merge-unit membership first, so `uv run gza merge <review-task-id>` and same-branch follow-up task IDs merge the shared implementation branch/unit they belong to. It does not reconcile GitHub PR state. After merge, run `uv run gza sync` to refresh cached PR metadata and close any stale still-open PRs when remote default-branch state proves the changes already landed.
 
 ### unmerged
 
-List tasks with branches that have not been merged to the default branch.
+List tasks with merge units that have not been merged to the default branch.
 
 ```bash
 uv run gza unmerged [options]
@@ -995,7 +995,7 @@ uv run gza unmerged [options]
 | `--json` | Output JSON rows from the unified query API |
 | `--fields CSV` | Projection field override (for example `id,prompt`). In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
 
-`uv run gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills legacy `merge_status` when needed for merge-owning code rows, refreshes canonical branch-cohort merge truth from local git plus any already-present `origin/<default-branch>` remote-tracking ref, persists normalized `merge_status` and diff stats, and then prints the reconciled default-branch unmerged list. Same-branch improve/fix/rebase follow-ups may validly keep `merge_status = NULL` because the owning implementation row carries the shared branch merge truth.
+`uv run gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills merge units when needed, refreshes canonical branch-cohort merge truth from local git plus any already-present `origin/<default-branch>` remote-tracking ref, persists merge-unit state and diff stats for the real default target branch, dual-writes compatibility task merge fields, and then prints the reconciled default-branch unmerged list. Same-branch improve/fix/rebase/review follow-ups may validly keep `merge_status = NULL` because the owning implementation row carries the shared branch merge truth while all related rows remain attached to the same merge unit.
 
 This is the deliberate narrow exception to the usual read-only query convention: only plain default-branch `uv run gza unmerged` mutates, because its entire purpose is to answer the canonical question "what still needs to be merged?" without leaving stale cached rows behind.
 
@@ -1007,7 +1007,7 @@ If the canonical default-branch refresh cannot persist because the database is r
 
 With `--into-current` or `--target`, `uv run gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged. If a live branch comparison or diff-stat refresh fails for any branch, the command exits non-zero and does not print a potentially stale unmerged list from fallback state.
 
-`uv run gza unmerged` now builds an unmerged-specific query preset and then renders that result through the shared query projection/presentation path. The default text view is the slim operator-focused summary. Any explicit `--fields` switches to the generic projection renderer in either text or JSON mode, so `uv run gza unmerged --fields id` prints bare IDs and `uv run gza unmerged --json --fields id,prompt` returns structured rows.
+`uv run gza unmerged` now builds an unmerged-specific query preset and then renders that result through the shared query projection/presentation path. The default text view is the slim operator-focused summary. Any explicit `--fields` switches to the generic projection renderer in either text or JSON mode, so `uv run gza unmerged --fields id` prints bare IDs and `uv run gza unmerged --json --fields id,prompt,merge_unit_id,merge_unit_state,source_branch,target_branch` returns structured rows that expose both task and merge-unit context.
 
 During execution, the command logs concise progress for the refresh, query, and render phases. Those lines include counts for how many candidate tasks are being refreshed, how many task rows the query scans, and how many filtered rows are rendered.
 

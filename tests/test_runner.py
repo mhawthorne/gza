@@ -9765,7 +9765,6 @@ class TestDependencyMergePrecondition:
         assert target_branch == "main"
         assert git_error is None
 
-
 class TestGetPlanForTask:
     def test_finds_plan_via_depends_on_only(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")

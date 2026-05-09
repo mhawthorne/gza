@@ -14,6 +14,7 @@ import pytest
 from gza.db import (
     SCHEMA_VERSION,
     ManualMigrationRequired,
+    MergeTargetResolutionError,
     SchemaIntegrityError,
     SqliteTaskStore,
     StepRef,
@@ -1764,6 +1765,11 @@ class TestMergeStatus:
         assert retrieved is not None
         assert retrieved.merge_status == "unmerged"
         assert retrieved.has_commits is True
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.source_branch == "feature/test"
+        assert unit.target_branch == "main"
+        assert unit.state == "unmerged"
 
     def test_mark_completed_same_branch_improve_keeps_merge_status_on_owner_only(self, tmp_path: Path):
         """Completed same-branch improve rows should not own merge state."""
@@ -1926,8 +1932,8 @@ class TestMergeStatus:
         assert refreshed_improve.merge_status is None
         assert needs_merge_status_migration(store) is False
 
-    def test_needs_merge_status_migration_still_flags_merge_owner_rows(self, tmp_path: Path):
-        """Merge-owning legacy rows with commits still require backfill."""
+    def test_needs_merge_status_migration_is_disabled_when_merge_units_are_available(self, tmp_path: Path):
+        """Merge-unit-backed stores no longer report legacy merge-status migration work."""
         from gza.db import needs_merge_status_migration
 
         db_path = tmp_path / "test.db"
@@ -1938,7 +1944,197 @@ class TestMergeStatus:
         assert impl_task.id is not None
         store.set_merge_status(impl_task.id, None)
 
-        assert needs_merge_status_migration(store) is True
+        assert needs_merge_status_migration(store) is False
+
+    def test_same_branch_followups_share_one_merge_unit(self, tmp_path: Path) -> None:
+        """Same-branch improve/fix/review rows attach to the existing merge unit."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/impl")
+        review = store.add("Review feature", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "completed"
+        review.branch = "feature/impl"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        store.mark_completed(improve, has_commits=True, branch="feature/impl")
+
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        review_unit = store.resolve_merge_unit_for_task(review.id)
+        improve_unit = store.resolve_merge_unit_for_task(improve.id)
+        assert impl_unit is not None
+        assert review_unit is not None
+        assert improve_unit is not None
+        assert impl_unit.id == review_unit.id == improve_unit.id
+        attached_ids = {task.id for task in store.list_tasks_for_merge_unit(impl_unit.id)}
+        assert attached_ids == {impl.id, review.id, improve.id}
+
+    def test_mark_completed_without_explicit_target_raises_when_project_default_branch_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Project-backed write paths must not silently persist merge truth under main."""
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        store = SqliteTaskStore(tmp_path / "test.db", project_root=project_root)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        with patch("gza.git.Git.default_branch", side_effect=RuntimeError("git failure")):
+            with pytest.raises(MergeTargetResolutionError, match="Could not determine default merge target"):
+                store.mark_completed(task, has_commits=True, branch="feature/strict-default")
+
+        assert task.id is not None
+        assert store.resolve_merge_unit_for_task(task.id) is None
+        assert store.resolve_merge_unit_for_task(task.id) is None
+
+    def test_get_unmerged_backfills_legacy_actionable_row_when_merge_units_exist(self, tmp_path: Path) -> None:
+        """Legacy unmerged rows should remain visible until lazy merge-unit backfill attaches them."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        task = store.add(prompt="Legacy feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feature/legacy-unmerged"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        assert task.id is not None
+        assert store.supports_merge_units() is True
+        assert store.resolve_merge_unit_for_task(task.id) is None
+
+        unmerged = store.get_unmerged()
+
+        assert [candidate.id for candidate in unmerged] == [task.id]
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == "unmerged"
+        assert {member.id for member in store.list_tasks_for_merge_unit(unit.id)} == {task.id}
+
+    def test_get_unmerged_prefers_actionable_merge_unit_member_over_failed_owner(self, tmp_path: Path) -> None:
+        """Unit-backed reads should surface the mergeable member, not a failed historical owner."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        failed = store.add(prompt="Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.completed_at = datetime.now(UTC)
+        failed.branch = "feature/recovered-work"
+        failed.has_commits = True
+        failed.merge_status = "unmerged"
+        store.update(failed)
+
+        recovery = store.add(prompt="Completed retry", task_type="implement", based_on=failed.id)
+        store.mark_completed(recovery, has_commits=True, branch="feature/recovered-work")
+        assert recovery.id is not None
+
+        unit = store.resolve_merge_unit_for_task(recovery.id)
+        assert unit is not None
+        assert unit.owner_task_id == failed.id
+        assert store._legacy_merge_status_owner_for_unit(unit).id == failed.id
+
+        assert [task.id for task in store.get_unmerged()] == [recovery.id]
+        representative = store.resolve_merge_unit_representative_task(unit, require_actionable=True)
+        assert representative is not None
+        assert representative.id == recovery.id
+
+    def test_merge_unit_backfill_attaches_existing_branchless_reviews_with_review_role(self, tmp_path: Path) -> None:
+        """Backfilling an implementation unit should attach existing branchless reviews."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Legacy implement", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        impl.branch = "feature/review-backfill"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        unit = store.get_or_create_merge_unit_for_task(impl)
+        assert unit is not None
+        assert review.id is not None
+        assert store.resolve_merge_unit_for_task(review.id).id == unit.id
+
+        conn = sqlite3.connect(db_path)
+        role_row = conn.execute(
+            """
+            SELECT role
+            FROM merge_unit_tasks
+            WHERE project_id = ? AND merge_unit_id = ? AND task_id = ?
+            """,
+            ("default", unit.id, review.id),
+        ).fetchone()
+        conn.close()
+        assert role_row is not None
+        assert role_row[0] == "review"
+
+    def test_reused_branch_creates_new_merge_unit_for_unrelated_work(self, tmp_path: Path) -> None:
+        """Unrelated later work on a reused branch must not reopen the historical unit."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        original = store.add(prompt="Original feature", task_type="implement")
+        store.mark_completed(original, has_commits=True, branch="feature/reused")
+        assert original.id is not None
+        original_unit = store.resolve_merge_unit_for_task(original.id)
+        assert original_unit is not None
+        store.set_merge_unit_state(original_unit.id, "merged")
+
+        merged_original = store.get(original.id)
+        assert merged_original is not None
+        assert merged_original.merge_status == "merged"
+        original_merged_at = merged_original.merged_at
+
+        unrelated = store.add(prompt="Unrelated feature", task_type="implement")
+        store.mark_completed(unrelated, has_commits=True, branch="feature/reused")
+        assert unrelated.id is not None
+        unrelated_unit = store.resolve_merge_unit_for_task(unrelated.id)
+        assert unrelated_unit is not None
+
+        assert unrelated_unit.id != original_unit.id
+        assert store.get_merge_unit(original_unit.id).state == "merged"
+        assert {task.id for task in store.list_tasks_for_merge_unit(original_unit.id)} == {original.id}
+        assert {task.id for task in store.list_tasks_for_merge_unit(unrelated_unit.id)} == {unrelated.id}
+
+        refreshed_original = store.get(original.id)
+        assert refreshed_original is not None
+        assert refreshed_original.merge_status == "merged"
+        assert refreshed_original.merged_at == original_merged_at
+
+    def test_same_branch_improve_reuses_related_merged_unit(self, tmp_path: Path) -> None:
+        """A same-lineage same-branch improve task should reopen the existing unit."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/reused")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+        store.set_merge_unit_state(impl_unit.id, "merged")
+
+        improve = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        store.mark_completed(improve, has_commits=True, branch="feature/reused")
+        assert improve.id is not None
+        improve_unit = store.resolve_merge_unit_for_task(improve.id)
+        assert improve_unit is not None
+
+        assert improve_unit.id == impl_unit.id
+        assert store.get_merge_unit(impl_unit.id).state == "unmerged"
+        assert {task.id for task in store.list_tasks_for_merge_unit(impl_unit.id)} == {impl.id, improve.id}
 
     def test_migrate_merge_status_logs_when_remote_probe_fails(self, tmp_path: Path, caplog: pytest.LogCaptureFixture):
         """Migration logs a warning and defaults safely when origin inspection fails."""
@@ -1973,6 +2169,9 @@ class TestMergeStatus:
         updated = store.get(task.id)
         assert updated is not None
         assert updated.merge_status == "unmerged"
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == "unmerged"
         assert "Could not inspect origin while backfilling merge status" in caplog.text
 
     def test_migrate_merge_status_deleted_local_branch_with_remote_survivor_stays_unmerged(self, tmp_path: Path):
@@ -5085,7 +5284,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -5097,7 +5296,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -7522,7 +7721,7 @@ class TestSharedDbIsolationAndImportGating:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]
 
 
 class TestSyncCandidates:
@@ -7638,3 +7837,29 @@ class TestSyncCandidates:
 
         assert task.id not in cached_candidate_ids
         assert task.id in uncached_candidate_ids
+
+    def test_get_sync_candidates_unions_merge_units_and_legacy_rows_during_migration(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+        now = datetime.now(UTC)
+
+        unit_task = store.add("Unit-backed task", task_type="implement")
+        unit_task.status = "completed"
+        unit_task.completed_at = now
+        unit_task.branch = "feature/unit-backed"
+        unit_task.has_commits = True
+        unit_task.merge_status = "unmerged"
+        store.update(unit_task)
+        unit = store.get_or_create_merge_unit_for_task(unit_task)
+        assert unit is not None
+
+        legacy_task = store.add("Legacy task", task_type="implement")
+        legacy_task.status = "completed"
+        legacy_task.completed_at = now - timedelta(hours=1)
+        legacy_task.branch = "feature/legacy-only"
+        legacy_task.has_commits = True
+        legacy_task.merge_status = "unmerged"
+        store.update(legacy_task)
+
+        candidate_ids = {task.id for task in store.get_sync_candidates(recent_days=30)}
+
+        assert candidate_ids == {unit_task.id, legacy_task.id}

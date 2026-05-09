@@ -8,6 +8,7 @@ from gza.git import GitError
 from gza.github import GitHubError, PullRequestDetails
 from gza.sync_ops import (
     BranchCohort,
+    build_default_branch_cohorts,
     build_branch_cohorts_for_task_ids,
     build_task_branch_cohort,
     build_unmerged_branch_cohorts,
@@ -268,6 +269,123 @@ def test_sync_branch_cohorts_marks_merged_when_origin_default_ref_proves_remote_
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.merge_status == "merged"
+
+
+def test_sync_branch_cohorts_persists_merge_units(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/master-target-sync")
+
+    git = Mock()
+    git.default_branch.return_value = "master"
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        [BranchCohort(branch=task.branch, tasks=(task,))],
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=False,
+    )
+
+    assert partial is False
+    assert results[0].merge_status == "unmerged"
+    assert task.id is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    assert unit.state == "unmerged"
+
+
+def test_build_default_branch_cohorts_unions_merge_units_and_legacy_branches_without_duplicates(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    unit_task = _completed_branch_task(store, "Unit task", "feature/unit")
+    unit = store.get_or_create_merge_unit_for_task(unit_task)
+    assert unit is not None
+
+    unit_follow_up = store.add("Fix task", task_type="fix", based_on=unit_task.id)
+    unit_follow_up.status = "completed"
+    unit_follow_up.completed_at = datetime.now(UTC)
+    unit_follow_up.branch = "feature/unit"
+    unit_follow_up.has_commits = True
+    unit_follow_up.same_branch = True
+    store.update(unit_follow_up)
+    assert unit_task.id is not None
+    assert unit_follow_up.id is not None
+    store.get_or_create_merge_unit_for_task(unit_follow_up)
+
+    legacy_task = _completed_branch_task(store, "Legacy task", "feature/legacy")
+
+    cohorts = build_default_branch_cohorts(store, recent_days=30, cooldown_seconds=0)
+
+    assert {(cohort.branch, cohort.merge_unit_id) for cohort in cohorts} == {
+        ("feature/unit", unit.id),
+        ("feature/legacy", None),
+    }
+    assert {task.id for cohort in cohorts for task in cohort.tasks} == {
+        unit_task.id,
+        unit_follow_up.id,
+        legacy_task.id,
+    }
+
+
+def test_sync_branch_cohorts_keeps_historical_reused_branch_unit_merged(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    historical = _completed_branch_task(store, "Historical task", "feature/reused")
+    assert historical.id is not None
+    historical_unit = store.get_or_create_merge_unit_for_task(historical)
+    assert historical_unit is not None
+    store.set_merge_unit_state(historical_unit.id, "merged")
+
+    unrelated = _completed_branch_task(store, "Unrelated task", "feature/reused")
+    assert unrelated.id is not None
+    unrelated_unit = store.get_or_create_merge_unit_for_task(unrelated)
+    assert unrelated_unit is not None
+    assert unrelated_unit.id != historical_unit.id
+
+    cohorts = build_unmerged_branch_cohorts(store)
+    assert len(cohorts) == 1
+    assert cohorts[0].merge_unit_id == unrelated_unit.id
+    assert {task.id for task in cohorts[0].code_tasks} == {unrelated.id}
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        cohorts,
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=False,
+    )
+
+    assert partial is False
+    assert results[0].merge_status == "unmerged"
+
+    refreshed_historical = store.get(historical.id)
+    refreshed_unrelated = store.get(unrelated.id)
+    refreshed_historical_unit = store.resolve_merge_unit_for_task(historical.id)
+    refreshed_unrelated_unit = store.resolve_merge_unit_for_task(unrelated.id)
+    assert refreshed_historical is not None
+    assert refreshed_unrelated is not None
+    assert refreshed_historical_unit is not None
+    assert refreshed_unrelated_unit is not None
+    assert refreshed_historical_unit.state == "merged"
+    assert refreshed_historical.merge_status == "merged"
+    assert refreshed_unrelated_unit.state == "unmerged"
+    assert refreshed_unrelated.merge_status == "unmerged"
+    assert (
+        refreshed_unrelated_unit.diff_files_changed,
+        refreshed_unrelated_unit.diff_lines_added,
+        refreshed_unrelated_unit.diff_lines_removed,
+    ) == (1, 2, 1)
 
 
 def test_sync_branch_cohorts_no_fetch_ignores_cached_origin_default_ref_by_default(tmp_path):
@@ -890,3 +1008,34 @@ def test_sync_branch_cohorts_preserves_existing_merged_at_for_already_merged_bra
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.merged_at == old_merged_at
+
+
+def test_sync_branch_cohorts_preserves_existing_merged_by_task_id_on_routine_persistence(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Merged task", "feature/merged-by")
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "merged", merged_by_task_id=task.id)
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = True
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        [BranchCohort(branch="feature/merged-by", tasks=(task,), merge_unit_id=unit.id)],
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=False,
+    )
+
+    assert partial is False
+    assert "marked merged" in results[0].actions
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.merged_by_task_id == task.id

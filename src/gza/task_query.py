@@ -80,6 +80,7 @@ class TaskQuery:
     exclude_root_ids: tuple[str, ...] | None = None
     task_ids: tuple[str, ...] | None = None
     branch_owner_ids: tuple[str, ...] | None = None
+    merge_unit_ids: tuple[str, ...] | None = None
     groups: tuple[str, ...] | None = None
     tag_filters: tuple[str, ...] | None = None
     exclude_tag_filters: tuple[str, ...] | None = None
@@ -201,7 +202,10 @@ _PROJECTION_PRESET_FIELDS: dict[str, tuple[str, ...]] = {
         "unresolved_ids",
         "lineage_text",
         "branch",
+        "source_branch",
         "target_branch",
+        "merge_unit_id",
+        "merge_unit_state",
         "branch_deleted",
         "commit_count",
         "files_changed",
@@ -333,6 +337,7 @@ class TaskQueryPresets:
     def unmerged(
         *,
         branch_owner_ids: tuple[str, ...],
+        merge_unit_ids: tuple[str, ...] | None = None,
         task_ids: tuple[str, ...] | None = None,
         limit: int | None = 5,
         mode: PresentationMode = "rich",
@@ -343,6 +348,7 @@ class TaskQueryPresets:
             limit=limit,
             task_ids=task_ids,
             branch_owner_ids=branch_owner_ids,
+            merge_unit_ids=merge_unit_ids,
             projection=projection or ProjectionSpec(preset=TaskProjectionPreset.UNMERGED_DEFAULT),
             presentation=PresentationSpec(mode=mode),
         )
@@ -364,7 +370,7 @@ class TaskQueryService:
     ) -> TaskQueryResult:
         """Execute a query and return projected rows."""
         if query.scope == "lineages":
-            all_lineages = self._collect_lineages_unlimited(query)
+            all_lineages = self._collect_lineages_unlimited(query, target_branch=target_branch)
             lineages = self._apply_limit(all_lineages, query.limit)
             lineage_rows = tuple(
                 self._project_lineage_row(
@@ -380,7 +386,7 @@ class TaskQueryService:
 
         all_tasks = self._collect_tasks_unlimited(query)
         tasks = self._apply_limit(all_tasks, query.limit)
-        task_rows = tuple(self._project_task_row(task, query) for task in tasks)
+        task_rows = tuple(self._project_task_row(task, query, target_branch=target_branch) for task in tasks)
         return TaskQueryResult(query=query, rows=task_rows, total_count=len(all_tasks))
 
     def _collect_tasks(self, query: TaskQuery) -> list[DbTask]:
@@ -404,10 +410,10 @@ class TaskQueryService:
             return list(self._store.get_pending(limit=None, tags=tags, any_tag=query.any_tag))
         return list(self._store.get_all())
 
-    def _collect_lineages(self, query: TaskQuery) -> list[LineageRow]:
-        return self._apply_limit(self._collect_lineages_unlimited(query), query.limit)
+    def _collect_lineages(self, query: TaskQuery, *, target_branch: str | None = None) -> list[LineageRow]:
+        return self._apply_limit(self._collect_lineages_unlimited(query, target_branch=target_branch), query.limit)
 
-    def _collect_lineages_unlimited(self, query: TaskQuery) -> list[LineageRow]:
+    def _collect_lineages_unlimited(self, query: TaskQuery, *, target_branch: str | None = None) -> list[LineageRow]:
         use_incomplete_rollup = bool(
             query.lifecycle_state and "incomplete" in query.lifecycle_state
         )
@@ -426,7 +432,7 @@ class TaskQueryService:
                 end_date=(query.date_filter.end.isoformat() if query.date_filter and query.date_filter.end else None),
                 date_field=(query.date_filter.field if query.date_filter else "effective"),
             )
-            incomplete = _query_incomplete(self._store, f)
+            incomplete = _query_incomplete(self._store, f, target_branch=target_branch)
             excluded_task_types = set(query.exclude_task_types) if query.exclude_task_types is not None else None
             unresolved_by_owner: dict[str, list[DbTask]] = {}
             incomplete_owner_by_id: dict[str, DbTask] = {}
@@ -515,6 +521,7 @@ class TaskQueryService:
                     exclude_root_ids=query.exclude_root_ids,
                     task_ids=query.task_ids,
                     branch_owner_ids=query.branch_owner_ids,
+                    merge_unit_ids=query.merge_unit_ids,
                     groups=query.groups,
                     tag_filters=query.tag_filters,
                     exclude_tag_filters=query.exclude_tag_filters,
@@ -662,6 +669,14 @@ class TaskQueryService:
                 if self._resolve_branch_owner(task).id in allowed_owners
             ]
 
+        if query.merge_unit_ids is not None:
+            filtered = [
+                task
+                for task in filtered
+                if task.id is not None
+                and self._store.task_is_attached_to_merge_unit_ids(task.id, query.merge_unit_ids)
+            ]
+
         if query.groups is not None or query.tag_filters is not None or query.exclude_tag_filters is not None:
             filtered = [task for task in filtered if self._matches_group_and_tag_filters(task, query)]
 
@@ -745,7 +760,7 @@ class TaskQueryService:
 
         return filtered
 
-    def _project_task_row(self, task: DbTask, query: TaskQuery) -> TaskRow:
+    def _project_task_row(self, task: DbTask, query: TaskQuery, *, target_branch: str | None) -> TaskRow:
         root = _resolve_lineage_root(self._store, task)
         branch_owner = self._resolve_branch_owner(task)
         blocked, blocking_id, blocking_status = self._store.is_task_blocked(task)
@@ -887,6 +902,10 @@ class TaskQueryService:
         return task
 
     def _branch_merge_state(self, owner_task: DbTask) -> str:
+        if owner_task.id is not None:
+            unit = self._store.resolve_merge_unit_for_task(owner_task.id)
+            if unit is not None:
+                return unit.state
         if owner_task.merge_status == "merged":
             return "merged"
         if owner_task.merge_status == "unmerged":
@@ -1091,10 +1110,10 @@ def _flatten_lineage_tree(tree: Any) -> list[DbTask]:
     return flatten_lineage_tree(tree)
 
 
-def _query_incomplete(store: SqliteTaskStore, history_filter: Any) -> list[Any]:
+def _query_incomplete(store: SqliteTaskStore, history_filter: Any, *, target_branch: str | None = None) -> list[Any]:
     from gza.query import query_incomplete
 
-    return query_incomplete(store, history_filter)
+    return query_incomplete(store, history_filter, target_branch=target_branch)
 
 
 def _prune_lineage_tree_to_ids(tree: Any, keep_ids: set[str]) -> Any:

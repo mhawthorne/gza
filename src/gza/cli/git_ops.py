@@ -23,6 +23,7 @@ from ..console import (
     shorten_prompt,
 )
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from ..dependency_preconditions import task_is_merged
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import (
     Git,
@@ -86,6 +87,11 @@ from .advance_executor import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _task_is_already_merged(store: SqliteTaskStore, task: DbTask) -> bool:
+    """Return whether the selected task is already merged."""
+    return task_is_merged(store, task)
 
 
 def _format_needs_attention_line(task: DbTask, action: dict[str, Any]) -> str:
@@ -255,6 +261,7 @@ def _collect_advance_completed_tasks(
     store: SqliteTaskStore,
     *,
     advance_type: str | None = None,
+    target_branch: str | None = None,
 ) -> tuple[list[DbTask], set[str]]:
     """Collect completed tasks eligible for advance-style action planning.
 
@@ -378,6 +385,40 @@ def _build_auto_merge_args(
     )
 
 
+def _task_merge_unit_state(store: SqliteTaskStore, task: DbTask, *, target_branch: str | None) -> str | None:
+    if task.id is not None:
+        unit = store.resolve_merge_unit_for_task(task.id)
+        if unit is not None:
+            return unit.state
+    return task.merge_status
+
+
+def _resolve_merge_target_task(
+    store: SqliteTaskStore,
+    task_id: str,
+    target_branch: str,
+) -> DbTask | None:
+    task = store.get(task_id)
+    if task is None:
+        return None
+    if task.id is None:
+        return task
+    unit = store.resolve_merge_unit_for_task(task.id)
+    if unit is None:
+        unit = store.get_or_create_merge_unit_for_task(task)
+    if unit is None:
+        return task
+    representative = store.resolve_merge_unit_representative_task(
+        unit,
+        preferred_task_id=task.id,
+        require_actionable=True,
+    )
+    if representative is not None:
+        return representative
+    owner = store._legacy_merge_status_owner_for_unit(unit)
+    return owner or task
+
+
 def _merge_single_task(
     task_id: str,
     config: Config,
@@ -387,11 +428,13 @@ def _merge_single_task(
     current_branch: str,
 ) -> int:
     """Merge a single task's branch. Returns 0 on success, 1 on failure."""
-    # Get the task
-    task = store.get(task_id)
+    # Resolve selected row to the active merge unit owner when available.
+    target_branch = git.default_branch()
+    task = _resolve_merge_target_task(store, task_id, target_branch)
     if not task:
         print(f"Error: Task {task_id} not found")
         return 1
+    merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
 
     # Validate task state
     if task.status not in ("completed", "unmerged"):
@@ -409,7 +452,10 @@ def _merge_single_task(
             print("Error: --mark-only cannot be used with --rebase, --squash, or --delete")
             return 1
 
-        store.set_merge_status(task.id, "merged")
+        if merge_unit is not None:
+            store.set_merge_unit_state(merge_unit.id, "merged", merged_by_task_id=task.id)
+        else:
+            store.set_merge_status(task.id, "merged")
         print(f"✓ Marked task {task.id} as merged (branch '{task.branch}' preserved)")
         return 0
 
@@ -507,7 +553,10 @@ def _merge_single_task(
                 print(f"Warning: Could not delete branch: {e}")
 
         if git.repo_dir == config.project_dir:
-            store.set_merge_status(task.id, "merged")
+            if merge_unit is not None:
+                store.set_merge_unit_state(merge_unit.id, "merged", merged_by_task_id=task.id)
+            else:
+                store.set_merge_status(task.id, "merged")
         return 0
 
     except GitError as e:
@@ -552,7 +601,10 @@ def _merge_single_task(
                     print(f"Warning: Could not delete branch: {del_error}")
 
             if git.repo_dir == config.project_dir:
-                store.set_merge_status(task.id, "merged")
+                if merge_unit is not None:
+                    store.set_merge_unit_state(merge_unit.id, "merged", merged_by_task_id=task.id)
+                else:
+                    store.set_merge_status(task.id, "merged")
             return 0
 
         print(f"Error during {operation}: {e}")
@@ -582,12 +634,12 @@ def cmd_merge(args: argparse.Namespace) -> int:
 
     # Get current branch once
     current_branch = git.current_branch()
+    default = git.default_branch()
     print(f"On branch {current_branch}")
 
     # --mark-only is a DB-only escape hatch for users who merge manually;
     # it does not run git operations so the default-branch rule does not apply.
     if getattr(args, 'mark_only', False):
-        default = git.default_branch()
         if current_branch != default:
             print(
                 f"Note: --mark-only on non-default branch "
@@ -602,23 +654,43 @@ def cmd_merge(args: argparse.Namespace) -> int:
 
     use_all = getattr(args, 'all', False)
     if use_all:
-        # Find all completed/unmerged tasks with branches not yet merged
-        history = store.get_history(limit=None)
         seen_ids = set(task_ids)
-        # Process oldest first (history is newest-first, so reverse it)
-        for task in reversed(history):
-            if task.id in seen_ids:
+        for task in reversed(store.get_unmerged()):
+            if task.id is None or task.id in seen_ids or not task.branch:
                 continue
-            if task.id is not None and task.status in ("completed", "unmerged") and task.branch and task.has_commits:
-                if task.merge_status != "merged" and not git.is_merged(task.branch, current_branch):
-                    task_ids.append(task.id)
-                    seen_ids.add(task.id)
+            if task.status not in ("completed", "unmerged"):
+                continue
+            if git.is_merged(task.branch, current_branch):
+                continue
+            task_ids.append(task.id)
+            seen_ids.add(task.id)
         if not task_ids:
             print("No unmerged done tasks found")
             return 0
     elif not task_ids:
         print("Error: either provide task_id(s) or use --all to merge all unmerged done tasks")
         return 1
+
+    # Deduplicate selected task rows by active merge unit/branch owner.
+    deduped_task_ids: list[str] = []
+    seen_units: set[str] = set()
+    seen_tasks: set[str] = set()
+    for raw_task_id in task_ids:
+        resolved = _resolve_merge_target_task(store, raw_task_id, default)
+        if resolved is None or resolved.id is None:
+            print(f"Error: Task {raw_task_id} not found")
+            return 1
+        resolved_id = resolved.id
+        resolved_unit = store.resolve_merge_unit_for_task(resolved_id)
+        if resolved_unit is not None:
+            if resolved_unit.id in seen_units:
+                continue
+            seen_units.add(resolved_unit.id)
+        if resolved_id in seen_tasks:
+            continue
+        seen_tasks.add(resolved_id)
+        deduped_task_ids.append(resolved_id)
+    task_ids = deduped_task_ids
 
     # Track success/failure
     merged_tasks = []
@@ -970,7 +1042,11 @@ def _run_task_backed_rebase(
         if target_parent_id:
             store.invalidate_review_state(target_parent_id)
             parent = store.get(target_parent_id)
-            if parent and parent.id is not None and parent.merge_status == "merged":
+            if parent and parent.id is not None and _task_merge_unit_state(
+                store,
+                parent,
+                target_branch=rebase_target,
+            ) == "merged":
                 store.set_merge_status(parent.id, "unmerged")
 
         if resolved_by_provider:
@@ -1241,11 +1317,10 @@ def cmd_pr(args: argparse.Namespace) -> int:
         return 1
 
     # Check merge_status before requiring gh (local DB check, no external dependencies)
-    if task.merge_status == "merged":
+    default_branch = git.default_branch()
+    if _task_merge_unit_state(store, task, target_branch=default_branch) == "merged":
         print(f"Error: Task {task.id} is already marked as merged")
         return 1
-
-    default_branch = git.default_branch()
 
     result = ensure_task_pr(
         task,
@@ -1311,7 +1386,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
     preliminary_results: list = []
     if args.task_ids:
         resolved_ids = [resolve_id(config, task_id) for task_id in args.task_ids]
-        cohorts, preliminary_results = build_branch_cohorts_for_task_ids(store, resolved_ids)
+        cohorts, preliminary_results = build_branch_cohorts_for_task_ids(
+            store,
+            resolved_ids,
+        )
     else:
         cohorts = build_default_branch_cohorts(store)
 
@@ -1730,6 +1808,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     def _prompt_avail(task_id: str | None) -> int:
         return prompt_available_width(prefix=len(task_id or "") + 4)  # "  #NNN "
     git = Git(config.project_dir)
+    default_branch = git.default_branch()
 
     dry_run: bool = args.dry_run
     auto: bool = getattr(args, 'auto', False)
@@ -1803,7 +1882,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
             else:
                 planning_task = resolve_recovery_planning_task(store, task)
                 if planning_task is not task:
-                    tasks = [planning_task] if planning_task.merge_status != 'merged' else []
+                    tasks = [planning_task] if not _task_is_already_merged(
+                        store, planning_task
+                    ) else []
                     failed_tasks = []
                 else:
                     tasks = []
@@ -1812,12 +1893,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if task.status != 'completed':
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
                 return 1
-            if task.merge_status == 'merged':
+            if _task_is_already_merged(store, task):
                 print(f"Task {task_id} is already merged")
                 return 0
             tasks = [task]
     else:
-        tasks, impl_based_on_ids = _collect_advance_completed_tasks(store, advance_type=advance_type)
+        tasks, impl_based_on_ids = _collect_advance_completed_tasks(
+            store,
+            advance_type=advance_type,
+            target_branch=default_branch,
+        )
 
         # Apply failed-task filters after completed-task type filtering above.
         if advance_type == 'plan':

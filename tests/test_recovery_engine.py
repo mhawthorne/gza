@@ -5,6 +5,8 @@ import pytest
 
 import gza.recovery_engine as recovery_engine
 from gza.git import GitError
+from gza.db import MergeTargetResolutionError
+from gza.git import GitError
 from gza.recovery_engine import (
     _MergeContext,
     decide_failed_task_recovery,
@@ -44,22 +46,28 @@ def _completed_impl(store, *, merge_status: str):
 
 
 class _StubMergeGit:
-    def __init__(self, *, merged_branches: set[str] | None = None) -> None:
+    def __init__(self, *, merged_branches: set[str] | None = None, default_branch: str = "main") -> None:
         self.merged_branches = merged_branches or set()
+        self.default_branch = default_branch
 
     def branch_exists(self, branch: str) -> bool:
         return bool(branch)
 
     def is_merged(self, branch: str, into: str) -> bool:
-        return into == "main" and branch in self.merged_branches
+        return into == self.default_branch and branch in self.merged_branches
 
 
-def _stub_merge_context(monkeypatch: pytest.MonkeyPatch, *, merged_branches: set[str] | None = None) -> None:
-    git = _StubMergeGit(merged_branches=merged_branches)
+def _stub_merge_context(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    merged_branches: set[str] | None = None,
+    default_branch: str = "main",
+) -> None:
+    git = _StubMergeGit(merged_branches=merged_branches, default_branch=default_branch)
     monkeypatch.setattr(
         recovery_engine,
         "_load_merge_context",
-        lambda _project_dir=None: _MergeContext(git=git, default_branch="main"),
+        lambda _project_dir=None: _MergeContext(git=git, default_branch=default_branch),
     )
 
 

@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
-from .db import SqliteTaskStore, Task, task_owns_merge_status
+from .db import _DB_UNSET, SqliteTaskStore, Task, task_owns_merge_status
 from .git import Git, GitError, parse_diff_numstat
 from .github import GitHub, GitHubError, PullRequestDetails
 
@@ -33,6 +33,7 @@ class BranchCohort:
 
     branch: str
     tasks: tuple[Task, ...]
+    merge_unit_id: str | None = None
 
     @property
     def code_tasks(self) -> tuple[Task, ...]:
@@ -162,7 +163,7 @@ def build_branch_cohorts_for_task_ids(
     task_ids: list[str],
 ) -> tuple[list[BranchCohort], list[BranchSyncResult]]:
     """Expand explicit task IDs into branch cohorts and skip/error rows."""
-    branch_names: set[str] = set()
+    seen_keys: set[tuple[str, str]] = set()
     cohorts: list[BranchCohort] = []
     prelim_results: list[BranchSyncResult] = []
 
@@ -195,9 +196,28 @@ def build_branch_cohorts_for_task_ids(
                 )
             )
             continue
-        if task.branch in branch_names:
+        unit = (
+            store.resolve_merge_unit_for_task(task.id)
+            if store.supports_merge_units() and task.id is not None
+            else None
+        )
+        if unit is not None:
+            cohort_key = ("unit", unit.id)
+            if cohort_key in seen_keys:
+                continue
+            seen_keys.add(cohort_key)
+            cohorts.append(
+                BranchCohort(
+                    branch=unit.source_branch,
+                    tasks=tuple(store.list_tasks_for_merge_unit(unit.id)),
+                    merge_unit_id=unit.id,
+                )
+            )
             continue
-        branch_names.add(task.branch)
+        cohort_key = ("branch", task.branch)
+        if cohort_key in seen_keys:
+            continue
+        seen_keys.add(cohort_key)
         cohorts.append(BranchCohort(branch=task.branch, tasks=tuple(store.get_tasks_for_branch(task.branch))))
 
     return cohorts, prelim_results
@@ -208,12 +228,33 @@ def build_branch_cohorts_for_tasks(
     tasks: list[Task],
 ) -> list[BranchCohort]:
     """Collapse branch-bearing task rows into one cohort per branch."""
-    branch_names: set[str] = set()
+    seen_keys: set[tuple[str, str]] = set()
     cohorts: list[BranchCohort] = []
     for task in tasks:
-        if not task.branch or task.branch in branch_names:
+        if not task.branch:
             continue
-        branch_names.add(task.branch)
+        unit = (
+            store.resolve_merge_unit_for_task(task.id)
+            if store.supports_merge_units() and task.id is not None
+            else None
+        )
+        if unit is not None:
+            cohort_key = ("unit", unit.id)
+            if cohort_key in seen_keys:
+                continue
+            seen_keys.add(cohort_key)
+            cohorts.append(
+                BranchCohort(
+                    branch=unit.source_branch,
+                    tasks=tuple(store.list_tasks_for_merge_unit(unit.id)),
+                    merge_unit_id=unit.id,
+                )
+            )
+            continue
+        cohort_key = ("branch", task.branch)
+        if cohort_key in seen_keys:
+            continue
+        seen_keys.add(cohort_key)
         cohorts.append(BranchCohort(branch=task.branch, tasks=tuple(store.get_tasks_for_branch(task.branch))))
     return cohorts
 
@@ -240,13 +281,19 @@ def build_default_branch_cohorts(
     """Build the bounded default sync cohort set."""
     return build_branch_cohorts_for_tasks(
         store,
-        store.get_sync_candidates(recent_days=recent_days, cooldown_seconds=cooldown_seconds),
+        store.get_sync_candidates(
+            recent_days=recent_days,
+            cooldown_seconds=cooldown_seconds,
+        ),
     )
 
 
 def build_unmerged_branch_cohorts(store: SqliteTaskStore) -> list[BranchCohort]:
     """Build the canonical branch cohort set for daily default-branch unmerged reconciliation."""
-    return build_branch_cohorts_for_tasks(store, store.get_canonical_unmerged_candidates())
+    return build_branch_cohorts_for_tasks(
+        store,
+        store.get_canonical_unmerged_candidates(),
+    )
 
 
 def _remote_branch_ref_for_reconcile(
@@ -489,6 +536,7 @@ def _persist_branch_updates(
     cohorts: list[BranchCohort],
     results: list[BranchSyncResult],
     updates: list[_BranchPersistenceUpdate],
+    target_branch: str,
     *,
     sync_completed_at: datetime | None = None,
 ) -> None:
@@ -501,6 +549,8 @@ def _persist_branch_updates(
         _persist_branch_state(
             store,
             cohort.code_tasks,
+            target_branch,
+            merge_unit_id=cohort.merge_unit_id,
             merge_status=update.merge_status,
             diff_stats=update.diff_stats,
             pr_number=update.pr_number,
@@ -535,7 +585,7 @@ def reconcile_task_branch_merge_truth(
         include_diff_stats=include_diff_stats,
     )[0]
     if persist and result.skipped_reason is None:
-        _persist_branch_updates(store, [cohort], [result], [_git_reconcile_update(result)])
+        _persist_branch_updates(store, [cohort], [result], [_git_reconcile_update(result)], target_branch)
     return result
 
 
@@ -648,6 +698,7 @@ def sync_branch_cohorts(
             cohorts,
             results,
             updates,
+            default_branch,
             sync_completed_at=datetime.now(UTC),
         )
 
@@ -677,9 +728,9 @@ def refresh_branch_diff_stats(
     tasks: list[Task],
 ) -> tuple[list[BranchSyncResult], int]:
     """Refresh diff stats for explicit task/branch selections via the shared path."""
-    branch_names: set[str] = set()
-    cohorts: list[BranchCohort] = []
     results: list[BranchSyncResult] = []
+    eligible_tasks: list[Task] = []
+    default_branch = git.default_branch()
     for task in tasks:
         task_id = task.id
         if not task.branch:
@@ -700,12 +751,9 @@ def refresh_branch_diff_stats(
                 )
             )
             continue
-        if task.branch in branch_names:
-            continue
-        branch_names.add(task.branch)
-        cohorts.append(BranchCohort(branch=task.branch, tasks=tuple(store.get_tasks_for_branch(task.branch))))
+        eligible_tasks.append(task)
 
-    default_branch = git.default_branch()
+    cohorts = build_branch_cohorts_for_tasks(store, eligible_tasks)
     for cohort in cohorts:
         result = BranchSyncResult(
             branch=cohort.branch,
@@ -721,6 +769,8 @@ def refresh_branch_diff_stats(
         _persist_branch_state(
             store,
             cohort.code_tasks,
+            default_branch,
+            merge_unit_id=cohort.merge_unit_id,
             diff_stats=(files_changed, lines_added, lines_removed),
         )
         results.append(result)
@@ -731,7 +781,9 @@ def refresh_branch_diff_stats(
 def _persist_branch_state(
     store: SqliteTaskStore,
     tasks: tuple[Task, ...],
+    target_branch: str,
     *,
+    merge_unit_id: str | None = None,
     merge_status: str | None | object = _UNSET,
     diff_stats: tuple[int | None, int | None, int | None] | object = _UNSET,
     pr_number: int | None | object = _UNSET,
@@ -744,6 +796,40 @@ def _persist_branch_state(
     Merge truth is stored only on rows that own merge status; other branch-scoped
     sync fields continue to fan out across the cohort.
     """
+    if store.supports_merge_units():
+        unit = store.get_merge_unit(merge_unit_id) if merge_unit_id is not None else None
+        if unit is None:
+            owner_task = next((task for task in tasks if task.id is not None and task_owns_merge_status(task)), None)
+            if owner_task is not None:
+                owner_task_id = owner_task.id
+                assert owner_task_id is not None
+                unit = store.resolve_merge_unit_for_task(
+                    owner_task_id) or store.get_or_create_merge_unit_for_task(
+                    owner_task)
+        if unit is not None:
+            diff_tuple = (
+                cast("tuple[int | None, int | None, int | None]", diff_stats)
+                if diff_stats is not _UNSET
+                else None
+            )
+            store.set_merge_unit_state(
+                unit.id,
+                unit.state if merge_status is _UNSET else cast("str | None", merge_status) or "stale",
+                pr_number=cast(Any, cast("int | None", pr_number) if pr_number is not _UNSET else _DB_UNSET),
+                pr_state=cast(Any, cast("str | None", pr_state) if pr_state is not _UNSET else _DB_UNSET),
+                pr_last_synced_at=cast(
+                    Any,
+                    cast("datetime | None", pr_last_synced_at) if pr_last_synced_at is not _UNSET else _DB_UNSET,
+                ),
+                sync_last_synced_at=cast(
+                    Any,
+                    cast("datetime | None", sync_last_synced_at)
+                    if sync_last_synced_at is not _UNSET
+                    else _DB_UNSET,
+                ),
+                diff_stats=diff_tuple,
+            )
+            return
     for original in tasks:
         task = store.get(original.id) if original.id is not None else None
         if task is None:
