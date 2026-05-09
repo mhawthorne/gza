@@ -9,6 +9,7 @@ from gza.db import MergeTargetResolutionError
 from gza.git import GitError
 from gza.recovery_engine import (
     _MergeContext,
+    _is_resolved_by_landed_lineage,
     decide_failed_task_recovery,
     get_completed_recovery_descendant,
     get_failed_recovery_needs_attention_reason,
@@ -410,18 +411,27 @@ def test_list_failed_tasks_for_recovery_keeps_failed_fix_under_merged_cross_type
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed_fix.id]
 
 
-def test_list_failed_tasks_for_recovery_keeps_same_branch_failed_improve_under_merged_impl(
+def test_list_failed_tasks_for_recovery_filters_same_branch_failed_improve_under_merged_impl(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    _stub_merge_context(monkeypatch, merged_branches={"feature/merged-impl"})
+    _stub_merge_context(monkeypatch)
 
-    impl = _completed_impl(store, merge_status="merged")
+    impl = _completed_impl(store, merge_status="unmerged")
     assert impl.id is not None
-    impl.branch = "feature/merged-impl"
+    impl.branch = "feature/shared-branch"
     store.update(impl)
+
+    merged_sibling = store.add("Merged sibling", task_type="implement", based_on=impl.id)
+    assert merged_sibling.id is not None
+    merged_sibling.status = "completed"
+    merged_sibling.session_id = "sess-sibling"
+    merged_sibling.branch = impl.branch
+    merged_sibling.merge_status = "merged"
+    merged_sibling.completed_at = datetime.now(UTC)
+    store.update(merged_sibling)
 
     review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
     assert review.id is not None
@@ -444,7 +454,9 @@ def test_list_failed_tasks_for_recovery_keeps_same_branch_failed_improve_under_m
     store.update(failed_improve)
 
     assert is_resolved_by_merged_target(store, failed_improve) is False
-    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed_improve.id]
+    merge_context = recovery_engine._load_merge_context(tmp_path)
+    assert _is_resolved_by_landed_lineage(store, failed_improve, merge_context=merge_context) is True
+    assert list_failed_tasks_for_recovery(store) == []
 
 
 def test_recovery_engine_resumable_with_session_chooses_resume(tmp_path: Path) -> None:

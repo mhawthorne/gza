@@ -505,7 +505,7 @@ def _is_resolved_by_landed_lineage(
     if task.id is None or task.status != "failed":
         return False
 
-    if task.task_type == "improve" and task.same_branch:
+    if task.task_type == "improve" and task.same_branch and task.status != "failed":
         # Same-branch improve tasks can represent real post-merge follow-up work.
         return False
 
