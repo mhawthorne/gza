@@ -546,12 +546,11 @@ class TestSkillContentValidation:
         assert "depends_on='<REVIEW_TASK_ID>'" in content
         assert "Use the `review_task_id` already resolved in Step 1" in content
 
-    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
-    def test_manual_review_improve_skills_preserve_starting_checkout(self, skill_name: str):
-        """Manual review/improve skills should restore the user's starting checkout before exit."""
+    def test_manual_improve_skill_preserves_starting_checkout(self):
+        """gza-task-improve should restore the user's starting checkout before exit."""
         from gza.skills_utils import get_skills_source_path
 
-        skill_file = get_skills_source_path() / skill_name / "SKILL.md"
+        skill_file = get_skills_source_path() / "gza-task-improve" / "SKILL.md"
         content = skill_file.read_text()
 
         assert "git symbolic-ref --quiet --short HEAD || git rev-parse --short HEAD" in content
@@ -606,6 +605,22 @@ class TestSkillContentValidation:
         assert "Pass the result forward as a `## verify_command result` section." in content
         assert "Independently evaluate the provided `## verify_command result` section in addition to the normal code review." in content
         assert "Pass the branch name, authoritative diff context, the `## verify_command result` section" in content
+
+    def test_manual_review_skill_forbids_manual_checkout_switching(self):
+        """gza-task-review should avoid forbidden manual checkout/switch instructions while keeping verify guidance."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-review" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "Bash(git:*)" not in content
+        assert "git checkout <impl_branch>" not in content
+        assert "git switch <impl_branch>" not in content
+        assert "git checkout <START_CHECKOUT>" not in content
+        assert "git checkout --detach <START_CHECKOUT>" not in content
+        assert "Do not run `git checkout`, `git switch`, or other manual branch-switching commands as part of this skill." in content
+        assert "Run `verify_command` from `gza.yaml` as part of every review cycle." in content
+        assert "Pass the result forward as a `## verify_command result` section." in content
 
     def test_gza_task_run_no_longer_documents_manual_mark_completed_recovery(self):
         """gza-task-run should route only through run-inline, without manual completion recovery steps."""

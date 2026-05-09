@@ -1,7 +1,7 @@
 ---
 name: gza-task-review
 description: Run an interactive code review for a gza task's implementation branch, always running verify_command and producing structured review output compatible with gza-task-improve
-allowed-tools: Bash(uv run:*), Bash(git:*), Bash(gh:*), Read, Glob, Grep, Agent, AskUserQuestion
+allowed-tools: Bash(uv run:*), Bash(gh:*), Read, Glob, Grep, Agent, AskUserQuestion
 version: 1.0.0
 public: true
 ---
@@ -21,15 +21,17 @@ Use the full prefixed task ID as provided.
 
 ## Process
 
-### Step 0: Capture the starting checkout
+### Step 0: Confirm review inputs without switching branches
 
-Before reading task state, capture where the user started:
+Manual `/gza-task-review` must stay compatible with repositories that forbid ad hoc git commands. Do not run `git checkout`, `git switch`, or other manual branch-switching commands as part of this skill.
 
-```bash
-git symbolic-ref --quiet --short HEAD || git rev-parse --short HEAD
-```
+Before proceeding, make sure at least one of these is true:
+- The current workspace/worktree was already prepared on the implementation checkout by Gza or another documented non-forbidden workflow, so running `verify_command` here will evaluate the intended implementation.
+- The caller already provided authoritative diff context, so the review can use that diff even if this workspace is not on the implementation checkout.
 
-Save this as `<START_CHECKOUT>`. If you change checkouts at any point during the review, return to `<START_CHECKOUT>` before finishing. If `<START_CHECKOUT>` is a detached HEAD, restore it with `git checkout --detach <START_CHECKOUT>`.
+If neither is true, stop and ask the user to either:
+- rerun `/gza-task-review` from a prepared implementation checkout/worktree, or
+- provide the authoritative implementation diff explicitly.
 
 ### Step 1: Resolve the task
 
@@ -79,25 +81,11 @@ Replace `<TASK_ID>` with the actual full prefixed task ID.
 
 If the task is not found, stop and tell the user.
 
-### Step 2: Verify branch state and switch to the implementation checkout
-
-Check that the implementation branch exists and has commits:
-
-```bash
-git log main..<impl_branch> --oneline
-```
-
-If no commits, stop — there's nothing to review.
+### Step 2: Confirm the implementation context is reviewable
 
 If there's an existing review, inform the user and ask if they want to proceed with a fresh review.
 
-To run `verify_command` against the actual implementation and let the reviewer inspect current source, make `<impl_branch>` the active checkout/worktree now:
-
-```bash
-git checkout <impl_branch>
-```
-
-If the branch is checked out in another worktree, inform the user and ask whether to use the existing worktree path or create a new worktree. If `<START_CHECKOUT>` already equals `<impl_branch>`, do not switch away and back unnecessarily.
+If the current workspace/worktree is not already prepared on `<impl_branch>` and no authoritative diff was supplied, stop and ask the user for one of those inputs. Do not try to make `<impl_branch>` active yourself.
 
 ### Step 3: Get task context
 
@@ -119,18 +107,15 @@ Capture one canonical ask section before spawning the reviewer:
 ### Step 5: Capture the committed diff
 
 If the caller already provided diff context, use that as-is and do not reconstruct it.
-Otherwise, collect the committed branch diff once in the parent session:
-```bash
-git diff main...<impl_branch>
-```
-Pass this diff to the subagent as `## Implementation diff context`.
+Otherwise, if the prepared review environment already includes authoritative diff context through Gza's review workflow, pass that through unchanged as `## Implementation diff context`.
+If neither source exists, stop and ask the user for the authoritative implementation diff instead of using git commands to reconstruct it.
 
 ### Step 6: Run verify_command
 
 Run `verify_command` from `gza.yaml` as part of every review cycle. This is required even when the diff already has obvious code-review blockers; do not skip verify just because the code review may fail.
 
 - If `verify_command` is empty or unset, note that verify is not configured and continue with the code review.
-- If `verify_command` is configured, run it from the project root while `<impl_branch>` is checked out.
+- If `verify_command` is configured, run it from the project root only when this workspace/worktree was already prepared on `<impl_branch>` or equivalent implementation content. If the current checkout is not known to match the implementation, stop and ask the user for a prepared review environment rather than running verify against the wrong source tree.
 - Capture the exit status and keep a trimmed diagnostic excerpt for the reviewer. If the output is huge, keep the most useful failing excerpt (for example, the failing tool header plus the first ~120 lines and last ~40 lines).
 - If the verify run hangs, stop it after a bounded wait and pass the timeout forward as a failed `## verify_command result` with timeout evidence and any partial output captured so the review still happens in the same cycle.
 - Do not fix the branch during review. The point here is to independently detect verify failures and fold them into the review findings.
@@ -309,7 +294,6 @@ After the subagent completes:
 - Print a brief summary of findings
 - If changes were requested, tell the user: "Run `/gza-task-improve <IMPL_TASK_ID>` to address the blocker items."
 - If a PR was used, include a link to it
-- If you changed checkouts during the workflow, switch back to `<START_CHECKOUT>` before the final message and state explicitly which checkout is now active
 
 ## Important notes
 
@@ -319,4 +303,4 @@ After the subagent completes:
 - **Clearly label verify-driven blockers** — titles should include `verify_command failure`, and `Evidence:` should carry the trimmed failing output so improve can act on it without rerunning history reconstruction.
 - **Don't duplicate existing reviews** — if there's already a recent review, inform the user and ask before creating another one.
 - **Use authoritative diff context** — do not reconstruct or expand the diff in the reviewing subagent; only use provided diff context plus unchanged-source reads for verification.
-- **Preserve the user's checkout** — `/gza-task-review` should be checkout-neutral. If you switch branches for any reason, restore the starting checkout before returning control to the user.
+- **Stay checkout-neutral** — `/gza-task-review` must not instruct agents to switch branches manually. Review only from a prepared implementation checkout/worktree or from authoritative diff context that the caller already supplied.
