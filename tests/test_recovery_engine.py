@@ -261,6 +261,36 @@ def test_list_failed_tasks_for_recovery_emits_one_warning_when_branch_reachabili
     assert "reached default branch 'main': simulated reachability failure" in warnings[0]
 
 
+def test_list_failed_tasks_for_recovery_raises_when_project_default_merge_target_cannot_be_resolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-failed"
+    failed.branch = "feature/unresolved-default"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(
+            git=None,
+            default_branch=None,
+            resolution_error="simulated default-branch failure",
+        ),
+    )
+
+    with pytest.raises(MergeTargetResolutionError, match="Could not determine default merge target"):
+        list_failed_tasks_for_recovery(store)
+
+
 def test_list_failed_tasks_for_recovery_filters_failed_descendant_when_merged_ancestor_shares_branch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
