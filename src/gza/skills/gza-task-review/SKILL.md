@@ -234,7 +234,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.git import Git
 from gza.runner import _compute_slug_override, generate_slug
 import subprocess
 
@@ -260,12 +259,13 @@ if created.slug is None:
         created.prompt,
         existing_id=None,
         log_path=config.log_path,
-        git=Git(config.project_dir),
+        git=None,
         project_name=config.project_name,
         project_prefix=config.project_prefix,
         slug_override=slug_override,
         branch_strategy=config.branch_strategy,
         explicit_type=created.task_type_hint,
+        store=store,
     )
     store.update(created)
 

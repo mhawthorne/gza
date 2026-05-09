@@ -375,9 +375,12 @@ class TestSkillContentValidation:
         assert "store.update(created)" in content
         assert "store.create(" not in content
 
-    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
+    @pytest.mark.parametrize(
+        ("skill_name", "expects_git_import"),
+        [("gza-task-review", False), ("gza-task-improve", True)],
+    )
     def test_manual_review_improve_persistence_snippets_assign_slug_before_show_prompt(
-        self, skill_name: str
+        self, skill_name: str, expects_git_import: bool
     ):
         """Manual persistence snippets should assign/persist slug before calling gza show --prompt."""
         from gza.skills_utils import get_skills_source_path
@@ -385,7 +388,6 @@ class TestSkillContentValidation:
         skill_file = get_skills_source_path() / skill_name / "SKILL.md"
         content = skill_file.read_text()
 
-        assert "from gza.git import Git" in content
         assert "from gza.runner import _compute_slug_override, generate_slug" in content
         assert "if created.slug is None:" in content
         assert "store.update(created)" in content
@@ -393,6 +395,22 @@ class TestSkillContentValidation:
         assert content.find("if created.slug is None:") < content.find(
             "['uv', 'run', 'gza', 'show', '--prompt', created.id]"
         )
+        if expects_git_import:
+            assert "from gza.git import Git" in content
+        else:
+            assert "from gza.git import Git" not in content
+
+    def test_manual_review_skill_persistence_snippet_stays_checkout_neutral(self):
+        """gza-task-review persistence should avoid Git-backed slug collision checks."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-task-review" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "from gza.git import Git" not in content
+        assert "Git(config.project_dir)" not in content
+        assert "git=None," in content
+        assert "store=store," in content
 
     @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
     def test_manual_review_improve_persistence_snippets_keep_completed_at_as_datetime(
