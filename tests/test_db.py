@@ -1828,6 +1828,29 @@ class TestMergeStatus:
         retrieved = store.get(task.id)
         assert retrieved.merge_status is None
 
+    def test_set_merge_status_to_none_does_not_flip_unit_to_stale(self, tmp_path: Path) -> None:
+        """Legacy None clears the task row without mutating canonical unit state."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task")
+        store.mark_completed(task, has_commits=True, branch="feature/test")
+        assert task.id is not None
+
+        before = store.resolve_merge_unit_for_task(task.id)
+        assert before is not None
+        assert before.state == "unmerged"
+
+        store.set_merge_status(task.id, None)
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.merge_status is None
+
+        after = store.resolve_merge_unit_for_task(task.id)
+        assert after is not None
+        assert after.state == "unmerged"
+
     def test_get_unmerged_queries_by_merge_status(self, tmp_path: Path):
         """get_unmerged returns tasks with merge_status='unmerged'."""
         db_path = tmp_path / "test.db"

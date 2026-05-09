@@ -4371,7 +4371,13 @@ class SqliteTaskStore:
             return self._rows_to_tasks(conn, cur.fetchall())
 
     def set_merge_status(self, task_id: str, merge_status: str | None) -> None:
-        """Set the merge_status for a task. Records merged_at when setting to 'merged'."""
+        """Set legacy task-row merge status without inventing new merge-unit semantics.
+
+        When merge units are enabled, non-``None`` values update canonical unit state.
+        ``None`` keeps the unit untouched and only clears compatibility fields on the
+        addressed task row, preserving the legacy "unset tracking on this task" behavior.
+        Records ``merged_at`` when setting to ``"merged"``.
+        """
         if self.supports_merge_units():
             task = self.get(task_id)
             if task is not None:
@@ -4379,9 +4385,10 @@ class SqliteTaskStore:
                 if unit is None:
                     unit = self.get_or_create_merge_unit_for_task(task)
                 if unit is not None:
-                    state = "merged" if merge_status == "merged" else ("unmerged" if merge_status is not None else "stale")
-                    self.set_merge_unit_state(unit.id, state, merged_by_task_id=task_id if state == "merged" else None)
-                    return
+                    if merge_status is not None:
+                        state = "merged" if merge_status == "merged" else "unmerged"
+                        self.set_merge_unit_state(unit.id, state, merged_by_task_id=task_id if state == "merged" else None)
+                        return
         merged_at = datetime.now(UTC).isoformat() if merge_status == "merged" else None
         with self._connect() as conn:
             conn.execute(
