@@ -1391,6 +1391,31 @@ class TestExtractionGitHelpers:
                 check=False,
             )
 
+    def test_resolve_merge_source_ref_prefers_local_branch(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # branch_exists
+            ]
+
+            assert git.resolve_merge_source_ref("feature/demo") == "feature/demo"
+
+    def test_resolve_merge_source_ref_falls_back_to_origin_ref(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=1),  # branch_exists
+                MagicMock(returncode=0),  # ref_exists(origin/feature/demo)
+            ]
+
+            assert git.resolve_merge_source_ref("feature/demo") == "origin/feature/demo"
+
     def test_get_diff_name_status_scoped_to_paths(self, tmp_path: Path):
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()

@@ -510,6 +510,22 @@ class Git:
         result = self._run("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
         return result.returncode == 0
 
+    def resolve_merge_source_ref(self, branch: str, *, remote: str = "origin") -> str | None:
+        """Return an existing ref that can prove merge truth for a branch.
+
+        Prefer the local branch when it survives. Fall back to ``<remote>/<branch>``
+        when only the remote-tracking ref remains. If neither exists, return
+        ``None`` so callers do not treat a missing source ref as merge proof.
+        """
+        if self.branch_exists(branch):
+            return branch
+
+        remote_ref = f"{remote}/{branch}"
+        if self.ref_exists(remote_ref):
+            return remote_ref
+
+        return None
+
     def rev_parse(self, ref: str) -> str:
         """Resolve a ref to its commit SHA."""
         result = self._run("rev-parse", "--verify", f"{ref}^{{commit}}")

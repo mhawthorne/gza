@@ -104,6 +104,51 @@ def _foreground_command_invocation(command: str) -> RunInvocationContext:
     )
 
 
+def _resolve_iterate_merge_state_for_current_target(
+    *,
+    store: SqliteTaskStore,
+    impl_task: DbTask,
+    git_runtime: Git,
+    target_branch: str,
+) -> str | None:
+    """Resolve iterate merge suppression state for the current target branch.
+
+    Stored merge-unit state remains authoritative for its recorded target, but
+    iterate must suppress when current-target branch reachability proves the
+    source ref is already merged elsewhere. Missing refs remain unproven.
+    """
+    resolved_merge_unit = (
+        store.resolve_merge_unit_for_task(impl_task.id) if impl_task.id is not None else None
+    )
+    source_merge_ref = (
+        git_runtime.resolve_merge_source_ref(impl_task.branch) if impl_task.branch else None
+    )
+    current_target_proves_merge = (
+        source_merge_ref is not None and git_runtime.is_merged(source_merge_ref, target_branch) is True
+    )
+
+    if resolved_merge_unit is not None:
+        if resolved_merge_unit.state == "merged" and resolved_merge_unit.target_branch == target_branch:
+            return "merged"
+        if resolved_merge_unit.state == "merged":
+            if current_target_proves_merge:
+                return "merged"
+            return None
+        if current_target_proves_merge:
+            return "merged"
+        return resolved_merge_unit.state
+
+    if current_target_proves_merge:
+        return "merged"
+
+    if impl_task.merge_status == "merged":
+        if not impl_task.branch:
+            return "merged"
+        return None
+
+    return impl_task.merge_status
+
+
 def _run_with_registered_worker(
     *,
     config: Config,
@@ -2061,10 +2106,12 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         print(f"Error: failed to initialize git runtime for iterate: {exc}")
         return 1
 
-    resolved_merge_unit = (
-        store.resolve_merge_unit_for_task(impl_task.id) if impl_task.id is not None else None
+    resolved_merge_state = _resolve_iterate_merge_state_for_current_target(
+        store=store,
+        impl_task=impl_task,
+        git_runtime=git_runtime,
+        target_branch=target_branch,
     )
-    resolved_merge_state = resolved_merge_unit.state if resolved_merge_unit is not None else impl_task.merge_status
     if resolved_from_failed_ancestor and resolved_merge_state == "merged":
         print(
             "No remaining iterate action: "
