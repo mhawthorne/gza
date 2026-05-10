@@ -1293,6 +1293,11 @@ def _spawn_background_iterate_worker(
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     registry = WorkerRegistry(config.workers_path)
+    display_task = impl_task
+    if prepared_task_id is not None:
+        prepared_task = get_store(config).get(prepared_task_id)
+        if prepared_task is not None:
+            display_task = prepared_task
 
     inner_cmd = [
         sys.executable, "-m", "gza",
@@ -1331,12 +1336,12 @@ def _spawn_background_iterate_worker(
         proc, startup_log_rel = _spawn_detached_worker_process(inner_cmd, config, worker_id)
         worker = WorkerMetadata(
             worker_id=worker_id,
-            task_id=impl_task.id,
+            task_id=display_task.id,
             pid=proc.pid,
             startup_log_file=startup_log_rel,
         )
         registry.ensure_running(worker)
-        _print_background_worker_started(impl_task, pid=proc.pid, quiet=quiet)
+        _print_background_worker_started(display_task, pid=proc.pid, quiet=quiet)
         return 0
     except Exception as e:
         _rollback_background_worker_launch(
@@ -1375,7 +1380,12 @@ def _create_rebase_task(
     )
 
 
-def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
+def _spawn_background_workers(
+    args: argparse.Namespace,
+    config: Config,
+    *,
+    prepared_tasks: dict[str, DbTask] | None = None,
+) -> int:
     """Spawn N background workers in parallel.
 
     Args:
@@ -1399,7 +1409,12 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
         spawned_count = 0
         had_error = False
         for task_id in args.task_ids:
-            result = _spawn_background_worker(args, config, task_id=task_id)
+            result = _spawn_background_worker(
+                args,
+                config,
+                task_id=task_id,
+                prepared_task=(prepared_tasks or {}).get(str(task_id)),
+            )
             if result == 0:
                 spawned_count += 1
             else:
