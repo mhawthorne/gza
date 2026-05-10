@@ -533,6 +533,8 @@ def _resolve_owner_merge_unit(
     if not units:
         return None
     return max(units.values(), key=lambda unit: (unit.updated_at, unit.id))
+
+
 def query_lineage_owner_rows(
     store: SqliteTaskStore,
     query: LineageOwnerQuery,
