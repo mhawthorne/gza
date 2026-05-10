@@ -991,6 +991,140 @@ class TestLogCommand:
         assert "assistant second" in output
         assert output.index("ops first") < output.index("assistant second")
 
+    @pytest.mark.parametrize("raw_mode", [False, True], ids=["formatted", "raw"])
+    def test_log_follow_re_resolves_startup_logs_after_slug_promotion(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        raw_mode: bool,
+    ):
+        """Follow mode should continue onto slug logs after startup logs are renamed."""
+        import argparse
+
+        from gza.cli.log import _tail_log_file
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Startup follow promotion")
+        assert task.id is not None
+        task.status = "in_progress"
+        task.log_file = f".gza/logs/{task.id}.startup.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        startup_conversation = log_dir / f"{task.id}.startup.log"
+        startup_ops = log_dir / f"{task.id}.startup.ops.jsonl"
+        startup_conversation.write_text(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "startup transcript"}],
+                    },
+                }
+            )
+            + "\n"
+        )
+        startup_ops.write_text(
+            json.dumps(
+                {
+                    "type": "gza",
+                    "subtype": "info",
+                    "timestamp": "2026-05-08T10:00:00Z",
+                    "message": "startup ops",
+                }
+            )
+            + "\n"
+        )
+
+        slug = "20260508-promoted-follow"
+        promoted_conversation = log_dir / f"{slug}.log"
+        promoted_ops = log_dir / f"{slug}.ops.jsonl"
+        sleep_count = {"value": 0}
+
+        def fake_sleep(_seconds: float) -> None:
+            sleep_count["value"] += 1
+            latest = store.get(task.id)
+            assert latest is not None
+            if sleep_count["value"] == 1:
+                startup_conversation.replace(promoted_conversation)
+                startup_ops.replace(promoted_ops)
+                promoted_conversation.write_text(
+                    promoted_conversation.read_text()
+                    + json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": "2026-05-08T10:00:02Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "promoted transcript"}],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                promoted_ops.write_text(
+                    promoted_ops.read_text()
+                    + json.dumps(
+                        {
+                            "type": "gza",
+                            "subtype": "info",
+                            "timestamp": "2026-05-08T10:00:01Z",
+                            "message": "promoted ops",
+                        }
+                    )
+                    + "\n"
+                )
+                latest.log_file = f".gza/logs/{slug}.log"
+                latest.slug = slug
+                store.update(latest)
+                return
+            if sleep_count["value"] == 2:
+                latest.status = "completed"
+                store.update(latest)
+
+        class FakeRegistry:
+            def is_running(self, _worker_id: str) -> bool:
+                return False
+
+            def list_all(self, include_completed: bool = True) -> list[Any]:
+                return []
+
+        monkeypatch.setattr("gza.cli.log.time.sleep", fake_sleep)
+        args = argparse.Namespace(
+            raw=raw_mode,
+            follow=True,
+            tail=None,
+            verbose=False,
+            conversation_only=False,
+            ops_only=False,
+            _log_provider_name=None,
+            _log_configured_model=None,
+            _ops_log_path=startup_ops,
+            project_dir=tmp_path,
+        )
+
+        rc = _tail_log_file(
+            startup_conversation,
+            args,
+            FakeRegistry(),
+            worker_id=None,
+            task_id=task.id,
+            store=store,
+        )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert output.count("startup transcript") == 1
+        assert output.count("startup ops") == 1
+        assert "promoted transcript" in output
+        assert "promoted ops" in output
+        assert output.count("promoted transcript") == 1
+        assert output.count("promoted ops") == 1
+
     def test_log_follow_raw_by_task_skips_header_even_when_running(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
         """-t -f --raw should not print the task header banner."""
         import argparse

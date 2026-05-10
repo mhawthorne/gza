@@ -553,6 +553,67 @@ def _load_selected_log_entries(
     )
 
 
+def _read_follow_lines(path: Path | None) -> list[str]:
+    """Return all lines from one follow target, or an empty list when absent."""
+    if path is None or not path.exists():
+        return []
+    with open(path) as f:
+        return f.readlines()
+
+
+def _seed_follow_offset(
+    offsets: dict[str, int],
+    previous_path: Path | None,
+    current_path: Path | None,
+    *,
+    current_line_count: int,
+) -> None:
+    """Initialize offsets for newly resolved paths without replaying renamed startup logs."""
+    if current_path is None:
+        return
+    current_key = str(current_path)
+    if current_key in offsets:
+        return
+    if previous_path is None:
+        offsets[current_key] = 0
+        return
+
+    previous_key = str(previous_path)
+    previous_count = offsets.get(previous_key, 0)
+    if previous_path != current_path and current_line_count >= previous_count:
+        offsets[current_key] = previous_count
+        return
+    offsets[current_key] = 0
+
+
+def _resolve_follow_log_paths(
+    args: argparse.Namespace,
+    registry: WorkerRegistry,
+    current_conversation_path: Path,
+    current_ops_path: Path | None,
+    *,
+    task_id: str | None,
+    store: SqliteTaskStore | None,
+) -> tuple[Path, Path | None]:
+    """Re-resolve follow targets so startup logs can promote to slug logs mid-tail."""
+    if task_id is None or store is None:
+        return current_conversation_path, current_ops_path
+
+    project_dir = getattr(args, "project_dir", None)
+    if project_dir is None:
+        return current_conversation_path, current_ops_path
+
+    latest_task = store.get(task_id)
+    if latest_task is None:
+        return current_conversation_path, current_ops_path
+
+    config = Config.load(project_dir)
+    resolved_conversation_path, _using_startup = _resolve_task_log_path(config, registry, latest_task)
+    if resolved_conversation_path is None:
+        return current_conversation_path, current_ops_path
+    return resolved_conversation_path, ops_log_path_for(resolved_conversation_path)
+
+
 def _print_log_header(
     *,
     task: DbTask | None,
@@ -897,10 +958,14 @@ def _tail_log_file(
 
     if raw_mode:
         try:
+            current_conversation_path = log_path
+            current_ops_path = ops_log_path
+            stream_offsets: dict[str, int] = {}
+
             def _emit_raw_entries() -> tuple[int, int]:
                 _log_data, entries, _content = _load_selected_log_entries(
-                    log_path,
-                    ops_log_path,
+                    current_conversation_path,
+                    current_ops_path,
                     conversation_only=conversation_only,
                     ops_only=ops_only,
                 )
@@ -910,38 +975,66 @@ def _tail_log_file(
                     print(json.dumps(entry))
                 conv_count = 0
                 ops_count = 0
-                if log_path.exists() and not ops_only:
-                    conv_count = len(log_path.read_text().splitlines())
-                if ops_log_path is not None and ops_log_path.exists() and not conversation_only:
-                    ops_count = len(ops_log_path.read_text().splitlines())
+                if current_conversation_path.exists() and not ops_only:
+                    conv_count = len(current_conversation_path.read_text().splitlines())
+                if current_ops_path is not None and current_ops_path.exists() and not conversation_only:
+                    ops_count = len(current_ops_path.read_text().splitlines())
                 return conv_count, ops_count
 
             conv_count, ops_count = _emit_raw_entries()
+            if not ops_only:
+                stream_offsets[str(current_conversation_path)] = conv_count
+            if not conversation_only and current_ops_path is not None:
+                stream_offsets[str(current_ops_path)] = ops_count
             if not follow:
                 return 0
 
             while True:
                 time.sleep(0.5)
+                previous_conversation_path = log_path
+                previous_ops_path = ops_log_path
+                current_conversation_path, current_ops_path = _resolve_follow_log_paths(
+                    args,
+                    registry,
+                    current_conversation_path,
+                    current_ops_path,
+                    task_id=task_id,
+                    store=store,
+                )
                 new_conversation_entries: list[dict] = []
                 new_ops_entries: list[dict] = []
-                if not ops_only and log_path.exists():
-                    conv_lines = log_path.read_text().splitlines()
-                    if len(conv_lines) > conv_count:
-                        for line in conv_lines[conv_count:]:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            new_conversation_entries.extend(_parse_stream_lines([line], "conversation"))
-                        conv_count = len(conv_lines)
-                if not conversation_only and ops_log_path is not None and ops_log_path.exists():
-                    ops_lines = ops_log_path.read_text().splitlines()
-                    if len(ops_lines) > ops_count:
-                        for line in ops_lines[ops_count:]:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            new_ops_entries.extend(_parse_stream_lines([line], "ops"))
-                        ops_count = len(ops_lines)
+                conv_lines = current_conversation_path.read_text().splitlines() if current_conversation_path.exists() else []
+                _seed_follow_offset(
+                    stream_offsets,
+                    previous_conversation_path,
+                    current_conversation_path,
+                    current_line_count=len(conv_lines),
+                )
+                conv_count = stream_offsets.get(str(current_conversation_path), 0)
+                if not ops_only and len(conv_lines) > conv_count:
+                    for line in conv_lines[conv_count:]:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        new_conversation_entries.extend(_parse_stream_lines([line], "conversation"))
+                    stream_offsets[str(current_conversation_path)] = len(conv_lines)
+                ops_lines = current_ops_path.read_text().splitlines() if current_ops_path is not None and current_ops_path.exists() else []
+                _seed_follow_offset(
+                    stream_offsets,
+                    previous_ops_path,
+                    current_ops_path,
+                    current_line_count=len(ops_lines),
+                )
+                ops_count = stream_offsets.get(str(current_ops_path), 0) if current_ops_path is not None else 0
+                if not conversation_only and current_ops_path is not None and len(ops_lines) > ops_count:
+                    for line in ops_lines[ops_count:]:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        new_ops_entries.extend(_parse_stream_lines([line], "ops"))
+                    stream_offsets[str(current_ops_path)] = len(ops_lines)
+                log_path = current_conversation_path
+                ops_log_path = current_ops_path
                 new_entries = (
                     new_ops_entries
                     if ops_only
@@ -951,7 +1044,7 @@ def _tail_log_file(
                 )
                 if new_entries:
                     for entry in new_entries:
-                            print(json.dumps(entry))
+                        print(json.dumps(entry))
                     continue
 
                 if worker_id and not registry.is_running(worker_id):
@@ -976,12 +1069,6 @@ def _tail_log_file(
             verbose=bool(getattr(args, "verbose", False)),
         )
 
-        def _read_lines(path: Path | None) -> list[str]:
-            if path is None or not path.exists():
-                return []
-            with open(path) as f:
-                return f.readlines()
-
         def _process_entries(entries: list[dict]) -> None:
             for entry in entries:
                 printer.process(entry)
@@ -996,8 +1083,12 @@ def _tail_log_file(
                 _parse_stream_lines(ops_batch, "ops"),
             )
 
-        conv_lines = _read_lines(log_path)
-        ops_lines = _read_lines(ops_log_path if not conversation_only else None)
+        current_conversation_path = log_path
+        current_ops_path = ops_log_path if not conversation_only else None
+        stream_offsets = {}
+
+        conv_lines = _read_follow_lines(current_conversation_path)
+        ops_lines = _read_follow_lines(current_ops_path)
         initial_entries = _merged_batch(conv_lines, ops_lines)
         if tail_lines:
             initial_entries = initial_entries[-tail_lines:]
@@ -1011,36 +1102,87 @@ def _tail_log_file(
                 )
             return 0
 
-        conv_count = len(conv_lines)
-        ops_count = len(ops_lines)
+        if not ops_only:
+            stream_offsets[str(current_conversation_path)] = len(conv_lines)
+        if not conversation_only and current_ops_path is not None:
+            stream_offsets[str(current_ops_path)] = len(ops_lines)
 
         while True:
             time.sleep(0.5)
+            current_conversation_path, resolved_ops_path = _resolve_follow_log_paths(
+                args,
+                registry,
+                current_conversation_path,
+                current_ops_path,
+                task_id=task_id,
+                store=store,
+            )
+            current_ops_path = None if conversation_only else resolved_ops_path
 
-            conv_lines_now = _read_lines(log_path)
-            ops_lines_now = _read_lines(ops_log_path if not conversation_only else None)
+            conv_lines_now = _read_follow_lines(current_conversation_path)
+            ops_lines_now = _read_follow_lines(current_ops_path)
+            _seed_follow_offset(
+                stream_offsets,
+                log_path,
+                current_conversation_path,
+                current_line_count=len(conv_lines_now),
+            )
+            if current_ops_path is not None:
+                _seed_follow_offset(
+                    stream_offsets,
+                    ops_log_path,
+                    current_ops_path,
+                    current_line_count=len(ops_lines_now),
+                )
             new_conv_lines: list[str] = []
             new_ops_lines: list[str] = []
+            conv_count = stream_offsets.get(str(current_conversation_path), 0)
+            ops_count = stream_offsets.get(str(current_ops_path), 0) if current_ops_path is not None else 0
             if not ops_only and len(conv_lines_now) > conv_count:
                 new_conv_lines = conv_lines_now[conv_count:]
-                conv_count = len(conv_lines_now)
-            if not conversation_only and ops_log_path is not None and len(ops_lines_now) > ops_count:
+                stream_offsets[str(current_conversation_path)] = len(conv_lines_now)
+            if not conversation_only and current_ops_path is not None and len(ops_lines_now) > ops_count:
                 new_ops_lines = ops_lines_now[ops_count:]
-                ops_count = len(ops_lines_now)
+                stream_offsets[str(current_ops_path)] = len(ops_lines_now)
             new_entries = _merged_batch(new_conv_lines, new_ops_lines)
             if new_entries:
                 _process_entries(new_entries)
+            log_path = current_conversation_path
+            ops_log_path = current_ops_path
 
             # Check if worker is still running
             if worker_id and not registry.is_running(worker_id):
                 time.sleep(0.5)
                 final_new_conv_lines: list[str] = []
                 final_new_ops_lines: list[str] = []
-                conv_lines_now = _read_lines(log_path)
+                current_conversation_path, resolved_ops_path = _resolve_follow_log_paths(
+                    args,
+                    registry,
+                    current_conversation_path,
+                    current_ops_path,
+                    task_id=task_id,
+                    store=store,
+                )
+                current_ops_path = None if conversation_only else resolved_ops_path
+                conv_lines_now = _read_follow_lines(current_conversation_path)
+                _seed_follow_offset(
+                    stream_offsets,
+                    log_path,
+                    current_conversation_path,
+                    current_line_count=len(conv_lines_now),
+                )
+                conv_count = stream_offsets.get(str(current_conversation_path), 0)
                 if not ops_only and len(conv_lines_now) > conv_count:
                     final_new_conv_lines = conv_lines_now[conv_count:]
-                if not conversation_only and ops_log_path is not None:
-                    ops_lines_now = _read_lines(ops_log_path)
+                if not conversation_only and current_ops_path is not None:
+                    ops_lines_now = _read_follow_lines(current_ops_path)
+                    _seed_follow_offset(
+                        stream_offsets,
+                        ops_log_path,
+                        current_ops_path,
+                        current_line_count=len(ops_lines_now),
+                    )
+                    ops_count = stream_offsets.get(str(current_ops_path), 0)
                     if len(ops_lines_now) > ops_count:
                         final_new_ops_lines = ops_lines_now[ops_count:]
                 _process_entries(_merged_batch(final_new_conv_lines, final_new_ops_lines))
@@ -1053,11 +1195,34 @@ def _tail_log_file(
                     time.sleep(0.5)
                     task_final_new_conv_lines: list[str] = []
                     task_final_new_ops_lines: list[str] = []
-                    conv_lines_now = _read_lines(log_path)
+                    current_conversation_path, resolved_ops_path = _resolve_follow_log_paths(
+                        args,
+                        registry,
+                        current_conversation_path,
+                        current_ops_path,
+                        task_id=task_id,
+                        store=store,
+                    )
+                    current_ops_path = None if conversation_only else resolved_ops_path
+                    conv_lines_now = _read_follow_lines(current_conversation_path)
+                    _seed_follow_offset(
+                        stream_offsets,
+                        log_path,
+                        current_conversation_path,
+                        current_line_count=len(conv_lines_now),
+                    )
+                    conv_count = stream_offsets.get(str(current_conversation_path), 0)
                     if not ops_only and len(conv_lines_now) > conv_count:
                         task_final_new_conv_lines = conv_lines_now[conv_count:]
-                    if not conversation_only and ops_log_path is not None:
-                        ops_lines_now = _read_lines(ops_log_path)
+                    if not conversation_only and current_ops_path is not None:
+                        ops_lines_now = _read_follow_lines(current_ops_path)
+                        _seed_follow_offset(
+                            stream_offsets,
+                            ops_log_path,
+                            current_ops_path,
+                            current_line_count=len(ops_lines_now),
+                        )
+                        ops_count = stream_offsets.get(str(current_ops_path), 0)
                         if len(ops_lines_now) > ops_count:
                             task_final_new_ops_lines = ops_lines_now[ops_count:]
                     _process_entries(_merged_batch(task_final_new_conv_lines, task_final_new_ops_lines))
