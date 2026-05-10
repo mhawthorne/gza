@@ -165,6 +165,7 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
             root_ids=q.root_ids,
             exclude_root_ids=q.exclude_root_ids,
             branch_owner_ids=q.branch_owner_ids,
+            branch_owner_mode=q.branch_owner_mode,
             tag_filters=f.tags,
             exclude_tag_filters=f.tags_not,
             any_tag=f.any_tag,
@@ -191,6 +192,7 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
             root_ids=q.root_ids,
             exclude_root_ids=q.exclude_root_ids,
             branch_owner_ids=q.branch_owner_ids,
+            branch_owner_mode=q.branch_owner_mode,
             tag_filters=f.tags,
             exclude_tag_filters=f.tags_not,
             any_tag=f.any_tag,
@@ -789,3 +791,61 @@ def resolve_lineage_root(store: SqliteTaskStore, task: Task) -> Task:
         return (ts, task_id_numeric_key(candidate.id))
 
     return sorted(candidates, key=_root_order_key)[0]
+
+
+def resolve_same_branch_lineage_root(store: SqliteTaskStore, task: Task) -> Task:
+    """Resolve the highest ancestor that stays on ``task.branch``.
+
+    This keeps branch-owner decisions on the active code branch instead of
+    crossing into branchless or different-branch ancestors that provide broader
+    lineage context only.
+    """
+    if task.id is None or not task.branch:
+        return task
+
+    graph_nodes: dict[str, Task] = {task.id: task}
+    visited: set[str] = {task.id}
+    stack: list[str] = []
+    if task.based_on:
+        stack.append(task.based_on)
+    if task.depends_on:
+        stack.append(task.depends_on)
+
+    while stack:
+        ancestor_id = stack.pop()
+        if ancestor_id in visited:
+            continue
+        visited.add(ancestor_id)
+        ancestor = store.get(ancestor_id)
+        if ancestor is None or ancestor.id is None or ancestor.branch != task.branch:
+            continue
+        graph_nodes[ancestor.id] = ancestor
+        if ancestor.based_on:
+            stack.append(ancestor.based_on)
+        if ancestor.depends_on:
+            stack.append(ancestor.depends_on)
+
+    if len(graph_nodes) == 1:
+        return task
+
+    node_ids = set(graph_nodes.keys())
+    root_candidates = [
+        candidate
+        for candidate in graph_nodes.values()
+        if not any(parent_id in node_ids for parent_id in _get_parent_ids(candidate))
+    ]
+    candidates = root_candidates or list(graph_nodes.values())
+
+    def _root_order_key(candidate: Task) -> tuple[datetime, int]:
+        ts = _normalize_lineage_time(task_time_for_lineage(candidate))
+        return (ts, task_id_numeric_key(candidate.id))
+
+    return sorted(candidates, key=_root_order_key)[0]
+
+
+def resolve_unmerged_branch_owner(store: SqliteTaskStore, task: Task) -> Task:
+    """Resolve the branch owner used by `gza unmerged`."""
+    lineage_root = resolve_same_branch_lineage_root(store, task)
+    if _is_shared_branch_descendant(task, lineage_root):
+        return lineage_root
+    return task

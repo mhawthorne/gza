@@ -49,7 +49,6 @@ from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
     TaskLineageNode,
     _classify_child_relationship as _classify_lineage_child_relationship,
-    _is_shared_branch_descendant as _query_is_shared_branch_descendant,
     _lineage_child_sort_key as _lineage_child_sort_key,
     build_lineage_tree as _build_lineage_tree_for_root,
     flatten_lineage_tree as _flatten_query_lineage_tree,
@@ -1312,11 +1311,22 @@ def _unmerged_effective_fields(query: _TaskQuery) -> set[str]:
     return set(_projection_fields(query.projection, scope="lineages"))
 
 
+def _resolve_same_branch_unmerged_lineage_root(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    """Return the highest ancestor that remains on ``task.branch``.
+
+    ``gza unmerged`` uses this to pick a branch owner without crossing into
+    branchless or different-branch ancestors that only provide broader lineage
+    context (for example plan/explore dependencies).
+    """
+    from gza.query import resolve_same_branch_lineage_root
+
+    return resolve_same_branch_lineage_root(store, task)
+
+
 def _resolve_unmerged_branch_owner(store: SqliteTaskStore, task: DbTask) -> DbTask:
-    lineage_root = _resolve_lineage_root_task(store, task)
-    if _query_is_shared_branch_descendant(task, lineage_root):
-        return lineage_root
-    return task
+    from gza.query import resolve_unmerged_branch_owner
+
+    return resolve_unmerged_branch_owner(store, task)
 
 
 def _descendants_only_unmerged_lineage_tree(

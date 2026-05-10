@@ -244,8 +244,62 @@ def test_unmerged_preset_uses_lineage_scope_and_unmerged_default_projection() ->
     assert query.scope == "lineages"
     assert query.limit == 7
     assert query.branch_owner_ids == ("gza-1",)
+    assert query.branch_owner_mode == "unmerged_same_branch"
     assert query.projection.preset == TaskProjectionPreset.UNMERGED_DEFAULT
     assert query.presentation.mode == "flat"
+
+
+def test_unmerged_branch_owner_filter_uses_same_branch_owner_for_representative_descendant(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    plan = store.add("Branchless plan", task_type="plan")
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 2, 12, 9, 0, tzinfo=UTC)
+    store.update(plan)
+    assert plan.id is not None
+
+    implement = store.add("Branch owner implementation", task_type="implement", depends_on=plan.id)
+    implement.status = "completed"
+    implement.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+    implement.branch = "feature/representative-descendant"
+    implement.has_commits = True
+    store.update(implement)
+    assert implement.id is not None
+
+    rebase = store.add("Representative rebase", task_type="rebase", based_on=implement.id)
+    rebase.status = "completed"
+    rebase.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+    rebase.branch = "feature/representative-descendant"
+    rebase.has_commits = True
+    store.update(rebase)
+    assert rebase.id is not None
+
+    unit = store.create_merge_unit(
+        source_branch="feature/representative-descendant",
+        target_branch="main",
+        owner_task_id=plan.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(implement.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(rebase.id, unit.id, "rebase")
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQueryPresets.unmerged(
+            branch_owner_ids=(implement.id,),
+            merge_unit_ids=(unit.id,),
+            task_ids=(rebase.id,),
+            limit=None,
+            mode="json",
+        )
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert hasattr(row, "owner_task")
+    assert row.owner_task.id == implement.id
+    assert row.values["branch_owner_id"] == implement.id
 
 
 def test_incomplete_date_field_created_vs_effective_affects_lineage_selection(tmp_path: Path) -> None:

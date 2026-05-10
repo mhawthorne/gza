@@ -8405,6 +8405,168 @@ class TestUnmergedSelectionBehavior:
         assert refreshed_improve is not None
         assert refreshed_improve.merge_status is None
 
+    def test_unmerged_branch_owner_stops_before_branchless_plan_dependency(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A plan dependency must not become the owner for a same-branch rebase."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan ancestor", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 5, 9, 9, 0, tzinfo=UTC)
+        store.update(plan)
+
+        owner = store.add("Implement owner", task_type="implement")
+        owner.status = "completed"
+        owner.completed_at = datetime(2026, 5, 9, 10, 0, tzinfo=UTC)
+        owner.branch = "feature/branch-owner"
+        owner.has_commits = True
+        owner.merge_status = "unmerged"
+        owner.depends_on = plan.id
+        store.update(owner)
+
+        rebase = store.add("Rebase descendant", task_type="rebase")
+        rebase.status = "completed"
+        rebase.completed_at = datetime(2026, 5, 9, 11, 0, tzinfo=UTC)
+        rebase.branch = "feature/branch-owner"
+        rebase.has_commits = True
+        rebase.same_branch = True
+        rebase.based_on = owner.id
+        store.update(rebase)
+
+        assert query_cli._resolve_unmerged_branch_owner(store, rebase).id == owner.id  # noqa: SLF001
+
+    @pytest.mark.parametrize("relation_field", ["based_on", "depends_on"])
+    def test_unmerged_branch_owner_stops_before_branchless_explore_ancestor(
+        self,
+        tmp_path: Path,
+        relation_field: str,
+    ) -> None:
+        """A branchless explore ancestor must not replace the branch-bearing implement owner."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        explore = store.add("Explore ancestor", task_type="explore")
+        explore.status = "completed"
+        explore.completed_at = datetime(2026, 5, 9, 9, 0, tzinfo=UTC)
+        store.update(explore)
+
+        implement = store.add("Implement owner", task_type="implement")
+        implement.status = "completed"
+        implement.completed_at = datetime(2026, 5, 9, 10, 0, tzinfo=UTC)
+        implement.branch = "feature/explore-boundary"
+        implement.has_commits = True
+        implement.merge_status = "unmerged"
+        setattr(implement, relation_field, explore.id)
+        store.update(implement)
+
+        assert query_cli._resolve_unmerged_branch_owner(store, implement).id == implement.id  # noqa: SLF001
+
+    def test_unmerged_different_branch_implement_chain_keeps_separate_branch_owners(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Different-branch implement dependencies should surface one owner row per branch."""
+        store, branch_a, _git = _setup_unmerged_env_fast(
+            tmp_path,
+            task_prompt="Branch A owner",
+            branch="feature/branch-a",
+        )
+        branch_a.completed_at = datetime(2026, 5, 9, 10, 0, tzinfo=UTC)
+        store.update(branch_a)
+
+        branch_b = store.add("Branch B owner", task_type="implement")
+        branch_b.status = "completed"
+        branch_b.completed_at = datetime(2026, 5, 9, 11, 0, tzinfo=UTC)
+        branch_b.based_on = branch_a.id
+        branch_b.branch = "feature/branch-b"
+        branch_b.has_commits = True
+        branch_b.merge_status = "unmerged"
+        store.update(branch_b)
+
+        assert branch_a.id is not None
+        assert branch_b.id is not None
+        assert query_cli._resolve_unmerged_branch_owner(store, branch_a).id == branch_a.id  # noqa: SLF001
+        assert query_cli._resolve_unmerged_branch_owner(store, branch_b).id == branch_b.id  # noqa: SLF001
+
+        branch_a_unit = store.get_or_create_merge_unit_for_task(branch_a)
+        branch_b_unit = store.get_or_create_merge_unit_for_task(branch_b)
+        assert branch_a_unit is not None
+        assert branch_b_unit is not None
+        assert branch_a_unit.id != branch_b_unit.id
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=True,
+            fields="id,prompt,branch",
+        )
+
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+        captured = capsys.readouterr()
+        assert result == 0
+        payload = json.loads(captured.out)
+        assert {(row["id"], row["prompt"], row["branch"]) for row in payload} == {
+            (branch_a.id, "Branch A owner", "feature/branch-a"),
+            (branch_b.id, "Branch B owner", "feature/branch-b"),
+        }
+
+    @pytest.mark.parametrize("descendant_type", ["rebase", "improve", "fix"])
+    def test_unmerged_same_branch_followups_still_surface_implement_owner(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        descendant_type: str,
+    ) -> None:
+        """Same-branch follow-up task types should still resolve to the root implement owner."""
+        store, owner, _git = _setup_unmerged_env_fast(
+            tmp_path,
+            task_prompt="Implement owner",
+            branch="feature/same-branch-owner",
+        )
+        owner.completed_at = datetime(2026, 5, 9, 10, 0, tzinfo=UTC)
+        store.update(owner)
+
+        review = store.add("Review context", task_type="review")
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 9, 10, 30, tzinfo=UTC)
+        review.depends_on = owner.id
+        review.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review)
+
+        descendant = store.add(f"{descendant_type.title()} descendant", task_type=descendant_type)
+        descendant.status = "completed"
+        descendant.completed_at = datetime(2026, 5, 9, 11, 0, tzinfo=UTC)
+        descendant.branch = "feature/same-branch-owner"
+        descendant.has_commits = True
+        descendant.same_branch = True
+        descendant.based_on = owner.id
+        descendant.depends_on = review.id
+        store.update(descendant)
+
+        assert query_cli._resolve_unmerged_branch_owner(store, descendant).id == owner.id  # noqa: SLF001
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=True,
+            fields="id,prompt",
+        )
+
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+        captured = capsys.readouterr()
+        assert result == 0
+        assert json.loads(captured.out) == [{"id": owner.id, "prompt": "Implement owner"}]
+
     def test_unmerged_uses_existing_origin_default_branch_without_fetch_by_default(
         self,
         tmp_path: Path,
@@ -9669,6 +9831,72 @@ class TestUnmergedUnifiedQueryOutput:
                 "status": "completed",
             }
         ]
+
+    def test_unmerged_json_rebase_representative_with_branchless_plan_returns_branch_owner_row(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Branchless plan root", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 2, 12, 9, 0, tzinfo=UTC)
+        store.update(plan)
+        assert plan.id is not None
+
+        implement = store.add("Actionable branch owner", task_type="implement", depends_on=plan.id)
+        implement.status = "completed"
+        implement.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        implement.branch = "feature/rebase-representative"
+        implement.has_commits = True
+        store.update(implement)
+        assert implement.id is not None
+
+        rebase = store.add("Selected representative rebase", task_type="rebase", based_on=implement.id)
+        rebase.status = "completed"
+        rebase.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        rebase.branch = "feature/rebase-representative"
+        rebase.has_commits = True
+        store.update(rebase)
+        assert rebase.id is not None
+
+        unit = store.create_merge_unit(
+            source_branch="feature/rebase-representative",
+            target_branch="main",
+            owner_task_id=plan.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(implement.id, unit.id, "owner")
+        store.attach_task_to_merge_unit(rebase.id, unit.id, "rebase")
+
+        selected = store.resolve_merge_unit_representative_task(unit, require_actionable=True)
+        assert selected is not None
+        assert selected.id == rebase.id
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=True,
+            fields="id,prompt,branch",
+        )
+
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert json.loads(captured.out) == [
+            {
+                "id": implement.id,
+                "prompt": "Actionable branch owner",
+                "branch": "feature/rebase-representative",
+            }
+        ]
+
     def test_unmerged_json_id_prompt_projection_skips_lineage_rendering_work(
         self,
         tmp_path: Path,

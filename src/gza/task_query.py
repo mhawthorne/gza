@@ -12,6 +12,7 @@ from gza.db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_num
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
 PresentationMode = Literal["flat", "blocks", "grouped", "lineage", "tree", "one_line", "json", "rich"]
+BranchOwnerMode = Literal["generic", "unmerged_same_branch"]
 _T = TypeVar("_T")
 
 
@@ -80,6 +81,7 @@ class TaskQuery:
     exclude_root_ids: tuple[str, ...] | None = None
     task_ids: tuple[str, ...] | None = None
     branch_owner_ids: tuple[str, ...] | None = None
+    branch_owner_mode: BranchOwnerMode = "generic"
     merge_unit_ids: tuple[str, ...] | None = None
     groups: tuple[str, ...] | None = None
     tag_filters: tuple[str, ...] | None = None
@@ -348,6 +350,7 @@ class TaskQueryPresets:
             limit=limit,
             task_ids=task_ids,
             branch_owner_ids=branch_owner_ids,
+            branch_owner_mode="unmerged_same_branch",
             merge_unit_ids=merge_unit_ids,
             projection=projection or ProjectionSpec(preset=TaskProjectionPreset.UNMERGED_DEFAULT),
             presentation=PresentationSpec(mode=mode),
@@ -450,7 +453,7 @@ class TaskQueryService:
                         continue
                     if not self._matches_group_and_tag_filters(task, query):
                         continue
-                    owner = self._resolve_branch_owner(task)
+                    owner = self._resolve_branch_owner(task, query=query)
                     owner_id = owner.id
                     if owner_id is None:
                         continue
@@ -521,6 +524,7 @@ class TaskQueryService:
                     exclude_root_ids=query.exclude_root_ids,
                     task_ids=query.task_ids,
                     branch_owner_ids=query.branch_owner_ids,
+                    branch_owner_mode=query.branch_owner_mode,
                     merge_unit_ids=query.merge_unit_ids,
                     groups=query.groups,
                     tag_filters=query.tag_filters,
@@ -533,7 +537,7 @@ class TaskQueryService:
                     presentation=query.presentation,
                 )
             ):
-                owner = self._resolve_branch_owner(task)
+                owner = self._resolve_branch_owner(task, query=query)
                 owner_id = owner.id
                 if owner_id is None:
                     continue
@@ -666,7 +670,7 @@ class TaskQueryService:
             filtered = [
                 task
                 for task in filtered
-                if self._resolve_branch_owner(task).id in allowed_owners
+                if self._resolve_branch_owner(task, query=query).id in allowed_owners
             ]
 
         if query.merge_unit_ids is not None:
@@ -762,7 +766,7 @@ class TaskQueryService:
 
     def _project_task_row(self, task: DbTask, query: TaskQuery, *, target_branch: str | None) -> TaskRow:
         root = _resolve_lineage_root(self._store, task)
-        branch_owner = self._resolve_branch_owner(task)
+        branch_owner = self._resolve_branch_owner(task, query=query)
         blocked, blocking_id, blocking_status = self._store.is_task_blocked(task)
         review_verdict = None
         comments_count = 0
@@ -895,7 +899,14 @@ class TaskQueryService:
         latest = completed[0]
         return latest.output_content
 
-    def _resolve_branch_owner(self, task: DbTask) -> DbTask:
+    def _resolve_branch_owner(
+        self,
+        task: DbTask,
+        *,
+        query: TaskQuery | None = None,
+    ) -> DbTask:
+        if query is not None and query.branch_owner_mode == "unmerged_same_branch":
+            return _resolve_unmerged_branch_owner(self._store, task)
         root = _resolve_lineage_root(self._store, task)
         if _is_shared_branch_descendant_query(task, root):
             return root
@@ -1152,6 +1163,12 @@ def _is_shared_branch_descendant_query(task: DbTask, root_task: DbTask) -> bool:
     from gza.query import _is_shared_branch_descendant
 
     return _is_shared_branch_descendant(task, root_task)
+
+
+def _resolve_unmerged_branch_owner(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    from gza.query import resolve_unmerged_branch_owner
+
+    return resolve_unmerged_branch_owner(store, task)
 
 
 def _get_reviews_for_root(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
