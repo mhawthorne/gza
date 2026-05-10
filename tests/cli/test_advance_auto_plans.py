@@ -479,6 +479,8 @@ def test_advance_new_pending_implement_iterate_spawn_marks_auto_iterate(tmp_path
                 "task_id": impl_task.id,
                 "auto_iterate": kwargs.get("auto_iterate"),
                 "max_iterations": kwargs.get("max_iterations"),
+                "prepared_task_id": kwargs.get("prepared_task_id"),
+                "prepared_phase": kwargs.get("prepared_phase"),
             }
         )
         return 0
@@ -486,6 +488,7 @@ def test_advance_new_pending_implement_iterate_spawn_marks_auto_iterate(tmp_path
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
         patch("gza.cli.git_ops._advance_uses_iterate", return_value=True),
+        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.git_ops._spawn_background_iterate_worker", side_effect=fake_spawn_iterate),
     ):
         rc = cmd_advance(_advance_args(tmp_path, batch=1, new=True))
@@ -496,8 +499,44 @@ def test_advance_new_pending_implement_iterate_spawn_marks_auto_iterate(tmp_path
             "task_id": pending_impl.id,
             "auto_iterate": True,
             "max_iterations": 3,
+            "prepared_task_id": pending_impl.id,
+            "prepared_phase": "preloop",
         }
     ]
+
+
+def test_advance_new_pending_implement_iterate_startup_failure_surfaces_and_skips_spawn(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending_impl = store.add("Implement queued task", task_type="implement")
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops._advance_uses_iterate", return_value=True),
+        patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")),
+        patch(
+            "gza.cli.git_ops._spawn_background_iterate_worker",
+            side_effect=AssertionError("iterate worker should not spawn"),
+        ),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, batch=1, new=True))
+
+    output = capsys.readouterr()
+    assert rc == 1
+    assert "creator boom" in output.err
+    refreshed = store.get(pending_impl.id)
+    assert refreshed is not None
+    assert refreshed.slug is None
+    assert refreshed.log_file is None
+    logs_dir = tmp_path / ".gza" / "logs"
+    if logs_dir.exists():
+        assert list(logs_dir.iterdir()) == []
+    workers_dir = tmp_path / ".gza" / "workers"
+    if workers_dir.exists():
+        assert list(workers_dir.iterdir()) == []
 
 
 def test_advance_creates_exactly_one_closing_review_after_completed_improve(
