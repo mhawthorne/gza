@@ -15,6 +15,7 @@ from rich.console import Console
 
 from gza.cli import query as query_cli
 from gza.console import truncate
+from gza.db import Task
 from gza.git import GitError
 from gza.pr_ops import LookupTaskPrResult
 from gza.sync_ops import BranchSyncResult
@@ -10119,6 +10120,91 @@ class TestUnmergedUnifiedQueryOutput:
         assert improve.id in normalized
         assert "Depends-only implement noise" not in normalized
         assert depends_only_impl.id not in normalized
+
+    def test_descendants_only_unmerged_lineage_tree_dedupes_direct_review_children(self) -> None:
+        store = MagicMock()
+        owner = Task(
+            id="gza-1",
+            prompt="Owner implementation",
+            status="completed",
+            task_type="implement",
+            created_at=datetime(2026, 2, 12, 10, 0, tzinfo=UTC),
+        )
+        review_a = Task(
+            id="gza-2",
+            prompt="Review A",
+            status="completed",
+            task_type="review",
+            based_on=owner.id,
+            depends_on=owner.id,
+            created_at=datetime(2026, 2, 12, 11, 0, tzinfo=UTC),
+        )
+        review_b = Task(
+            id="gza-3",
+            prompt="Review B",
+            status="completed",
+            task_type="review",
+            based_on=owner.id,
+            depends_on=owner.id,
+            created_at=datetime(2026, 2, 12, 12, 0, tzinfo=UTC),
+        )
+
+        store.get_based_on_children.side_effect = lambda task_id: (
+            [review_a, review_b] if task_id == owner.id else []
+        )
+        store.get_reviews_for_task.side_effect = lambda task_id: (
+            [review_a, review_b] if task_id == owner.id else []
+        )
+
+        tree = query_cli._descendants_only_unmerged_lineage_tree(  # noqa: SLF001
+            store,
+            owner_task=owner,
+        )
+
+        assert tree is not None
+        assert [child.task.id for child in tree.children].count(review_a.id) == 1
+        assert [child.task.id for child in tree.children].count(review_b.id) == 1
+
+    def test_unmerged_descendants_only_lineage_renders_each_review_once(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        store, impl, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Owner implementation")
+        impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        store.update(impl)
+
+        review_a = store.add("Review one", task_type="review", based_on=impl.id, depends_on=impl.id)
+        review_a.status = "completed"
+        review_a.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        review_a.output_content = "Verdict: APPROVED"
+        store.update(review_a)
+        assert review_a.id is not None
+
+        review_b = store.add("Review two", task_type="review", based_on=impl.id, depends_on=impl.id)
+        review_b.status = "completed"
+        review_b.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
+        review_b.output_content = "Verdict: CHANGES_REQUESTED"
+        store.update(review_b)
+        assert review_b.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=False,
+            fields=None,
+        )
+
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        normalized = " ".join(captured.out.split())
+        assert normalized.count(str(review_a.id)) == 1
+        assert normalized.count(str(review_b.id)) == 1
 
     def test_unmerged_shows_descendants_only_lineage_without_ancestors(
         self,

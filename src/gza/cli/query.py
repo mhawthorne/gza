@@ -1368,6 +1368,8 @@ def _descendants_only_unmerged_lineage_tree(
         }
         direct_based_on_children: list[DbTask] = []
         for child in based_on_children:
+            if child.id is not None and child.id in review_by_id:
+                continue
             if child.depends_on is not None and child.depends_on in review_attached_children:
                 review_attached_children[child.depends_on].append(child)
             else:
