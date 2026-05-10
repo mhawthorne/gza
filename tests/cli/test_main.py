@@ -257,11 +257,19 @@ class TestHelpOutput:
             in normalized_output
         )
 
-    def test_iterate_accepts_internal_worker_id_flag(self, tmp_path):
-        """Background iterate workers pass --worker-id; parser must accept it."""
+    def test_iterate_accepts_internal_worker_flags(self, tmp_path):
+        """Background iterate workers pass hidden flags; parser must accept them."""
         setup_config(tmp_path)
 
-        result = run_gza("iterate", "gza-999999", "--worker-id", "w-test", "--project", str(tmp_path))
+        result = run_gza(
+            "iterate",
+            "gza-999999",
+            "--worker-id",
+            "w-test",
+            "--auto-iterate",
+            "--project",
+            str(tmp_path),
+        )
 
         assert result.returncode == 1
         output = result.stdout + (result.stderr or "")

@@ -2033,6 +2033,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 config,
                 task_obj,
                 max_iterations=config.iterate_max_iterations,
+                auto_iterate=True,
                 quiet=True,
             ),
             spawn_iterate_recovery=lambda task_obj, mode: _spawn_background_iterate_worker(
@@ -2045,6 +2046,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 max_iterations=config.iterate_max_iterations,
                 resume=mode == "resume",
                 retry=mode == "retry",
+                auto_iterate=True,
                 quiet=True,
             ),
         )
@@ -2374,6 +2376,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     config,
                     pt,
                     max_iterations=config.iterate_max_iterations,
+                    auto_iterate=True,
                     quiet=True,
                 )
             else:

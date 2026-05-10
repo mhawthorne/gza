@@ -308,6 +308,7 @@ def main() -> int:
                             max_iterations=config.iterate_max_iterations,
                             resume=handoff_resume_mode,
                             retry=False,
+                            auto_iterate=True,
                         )
                         spawn_rc = _spawn_background_iterate(
                             iterate_args,

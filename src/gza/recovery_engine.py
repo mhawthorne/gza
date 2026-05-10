@@ -883,6 +883,37 @@ def get_failed_recovery_needs_attention_reason(
     )
 
 
+def get_manual_resume_override_descendant(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    decision: FailedRecoveryDecision | None = None,
+    max_recovery_attempts: int,
+) -> DbTask | None:
+    """Return the newest failed recovery descendant eligible for manual override."""
+    if task.id is None:
+        return None
+    resolved_decision = decision or decide_failed_task_recovery(
+        store,
+        task,
+        max_recovery_attempts=max_recovery_attempts,
+    )
+    if resolved_decision.reason_code != "recovery_has_newer_unresolved_descendant":
+        return None
+
+    unresolved_descendants = sort_failed_tasks(
+        _list_unresolved_recovery_terminal_descendants(_build_recovery_chain_snapshot(store, task))
+    )
+    failed_descendants = [
+        descendant
+        for descendant in unresolved_descendants
+        if descendant.status == "failed" and descendant.id is not None
+    ]
+    if not failed_descendants:
+        return None
+    return failed_descendants[-1]
+
+
 def _get_failed_recovery_needs_attention_reason(
     store: SqliteTaskStore,
     task: DbTask,

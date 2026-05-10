@@ -222,6 +222,40 @@ def test_advance_create_implement_respects_batch_limit(tmp_path: Path, capsys) -
     assert "batch limit reached" in output
 
 
+def test_advance_new_pending_implement_iterate_spawn_marks_auto_iterate(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending_impl = store.add("Implement queued task", task_type="implement")
+
+    iterate_calls: list[dict[str, object]] = []
+
+    def fake_spawn_iterate(_args, _config, impl_task, **kwargs):
+        iterate_calls.append(
+            {
+                "task_id": impl_task.id,
+                "auto_iterate": kwargs.get("auto_iterate"),
+                "max_iterations": kwargs.get("max_iterations"),
+            }
+        )
+        return 0
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops._advance_uses_iterate", return_value=True),
+        patch("gza.cli.git_ops._spawn_background_iterate_worker", side_effect=fake_spawn_iterate),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, batch=1, new=True))
+
+    assert rc == 0
+    assert iterate_calls == [
+        {
+            "task_id": pending_impl.id,
+            "auto_iterate": True,
+            "max_iterations": 3,
+        }
+    ]
+
+
 def test_advance_creates_exactly_one_closing_review_after_completed_improve(
     tmp_path: Path, capsys
 ) -> None:

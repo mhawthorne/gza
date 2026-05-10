@@ -47,6 +47,8 @@ from ..query import (
 from ..recovery_engine import (
     FailedRecoveryDecision,
     decide_failed_task_recovery,
+    get_failed_recovery_needs_attention_reason,
+    get_manual_resume_override_descendant,
     resolve_recovery_planning_task,
 )
 from ..review_verdict import get_review_report
@@ -2039,6 +2041,7 @@ def _spawn_background_iterate(
         max_iterations=effective_max_iterations,
         resume=getattr(args, "resume", False),
         retry=getattr(args, "retry", False),
+        auto_iterate=bool(getattr(args, "auto_iterate", False)),
         dry_run=dry_run,
     )
 
@@ -2115,19 +2118,113 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         getattr(config, "max_resume_attempts", None),
         DEFAULT_MAX_RESUME_ATTEMPTS,
     )
+    manual_iterate = not bool(getattr(args, "auto_iterate", False))
 
-    def _resolve_failed_iterate_resume_start(
+    def _decision_hits_max_auto_resume_cap(
         failed_task: DbTask,
-    ) -> tuple[tuple[DbTask, FailedRecoveryDecision] | None, FailedRecoveryDecision | None]:
-        decision = decide_failed_task_recovery(
+        decision: FailedRecoveryDecision,
+    ) -> bool:
+        return (
+            get_failed_recovery_needs_attention_reason(
+                store,
+                failed_task,
+                decision=decision,
+                max_recovery_attempts=max(1, effective_max_resume_attempts),
+            )
+            == "max-resume-attempts-reached"
+        )
+
+    def _resolve_manual_resume_override(
+        failed_task: DbTask,
+        decision: FailedRecoveryDecision,
+    ) -> tuple[DbTask, FailedRecoveryDecision, list[str]] | None:
+        if not manual_iterate or decision.action == "resume":
+            return None
+        if _decision_hits_max_auto_resume_cap(failed_task, decision):
+            assert failed_task.id is not None
+            return (
+                failed_task,
+                decision,
+                [
+                    "warning: task "
+                    f"{failed_task.id} has hit max auto-resume attempts; proceeding because this resume is manual"
+                ],
+            )
+        attention_reason = get_failed_recovery_needs_attention_reason(
+            store,
+            failed_task,
+            decision=decision,
+            max_recovery_attempts=max(1, effective_max_resume_attempts),
+        )
+        if attention_reason != "newer-recovery-descendant-needs-attention":
+            return None
+        descendant = get_manual_resume_override_descendant(
+            store,
+            failed_task,
+            decision=decision,
+            max_recovery_attempts=max(1, effective_max_resume_attempts),
+        )
+        if descendant is None or descendant.id is None or descendant.id == failed_task.id:
+            return None
+        descendant_decision = _decide_failed_iterate_resume_start(descendant)
+        nested_override = _resolve_manual_resume_override(descendant, descendant_decision)
+        route_warning = (
+            "warning: task "
+            f"{failed_task.id} is blocked by newer failed recovery descendant {descendant.id}; "
+            f"proceeding with manual resume from {descendant.id}"
+        )
+        if nested_override is not None:
+            target_task, target_decision, warnings = nested_override
+            return target_task, target_decision, [route_warning, *warnings]
+        if descendant_decision.action != "resume":
+            return None
+        return descendant, descendant_decision, [route_warning]
+
+    def _emit_manual_resume_override_warnings(
+        failed_task: DbTask,
+        decision: FailedRecoveryDecision,
+    ) -> tuple[DbTask, FailedRecoveryDecision] | None:
+        override = _resolve_manual_resume_override(failed_task, decision)
+        if override is None:
+            return None
+        target_task, target_decision, warnings = override
+        for warning in warnings:
+            print(warning, file=sys.stderr)
+        return target_task, target_decision
+
+    def _decide_failed_iterate_resume_start(failed_task: DbTask) -> FailedRecoveryDecision:
+        return decide_failed_task_recovery(
             store,
             failed_task,
             # Explicit iterate --resume is still manual intent, but the failed-start
             # selector must use shared recovery edge classification/guardrails.
             max_recovery_attempts=max(1, effective_max_resume_attempts),
         )
+
+    def _resolve_failed_iterate_resume_start(
+        failed_task: DbTask,
+    ) -> tuple[
+        tuple[DbTask, FailedRecoveryDecision] | None,
+        tuple[DbTask, FailedRecoveryDecision] | None,
+    ]:
+        decision = _decide_failed_iterate_resume_start(failed_task)
+        override = _emit_manual_resume_override_warnings(failed_task, decision)
+        if override is not None:
+            target_failed_task, target_decision = override
+            if target_decision.action == "resume":
+                if target_decision.reuse_existing and target_decision.recovery_task_id is not None:
+                    existing_resume = store.get(target_decision.recovery_task_id)
+                    if existing_resume is None:
+                        print(
+                            f"Error: pending resume child {target_decision.recovery_task_id} "
+                            "selected by recovery policy was not found."
+                        )
+                        return None, None
+                    return (existing_resume, target_decision), None
+                return (_create_resume_task(store, target_failed_task), target_decision), None
+            return (_create_resume_task(store, target_failed_task), target_decision), None
         if decision.action != "resume":
-            return None, decision
+            return None, (failed_task, decision)
         if decision.reuse_existing and decision.recovery_task_id is not None:
             existing_resume = store.get(decision.recovery_task_id)
             if existing_resume is None:
@@ -2139,8 +2236,59 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             return (existing_resume, decision), None
         return (_create_resume_task(store, failed_task), decision), None
 
+    def _warn_manual_background_iterate_override_if_needed(iterate_task: DbTask) -> None:
+        if not manual_iterate:
+            return
+        if iterate_task.status == "failed" and use_resume:
+            _emit_manual_resume_override_warnings(
+                iterate_task,
+                _decide_failed_iterate_resume_start(iterate_task),
+            )
+            return
+        if iterate_task.status != "completed":
+            return
+        try:
+            git_runtime: Any = Git(config.project_dir)
+            target_branch = git_runtime.current_branch()
+        except Exception as exc:
+            task_label = iterate_task.id or "<unknown>"
+            print(
+                "Warning: could not evaluate manual iterate background preflight "
+                f"for task {task_label} before handoff: {exc}",
+                file=sys.stderr,
+            )
+            return
+        initial_action = determine_next_action(
+            config,
+            store,
+            git_runtime,
+            iterate_task,
+            target_branch,
+            max_resume_attempts=effective_max_resume_attempts,
+        )
+        if initial_action.get("type") != "improve":
+            return
+        review_task = initial_action.get("review_task")
+        if not isinstance(review_task, DbTask):
+            return
+        assert iterate_task.id is not None
+        assert review_task.id is not None
+        improve_action, failed_improve, improve_decision = resolve_improve_action(
+            store,
+            iterate_task.id,
+            review_task.id,
+            max_resume_attempts=effective_max_resume_attempts,
+        )
+        if (
+            improve_action == "manual_review"
+            and failed_improve is not None
+            and improve_decision is not None
+        ):
+            _emit_manual_resume_override_warnings(failed_improve, improve_decision)
+
     # Handle background mode: re-exec this command as a detached process.
     if background:
+        _warn_manual_background_iterate_override_if_needed(impl_task)
         return _spawn_background_iterate(
             args,
             config,
@@ -2289,11 +2437,12 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             if dry_run:
                 print(f"[dry-run] Would resume failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
                 return 0
-            resume_start, resume_blocked_decision = _resolve_failed_iterate_resume_start(impl_task)
+            resume_start, resume_blocked = _resolve_failed_iterate_resume_start(impl_task)
             if resume_start is None:
-                if resume_blocked_decision is not None:
+                if resume_blocked is not None:
+                    blocked_task, resume_blocked_decision = resume_blocked
                     exit_code = _print_failed_recovery_attention_and_return(
-                        impl_task,
+                        blocked_task,
                         resume_blocked_decision,
                         fix_task_id=impl_task_id,
                     )
@@ -2306,7 +2455,13 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 return 1
             run_start_task, _decision = resume_start
             assert run_start_task.id is not None
-            print(f"Resuming failed implementation {impl_task.id} as {run_start_task.id}...")
+            if run_start_task.based_on is not None and str(run_start_task.based_on) != str(impl_task.id):
+                print(
+                    f"Resuming failed implementation {impl_task.id} via newer recovery descendant "
+                    f"{run_start_task.based_on} as {run_start_task.id}..."
+                )
+            else:
+                print(f"Resuming failed implementation {impl_task.id} as {run_start_task.id}...")
             impl_task, rc, terminal_skip_decision = _run_task_with_recovery(
                 run_start_task,
                 initial_resume=True,
@@ -2886,6 +3041,15 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             improve_action, failed_improve, improve_decision = resolve_improve_action(
                 store, impl_task.id, review_task.id, max_resume_attempts=max_resume_attempts
             )
+            if (
+                improve_action == "manual_review"
+                and failed_improve is not None
+                and improve_decision is not None
+            ):
+                manual_override = _emit_manual_resume_override_warnings(failed_improve, improve_decision)
+                if manual_override is not None:
+                    failed_improve, improve_decision = manual_override
+                    improve_action = "resume"
             attention_result = build_improve_needs_attention_result(
                 store=store,
                 impl_task=impl_task,

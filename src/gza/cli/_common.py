@@ -1159,6 +1159,7 @@ def _spawn_background_iterate_worker(
     max_iterations: int,
     resume: bool = False,
     retry: bool = False,
+    auto_iterate: bool = False,
     quiet: bool = False,
     dry_run: bool = False,
 ) -> int:
@@ -1180,6 +1181,8 @@ def _spawn_background_iterate_worker(
         inner_cmd.append("--resume")
     if retry:
         inner_cmd.append("--retry")
+    if auto_iterate:
+        inner_cmd.append("--auto-iterate")
 
     inner_cmd.extend(["--project", str(config.project_dir.absolute())])
 

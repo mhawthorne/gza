@@ -1837,6 +1837,12 @@ def main() -> int:
             help=argparse.SUPPRESS,  # Internal: worker registry ID passed by parent
         )
         iterate_parser.add_argument(
+            "--auto-iterate",
+            action="store_true",
+            dest="auto_iterate",
+            help=argparse.SUPPRESS,  # Internal: marks scheduler/worker-launched iterate runs
+        )
+        iterate_parser.add_argument(
             "--background", "-b",
             action="store_true",
             help="Run the entire iterate loop in the background",
