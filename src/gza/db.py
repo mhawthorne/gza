@@ -2088,6 +2088,7 @@ class SqliteTaskStore:
             self._ensure_db_query_only()
         else:
             self._ensure_db()
+            self.repair_inconsistent_unmerged_merge_units()
             self._ensure_project_row()
 
     @classmethod
@@ -3754,6 +3755,27 @@ class SqliteTaskStore:
             return owner_candidates[0]
         return branch_tasks[0] if branch_tasks else None
 
+    def resolve_merge_unit_owner_task(
+        self,
+        unit: MergeUnit,
+        *,
+        require_actionable: bool = False,
+    ) -> Task | None:
+        """Return the merge-unit owner row used for provenance and lifecycle ownership.
+
+        ``owner_task_id`` is canonical. The legacy fallback remains only for older
+        or externally damaged databases where a unit row can exist without a
+        resolvable owner task; keep that compatibility debt contained here.
+        """
+        owner = self.get(unit.owner_task_id) if unit.owner_task_id is not None else None
+        if owner is None:
+            owner = self._legacy_merge_status_owner_for_unit(unit)
+        if owner is None:
+            return None
+        if require_actionable and not _task_is_actionable_merge_unit_member(owner, unit):
+            return None
+        return owner
+
     def resolve_merge_unit_representative_task(
         self,
         unit: MergeUnit,
@@ -4090,22 +4112,40 @@ class SqliteTaskStore:
             return
         now = datetime.now(UTC)
         current_unit = self.get_merge_unit(unit_id)
+        if current_unit is None:
+            raise ValueError(f"Merge unit {unit_id} not found")
+        owner = self.resolve_merge_unit_owner_task(current_unit)
+        owner_task_id = owner.id if owner is not None else current_unit.owner_task_id
+        typed_merged_by_task_id = (
+            cast("str | None", merged_by_task_id) if merged_by_task_id is not DB_UNSET else None
+        )
+        if merged_by_task_id is not DB_UNSET and typed_merged_by_task_id is not None:
+            if owner_task_id is None or typed_merged_by_task_id != owner_task_id:
+                raise ValueError(
+                    f"merged_by_task_id must equal merge-unit owner {owner_task_id!r}; "
+                    f"got {typed_merged_by_task_id!r}"
+                )
         updates: list[str] = ["state = ?", "updated_at = ?"]
         params: list[object] = [state, now.isoformat()]
         merged_at_value: datetime | None | object = merged_at
-        if merged_at_value is DB_UNSET:
-            if state == "merged":
-                if current_unit is not None and current_unit.merged_at is not None:
+        if state == "merged":
+            if merged_at_value is DB_UNSET:
+                if current_unit.merged_at is not None:
                     merged_at_value = current_unit.merged_at
                 else:
                     merged_at_value = now
-        if merged_at_value is not DB_UNSET:
-            typed_merged_at_value = cast("datetime | None", merged_at_value)
-            updates.append("merged_at = ?")
-            params.append(typed_merged_at_value.isoformat() if typed_merged_at_value is not None else None)
-        if merged_by_task_id is not DB_UNSET:
-            updates.append("merged_by_task_id = ?")
-            params.append(cast("str | None", merged_by_task_id))
+            if merged_by_task_id is DB_UNSET:
+                merged_by_task_id = owner_task_id
+        else:
+            if merged_at_value is DB_UNSET:
+                merged_at_value = None
+            if merged_by_task_id is DB_UNSET:
+                merged_by_task_id = None
+        typed_merged_at_value = cast("datetime | None", merged_at_value)
+        updates.append("merged_at = ?")
+        params.append(typed_merged_at_value.isoformat() if typed_merged_at_value is not None else None)
+        updates.append("merged_by_task_id = ?")
+        params.append(cast("str | None", merged_by_task_id))
         if pr_number is not DB_UNSET:
             updates.append("pr_number = ?")
             params.append(pr_number)
@@ -4138,6 +4178,41 @@ class SqliteTaskStore:
                 tuple(params),
             )
         self.dual_write_legacy_merge_status(unit_id)
+
+    def repair_inconsistent_unmerged_merge_units(self) -> int:
+        """Clear merged provenance left behind on still-unmerged merge units."""
+        if not self.supports_merge_units():
+            return 0
+        affected_unit_ids: list[str] = []
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id
+                FROM merge_units
+                WHERE project_id = ?
+                  AND state = 'unmerged'
+                  AND (merged_at IS NOT NULL OR merged_by_task_id IS NOT NULL)
+                """,
+                (self._project_id,),
+            ).fetchall()
+            affected_unit_ids = [str(row["id"]) for row in rows]
+            if affected_unit_ids:
+                conn.execute(
+                    """
+                    UPDATE merge_units
+                    SET merged_at = NULL,
+                        merged_by_task_id = NULL,
+                        updated_at = ?
+                    WHERE project_id = ?
+                      AND state = 'unmerged'
+                      AND (merged_at IS NOT NULL OR merged_by_task_id IS NOT NULL)
+                    """,
+                    (now, self._project_id),
+                )
+        for unit_id in affected_unit_ids:
+            self.dual_write_legacy_merge_status(unit_id)
+        return len(affected_unit_ids)
 
     def refresh_merge_unit_head(
         self,
@@ -4404,7 +4479,13 @@ class SqliteTaskStore:
                 if unit is not None:
                     if merge_status is not None:
                         state = "merged" if merge_status == "merged" else "unmerged"
-                        self.set_merge_unit_state(unit.id, state, merged_by_task_id=task_id if state == "merged" else None)
+                        owner = self.resolve_merge_unit_owner_task(unit)
+                        owner_task_id = owner.id if owner is not None else unit.owner_task_id
+                        self.set_merge_unit_state(
+                            unit.id,
+                            state,
+                            merged_by_task_id=owner_task_id if state == "merged" else None,
+                        )
                         return
         merged_at = datetime.now(UTC).isoformat() if merge_status == "merged" else None
         with self._connect() as conn:

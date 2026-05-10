@@ -55,7 +55,8 @@ class LineageOwnerRow:
     next_action_reason: str
     unresolved_tasks: tuple[DbTask, ...]
     unresolved_leaf_summary: tuple[UnresolvedLeafSummary, ...]
-    action_task: DbTask | None = None
+    lifecycle_action_task: DbTask | None = None
+    recovery_action_task: DbTask | None = None
     recovery_leaf_task: DbTask | None = None
 
 
@@ -666,12 +667,14 @@ def query_lineage_owner_rows(
         if resolved_in_query:
             continue
 
-        action_task = _select_representative_completed_task(
+        lifecycle_action_task = _select_representative_completed_task(
             store,
             snapshot,
             unresolved_tasks,
             impl_based_on_ids=indexes.impl_based_on_ids,
         )
+        planning_task = lifecycle_action_task
+        recovery_action_task: DbTask | None = None
         recovery_leaf_task: DbTask | None = None
         max_recovery_attempts = query.max_recovery_attempts if query.max_recovery_attempts is not None else 1
         failed_action_candidate: DbTask | None = None
@@ -696,23 +699,23 @@ def query_lineage_owner_rows(
             )
             if decision.reason_code == "recovery_has_newer_unresolved_descendant":
                 continue
-            if failed_task.task_type == "improve" and action_task is not None:
+            if failed_task.task_type == "improve" and lifecycle_action_task is not None:
                 continue
             if decision.action != "skip" or attention_action is not None:
                 failed_action_candidate = failed_task
                 break
         if failed_action_candidate is not None:
-            action_task = failed_action_candidate
+            recovery_action_task = failed_action_candidate
             recovery_leaf_task = failed_action_candidate
-        elif action_task is None and failed_leaves:
+        elif lifecycle_action_task is None and failed_leaves:
             recovery_leaf_task = max(
                 failed_leaves,
                 key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)),
             )
-            action_task = recovery_leaf_task
-        elif action_task is not None and action_task.status == "failed":
-            recovery_leaf_task = action_task
-        if action_task is None:
+            recovery_action_task = recovery_leaf_task
+        if planning_task is None:
+            planning_task = recovery_action_task
+        if planning_task is None:
             continue
 
         action: dict[str, Any] | None = None
@@ -721,7 +724,7 @@ def query_lineage_owner_rows(
                 config,
                 store,
                 git,
-                action_task,
+                planning_task,
                 target_branch,
                 impl_based_on_ids=indexes.impl_based_on_ids,
                 max_resume_attempts=query.max_recovery_attempts,
@@ -756,7 +759,8 @@ def query_lineage_owner_rows(
                 next_action_reason=str(action.get("description", "")) if action is not None else "",
                 unresolved_tasks=tuple(unresolved_tasks),
                 unresolved_leaf_summary=summaries,
-                action_task=action_task,
+                lifecycle_action_task=lifecycle_action_task,
+                recovery_action_task=recovery_action_task,
                 recovery_leaf_task=recovery_leaf_task,
             )
         )

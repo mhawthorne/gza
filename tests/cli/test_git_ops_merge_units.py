@@ -12,6 +12,7 @@ class _MergeGit:
         self.repo_dir = project_dir
         self._default_branch = default_branch
         self.merged: list[tuple[str, bool]] = []
+        self.commit_messages: list[str | None] = []
 
     def current_branch(self) -> str:
         return self._default_branch
@@ -45,6 +46,7 @@ class _MergeGit:
 
     def merge(self, branch: str, squash: bool = False, commit_message: str | None = None) -> None:
         self.merged.append((branch, squash))
+        self.commit_messages.append(commit_message)
 
     def delete_branch(self, branch: str) -> None:
         return None
@@ -141,6 +143,24 @@ def test_collect_advance_completed_tasks_backfills_legacy_unmerged_owner(tmp_pat
     unit = store.resolve_merge_unit_for_task(legacy.id)
     assert unit is not None
     assert unit.state == "unmerged"
+
+
+def test_collect_advance_completed_tasks_returns_owner_once_for_same_unit_descendants(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement shared branch", task_type="implement")
+    store.mark_completed(impl, has_commits=True, branch="feature/owner-only-advance")
+    assert impl.id is not None
+
+    improve = store.add("Improve shared branch", task_type="improve", based_on=impl.id, same_branch=True)
+    store.mark_completed(improve, has_commits=True, branch="feature/owner-only-advance")
+    assert improve.id is not None
+
+    tasks, _ = _collect_advance_completed_tasks(store, target_branch="main")
+
+    assert [task.id for task in tasks if task.task_type == "implement"] == [impl.id]
+    assert improve.id not in [task.id for task in tasks]
 
 
 def test_collect_advance_completed_tasks_filters_unmerged_tasks_by_target_branch(tmp_path: Path) -> None:
@@ -475,7 +495,33 @@ def test_merge_explicit_retry_task_id_uses_actionable_member_when_owner_failed(t
     assert fake_git.merged == [("feature/explicit-retry", False)]
     unit = store.resolve_merge_unit_for_task(retry.id)
     assert unit is not None
-    assert unit.merged_by_task_id == retry.id
+    assert unit.merged_by_task_id == failed.id
+
+
+def test_merge_explicit_improve_task_uses_owner_for_provenance_and_squash_subject(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement shared branch", task_type="implement")
+    store.mark_completed(impl, has_commits=True, branch="feature/explicit-improve")
+    assert impl.id is not None
+
+    improve = store.add("Improve shared branch", task_type="improve", based_on=impl.id, same_branch=True)
+    store.mark_completed(improve, has_commits=True, branch="feature/explicit-improve")
+    assert improve.id is not None
+
+    fake_git = _MergeGit(tmp_path)
+    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
+        result = run_gza("merge", str(improve.id), "--squash", "--project", str(tmp_path), cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert fake_git.merged == [("feature/explicit-improve", True)]
+    assert fake_git.commit_messages and fake_git.commit_messages[0] is not None
+    assert impl.id in fake_git.commit_messages[0]
+    assert "Implement shared branch" in fake_git.commit_messages[0]
+    unit = store.resolve_merge_unit_for_task(improve.id)
+    assert unit is not None
+    assert unit.merged_by_task_id == impl.id
 
 
 def test_merge_valid_and_missing_explicit_task_ids_report_missing_without_partial_merge(tmp_path: Path) -> None:
