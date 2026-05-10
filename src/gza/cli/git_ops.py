@@ -70,6 +70,7 @@ from ._common import (
     _create_review_task,
     _get_pager,
     _looks_like_task_id,
+    _prepare_task_for_immediate_execution,
     _spawn_background_iterate_worker,
     _spawn_background_resume_worker,
     _spawn_background_worker,
@@ -1218,8 +1219,19 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         if getattr(args, 'remote', False):
             target = f"origin/{target}"
         rebase_task = _create_rebase_task(store, task_id, task.branch, target)
-        worker_args = argparse.Namespace(no_docker=False, max_turns=None)
-        return _spawn_background_worker(worker_args, config, task_id=rebase_task.id)
+        prepared_rebase_task = _prepare_task_for_immediate_execution(
+            config,
+            rebase_task,
+            rollback_on_failure=True,
+        )
+        if prepared_rebase_task is None:
+            return 1
+        assert prepared_rebase_task.id is not None
+        worker_args = argparse.Namespace(
+            no_docker=getattr(args, "no_docker", False),
+            max_turns=None,
+        )
+        return _spawn_background_worker(worker_args, config, task_id=prepared_rebase_task.id)
 
     store = get_store(config)
 
