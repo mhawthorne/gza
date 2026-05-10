@@ -111,7 +111,8 @@ class LineageRow:
     members: tuple[DbTask, ...]
     tree: Any | None
     unresolved_tasks: tuple[DbTask, ...] = ()
-    action_task: DbTask | None = None
+    lifecycle_action_task: DbTask | None = None
+    recovery_action_task: DbTask | None = None
     recovery_leaf_task: DbTask | None = None
     lineage_status: str | None = None
     next_action_data: Mapping[str, object] | None = None
@@ -483,7 +484,8 @@ class TaskQueryService:
                     members=row.members,
                     tree=row.tree,
                     unresolved_tasks=row.unresolved_tasks,
-                    action_task=row.action_task,
+                    lifecycle_action_task=row.lifecycle_action_task,
+                    recovery_action_task=row.recovery_action_task,
                     recovery_leaf_task=row.recovery_leaf_task,
                     lineage_status=row.lineage_status,
                     next_action_data=row.next_action,
@@ -814,7 +816,7 @@ class TaskQueryService:
                 dict(row.next_action_data)
                 if row.next_action_data is not None
                 else self._project_next_action(
-                    row.action_task or owner,
+                    row.lifecycle_action_task or row.recovery_action_task or owner,
                     config=config,
                     git=git,
                     target_branch=target_branch,
@@ -858,7 +860,8 @@ class TaskQueryService:
             members=row.members,
             tree=row.tree,
             unresolved_tasks=row.unresolved_tasks,
-            action_task=row.action_task,
+            lifecycle_action_task=row.lifecycle_action_task,
+            recovery_action_task=row.recovery_action_task,
             recovery_leaf_task=row.recovery_leaf_task,
             lineage_status=row.lineage_status,
             next_action_data=row.next_action_data,

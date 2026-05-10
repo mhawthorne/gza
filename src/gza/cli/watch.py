@@ -747,8 +747,8 @@ def _emit_recovery_dry_run_report(
         )
         if (
             row.recovery_leaf_task is not None
-            and row.action_task is not None
-            and row.action_task.id == row.recovery_leaf_task.id
+            and row.recovery_action_task is not None
+            and row.recovery_action_task.id == row.recovery_leaf_task.id
         )
     ]
     failed_rows.sort(
@@ -901,13 +901,17 @@ def _run_cycle(
     lifecycle_rows = [
         row
         for row in owner_rows
-        if row.action_task is not None and row.action_task.status != "failed"
+        if row.lifecycle_action_task is not None and row.lifecycle_action_task.status != "failed"
     ]
     recovery_rows = [row for row in owner_rows if row.recovery_leaf_task is not None]
     recovery_rows = [
         row
         for row in recovery_rows
-        if row.action_task is not None and row.recovery_leaf_task is not None and row.action_task.id == row.recovery_leaf_task.id
+        if (
+            row.recovery_action_task is not None
+            and row.recovery_leaf_task is not None
+            and row.recovery_action_task.id == row.recovery_leaf_task.id
+        )
     ]
     recovery_rows.sort(
         key=lambda row: (
@@ -957,7 +961,7 @@ def _run_cycle(
 
         action_plan: list[tuple[LineageOwnerRow, DbTask, dict]] = []
         for row in lifecycle_rows:
-            task = row.action_task or row.owner_task
+            task = row.lifecycle_action_task or row.owner_task
             action_plan.append(
                 (
                     row,

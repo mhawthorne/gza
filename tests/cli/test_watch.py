@@ -101,6 +101,24 @@ def test_watch_collects_legacy_unmerged_owner_after_lazy_merge_unit_backfill(tmp
     assert unit.state == "unmerged"
 
 
+def test_watch_collects_only_merge_unit_owner_for_same_branch_descendants(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Watch implement owner", task_type="implement")
+    store.mark_completed(impl, has_commits=True, branch="feature/watch-owner-only")
+    assert impl.id is not None
+
+    improve = store.add("Watch improve descendant", task_type="improve", based_on=impl.id, same_branch=True)
+    store.mark_completed(improve, has_commits=True, branch="feature/watch-owner-only")
+    assert improve.id is not None
+
+    tasks, _ = _collect_advance_completed_tasks(store, target_branch="main")
+
+    assert [task.id for task in tasks if task.task_type == "implement"] == [impl.id]
+    assert improve.id not in [task.id for task in tasks]
+
+
 def test_watch_query_owner_rows_filters_target_branch_and_keeps_legacy_fallback(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -166,6 +184,71 @@ def test_watch_query_owner_rows_filters_target_branch_and_keeps_legacy_fallback(
 
     owner_ids = {row.owner_task.id for row in rows}
     assert owner_ids == {main_task.id, legacy_task.id}
+
+
+def test_watch_owner_rows_keep_lifecycle_merge_candidate_and_failed_recovery_separately(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Watch merge owner", task_type="implement")
+    store.mark_completed(impl, has_commits=True, branch="feature/watch-split-owner")
+    assert impl.id is not None
+
+    review = store.add("Review merge owner", task_type="review", based_on=impl.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+    assert review.id is not None
+    store.get_or_create_merge_unit_for_task(review)
+
+    failed_rebase = store.add(
+        "Failed rebase descendant",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    failed_rebase.status = "failed"
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    failed_rebase.completed_at = datetime.now(UTC)
+    failed_rebase.branch = "feature/watch-split-owner"
+    failed_rebase.has_commits = True
+    store.update(failed_rebase)
+    assert failed_rebase.id is not None
+    store.get_or_create_merge_unit_for_task(failed_rebase)
+
+    owner_rows = _query_owner_rows(
+        store=store,
+        max_recovery_attempts=1,
+        include_skipped=True,
+    )
+
+    assert len(owner_rows) == 1
+    row = owner_rows[0]
+    assert row.owner_task.id == impl.id
+    assert row.lifecycle_action_task is not None
+    assert row.lifecycle_action_task.status != "failed"
+    assert row.recovery_action_task is not None
+    assert row.recovery_action_task.id == failed_rebase.id
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == failed_rebase.id
+
+    lifecycle_rows = [
+        candidate
+        for candidate in owner_rows
+        if candidate.lifecycle_action_task is not None and candidate.lifecycle_action_task.status != "failed"
+    ]
+    recovery_rows = [
+        candidate
+        for candidate in owner_rows
+        if candidate.recovery_action_task is not None
+        and candidate.recovery_leaf_task is not None
+        and candidate.recovery_action_task.id == candidate.recovery_leaf_task.id
+    ]
+
+    assert [candidate.owner_task.id for candidate in lifecycle_rows] == [impl.id]
+    assert [candidate.recovery_leaf_task.id for candidate in recovery_rows] == [failed_rebase.id]
 
 
 def test_watch_cycle_prefers_freshly_bumped_task_over_older_urgent(tmp_path: Path) -> None:

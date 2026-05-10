@@ -86,6 +86,16 @@ from .advance_executor import (
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass(frozen=True)
+class _ResolvedMergeSubject:
+    trigger_task: DbTask
+    execution_task: DbTask
+    merge_subject: DbTask
+    merge_unit_id: str | None
+    merge_branch: str | None
+
+
 def _task_is_already_merged(store: SqliteTaskStore, task: DbTask) -> bool:
     """Return whether the selected task is already merged."""
     return task_is_merged(store, task)
@@ -266,19 +276,34 @@ def _collect_advance_completed_tasks(
     implement children (except when filtering to implement-only mode).
     """
     impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
-
-    all_unmerged = store.get_unmerged()
-    tasks = [t for t in all_unmerged if t.status == 'completed']
-    if isinstance(target_branch, str):
-        filtered_tasks: list[DbTask] = []
-        for task in tasks:
-            unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
-            if unit is None:
-                unit = store.get_or_create_merge_unit_for_task(task)
-            if unit is not None and unit.target_branch != target_branch:
+    if store.supports_merge_units():
+        tasks = []
+        seen_unit_ids: set[str] = set()
+        seen_task_ids: set[str] = set()
+        for unit in store._get_unmerged_merge_units_with_legacy_fallback():
+            if unit.id in seen_unit_ids:
                 continue
-            filtered_tasks.append(task)
-        tasks = filtered_tasks
+            seen_unit_ids.add(unit.id)
+            if isinstance(target_branch, str) and unit.target_branch != target_branch:
+                continue
+            owner = store.resolve_merge_unit_owner_task(unit, require_actionable=True)
+            if owner is None or owner.status != "completed" or owner.id is None or owner.id in seen_task_ids:
+                continue
+            tasks.append(owner)
+            seen_task_ids.add(owner.id)
+    else:
+        all_unmerged = store.get_unmerged()
+        tasks = [t for t in all_unmerged if t.status == 'completed']
+        if isinstance(target_branch, str):
+            filtered_tasks: list[DbTask] = []
+            for task in tasks:
+                unit_for_task = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
+                if unit_for_task is None:
+                    unit_for_task = store.get_or_create_merge_unit_for_task(task)
+                if unit_for_task is not None and unit_for_task.target_branch != target_branch:
+                    continue
+                filtered_tasks.append(task)
+            tasks = filtered_tasks
 
     if advance_type != 'implement':
         completed_plans = store.get_history(limit=None, status='completed', task_type='plan')
@@ -425,8 +450,55 @@ def _resolve_merge_target_task(
     )
     if representative is not None:
         return representative
-    owner = store._legacy_merge_status_owner_for_unit(unit)
+    owner = store.resolve_merge_unit_owner_task(unit)
     return owner or task
+
+
+def _resolve_merge_subject(
+    store: SqliteTaskStore,
+    task_id: str,
+    *,
+    target_branch: str,
+) -> _ResolvedMergeSubject | None:
+    trigger_task = store.get(task_id)
+    if trigger_task is None:
+        return None
+    if trigger_task.id is None:
+        return _ResolvedMergeSubject(
+            trigger_task=trigger_task,
+            execution_task=trigger_task,
+            merge_subject=trigger_task,
+            merge_unit_id=None,
+            merge_branch=trigger_task.branch,
+        )
+
+    unit = store.resolve_merge_unit_for_task(trigger_task.id)
+    if unit is None and trigger_task.branch:
+        unit = store.get_or_create_merge_unit_for_task(trigger_task)
+    if unit is None:
+        return _ResolvedMergeSubject(
+            trigger_task=trigger_task,
+            execution_task=trigger_task,
+            merge_subject=trigger_task,
+            merge_unit_id=None,
+            merge_branch=trigger_task.branch,
+        )
+
+    merge_subject = store.resolve_merge_unit_owner_task(unit) or trigger_task
+    execution_task = store.resolve_merge_unit_representative_task(
+        unit,
+        preferred_task_id=trigger_task.id,
+        require_actionable=True,
+    )
+    if execution_task is None:
+        execution_task = trigger_task if trigger_task.branch == unit.source_branch else merge_subject
+    return _ResolvedMergeSubject(
+        trigger_task=trigger_task,
+        execution_task=execution_task,
+        merge_subject=merge_subject,
+        merge_unit_id=unit.id,
+        merge_branch=unit.source_branch,
+    )
 
 
 def _merge_single_task(
@@ -438,21 +510,27 @@ def _merge_single_task(
     current_branch: str,
 ) -> int:
     """Merge a single task's branch. Returns 0 on success, 1 on failure."""
-    # Resolve selected row to the active merge unit owner when available.
     target_branch = git.default_branch()
-    task = _resolve_merge_target_task(store, task_id, target_branch)
-    if not task:
+    resolved = _resolve_merge_subject(store, task_id, target_branch=target_branch)
+    if resolved is None:
         print(f"Error: Task {task_id} not found")
         return 1
-    merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
+    execution_task = resolved.execution_task
+    merge_subject = resolved.merge_subject
+    assert merge_subject.id is not None
+    merge_branch = resolved.merge_branch or execution_task.branch
+    merge_unit_id = resolved.merge_unit_id
 
     # Validate task state
-    if task.status not in ("completed", "unmerged"):
-        print(f"Error: Task {task.id} is not completed or unmerged (status: {task.status})")
+    if execution_task.status not in ("completed", "unmerged"):
+        print(
+            f"Error: Task {merge_subject.id} is not completed or unmerged "
+            f"(execution status: {execution_task.status})"
+        )
         return 1
 
-    if not task.branch:
-        print(f"Error: Task {task.id} has no branch")
+    if not merge_branch:
+        print(f"Error: Task {merge_subject.id} has no branch")
         return 1
 
     # Handle --mark-only flag
@@ -462,23 +540,23 @@ def _merge_single_task(
             print("Error: --mark-only cannot be used with --rebase, --squash, or --delete")
             return 1
 
-        if merge_unit is not None:
-            store.set_merge_unit_state(merge_unit.id, "merged", merged_by_task_id=task.id)
+        if merge_unit_id is not None:
+            store.set_merge_unit_state(merge_unit_id, "merged", merged_by_task_id=merge_subject.id)
         else:
-            store.set_merge_status(task.id, "merged")
-        print(f"✓ Marked task {task.id} as merged (branch '{task.branch}' preserved)")
+            store.set_merge_status(merge_subject.id, "merged")
+        print(f"✓ Marked task {merge_subject.id} as merged (branch '{merge_branch}' preserved)")
         return 0
 
     # Check if branch already merged
-    if git.is_merged(task.branch, current_branch):
+    if git.is_merged(merge_branch, current_branch):
         default_branch = git.default_branch()
-        if current_branch != default_branch and not git.is_merged(task.branch, default_branch):
+        if current_branch != default_branch and not git.is_merged(merge_branch, default_branch):
             print(
-                f"Error: Branch '{task.branch}' is already merged into current branch "
+                f"Error: Branch '{merge_branch}' is already merged into current branch "
                 f"'{current_branch}', but still unmerged from default branch '{default_branch}'"
             )
         else:
-            print(f"Error: Branch '{task.branch}' is already merged into {current_branch}")
+            print(f"Error: Branch '{merge_branch}' is already merged into {current_branch}")
         return 1
 
     # Check for uncommitted changes (untracked files are OK, they won't conflict with merge)
@@ -501,13 +579,13 @@ def _merge_single_task(
         print("Error: --resolve requires --rebase")
         return 1
 
-    if not args.rebase and not git.can_merge(task.branch, current_branch):
+    if not args.rebase and not git.can_merge(merge_branch, current_branch):
         print(
-            f"Error: Branch '{task.branch}' has conflicts against '{current_branch}' "
+            f"Error: Branch '{merge_branch}' has conflicts against '{current_branch}' "
             "and cannot be merged cleanly."
         )
-        print(f"Run: uv run gza rebase {task.id} --resolve")
-        print(f"Or preview the lifecycle action with: uv run gza advance {task.id} --dry-run")
+        print(f"Run: uv run gza rebase {merge_subject.id} --resolve")
+        print(f"Or preview the lifecycle action with: uv run gza advance {merge_subject.id} --dry-run")
         return 1
 
     # Perform the merge or rebase
@@ -523,50 +601,50 @@ def _merge_single_task(
                 rebase_target = f"origin/{current_branch}"
 
             # For rebase: checkout the task branch, rebase onto target, then fast-forward merge
-            print(f"Rebasing '{task.branch}' onto '{rebase_target}'...")
-            git.checkout(task.branch)
+            print(f"Rebasing '{merge_branch}' onto '{rebase_target}'...")
+            git.checkout(merge_branch)
             git.rebase(rebase_target)
-            print(f"✓ Successfully rebased {task.branch}")
+            print(f"✓ Successfully rebased {merge_branch}")
 
             # Switch back and fast-forward merge
             git.checkout(current_branch)
-            git.merge(task.branch, squash=False)
-            print(f"✓ Fast-forwarded {current_branch} to {task.branch}")
+            git.merge(merge_branch, squash=False)
+            print(f"✓ Fast-forwarded {current_branch} to {merge_branch}")
         else:
             # Regular merge or squash merge
-            print(f"Merging '{task.branch}' into '{current_branch}'...")
+            print(f"Merging '{merge_branch}' into '{current_branch}'...")
 
             # For squash merge, create a commit message from the task
             commit_message = None
             if args.squash:
-                assert task.id is not None, "Task ID must be set before squash merge commit"
+                assert merge_subject.id is not None, "Task ID must be set before squash merge commit"
                 commit_message = build_task_commit_message(
-                    task.prompt,
-                    task_id=task.id,
-                    task_slug=task.slug,
+                    merge_subject.prompt,
+                    task_id=merge_subject.id,
+                    task_slug=merge_subject.slug,
                     subject_prefix="Squash merge: ",
                 )
 
-            git.merge(task.branch, squash=args.squash, commit_message=commit_message)
+            git.merge(merge_branch, squash=args.squash, commit_message=commit_message)
 
             if args.squash:
-                print(f"✓ Successfully squash merged {task.branch} and created commit")
+                print(f"✓ Successfully squash merged {merge_branch} and created commit")
             else:
-                print(f"✓ Successfully merged {task.branch}")
+                print(f"✓ Successfully merged {merge_branch}")
 
         # Delete branch if requested
         if args.delete:
             try:
-                git.delete_branch(task.branch)
-                print(f"✓ Deleted branch {task.branch}")
+                git.delete_branch(merge_branch)
+                print(f"✓ Deleted branch {merge_branch}")
             except GitError as e:
                 print(f"Warning: Could not delete branch: {e}")
 
         if git.repo_dir == config.project_dir:
-            if merge_unit is not None:
-                store.set_merge_unit_state(merge_unit.id, "merged", merged_by_task_id=task.id)
+            if merge_unit_id is not None:
+                store.set_merge_unit_state(merge_unit_id, "merged", merged_by_task_id=merge_subject.id)
             else:
-                store.set_merge_status(task.id, "merged")
+                store.set_merge_status(merge_subject.id, "merged")
         return 0
 
     except GitError as e:
@@ -575,17 +653,17 @@ def _merge_single_task(
         if args.rebase and getattr(args, 'resolve', False):
             # --resolve: invoke Claude to fix conflicts
             print("Conflicts detected. Invoking provider to resolve...")
-            resolve_log = ensure_task_log_path(config, store, task)
-            resolved = invoke_provider_resolve(
-                task,
-                task.branch,
+            resolve_log = ensure_task_log_path(config, store, execution_task)
+            conflicts_resolved = invoke_provider_resolve(
+                execution_task,
+                merge_branch,
                 rebase_target,
                 config,
                 log_file=resolve_log,
                 logger=TaskExecutionLogger(resolve_ops_log_path(config, resolve_log), echo=True),
             )
 
-            if not resolved:
+            if not conflicts_resolved:
                 print("Could not resolve conflicts automatically.")
                 try:
                     git.rebase_abort()
@@ -599,22 +677,22 @@ def _merge_single_task(
 
             # Switch back and fast-forward merge
             git.checkout(current_branch)
-            git.merge(task.branch, squash=False)
-            print(f"✓ Fast-forwarded {current_branch} to {task.branch}")
+            git.merge(merge_branch, squash=False)
+            print(f"✓ Fast-forwarded {current_branch} to {merge_branch}")
 
             # Delete branch if requested
             if args.delete:
                 try:
-                    git.delete_branch(task.branch)
-                    print(f"✓ Deleted branch {task.branch}")
+                    git.delete_branch(merge_branch)
+                    print(f"✓ Deleted branch {merge_branch}")
                 except GitError as del_error:
                     print(f"Warning: Could not delete branch: {del_error}")
 
             if git.repo_dir == config.project_dir:
-                if merge_unit is not None:
-                    store.set_merge_unit_state(merge_unit.id, "merged", merged_by_task_id=task.id)
+                if merge_unit_id is not None:
+                    store.set_merge_unit_state(merge_unit_id, "merged", merged_by_task_id=merge_subject.id)
                 else:
-                    store.set_merge_status(task.id, "merged")
+                    store.set_merge_status(merge_subject.id, "merged")
             return 0
 
         print(f"Error during {operation}: {e}")
@@ -1754,6 +1832,9 @@ def _execute_merge_action(
     reused_followups: list[DbTask] = []
     execution_git = merge_git or git
     execution_branch = merge_current_branch or current_branch
+    resolved_subject = _resolve_merge_subject(store, task.id or "", target_branch=target_branch) if task.id else None
+    merge_subject = resolved_subject.merge_subject if resolved_subject is not None else task
+    assert merge_subject.id is not None
 
     if action.get("type") == "merge_with_followups":
         review_task = action.get("review_task")
@@ -1762,18 +1843,26 @@ def _execute_merge_action(
             created_followups, reused_followups = _create_or_reuse_followup_tasks(
                 store,
                 review_task=review_task,
-                impl_task=task,
+                impl_task=merge_subject,
                 findings=followup_findings,
             )
 
     assert task.id is not None
     if (
         already_merged_behavior == "mark_merged"
-        and task.branch
-        and execution_git.branch_exists(task.branch)
-        and execution_git.is_merged(task.branch, execution_branch)
+        and resolved_subject is not None
+        and resolved_subject.merge_branch
+        and execution_git.branch_exists(resolved_subject.merge_branch)
+        and execution_git.is_merged(resolved_subject.merge_branch, execution_branch)
     ):
-        store.set_merge_status(task.id, "merged")
+        if resolved_subject.merge_unit_id is not None:
+            store.set_merge_unit_state(
+                resolved_subject.merge_unit_id,
+                "merged",
+                merged_by_task_id=merge_subject.id,
+            )
+        else:
+            store.set_merge_status(merge_subject.id, "merged")
         return _MergeActionResult(
             rc=0,
             created_followups=created_followups,
@@ -1793,7 +1882,14 @@ def _execute_merge_action(
     if rc == 0 and merge_git is not None and merge_git.repo_dir != git.repo_dir:
         try:
             _promote_isolated_merge_to_target_branch(git, execution_git, target_branch)
-            store.set_merge_status(task.id, "merged")
+            if resolved_subject is not None and resolved_subject.merge_unit_id is not None:
+                store.set_merge_unit_state(
+                    resolved_subject.merge_unit_id,
+                    "merged",
+                    merged_by_task_id=merge_subject.id,
+                )
+            else:
+                store.set_merge_status(merge_subject.id, "merged")
         except GitError as exc:
             print(f"Error finalizing isolated merge success: {exc}")
             rc = 1
@@ -1943,7 +2039,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     next_action_reason="pending command evaluation",
                     unresolved_tasks=(planning_task,),
                     unresolved_leaf_summary=(),
-                    action_task=planning_task,
+                    lifecycle_action_task=planning_task if planning_task.status != "failed" else None,
+                    recovery_action_task=planning_task if planning_task.status == "failed" else None,
                     recovery_leaf_task=task if task.status == "failed" else None,
                 )
             ]
@@ -1969,7 +2066,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             owner_rows = [
                 row
                 for row in owner_rows
-                if row.action_task is None or row.action_task.status != "failed"
+                if row.lifecycle_action_task is not None or row.recovery_action_task is None
             ]
 
     if not owner_rows and not new_mode:
@@ -2053,7 +2150,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     plan: list[tuple[LineageOwnerRow, DbTask, dict[str, Any]]] = []
     for row in owner_rows:
-        action_task = row.action_task or row.owner_task
+        action_task = row.lifecycle_action_task or row.recovery_action_task or row.owner_task
         action = determine_next_action(
             config,
             store,

@@ -2212,8 +2212,31 @@ class TestMergeStatus:
         assert refreshed_original.merge_status == "merged"
         assert refreshed_original.merged_at == original_merged_at
 
-    def test_set_merge_unit_state_preserves_merged_at_across_unmerge_remerge_cycle(self, tmp_path: Path) -> None:
-        """Unmerge/re-merge should keep the original merge timestamp on the unit and owner projection."""
+    def test_set_merge_unit_state_rejects_non_owner_merged_by_task_id(self, tmp_path: Path) -> None:
+        """Merged provenance must always be attributed to the merge-unit owner."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/remerge")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        improve = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        store.mark_completed(improve, has_commits=True, branch="feature/remerge")
+        assert improve.id is not None
+
+        with pytest.raises(ValueError, match="merged_by_task_id must equal merge-unit owner"):
+            store.set_merge_unit_state(impl_unit.id, "merged", merged_by_task_id=improve.id)
+
+    def test_set_merge_unit_state_clears_provenance_for_unmerged_state(self, tmp_path: Path) -> None:
+        """Unmerged states must not retain merged provenance on the unit or owner projection."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -2224,32 +2247,42 @@ class TestMergeStatus:
         assert impl_unit is not None
 
         store.set_merge_unit_state(impl_unit.id, "merged")
-        merged_unit = store.get_merge_unit(impl_unit.id)
-        assert merged_unit is not None
-        assert merged_unit.merged_at is not None
-        original_merged_at = merged_unit.merged_at
-
         store.set_merge_unit_state(impl_unit.id, "unmerged")
+
         unmerged_unit = store.get_merge_unit(impl_unit.id)
         assert unmerged_unit is not None
         assert unmerged_unit.state == "unmerged"
-        assert unmerged_unit.merged_at == original_merged_at
+        assert unmerged_unit.merged_at is None
+        assert unmerged_unit.merged_by_task_id is None
 
         unmerged_impl = store.get(impl.id)
         assert unmerged_impl is not None
         assert unmerged_impl.merge_status == "unmerged"
         assert unmerged_impl.merged_at is None
 
-        store.set_merge_unit_state(impl_unit.id, "merged")
-        remerged_unit = store.get_merge_unit(impl_unit.id)
-        assert remerged_unit is not None
-        assert remerged_unit.state == "merged"
-        assert remerged_unit.merged_at == original_merged_at
+    def test_set_merge_unit_state_sets_merged_state_and_provenance_together(self, tmp_path: Path) -> None:
+        """Merged writes should stamp owner provenance and merged_at in one state change."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
 
-        remerged_impl = store.get(impl.id)
-        assert remerged_impl is not None
-        assert remerged_impl.merge_status == "merged"
-        assert remerged_impl.merged_at == original_merged_at
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/remerge")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        store.set_merge_unit_state(impl_unit.id, "merged")
+
+        merged_unit = store.get_merge_unit(impl_unit.id)
+        assert merged_unit is not None
+        assert merged_unit.state == "merged"
+        assert merged_unit.merged_at is not None
+        assert merged_unit.merged_by_task_id == impl.id
+
+        merged_impl = store.get(impl.id)
+        assert merged_impl is not None
+        assert merged_impl.merge_status == "merged"
+        assert merged_impl.merged_at == merged_unit.merged_at
 
     def test_set_merge_unit_state_public_db_unset_preserves_existing_optional_fields(
         self, tmp_path: Path
@@ -2292,6 +2325,112 @@ class TestMergeStatus:
         assert refreshed_unit.pr_state == "open"
         assert refreshed_unit.pr_last_synced_at == synced_at
         assert refreshed_unit.sync_last_synced_at == synced_at
+
+    def test_repair_inconsistent_unmerged_merge_units_is_idempotent(self, tmp_path: Path) -> None:
+        """Startup cleanup and manual reruns should clear stale merged provenance once."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/repair-one")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        review_impl = store.add(prompt="Review target", task_type="implement")
+        store.mark_completed(review_impl, has_commits=True, branch="feature/repair-two")
+        assert review_impl.id is not None
+        review_unit = store.resolve_merge_unit_for_task(review_impl.id)
+        assert review_unit is not None
+
+        now_iso = datetime.now(UTC).isoformat()
+        with store._connect() as conn:
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET state = 'unmerged',
+                    merged_at = ?,
+                    merged_by_task_id = ?
+                WHERE project_id = ? AND id = ?
+                """,
+                (now_iso, impl.id, store._project_id, impl_unit.id),
+            )
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET state = 'unmerged',
+                    merged_at = ?,
+                    merged_by_task_id = NULL
+                WHERE project_id = ? AND id = ?
+                """,
+                (now_iso, store._project_id, review_unit.id),
+            )
+
+        repaired = store.repair_inconsistent_unmerged_merge_units()
+        repaired_again = store.repair_inconsistent_unmerged_merge_units()
+
+        assert repaired == 2
+        assert repaired_again == 0
+        refreshed_impl_unit = store.get_merge_unit(impl_unit.id)
+        refreshed_review_unit = store.get_merge_unit(review_unit.id)
+        assert refreshed_impl_unit is not None
+        assert refreshed_review_unit is not None
+        assert refreshed_impl_unit.merged_at is None
+        assert refreshed_impl_unit.merged_by_task_id is None
+        assert refreshed_review_unit.merged_at is None
+        assert refreshed_review_unit.merged_by_task_id is None
+
+    def test_store_open_repairs_inconsistent_unmerged_merge_units(self, tmp_path: Path) -> None:
+        """DB open should clear corrupt unmerged merge provenance before normal use."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        first = store.add(prompt="Repair first", task_type="implement")
+        store.mark_completed(first, has_commits=True, branch="feature/open-repair-one")
+        assert first.id is not None
+        first_unit = store.resolve_merge_unit_for_task(first.id)
+        assert first_unit is not None
+
+        second = store.add(prompt="Repair second", task_type="implement")
+        store.mark_completed(second, has_commits=True, branch="feature/open-repair-two")
+        assert second.id is not None
+        second_unit = store.resolve_merge_unit_for_task(second.id)
+        assert second_unit is not None
+
+        now_iso = datetime.now(UTC).isoformat()
+        with store._connect() as conn:
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET state = 'unmerged',
+                    merged_at = ?,
+                    merged_by_task_id = ?
+                WHERE project_id = ? AND id = ?
+                """,
+                (now_iso, first.id, store._project_id, first_unit.id),
+            )
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET state = 'unmerged',
+                    merged_at = NULL,
+                    merged_by_task_id = ?
+                WHERE project_id = ? AND id = ?
+                """,
+                (second.id, store._project_id, second_unit.id),
+            )
+
+        reopened = SqliteTaskStore(db_path)
+        repaired_first = reopened.get_merge_unit(first_unit.id)
+        repaired_second = reopened.get_merge_unit(second_unit.id)
+        assert repaired_first is not None
+        assert repaired_second is not None
+        assert repaired_first.state == "unmerged"
+        assert repaired_first.merged_at is None
+        assert repaired_first.merged_by_task_id is None
+        assert repaired_second.state == "unmerged"
+        assert repaired_second.merged_at is None
+        assert repaired_second.merged_by_task_id is None
 
     def test_same_branch_improve_reuses_related_merged_unit(self, tmp_path: Path) -> None:
         """A same-lineage same-branch improve task should reopen the existing unit."""
