@@ -1857,6 +1857,14 @@ def main() -> int:
             help=argparse.SUPPRESS,
         )
         iterate_parser.add_argument(
+            "--prepared-action-type",
+            help=argparse.SUPPRESS,
+        )
+        iterate_parser.add_argument(
+            "--prepared-review-task-id",
+            help=argparse.SUPPRESS,
+        )
+        iterate_parser.add_argument(
             "--background", "-b",
             action="store_true",
             help="Run the entire iterate loop in the background",

@@ -7225,6 +7225,86 @@ class TestIterateCommand:
         if workers_dir.exists():
             assert list(workers_dir.iterdir()) == []
 
+    def test_completed_task_background_create_review_startup_failure_surfaces_and_cleans_up(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Completed background iterate should fail in the parent if first review startup prep fails."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/completed-background-review"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+        store.set_merge_status(impl.id, "unmerged")
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+            force=False,
+            worker_id=None,
+            prepared_task_id=None,
+            prepared_resume=False,
+            prepared_phase=None,
+            prepared_action_type=None,
+            prepared_review_task_id=None,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli._common.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "create_review", "description": "Create review"},
+            ),
+            patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")),
+            patch(
+                "gza.cli.execution._spawn_background_iterate",
+                side_effect=AssertionError("background iterate should not spawn"),
+            ),
+        ):
+            rc = cmd_iterate(args)
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "creator boom" in captured.err
+        assert "started iterate worker" not in captured.out.lower()
+        assert store.get_reviews_for_task(impl.id) == []
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert not any(path.is_file() for path in logs_dir.rglob("*"))
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
+
     @pytest.mark.parametrize(
         ("resume_mode", "expected_prefix"),
         [
@@ -7305,6 +7385,8 @@ class TestIterateCommand:
             "prepared_task_id": prepared_task_id,
             "prepared_resume": resume_mode,
             "prepared_phase": "preloop",
+            "prepared_action_type": None,
+            "prepared_review_task_id": None,
         }
         children_after_parent = store.get_based_on_children(impl.id)
         assert [task.id for task in children_after_parent] == [prepared_task_id]
@@ -7357,6 +7439,140 @@ class TestIterateCommand:
         assert run_foreground.call_args.kwargs.get("resume", False) is resume_mode
         assert expected_prefix in output
         assert len(store.get_based_on_children(impl.id)) == 1
+
+    def test_background_iterate_completed_create_review_prepares_before_spawn_and_child_reuses_prepared_task(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Completed background iterate should prepare the first review in the parent and reuse it in the child."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/completed-background-review-success"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+        store.set_merge_status(impl.id, "unmerged")
+
+        parent_args = argparse.Namespace(
+            project_dir=tmp_path,
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+            force=False,
+            worker_id=None,
+            prepared_task_id=None,
+            prepared_resume=False,
+            prepared_phase=None,
+            prepared_action_type=None,
+            prepared_review_task_id=None,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        captured_spawn: dict[str, object] = {}
+
+        def fake_spawn(_args, _config, spawn_impl_task, **kwargs):
+            assert spawn_impl_task.id == impl.id
+            captured_spawn.update(kwargs)
+            return 0
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "create_review", "description": "Create review"},
+            ),
+            patch("gza.cli.execution._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task) as prepare_start,
+            patch("gza.cli.execution._spawn_background_iterate", side_effect=fake_spawn),
+        ):
+            parent_rc = cmd_iterate(parent_args)
+
+        assert parent_rc == 0
+        assert prepare_start.call_count == 1
+        review_tasks = store.get_reviews_for_task(impl.id)
+        assert len(review_tasks) == 1
+        prepared_review = review_tasks[0]
+        assert captured_spawn == {
+            "max_iterations": 1,
+            "dry_run": False,
+            "prepared_task_id": prepared_review.id,
+            "prepared_resume": False,
+            "prepared_phase": "iteration",
+            "prepared_action_type": "create_review",
+            "prepared_review_task_id": None,
+        }
+
+        child_args = argparse.Namespace(
+            project_dir=tmp_path,
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=False,
+            force=False,
+            worker_id=None,
+            prepared_task_id=prepared_review.id,
+            prepared_resume=False,
+            prepared_phase="iteration",
+            prepared_action_type="create_review",
+            prepared_review_task_id=None,
+        )
+
+        def fake_run_foreground(_config, task_id, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task_id == prepared_review.id
+            assert kwargs["invocation"].command == "iterate"
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+            patch("gza.cli.execution._create_review_task", side_effect=AssertionError("review should be reused")),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "wait_review", "description": "wait"},
+            ),
+        ):
+            child_rc = cmd_iterate(child_args)
+
+        output = capsys.readouterr().out
+        assert child_rc == 3
+        assert run_foreground.call_count == 1
+        assert run_foreground.call_args.kwargs["task_id"] == prepared_review.id
+        assert "Iteration 1/1: create_review" in output
+        assert len(store.get_reviews_for_task(impl.id)) == 1
 
     @pytest.mark.parametrize(
         ("start_flag", "resume_mode"),

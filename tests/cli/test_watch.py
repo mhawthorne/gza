@@ -2650,6 +2650,7 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_c
         patch("gza.cli.determine_next_action", side_effect=choose_action),
         patch("gza.cli.watch._execute_merge_action", side_effect=merge_results) as execute_merge,
         patch("gza.cli.watch.cleanup_failed_merge_checkout", side_effect=GitError("cleanup failed")),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._create_rebase_task", return_value=rebase_task),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
@@ -2673,6 +2674,75 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_c
     assert "isolated merge checkout rebuilt" in log_text
     assert "merge conflict routed to rebase" in log_text
     assert " MERGE " in log_text
+
+
+def test_watch_cycle_with_isolation_enabled_merge_conflict_preparation_failure_rolls_back_rebase(
+    tmp_path: Path,
+) -> None:
+    """Isolated conflict rebases must prepare in the watch parent and roll back on failure."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-prep-failure"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    isolated_git = MagicMock()
+    isolated_git.branch_exists.return_value = True
+    isolated_git.is_merged.return_value = False
+    isolated_git.can_merge.return_value = False
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
+        ),
+        patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")),
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=AssertionError("rebase worker should not spawn"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    assert store.get_based_on_children(task.id) == []
+    log_text = log_path.read_text()
+    assert "failed to prepare merge-conflict rebase task" in log_text
+    assert "merge conflict routed to rebase" not in log_text
+    logs_dir = tmp_path / ".gza" / "logs"
+    if logs_dir.exists():
+        assert not any(path.is_file() for path in logs_dir.rglob("*"))
+    workers_dir = tmp_path / ".gza" / "workers"
+    if workers_dir.exists():
+        assert list(workers_dir.iterdir()) == []
 
 
 def test_watch_cycle_with_isolation_enabled_rebuild_failure_skips_later_merges_but_runs_other_actions(
@@ -2733,6 +2803,7 @@ def test_watch_cycle_with_isolation_enabled_rebuild_failure_skips_later_merges_b
             return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
         ),
         patch("gza.cli.watch.cleanup_failed_merge_checkout", side_effect=GitError("cleanup failed")),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._create_rebase_task", return_value=SimpleNamespace(id="gza-rebase-fail")),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
@@ -4141,6 +4212,73 @@ def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
         for line in lines
     )
     assert not any(" REBASE " in line for line in lines)
+
+
+def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebase_task(tmp_path: Path) -> None:
+    """Isolated conflict rebases should pass the prepared child into the worker spawn helper."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-prepared-rebase"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    isolated_git = MagicMock()
+    isolated_git.branch_exists.return_value = True
+    isolated_git.is_merged.return_value = False
+    isolated_git.can_merge.return_value = False
+
+    created_rebase = SimpleNamespace(id="test-rebase-raw")
+    prepared_rebase = SimpleNamespace(id="test-rebase-prepared")
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
+        ),
+        patch("gza.cli.watch._create_rebase_task", return_value=created_rebase),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", return_value=prepared_rebase) as prepare_task,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    prepare_task.assert_called_once_with(
+        config,
+        created_rebase,
+        rollback_on_failure=True,
+    )
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == prepared_rebase.id
+    assert spawn_worker.call_args.kwargs["prepared_task"] is prepared_rebase
+    assert f"START     {prepared_rebase.id} rebase" in log_path.read_text()
 
 
 def test_watch_cycle_off_default_branch_targets_rebase_to_default_branch(tmp_path: Path) -> None:

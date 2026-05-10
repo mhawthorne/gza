@@ -1181,13 +1181,24 @@ def _run_cycle(
                                 log.emit("ERROR", f"{display_task.id}: failed to create rebase task ({rebase_error})")
                                 continue
                             assert rebase_task.id is not None
+                            prepared_rebase_task = _prepare_task_for_immediate_execution(
+                                config,
+                                rebase_task,
+                                rollback_on_failure=True,
+                            )
+                            if prepared_rebase_task is None:
+                                log.emit(
+                                    "ERROR",
+                                    f"{display_task.id}: failed to prepare merge-conflict rebase task {rebase_task.id}",
+                                )
+                                continue
                             step1_handled_child_task_ids.add(str(rebase_task.id))
                             work_done = True
                             if slots > 0:
-                                rebase_rc = _watch_spawn_worker(str(rebase_task.id), "rebase")
+                                rebase_rc = _watch_spawn_worker(prepared_rebase_task, "rebase")
                                 if rebase_rc == 0:
-                                    log.emit("START", f"{rebase_task.id} rebase")
-                                    started_task_ids.add(str(rebase_task.id))
+                                    log.emit("START", f"{prepared_rebase_task.id} rebase")
+                                    started_task_ids.add(str(prepared_rebase_task.id))
                                     slots -= 1
                                 else:
                                     log.emit(

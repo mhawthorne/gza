@@ -1290,6 +1290,8 @@ def _spawn_background_iterate_worker(
     prepared_task_id: str | None = None,
     prepared_resume: bool = False,
     prepared_phase: str | None = None,
+    prepared_action_type: str | None = None,
+    prepared_review_task_id: str | None = None,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     registry = WorkerRegistry(config.workers_path)
@@ -1322,6 +1324,10 @@ def _spawn_background_iterate_worker(
         inner_cmd.append("--prepared-resume")
     if prepared_phase:
         inner_cmd.extend(["--prepared-phase", prepared_phase])
+    if prepared_action_type:
+        inner_cmd.extend(["--prepared-action-type", prepared_action_type])
+    if prepared_review_task_id:
+        inner_cmd.extend(["--prepared-review-task-id", prepared_review_task_id])
 
     inner_cmd.extend(["--project", str(config.project_dir.absolute())])
 
