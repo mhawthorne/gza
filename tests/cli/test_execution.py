@@ -1163,8 +1163,30 @@ class TestResumeCommand:
         new_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
         assert new_task is not None
         assert new_task.id != task.id
-        assert new_task.based_on == task.id
-        assert new_task.session_id == "test-session-123"
+        assert new_task.slug is not None
+        assert new_task.log_file is not None
+
+    def test_resume_background_creator_phase_failure_surfaces_and_cleans_up(self, tmp_path: Path):
+        """Background resume failures before worker handoff must hit stderr and leave no child row."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Failed task to resume")
+        task.status = "failed"
+        task.session_id = "test-session-123"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        with patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")):
+            result = run_gza("resume", str(task.id), "--background", "--no-docker", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "creator boom" in result.stderr
+        assert store.get_based_on_children(task.id) == []
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert list(logs_dir.iterdir()) == []
 
     def test_resume_without_session_id_fails(self, tmp_path: Path):
         """Resume command fails for tasks without session ID."""

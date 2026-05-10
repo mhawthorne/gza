@@ -65,6 +65,7 @@ from ._common import (
     _create_resume_task,
     _create_retry_task,
     _create_review_task,
+    _prepare_task_for_immediate_execution,
     _run_as_worker,
     _run_foreground,
     _spawn_background_iterate_worker,
@@ -694,16 +695,23 @@ def cmd_implement(args: argparse.Namespace) -> int:
     print(f"✓ Created implement task {impl_task.id}")
     print(f"  Depends on: plan {plan_task.id}")
 
+    # Handle queue mode - add to queue without executing
+    if hasattr(args, 'queue') and args.queue:
+        return 0
+
+    if _prepare_task_for_immediate_execution(
+        config,
+        impl_task,
+        rollback_on_failure=True,
+    ) is None:
+        return 1
+
     # Handle background mode - spawn worker to run the implement task
     if hasattr(args, 'background') and args.background:
         assert impl_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [impl_task.id]
         return _spawn_background_worker(worker_args, config, task_id=impl_task.id)
-
-    # Handle queue mode - add to queue without executing
-    if hasattr(args, 'queue') and args.queue:
-        return 0
 
     # Default: run the implement task immediately
     print(f"\nRunning implement task {impl_task.id}...")
@@ -890,14 +898,22 @@ def cmd_extract(args: argparse.Namespace) -> int:
             bundle_path=bundle_dir.relative_to(config.project_dir),
         )
 
+    if hasattr(args, "queue") and args.queue:
+        return 0
+
+    for created_task in created_tasks:
+        if _prepare_task_for_immediate_execution(
+            config,
+            created_task,
+            rollback_on_failure=True,
+        ) is None:
+            return 1
+
     if hasattr(args, "background") and args.background:
         worker_args = _extract_run_args(args, [task.id for task in created_tasks if task.id is not None])
         if len(worker_args.task_ids) == 1:
             return _spawn_background_worker(worker_args, config, task_id=worker_args.task_ids[0])
         return _spawn_background_workers(worker_args, config)
-
-    if hasattr(args, "queue") and args.queue:
-        return 0
 
     task_ids = [task.id for task in created_tasks if task.id is not None]
     if len(task_ids) == 1:
@@ -1381,6 +1397,17 @@ def cmd_retry(args: argparse.Namespace) -> int:
 
     print(f"✓ Created task {new_task.id} (retry of {task_id})")
 
+    # Handle queue mode - add to queue without executing
+    if hasattr(args, 'queue') and args.queue:
+        return 0
+
+    if _prepare_task_for_immediate_execution(
+        config,
+        new_task,
+        rollback_on_failure=True,
+    ) is None:
+        return 1
+
     # Handle background mode - spawn worker to run the new task
     if args.background:
         # Create a temporary args object for the worker with the new task_id
@@ -1388,10 +1415,6 @@ def cmd_retry(args: argparse.Namespace) -> int:
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [new_task.id]
         return _spawn_background_worker(worker_args, config, task_id=new_task.id)
-
-    # Handle queue mode - add to queue without executing
-    if hasattr(args, 'queue') and args.queue:
-        return 0
 
     # Default: run the new task immediately
     print(f"\nRunning task {new_task.id}...")
@@ -1838,6 +1861,8 @@ def cmd_improve(args: argparse.Namespace) -> int:
             print(f"Error: {e}")
             return 1
 
+    created_new_improve = not (review_task is None and comments_action == "reuse_pending")
+
     if action_message is not None:
         print(f"✓ {action_message}")
     else:
@@ -1849,16 +1874,23 @@ def cmd_improve(args: argparse.Namespace) -> int:
         print(f"  Comments: {len(unresolved_comments)} unresolved")
     print(f"  Branch: {impl_task.branch or '(will use implementation branch)'}")
 
+    # Handle queue mode - add to queue without executing
+    if hasattr(args, 'queue') and args.queue:
+        return 0
+
+    if _prepare_task_for_immediate_execution(
+        config,
+        improve_task,
+        rollback_on_failure=created_new_improve,
+    ) is None:
+        return 1
+
     # Handle background mode - spawn worker to run the improve task
     if hasattr(args, 'background') and args.background:
         assert improve_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [improve_task.id]
         return _spawn_background_worker(worker_args, config, task_id=improve_task.id)
-
-    # Handle queue mode - add to queue without executing
-    if hasattr(args, 'queue') and args.queue:
-        return 0
 
     # Default: run the improve task immediately
     print(f"\nRunning improve task {improve_task.id}...")
@@ -1918,13 +1950,20 @@ def cmd_fix(args: argparse.Namespace) -> int:
         print("  Latest completed review: (none found)")
     print("  Handoff policy: changed code requires a fresh independent review")
 
+    if hasattr(args, 'queue') and args.queue:
+        return 0
+
+    if _prepare_task_for_immediate_execution(
+        config,
+        fix_task,
+        rollback_on_failure=True,
+    ) is None:
+        return 1
+
     if hasattr(args, 'background') and args.background:
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [fix_task.id]
         return _spawn_background_worker(worker_args, config, task_id=fix_task.id)
-
-    if hasattr(args, 'queue') and args.queue:
-        return 0
 
     print(f"\nRunning fix task {fix_task.id}...")
     return _run_foreground(
@@ -1999,16 +2038,23 @@ def cmd_review(args: argparse.Namespace) -> int:
     if impl_task.tags:
         print(f"  Tags: {', '.join(impl_task.tags)}")
 
+    # Handle queue mode - add to queue without executing
+    if hasattr(args, 'queue') and args.queue:
+        return 0
+
+    if _prepare_task_for_immediate_execution(
+        config,
+        review_task,
+        rollback_on_failure=True,
+    ) is None:
+        return 1
+
     # Handle background mode - spawn worker to run the review task
     if hasattr(args, 'background') and args.background:
         assert review_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [review_task.id]
         return _spawn_background_worker(worker_args, config, task_id=review_task.id)
-
-    # Handle queue mode - add to queue without executing
-    if hasattr(args, 'queue') and args.queue:
-        return 0
 
     # Default: run the review task immediately
     # Note: PR posting happens in _run_non_code_task, no need to do it here
@@ -2036,6 +2082,9 @@ def _spawn_background_iterate(
     *,
     max_iterations: int | None = None,
     dry_run: bool = False,
+    prepared_task_id: str | None = None,
+    prepared_resume: bool = False,
+    prepared_phase: str | None = None,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     effective_max_iterations = max_iterations
@@ -2052,6 +2101,9 @@ def _spawn_background_iterate(
         retry=getattr(args, "retry", False),
         auto_iterate=bool(getattr(args, "auto_iterate", False)),
         dry_run=dry_run,
+        prepared_task_id=prepared_task_id,
+        prepared_resume=prepared_resume,
+        prepared_phase=prepared_phase,
     )
 
 
@@ -2072,6 +2124,13 @@ def _iterate_action_description(action: dict[str, Any]) -> str:
     if isinstance(description, str) and description:
         return description.removeprefix("SKIP: ").strip()
     return str(action.get("type", "skip"))
+
+
+@dataclass(frozen=True)
+class _PreparedIterateStart:
+    task_id: str
+    initial_resume: bool
+    phase: str
 
 
 def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
@@ -3550,13 +3609,20 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     print(f"✓ Created task {new_task.id} (resume of {task_id})")
 
-    # Handle background mode
-    if args.background:
-        return _spawn_background_resume_worker(args, config, new_task.id)
-
     # Handle queue mode - add to queue without executing
     if hasattr(args, 'queue') and args.queue:
         return 0
+
+    if _prepare_task_for_immediate_execution(
+        config,
+        new_task,
+        rollback_on_failure=True,
+    ) is None:
+        return 1
+
+    # Handle background mode
+    if args.background:
+        return _spawn_background_resume_worker(args, config, new_task.id)
 
     # Default: run the new resume task immediately
     return _run_foreground(
