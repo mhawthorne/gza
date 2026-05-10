@@ -848,10 +848,10 @@ class TestWorkForceBackgroundDispatch:
         mock_proc = MagicMock()
         mock_proc.pid = 4242
 
-        def capture_popen(cmd, **_kwargs):
+        def capture_spawn(cmd, _config, worker_id):
             nonlocal captured_cmd
             captured_cmd = cmd
-            return mock_proc
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
         with (
             patch.object(
@@ -869,7 +869,7 @@ class TestWorkForceBackgroundDispatch:
                 ],
             ),
             patch("gza.cli.execution._prepare_task_for_immediate_execution", side_effect=lambda _c, prepared_task, **_k: prepared_task),
-            patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
+            patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn),
         ):
             rc = main()
 
