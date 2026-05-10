@@ -2128,7 +2128,7 @@ def _iterate_action_description(action: dict[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class _PreparedIterateStart:
-    task_id: str
+    task: DbTask
     initial_resume: bool
     phase: str
 
@@ -2279,12 +2279,23 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
 
     def _resolve_failed_iterate_resume_start(
         failed_task: DbTask,
+        *,
+        emit_override_warnings: bool = True,
     ) -> tuple[
         tuple[DbTask, FailedRecoveryDecision] | None,
         tuple[DbTask, FailedRecoveryDecision] | None,
     ]:
         decision = _decide_failed_iterate_resume_start(failed_task)
-        override = _emit_manual_resume_override_warnings(failed_task, decision)
+        override: tuple[DbTask, FailedRecoveryDecision] | None
+        if emit_override_warnings:
+            override = _emit_manual_resume_override_warnings(failed_task, decision)
+        else:
+            manual_override = _resolve_manual_resume_override(failed_task, decision)
+            override = (
+                None
+                if manual_override is None
+                else (manual_override[0], manual_override[1])
+            )
         if override is not None:
             target_failed_task, target_decision = override
             if target_decision.action == "resume":
@@ -2509,6 +2520,139 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         print(f"Iterate blocked: {_iterate_action_description(initial_action)}")
         return 3
 
+    def _print_failed_recovery_attention_and_return(
+        failed_task: DbTask,
+        decision: FailedRecoveryDecision,
+        *,
+        fix_task_id: str,
+    ) -> int | None:
+        attention_result = build_failed_recovery_needs_attention_result(
+            store=store,
+            failed_task=failed_task,
+            recovery_decision=decision,
+            max_resume_attempts=effective_max_resume_attempts,
+        )
+        if attention_result is None:
+            return None
+        attention = resolve_execution_needs_attention(failed_task, attention_result)
+        if attention is None:
+            return None
+        print(
+            f"{NEEDS_ATTENTION_LABEL}: "
+            f"{format_needs_attention_entry_for_display(attention.task, action=attention.action, prefix=len(attention.task.id or '') + 4)}"
+        )
+        if attention.action.get("needs_attention_reason") in {
+            "review-max-cycles-reached",
+            "automatic-recovery-disabled",
+            "max-resume-attempts-reached",
+        }:
+            print(f"Recommended next step: uv run gza fix {fix_task_id}")
+        return 3
+
+    def _resolve_prepared_iterate_start() -> tuple[_PreparedIterateStart | None, int | None]:
+        prepared_task_id = getattr(args, "prepared_task_id", None)
+        if not prepared_task_id:
+            return None, None
+        prepared_phase = getattr(args, "prepared_phase", None) or "preloop"
+        if prepared_phase != "preloop":
+            print(f"Error: unsupported iterate prepared startup phase {prepared_phase!r}.")
+            return None, 1
+        prepared_task = store.get(prepared_task_id)
+        if prepared_task is None:
+            print(f"Error: prepared iterate task {prepared_task_id} not found.")
+            return None, 1
+        return (
+            _PreparedIterateStart(
+                task=prepared_task,
+                initial_resume=bool(getattr(args, "prepared_resume", False)),
+                phase=prepared_phase,
+            ),
+            None,
+        )
+
+    def _prepare_background_failed_iterate_start(
+        failed_task: DbTask,
+    ) -> tuple[_PreparedIterateStart | None, int | None]:
+        if dry_run or failed_task.status != "failed":
+            return None, None
+        if use_resume:
+            resume_start, resume_blocked = _resolve_failed_iterate_resume_start(
+                failed_task,
+                emit_override_warnings=False,
+            )
+            if resume_start is None:
+                if resume_blocked is not None:
+                    blocked_task, resume_blocked_decision = resume_blocked
+                    exit_code = _print_failed_recovery_attention_and_return(
+                        blocked_task,
+                        resume_blocked_decision,
+                        fix_task_id=impl_task_id,
+                    )
+                    if exit_code is not None:
+                        return None, exit_code
+                    print(
+                        f"Error: Cannot resume failed implementation {failed_task.id}: "
+                        f"{resume_blocked_decision.reason_text}."
+                    )
+                return None, 1
+            run_start_task, decision = resume_start
+            prepared_task = _prepare_task_for_immediate_execution(
+                config,
+                run_start_task,
+                rollback_on_failure=not decision.reuse_existing,
+            )
+            if prepared_task is None:
+                return None, 1
+            return (
+                _PreparedIterateStart(
+                    task=prepared_task,
+                    initial_resume=True,
+                    phase="preloop",
+                ),
+                None,
+            )
+        if use_retry:
+            run_start_task = _create_retry_task(store, failed_task)
+            prepared_task = _prepare_task_for_immediate_execution(
+                config,
+                run_start_task,
+                rollback_on_failure=True,
+            )
+            if prepared_task is None:
+                return None, 1
+            return (
+                _PreparedIterateStart(
+                    task=prepared_task,
+                    initial_resume=False,
+                    phase="preloop",
+                ),
+                None,
+            )
+        return None, None
+
+    def _print_iterate_failed_start_message(
+        failed_task: DbTask,
+        run_start_task: DbTask,
+        *,
+        resume_start: bool,
+    ) -> None:
+        assert failed_task.id is not None
+        assert run_start_task.id is not None
+        if resume_start:
+            if run_start_task.based_on is not None and str(run_start_task.based_on) != str(failed_task.id):
+                print(
+                    f"Resuming failed implementation {failed_task.id} via newer recovery descendant "
+                    f"{run_start_task.based_on} as {run_start_task.id}..."
+                )
+                return
+            print(f"Resuming failed implementation {failed_task.id} as {run_start_task.id}...")
+            return
+        print(f"Retrying failed implementation {failed_task.id} as {run_start_task.id}...")
+
+    prepared_start, prepared_start_rc = _resolve_prepared_iterate_start()
+    if prepared_start_rc is not None:
+        return prepared_start_rc
+
     # Handle background mode: re-exec this command as a detached process.
     if background:
         background_preflight_context = _prepare_iterate_background_preflight_context(impl_task)
@@ -2518,12 +2662,23 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         )
         if preflight_result is not None:
             return preflight_result
+        _warn_manual_background_iterate_override_if_needed(impl_task)
+        prepared_background_start, background_prepare_rc = _prepare_background_failed_iterate_start(
+            impl_task,
+        )
+        if background_prepare_rc is not None:
+            return background_prepare_rc
         return _spawn_background_iterate(
             args,
             config,
             impl_task,
             max_iterations=max_iterations,
             dry_run=dry_run,
+            prepared_task_id=prepared_background_start.task.id if prepared_background_start is not None else None,
+            prepared_resume=(
+                prepared_background_start.initial_resume if prepared_background_start is not None else False
+            ),
+            prepared_phase=prepared_background_start.phase if prepared_background_start is not None else None,
         )
 
     try:
@@ -2607,35 +2762,6 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         )
         return final_task, rc, terminal_skip_decision
 
-    def _print_failed_recovery_attention_and_return(
-        failed_task: DbTask,
-        decision: FailedRecoveryDecision,
-        *,
-        fix_task_id: str,
-    ) -> int | None:
-        attention_result = build_failed_recovery_needs_attention_result(
-            store=store,
-            failed_task=failed_task,
-            recovery_decision=decision,
-            max_resume_attempts=effective_max_resume_attempts,
-        )
-        if attention_result is None:
-            return None
-        attention = resolve_execution_needs_attention(failed_task, attention_result)
-        if attention is None:
-            return None
-        print(
-            f"{NEEDS_ATTENTION_LABEL}: "
-            f"{format_needs_attention_entry_for_display(attention.task, action=attention.action, prefix=len(attention.task.id or '') + 4)}"
-        )
-        if attention.action.get("needs_attention_reason") in {
-            "review-max-cycles-reached",
-            "automatic-recovery-disabled",
-            "max-resume-attempts-reached",
-        }:
-            print(f"Recommended next step: uv run gza fix {fix_task_id}")
-        return 3
-
     # If the task is pending, run it first before entering the loop.
     if impl_task.status == "pending":
         if dry_run:
@@ -2662,7 +2788,18 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
 
     # If the task is failed, resume or retry it first.
     if impl_task.status == "failed":
-        if use_resume:
+        if prepared_start is not None:
+            run_start_task = prepared_start.task
+            _print_iterate_failed_start_message(
+                impl_task,
+                run_start_task,
+                resume_start=prepared_start.initial_resume,
+            )
+            impl_task, rc, terminal_skip_decision = _run_task_with_recovery(
+                run_start_task,
+                initial_resume=prepared_start.initial_resume,
+            )
+        elif use_resume:
             if dry_run:
                 print(f"[dry-run] Would resume failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
                 return 0
@@ -2683,14 +2820,11 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     )
                 return 1
             run_start_task, _decision = resume_start
-            assert run_start_task.id is not None
-            if run_start_task.based_on is not None and str(run_start_task.based_on) != str(impl_task.id):
-                print(
-                    f"Resuming failed implementation {impl_task.id} via newer recovery descendant "
-                    f"{run_start_task.based_on} as {run_start_task.id}..."
-                )
-            else:
-                print(f"Resuming failed implementation {impl_task.id} as {run_start_task.id}...")
+            _print_iterate_failed_start_message(
+                impl_task,
+                run_start_task,
+                resume_start=True,
+            )
             impl_task, rc, terminal_skip_decision = _run_task_with_recovery(
                 run_start_task,
                 initial_resume=True,
@@ -2701,8 +2835,11 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 print(f"[dry-run] Would retry failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
                 return 0
             run_start_task = _create_retry_task(store, impl_task)
-            assert run_start_task.id is not None
-            print(f"Retrying failed implementation {impl_task.id} as {run_start_task.id}...")
+            _print_iterate_failed_start_message(
+                impl_task,
+                run_start_task,
+                resume_start=False,
+            )
             impl_task, rc, terminal_skip_decision = _run_task_with_recovery(run_start_task)
 
         if rc != 0:
