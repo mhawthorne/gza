@@ -96,3 +96,53 @@ def test_run_task_backed_rebase_refreshes_merge_unit_provenance(tmp_path) -> Non
     assert refreshed_unit is not None
     assert refreshed_unit.head_sha == "head-new"
     assert refreshed_unit.base_sha == "base-new"
+
+
+def test_run_task_backed_rebase_surfaces_resolution_warnings_and_preserves_existing_merge_unit_provenance(
+    tmp_path, capsys
+) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
+    assert parent.id is not None
+    unit = store.resolve_merge_unit_for_task(parent.id)
+    assert unit is not None
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.return_value = None
+    worktree_git.rev_parse_if_exists.side_effect = RuntimeError("boom")
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 0
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.head_sha == "head-old"
+    assert refreshed_unit.base_sha == "base-old"
+    output = capsys.readouterr()
+    assert "unexpected error resolving ref 'feature/rebased': boom" in output.err
+    assert "unexpected error resolving ref 'main': boom" in output.err

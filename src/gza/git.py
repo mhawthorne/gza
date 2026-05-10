@@ -25,6 +25,14 @@ class GitApplyResult:
         return self.stderr or self.stdout
 
 
+@dataclass(frozen=True)
+class ResolvedGitRef:
+    """Best-effort ref resolution outcome for callers with different warning policy."""
+
+    sha: str | None
+    warning: str | None = None
+
+
 def _unquote_c_style_path(path: str) -> str:
     """Decode git C-style quoted paths from porcelain output."""
     if not (len(path) >= 2 and path[0] == '"' and path[-1] == '"'):
@@ -120,6 +128,35 @@ def parse_diff_numstat(numstat_output: str) -> tuple[int, int, int]:
         except ValueError:
             continue
     return files, added, removed
+
+
+def resolve_ref_if_possible(git: "Git", ref: str | None) -> ResolvedGitRef:
+    """Resolve ``ref`` when available without forcing a caller-wide failure."""
+    if not ref:
+        return ResolvedGitRef(None)
+
+    def _normalize(value: object) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
+    if callable(rev_parse_if_exists):
+        try:
+            return ResolvedGitRef(_normalize(rev_parse_if_exists(ref)))
+        except GitError:
+            return ResolvedGitRef(None)
+        except Exception as exc:
+            return ResolvedGitRef(None, f"unexpected error resolving ref '{ref}': {exc}")
+
+    rev_parse = getattr(git, "rev_parse", None)
+    if callable(rev_parse):
+        try:
+            return ResolvedGitRef(_normalize(rev_parse(ref)))
+        except GitError:
+            return ResolvedGitRef(None)
+        except Exception as exc:
+            return ResolvedGitRef(None, f"unexpected error resolving ref '{ref}': {exc}")
+
+    return ResolvedGitRef(None)
 
 
 class Git:

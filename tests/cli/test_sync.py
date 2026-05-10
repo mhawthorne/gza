@@ -226,6 +226,47 @@ def test_sync_reports_degraded_provenance_warning_without_clearing_stored_base_s
     assert "warnings: degraded merge-unit provenance: could not resolve base SHA for 'main'; preserving any stored base_sha" in output
 
 
+def test_sync_reports_unexpected_ref_resolution_warning_without_clearing_stored_shas(tmp_path, capsys):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_branch_task(store, "Resolution warning", "feature/resolution-warning")
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, "head-old-123", "base-old-456")
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+    git.rev_parse_if_exists.side_effect = RuntimeError("boom")
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_ids=[task.id],
+        dry_run=False,
+        git_only=True,
+        pr_only=False,
+        no_fetch=True,
+    )
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        patch("gza.cli.git_ops.Git", return_value=git),
+    ):
+        rc = cmd_sync(args)
+
+    assert rc == 0
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.head_sha == "head-old-123"
+    assert refreshed_unit.base_sha == "base-old-456"
+    output = capsys.readouterr().out
+    assert "unexpected error resolving ref 'feature/resolution-warning': boom" in output
+    assert "unexpected error resolving ref 'main': boom" in output
+
+
 def test_sync_missing_explicit_task_id_returns_error(tmp_path, capsys):
     setup_config(tmp_path)
     store = make_store(tmp_path)

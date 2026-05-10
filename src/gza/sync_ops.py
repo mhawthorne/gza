@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 from .db import DB_UNSET, MergeUnit, SqliteTaskStore, Task, task_owns_merge_status
-from .git import Git, GitError, parse_diff_numstat
+from .git import Git, GitError, parse_diff_numstat, resolve_ref_if_possible
 from .github import GitHub, GitHubError, PullRequestDetails
 
 _UNSET = object()
@@ -314,33 +314,6 @@ def _remote_branch_ref_for_reconcile(
     return None
 
 
-def _best_effort_rev_parse(git: Git, ref: str | None) -> tuple[str | None, str | None]:
-    """Return a commit SHA for ``ref`` plus any unexpected-resolution warning."""
-    if not ref:
-        return None, None
-
-    def _normalize(value: object) -> str | None:
-        return value if isinstance(value, str) and value else None
-
-    rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
-    if callable(rev_parse_if_exists):
-        try:
-            return _normalize(rev_parse_if_exists(ref)), None
-        except GitError:
-            return None, None
-        except Exception as exc:
-            return None, f"unexpected error resolving ref '{ref}': {exc}"
-    rev_parse = getattr(git, "rev_parse", None)
-    if callable(rev_parse):
-        try:
-            return _normalize(rev_parse(ref)), None
-        except GitError:
-            return None, None
-        except Exception as exc:
-            return None, f"unexpected error resolving ref '{ref}': {exc}"
-    return None, None
-
-
 def reconcile_branch_merge_truth(
     git: Git,
     cohorts: list[BranchCohort],
@@ -393,12 +366,14 @@ def reconcile_branch_merge_truth(
             result.merge_status = desired_merge_status
             continue
 
-        result.head_sha, head_warning = _best_effort_rev_parse(git, reconcile_ref)
-        result.base_sha, base_warning = _best_effort_rev_parse(git, remote_target_ref or target_branch)
-        if head_warning is not None:
-            result.warnings.append(head_warning)
-        if base_warning is not None:
-            result.warnings.append(base_warning)
+        head_resolution = resolve_ref_if_possible(git, reconcile_ref)
+        base_resolution = resolve_ref_if_possible(git, remote_target_ref or target_branch)
+        result.head_sha = head_resolution.sha
+        result.base_sha = base_resolution.sha
+        if head_resolution.warning is not None:
+            result.warnings.append(head_resolution.warning)
+        if base_resolution.warning is not None:
+            result.warnings.append(base_resolution.warning)
         if (result.head_sha is None) ^ (result.base_sha is None):
             if result.head_sha is None:
                 result.warnings.append(
@@ -934,12 +909,14 @@ def refresh_branch_diff_stats(
         result.diff_files_changed = files_changed
         result.diff_lines_added = lines_added
         result.diff_lines_removed = lines_removed
-        result.head_sha, head_warning = _best_effort_rev_parse(git, cohort.branch)
-        result.base_sha, base_warning = _best_effort_rev_parse(git, default_branch)
-        if head_warning is not None:
-            result.warnings.append(head_warning)
-        if base_warning is not None:
-            result.warnings.append(base_warning)
+        head_resolution = resolve_ref_if_possible(git, cohort.branch)
+        base_resolution = resolve_ref_if_possible(git, default_branch)
+        result.head_sha = head_resolution.sha
+        result.base_sha = base_resolution.sha
+        if head_resolution.warning is not None:
+            result.warnings.append(head_resolution.warning)
+        if base_resolution.warning is not None:
+            result.warnings.append(base_resolution.warning)
         if (result.head_sha is None) ^ (result.base_sha is None):
             if result.head_sha is None:
                 result.warnings.append(

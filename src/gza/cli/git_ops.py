@@ -30,6 +30,7 @@ from ..git import (
     GitError,
     active_worktree_path_for_branch,
     cleanup_worktree_for_branch,
+    resolve_ref_if_possible,
 )
 from ..pickup import (
     count_worker_consuming_actions,
@@ -87,31 +88,6 @@ from .advance_executor import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _best_effort_git_ref_sha(git: Git, ref: str | None) -> str | None:
-    """Resolve a ref SHA when available without failing the caller on missing refs."""
-    if not ref:
-        return None
-
-    def _normalize(value: object) -> str | None:
-        return value if isinstance(value, str) and value else None
-
-    rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
-    if callable(rev_parse_if_exists):
-        try:
-            return _normalize(rev_parse_if_exists(ref))
-        except GitError:
-            return None
-
-    rev_parse = getattr(git, "rev_parse", None)
-    if callable(rev_parse):
-        try:
-            return _normalize(rev_parse(ref))
-        except GitError:
-            return None
-    return None
-
 
 def _task_is_already_merged(store: SqliteTaskStore, task: DbTask) -> bool:
     """Return whether the selected task is already merged."""
@@ -1067,16 +1043,19 @@ def _run_task_backed_rebase(
             output_content = f"Resolved conflicts and rebased '{branch}' onto '{rebase_target}'."
 
         has_commits = _branch_has_commits(config, branch)
-        head_sha = _best_effort_git_ref_sha(worktree_git, branch)
-        base_sha = _best_effort_git_ref_sha(worktree_git, rebase_target)
+        head_ref = resolve_ref_if_possible(worktree_git, branch)
+        base_ref = resolve_ref_if_possible(worktree_git, rebase_target)
+        for warning in (head_ref.warning, base_ref.warning):
+            if warning:
+                logger.warning(warning)
         store.mark_completed(
             rebase_task,
             branch=branch,
             log_file=log_file_storage,
             output_content=output_content,
             has_commits=has_commits,
-            head_sha=head_sha if head_sha is not None else DB_UNSET,
-            base_sha=base_sha if base_sha is not None else DB_UNSET,
+            head_sha=head_ref.sha if head_ref.sha is not None else DB_UNSET,
+            base_sha=base_ref.sha if base_ref.sha is not None else DB_UNSET,
         )
 
         target_parent_id = parent_task_id or rebase_task.based_on

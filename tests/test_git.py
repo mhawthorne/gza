@@ -8,9 +8,11 @@ import pytest
 from gza.git import (
     Git,
     GitError,
+    ResolvedGitRef,
     active_worktree_path_for_branch,
     cleanup_worktree_for_branch,
     parse_diff_numstat,
+    resolve_ref_if_possible,
 )
 
 
@@ -1404,6 +1406,44 @@ class TestExtractionGitHelpers:
 
             assert git.rev_parse_if_exists("main") == "abc123"
             assert git.rev_parse_if_exists("missing") is None
+
+    def test_resolve_ref_if_possible_uses_rev_parse_if_exists_when_available(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "rev_parse_if_exists", return_value="abc123"):
+            assert resolve_ref_if_possible(git, "main") == ResolvedGitRef("abc123")
+
+    def test_resolve_ref_if_possible_falls_back_to_rev_parse(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with (
+            patch.object(git, "rev_parse_if_exists", new=None),
+            patch.object(git, "rev_parse", return_value="def456"),
+        ):
+            assert resolve_ref_if_possible(git, "main") == ResolvedGitRef("def456")
+
+    def test_resolve_ref_if_possible_treats_missing_ref_as_silent_none(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "rev_parse_if_exists", side_effect=GitError("missing")):
+            assert resolve_ref_if_possible(git, "missing") == ResolvedGitRef(None)
+
+    def test_resolve_ref_if_possible_reports_unexpected_resolution_error(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "rev_parse_if_exists", side_effect=RuntimeError("boom")):
+            assert resolve_ref_if_possible(git, "main") == ResolvedGitRef(
+                None,
+                "unexpected error resolving ref 'main': boom",
+            )
 
     def test_resolve_merge_source_ref_prefers_local_branch(self, tmp_path: Path):
         repo_dir = tmp_path / "repo"
