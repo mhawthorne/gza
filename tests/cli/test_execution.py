@@ -2332,7 +2332,10 @@ class TestBackgroundWorkerCommand:
         mock_proc.pid = 44444
 
         with (
-            patch("gza.cli.subprocess.Popen", return_value=mock_proc),
+            patch(
+                "gza.cli._spawn_detached_worker_process",
+                return_value=(mock_proc, ".gza/workers/test-startup.log"),
+            ),
             console.capture() as capture,
         ):
             rc = _spawn_background_resume_worker(args, config, new_task_id=task.id)
@@ -5400,12 +5403,13 @@ class TestIterateCommand:
             max_resume_attempts=max_resume_attempts,
             use_iterate_for_create_implement=False,
             use_iterate_for_needs_rebase=False,
+            prepare_task_for_background_start=lambda task, _rollback: task,
             prepare_create_review=lambda _task: pytest.fail("unused"),
             create_resume_task=lambda _task: pytest.fail("unused"),
             create_rebase_task=lambda _task: pytest.fail("unused"),
             create_implement_task=lambda _task: pytest.fail("unused"),
-            spawn_worker=lambda _task_id, _kind: pytest.fail("unused"),
-            spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+            spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+            spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
             spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         )
         result = execute_advance_action(

@@ -37,6 +37,7 @@ from ._common import (
     _create_rebase_task,
     _create_resume_task,
     _create_retry_task,
+    _prepare_task_for_immediate_execution,
     _spawn_background_resume_worker,
     _spawn_background_worker,
     clear_task_queue_position_scoped,
@@ -998,22 +999,38 @@ def _run_cycle(
 
         worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
 
-        def _watch_spawn_worker(task_id: str, task_kind: str) -> int:
+        def _watch_spawn_worker(task_obj: DbTask, task_kind: str) -> int:
+            assert task_obj.id is not None
+            task_id = str(task_obj.id)
             return _spawn_worker_with_failure_log(
                 quiet=quiet,
                 log=log,
                 failure_message=f"{task_id} {task_kind}: worker spawn failed",
                 dedupe_key=f"spawn-worker-failed:{task_id}",
-                spawn_fn=lambda: _spawn_background_worker(worker_args, config, task_id=task_id, quiet=quiet),
+                spawn_fn=lambda: _spawn_background_worker(
+                    worker_args,
+                    config,
+                    task_id=task_id,
+                    quiet=quiet,
+                    prepared_task=task_obj,
+                ),
             )
 
-        def _watch_spawn_resume_worker(task_id: str, task_kind: str) -> int:
+        def _watch_spawn_resume_worker(task_obj: DbTask, task_kind: str) -> int:
+            assert task_obj.id is not None
+            task_id = str(task_obj.id)
             return _spawn_worker_with_failure_log(
                 quiet=quiet,
                 log=log,
                 failure_message=f"{task_id} {task_kind}: resume worker spawn failed",
                 dedupe_key=f"spawn-resume-failed:{task_id}",
-                spawn_fn=lambda: _spawn_background_resume_worker(worker_args, config, new_task_id=task_id, quiet=quiet),
+                spawn_fn=lambda: _spawn_background_resume_worker(
+                    worker_args,
+                    config,
+                    new_task_id=task_id,
+                    quiet=quiet,
+                    prepared_task=task_obj,
+                ),
             )
 
         def _watch_spawn_iterate(task_obj: DbTask, task_kind: str) -> int:
@@ -1052,6 +1069,11 @@ def _run_cycle(
             max_resume_attempts=max_recovery_attempts,
             use_iterate_for_create_implement=True,
             use_iterate_for_needs_rebase=False,
+            prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
+                config,
+                task,
+                rollback_on_failure=rollback_on_failure,
+            ),
             prepare_create_review=lambda t: _prepare_create_review_action(store, t),
             create_resume_task=lambda t: _create_resume_task(store, t),
             create_rebase_task=_create_rebase_from_task,
@@ -1059,6 +1081,26 @@ def _run_cycle(
             spawn_worker=_watch_spawn_worker,
             spawn_resume_worker=_watch_spawn_resume_worker,
             spawn_iterate_worker=_watch_spawn_iterate,
+            spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=log,
+                failure_message=f"{task_obj.id} {mode}: iterate worker spawn failed",
+                dedupe_key=f"spawn-iterate-failed:{task_obj.id}:{mode}",
+                spawn_fn=lambda: _spawn_background_iterate(
+                    argparse.Namespace(
+                        max_iterations=max_iterations,
+                        no_docker=False,
+                        resume=mode == "resume",
+                        retry=mode == "retry",
+                        auto_iterate=True,
+                    ),
+                    config,
+                    task_obj,
+                    prepared_task_id=str(prepared_task.id),
+                    prepared_resume=mode == "resume",
+                    prepared_phase="preloop",
+                ),
+            ),
             prefer_iterate_for_action=lambda task, action: _watch_iterate_impl_target(
                 store=store,
                 task=task,
@@ -1164,7 +1206,7 @@ def _run_cycle(
                             step1_handled_child_task_ids.add(str(rebase_task.id))
                             work_done = True
                             if slots > 0:
-                                rebase_rc = _watch_spawn_worker(str(rebase_task.id), "rebase")
+                                rebase_rc = _watch_spawn_worker(rebase_task, "rebase")
                                 if rebase_rc == 0:
                                     log.emit("START", f"{rebase_task.id} rebase")
                                     started_task_ids.add(str(rebase_task.id))
@@ -1398,10 +1440,19 @@ def _run_cycle(
                 if decision.reuse_existing:
                     assert decision.recovery_task_id is not None
                     recovered_task_id = decision.recovery_task_id
+                    recovered_task = store.get(recovered_task_id)
+                    assert recovered_task is not None
                 else:
                     recovered_task = _create_resume_task(store, failed)
                     assert recovered_task.id is not None
                     recovered_task_id = str(recovered_task.id)
+                prepared_recovered_task = _prepare_task_for_immediate_execution(
+                    config,
+                    recovered_task,
+                    rollback_on_failure=not decision.reuse_existing,
+                )
+                if prepared_recovered_task is None:
+                    continue
                 pending_recovery_task_ids.add(recovered_task_id)
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
@@ -1413,10 +1464,24 @@ def _run_cycle(
                         config,
                         recovered_task_id,
                         quiet=quiet,
+                        prepared_task=prepared_recovered_task,
                     ),
                 )
             else:
-                recovered_task_id = decision.recovery_task_id or str(failed.id)
+                if decision.reuse_existing:
+                    assert decision.recovery_task_id is not None
+                    recovered_task = store.get(decision.recovery_task_id)
+                    assert recovered_task is not None
+                else:
+                    recovered_task = _create_resume_task(store, failed)
+                prepared_recovered_task = _prepare_task_for_immediate_execution(
+                    config,
+                    recovered_task,
+                    rollback_on_failure=not decision.reuse_existing,
+                )
+                if prepared_recovered_task is None:
+                    continue
+                recovered_task_id = str(prepared_recovered_task.id)
                 pending_recovery_task_ids.add(recovered_task_id)
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
@@ -1433,6 +1498,9 @@ def _run_cycle(
                         ),
                         config,
                         failed,
+                        prepared_task_id=recovered_task_id,
+                        prepared_resume=True,
+                        prepared_phase="preloop",
                     ),
                 )
         else:
@@ -1461,6 +1529,14 @@ def _run_cycle(
                 recovered_task = _create_retry_task(store, failed, automatic_recovery=True)
                 assert recovered_task.id is not None
                 recovered_task_id = str(recovered_task.id)
+            prepared_recovered_task = _prepare_task_for_immediate_execution(
+                config,
+                recovered_task,
+                rollback_on_failure=not decision.reuse_existing,
+            )
+            if prepared_recovered_task is None:
+                continue
+            recovered_task_id = str(prepared_recovered_task.id)
             pending_recovery_task_ids.add(recovered_task_id)
             rc = (
                 _spawn_worker_with_failure_log(
@@ -1473,6 +1549,7 @@ def _run_cycle(
                         config,
                         task_id=recovered_task_id,
                         quiet=quiet,
+                        prepared_task=prepared_recovered_task,
                     ),
                 )
                 if decision.launch_mode == "worker"
@@ -1490,7 +1567,10 @@ def _run_cycle(
                             auto_iterate=True,
                         ),
                         config,
-                        recovered_task,
+                        failed,
+                        prepared_task_id=recovered_task_id,
+                        prepared_resume=False,
+                        prepared_phase="preloop",
                     ),
                 )
             )

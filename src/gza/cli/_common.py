@@ -783,7 +783,13 @@ def _run_foreground(
             os.environ["GZA_INTERRUPT_DETAIL"] = previous_interrupt_detail
 
 
-def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: str | None = None, quiet: bool = False) -> int:
+def _spawn_background_worker(
+    args: argparse.Namespace,
+    config: Config,
+    task_id: str | None = None,
+    quiet: bool = False,
+    prepared_task: DbTask | None = None,
+) -> int:
     """Spawn a background worker process.
 
     Args:
@@ -803,7 +809,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     selected_tags, any_tag = parse_cli_tag_filters(args)
 
     if explicit_task_id is not None:
-        task = store.get(explicit_task_id)
+        task = prepared_task or store.get(explicit_task_id)
         if not task:
             _print_work_message(f"Error: Task {explicit_task_id} not found", color=_colors.WORK_COLORS.error)
             return 1
@@ -857,13 +863,14 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
 
     assert selected_task is not None
 
-    prepared_task = _prepare_task_for_immediate_execution(
-        config,
-        selected_task,
-        rollback_on_failure=False,
-    )
     if prepared_task is None:
-        return 1
+        prepared_task = _prepare_task_for_immediate_execution(
+            config,
+            selected_task,
+            rollback_on_failure=False,
+        )
+        if prepared_task is None:
+            return 1
     selected_task = prepared_task
     task_id_for_child = explicit_task_id or selected_task.id
 
@@ -1177,7 +1184,13 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             os.environ["GZA_WORKER_MODE"] = previous_worker_mode
 
 
-def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, new_task_id: str, quiet: bool = False) -> int:
+def _spawn_background_resume_worker(
+    args: argparse.Namespace,
+    config: Config,
+    new_task_id: str,
+    quiet: bool = False,
+    prepared_task: DbTask | None = None,
+) -> int:
     """Spawn a background worker to run a resume task.
 
     Args:
@@ -1193,10 +1206,18 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
     store = get_store(config)
 
     # Get the new resume task
-    task = store.get(new_task_id)
+    task = prepared_task or store.get(new_task_id)
     if not task:
         _print_work_message(f"Error: Task {new_task_id} not found", color=_colors.WORK_COLORS.error)
         return 1
+    if prepared_task is None:
+        task = _prepare_task_for_immediate_execution(
+            config,
+            task,
+            rollback_on_failure=False,
+        )
+        if task is None:
+            return 1
 
     # Build command for worker subprocess
     cmd = [

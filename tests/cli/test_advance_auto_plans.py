@@ -110,6 +110,38 @@ def test_advance_creates_implement_for_completed_plan(tmp_path: Path, capsys) ->
     assert spawn_calls == [impl_tasks[0].id]
 
 
+def test_advance_create_implement_startup_failure_rolls_back_child_and_skips_spawn(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _create_completed_plan(store, "Design auth system")
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")),
+        patch(
+            "gza.cli.git_ops._spawn_background_worker",
+            side_effect=AssertionError("worker should not spawn"),
+        ),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path))
+
+    assert rc == 1
+    output = capsys.readouterr()
+    assert "creator boom" in output.err
+    assert "Created implement task" not in output.out
+    impl_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+    assert impl_tasks == []
+    logs_dir = tmp_path / ".gza" / "logs"
+    if logs_dir.exists():
+        assert list(logs_dir.iterdir()) == []
+    workers_dir = tmp_path / ".gza" / "workers"
+    if workers_dir.exists():
+        assert list(workers_dir.iterdir()) == []
+
+
 def test_advance_skips_plan_with_existing_implement(tmp_path: Path, capsys) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -508,6 +540,7 @@ def test_advance_creates_exactly_one_closing_review_after_completed_improve(
                 message=f"Created review task {closing_review.id}",
             ),
         ) as create_review,
+        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.git_ops._spawn_background_worker", return_value=0) as spawn_worker,
     ):
         rc = cmd_advance(_advance_args(tmp_path))

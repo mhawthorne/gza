@@ -29,7 +29,7 @@ from gza.cli.watch import (
     cmd_watch,
 )
 from gza.config import Config
-from gza.git import Git, GitError
+from gza.git import GitError
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.workers import WorkerMetadata, WorkerRegistry
 
@@ -819,7 +819,11 @@ def test_watch_cycle_default_mode_does_not_treat_unrelated_in_progress_child_as_
     assert spawn_iterate.call_count == 1
     assert spawn_iterate.call_args.args[2].id == failed.id
     assert spawn_iterate.call_args.args[0].resume is True
-    assert [task.id for task in store.get_based_on_children(failed.id)] == [unrelated_child.id]
+    prepared_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
+    assert isinstance(prepared_child_id, str)
+    assert spawn_iterate.call_args.kwargs["prepared_resume"] is True
+    assert spawn_iterate.call_args.kwargs["prepared_phase"] == "preloop"
+    assert [task.id for task in store.get_based_on_children(failed.id)] == [unrelated_child.id, prepared_child_id]
 
 
 def test_watch_cycle_default_mode_spawn_failure_reuses_pending_resume_child_next_cycle(tmp_path: Path) -> None:
@@ -1125,10 +1129,14 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
     spawned_task = spawn_iterate.call_args.args[2]
     assert spawned_args.resume is False
     assert spawned_args.retry is False
-    assert spawned_task.based_on == failed.id
+    assert spawned_task.id == failed.id
+    assert spawn_iterate.call_args.kwargs["prepared_resume"] is False
+    assert spawn_iterate.call_args.kwargs["prepared_phase"] == "preloop"
+    spawned_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
+    assert isinstance(spawned_child_id, str)
     log_text = log_path.read_text()
-    assert any("RECOVR" in line and f"{failed.id} retry via iterate -> {spawned_task.id}" in line for line in log_text.splitlines())
-    assert not any("RECOVR" in line and f"{failed.id} resume via iterate -> {spawned_task.id}" in line for line in log_text.splitlines())
+    assert any("RECOVR" in line and f"{failed.id} retry via iterate -> {spawned_child_id}" in line for line in log_text.splitlines())
+    assert not any("RECOVR" in line and f"{failed.id} resume via iterate -> {spawned_child_id}" in line for line in log_text.splitlines())
 
 
 def test_watch_cycle_restart_failed_reuses_existing_deep_recovery_chain_without_creating_sibling(
@@ -1228,6 +1236,53 @@ def test_watch_cycle_dry_run_recovery_mode_reports_actions_without_mutation(tmp_
     assert len(store.get_based_on_children(failed.id)) == 0
 
 
+def test_watch_cycle_recovery_startup_failure_rolls_back_child_and_skips_success_log(tmp_path: Path) -> None:
+    """Restart-failed startup failures should not leave recovery children or RECOVR success output behind."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed review", task_type="review")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker",
+            side_effect=AssertionError("resume worker should not spawn"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is False
+    assert store.get_based_on_children(failed.id) == []
+    text = log_path.read_text()
+    assert "creator boom" not in text
+    assert not any("RECOVR" in line and str(failed.id) in line for line in text.splitlines())
+    workers_dir = tmp_path / ".gza" / "workers"
+    if workers_dir.exists():
+        assert list(workers_dir.iterdir()) == []
+
+
 def test_watch_cycle_recovery_mode_does_not_resume_test_failure_tasks(tmp_path: Path) -> None:
     """TEST_FAILURE is excluded from unattended recovery."""
     setup_config(tmp_path)
@@ -1271,7 +1326,7 @@ def test_watch_cycle_recovery_mode_does_not_resume_test_failure_tasks(tmp_path: 
 
 
 def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(tmp_path: Path) -> None:
-    """Implement recovery should retry the failed root iterate launch without creating local resume children."""
+    """Implement recovery should retry the failed root iterate launch while reusing one prepared resume child."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -1323,9 +1378,12 @@ def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(
     second_task = spawn_iterate.call_args_list[1].args[2]
     assert first_task.id == second_task.id
     assert first_task.id == failed.id
+    first_prepared_child = spawn_iterate.call_args_list[0].kwargs["prepared_task_id"]
+    second_prepared_child = spawn_iterate.call_args_list[1].kwargs["prepared_task_id"]
+    assert first_prepared_child == second_prepared_child
     assert second_args.resume is True
     assert second_args.retry is False
-    assert children == []
+    assert [task.id for task in children] == [first_prepared_child]
 
 
 def test_watch_cycle_reuses_preexisting_pending_resume_child_with_resume_semantics(tmp_path: Path) -> None:
@@ -4309,13 +4367,13 @@ def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
     git.default_branch.return_value = "main"
     git.can_merge.return_value = False
 
-    rebase_task = MagicMock()
-    rebase_task.id = "test-rebase-id"
+    rebase_task = SimpleNamespace(id="test-rebase-id")
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._create_rebase_task", return_value=rebase_task) as create_rebase,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
@@ -4359,14 +4417,14 @@ def test_watch_cycle_off_default_branch_targets_rebase_to_default_branch(tmp_pat
     git.current_branch.return_value = "feature/local"
     git.default_branch.return_value = "main"
 
-    rebase_task = MagicMock()
-    rebase_task.id = "test-rebase-off-default"
+    rebase_task = SimpleNamespace(id="test-rebase-off-default")
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value={"type": "needs_rebase"}),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._create_rebase_task", return_value=rebase_task) as create_rebase,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
@@ -7157,10 +7215,12 @@ def test_watch_cycle_quiet_logs_start_failed_when_recovery_iterate_spawn_fails(
     assert "Error spawning background worker" not in stdout
     assert spawn_resume.call_count == 0
     assert spawn_iterate.call_count == 1
-    assert store.get_based_on_children(failed.id) == []
+    children = store.get_based_on_children(failed.id)
+    assert len(children) == 1
+    child_id = children[0].id
     log_text = log_path.read_text()
     assert "START_FAILED" in log_text
-    assert f"{failed.id} -> {failed.id}: iterate worker spawn failed" in log_text
+    assert f"{failed.id} -> {child_id}: iterate worker spawn failed" in log_text
 
 
 def test_cmd_watch_interrupts_sleep_promptly_on_signal(tmp_path: Path) -> None:

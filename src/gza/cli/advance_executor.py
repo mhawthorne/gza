@@ -32,18 +32,19 @@ class AdvanceActionExecutionContext:
     max_resume_attempts: int
     use_iterate_for_create_implement: bool
     use_iterate_for_needs_rebase: bool
+    prepare_task_for_background_start: Callable[[DbTask, bool], DbTask | None]
     prepare_create_review: Callable[[DbTask], CreateReviewActionResult]
     create_resume_task: Callable[[DbTask], DbTask]
     create_rebase_task: Callable[[DbTask], DbTask]
     create_implement_task: Callable[[DbTask], DbTask]
-    spawn_worker: Callable[[str, str], int]
-    spawn_resume_worker: Callable[[str, str], int]
+    spawn_worker: Callable[[DbTask, str], int]
+    spawn_resume_worker: Callable[[DbTask, str], int]
     spawn_iterate_worker: Callable[[DbTask, str], int]
     prefer_iterate_for_action: Callable[
         [DbTask, dict[str, Any]],
         DbTask | AdvanceActionExecutionResult | None,
     ] | None = None
-    spawn_iterate_recovery: Callable[[DbTask, Literal["resume", "retry"]], int] | None = None
+    spawn_iterate_recovery: Callable[[DbTask, Literal["resume", "retry"], DbTask], int] | None = None
     create_retry_task: Callable[[DbTask], DbTask] | None = None
 
 
@@ -233,6 +234,42 @@ def _spawn_result(
 _ITERATE_ROUTABLE_ACTIONS = frozenset({"create_review", "run_review", "improve", "run_improve"})
 
 
+def _startup_preparation_failed_result(
+    *,
+    action_type: str,
+    task: DbTask,
+    worker_label: str,
+) -> AdvanceActionExecutionResult:
+    task_id = str(task.id) if task.id is not None else "<unknown>"
+    return AdvanceActionExecutionResult(
+        action_type=action_type,
+        status="error",
+        message=f"startup preparation failed for task {task_id}",
+        error_message=f"Failed to start {worker_label} worker for task {task_id}",
+        handled_task_id=task_id,
+        created_task=task,
+        worker_label=worker_label,
+    )
+
+
+def _prepare_background_start(
+    *,
+    context: AdvanceActionExecutionContext,
+    action_type: str,
+    task: DbTask,
+    worker_label: str,
+    rollback_on_failure: bool,
+) -> tuple[DbTask | None, AdvanceActionExecutionResult | None]:
+    prepared_task = context.prepare_task_for_background_start(task, rollback_on_failure)
+    if prepared_task is None:
+        return None, _startup_preparation_failed_result(
+            action_type=action_type,
+            task=task,
+            worker_label=worker_label,
+        )
+    return prepared_task, None
+
+
 def _maybe_route_action_through_iterate(
     *,
     task: DbTask,
@@ -344,13 +381,25 @@ def execute_advance_action(
                 message="review creation returned no task",
             )
 
-        rc = context.spawn_worker(review_task.id, "review")
+        prepared_review_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=review_task,
+            worker_label="review",
+            rollback_on_failure=True,
+        )
+        if prepared_review_task is None:
+            assert prepare_error is not None
+            return prepare_error
+        assert prepared_review_task.id is not None
+
+        rc = context.spawn_worker(prepared_review_task, "review")
         result = _spawn_result(
             action_type=action_type,
             rc=rc,
-            handled_task_id=review_task.id,
+            handled_task_id=prepared_review_task.id,
             worker_label="review",
-            created_task=review_task,
+            created_task=prepared_review_task,
         )
         result.success_message = create_result.message
         return result
@@ -371,13 +420,25 @@ def execute_advance_action(
                 created_task=review_task,
             )
 
-        rc = context.spawn_worker(review_task.id, "review")
+        prepared_review_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=review_task,
+            worker_label="review",
+            rollback_on_failure=False,
+        )
+        if prepared_review_task is None:
+            assert prepare_error is not None
+            return prepare_error
+        assert prepared_review_task.id is not None
+
+        rc = context.spawn_worker(prepared_review_task, "review")
         return _spawn_result(
             action_type=action_type,
             rc=rc,
-            handled_task_id=review_task.id,
+            handled_task_id=prepared_review_task.id,
             worker_label="review",
-            created_task=review_task,
+            created_task=prepared_review_task,
         )
 
     if action_type == "improve":
@@ -446,18 +507,28 @@ def execute_advance_action(
                     failed_improve=failed_improve,
                 )
 
-        assert improve_task.id is not None
-        if improve_task.session_id is not None:
-            rc = context.spawn_resume_worker(improve_task.id, "improve")
+        prepared_improve_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=improve_task,
+            worker_label="improve",
+            rollback_on_failure=True,
+        )
+        if prepared_improve_task is None:
+            assert prepare_error is not None
+            return prepare_error
+        assert prepared_improve_task.id is not None
+        if prepared_improve_task.session_id is not None:
+            rc = context.spawn_resume_worker(prepared_improve_task, "improve")
         else:
-            rc = context.spawn_worker(improve_task.id, "improve")
+            rc = context.spawn_worker(prepared_improve_task, "improve")
 
         return _spawn_result(
             action_type=action_type,
             rc=rc,
-            handled_task_id=improve_task.id,
+            handled_task_id=prepared_improve_task.id,
             worker_label="improve",
-            created_task=improve_task,
+            created_task=prepared_improve_task,
             improve_mode=improve_mode,
             failed_improve=failed_improve,
         )
@@ -478,13 +549,25 @@ def execute_advance_action(
                 created_task=run_improve_task,
             )
 
-        rc = context.spawn_worker(run_improve_task.id, "improve")
+        prepared_improve_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=run_improve_task,
+            worker_label="improve",
+            rollback_on_failure=False,
+        )
+        if prepared_improve_task is None:
+            assert prepare_error is not None
+            return prepare_error
+        assert prepared_improve_task.id is not None
+
+        rc = context.spawn_worker(prepared_improve_task, "improve")
         return _spawn_result(
             action_type=action_type,
             rc=rc,
-            handled_task_id=run_improve_task.id,
+            handled_task_id=prepared_improve_task.id,
             worker_label="improve",
-            created_task=run_improve_task,
+            created_task=prepared_improve_task,
         )
 
     if action_type == "resume":
@@ -500,6 +583,8 @@ def execute_advance_action(
             )
 
         launch_mode = str(action.get("launch_mode") or ("iterate" if task.task_type == "implement" else "worker"))
+        resume_task_id = action.get("recovery_task_id")
+        reuse_existing = bool(action.get("reuse_existing", False))
         if launch_mode == "iterate":
             if context.spawn_iterate_recovery is None:
                 return AdvanceActionExecutionResult(
@@ -507,18 +592,42 @@ def execute_advance_action(
                     status="error",
                     message="missing iterate recovery launcher",
                 )
-            rc = context.spawn_iterate_recovery(task, "resume")
+            if reuse_existing and isinstance(resume_task_id, str):
+                resume_task = context.store.get(resume_task_id)
+                if resume_task is None:
+                    return AdvanceActionExecutionResult(
+                        action_type=action_type,
+                        status="error",
+                        message=f"missing existing resume task {resume_task_id}",
+                    )
+            else:
+                resume_task = context.create_resume_task(task)
+            prepared_resume_task, prepare_error = _prepare_background_start(
+                context=context,
+                action_type=action_type,
+                task=resume_task,
+                worker_label="iterate",
+                rollback_on_failure=not reuse_existing,
+            )
+            if prepared_resume_task is None:
+                assert prepare_error is not None
+                return prepare_error
+            assert prepared_resume_task.id is not None
+
+            rc = context.spawn_iterate_recovery(task, "resume", prepared_resume_task)
             result = _spawn_result(
                 action_type=action_type,
                 rc=rc,
-                handled_task_id=task.id,
+                handled_task_id=prepared_resume_task.id,
                 worker_label="iterate",
+                created_task=prepared_resume_task,
             )
-            result.success_message = f"Started iterate resume for {task.id}"
+            if reuse_existing:
+                result.success_message = f"Reused pending resume task {prepared_resume_task.id}"
+            else:
+                result.success_message = f"Created resume task {prepared_resume_task.id}"
             return result
 
-        resume_task_id = action.get("recovery_task_id")
-        reuse_existing = bool(action.get("reuse_existing", False))
         if reuse_existing and isinstance(resume_task_id, str):
             resume_task = context.store.get(resume_task_id)
             if resume_task is None:
@@ -529,19 +638,30 @@ def execute_advance_action(
                 )
         else:
             resume_task = context.create_resume_task(task)
-        assert resume_task.id is not None
-        rc = context.spawn_resume_worker(resume_task.id, task.task_type or "task")
+        prepared_resume_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=resume_task,
+            worker_label="resume",
+            rollback_on_failure=not reuse_existing,
+        )
+        if prepared_resume_task is None:
+            assert prepare_error is not None
+            return prepare_error
+
+        assert prepared_resume_task.id is not None
+        rc = context.spawn_resume_worker(prepared_resume_task, task.task_type or "task")
         result = _spawn_result(
             action_type=action_type,
             rc=rc,
-            handled_task_id=resume_task.id,
+            handled_task_id=prepared_resume_task.id,
             worker_label="resume",
-            created_task=resume_task,
+            created_task=prepared_resume_task,
         )
         if reuse_existing:
-            result.success_message = f"Reused pending resume task {resume_task.id}"
+            result.success_message = f"Reused pending resume task {prepared_resume_task.id}"
         else:
-            result.success_message = f"Created resume task {resume_task.id}"
+            result.success_message = f"Created resume task {prepared_resume_task.id}"
         return result
 
     if action_type == "retry":
@@ -575,24 +695,54 @@ def execute_advance_action(
                     message="missing retry task factory",
                 )
             retry_task = context.create_retry_task(task)
-        assert retry_task.id is not None
         if launch_mode == "iterate":
-            rc = context.spawn_iterate_worker(retry_task, task.task_type or "task")
+            if context.spawn_iterate_recovery is None:
+                return AdvanceActionExecutionResult(
+                    action_type=action_type,
+                    status="error",
+                    message="missing iterate recovery launcher",
+                )
+            prepared_retry_task, prepare_error = _prepare_background_start(
+                context=context,
+                action_type=action_type,
+                task=retry_task,
+                worker_label="iterate",
+                rollback_on_failure=not reuse_existing,
+            )
+            if prepared_retry_task is None:
+                assert prepare_error is not None
+                return prepare_error
+            assert prepared_retry_task.id is not None
+            rc = context.spawn_iterate_recovery(task, "retry", prepared_retry_task)
             worker_label = "iterate"
+            handled_task = prepared_retry_task
         else:
-            rc = context.spawn_worker(retry_task.id, task.task_type or "task")
+            prepared_retry_task, prepare_error = _prepare_background_start(
+                context=context,
+                action_type=action_type,
+                task=retry_task,
+                worker_label="retry",
+                rollback_on_failure=not reuse_existing,
+            )
+            if prepared_retry_task is None:
+                assert prepare_error is not None
+                return prepare_error
+            assert prepared_retry_task.id is not None
+            rc = context.spawn_worker(prepared_retry_task, task.task_type or "task")
             worker_label = "retry"
+            handled_task = prepared_retry_task
+        assert handled_task.id is not None
         result = _spawn_result(
             action_type=action_type,
             rc=rc,
-            handled_task_id=retry_task.id,
+            handled_task_id=handled_task.id,
             worker_label=worker_label,
-            created_task=retry_task,
+            created_task=handled_task,
         )
         if reuse_existing:
-            result.success_message = f"Reused pending retry task {retry_task.id}"
+            result.success_message = f"Reused pending retry task {handled_task.id}"
         else:
-            result.success_message = f"Created retry task {retry_task.id}"
+            result.success_message = f"Created retry task {handled_task.id}"
         return result
 
     if action_type == "create_implement":
@@ -608,22 +758,33 @@ def execute_advance_action(
             )
 
         impl_task = context.create_implement_task(task)
-        assert impl_task.id is not None
+        prepared_impl_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=impl_task,
+            worker_label="implement" if not context.use_iterate_for_create_implement else "iterate",
+            rollback_on_failure=True,
+        )
+        if prepared_impl_task is None:
+            assert prepare_error is not None
+            return prepare_error
+
+        assert prepared_impl_task.id is not None
         if context.use_iterate_for_create_implement:
-            rc = context.spawn_iterate_worker(impl_task, "implement")
+            rc = context.spawn_iterate_worker(prepared_impl_task, "implement")
             worker_label = "iterate"
         else:
-            rc = context.spawn_worker(impl_task.id, "implement")
+            rc = context.spawn_worker(prepared_impl_task, "implement")
             worker_label = "implement"
 
         result = _spawn_result(
             action_type=action_type,
             rc=rc,
-            handled_task_id=impl_task.id,
+            handled_task_id=prepared_impl_task.id,
             worker_label=worker_label,
-            created_task=impl_task,
+            created_task=prepared_impl_task,
         )
-        result.success_message = f"Created implement task {impl_task.id}"
+        result.success_message = f"Created implement task {prepared_impl_task.id}"
         return result
 
     if action_type == "needs_rebase":
@@ -653,16 +814,27 @@ def execute_advance_action(
             )
 
         rebase_task = context.create_rebase_task(task)
-        assert rebase_task.id is not None
-        rc = context.spawn_worker(rebase_task.id, "rebase")
+        prepared_rebase_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=rebase_task,
+            worker_label="rebase",
+            rollback_on_failure=True,
+        )
+        if prepared_rebase_task is None:
+            assert prepare_error is not None
+            return prepare_error
+
+        assert prepared_rebase_task.id is not None
+        rc = context.spawn_worker(prepared_rebase_task, "rebase")
         result = _spawn_result(
             action_type=action_type,
             rc=rc,
-            handled_task_id=rebase_task.id,
+            handled_task_id=prepared_rebase_task.id,
             worker_label="rebase",
-            created_task=rebase_task,
+            created_task=prepared_rebase_task,
         )
-        result.success_message = f"Created rebase task {rebase_task.id}"
+        result.success_message = f"Created rebase task {prepared_rebase_task.id}"
         return result
 
     return AdvanceActionExecutionResult(

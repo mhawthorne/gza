@@ -2153,16 +2153,21 @@ def cmd_advance(args: argparse.Namespace) -> int:
             max_resume_attempts=max_resume_attempts,
             use_iterate_for_create_implement=use_iterate_mode,
             use_iterate_for_needs_rebase=use_iterate_mode,
+            prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
+                config,
+                task,
+                rollback_on_failure=rollback_on_failure,
+            ),
             prepare_create_review=lambda t: _prepare_create_review_action(store, t),
             create_resume_task=lambda t: _create_resume_task(store, t),
             create_retry_task=lambda t: _create_retry_task(store, t),
             create_rebase_task=_create_rebase_from_task,
             create_implement_task=_create_implement_from_task,
-            spawn_worker=lambda task_id, _kind: _spawn_background_worker(
-                _worker_args(), config, task_id=task_id, quiet=True
+            spawn_worker=lambda task_obj, _kind: _spawn_background_worker(
+                _worker_args(), config, task_id=str(task_obj.id), quiet=True, prepared_task=task_obj
             ),
-            spawn_resume_worker=lambda task_id, _kind: _spawn_background_resume_worker(
-                _worker_args(), config, task_id, quiet=True
+            spawn_resume_worker=lambda task_obj, _kind: _spawn_background_resume_worker(
+                _worker_args(), config, str(task_obj.id), quiet=True, prepared_task=task_obj
             ),
             spawn_iterate_worker=lambda task_obj, _kind: _spawn_background_iterate_worker(
                 argparse.Namespace(
@@ -2175,7 +2180,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 auto_iterate=True,
                 quiet=True,
             ),
-            spawn_iterate_recovery=lambda task_obj, mode: _spawn_background_iterate_worker(
+            spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_background_iterate_worker(
                 argparse.Namespace(
                     no_docker=getattr(args, 'no_docker', False),
                     force=force,
@@ -2187,6 +2192,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 retry=mode == "retry",
                 auto_iterate=True,
                 quiet=True,
+                prepared_task_id=str(prepared_task.id),
+                prepared_resume=mode == "resume",
+                prepared_phase="preloop",
             ),
         )
 
