@@ -440,8 +440,12 @@ def _select_representative_completed_task(
         return None
     owner_unit = snapshot.merge_units_by_task_id.get(owner.id or "")
     if owner_unit is not None:
-        rep = store.resolve_merge_unit_representative_task(owner_unit, preferred_task_id=owner.id, require_actionable=False)
-        if rep is not None and rep in actionable:
+        rep = store.resolve_merge_unit_representative_task(
+            owner_unit,
+            preferred_task_id=owner.id,
+            require_actionable=True,
+        )
+        if rep is not None:
             return rep
     return max(actionable, key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)))
 
