@@ -57,7 +57,13 @@ from ..review_verdict import (
     get_review_verdict as _get_review_verdict,
     parse_review_verdict,
 )
-from ..runner import RunInvocationContext, get_effective_config_for_task, run
+from ..runner import (
+    RunInvocationContext,
+    get_effective_config_for_task,
+    prepare_task_startup_phase,
+    remove_task_startup_artifacts,
+    run,
+)
 from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
 
@@ -633,6 +639,27 @@ def _rollback_background_worker_launch(
                 f"remove failed with {cleanup_exc}; terminal fallback failed with {mark_exc}",
                 file=sys.stderr,
             )
+
+
+def _prepare_task_for_immediate_execution(
+    config: Config,
+    task: DbTask,
+    *,
+    rollback_on_failure: bool,
+) -> DbTask | None:
+    """Run the synchronous creator phase on the caller's stdout/stderr."""
+    store = get_store(config)
+    try:
+        prepared = prepare_task_startup_phase(config, store, task)
+    except Exception as exc:
+        failed_task = store.get(task.id) if task.id is not None else None
+        failed_task = failed_task or task
+        if rollback_on_failure and task.id is not None:
+            remove_task_startup_artifacts(config, failed_task)
+            store.delete(task.id)
+        print(f"Error: {exc}", file=sys.stderr)
+        return None
+    return prepared
 
 
 def _run_foreground(
@@ -1219,6 +1246,9 @@ def _spawn_background_iterate_worker(
     auto_iterate: bool = False,
     quiet: bool = False,
     dry_run: bool = False,
+    prepared_task_id: str | None = None,
+    prepared_resume: bool = False,
+    prepared_phase: str | None = None,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     registry = WorkerRegistry(config.workers_path)
@@ -1240,6 +1270,12 @@ def _spawn_background_iterate_worker(
         inner_cmd.append("--retry")
     if auto_iterate:
         inner_cmd.append("--auto-iterate")
+    if prepared_task_id:
+        inner_cmd.extend(["--prepared-task-id", prepared_task_id])
+    if prepared_resume:
+        inner_cmd.append("--prepared-resume")
+    if prepared_phase:
+        inner_cmd.extend(["--prepared-phase", prepared_phase])
 
     inner_cmd.extend(["--project", str(config.project_dir.absolute())])
 

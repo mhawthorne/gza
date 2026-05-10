@@ -399,6 +399,49 @@ def ensure_task_log_paths(config: Config, store: SqliteTaskStore, task: Task) ->
     return paths
 
 
+def prepare_task_startup_phase(config: Config, store: SqliteTaskStore, task: Task) -> Task:
+    """Synchronously materialize task startup metadata before execution detaches."""
+    if task.slug is None:
+        git = Git(config.project_dir)
+        slug_override = _compute_slug_override(task, store)
+        task.slug = generate_slug(
+            task.prompt,
+            existing_id=None,
+            log_path=config.log_path,
+            git=git,
+            store=store,
+            exclude_task_id=task.id,
+            project_name=config.project_name,
+            project_prefix=config.project_prefix,
+            slug_override=slug_override,
+            branch_strategy=config.branch_strategy,
+            explicit_type=task.task_type_hint,
+        )
+        store.update(task)
+
+    ensure_task_log_paths(config, store, task)
+    # Phase 1 ends here: the task row is durably committed with its slug and log
+    # path before provider preflight, worktree setup, or detached execution starts.
+    if task.id is None:
+        return task
+    return store.get(task.id) or task
+
+
+def remove_task_startup_artifacts(config: Config, task: Task) -> None:
+    """Best-effort cleanup for startup artifacts created before execution begins."""
+    paths = resolve_task_log_paths(config, task)
+    for path in {
+        paths.conversation,
+        paths.ops,
+        paths.startup_conversation,
+        paths.startup_ops,
+    }:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove startup artifact %s", path, exc_info=True)
+
+
 class TaskExecutionLogger:
     """Emit provider-agnostic task execution events to the canonical ops log."""
 

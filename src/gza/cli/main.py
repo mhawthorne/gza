@@ -1848,6 +1848,20 @@ def main() -> int:
             help=argparse.SUPPRESS,  # Internal: marks scheduler/worker-launched iterate runs
         )
         iterate_parser.add_argument(
+            "--prepared-task-id",
+            help=argparse.SUPPRESS,
+        )
+        iterate_parser.add_argument(
+            "--prepared-resume",
+            action="store_true",
+            help=argparse.SUPPRESS,
+        )
+        iterate_parser.add_argument(
+            "--prepared-phase",
+            choices=("preloop", "iteration"),
+            help=argparse.SUPPRESS,
+        )
+        iterate_parser.add_argument(
             "--background", "-b",
             action="store_true",
             help="Run the entire iterate loop in the background",
