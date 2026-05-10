@@ -417,7 +417,6 @@ def prepare_task_startup_phase(config: Config, store: SqliteTaskStore, task: Tas
             branch_strategy=config.branch_strategy,
             explicit_type=task.task_type_hint,
         )
-        store.update(task)
 
     ensure_task_log_paths(config, store, task)
     # Phase 1 ends here: the task row is durably committed with its slug and log

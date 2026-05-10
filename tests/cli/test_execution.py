@@ -2424,6 +2424,52 @@ class TestBackgroundWorkerCommand:
         if workers_dir.exists():
             assert list(workers_dir.iterdir()) == []
 
+    def test_work_background_existing_task_log_setup_failure_restores_startup_metadata(self, tmp_path: Path):
+        """Existing pending work rows should not retain startup metadata after Phase 1 log setup fails."""
+        from gza.log_paths import resolve_task_log_paths
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Parent-side log setup failure")
+        assert task.slug is None
+        assert task.log_file is None
+
+        def fail_log_setup(config, _store, pending_task):
+            paths = resolve_task_log_paths(config, pending_task)
+            paths.conversation.parent.mkdir(parents=True, exist_ok=True)
+            paths.conversation.touch()
+            raise RuntimeError("log setup boom")
+
+        with (
+            patch("gza.runner.generate_slug", return_value="20260510-test-project-parent-side-log-setup-failure"),
+            patch("gza.runner.ensure_task_log_paths", side_effect=fail_log_setup),
+            patch(
+                "gza.cli._spawn_detached_worker_process",
+                side_effect=AssertionError("worker process should not spawn"),
+            ),
+        ):
+            result = run_gza(
+                "work",
+                str(task.id),
+                "--background",
+                "--no-docker",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 1
+        assert "log setup boom" in result.stderr
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.slug is None
+        assert refreshed.log_file is None
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert not any(path.is_file() for path in logs_dir.rglob("*"))
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
+
     def test_background_worker_tag_selection_prepares_selected_task_and_hands_off_that_task_id(
         self,
         tmp_path: Path,
@@ -7057,6 +7103,55 @@ class TestIterateCommand:
         logs_dir = tmp_path / ".gza" / "logs"
         if logs_dir.exists():
             assert list(logs_dir.iterdir()) == []
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
+
+    def test_pending_task_background_log_setup_failure_restores_startup_metadata(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Pending background iterate should roll back startup metadata when log setup fails."""
+        from gza.log_paths import resolve_task_log_paths
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.slug is None
+        assert impl.log_file is None
+
+        def fail_log_setup(config, _store, pending_task):
+            paths = resolve_task_log_paths(config, pending_task)
+            paths.conversation.parent.mkdir(parents=True, exist_ok=True)
+            paths.conversation.touch()
+            raise RuntimeError("log setup boom")
+
+        with (
+            patch("gza.runner.generate_slug", return_value="20260510-test-project-implement-feature"),
+            patch("gza.runner.ensure_task_log_paths", side_effect=fail_log_setup),
+            patch(
+                "gza.cli.execution._spawn_background_iterate",
+                side_effect=AssertionError("background iterate should not spawn"),
+            ),
+        ):
+            result = run_gza(
+                "iterate",
+                str(impl.id),
+                "--background",
+                "--no-docker",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 1
+        assert "log setup boom" in result.stderr
+        refreshed = store.get(impl.id)
+        assert refreshed is not None
+        assert refreshed.slug is None
+        assert refreshed.log_file is None
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert not any(path.is_file() for path in logs_dir.rglob("*"))
         workers_dir = tmp_path / ".gza" / "workers"
         if workers_dir.exists():
             assert list(workers_dir.iterdir()) == []
