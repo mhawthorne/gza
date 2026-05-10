@@ -395,6 +395,20 @@ def query_incomplete(
     from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows
     from .task_query import DateFilter, normalize_tag_filters
 
+    statuses: tuple[str, ...] | None = None
+    merge_chain_state: tuple[str, ...] | None = None
+    exclude_statuses: tuple[str, ...] | None = None
+    exclude_merge_chain_state: tuple[str, ...] | None = None
+    if f.status == "unmerged":
+        merge_chain_state = ("unmerged",)
+        statuses = ("completed", "unmerged")
+    elif f.status:
+        statuses = (f.status,)
+    if f.status_not == "unmerged":
+        exclude_merge_chain_state = ("unmerged",)
+    elif f.status_not:
+        exclude_statuses = (f.status_not,)
+
     date_filter = DateFilter(
         field=f.date_field,
         days=f.days,
@@ -405,9 +419,14 @@ def query_incomplete(
         store,
         LineageOwnerQuery(
             limit=f.limit,
+            statuses=statuses,
+            exclude_statuses=exclude_statuses,
+            merge_chain_state=merge_chain_state,
+            exclude_merge_chain_state=exclude_merge_chain_state,
             task_types=(f.task_type,) if f.task_type else None,
             exclude_task_types=(f.task_type_not,) if f.task_type_not else None,
             tags=normalize_tag_filters(f.tags),
+            exclude_tags=normalize_tag_filters(f.tags_not),
             any_tag=f.any_tag,
             date_filter=date_filter,
             include_skipped=True,

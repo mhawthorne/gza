@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from gza.db import SqliteTaskStore, Task
+from gza.db import MergeUnit, SqliteTaskStore, Task
+from gza.lineage_query import LineageOwnerSnapshot, is_lineage_resolved
 from gza.query import (
     _classify_child_relationship,
     _resolve_effective_shared_branch_retry_head,
@@ -840,6 +841,92 @@ class TestQueryIncomplete:
         unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
         assert unresolved_ids == {resumed.id, improve.id}
 
+    def test_status_failed_excludes_completed_unmerged_rows(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        failed = store.add("failed implement", task_type="implement", tags=("release",))
+        self._fail(failed)
+        store.update(failed)
+        assert failed.id is not None
+
+        completed = store.add("completed unmerged implement", task_type="implement", tags=("release",))
+        self._complete(completed, merge_status="unmerged")
+        store.update(completed)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None, status="failed"))
+        assert len(lineages) == 1
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {failed.id}
+
+    def test_status_not_failed_excludes_failed_rows(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        failed = store.add("failed implement", task_type="implement", tags=("release",))
+        self._fail(failed)
+        store.update(failed)
+        assert failed.id is not None
+
+        completed = store.add("completed unmerged implement", task_type="implement", tags=("release",))
+        self._complete(completed, merge_status="unmerged")
+        store.update(completed)
+        assert completed.id is not None
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None, status_not="failed"))
+        assert len(lineages) == 1
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {completed.id}
+
+    def test_status_unmerged_uses_attached_merge_unit_state(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        task = store.add("completed implement backed by merge unit", task_type="implement", tags=("release",))
+        store.mark_completed(task, has_commits=True, branch="feature/status-unmerged-merge-unit")
+        assert task.id is not None
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        refreshed.merge_status = None
+        store.update(refreshed)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None, status="unmerged"))
+        assert len(lineages) == 1
+        unresolved_ids = {member.id for member in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {task.id}
+
+    def test_status_not_unmerged_excludes_attached_merge_unit_state(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        task = store.add("completed implement excluded by merge unit", task_type="implement", tags=("release",))
+        store.mark_completed(task, has_commits=True, branch="feature/status-not-unmerged-merge-unit")
+        assert task.id is not None
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        refreshed.merge_status = None
+        store.update(refreshed)
+
+        assert query_incomplete(store, HistoryFilter(limit=None, status_not="unmerged")) == []
+
+    def test_tags_not_excludes_blocked_rows_while_preserving_positive_tags(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        allowed = store.add("allowed implement", task_type="implement", tags=("release",))
+        self._complete(allowed, merge_status="unmerged")
+        store.update(allowed)
+        assert allowed.id is not None
+
+        blocked = store.add("blocked implement", task_type="implement", tags=("release", "blocked"))
+        self._complete(blocked, merge_status="unmerged")
+        store.update(blocked)
+
+        lineages = query_incomplete(
+            store,
+            HistoryFilter(limit=None, tags=("release",), tags_not=("blocked",)),
+        )
+        assert len(lineages) == 1
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {allowed.id}
+
     def test_effective_shared_branch_head_distinguishes_canonical_root_from_merged_resume(self, tmp_path: Path):
         store = self._store(tmp_path)
 
@@ -859,3 +946,98 @@ class TestQueryIncomplete:
         assert effective_head.id == resumed.id
         resolved_root_id = get_task_lineage(store, resumed.id, 0).task.id
         assert resolved_root_id == root.id
+
+
+class TestIsLineageResolved:
+    def _merge_unit(self, *, unit_id: str, owner_task_id: str, state: str) -> MergeUnit:
+        now = datetime.now(UTC)
+        return MergeUnit(
+            id=unit_id,
+            source_branch="feature/test",
+            target_branch="main",
+            state=state,
+            owner_task_id=owner_task_id,
+            head_sha=None,
+            base_sha=None,
+            created_at=now,
+            updated_at=now,
+            merged_at=now if state == "merged" else None,
+            merged_by_task_id=None,
+            pr_number=None,
+            pr_state=None,
+            pr_last_synced_at=None,
+            sync_last_synced_at=None,
+            diff_files_changed=None,
+            diff_lines_added=None,
+            diff_lines_removed=None,
+            superseded_by_unit_id=None,
+        )
+
+    def test_completed_unmerged_task_row_keeps_snapshot_unresolved(self):
+        task = _make_task(
+            id="gza-1",
+            status="completed",
+            task_type="implement",
+            has_commits=True,
+            merge_status="unmerged",
+        )
+        snapshot = LineageOwnerSnapshot(
+            owner_task=task,
+            root_task=task,
+            members=(task,),
+            merge_units_by_task_id={},
+            failed_leaves=(),
+            recovery_completed_by_failed_id={},
+        )
+
+        resolution = is_lineage_resolved(snapshot)
+
+        assert resolution.resolved is False
+        assert resolution.reasons == ()
+
+    def test_completed_task_with_unmerged_merge_unit_keeps_snapshot_unresolved(self):
+        task = _make_task(
+            id="gza-1",
+            status="completed",
+            task_type="implement",
+            has_commits=True,
+            merge_status=None,
+        )
+        merge_unit = self._merge_unit(unit_id="gza-mu-1", owner_task_id="gza-1", state="unmerged")
+        snapshot = LineageOwnerSnapshot(
+            owner_task=task,
+            root_task=task,
+            members=(task,),
+            merge_units_by_task_id={task.id: merge_unit},
+            failed_leaves=(),
+            recovery_completed_by_failed_id={},
+        )
+
+        resolution = is_lineage_resolved(snapshot)
+
+        assert resolution.resolved is False
+        assert resolution.reasons == ()
+
+    def test_completed_task_with_merged_merge_unit_resolves_snapshot(self):
+        task = _make_task(
+            id="gza-1",
+            status="completed",
+            task_type="implement",
+            has_commits=True,
+            merge_status="unmerged",
+        )
+        merge_unit = self._merge_unit(unit_id="gza-mu-1", owner_task_id="gza-1", state="merged")
+        snapshot = LineageOwnerSnapshot(
+            owner_task=task,
+            root_task=task,
+            members=(task,),
+            merge_units_by_task_id={task.id: merge_unit},
+            failed_leaves=(),
+            recovery_completed_by_failed_id={},
+        )
+
+        resolution = is_lineage_resolved(snapshot)
+
+        assert resolution.resolved is True
+        assert resolution.reasons == ("branch_merged",)
+        assert resolution.resolved_by_task_ids == ("gza-1",)

@@ -62,9 +62,14 @@ class LineageOwnerRow:
 @dataclass(frozen=True)
 class LineageOwnerQuery:
     limit: int | None = None
+    statuses: tuple[str, ...] | None = None
+    exclude_statuses: tuple[str, ...] | None = None
+    merge_chain_state: tuple[str, ...] | None = None
+    exclude_merge_chain_state: tuple[str, ...] | None = None
     task_types: tuple[str, ...] | None = None
     exclude_task_types: tuple[str, ...] | None = None
     tags: tuple[str, ...] | None = None
+    exclude_tags: tuple[str, ...] | None = None
     any_tag: bool = False
     date_filter: DateFilter | None = None
     include_skipped: bool = False
@@ -104,7 +109,24 @@ def _matches_task_filters(
     query: LineageOwnerQuery,
     *,
     tag_matcher: Any,
+    merge_unit: MergeUnit | None = None,
 ) -> bool:
+    if query.statuses is not None:
+        allowed_statuses = set(query.statuses)
+        if not _matches_status_filters(task, allowed_statuses, merge_unit=merge_unit):
+            return False
+    if query.exclude_statuses is not None:
+        disallowed_statuses = set(query.exclude_statuses)
+        if _matches_status_filters(task, disallowed_statuses, merge_unit=merge_unit):
+            return False
+    if query.merge_chain_state is not None:
+        merge_states = set(query.merge_chain_state)
+        if not _matches_merge_chain_state(task, merge_states, merge_unit=merge_unit):
+            return False
+    if query.exclude_merge_chain_state is not None:
+        excluded_merge_states = set(query.exclude_merge_chain_state)
+        if _matches_merge_chain_state(task, excluded_merge_states, merge_unit=merge_unit):
+            return False
     if query.task_types is not None and task.task_type not in set(query.task_types):
         return False
     if query.exclude_task_types is not None and task.task_type in set(query.exclude_task_types):
@@ -117,12 +139,47 @@ def _matches_task_filters(
             return False
     if query.tags is not None and not tag_matcher(task_tags=task.tags, tag_filters=query.tags, any_tag=query.any_tag):
         return False
+    if query.exclude_tags is not None and tag_matcher(task_tags=task.tags, tag_filters=query.exclude_tags, any_tag=query.any_tag):
+        return False
     if query.date_filter is not None:
         if not _matches_date_filter(task, query.date_filter):
             return False
     if query.task_ids is not None and task.id not in set(query.task_ids):
         return False
     return True
+
+
+def _effective_merge_state(task: DbTask, *, merge_unit: MergeUnit | None) -> str | None:
+    return merge_unit.state if merge_unit is not None else task.merge_status
+
+
+def _matches_status_filters(
+    task: DbTask,
+    statuses: set[str],
+    *,
+    merge_unit: MergeUnit | None,
+) -> bool:
+    if "unmerged" in statuses and _matches_merge_chain_state(task, {"unmerged"}, merge_unit=merge_unit):
+        return True
+    return task.status in statuses
+
+
+def _matches_merge_chain_state(
+    task: DbTask,
+    merge_states: set[str],
+    *,
+    merge_unit: MergeUnit | None,
+) -> bool:
+    merge_state = _effective_merge_state(task, merge_unit=merge_unit)
+    if "merged" in merge_states and merge_state == "merged":
+        return True
+    if "unmerged" in merge_states and (
+        merge_state == "unmerged" or (task.status == "unmerged" and merge_unit is None and merge_state != "merged")
+    ):
+        return True
+    if "needs_merge" in merge_states and task.status == "completed" and task.has_commits and merge_state != "merged":
+        return True
+    return False
 
 
 def _task_time_for_field(task: DbTask, field_name: str) -> datetime | None:
@@ -302,11 +359,7 @@ def is_lineage_resolved(snapshot: LineageOwnerSnapshot) -> LineageResolution:
         )
 
     if not snapshot.failed_leaves and not merged_member_ids:
-        unresolved_nonfailed = [
-            task
-            for task in snapshot.members
-            if task.status in {"failed", "dropped", "pending", "in_progress", "unmerged"}
-        ]
+        unresolved_nonfailed = [task for task in snapshot.members if not _snapshot_task_is_complete(snapshot, task)]
         if not unresolved_nonfailed:
             reasons.append("lineage_complete")
 
@@ -315,6 +368,21 @@ def is_lineage_resolved(snapshot: LineageOwnerSnapshot) -> LineageResolution:
         reasons=tuple(reasons),
         resolved_by_task_ids=tuple(dict.fromkeys(task_id for task_id in resolved_by_ids if task_id is not None)),
     )
+
+
+def _snapshot_task_is_complete(snapshot: LineageOwnerSnapshot, task: DbTask) -> bool:
+    if task.status in {"failed", "pending", "in_progress", "dropped"}:
+        return False
+    merge_state = _effective_merge_state(task, merge_unit=snapshot.merge_units_by_task_id.get(task.id or ""))
+    if task.status == "completed":
+        if merge_state == "merged":
+            return True
+        if not task.has_commits:
+            return True
+        return False
+    if task.status == "unmerged":
+        return merge_state == "merged"
+    return False
 
 
 def _build_owner_tree(
@@ -524,10 +592,12 @@ def query_lineage_owner_rows(
                 continue
             if task.status not in {"failed", "completed", "unmerged", "dropped"}:
                 continue
+            merge_unit = merge_units_by_member.get(task.id)
             matches = _matches_task_filters(
                 task,
                 query,
                 tag_matcher=task_matches_tag_filters,
+                merge_unit=merge_unit,
             )
             if task.task_type in {"plan", "explore"} and task.status == "completed" and task.id not in indexes.impl_based_on_ids:
                 if matches:
@@ -552,7 +622,6 @@ def query_lineage_owner_rows(
                 continue
             if merged_owner_branch:
                 continue
-            merge_unit = merge_units_by_member.get(task.id)
             explicit_merge_state = merge_unit.state if merge_unit is not None else task.merge_status
             if task.status in {"completed", "unmerged"} and explicit_merge_state == "unmerged":
                 if matches:
