@@ -71,6 +71,24 @@ class _AdvanceGit:
     def default_branch(self) -> str:
         return self._default_branch
 
+    def can_merge(self, branch: str, into: str | None = None) -> bool:
+        return True
+
+    def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
+        return False
+
+    def branch_exists(self, branch: str) -> bool:
+        return True
+
+    def ref_exists(self, ref: str) -> bool:
+        return False
+
+    def count_commits_ahead(self, branch: str, target: str) -> int:
+        return 1
+
+    def get_diff_stat_parsed(self, revision_range: str) -> tuple[int, int, int]:
+        return (1, 1, 0)
+
 
 def _add_completed_legacy_impl(store, prompt: str, branch: str):
     task = store.add(prompt, task_type="implement")
@@ -267,6 +285,59 @@ def test_advance_dry_run_uses_current_branch_for_merge_unit_target_collection(tm
     assert release_task.id in result.stdout
     assert "eligible on current release branch" in result.stdout
     assert calls == [release_task.id]
+
+
+def test_advance_dry_run_filters_owner_rows_by_target_branch_and_keeps_legacy_fallback(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    main_task = _add_completed_legacy_impl(store, "Main-target owner", "feature/main-owner")
+    release_task = _add_completed_legacy_impl(store, "Release-target owner", "feature/release-owner")
+    legacy_task = _add_completed_legacy_impl(store, "Legacy fallback owner", "feature/legacy-owner")
+    assert main_task.id is not None
+    assert release_task.id is not None
+    assert legacy_task.id is not None
+
+    main_unit = store.create_merge_unit(
+        source_branch="feature/main-owner",
+        target_branch="main",
+        owner_task_id=main_task.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(main_task.id, main_unit.id, "owner")
+    store.dual_write_legacy_merge_status(main_unit.id)
+
+    release_unit = store.create_merge_unit(
+        source_branch="feature/release-owner",
+        target_branch="release",
+        owner_task_id=release_task.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(release_task.id, release_unit.id, "owner")
+    store.dual_write_legacy_merge_status(release_unit.id)
+
+    calls: list[str] = []
+
+    def _fake_determine_next_action(*args, **kwargs):
+        selected_task = args[3]
+        assert selected_task.id is not None
+        calls.append(selected_task.id)
+        return {"type": "merge", "description": f"merge {selected_task.id}"}
+
+    with (
+        patch("gza.cli.git_ops.Git", lambda _project_dir: _AdvanceGit(current_branch="main")),
+        patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine_next_action),
+    ):
+        result = run_gza("advance", "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert set(calls) == {main_task.id, legacy_task.id}
+    assert release_task.id not in calls
+    assert main_task.id in result.stdout
+    assert legacy_task.id in result.stdout
+    assert release_task.id not in result.stdout
 
 
 def test_merge_review_task_id_resolves_branchless_review_to_implementation_unit(tmp_path: Path) -> None:

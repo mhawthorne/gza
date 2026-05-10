@@ -437,7 +437,7 @@ class TestQueryIncomplete:
         lineages = query_incomplete(store, HistoryFilter(limit=None))
         assert lineages == []
 
-    def test_failed_improve_under_merged_root_remains_unresolved(self, tmp_path: Path):
+    def test_failed_improve_under_merged_root_is_suppressed(self, tmp_path: Path):
         store = self._store(tmp_path)
 
         root = store.add("implement root", task_type="implement")
@@ -450,11 +450,7 @@ class TestQueryIncomplete:
         store.update(improve)
         assert improve.id is not None
 
-        lineages = query_incomplete(store, HistoryFilter(limit=None))
-        assert len(lineages) == 1
-        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
-        assert improve.id in unresolved_ids
-        assert root.id not in unresolved_ids
+        assert query_incomplete(store, HistoryFilter(limit=None)) == []
 
     def test_unmerged_root_keeps_unresolved_completed_improve_descendant_visible(self, tmp_path: Path):
         store = self._store(tmp_path)
@@ -569,7 +565,7 @@ class TestQueryIncomplete:
 
         assert query_incomplete(store, HistoryFilter(limit=None)) == []
 
-    def test_failed_review_attached_to_merged_unit_remains_visible(self, tmp_path: Path):
+    def test_failed_review_attached_to_merged_unit_is_suppressed(self, tmp_path: Path):
         store = self._store(tmp_path)
 
         root = store.add("implement root", task_type="implement")
@@ -590,10 +586,7 @@ class TestQueryIncomplete:
         assert attached_unit.id == unit.id
         store.set_merge_unit_state(unit.id, "merged")
 
-        lineages = query_incomplete(store, HistoryFilter(limit=None))
-        assert len(lineages) == 1
-        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
-        assert unresolved_ids == {review.id}
+        assert query_incomplete(store, HistoryFilter(limit=None)) == []
 
     def test_dropped_root_task_remains_visible(self, tmp_path: Path):
         store = self._store(tmp_path)
@@ -653,7 +646,7 @@ class TestQueryIncomplete:
         lineages = query_incomplete(store, HistoryFilter(limit=None))
         assert lineages == []
 
-    def test_completed_no_commit_plan_root_is_excluded(self, tmp_path: Path):
+    def test_completed_no_commit_plan_root_is_visible_as_unimplemented(self, tmp_path: Path):
         store = self._store(tmp_path)
 
         plan = store.add("plan complete", task_type="plan")
@@ -664,9 +657,12 @@ class TestQueryIncomplete:
         store.update(plan)
 
         lineages = query_incomplete(store, HistoryFilter(limit=None))
-        assert lineages == []
+        assert len(lineages) == 1
+        assert lineages[0].root.id == plan.id
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {plan.id}
 
-    def test_failed_rebase_under_merged_root_remains_visible(self, tmp_path: Path):
+    def test_failed_rebase_under_merged_root_is_suppressed(self, tmp_path: Path):
         store = self._store(tmp_path)
 
         root = store.add("implement root", task_type="implement")
@@ -679,10 +675,7 @@ class TestQueryIncomplete:
         store.update(rebase)
         assert rebase.id is not None
 
-        lineages = query_incomplete(store, HistoryFilter(limit=None))
-        assert len(lineages) == 1
-        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
-        assert unresolved_ids == {rebase.id}
+        assert query_incomplete(store, HistoryFilter(limit=None)) == []
 
     def test_completed_unmerged_root_superseded_by_merged_retry_is_hidden(self, tmp_path: Path):
         """Regression: completed-but-unmerged root should be suppressed once a
@@ -761,7 +754,7 @@ class TestQueryIncomplete:
         lineages = query_incomplete(store, HistoryFilter(limit=None))
         assert lineages == []
 
-    def test_unmerged_root_is_not_suppressed_by_merged_improve_descendant(self, tmp_path: Path):
+    def test_unmerged_root_is_suppressed_by_merged_improve_descendant(self, tmp_path: Path):
         store = self._store(tmp_path)
 
         root = store.add("unmerged implement", task_type="implement")
@@ -773,11 +766,7 @@ class TestQueryIncomplete:
         self._complete(improve, merge_status="merged")
         store.update(improve)
 
-        lineages = query_incomplete(store, HistoryFilter(limit=None))
-        assert len(lineages) == 1
-        assert lineages[0].root.id == root.id
-        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
-        assert unresolved_ids == {root.id}
+        assert query_incomplete(store, HistoryFilter(limit=None)) == []
 
     def test_failed_root_with_merged_resume_hides_shared_branch_completed_descendants(self, tmp_path: Path):
         """Regression: failed root should use merged resume head merge truth."""

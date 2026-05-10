@@ -17,12 +17,11 @@ from ..config import Config
 from ..console import prompt_available_width, shorten_prompt
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..git import Git, GitError
+from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..recovery_engine import (
     FailedRecoveryDecision,
     decide_failed_task_recovery,
-    has_recovery_chain_ancestor_in_ids,
-    list_failed_tasks_for_recovery,
     should_hide_failed_recovery_decision,
 )
 from ..sync_ops import reconcile_task_branch_merge_truth
@@ -63,7 +62,7 @@ from .advance_executor import (
 )
 from .execution import _spawn_background_iterate
 from .git_ops import (
-    _collect_advance_completed_tasks,
+    _collect_advance_completed_tasks as _git_ops_collect_advance_completed_tasks,
     _execute_merge_action,
     _merge_single_task as _git_ops_merge_single_task,
     _prepare_create_review_action,
@@ -89,6 +88,20 @@ def _merge_single_task(
 ) -> int:
     """Compatibility shim for tests patching watch-local merge execution."""
     return _git_ops_merge_single_task(task_id, config, store, git, args, current_branch)
+
+
+def _collect_advance_completed_tasks(
+    store: SqliteTaskStore,
+    *,
+    advance_type: str | None = None,
+    target_branch: str | None = None,
+) -> tuple[list[DbTask], set[str]]:
+    """Compatibility shim for tests patching watch-local task collection."""
+    return _git_ops_collect_advance_completed_tasks(
+        store,
+        advance_type=advance_type,
+        target_branch=target_branch,
+    )
 
 
 def _watch_skip_message(task: DbTask, action: dict) -> str:
@@ -118,6 +131,48 @@ def _failed_recovery_attention_action(
         task,
         decision,
         max_recovery_attempts=max_recovery_attempts,
+    )
+
+
+def _format_recovery_report_subject(row: LineageOwnerRow, task: DbTask) -> str:
+    owner_id = row.owner_task.id or "unknown"
+    task_id = task.id or "unknown"
+    subject_ids: list[str] = [owner_id]
+    if task_id != owner_id:
+        subject_ids.append(task_id)
+    subject_ids.extend(
+        failed_task.id
+        for failed_task in row.unresolved_tasks
+        if failed_task.id is not None and failed_task.status == "failed" and failed_task.id not in set(subject_ids)
+    )
+    return " ".join(subject_ids)
+
+
+def _query_owner_rows(
+    *,
+    store: SqliteTaskStore,
+    config: Config | None = None,
+    git: Git | None = None,
+    target_branch: str | None = None,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = False,
+    max_recovery_attempts: int,
+    include_skipped: bool,
+) -> list[LineageOwnerRow]:
+    return list(
+        query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(
+                limit=None,
+                tags=tags,
+                any_tag=any_tag,
+                include_skipped=include_skipped,
+                max_recovery_attempts=max_recovery_attempts,
+            ),
+            config=config,
+            git=git,
+            target_branch=target_branch,
+        )
     )
 
 
@@ -681,7 +736,27 @@ def _emit_recovery_dry_run_report(
     max_recovery_attempts: int,
     show_skipped: bool = False,
 ) -> _RecoveryReport:
-    failed_tasks = list_failed_tasks_for_recovery(store, tags=tags, any_tag=any_tag)
+    failed_rows = [
+        row
+        for row in _query_owner_rows(
+            store=store,
+            tags=tags,
+            any_tag=any_tag,
+            max_recovery_attempts=max_recovery_attempts,
+            include_skipped=True,
+        )
+        if (
+            row.recovery_leaf_task is not None
+            and row.action_task is not None
+            and row.action_task.id == row.recovery_leaf_task.id
+        )
+    ]
+    failed_rows.sort(
+        key=lambda row: (
+            row.recovery_leaf_task.created_at if row.recovery_leaf_task and row.recovery_leaf_task.created_at else datetime.min.replace(tzinfo=UTC),
+            task_id_numeric_key(row.owner_task.id),
+        )
+    )
     scope = ",".join(tags) if tags else "*"
     print(f"Failed recovery plan (tags={scope}, mode=restart-failed)")
     print()
@@ -689,14 +764,16 @@ def _emit_recovery_dry_run_report(
     attention_rows: list[tuple[DbTask, dict[str, object]]] = []
     skipped = 0
     hidden_skipped = 0
-    for task in failed_tasks:
+    for row in failed_rows:
+        task = row.recovery_leaf_task
+        assert task is not None
         if task.id is None:
             continue
         decision = decide_failed_task_recovery(store, task, max_recovery_attempts=max_recovery_attempts)
         if decision.action in {"resume", "retry"}:
             launch = decision.launch_mode
             print(
-                f"{decision.action:<6} {task.id} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
+                f"{decision.action:<6} {_format_recovery_report_subject(row, task)} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
                 f"attempt={decision.attempt_index}/{decision.attempt_limit}"
             )
             actionable += 1
@@ -718,7 +795,7 @@ def _emit_recovery_dry_run_report(
         if show_skipped:
             launch = decision.launch_mode
             print(
-                f"{decision.action:<6} {task.id} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
+                f"{decision.action:<6} {_format_recovery_report_subject(row, task)} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
                 f"attempt={decision.attempt_index}/{decision.attempt_limit}"
             )
         else:
@@ -810,14 +887,35 @@ def _run_cycle(
     isolation_enabled = bool(getattr(config, "main_checkout_isolate", False))
     git = Git(config.project_dir)
     target_branch = git.default_branch()
-    merge_candidates, impl_based_on_ids = _collect_advance_completed_tasks(store, target_branch=target_branch)
-    if tags:
-        merge_candidates = [
-            task
-            for task in merge_candidates
-            if task_matches_tag_filters(task_tags=task.tags, tag_filters=tags, any_tag=any_tag)
-        ]
-    if merge_candidates:
+    impl_based_on_ids = store.get_impl_based_on_ids()
+    owner_rows = _query_owner_rows(
+        store=store,
+        config=config,
+        git=git,
+        target_branch=target_branch,
+        tags=tags,
+        any_tag=any_tag,
+        max_recovery_attempts=max_recovery_attempts,
+        include_skipped=True,
+    )
+    lifecycle_rows = [
+        row
+        for row in owner_rows
+        if row.action_task is not None and row.action_task.status != "failed"
+    ]
+    recovery_rows = [row for row in owner_rows if row.recovery_leaf_task is not None]
+    recovery_rows = [
+        row
+        for row in recovery_rows
+        if row.action_task is not None and row.recovery_leaf_task is not None and row.action_task.id == row.recovery_leaf_task.id
+    ]
+    recovery_rows.sort(
+        key=lambda row: (
+            row.recovery_leaf_task.created_at if row.recovery_leaf_task and row.recovery_leaf_task.created_at else datetime.min.replace(tzinfo=UTC),
+            task_id_numeric_key(row.owner_task.id),
+        )
+    )
+    if lifecycle_rows:
         current_branch = git.current_branch()
         merge_git: Git | None = None
         merge_actions_available = True
@@ -857,10 +955,12 @@ def _run_cycle(
                 )
                 _rebuild_isolated_checkout()
 
-        action_plan: list[tuple[DbTask, dict]] = []
-        for task in merge_candidates:
+        action_plan: list[tuple[LineageOwnerRow, DbTask, dict]] = []
+        for row in lifecycle_rows:
+            task = row.action_task or row.owner_task
             action_plan.append(
                 (
+                    row,
                     task,
                     determine_next_action(
                         config,
@@ -872,8 +972,13 @@ def _run_cycle(
                     ),
                 )
         )
-        action_plan.sort(key=lambda item: _WATCH_ADVANCE_ACTION_ORDER.get(item[1].get("type", ""), 1))
-        has_merge_action = any(action.get("type") in {"merge", "merge_with_followups"} for _, action in action_plan)
+        action_plan.sort(
+            key=lambda item: (
+                _WATCH_ADVANCE_ACTION_ORDER.get(item[2].get("type", ""), 1),
+                1 if item[1].task_type in {"plan", "explore"} else 0,
+            )
+        )
+        has_merge_action = any(action.get("type") in {"merge", "merge_with_followups"} for _, _, action in action_plan)
         can_merge = merge_actions_available
         if has_merge_action:
             if isolation_enabled:
@@ -957,20 +1062,21 @@ def _run_cycle(
             ),
         )
 
-        for task, action in action_plan:
+        for row, task, action in action_plan:
+            display_task = row.owner_task
             action_type = action.get("type")
             if classify_advance_action(action) == "needs_attention":
                 log.emit_attention(
-                    attention_key=f"advance-attention:{task.id}:{action_type}",
-                    message=_watch_needs_attention_message(task, action),
+                    attention_key=f"advance-attention:{display_task.id}:{action_type}",
+                    message=_watch_needs_attention_message(display_task, action),
                 )
                 continue
 
             if classify_advance_action(action) == "skip":
                 log.emit(
                     "SKIP",
-                    _watch_skip_message(task, action),
-                    dedupe_key=f"advance-skip:{action_type}:{task.id}",
+                    _watch_skip_message(display_task, action),
+                    dedupe_key=f"advance-skip:{action_type}:{display_task.id}",
                 )
                 continue
 
@@ -990,7 +1096,7 @@ def _run_cycle(
                     )
                     continue
                 if dry_run:
-                    log.emit("MERGE", f"{task.id} -> {target_branch} [dry-run]")
+                    log.emit("MERGE", f"{display_task.id} -> {target_branch} [dry-run]")
                     work_done = True
                     continue
                 merge_execution_git = merge_git if (isolation_enabled and merge_git is not None) else git
@@ -1012,14 +1118,14 @@ def _run_cycle(
                 )
                 rc = merge_result.rc
                 for followup_task in merge_result.created_followups:
-                    log.emit("FOLLOW", f"{followup_task.id} created from {task.id}")
+                    log.emit("FOLLOW", f"{followup_task.id} created from {display_task.id}")
                 for followup_task in merge_result.reused_followups:
-                    log.emit("FOLLOW", f"{followup_task.id} reused from {task.id}")
+                    log.emit("FOLLOW", f"{followup_task.id} reused from {display_task.id}")
                 if rc == 0:
                     if getattr(merge_result, "status", "merged") == "already_merged":
-                        log.emit("INFO", f"{task.id} already merged into {target_branch}; marked merged")
+                        log.emit("INFO", f"{display_task.id} already merged into {target_branch}; marked merged")
                     else:
-                        log.emit("MERGE", f"{task.id} -> {target_branch}")
+                        log.emit("MERGE", f"{display_task.id} -> {target_branch}")
                     work_done = True
                 else:
                     conflict_handled = False
@@ -1038,7 +1144,7 @@ def _run_cycle(
                                 log.emit(
                                     "WARN",
                                     (
-                                        f"{task.id}: isolated checkout cleanup failed after conflict: "
+                                        f"{display_task.id}: isolated checkout cleanup failed after conflict: "
                                         f"{cleanup_error}"
                                     ),
                                 )
@@ -1046,7 +1152,7 @@ def _run_cycle(
                             try:
                                 rebase_task = _create_rebase_from_task(task)
                             except Exception as rebase_error:
-                                log.emit("ERROR", f"{task.id}: failed to create rebase task ({rebase_error})")
+                                log.emit("ERROR", f"{display_task.id}: failed to create rebase task ({rebase_error})")
                                 continue
                             assert rebase_task.id is not None
                             step1_handled_child_task_ids.add(str(rebase_task.id))
@@ -1060,19 +1166,19 @@ def _run_cycle(
                                 else:
                                     log.emit(
                                         "SKIP",
-                                        f"{task.id}: merge conflict rebase worker spawn failed",
-                                        dedupe_key=f"merge-conflict-rebase-spawn-failed:{task.id}",
+                                        f"{display_task.id}: merge conflict rebase worker spawn failed",
+                                        dedupe_key=f"merge-conflict-rebase-spawn-failed:{display_task.id}",
                                     )
                             else:
                                 log.emit(
                                     "SKIP",
-                                    f"{task.id}: merge conflict queued rebase {rebase_task.id} (no free slots)",
-                                    dedupe_key=f"merge-conflict-rebase-queued:{task.id}",
+                                    f"{display_task.id}: merge conflict queued rebase {rebase_task.id} (no free slots)",
+                                    dedupe_key=f"merge-conflict-rebase-queued:{display_task.id}",
                                 )
                             log.emit(
                                 "SKIP",
-                                f"{task.id}: merge conflict routed to rebase",
-                                dedupe_key=f"merge-conflict:{task.id}",
+                                f"{display_task.id}: merge conflict routed to rebase",
+                                dedupe_key=f"merge-conflict:{display_task.id}",
                             )
                     if conflict_handled:
                         continue
@@ -1092,7 +1198,7 @@ def _run_cycle(
                         if repaired.ok and repaired.merge_status == "merged":
                             log.emit(
                                 "REPAIR",
-                                f"{task.id}: marked merged after shared reconciliation against {target_branch}",
+                                f"{display_task.id}: marked merged after shared reconciliation against {target_branch}",
                             )
                             work_done = True
                             continue
@@ -1100,16 +1206,16 @@ def _run_cycle(
                         log.emit(
                             "SKIP",
                             (
-                                f"{task.id}: merge failed ({conflict_assessment.reason}); "
+                                f"{display_task.id}: merge failed ({conflict_assessment.reason}); "
                                 "not routing to rebase"
                             ),
-                            dedupe_key=f"merge-failed-non-conflict:{task.id}",
+                            dedupe_key=f"merge-failed-non-conflict:{display_task.id}",
                         )
                         continue
                     log.emit(
                         "SKIP",
-                        f"{task.id}: merge failed",
-                        dedupe_key=f"merge-failed:{task.id}",
+                        f"{display_task.id}: merge failed",
+                        dedupe_key=f"merge-failed:{display_task.id}",
                     )
                 continue
 
@@ -1126,30 +1232,30 @@ def _run_cycle(
                 if guarded_pending_task_id is not None:
                     step1_handled_child_task_ids.add(str(guarded_pending_task_id))
                 message = exec_result.message
-                if action_type == "improve" and task.id is not None:
-                    message = f"{task.id}: {message}"
+                if action_type == "improve" and display_task.id is not None:
+                    message = f"{display_task.id}: {message}"
                 attention = resolve_execution_needs_attention(task, exec_result)
-                if attention is not None and attention.task.id is not None:
+                if attention is not None and display_task.id is not None:
                     log.emit_attention(
-                        attention_key=f"advance-attention:{attention.task.id}:{attention.action['type']}",
-                        message=_watch_needs_attention_message(attention.task, attention.action),
+                        attention_key=f"advance-attention:{display_task.id}:{attention.action['type']}",
+                        message=_watch_needs_attention_message(display_task, attention.action),
                     )
                     continue
                 log.emit(
                     "SKIP",
                     message,
-                    dedupe_key=f"advance-worker-skip:{action_type}:{task.id}:{message}",
+                    dedupe_key=f"advance-worker-skip:{action_type}:{display_task.id}:{message}",
                 )
                 continue
 
             if exec_result.status == "error":
                 if guarded_pending_task_id is not None:
                     step1_handled_child_task_ids.add(str(guarded_pending_task_id))
-                if not exec_result.attempted_spawn and task.id is not None:
+                if not exec_result.attempted_spawn and display_task.id is not None:
                     log.emit(
                         "ERROR",
-                        f"{task.id}: {exec_result.message}",
-                        dedupe_key=f"advance-worker-error:{action_type}:{task.id}:{exec_result.message}",
+                        f"{display_task.id}: {exec_result.message}",
+                        dedupe_key=f"advance-worker-error:{action_type}:{display_task.id}:{exec_result.message}",
                     )
                 if child_id is not None and action_type in {
                     "create_review",
@@ -1168,8 +1274,8 @@ def _run_cycle(
                 if exec_result.worker_label == "iterate" and child_id is not None:
                     log.emit("START", f"{child_id} iterate [dry-run]")
                     started_task_ids.add(str(child_id))
-                elif action_type == "create_review" and task.id is not None:
-                    log.emit("START", f"(new) review for {task.id} [dry-run]")
+                elif action_type == "create_review" and display_task.id is not None:
+                    log.emit("START", f"(new) review for {display_task.id} [dry-run]")
                 elif action_type == "run_review" and child_id is not None:
                     log.emit("START", f"{child_id} review [dry-run]")
                     started_task_ids.add(str(child_id))
@@ -1179,15 +1285,15 @@ def _run_cycle(
                         log.emit("START", f"(resume) improve for {failed_id} [dry-run]")
                     elif exec_result.improve_mode == "retry" and failed_id is not None:
                         log.emit("START", f"(retry) improve for {failed_id} [dry-run]")
-                    elif task.id is not None:
-                        log.emit("START", f"(new) improve for {task.id} [dry-run]")
+                    elif display_task.id is not None:
+                        log.emit("START", f"(new) improve for {display_task.id} [dry-run]")
                 elif action_type == "run_improve" and child_id is not None:
                     log.emit("START", f"{child_id} improve [dry-run]")
                     started_task_ids.add(str(child_id))
-                elif action_type == "create_implement" and task.id is not None:
-                    log.emit("START", f"(new) implement for {task.id} [dry-run]")
-                elif action_type == "needs_rebase" and task.id is not None:
-                    log.emit("START", f"(new) rebase for {task.id} [dry-run]")
+                elif action_type == "create_implement" and display_task.id is not None:
+                    log.emit("START", f"(new) implement for {display_task.id} [dry-run]")
+                elif action_type == "needs_rebase" and display_task.id is not None:
+                    log.emit("START", f"(new) rebase for {display_task.id} [dry-run]")
                 slots -= 1
                 work_done = True
                 continue
@@ -1221,13 +1327,11 @@ def _run_cycle(
     if restart_failed:
         log.emit("PHASE", "recovery queue enabled (--restart-failed)")
     failed_decisions: list[tuple[DbTask, FailedRecoveryDecision]] = []
-    actionable_failed: list[tuple[DbTask, FailedRecoveryDecision]] = []
-    completed_owner_ids = {task.id for task in merge_candidates if task.id is not None}
-    failed_tasks = list_failed_tasks_for_recovery(store, tags=tags, any_tag=any_tag)
-    for failed in failed_tasks:
+    actionable_failed: list[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision]] = []
+    for row in recovery_rows:
+        failed = row.recovery_leaf_task
+        assert failed is not None
         if failed.id is None:
-            continue
-        if has_recovery_chain_ancestor_in_ids(store, failed, completed_owner_ids):
             continue
         decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
         failed_decisions.append((failed, decision))
@@ -1250,13 +1354,13 @@ def _run_cycle(
             if restart_failed and show_skipped:
                 log.emit(
                     "SKIP",
-                    f"{failed.id} failed {failed.task_type}: {decision.reason_code}",
-                    dedupe_key=f"recovery-skip:{failed.id}:{decision.reason_code}",
+                    f"{row.owner_task.id} failed {failed.task_type}: {decision.reason_code}",
+                    dedupe_key=f"recovery-skip:{row.owner_task.id}:{decision.reason_code}",
                 )
             continue
         if decision.recovery_task_id is not None:
             pending_recovery_task_ids.add(decision.recovery_task_id)
-        actionable_failed.append((failed, decision))
+        actionable_failed.append((row, failed, decision))
 
     pending_tasks = _pending_runnable_tasks(store, tags=tags, any_tag=any_tag)
     pending_candidates = [
@@ -1276,7 +1380,7 @@ def _run_cycle(
         recovery_slots = max(0, slots - reserved_for_pending)
     started_recovery_task_ids: set[str] = set()
     launched_recovery_count = 0
-    for failed, decision in actionable_failed:
+    for row, failed, decision in actionable_failed:
         if recovery_slots <= 0:
             break
         if failed.id is None:
@@ -1288,6 +1392,7 @@ def _run_cycle(
                     "RECOVR",
                     (
                         f"{failed.id} resume via {decision.launch_mode} -> {destination} "
+                        f"[owner={row.owner_task.id}] "
                         f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
                     ),
                 )
@@ -1338,6 +1443,7 @@ def _run_cycle(
                     "RECOVR",
                     (
                         f"{failed.id} retry via {decision.launch_mode} -> {destination} "
+                        f"[owner={row.owner_task.id}] "
                         f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
                     ),
                 )

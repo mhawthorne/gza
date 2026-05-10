@@ -21,6 +21,7 @@ from gza.cli.watch import (
     _CycleResult,
     _emit_transition_events,
     _format_wake_message,
+    _query_owner_rows,
     _run_cycle,
     _task_snapshot,
     _watch_iterate_impl_target,
@@ -98,6 +99,73 @@ def test_watch_collects_legacy_unmerged_owner_after_lazy_merge_unit_backfill(tmp
     unit = store.resolve_merge_unit_for_task(legacy.id)
     assert unit is not None
     assert unit.state == "unmerged"
+
+
+def test_watch_query_owner_rows_filters_target_branch_and_keeps_legacy_fallback(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    main_task = store.add("Watch main owner", task_type="implement")
+    release_task = store.add("Watch release owner", task_type="implement")
+    legacy_task = store.add("Watch legacy owner", task_type="implement")
+    assert main_task.id is not None
+    assert release_task.id is not None
+    assert legacy_task.id is not None
+
+    for task, branch in (
+        (main_task, "feature/watch-main"),
+        (release_task, "feature/watch-release"),
+        (legacy_task, "feature/watch-legacy"),
+    ):
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+    assert store.resolve_merge_unit_for_task(legacy_task.id) is None
+
+    main_unit = store.create_merge_unit(
+        source_branch="feature/watch-main",
+        target_branch="main",
+        owner_task_id=main_task.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(main_task.id, main_unit.id, "owner")
+    store.dual_write_legacy_merge_status(main_unit.id)
+
+    release_unit = store.create_merge_unit(
+        source_branch="feature/watch-release",
+        target_branch="release",
+        owner_task_id=release_task.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(release_task.id, release_unit.id, "owner")
+    store.dual_write_legacy_merge_status(release_unit.id)
+
+    config = Config.load(tmp_path)
+    git = MagicMock()
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.ref_exists.return_value = False
+    git.can_merge.return_value = True
+    git.is_merged.return_value = False
+    git.count_commits_ahead.return_value = 1
+    git.get_diff_stat_parsed.return_value = (1, 1, 0)
+    git.get_diff_numstat.return_value = "1\t0\tfeature.txt\n"
+
+    rows = _query_owner_rows(
+        store=store,
+        config=config,
+        git=git,
+        target_branch="main",
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+
+    owner_ids = {row.owner_task.id for row in rows}
+    assert owner_ids == {main_task.id, legacy_task.id}
 
 
 def test_watch_cycle_prefers_freshly_bumped_task_over_older_urgent(tmp_path: Path) -> None:
@@ -5068,9 +5136,9 @@ def test_cmd_watch_restart_failed_dry_run_hides_skipped_by_default_and_sorts_old
     assert "TEST_FAILURE requires manual intervention" in normalized
     assert f'{exhausted_child.id} implement "Failed resume attempt" reason=max-resume-attempts-reached' in normalized
     assert "automatic recovery stops here; manual review required" in normalized
-    assert f"{exhausted_root.id} implement" in normalized
-    assert "reason=newer-recovery-descendant-needs-attention" in normalized
-    assert "2 actionable (0 resume, 2 retry), 3 needs attention, 1 skipped hidden" in normalized
+    assert f'{exhausted_root.id} implement "Failed resume root"' not in normalized
+    assert "reason=newer-recovery-descendant-needs-attention" not in normalized
+    assert "2 actionable (0 resume, 2 retry), 2 needs attention, 1 skipped hidden" in normalized
 
 
 def test_cmd_watch_restart_failed_dry_run_show_skipped_includes_skipped_entries(

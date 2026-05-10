@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -77,6 +78,33 @@ def test_incomplete_preset_projects_next_action_fields(tmp_path: Path) -> None:
     assert hasattr(row, "owner_task")
     assert row.values["next_action"] == "unknown"
     assert "missing config/git context" in str(row.values["next_action_reason"])
+
+
+def test_incomplete_preset_projects_real_next_action_when_context_available(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    plan = store.add("completed plan", task_type="plan")
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQueryPresets.incomplete(limit=None),
+        config=SimpleNamespace(
+            max_resume_attempts=1,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+        ),
+        git=SimpleNamespace(),
+        target_branch="main",
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert hasattr(row, "owner_task")
+    assert row.values["next_action"] == "create_implement"
+    assert row.values["next_action_reason"] == "Create and start implement task"
 
 
 def test_lifecycle_incomplete_prefers_merged_unit_state_over_stale_task_row(tmp_path: Path) -> None:

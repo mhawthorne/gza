@@ -11376,6 +11376,34 @@ class TestIncompleteCommand:
         assert json.loads(result.stdout) == [{"id": task.id, "status": "failed"}]
         assert result.stderr == ""
 
+    def test_incomplete_cli_json_uses_real_next_action_when_git_context_is_available(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        plan = store.add("cli completed plan", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = run_gza(
+                "incomplete",
+                "--json",
+                "--fields",
+                "id,next_action,next_action_reason",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == [
+            {
+                "id": plan.id,
+                "next_action": "create_implement",
+                "next_action_reason": "Create and start implement task",
+            }
+        ]
+        assert result.stderr == ""
+
     def test_incomplete_cli_unknown_fields_list_valid_choices(self, tmp_path: Path):
         setup_config(tmp_path)
         make_store(tmp_path).add("cli unknown incomplete field", task_type="implement")

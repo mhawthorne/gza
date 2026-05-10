@@ -371,8 +371,8 @@ def test_internal_advance_workflow_task_collection_tracks_shared_recovery_policy
     internal_content = (docs_root / "internal" / "advance-workflow.md").read_text()
     task_collection_section = internal_content.split("## Task Collection", 1)[1].split("## Configuration", 1)[0]
 
-    assert "Advance collects tasks from three sources" in task_collection_section
-    assert "store.list_failed_tasks_for_recovery(...)" in task_collection_section
+    assert "Advance collects owner rows from one shared source" in task_collection_section
+    assert "query_lineage_owner_rows(...)" in task_collection_section
     assert "decide_failed_task_recovery(...)" in task_collection_section
     assert "resume`, `retry`, or manual review required" in task_collection_section
     assert "advance --dry-run` surfaces one warning that only git branch reachability suppression is unavailable for this run" in task_collection_section

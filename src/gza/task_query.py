@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal, TypeVar
 
 from gza.db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
+from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
 
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
@@ -110,6 +111,10 @@ class LineageRow:
     members: tuple[DbTask, ...]
     tree: Any | None
     unresolved_tasks: tuple[DbTask, ...] = ()
+    action_task: DbTask | None = None
+    recovery_leaf_task: DbTask | None = None
+    lineage_status: str | None = None
+    next_action_data: Mapping[str, object] | None = None
     values: Mapping[str, object] = field(default_factory=dict)
 
 
@@ -373,7 +378,12 @@ class TaskQueryService:
     ) -> TaskQueryResult:
         """Execute a query and return projected rows."""
         if query.scope == "lineages":
-            all_lineages = self._collect_lineages_unlimited(query, target_branch=target_branch)
+            all_lineages = self._collect_lineages_unlimited(
+                query,
+                config=config,
+                git=git,
+                target_branch=target_branch,
+            )
             lineages = self._apply_limit(all_lineages, query.limit)
             lineage_rows = tuple(
                 self._project_lineage_row(
@@ -413,10 +423,32 @@ class TaskQueryService:
             return list(self._store.get_pending(limit=None, tags=tags, any_tag=query.any_tag))
         return list(self._store.get_all())
 
-    def _collect_lineages(self, query: TaskQuery, *, target_branch: str | None = None) -> list[LineageRow]:
-        return self._apply_limit(self._collect_lineages_unlimited(query, target_branch=target_branch), query.limit)
+    def _collect_lineages(
+        self,
+        query: TaskQuery,
+        *,
+        config: Any | None = None,
+        git: Any | None = None,
+        target_branch: str | None = None,
+    ) -> list[LineageRow]:
+        return self._apply_limit(
+            self._collect_lineages_unlimited(
+                query,
+                config=config,
+                git=git,
+                target_branch=target_branch,
+            ),
+            query.limit,
+        )
 
-    def _collect_lineages_unlimited(self, query: TaskQuery, *, target_branch: str | None = None) -> list[LineageRow]:
+    def _collect_lineages_unlimited(
+        self,
+        query: TaskQuery,
+        *,
+        config: Any | None = None,
+        git: Any | None = None,
+        target_branch: str | None = None,
+    ) -> list[LineageRow]:
         use_incomplete_rollup = bool(
             query.lifecycle_state and "incomplete" in query.lifecycle_state
         )
@@ -427,81 +459,37 @@ class TaskQueryService:
                 raise ValueError(
                     "lineages scope with lifecycle_state=incomplete supports at most one task type"
                 )
-            f = _history_filter_cls()(
-                limit=None,
-                task_type=(query.task_types[0] if query.task_types and len(query.task_types) == 1 else None),
-                days=query.date_filter.days if query.date_filter else None,
-                start_date=(query.date_filter.start.isoformat() if query.date_filter and query.date_filter.start else None),
-                end_date=(query.date_filter.end.isoformat() if query.date_filter and query.date_filter.end else None),
-                date_field=(query.date_filter.field if query.date_filter else "effective"),
+            owner_rows = query_lineage_owner_rows(
+                self._store,
+                LineageOwnerQuery(
+                    limit=None,
+                    task_types=query.task_types,
+                    exclude_task_types=query.exclude_task_types,
+                    tags=query.tag_filters,
+                    any_tag=query.any_tag,
+                    date_filter=query.date_filter,
+                    include_skipped=True,
+                    groups=query.groups,
+                    task_ids=query.task_ids,
+                    owner_task_ids=query.branch_owner_ids,
+                ),
+                config=config,
+                git=git,
+                target_branch=target_branch,
             )
-            incomplete = _query_incomplete(self._store, f, target_branch=target_branch)
-            excluded_task_types = set(query.exclude_task_types) if query.exclude_task_types is not None else None
-            unresolved_by_owner: dict[str, list[DbTask]] = {}
-            incomplete_owner_by_id: dict[str, DbTask] = {}
-            root_by_owner_id: dict[str, DbTask] = {}
-            tree_by_root_id: dict[str, Any] = {}
-
-            for item in incomplete:
-                root = item.root
-                if root.id is None:
-                    continue
-                tree_by_root_id[root.id] = item.tree
-
-                for task in item.unresolved_tasks:
-                    if excluded_task_types is not None and task.task_type in excluded_task_types:
-                        continue
-                    if not self._matches_group_and_tag_filters(task, query):
-                        continue
-                    owner = self._resolve_branch_owner(task, query=query)
-                    owner_id = owner.id
-                    if owner_id is None:
-                        continue
-                    unresolved_by_owner.setdefault(owner_id, []).append(task)
-                    incomplete_owner_by_id[owner_id] = owner
-                    root_by_owner_id[owner_id] = root
-
-            rows = []
-            for owner_id, unresolved_tasks in unresolved_by_owner.items():
-                owner = incomplete_owner_by_id[owner_id]
-                root = root_by_owner_id[owner_id]
-                root_id = root.id
-                if root_id is None:
-                    continue
-
-                unresolved_by_id = {
-                    task.id: task for task in unresolved_tasks if task.id is not None
-                }
-                owner_unresolved = tuple(
-                    sorted(
-                        unresolved_by_id.values(),
-                        key=lambda task: self._sort_key(task, query.sort),
-                        reverse=query.sort.descending,
-                    )
+            rows = [
+                LineageRow(
+                    owner_task=row.owner_task,
+                    members=row.members,
+                    tree=row.tree,
+                    unresolved_tasks=row.unresolved_tasks,
+                    action_task=row.action_task,
+                    recovery_leaf_task=row.recovery_leaf_task,
+                    lineage_status=row.lineage_status,
+                    next_action_data=row.next_action,
                 )
-
-                keep_ids = {task_id for task_id in unresolved_by_id}
-                if owner.id is not None:
-                    keep_ids.add(owner.id)
-                keep_ids.add(root_id)
-
-                root_tree = tree_by_root_id.get(root_id) or _build_lineage_tree(
-                    self._store,
-                    root,
-                    max_depth=None,
-                )
-                pruned_tree = _prune_lineage_tree_to_ids(root_tree, keep_ids)
-                members = tuple(_flatten_lineage_tree(pruned_tree))
-
-                rows.append(
-                    LineageRow(
-                        owner_task=owner,
-                        members=members,
-                        tree=pruned_tree,
-                        unresolved_tasks=owner_unresolved,
-                        values={},
-                    )
-                )
+                for row in owner_rows
+            ]
         else:
             grouped: dict[str, list[DbTask]] = {}
             owner_by_id: dict[str, DbTask] = {}
@@ -822,14 +810,20 @@ class TaskQueryService:
         next_action_owner_id: str | None = None
 
         if query.projection.preset == TaskProjectionPreset.INCOMPLETE_SUMMARY:
-            action = self._project_next_action(
-                owner,
-                config=config,
-                git=git,
-                target_branch=target_branch,
+            action = (
+                dict(row.next_action_data)
+                if row.next_action_data is not None
+                else self._project_next_action(
+                    row.action_task or owner,
+                    config=config,
+                    git=git,
+                    target_branch=target_branch,
+                )
             )
-            next_action_type = action.get("type") if action else None
-            next_action_reason = action.get("description") if action else None
+            action_type_value = action.get("type") if action else None
+            action_reason_value = action.get("description") if action else None
+            next_action_type = str(action_type_value) if action_type_value is not None else None
+            next_action_reason = str(action_reason_value) if action_reason_value is not None else None
             next_action_owner_id = owner.id
 
         values: dict[str, object] = {
@@ -864,6 +858,10 @@ class TaskQueryService:
             members=row.members,
             tree=row.tree,
             unresolved_tasks=row.unresolved_tasks,
+            action_task=row.action_task,
+            recovery_leaf_task=row.recovery_leaf_task,
+            lineage_status=row.lineage_status,
+            next_action_data=row.next_action_data,
             values=self._apply_projection(values, query.projection, scope="lineages"),
         )
 

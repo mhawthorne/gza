@@ -32,18 +32,14 @@ from ..git import (
     cleanup_worktree_for_branch,
     resolve_ref_if_possible,
 )
+from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
 from ..pickup import (
     count_worker_consuming_actions,
     get_runnable_pending_tasks,
     is_worker_consuming_advance_action,
 )
 from ..pr_ops import build_task_pr_content, ensure_task_pr
-from ..recovery_engine import (
-    has_recovery_chain_ancestor_in_ids,
-    is_resolved_by_merged_target,
-    list_failed_tasks_for_recovery,
-    resolve_recovery_planning_task,
-)
+from ..recovery_engine import list_failed_tasks_for_recovery, resolve_recovery_planning_task
 from ..runner import (
     TaskExecutionLogger,
     ensure_task_log_path,
@@ -1885,11 +1881,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             task_types=unimplemented_types,
         )
 
-    # Pre-compute the set of plan IDs that already have implement children
-    # to avoid repeated DB queries in evaluate_advance_rules.
-    impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
-
-    failed_tasks: list[DbTask] = []
+    owner_rows: list[LineageOwnerRow] = []
     failed_task_recovery_warnings: list[str] = []
     target_branch: str | None = None
 
@@ -1903,19 +1895,6 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if no_resume_failed:
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
                 return 1
-            if is_resolved_by_merged_target(store, task):
-                tasks = []
-                failed_tasks = []
-            else:
-                planning_task = resolve_recovery_planning_task(store, task)
-                if planning_task is not task:
-                    tasks = [planning_task] if not _task_is_already_merged(
-                        store, planning_task
-                    ) else []
-                    failed_tasks = []
-                else:
-                    tasks = []
-                    failed_tasks = [task]
         else:
             if task.status != 'completed':
                 print(f"Error: Task {task_id} is not completed (status: {task.status})")
@@ -1923,48 +1902,76 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if _task_is_already_merged(store, task):
                 print(f"Task {task_id} is already merged")
                 return 0
-            tasks = [task]
+        target_branch = git.current_branch()
+        owner_rows = list(
+            query_lineage_owner_rows(
+                store,
+                LineageOwnerQuery(
+                    limit=None,
+                    task_types=(advance_type,) if advance_type else None,
+                    include_skipped=True,
+                    max_recovery_attempts=max_resume_attempts,
+                ),
+                config=config,
+                git=git,
+                target_branch=target_branch,
+            )
+        )
+        owner_rows = [
+            row
+            for row in owner_rows
+            if task.id == row.owner_task.id
+            or any(member.id == task.id for member in row.members if member.id is not None)
+            or any(member.id == task.id for member in row.unresolved_tasks if member.id is not None)
+        ]
+        if not owner_rows:
+            planning_task = resolve_recovery_planning_task(store, task) if task.status == "failed" else task
+            owner_rows = [
+                LineageOwnerRow(
+                    owner_task=task,
+                    members=(planning_task,),
+                    tree=None,
+                    lineage_status="skipped",
+                    next_action={"type": "unknown", "description": "pending command evaluation"},
+                    next_action_reason="pending command evaluation",
+                    unresolved_tasks=(planning_task,),
+                    unresolved_leaf_summary=(),
+                    action_task=planning_task,
+                    recovery_leaf_task=task if task.status == "failed" else None,
+                )
+            ]
     else:
         target_branch = git.current_branch()
-        tasks, impl_based_on_ids = _collect_advance_completed_tasks(
-            store,
-            advance_type=advance_type,
-            target_branch=target_branch,
+        owner_rows = list(
+            query_lineage_owner_rows(
+                store,
+                LineageOwnerQuery(
+                    limit=None,
+                    task_types=(advance_type,) if advance_type else None,
+                    include_skipped=True,
+                    max_recovery_attempts=max_resume_attempts,
+                ),
+                config=config,
+                git=git,
+                target_branch=target_branch,
+            )
         )
-
-        # Apply failed-task filters after completed-task type filtering above.
-        if advance_type == 'plan':
-            tasks = [t for t in tasks if t.task_type == 'plan']
-        elif advance_type == 'implement':
-            tasks = [t for t in tasks if t.task_type == 'implement']
-
         if not no_resume_failed:
-            failed_tasks = list_failed_tasks_for_recovery(store, warnings=failed_task_recovery_warnings)
-            if advance_type == 'plan':
-                failed_tasks = [t for t in failed_tasks if t.task_type == 'plan']
-            elif advance_type == 'implement':
-                failed_tasks = [t for t in failed_tasks if t.task_type == 'implement']
+            list_failed_tasks_for_recovery(store, warnings=failed_task_recovery_warnings)
+        if no_resume_failed:
+            owner_rows = [
+                row
+                for row in owner_rows
+                if row.action_task is None or row.action_task.status != "failed"
+            ]
 
-    if not tasks and not failed_tasks and not new_mode:
+    if not owner_rows and not new_mode:
         print("No eligible tasks to advance")
         return 0
 
     # Apply --max limit
     if max_tasks is not None:
-        tasks = tasks[:max_tasks]
-
-    # Keep failed-task recovery on a single based_on-chain owner. When a
-    # completed-task lifecycle action already owns a based_on recovery chain in
-    # this run, do not add failed descendants from that same chain as separate
-    # recovery rows.
-    if failed_tasks and tasks:
-        completed_owner_ids = {task.id for task in tasks if task.id is not None}
-        if completed_owner_ids:
-            failed_tasks = [
-                failed_task
-                for failed_task in failed_tasks
-                if not has_recovery_chain_ancestor_in_ids(store, failed_task, completed_owner_ids)
-            ]
+        owner_rows = owner_rows[:max_tasks]
 
     # Use the currently checked-out branch as the target for conflict checks,
     # merge execution, and rebase task creation.
@@ -2035,39 +2042,27 @@ def cmd_advance(args: argparse.Namespace) -> int:
             ),
         )
 
-    # Analyze each task to determine the next action
-    plan: list[tuple[DbTask, dict]] = []
-    for task in tasks:
+    plan: list[tuple[LineageOwnerRow, DbTask, dict[str, Any]]] = []
+    for row in owner_rows:
+        action_task = row.action_task or row.owner_task
         action = determine_next_action(
             config,
             store,
             git,
-            task,
+            action_task,
             target_branch,
-            impl_based_on_ids=impl_based_on_ids,
             max_resume_attempts=max_resume_attempts,
         )
-        plan.append((task, action))
-    for failed_task in failed_tasks:
-        action = determine_next_action(
-            config,
-            store,
-            git,
-            failed_task,
-            target_branch,
-            impl_based_on_ids=impl_based_on_ids,
-            max_resume_attempts=max_resume_attempts,
-        )
-        plan.append((failed_task, action))
+        plan.append((row, action_task, action))
 
     # Sort so merges execute before worker spawns. See _ADVANCE_ACTION_ORDER for
     # the rationale. The sort is stable, preserving DB order within each group.
     # dry-run output inherits this order, so it accurately reflects execution.
-    plan.sort(key=lambda item: _ADVANCE_ACTION_ORDER.get(item[1]['type'], 1))
+    plan.sort(key=lambda item: _ADVANCE_ACTION_ORDER.get(item[2]['type'], 1))
 
     attention_plan = [
-        (task, action)
-        for task, action in plan
+        (row.owner_task, action)
+        for row, _task, action in plan
         if classify_advance_action(action) == "needs_attention"
     ]
 
@@ -2083,9 +2078,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     preview_context = _build_action_context(dry_run_mode=True)
     preview_attention_plan = list(attention_plan)
-    preview_actionable_rows: list[tuple[DbTask, dict[str, Any], str]] = []
+    preview_actionable_rows: list[tuple[LineageOwnerRow, DbTask, dict[str, Any], str]] = []
 
-    for task, action in plan:
+    for row, task, action in plan:
         if classify_advance_action(action) != "actionable":
             continue
         description = action["description"]
@@ -2097,11 +2092,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
             preview_result = execute_advance_action(task=task, action=action, context=preview_context)
             attention = resolve_execution_needs_attention(task, preview_result)
             if attention is not None:
-                preview_attention_plan.append((attention.task, attention.action))
+                preview_attention_plan.append((row.owner_task, attention.action))
                 continue
             if preview_result.status == "dry_run" and preview_result.message:
                 description = preview_result.message
-        preview_actionable_rows.append((task, action, description))
+        preview_actionable_rows.append((row, task, action, description))
 
     # If the plan is empty or every item is a skip, there's nothing actionable
     # (unless --new is set, in which case we still want to start pending tasks).
@@ -2111,11 +2106,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
             _print_needs_attention_section(preview_attention_plan)
             if plan:
                 print()
-                for task, action in plan:
+                for row, _task, action in plan:
                     if classify_advance_action(action) != "skip":
                         continue
-                    prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
-                    console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    display_task = row.owner_task
+                    prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
+                    console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action['type'])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                 print()
@@ -2125,11 +2121,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 _print_needs_attention_section(preview_attention_plan)
                 print()
             if plan:
-                for task, action in plan:
+                for row, _task, action in plan:
                     if classify_advance_action(action) != "skip":
                         continue
-                    prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
-                    console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    display_task = row.owner_task
+                    prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
+                    console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action['type'])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                 print()
@@ -2139,9 +2136,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
             print(f"Warning: {warning}", file=sys.stderr)
         if preview_actionable_rows:
             print(f"Would advance {len(preview_actionable_rows)} task(s):\n")
-            for task, action, description in preview_actionable_rows:
-                prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
-                console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+            for row, _task, action, description in preview_actionable_rows:
+                display_task = row.owner_task
+                prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
+                console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                 _color = _advance_action_color(action['type'])
                 console.print(f"      [{_color}]→ {description}[/{_color}]")
                 print()
@@ -2150,19 +2148,20 @@ def cmd_advance(args: argparse.Namespace) -> int:
         _print_needs_attention_section(preview_attention_plan)
         if plan:
             skip_rows_printed = False
-            for task, action in plan:
+            for row, _task, action in plan:
                 if classify_advance_action(action) != "skip":
                     continue
                 if not skip_rows_printed:
                     print()
                     skip_rows_printed = True
-                prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
-                console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                display_task = row.owner_task
+                prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
+                console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                 _color = _advance_action_color(action['type'])
                 console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                 print()
         if new_mode and batch_limit is not None:
-            planned_workers = count_worker_consuming_actions([action for _, action, _ in preview_actionable_rows])
+            planned_workers = count_worker_consuming_actions([action for _, _, action, _ in preview_actionable_rows])
             remaining = max(0, batch_limit - planned_workers)
             if remaining > 0:
                 pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
@@ -2180,9 +2179,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # Show the plan and prompt for confirmation
     if preview_actionable_rows:
         print(f"Will advance {len(preview_actionable_rows)} task(s):\n")
-        for task, action, description in preview_actionable_rows:
-            prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
-            console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+        for row, _task, action, description in preview_actionable_rows:
+            display_task = row.owner_task
+            prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
+            console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             _color = _advance_action_color(action['type'])
             console.print(f"      [{_color}]→ {description}[/{_color}]")
             print()
@@ -2196,7 +2196,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     new_pending_tasks: list = []
     if new_mode and batch_limit is not None:
-        planned_workers = count_worker_consuming_actions([action for _, action, _ in preview_actionable_rows])
+        planned_workers = count_worker_consuming_actions([action for _, _, action, _ in preview_actionable_rows])
         remaining = max(0, batch_limit - planned_workers)
         if remaining > 0:
             new_pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
@@ -2226,7 +2226,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     attention_tasks: list[tuple[DbTask, dict]] = []
     action_context = _build_action_context(dry_run_mode=False)
 
-    def _render_worker_action_result(task: DbTask, action_type: str, exec_result) -> None:
+    def _render_worker_action_result(action_task: DbTask, display_task: DbTask, action_type: str, exec_result) -> None:
         nonlocal workers_started, success_count, skip_count, error_count
 
         if exec_result.attempted_spawn:
@@ -2235,9 +2235,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
         if exec_result.status == "skip":
             console.print(f"      [{_c_warn}]{exec_result.message}[/{_c_warn}]")
             skip_count += 1
-            attention = resolve_execution_needs_attention(task, exec_result)
+            attention = resolve_execution_needs_attention(action_task, exec_result)
             if attention is not None:
-                attention_tasks.append((attention.task, attention.action))
+                attention_tasks.append((display_task, attention.action))
             return
 
         if exec_result.status == "error":
@@ -2257,30 +2257,31 @@ def cmd_advance(args: argparse.Namespace) -> int:
         elif exec_result.worker_consuming:
             error_count += 1
 
-    for task, action in plan:
+    for row, task, action in plan:
         assert task.id is not None
-        prompt_display = shorten_prompt(task.prompt, _prompt_avail(task.id))
+        display_task = row.owner_task
+        prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
         action_type = action['type']
 
         if classify_advance_action(action) != "actionable":
-            console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+            console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             _color = _advance_action_color(action_type)
             console.print(f"      [{_color}]{action['description']}[/{_color}]")
             skip_count += 1
             if classify_advance_action(action) == "needs_attention":
-                attention_tasks.append((task, action))
+                attention_tasks.append((display_task, action))
             continue
 
         # Worker-spawning actions: check batch limit before proceeding
         if is_worker_consuming_advance_action(action_type):
             if batch_limit is not None and workers_started >= batch_limit:
-                console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                 console.print(f"      [{_c_warn}]— batch limit reached ({workers_started}/{batch_limit}), skipping[/{_c_warn}]")
                 print()
                 skip_count += 1
                 continue
 
-        console.print(f"  [{_c_tid}]{task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+        console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
         _color = _advance_action_color(action_type)
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
 
@@ -2333,14 +2334,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         exec_result.success_message = (
                             f"{exec_result.success_message} (target: {target_branch})"
                         )
-                    _render_worker_action_result(task, action_type, exec_result)
+                    _render_worker_action_result(task, display_task, action_type, exec_result)
                 else:
                     console.print(f"      [{_c_err}]✗ Merge failed[/{_c_err}]")
                     error_count += 1
 
         else:
             exec_result = execute_advance_action(task=task, action=action, context=action_context)
-            _render_worker_action_result(task, action_type, exec_result)
+            _render_worker_action_result(task, display_task, action_type, exec_result)
 
         print()
 

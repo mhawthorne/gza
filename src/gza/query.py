@@ -392,102 +392,41 @@ def query_incomplete(
     target_branch: str | None = None,
 ) -> list[IncompleteLineage]:
     """Return unresolved lineages grouped by canonical root for attention workflows."""
-    filtered = HistoryFilter(
-        limit=None,
-        status=None,
-        task_type=f.task_type,
-        task_type_not=f.task_type_not,
+    from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows
+    from .task_query import DateFilter, normalize_tag_filters
+
+    date_filter = DateFilter(
+        field=f.date_field,
         days=f.days,
-        start_date=f.start_date,
-        end_date=f.end_date,
-        date_field=f.date_field,
-        status_not=f.status_not,
-        tags=f.tags,
-        tags_not=f.tags_not,
-        any_tag=f.any_tag,
+        start=datetime.fromisoformat(f.start_date).date() if f.start_date else None,
+        end=datetime.fromisoformat(f.end_date).date() if f.end_date else None,
     )
-    tasks = query_history(store, filtered)
-    if not tasks:
-        return []
-
-    unresolved_by_root: dict[str, list[Task]] = {}
-    root_by_id: dict[str, Task] = {}
-    effective_shared_merge_by_root: dict[str, bool] = {}
-
-    for task in tasks:
-        if task.id is None:
-            continue
-
-        unresolved_kind = _get_unresolved_terminal_kind(task, store=store)
-        if unresolved_kind is None:
-            continue
-
-        if unresolved_kind == "failed":
-            if _has_successful_retry_descendant(store, task):
-                continue
-            root = resolve_lineage_root(store, task)
-            if root.id is None:
-                continue
-            unresolved_by_root.setdefault(root.id, []).append(task)
-            root_by_id[root.id] = root
-            continue
-
-        root = resolve_lineage_root(store, task)
-        if root.id is None:
-            continue
-        root_merged = effective_shared_merge_by_root.get(root.id)
-        if root_merged is None:
-            root_merged = _is_effective_shared_branch_lineage_merged(store, root, target_branch=target_branch)
-            effective_shared_merge_by_root[root.id] = root_merged
-        shared_descendant = _is_shared_branch_descendant(task, root)
-
-        if shared_descendant:
-            if root_merged:
-                continue
-        else:
-            if is_lineage_complete(task, store=store):
-                continue
-            if _has_merged_retry_descendant(store, task, target_branch=target_branch):
-                continue
-
-        unresolved_by_root.setdefault(root.id, []).append(task)
-        root_by_id[root.id] = root
-
-    lineages: list[IncompleteLineage] = []
-    for root_id, unresolved in unresolved_by_root.items():
-        if not unresolved:
-            continue
-        root = root_by_id[root_id]
-        shown_ids: set[str] = set()
-        for task in unresolved:
-            if task.id is None:
-                continue
-            shown_ids.add(task.id)
-
-        tree = _prune_lineage_tree_to_ids(build_lineage_tree(store, root), shown_ids)
-        latest_unresolved_at = max(
-            _normalize_lineage_time(task_time_for_lineage(task)) for task in unresolved
-        )
-        shown_tasks = [
-            task for task in flatten_lineage_tree(tree)
-            if task.id is not None and task.id in shown_ids
-        ]
-        lineages.append(
-            IncompleteLineage(
-                root=root,
-                tree=tree,
-                unresolved_tasks=shown_tasks,
-                latest_unresolved_at=latest_unresolved_at,
-            )
-        )
-
-    lineages.sort(
-        key=lambda item: (
-            _normalize_lineage_time(item.latest_unresolved_at),
-            task_id_numeric_key(item.root.id),
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=f.limit,
+            task_types=(f.task_type,) if f.task_type else None,
+            exclude_task_types=(f.task_type_not,) if f.task_type_not else None,
+            tags=normalize_tag_filters(f.tags),
+            any_tag=f.any_tag,
+            date_filter=date_filter,
+            include_skipped=True,
         ),
-        reverse=True,
+        target_branch=target_branch,
     )
+    lineages = [
+        IncompleteLineage(
+            root=row.tree.task if row.tree is not None else row.owner_task,
+            tree=row.tree,
+            unresolved_tasks=list(row.unresolved_tasks),
+            latest_unresolved_at=max(
+                (_normalize_lineage_time(task_time_for_lineage(task)) for task in row.unresolved_tasks),
+                default=_normalize_lineage_time(task_time_for_lineage(row.owner_task)),
+            ),
+        )
+        for row in rows
+        if row.tree is not None
+    ]
     if f.limit is not None:
         lineages = lineages[: f.limit]
     return lineages
