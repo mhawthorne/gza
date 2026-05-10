@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 from gza.db import SqliteTaskStore, Task
 from gza.extractions import ExtractionDraft, ExtractionError, FileDiffSummary, SourceSelection
 from gza.git import Git
+from gza.runner import prepare_task_startup_phase
 
 from .conftest import get_latest_task, make_store, setup_config
 
@@ -317,3 +318,108 @@ def test_extract_background_creator_phase_failure_removes_bundle_and_allows_retr
     assert retried_task is not None
     assert retried_task.slug == fixed_slug
     assert bundle_dir.exists()
+
+
+def test_extract_per_commit_background_creator_phase_failure_rolls_back_entire_batch(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    from gza.cli.execution import cmd_extract
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    source = SourceSelection(
+        source_task_id=None,
+        source_commits=("aaa111", "bbb222", "ccc333"),
+        source_commit_subjects=("First commit", "Second commit", "Third commit"),
+    )
+    drafts = [
+        _draft(
+            source=SourceSelection(
+                source_task_id=None,
+                source_commits=(commit,),
+                source_commit_subjects=(subject,),
+            )
+        )
+        for commit, subject in (
+            ("aaa111", "First commit"),
+            ("bbb222", "Second commit"),
+            ("ccc333", "Third commit"),
+        )
+    ]
+    git = MagicMock(spec=Git)
+    fixed_slugs = [
+        "20260510-extract-first",
+        "20260510-extract-second",
+        "20260510-extract-third",
+    ]
+    bundle_dirs = [tmp_path / ".gza" / "extractions" / slug for slug in fixed_slugs]
+
+    prepare_calls = {"count": 0}
+
+    def _prepare_or_fail(config, prepare_store, task):
+        prepare_calls["count"] += 1
+        if prepare_calls["count"] == 2:
+            raise RuntimeError("creator boom")
+        return prepare_task_startup_phase(config, prepare_store, task)
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch("gza.cli.execution.resolve_source_selection", return_value=source),
+        patch("gza.cli.execution.normalize_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", side_effect=drafts),
+        patch("gza.cli.execution.generate_slug", side_effect=fixed_slugs),
+        patch("gza.cli._common.prepare_task_startup_phase", side_effect=_prepare_or_fail),
+        patch(
+            "gza.cli.execution._spawn_background_workers",
+            side_effect=AssertionError("background workers should not spawn"),
+        ),
+    ):
+        rc = cmd_extract(
+            _args(
+                tmp_path,
+                commits=["aaa111", "bbb222", "ccc333"],
+                per_commit=True,
+                paths=("src/extracted.py",),
+                background=True,
+            )
+        )
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "creator boom" in captured.err
+    assert "Created extract implement task" not in captured.out
+    assert prepare_calls["count"] == 2
+    assert store.get_all() == []
+    assert all(not bundle_dir.exists() for bundle_dir in bundle_dirs)
+    logs_dir = tmp_path / ".gza" / "logs"
+    if logs_dir.exists():
+        assert list(logs_dir.iterdir()) == []
+    workers_dir = tmp_path / ".gza" / "workers"
+    if workers_dir.exists():
+        assert list(workers_dir.iterdir()) == []
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch("gza.cli.execution.resolve_source_selection", return_value=source),
+        patch("gza.cli.execution.normalize_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", side_effect=drafts),
+        patch("gza.cli.execution.generate_slug", side_effect=fixed_slugs),
+    ):
+        retry_rc = cmd_extract(
+            _args(
+                tmp_path,
+                commits=["aaa111", "bbb222", "ccc333"],
+                per_commit=True,
+                paths=("src/extracted.py",),
+                queue=True,
+            )
+        )
+
+    retry_captured = capsys.readouterr()
+    assert retry_rc == 0
+    assert retry_captured.out.count("Created extract implement task") == 3
+    retried_tasks = store.get_all()
+    assert len(retried_tasks) == 3
+    assert sorted(task.slug for task in retried_tasks) == sorted(fixed_slugs)
+    assert all(bundle_dir.exists() for bundle_dir in bundle_dirs)

@@ -54,7 +54,7 @@ from ..recovery_engine import (
     resolve_recovery_planning_task,
 )
 from ..review_verdict import get_review_report
-from ..runner import RunInvocationContext, generate_slug, run
+from ..runner import RunInvocationContext, generate_slug, remove_task_startup_artifacts, run
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
     _REUSE_WORKER_OWNER_ENV,
@@ -272,6 +272,30 @@ def _extract_run_args(args: argparse.Namespace, task_ids: list[str]) -> argparse
     if not hasattr(worker_args, "count"):
         worker_args.count = None
     return worker_args
+
+
+@dataclass
+class _CreatedImmediateExecutionTask:
+    """Task plus rollback hooks for delayed immediate execution."""
+
+    task: DbTask
+    emit_created: Callable[[], None]
+    rollback_cleanup: Callable[[], None]
+
+
+def _rollback_created_immediate_execution_tasks(
+    *,
+    config: Config,
+    created_tasks: list[_CreatedImmediateExecutionTask],
+) -> None:
+    """Best-effort rollback for a command-scoped immediate-execution batch."""
+    store = get_store(config)
+    for created in created_tasks:
+        if created.task.id is not None:
+            remove_task_startup_artifacts(config, created.task)
+        created.rollback_cleanup()
+        if created.task.id is not None:
+            store.delete(created.task.id)
 
 
 def _maybe_reinterpret_extract_source_as_path(
@@ -906,7 +930,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
     skip_learnings = bool(getattr(args, "skip_learnings", False))
     base_branch = args.base_branch if hasattr(args, "base_branch") and args.base_branch else None
     created_tasks: list[DbTask] = []
-    created_task_summaries: list[tuple[DbTask, Callable[[], None], Callable[[], None]]] = []
+    created_task_summaries: list[_CreatedImmediateExecutionTask] = []
 
     def _make_extract_created_emitter(
         *,
@@ -952,36 +976,40 @@ def cmd_extract(args: argparse.Namespace) -> int:
             return 1
         created_tasks.append(impl_task)
         created_task_summaries.append(
-            (
-                impl_task,
-                _make_extract_created_emitter(
+            _CreatedImmediateExecutionTask(
+                task=impl_task,
+                emit_created=_make_extract_created_emitter(
                     draft=draft,
                     source=source,
                     bundle_dir=bundle_dir,
                     impl_task=impl_task,
                 ),
-                _make_extract_rollback_cleanup(bundle_dir),
+                rollback_cleanup=_make_extract_rollback_cleanup(bundle_dir),
             )
         )
 
     if hasattr(args, "queue") and args.queue:
-        for _created_task, emit_created, _rollback_cleanup in created_task_summaries:
-            emit_created()
+        for created_task in created_task_summaries:
+            created_task.emit_created()
         return 0
 
     prepared_tasks: list[DbTask] = []
-    for created_task, emit_created, rollback_cleanup in created_task_summaries:
-        prepared_task = _finalize_immediate_execution_task(
-            args=args,
-            config=config,
-            task=created_task,
-            rollback_on_failure=True,
-            emit_created=emit_created,
-            rollback_cleanup=rollback_cleanup,
+    for created_task in created_task_summaries:
+        prepared_task = _prepare_task_for_immediate_execution(
+            config,
+            created_task.task,
+            rollback_on_failure=False,
+            rollback_cleanup=created_task.rollback_cleanup,
         )
         if prepared_task is None:
+            _rollback_created_immediate_execution_tasks(
+                config=config,
+                created_tasks=created_task_summaries,
+            )
             return 1
         prepared_tasks.append(prepared_task)
+    for created_task in created_task_summaries:
+        created_task.emit_created()
     created_tasks = prepared_tasks
 
     if hasattr(args, "background") and args.background:
