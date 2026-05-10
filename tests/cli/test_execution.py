@@ -1245,10 +1245,14 @@ class TestResumeCommand:
 
         assert result.returncode == 1
         assert "creator boom" in result.stderr
+        assert "Created task" not in result.stdout
         assert store.get_based_on_children(task.id) == []
         logs_dir = tmp_path / ".gza" / "logs"
         if logs_dir.exists():
             assert list(logs_dir.iterdir()) == []
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
 
     def test_resume_without_session_id_fails(self, tmp_path: Path):
         """Resume command fails for tasks without session ID."""
@@ -4707,6 +4711,32 @@ class TestReviewCommand:
         assert review_task.task_type == "review"
         assert review_task.depends_on == impl_task.id
         assert review_task.group == "auth-feature"  # inherited from implementation
+
+    def test_review_background_creator_phase_failure_omits_created_message_and_cleans_up(self, tmp_path: Path):
+        """Background review failures before worker handoff must not claim successful creation."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add user authentication", task_type="implement", group="auth-feature")
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-user-authentication"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        with patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")):
+            result = run_gza("review", str(impl_task.id), "--background", "--no-docker", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "creator boom" in result.stderr
+        assert "Created review task" not in result.stdout
+        assert [task for task in store.get_all() if task.task_type == "review"] == []
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert list(logs_dir.iterdir()) == []
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
 
     def test_review_fails_on_non_implementation_task(self, tmp_path: Path):
         """Review command fails if task is not an implementation/improve/review task."""

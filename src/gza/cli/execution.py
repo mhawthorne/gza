@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -115,6 +116,31 @@ class _IterateBackgroundPreflightContext:
 
     git_runtime: Git
     target_branch: str
+
+
+def _finalize_immediate_execution_task(
+    *,
+    args: argparse.Namespace,
+    config: Config,
+    task: DbTask,
+    rollback_on_failure: bool,
+    emit_created: Callable[[], None],
+) -> DbTask | None:
+    """Print task creation only after immediate-execution preparation succeeds."""
+    if getattr(args, "queue", False):
+        emit_created()
+        return task
+
+    prepared_task = _prepare_task_for_immediate_execution(
+        config,
+        task,
+        rollback_on_failure=rollback_on_failure,
+    )
+    if prepared_task is None:
+        return None
+
+    emit_created()
+    return prepared_task
 
 
 def _resolve_iterate_merge_state_for_current_target(
@@ -691,20 +717,26 @@ def cmd_implement(args: argparse.Namespace) -> int:
         provider=provider,
         skip_learnings=skip_learnings,
     )
+    assert impl_task.id is not None
 
-    print(f"✓ Created implement task {impl_task.id}")
-    print(f"  Depends on: plan {plan_task.id}")
+    def _emit_impl_created() -> None:
+        print(f"✓ Created implement task {impl_task.id}")
+        print(f"  Depends on: plan {plan_task.id}")
+
+    prepared_impl_task = _finalize_immediate_execution_task(
+        args=args,
+        config=config,
+        rollback_on_failure=True,
+        task=impl_task,
+        emit_created=_emit_impl_created,
+    )
+    if prepared_impl_task is None:
+        return 1
+    impl_task = prepared_impl_task
 
     # Handle queue mode - add to queue without executing
     if hasattr(args, 'queue') and args.queue:
         return 0
-
-    if _prepare_task_for_immediate_execution(
-        config,
-        impl_task,
-        rollback_on_failure=True,
-    ) is None:
-        return 1
 
     # Handle background mode - spawn worker to run the implement task
     if hasattr(args, 'background') and args.background:
@@ -871,6 +903,25 @@ def cmd_extract(args: argparse.Namespace) -> int:
     skip_learnings = bool(getattr(args, "skip_learnings", False))
     base_branch = args.base_branch if hasattr(args, "base_branch") and args.base_branch else None
     created_tasks: list[DbTask] = []
+    created_task_summaries: list[tuple[DbTask, Callable[[], None]]] = []
+
+    def _make_extract_created_emitter(
+        *,
+        draft: ExtractionDraft,
+        source: SourceSelection,
+        bundle_dir: Path,
+        impl_task: DbTask,
+    ) -> Callable[[], None]:
+        def _emit_created() -> None:
+            _print_extraction_plan_summary(
+                draft=draft,
+                source_label=_describe_extract_source_label(source),
+                heading=f"✓ Created extract implement task {impl_task.id}",
+                bundle_path=bundle_dir.relative_to(config.project_dir),
+            )
+
+        return _emit_created
+
     for source, draft in drafts:
         try:
             impl_task, bundle_dir = _create_extract_task(
@@ -891,23 +942,36 @@ def cmd_extract(args: argparse.Namespace) -> int:
             print(f"Error: {exc}")
             return 1
         created_tasks.append(impl_task)
-        _print_extraction_plan_summary(
-            draft=draft,
-            source_label=_describe_extract_source_label(source),
-            heading=f"✓ Created extract implement task {impl_task.id}",
-            bundle_path=bundle_dir.relative_to(config.project_dir),
+        created_task_summaries.append(
+            (
+                impl_task,
+                _make_extract_created_emitter(
+                    draft=draft,
+                    source=source,
+                    bundle_dir=bundle_dir,
+                    impl_task=impl_task,
+                ),
+            )
         )
 
     if hasattr(args, "queue") and args.queue:
+        for _created_task, emit_created in created_task_summaries:
+            emit_created()
         return 0
 
-    for created_task in created_tasks:
-        if _prepare_task_for_immediate_execution(
-            config,
-            created_task,
+    prepared_tasks: list[DbTask] = []
+    for created_task, emit_created in created_task_summaries:
+        prepared_task = _finalize_immediate_execution_task(
+            args=args,
+            config=config,
+            task=created_task,
             rollback_on_failure=True,
-        ) is None:
+            emit_created=emit_created,
+        )
+        if prepared_task is None:
             return 1
+        prepared_tasks.append(prepared_task)
+    created_tasks = prepared_tasks
 
     if hasattr(args, "background") and args.background:
         worker_args = _extract_run_args(args, [task.id for task in created_tasks if task.id is not None])
@@ -1394,19 +1458,25 @@ def cmd_retry(args: argparse.Namespace) -> int:
         return 1
 
     new_task = _create_retry_task(store, task)
+    assert new_task.id is not None
 
-    print(f"✓ Created task {new_task.id} (retry of {task_id})")
+    def _emit_retry_created() -> None:
+        print(f"✓ Created task {new_task.id} (retry of {task_id})")
+
+    prepared_retry_task = _finalize_immediate_execution_task(
+        args=args,
+        config=config,
+        rollback_on_failure=True,
+        task=new_task,
+        emit_created=_emit_retry_created,
+    )
+    if prepared_retry_task is None:
+        return 1
+    new_task = prepared_retry_task
 
     # Handle queue mode - add to queue without executing
     if hasattr(args, 'queue') and args.queue:
         return 0
-
-    if _prepare_task_for_immediate_execution(
-        config,
-        new_task,
-        rollback_on_failure=True,
-    ) is None:
-        return 1
 
     # Handle background mode - spawn worker to run the new task
     if args.background:
@@ -1862,28 +1932,34 @@ def cmd_improve(args: argparse.Namespace) -> int:
             return 1
 
     created_new_improve = not (review_task is None and comments_action == "reuse_pending")
+    assert improve_task.id is not None
 
-    if action_message is not None:
-        print(f"✓ {action_message}")
-    else:
-        print(f"✓ Created improve task {improve_task.id}")
-    print(f"  Based on: implementation {impl_task.id}")
-    if review_task is not None:
-        print(f"  Review: {review_task.id}")
-    elif unresolved_comments:
-        print(f"  Comments: {len(unresolved_comments)} unresolved")
-    print(f"  Branch: {impl_task.branch or '(will use implementation branch)'}")
+    def _emit_improve_created() -> None:
+        if action_message is not None:
+            print(f"✓ {action_message}")
+        else:
+            print(f"✓ Created improve task {improve_task.id}")
+        print(f"  Based on: implementation {impl_task.id}")
+        if review_task is not None:
+            print(f"  Review: {review_task.id}")
+        elif unresolved_comments:
+            print(f"  Comments: {len(unresolved_comments)} unresolved")
+        print(f"  Branch: {impl_task.branch or '(will use implementation branch)'}")
+
+    prepared_improve_task = _finalize_immediate_execution_task(
+        args=args,
+        config=config,
+        rollback_on_failure=created_new_improve,
+        task=improve_task,
+        emit_created=_emit_improve_created,
+    )
+    if prepared_improve_task is None:
+        return 1
+    improve_task = prepared_improve_task
 
     # Handle queue mode - add to queue without executing
     if hasattr(args, 'queue') and args.queue:
         return 0
-
-    if _prepare_task_for_immediate_execution(
-        config,
-        improve_task,
-        rollback_on_failure=created_new_improve,
-    ) is None:
-        return 1
 
     # Handle background mode - spawn worker to run the improve task
     if hasattr(args, 'background') and args.background:
@@ -1944,23 +2020,28 @@ def cmd_fix(args: argparse.Namespace) -> int:
     )
     assert fix_task.id is not None
 
-    print(f"✓ Created fix task {fix_task.id}")
-    print(f"  Implementation: {impl_task.id}")
-    if review_id:
-        print(f"  Latest completed review: {review_id}")
-    else:
-        print("  Latest completed review: (none found)")
-    print("  Handoff policy: changed code requires a fresh independent review")
+    def _emit_fix_created() -> None:
+        print(f"✓ Created fix task {fix_task.id}")
+        print(f"  Implementation: {impl_task.id}")
+        if review_id:
+            print(f"  Latest completed review: {review_id}")
+        else:
+            print("  Latest completed review: (none found)")
+        print("  Handoff policy: changed code requires a fresh independent review")
+
+    prepared_fix_task = _finalize_immediate_execution_task(
+        args=args,
+        config=config,
+        rollback_on_failure=True,
+        task=fix_task,
+        emit_created=_emit_fix_created,
+    )
+    if prepared_fix_task is None:
+        return 1
+    fix_task = prepared_fix_task
 
     if hasattr(args, 'queue') and args.queue:
         return 0
-
-    if _prepare_task_for_immediate_execution(
-        config,
-        fix_task,
-        rollback_on_failure=True,
-    ) is None:
-        return 1
 
     if hasattr(args, 'background') and args.background:
         worker_args = argparse.Namespace(**vars(args))
@@ -2032,24 +2113,30 @@ def cmd_review(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"Error: {e}")
         return 1
+    assert review_task.id is not None
 
-    print(f"✓ Created review task {review_task.id}")
-    print(f"  Implementation: {impl_task.id}")
-    if len(impl_task.tags) == 1:
-        print(f"  Group: {impl_task.tags[0]}")
-    if impl_task.tags:
-        print(f"  Tags: {', '.join(impl_task.tags)}")
+    def _emit_review_created() -> None:
+        print(f"✓ Created review task {review_task.id}")
+        print(f"  Implementation: {impl_task.id}")
+        if len(impl_task.tags) == 1:
+            print(f"  Group: {impl_task.tags[0]}")
+        if impl_task.tags:
+            print(f"  Tags: {', '.join(impl_task.tags)}")
+
+    prepared_review_task = _finalize_immediate_execution_task(
+        args=args,
+        config=config,
+        rollback_on_failure=True,
+        task=review_task,
+        emit_created=_emit_review_created,
+    )
+    if prepared_review_task is None:
+        return 1
+    review_task = prepared_review_task
 
     # Handle queue mode - add to queue without executing
     if hasattr(args, 'queue') and args.queue:
         return 0
-
-    if _prepare_task_for_immediate_execution(
-        config,
-        review_task,
-        rollback_on_failure=True,
-    ) is None:
-        return 1
 
     # Handle background mode - spawn worker to run the review task
     if hasattr(args, 'background') and args.background:
@@ -3745,21 +3832,27 @@ def cmd_resume(args: argparse.Namespace) -> int:
     new_task = _create_resume_task(store, task)
     assert new_task.id is not None
 
-    print(f"✓ Created task {new_task.id} (resume of {task_id})")
+    def _emit_resume_created() -> None:
+        print(f"✓ Created task {new_task.id} (resume of {task_id})")
+
+    prepared_resume_task = _finalize_immediate_execution_task(
+        args=args,
+        config=config,
+        rollback_on_failure=True,
+        task=new_task,
+        emit_created=_emit_resume_created,
+    )
+    if prepared_resume_task is None:
+        return 1
+    new_task = prepared_resume_task
 
     # Handle queue mode - add to queue without executing
     if hasattr(args, 'queue') and args.queue:
         return 0
 
-    if _prepare_task_for_immediate_execution(
-        config,
-        new_task,
-        rollback_on_failure=True,
-    ) is None:
-        return 1
-
     # Handle background mode
     if args.background:
+        assert new_task.id is not None
         return _spawn_background_resume_worker(args, config, new_task.id)
 
     # Default: run the new resume task immediately
