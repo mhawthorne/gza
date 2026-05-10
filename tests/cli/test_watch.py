@@ -95,10 +95,17 @@ def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: P
 
     config = Config.load(tmp_path)
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    prepared_impl_ids: list[str] = []
+
+    def prepare_pending_impl(_config, task, **_kwargs):
+        assert task.id is not None
+        prepared_impl_ids.append(task.id)
+        return task
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=prepare_pending_impl) as prepare_task,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
@@ -112,10 +119,74 @@ def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: P
         )
 
     assert result.work_done is True
+    assert prepare_task.call_count == 1
+    assert prepared_impl_ids == [impl.id]
     assert spawn_iterate.call_count == 1
     assert spawn_iterate.call_args.args[2].id == impl.id
+    assert spawn_iterate.call_args.kwargs["prepared_task_id"] == impl.id
+    assert spawn_iterate.call_args.kwargs["prepared_phase"] == "preloop"
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == plan.id
+
+
+def test_watch_cycle_pending_implement_startup_failure_surfaces_without_spawning_iterate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Watch must fail pending implement startup in the parent before detach."""
+
+    from gza.log_paths import resolve_task_log_paths
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    def fail_log_setup(config, _store, pending_task):
+        paths = resolve_task_log_paths(config, pending_task)
+        paths.conversation.parent.mkdir(parents=True, exist_ok=True)
+        paths.conversation.touch()
+        raise RuntimeError("watch creator boom")
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.runner.Git", return_value=MagicMock()),
+        patch("gza.runner.generate_slug", return_value="20260510-test-project-implement-feature"),
+        patch("gza.runner.ensure_task_log_paths", side_effect=fail_log_setup),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("iterate worker should not spawn"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is False
+    assert "watch creator boom" not in capsys.readouterr().out
+    refreshed = store.get(impl.id)
+    assert refreshed is not None
+    assert refreshed.slug is None
+    assert refreshed.log_file is None
+    log_text = log_path.read_text()
+    assert "START_FAILED" in log_text
+    assert f"{impl.id} implement: iterate startup preparation failed" in log_text
+    logs_dir = tmp_path / ".gza" / "logs"
+    if logs_dir.exists():
+        assert not any(path.is_file() for path in logs_dir.rglob("*"))
+    workers_dir = tmp_path / ".gza" / "workers"
+    if workers_dir.exists():
+        assert list(workers_dir.iterdir()) == []
 
 
 def test_watch_collects_legacy_unmerged_owner_after_lazy_merge_unit_backfill(tmp_path: Path) -> None:
@@ -7184,7 +7255,7 @@ def test_cmd_watch_quiet_suppresses_worker_stdout_and_still_logs_events(
         yes=True,
     )
 
-    def fake_spawn_iterate(_args, _config, impl_task, *, quiet=False):
+    def fake_spawn_iterate(_args, _config, impl_task, *, quiet=False, **_kwargs):
         if not quiet:
             print("Started iterate worker noisy output")
         impl_task.status = "in_progress"

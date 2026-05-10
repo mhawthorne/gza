@@ -1259,7 +1259,12 @@ def cmd_rebase(args: argparse.Namespace) -> int:
             no_docker=getattr(args, "no_docker", False),
             max_turns=None,
         )
-        return _spawn_background_worker(worker_args, config, task_id=prepared_rebase_task.id)
+        return _spawn_background_worker(
+            worker_args,
+            config,
+            task_id=prepared_rebase_task.id,
+            prepared_task=prepared_rebase_task,
+        )
 
     store = get_store(config)
 

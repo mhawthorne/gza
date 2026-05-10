@@ -1647,12 +1647,30 @@ def _run_cycle(
                     retry=False,
                     auto_iterate=True,
                 )
+                prepared_pending_task = _prepare_task_for_immediate_execution(
+                    config,
+                    task,
+                    rollback_on_failure=False,
+                )
+                if prepared_pending_task is None:
+                    log.emit(
+                        "START_FAILED",
+                        f"{task.id} {task_type}: iterate startup preparation failed",
+                        dedupe_key=f"prepare-iterate-failed:{task.id}",
+                    )
+                    continue
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
                     log=log,
                     failure_message=f"{task.id} {task_type}: iterate worker spawn failed",
                     dedupe_key=f"spawn-iterate-failed:{task.id}",
-                    spawn_fn=lambda: _spawn_background_iterate(iterate_args, config, task),
+                    spawn_fn=lambda: _spawn_background_iterate(
+                        iterate_args,
+                        config,
+                        task,
+                        prepared_task_id=str(prepared_pending_task.id),
+                        prepared_phase="preloop",
+                    ),
                 )
                 if rc != 0:
                     continue
