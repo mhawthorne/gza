@@ -508,6 +508,26 @@ class TestQueryIncomplete:
 
         assert query_incomplete(store, HistoryFilter(limit=None)) == []
 
+    def test_stale_merged_task_row_remains_visible_when_merge_unit_is_unmerged(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("stale merged task row with unmerged unit", task_type="implement")
+        store.mark_completed(root, has_commits=True, branch="feature/stale-merged-task-row")
+        assert root.id is not None
+
+        unit = store.resolve_merge_unit_for_task(root.id)
+        assert unit is not None
+
+        refreshed = store.get(root.id)
+        assert refreshed is not None
+        refreshed.merge_status = "merged"
+        store.update(refreshed)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {root.id}
+
     def test_retry_chain_failed_failed_completed_keeps_only_latest_unresolved(self, tmp_path: Path):
         store = self._store(tmp_path)
 
@@ -1041,3 +1061,26 @@ class TestIsLineageResolved:
         assert resolution.resolved is True
         assert resolution.reasons == ("branch_merged",)
         assert resolution.resolved_by_task_ids == ("gza-1",)
+
+    def test_stale_merged_task_row_does_not_resolve_unmerged_merge_unit_snapshot(self):
+        task = _make_task(
+            id="gza-1",
+            status="completed",
+            task_type="implement",
+            has_commits=True,
+            merge_status="merged",
+        )
+        merge_unit = self._merge_unit(unit_id="gza-mu-1", owner_task_id="gza-1", state="unmerged")
+        snapshot = LineageOwnerSnapshot(
+            owner_task=task,
+            root_task=task,
+            members=(task,),
+            merge_units_by_task_id={task.id: merge_unit},
+            failed_leaves=(),
+            recovery_completed_by_failed_id={},
+        )
+
+        resolution = is_lineage_resolved(snapshot)
+
+        assert resolution.resolved is False
+        assert resolution.reasons == ()

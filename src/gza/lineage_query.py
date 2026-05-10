@@ -153,6 +153,22 @@ def _effective_merge_state(task: DbTask, *, merge_unit: MergeUnit | None) -> str
     return merge_unit.state if merge_unit is not None else task.merge_status
 
 
+def _task_effective_merge_state(
+    task: DbTask,
+    *,
+    merge_units_by_task_id: Mapping[str, MergeUnit],
+) -> str | None:
+    return _effective_merge_state(task, merge_unit=merge_units_by_task_id.get(task.id or ""))
+
+
+def _task_is_effectively_merged(
+    task: DbTask,
+    *,
+    merge_units_by_task_id: Mapping[str, MergeUnit],
+) -> bool:
+    return _task_effective_merge_state(task, merge_units_by_task_id=merge_units_by_task_id) == "merged"
+
+
 def _matches_status_filters(
     task: DbTask,
     statuses: set[str],
@@ -340,11 +356,7 @@ def is_lineage_resolved(snapshot: LineageOwnerSnapshot) -> LineageResolution:
         task.id
         for task in snapshot.members
         if task.id is not None
-        and (
-            snapshot.merge_units_by_task_id.get(task.id, None) is not None
-            and snapshot.merge_units_by_task_id[task.id].state == "merged"
-            or task.merge_status == "merged"
-        )
+        and _task_is_effectively_merged(task, merge_units_by_task_id=snapshot.merge_units_by_task_id)
     ]
     if merged_member_ids:
         reasons.append("branch_merged")
@@ -373,7 +385,7 @@ def is_lineage_resolved(snapshot: LineageOwnerSnapshot) -> LineageResolution:
 def _snapshot_task_is_complete(snapshot: LineageOwnerSnapshot, task: DbTask) -> bool:
     if task.status in {"failed", "pending", "in_progress", "dropped"}:
         return False
-    merge_state = _effective_merge_state(task, merge_unit=snapshot.merge_units_by_task_id.get(task.id or ""))
+    merge_state = _task_effective_merge_state(task, merge_units_by_task_id=snapshot.merge_units_by_task_id)
     if task.status == "completed":
         if merge_state == "merged":
             return True
@@ -582,8 +594,7 @@ def query_lineage_owner_rows(
         unresolved_tasks: list[DbTask] = []
 
         merged_owner_branch = any(
-            (merge_units_by_member.get(task.id or "") is not None and merge_units_by_member[task.id or ""].state == "merged")
-            or task.merge_status == "merged"
+            _task_is_effectively_merged(task, merge_units_by_task_id=merge_units_by_member)
             for task in owner_members
         )
 
@@ -622,7 +633,7 @@ def query_lineage_owner_rows(
                 continue
             if merged_owner_branch:
                 continue
-            explicit_merge_state = merge_unit.state if merge_unit is not None else task.merge_status
+            explicit_merge_state = _effective_merge_state(task, merge_unit=merge_unit)
             if task.status in {"completed", "unmerged"} and explicit_merge_state == "unmerged":
                 if matches:
                     unresolved_tasks.append(task)
