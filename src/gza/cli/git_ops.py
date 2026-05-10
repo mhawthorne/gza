@@ -265,6 +265,34 @@ def _advance_uses_iterate(config: Config) -> bool:
     return getattr(config, "advance_mode", "default") == "iterate"
 
 
+def _spawn_prepared_background_iterate(
+    args: argparse.Namespace,
+    config: Config,
+    impl_task: DbTask,
+    *,
+    max_iterations: int,
+    auto_iterate: bool = False,
+    quiet: bool = False,
+) -> int:
+    prepared_task = _prepare_task_for_immediate_execution(
+        config,
+        impl_task,
+        rollback_on_failure=False,
+    )
+    if prepared_task is None:
+        return 1
+    return _spawn_background_iterate_worker(
+        args,
+        config,
+        prepared_task,
+        max_iterations=max_iterations,
+        auto_iterate=auto_iterate,
+        quiet=quiet,
+        prepared_task_id=prepared_task.id,
+        prepared_phase="preloop",
+    )
+
+
 def _collect_advance_completed_tasks(
     store: SqliteTaskStore,
     *,
@@ -2488,7 +2516,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     no_docker=getattr(args, 'no_docker', False),
                     force=force,
                 )
-                rc = _spawn_background_iterate_worker(
+                rc = _spawn_prepared_background_iterate(
                     iterate_args,
                     config,
                     pt,
@@ -2500,6 +2528,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 worker_args = _worker_args()
                 rc = _spawn_background_worker(worker_args, config, task_id=pt.id, quiet=True)
             if rc != 0:
+                error_count += 1
                 break  # error spawning
             new_started += 1
             workers_started += 1

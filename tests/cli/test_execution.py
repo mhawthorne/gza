@@ -6934,6 +6934,46 @@ class TestIterateCommand:
         assert "--retry" in output
         assert "started iterate worker" not in output.lower()
 
+    def test_pending_task_background_start_creator_phase_failure_surfaces_and_cleans_up(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Pending background iterate must fail before detach when startup preparation fails."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+
+        with (
+            patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")),
+            patch(
+                "gza.cli.execution._spawn_background_iterate",
+                side_effect=AssertionError("background iterate should not spawn"),
+            ),
+        ):
+            result = run_gza(
+                "iterate",
+                str(impl.id),
+                "--background",
+                "--no-docker",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 1
+        assert "creator boom" in result.stderr
+        output = result.stdout + (result.stderr or "")
+        assert "started iterate worker" not in output.lower()
+        refreshed = store.get(impl.id)
+        assert refreshed is not None
+        assert refreshed.slug is None
+        assert refreshed.log_file is None
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert list(logs_dir.iterdir()) == []
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
+
     @pytest.mark.parametrize(
         ("start_flag", "resume_mode"),
         [

@@ -2668,14 +2668,32 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             None,
         )
 
-    def _prepare_background_failed_iterate_start(
-        failed_task: DbTask,
+    def _prepare_background_iterate_start(
+        iterate_task: DbTask,
     ) -> tuple[_PreparedIterateStart | None, int | None]:
-        if dry_run or failed_task.status != "failed":
+        if dry_run:
+            return None, None
+        if iterate_task.status == "pending":
+            prepared_task = _prepare_task_for_immediate_execution(
+                config,
+                iterate_task,
+                rollback_on_failure=False,
+            )
+            if prepared_task is None:
+                return None, 1
+            return (
+                _PreparedIterateStart(
+                    task=prepared_task,
+                    initial_resume=False,
+                    phase="preloop",
+                ),
+                None,
+            )
+        if iterate_task.status != "failed":
             return None, None
         if use_resume:
             resume_start, resume_blocked = _resolve_failed_iterate_resume_start(
-                failed_task,
+                iterate_task,
                 emit_override_warnings=False,
             )
             if resume_start is None:
@@ -2689,7 +2707,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     if exit_code is not None:
                         return None, exit_code
                     print(
-                        f"Error: Cannot resume failed implementation {failed_task.id}: "
+                        f"Error: Cannot resume failed implementation {iterate_task.id}: "
                         f"{resume_blocked_decision.reason_text}."
                     )
                 return None, 1
@@ -2710,7 +2728,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 None,
             )
         if use_retry:
-            run_start_task = _create_retry_task(store, failed_task)
+            run_start_task = _create_retry_task(store, iterate_task)
             prepared_task = _prepare_task_for_immediate_execution(
                 config,
                 run_start_task,
@@ -2761,7 +2779,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         if preflight_result is not None:
             return preflight_result
         _warn_manual_background_iterate_override_if_needed(impl_task)
-        prepared_background_start, background_prepare_rc = _prepare_background_failed_iterate_start(
+        prepared_background_start, background_prepare_rc = _prepare_background_iterate_start(
             impl_task,
         )
         if background_prepare_rc is not None:
@@ -2802,6 +2820,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     if resolved_merge_state == "merged":
         print(f"No remaining iterate action: implementation {impl_task.id} is already merged.")
         return 0
+
+    if prepared_start is not None and impl_task.status == "pending" and prepared_start.task.id == impl_task.id:
+        impl_task = prepared_start.task
 
     def _run_task_with_recovery(
         task_to_run: DbTask,
