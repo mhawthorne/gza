@@ -3,7 +3,6 @@
 import argparse
 import json
 import re
-import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +20,7 @@ from ..colors import (
 from ..config import Config
 from ..console import console, format_duration
 from ..db import SqliteTaskStore, Task as DbTask
+from ..log_paths import ops_log_path_for
 from ..providers.log_renderers import UnknownLogProviderError, get_log_renderer
 from ..providers.log_rendering import (
     message_content_items as provider_message_content_items,
@@ -309,11 +309,33 @@ def _task_log_candidates(config: Config, task: DbTask) -> list[Path]:
     return deduped
 
 
+def _ops_log_candidates(conversation_candidates: list[Path]) -> list[Path]:
+    """Build ordered sibling ops-log candidates for conversation log candidates."""
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for conversation_path in conversation_candidates:
+        ops_path = ops_log_path_for(conversation_path)
+        key = str(ops_path.resolve()) if ops_path.exists() else str(ops_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(ops_path)
+    return candidates
+
+
+def _first_existing(paths: list[Path]) -> Path | None:
+    """Return the first existing path in order, if any."""
+    for path in paths:
+        if path.exists():
+            return path
+    return None
+
+
 def _task_startup_log_path(config: Config, task: DbTask | None, worker: WorkerMetadata | None = None) -> Path | None:
     """Resolve deterministic startup log path from task slug, with legacy fallback."""
     if task and task.slug:
         deterministic = config.workers_path / f"{task.slug}.startup.log"
-        if deterministic.exists():
+        if deterministic.exists() or ops_log_path_for(deterministic).exists():
             return deterministic
     if worker and worker.startup_log_file:
         startup_path = Path(worker.startup_log_file)
@@ -343,11 +365,11 @@ def _resolve_worker_log_path(
         main_candidates.extend(_task_log_candidates(config, task))
 
     for candidate in main_candidates:
-        if candidate.exists():
+        if candidate.exists() or ops_log_path_for(candidate).exists():
             return candidate, False
 
     startup_log_path = _task_startup_log_path(config, task, worker)
-    if startup_log_path and startup_log_path.exists():
+    if startup_log_path and (startup_log_path.exists() or ops_log_path_for(startup_log_path).exists()):
         return startup_log_path, True
 
     # Prefer returning a main log candidate (even if missing) over a non-existent
@@ -376,7 +398,7 @@ def _resolve_task_log_path(
     main_candidates.extend(_task_log_candidates(config, task))
 
     for candidate in main_candidates:
-        if candidate.exists():
+        if candidate.exists() or ops_log_path_for(candidate).exists():
             return candidate, False
 
     if task.id is not None:
@@ -445,11 +467,98 @@ def _load_log_file_entries(log_path: Path) -> tuple[dict | None, list[dict], str
     return log_data, entries, content
 
 
+def _annotate_stream(entries: list[dict], stream: str) -> list[dict]:
+    """Return copies of entries annotated with their source stream."""
+    annotated: list[dict] = []
+    for entry in entries:
+        payload = dict(entry)
+        payload.setdefault("stream", stream)
+        annotated.append(payload)
+    return annotated
+
+
+_MAX_SORT_DATETIME = datetime.max.replace(tzinfo=UTC)
+
+
+def _entry_timestamp(entry: dict) -> tuple[int, datetime, int]:
+    """Return a comparable merge key for timestamped and untimestamped entries."""
+    raw = entry.get("timestamp")
+    if isinstance(raw, str):
+        parsed = _parse_iso(raw)
+        if parsed is not None:
+            return 0, parsed, int(entry.get("_merge_index", 0))
+    return 1, _MAX_SORT_DATETIME, int(entry.get("_merge_index", 0))
+
+
+def _merge_stream_entries(conversation_entries: list[dict], ops_entries: list[dict]) -> list[dict]:
+    """Merge split conversation and ops entries using stable timestamp/read ordering."""
+    merged_entries = _annotate_stream(conversation_entries, "conversation") + _annotate_stream(ops_entries, "ops")
+    for idx, entry in enumerate(merged_entries):
+        entry["_merge_index"] = idx
+    merged_entries.sort(key=_entry_timestamp)
+    return merged_entries
+
+
+def _parse_stream_lines(raw_lines: list[str], stream: str) -> list[dict]:
+    """Parse raw JSONL lines into annotated entries for one stream."""
+    entries: list[dict] = []
+    for raw_line in raw_lines:
+        line = raw_line.strip()
+        if not line or line.startswith("---"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            entries.append({"type": "raw", "message": line, "stream": stream})
+            continue
+        if isinstance(parsed, dict):
+            entry = dict(parsed)
+            entry.setdefault("stream", stream)
+            entries.append(entry)
+        else:
+            entries.append({"type": "raw", "message": str(parsed), "stream": stream})
+    return entries
+
+
+def _load_selected_log_entries(
+    conversation_log_path: Path | None,
+    ops_log_path: Path | None,
+    *,
+    conversation_only: bool,
+    ops_only: bool,
+) -> tuple[dict | None, list[dict], str]:
+    """Load conversation, ops, or merged entries based on CLI selection."""
+    if ops_only:
+        if ops_log_path is None or not ops_log_path.exists():
+            return None, [], ""
+        log_data, entries, content = _load_log_file_entries(ops_log_path)
+        return log_data, _annotate_stream(entries, "ops"), content
+
+    if conversation_only or ops_log_path is None or not ops_log_path.exists():
+        if conversation_log_path is None or not conversation_log_path.exists():
+            return None, [], ""
+        log_data, entries, content = _load_log_file_entries(conversation_log_path)
+        return log_data, _annotate_stream(entries, "conversation"), content
+
+    conversation_data, conversation_entries, conversation_content = (
+        _load_log_file_entries(conversation_log_path)
+        if conversation_log_path is not None and conversation_log_path.exists()
+        else (None, [], "")
+    )
+    ops_data, ops_entries, ops_content = _load_log_file_entries(ops_log_path)
+
+    merged_entries = _merge_stream_entries(conversation_entries, ops_entries)
+    return conversation_data or ops_data, merged_entries, "\n".join(
+        part for part in (conversation_content, ops_content) if part
+    )
+
+
 def _print_log_header(
     *,
     task: DbTask | None,
     worker: WorkerMetadata | None,
-    log_path: Path,
+    conversation_log_path: Path | None,
+    ops_log_path: Path | None,
     is_running: bool,
     using_startup_log: bool,
 ) -> None:
@@ -463,7 +572,10 @@ def _print_log_header(
         _status_color = LINEAGE_STATUS_COLORS.get(task.status, "")
         _status_val = f"[{_status_color}]{rich_escape(task.status)}[/{_status_color}]" if _status_color else rich_escape(task.status)
         console.print(f"[{_lc()}]Status:[/{_lc()}] {_status_val}", soft_wrap=True)
-        console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
+        if conversation_log_path is not None:
+            console.print(f"[{_lc()}]Transcript:[/{_lc()}] {rich_escape(str(conversation_log_path))}", soft_wrap=True)
+        if ops_log_path is not None and (ops_log_path.exists() or not using_startup_log):
+            console.print(f"[{_lc()}]Ops:[/{_lc()}] {rich_escape(str(ops_log_path))}", soft_wrap=True)
         if using_startup_log:
             console.print("[yellow]Using worker startup log (main task log not available).[/yellow]", soft_wrap=True)
         if task.branch:
@@ -476,7 +588,10 @@ def _print_log_header(
             _w_status = "running"
         _w_color = PS_STATUS_COLORS.get(_w_status, "white")
         console.print(f"[{_lc()}]Status:[/{_lc()}] [{_w_color}]{_w_status}[/{_w_color}]", soft_wrap=True)
-        console.print(f"[{_lc()}]Log:[/{_lc()}] {rich_escape(str(log_path))}", soft_wrap=True)
+        if conversation_log_path is not None:
+            console.print(f"[{_lc()}]Transcript:[/{_lc()}] {rich_escape(str(conversation_log_path))}", soft_wrap=True)
+        if ops_log_path is not None and ops_log_path.exists():
+            console.print(f"[{_lc()}]Ops:[/{_lc()}] {rich_escape(str(ops_log_path))}", soft_wrap=True)
         if using_startup_log:
             console.print("[yellow]Using startup log (main task log not available).[/yellow]", soft_wrap=True)
     console.print(_sep, soft_wrap=True)
@@ -510,6 +625,7 @@ def cmd_log(args: argparse.Namespace) -> int:
     task = None
     worker = None
     log_path = None
+    ops_log_path: Path | None = None
     using_startup_log = False
     is_running = False
     worker_id_for_follow: str | None = None
@@ -566,7 +682,21 @@ def cmd_log(args: argparse.Namespace) -> int:
         print("Error: No log file found")
         return 1
 
-    if not log_path.exists():
+    conversation_only = bool(getattr(args, "conversation_only", False))
+    ops_only = bool(getattr(args, "ops_only", False))
+    ops_log_path = ops_log_path_for(log_path)
+
+    selected_exists = (
+        (ops_log_path.exists() if ops_only and ops_log_path is not None else False)
+        or (log_path.exists() if not ops_only else False)
+        or (
+            not conversation_only
+            and not ops_only
+            and ops_log_path is not None
+            and ops_log_path.exists()
+        )
+    )
+    if not selected_exists:
         if is_running and not using_startup_log:
             print(f"Log file not yet created: {log_path}")
             print("Worker is still starting up...")
@@ -599,7 +729,8 @@ def cmd_log(args: argparse.Namespace) -> int:
         _print_log_header(
             task=task,
             worker=worker,
-            log_path=log_path,
+            conversation_log_path=log_path,
+            ops_log_path=ops_log_path,
             is_running=is_running,
             using_startup_log=using_startup_log,
         )
@@ -608,6 +739,7 @@ def cmd_log(args: argparse.Namespace) -> int:
         # Live streaming mode - use the formatted streaming output
         setattr(args, "_log_provider_name", provider_name)
         setattr(args, "_log_configured_model", configured_model)
+        setattr(args, "_ops_log_path", ops_log_path)
         return _tail_log_file(
             log_path,
             args,
@@ -621,7 +753,12 @@ def cmd_log(args: argparse.Namespace) -> int:
     with pager_context(use_page, config.project_dir):
         # Static display mode - show summary or full turns
         try:
-            log_data, entries, content = _load_log_file_entries(log_path)
+            log_data, entries, content = _load_selected_log_entries(
+                log_path,
+                ops_log_path,
+                conversation_only=conversation_only,
+                ops_only=ops_only,
+            )
 
             if log_data is None and not entries:
                 # If we have content but couldn't parse any JSON, it's likely a startup error
@@ -645,7 +782,8 @@ def cmd_log(args: argparse.Namespace) -> int:
         _print_log_header(
             task=task,
             worker=worker,
-            log_path=log_path,
+            conversation_log_path=log_path,
+            ops_log_path=ops_log_path,
             is_running=is_running,
             using_startup_log=using_startup_log,
         )
@@ -753,17 +891,75 @@ def _tail_log_file(
     """Tail a log file with optional follow mode."""
     raw_mode = hasattr(args, 'raw') and args.raw
     follow = hasattr(args, 'follow') and args.follow
+    conversation_only = bool(getattr(args, "conversation_only", False))
+    ops_only = bool(getattr(args, "ops_only", False))
+    ops_log_path: Path | None = getattr(args, "_ops_log_path", None)
 
     if raw_mode:
-        # Use tail directly for raw JSON output
         try:
-            cmd = ["tail"]
-            if hasattr(args, 'tail') and args.tail:
-                cmd.extend(["-n", str(args.tail)])
-            if follow:
-                cmd.append("-f")
-            cmd.append(str(log_path))
-            subprocess.run(cmd)
+            def _emit_raw_entries() -> tuple[int, int]:
+                _log_data, entries, _content = _load_selected_log_entries(
+                    log_path,
+                    ops_log_path,
+                    conversation_only=conversation_only,
+                    ops_only=ops_only,
+                )
+                tail_lines = args.tail if hasattr(args, 'tail') and args.tail else None
+                rendered_entries = entries[-tail_lines:] if tail_lines else entries
+                for entry in rendered_entries:
+                    print(json.dumps(entry))
+                conv_count = 0
+                ops_count = 0
+                if log_path.exists() and not ops_only:
+                    conv_count = len(log_path.read_text().splitlines())
+                if ops_log_path is not None and ops_log_path.exists() and not conversation_only:
+                    ops_count = len(ops_log_path.read_text().splitlines())
+                return conv_count, ops_count
+
+            conv_count, ops_count = _emit_raw_entries()
+            if not follow:
+                return 0
+
+            while True:
+                time.sleep(0.5)
+                new_conversation_entries: list[dict] = []
+                new_ops_entries: list[dict] = []
+                if not ops_only and log_path.exists():
+                    conv_lines = log_path.read_text().splitlines()
+                    if len(conv_lines) > conv_count:
+                        for line in conv_lines[conv_count:]:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            new_conversation_entries.extend(_parse_stream_lines([line], "conversation"))
+                        conv_count = len(conv_lines)
+                if not conversation_only and ops_log_path is not None and ops_log_path.exists():
+                    ops_lines = ops_log_path.read_text().splitlines()
+                    if len(ops_lines) > ops_count:
+                        for line in ops_lines[ops_count:]:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            new_ops_entries.extend(_parse_stream_lines([line], "ops"))
+                        ops_count = len(ops_lines)
+                new_entries = (
+                    new_ops_entries
+                    if ops_only
+                    else new_conversation_entries
+                    if conversation_only
+                    else _merge_stream_entries(new_conversation_entries, new_ops_entries)
+                )
+                if new_entries:
+                    for entry in new_entries:
+                            print(json.dumps(entry))
+                    continue
+
+                if worker_id and not registry.is_running(worker_id):
+                    break
+                if task_id is not None and store is not None and worker_id is None:
+                    latest_task = store.get(task_id)
+                    if latest_task is None or latest_task.status != "in_progress":
+                        break
             return 0
         except KeyboardInterrupt:
             return 0
@@ -780,27 +976,32 @@ def _tail_log_file(
             verbose=bool(getattr(args, "verbose", False)),
         )
 
-        def _process_lines(raw_lines: list[str]) -> None:
-            """Parse JSON lines and feed them to the live printer."""
-            for line in raw_lines:
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("---"):
-                    # Skip step timestamp markers written by the runner
-                    continue
-                try:
-                    entry = json.loads(line)
-                    printer.process(entry)
-                except json.JSONDecodeError:
-                    console.print(rich_escape(line), soft_wrap=True)
+        def _read_lines(path: Path | None) -> list[str]:
+            if path is None or not path.exists():
+                return []
+            with open(path) as f:
+                return f.readlines()
 
-        # Initial read
-        with open(log_path) as f:
-            lines = f.readlines()
+        def _process_entries(entries: list[dict]) -> None:
+            for entry in entries:
+                printer.process(entry)
+
+        def _merged_batch(conversation_batch: list[str], ops_batch: list[str]) -> list[dict]:
+            if ops_only:
+                return _parse_stream_lines(ops_batch, "ops")
+            if conversation_only:
+                return _parse_stream_lines(conversation_batch, "conversation")
+            return _merge_stream_entries(
+                _parse_stream_lines(conversation_batch, "conversation"),
+                _parse_stream_lines(ops_batch, "ops"),
+            )
+
+        conv_lines = _read_lines(log_path)
+        ops_lines = _read_lines(ops_log_path if not conversation_only else None)
+        initial_entries = _merged_batch(conv_lines, ops_lines)
         if tail_lines:
-            lines = lines[-tail_lines:]
-        _process_lines(lines)
+            initial_entries = initial_entries[-tail_lines:]
+        _process_entries(initial_entries)
 
         if not follow:
             if printer.renderer.suppressed_count:
@@ -810,30 +1011,39 @@ def _tail_log_file(
                 )
             return 0
 
-        # Follow mode - watch for new lines
-        last_size = log_path.stat().st_size
-        with open(log_path) as f:
-            last_line_count = sum(1 for _ in f)
+        conv_count = len(conv_lines)
+        ops_count = len(ops_lines)
 
         while True:
             time.sleep(0.5)
 
-            current_size = log_path.stat().st_size
-            if current_size > last_size:
-                with open(log_path) as f:
-                    lines = f.readlines()
-
-                new_lines = lines[last_line_count:]
-                last_line_count = len(lines)
-                last_size = current_size
-                _process_lines(new_lines)
+            conv_lines_now = _read_lines(log_path)
+            ops_lines_now = _read_lines(ops_log_path if not conversation_only else None)
+            new_conv_lines: list[str] = []
+            new_ops_lines: list[str] = []
+            if not ops_only and len(conv_lines_now) > conv_count:
+                new_conv_lines = conv_lines_now[conv_count:]
+                conv_count = len(conv_lines_now)
+            if not conversation_only and ops_log_path is not None and len(ops_lines_now) > ops_count:
+                new_ops_lines = ops_lines_now[ops_count:]
+                ops_count = len(ops_lines_now)
+            new_entries = _merged_batch(new_conv_lines, new_ops_lines)
+            if new_entries:
+                _process_entries(new_entries)
 
             # Check if worker is still running
             if worker_id and not registry.is_running(worker_id):
                 time.sleep(0.5)
-                with open(log_path) as f:
-                    lines = f.readlines()
-                _process_lines(lines[last_line_count:])
+                final_new_conv_lines: list[str] = []
+                final_new_ops_lines: list[str] = []
+                conv_lines_now = _read_lines(log_path)
+                if not ops_only and len(conv_lines_now) > conv_count:
+                    final_new_conv_lines = conv_lines_now[conv_count:]
+                if not conversation_only and ops_log_path is not None:
+                    ops_lines_now = _read_lines(ops_log_path)
+                    if len(ops_lines_now) > ops_count:
+                        final_new_ops_lines = ops_lines_now[ops_count:]
+                _process_entries(_merged_batch(final_new_conv_lines, final_new_ops_lines))
                 break
 
             # Fallback for task-based follow without a running worker ID.
@@ -841,9 +1051,16 @@ def _tail_log_file(
                 latest_task = store.get(task_id)
                 if latest_task is None or latest_task.status != "in_progress":
                     time.sleep(0.5)
-                    with open(log_path) as f:
-                        lines = f.readlines()
-                    _process_lines(lines[last_line_count:])
+                    task_final_new_conv_lines: list[str] = []
+                    task_final_new_ops_lines: list[str] = []
+                    conv_lines_now = _read_lines(log_path)
+                    if not ops_only and len(conv_lines_now) > conv_count:
+                        task_final_new_conv_lines = conv_lines_now[conv_count:]
+                    if not conversation_only and ops_log_path is not None:
+                        ops_lines_now = _read_lines(ops_log_path)
+                        if len(ops_lines_now) > ops_count:
+                            task_final_new_ops_lines = ops_lines_now[ops_count:]
+                    _process_entries(_merged_batch(task_final_new_conv_lines, task_final_new_ops_lines))
                     break
 
         if printer.renderer.suppressed_count:

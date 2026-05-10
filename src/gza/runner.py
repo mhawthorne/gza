@@ -1,5 +1,6 @@
 """Main Gza runner orchestration."""
 
+import inspect
 import json
 import logging
 import os
@@ -54,6 +55,7 @@ from .git import Git, GitApplyResult, GitError, cleanup_worktree_for_branch, par
 from .github import GitHub, GitHubError
 from .learnings import maybe_auto_regenerate_learnings
 from .lineage import get_plan_for_task
+from .log_paths import TaskLogPaths, ops_log_path_for, resolve_ops_log_path, resolve_task_log_paths
 from .pr_ops import build_task_pr_content, ensure_task_pr, sync_task_branch_if_live_pr
 from .prompt_sanitization import sanitize_provider_prompt
 from .prompts import PromptBuilder
@@ -115,6 +117,47 @@ class ResolvedRunFailure:
 def _interrupt_signal_name() -> str | None:
     """Return the current interrupt signal name, if one was recorded."""
     return os.environ.get("GZA_INTERRUPT_SIGNAL")
+
+
+def _provider_accepts_ops_log_file(provider: Provider) -> bool:
+    """Return whether provider.run accepts an explicit ops log path."""
+    params = inspect.signature(provider.run).parameters.values()
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == "ops_log_file"
+        for parameter in params
+    )
+
+
+def _call_provider_run(
+    provider: Provider,
+    config: Config,
+    prompt: str,
+    log_file: Path,
+    work_dir: Path,
+    *,
+    provider_run_kwargs: dict[str, Any],
+) -> RunResult:
+    """Run a provider while tolerating legacy test doubles without ops_log_file."""
+    try:
+        return provider.run(
+            config,
+            prompt,
+            log_file,
+            work_dir,
+            **provider_run_kwargs,
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument 'ops_log_file'" not in str(exc):
+            raise
+        fallback_kwargs = dict(provider_run_kwargs)
+        fallback_kwargs.pop("ops_log_file", None)
+        return provider.run(
+            config,
+            prompt,
+            log_file,
+            work_dir,
+            **fallback_kwargs,
+        )
 
 
 def _interruption_metadata() -> dict[str, str]:
@@ -263,25 +306,54 @@ __all__ = [
     "run",
     "build_prompt",
     "write_log_entry",
+    "write_ops_entry",
     "TaskExecutionLogger",
     "ensure_task_log_path",
+    "ensure_task_log_paths",
     "task_log_storage_path",
     "extract_content_from_log",
     "get_effective_config_for_task",
     "post_review_to_pr",
     "open_task_startup_log",
+    "open_task_startup_logs",
     "rename_startup_log_to_slug",
 ]
 
 
 def write_log_entry(log_file: "Path", entry: dict) -> None:
     """Append a JSONL entry to the task log file."""
+    target = log_file
+    payload = dict(entry)
+    if payload.get("type") == "gza" and log_file.suffix == ".log":
+        target = ops_log_path_for(log_file)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        if not log_file.exists():
+            log_file.touch()
+        payload.setdefault("stream", "ops")
+        payload.setdefault("source", "gza")
+        payload.setdefault("timestamp", _ops_timestamp())
     try:
-        with open(log_file, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        with open(target, "a") as f:
+            f.write(json.dumps(payload) + "\n")
             f.flush()
     except Exception:
-        logger.warning("Failed to write log entry to %s", log_file, exc_info=True)
+        logger.warning("Failed to write log entry to %s", target, exc_info=True)
+
+
+def _ops_timestamp() -> str:
+    """Return ISO-8601 UTC timestamp for structured ops entries."""
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def write_ops_entry(ops_log_file: "Path", entry: dict) -> None:
+    """Append a structured JSONL entry to the task ops log file."""
+    payload = dict(entry)
+    payload.setdefault("type", "gza")
+    payload.setdefault("stream", "ops")
+    payload.setdefault("source", "gza")
+    payload.setdefault("timestamp", _ops_timestamp())
+    write_log_entry(ops_log_file, payload)
 
 
 def task_log_storage_path(config: Config, path: Path) -> str:
@@ -292,37 +364,30 @@ def task_log_storage_path(config: Config, path: Path) -> str:
         return str(path)
 
 
-def _resolve_task_log_path(config: Config, task: Task) -> Path:
-    """Resolve canonical task log path without mutating task state."""
-    if task.log_file:
-        stored_path = Path(task.log_file)
-        if not stored_path.is_absolute():
-            return config.project_dir / stored_path
-        return stored_path
-    if task.slug:
-        return config.log_path / f"{task.slug}.log"
-    suffix = task.id or "unknown-task"
-    return config.log_path / f"{suffix}.startup.log"
-
-
 def ensure_task_log_path(config: Config, store: SqliteTaskStore, task: Task) -> Path:
-    """Ensure the task owns a canonical log path and persist it immediately."""
-    path = _resolve_task_log_path(config, task)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        path.touch()
-    storage_path = task_log_storage_path(config, path)
+    """Ensure the task owns a canonical conversation log path and persist it."""
+    paths = ensure_task_log_paths(config, store, task)
+    return paths.conversation
+
+
+def ensure_task_log_paths(config: Config, store: SqliteTaskStore, task: Task) -> TaskLogPaths:
+    """Ensure the task owns canonical conversation and ops log paths."""
+    paths = resolve_task_log_paths(config, task)
+    paths.conversation.parent.mkdir(parents=True, exist_ok=True)
+    if not paths.conversation.exists():
+        paths.conversation.touch()
+    storage_path = task_log_storage_path(config, paths.conversation)
     if task.log_file != storage_path:
         task.log_file = storage_path
         store.update(task)
-    return path
+    return paths
 
 
 class TaskExecutionLogger:
-    """Emit provider-agnostic task execution events to the canonical task log."""
+    """Emit provider-agnostic task execution events to the canonical ops log."""
 
-    def __init__(self, log_file: Path, *, echo: bool = True) -> None:
-        self.log_file = log_file
+    def __init__(self, ops_log_file: Path, *, echo: bool = True) -> None:
+        self.ops_log_file = ops_log_file
         self.echo = echo
 
     def _emit(self, subtype: str, message: str, *, stderr: bool = False, extra: dict | None = None) -> None:
@@ -333,7 +398,7 @@ class TaskExecutionLogger:
         }
         if extra:
             payload.update(extra)
-        write_log_entry(self.log_file, payload)
+        write_ops_entry(self.ops_log_file, payload)
         if self.echo:
             print(message, file=sys.stderr if stderr else sys.stdout)
 
@@ -355,25 +420,46 @@ class TaskExecutionLogger:
 
 def open_task_startup_log(config: Config, task: Task) -> Path:
     """Return the startup log path for a task, creating parent directories."""
-    path = _resolve_task_log_path(config, task)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        path.touch()
-    return path
+    return open_task_startup_logs(config, task).startup_conversation
+
+
+def open_task_startup_logs(config: Config, task: Task) -> TaskLogPaths:
+    """Return startup log paths for a task, creating parent directories."""
+    paths = resolve_task_log_paths(config, task)
+    selected_conversation = paths.startup_conversation
+    selected_ops = paths.startup_ops
+    if task.log_file or task.slug:
+        selected_conversation = paths.conversation
+        selected_ops = paths.ops
+    selected_conversation.parent.mkdir(parents=True, exist_ok=True)
+    if not selected_conversation.exists():
+        selected_conversation.touch()
+    return TaskLogPaths(
+        conversation=paths.conversation,
+        ops=paths.ops,
+        startup_conversation=selected_conversation,
+        startup_ops=selected_ops,
+        layout=paths.layout,
+    )
 
 
 def rename_startup_log_to_slug(config: Config, startup_log: Path, slug: str) -> Path:
-    """Rename a startup log file to the final slug log path."""
+    """Rename startup conversation and ops logs to final slug log paths."""
     final_log = config.log_path / f"{slug}.log"
-    if startup_log == final_log:
-        return final_log
-    final_log.parent.mkdir(parents=True, exist_ok=True)
-    if startup_log.exists():
-        startup_log.replace(final_log)
+    final_ops = resolve_ops_log_path(config, final_log)
+    startup_ops = resolve_ops_log_path(config, startup_log)
+    if startup_log != final_log:
+        final_log.parent.mkdir(parents=True, exist_ok=True)
+        if startup_log.exists():
+            startup_log.replace(final_log)
+    if startup_ops != final_ops:
+        final_ops.parent.mkdir(parents=True, exist_ok=True)
+        if startup_ops.exists():
+            startup_ops.replace(final_ops)
     return final_log
 
 
-def write_worker_start_event(log_file: "Path", *, resumed: bool) -> None:
+def write_worker_start_event(ops_log_file: "Path", *, resumed: bool) -> None:
     """Write a worker start lifecycle event when running under worker mode."""
     if os.environ.get("GZA_WORKER_MODE") != "1":
         return
@@ -381,10 +467,9 @@ def write_worker_start_event(log_file: "Path", *, resumed: bool) -> None:
     if not worker_id:
         return
     mode = "pipe mode, resumed" if resumed else "pipe mode"
-    write_log_entry(
-        log_file,
+    write_ops_entry(
+        ops_log_file,
         {
-            "type": "gza",
             "subtype": "worker_lifecycle",
             "event": "start",
             "worker_id": worker_id,
@@ -422,7 +507,7 @@ def _resolve_interaction_mode(
 
 
 def write_execution_provenance_event(
-    log_file: Path,
+    ops_log_file: Path,
     *,
     invocation: "RunInvocationContext",
     provider: "Provider",
@@ -437,10 +522,9 @@ def write_execution_provenance_event(
         f"Execution: command={invocation.command}, mode={canonical_execution_mode}, "
         f"interaction={interaction_mode}, provider={provider_name}, resumed={resumed}"
     )
-    write_log_entry(
-        log_file,
+    write_ops_entry(
+        ops_log_file,
         {
-            "type": "gza",
             "subtype": "execution",
             "message": message,
             "command": invocation.command,
@@ -2884,7 +2968,7 @@ def run(
     # Get the provider for this task
     provider = get_provider(task_config)
     resolved_interaction_mode = _resolve_interaction_mode(invocation_context, provider)
-    preflight_log = ensure_task_log_path(config, store, task)
+    preflight_logs = ensure_task_log_paths(config, store, task)
 
     if not provider.check_credentials():
         error_message(f"Error: No {provider.name} credentials found")
@@ -2904,7 +2988,7 @@ def run(
     # Verify credentials work before proceeding
     console.print(f"Verifying {provider.name} credentials...")
     preflight_result = _normalize_preflight_result(
-        provider.verify_credentials(task_config, log_file=preflight_log)
+        provider.verify_credentials(task_config, log_file=preflight_logs.ops)
     )
     if not preflight_result.ok:
         _mark_preflight_failure(
@@ -3990,8 +4074,17 @@ def _run_inner(
         }
         if interaction_mode == "interactive":
             provider_run_kwargs["interactive"] = True
+        if _provider_accepts_ops_log_file(provider):
+            provider_run_kwargs["ops_log_file"] = resolve_ops_log_path(config, log_file)
         provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type)
-        result = provider.run(task_config, provider_prompt, log_file, worktree_path, **provider_run_kwargs)
+        result = _call_provider_run(
+            provider,
+            task_config,
+            provider_prompt,
+            log_file,
+            worktree_path,
+            provider_run_kwargs=provider_run_kwargs,
+        )
 
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
@@ -4275,8 +4368,17 @@ def _run_non_code_task(
             }
             if interaction_mode == "interactive":
                 provider_run_kwargs["interactive"] = True
+            if _provider_accepts_ops_log_file(provider):
+                provider_run_kwargs["ops_log_file"] = resolve_ops_log_path(config, log_file)
             provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type)
-            result = provider.run(config, provider_prompt, log_file, worktree_path, **provider_run_kwargs)
+            result = _call_provider_run(
+                provider,
+                config,
+                provider_prompt,
+                log_file,
+                worktree_path,
+                provider_run_kwargs=provider_run_kwargs,
+            )
         except KeyboardInterrupt:
             failure_reason = _resolve_failure_reason(
                 interrupt_signal=_interrupt_signal_name(),

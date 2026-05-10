@@ -474,9 +474,11 @@ class TestCmdAttach:
         assert refreshed.failure_reason == "WORKER_DIED"
 
         import json as _json
+        from gza.log_paths import ops_log_path_for
+
         events = [
             _json.loads(line)
-            for line in log_path.read_text().splitlines()
+            for line in ops_log_path_for(log_path).read_text().splitlines()
             if line.strip()
         ]
         handoff_events = [

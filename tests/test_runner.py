@@ -16,6 +16,7 @@ from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError
 from gza.github import GitHubError, PullRequestDetails
 from gza.lineage import get_plan_for_task
+from gza.log_paths import ops_log_path_for
 from gza.providers import ClaudeProvider, RunResult
 from gza.providers.base import PreflightCheckResult
 from gza.recovery_engine import decide_failed_task_recovery
@@ -317,7 +318,7 @@ class TestWorkerLifecycleLogging:
         ):
             write_worker_start_event(log_file, resumed=True)
 
-        content = log_file.read_text().strip()
+        content = ops_log_path_for(log_file).read_text().strip()
         assert content
         import json
         event = json.loads(content)
@@ -348,7 +349,7 @@ class TestWorkerLifecycleLogging:
 
         import json
 
-        event = json.loads(log_file.read_text().strip())
+        event = json.loads(ops_log_path_for(log_file).read_text().strip())
         assert event["type"] == "gza"
         assert event["subtype"] == "execution"
         assert event["command"] == "run-inline"
@@ -379,7 +380,7 @@ class TestWorkerLifecycleLogging:
 
         import json
 
-        event = json.loads(log_file.read_text().strip())
+        event = json.loads(ops_log_path_for(log_file).read_text().strip())
         assert event["execution_mode"] == "worker_foreground"
         assert event["worker_mode"] is True
 
@@ -3293,7 +3294,7 @@ class TestMaxStepsHandling:
         assert failed.status == "failed"
         assert failed.failure_reason == "UNKNOWN"
         assert failed.log_file is not None
-        log_contents = (tmp_path / failed.log_file).read_text()
+        log_contents = ops_log_path_for(tmp_path / failed.log_file).read_text()
         assert "Outcome: failed (error_type=max_steps)" in log_contents
         assert "Outcome: failed (max_steps)" not in log_contents
 
@@ -3339,7 +3340,7 @@ class TestMaxStepsHandling:
         assert failed.status == "failed"
         assert failed.failure_reason == "UNKNOWN"
         assert failed.log_file is not None
-        log_contents = (tmp_path / failed.log_file).read_text()
+        log_contents = ops_log_path_for(tmp_path / failed.log_file).read_text()
         assert "Outcome: failed (error_type=max_turns)" in log_contents
         assert "Outcome: failed (max_turns)" not in log_contents
 
@@ -3483,7 +3484,7 @@ class TestMaxStepsHandling:
         assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider timed out after 10 minutes"
 
         assert failed.log_file is not None
-        log_contents = (tmp_path / failed.log_file).read_text()
+        log_contents = ops_log_path_for(tmp_path / failed.log_file).read_text()
         assert "Outcome: failed (timeout after 10m)" in log_contents
         assert "Outcome: failed (max_steps)" not in log_contents
 
@@ -3507,7 +3508,7 @@ class TestMaxStepsHandling:
         assert completed.output_content == report_text
 
         assert completed.log_file is not None
-        log_contents = (tmp_path / completed.log_file).read_text()
+        log_contents = ops_log_path_for(tmp_path / completed.log_file).read_text()
         assert "Outcome: completed" in log_contents
         assert "Outcome: failed (timeout after 10m)" not in log_contents
         assert "Outcome: failed (max_steps)" not in log_contents
@@ -3539,7 +3540,7 @@ class TestMaxStepsHandling:
         assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider exited with code 1"
 
         assert failed.log_file is not None
-        log_contents = (tmp_path / failed.log_file).read_text()
+        log_contents = ops_log_path_for(tmp_path / failed.log_file).read_text()
         assert "Outcome: failed (exit_code=1)" in log_contents
         assert "Outcome: failed (timeout after 10m)" not in log_contents
         assert "Outcome: failed (max_steps)" not in log_contents
@@ -3583,7 +3584,7 @@ class TestMaxStepsHandling:
         assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider exited with code 1"
 
         assert failed.log_file is not None
-        log_contents = (tmp_path / failed.log_file).read_text()
+        log_contents = ops_log_path_for(tmp_path / failed.log_file).read_text()
         assert "Outcome: failed (exit_code=1)" in log_contents
         assert "Outcome: failed (timeout after 10m)" not in log_contents
         assert "Outcome: failed (max_steps)" not in log_contents
@@ -4092,7 +4093,7 @@ class TestFailureReasonGroundTruth:
         assert mock_task_footer.call_count == 1
         assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider reported max_steps"
         assert failed.log_file is not None
-        log_contents = (tmp_path / failed.log_file).read_text()
+        log_contents = ops_log_path_for(tmp_path / failed.log_file).read_text()
         assert "Outcome: failed (error_type=max_steps)" in log_contents
         assert "Outcome: failed (max_steps)" not in log_contents
 
@@ -4116,7 +4117,7 @@ class TestFailureReasonGroundTruth:
         assert mock_task_footer.call_count == 1
         assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider reported max_turns"
         assert failed.log_file is not None
-        log_contents = (tmp_path / failed.log_file).read_text()
+        log_contents = ops_log_path_for(tmp_path / failed.log_file).read_text()
         assert "Outcome: failed (error_type=max_turns)" in log_contents
         assert "Outcome: failed (max_turns)" not in log_contents
 
@@ -4140,7 +4141,7 @@ class TestFailureReasonGroundTruth:
         assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider timed out after 15 minutes"
 
         assert failed.log_file is not None
-        log_contents = (tmp_path / failed.log_file).read_text()
+        log_contents = ops_log_path_for(tmp_path / failed.log_file).read_text()
         assert "Outcome: failed (timeout after 15m)" in log_contents
         assert "Outcome: failed (max_steps)" not in log_contents
 
@@ -4169,7 +4170,7 @@ class TestFailureReasonGroundTruth:
         assert completed.failure_reason is None
 
         assert completed.log_file is not None
-        log_contents = (tmp_path / completed.log_file).read_text()
+        log_contents = ops_log_path_for(tmp_path / completed.log_file).read_text()
         assert "Outcome: completed" in log_contents
         assert "Outcome: failed (timeout after 15m)" not in log_contents
         assert "Outcome: failed (max_steps)" not in log_contents
@@ -4201,7 +4202,7 @@ class TestFailureReasonGroundTruth:
         assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider exited with code 1"
 
         assert failed.log_file is not None
-        log_contents = (tmp_path / failed.log_file).read_text()
+        log_contents = ops_log_path_for(tmp_path / failed.log_file).read_text()
         assert "Outcome: failed (exit_code=1)" in log_contents
         assert "Outcome: failed (timeout after 15m)" not in log_contents
         assert "Outcome: failed (max_steps)" not in log_contents
@@ -4245,7 +4246,7 @@ class TestFailureReasonGroundTruth:
         assert mock_task_footer.call_args.kwargs["status"] == "Failed: MockProvider exited with code 1"
 
         assert failed.log_file is not None
-        log_contents = (tmp_path / failed.log_file).read_text()
+        log_contents = ops_log_path_for(tmp_path / failed.log_file).read_text()
         assert "Outcome: failed (exit_code=1)" in log_contents
         assert "Outcome: failed (timeout after 15m)" not in log_contents
         assert "Outcome: failed (max_steps)" not in log_contents
@@ -4553,7 +4554,7 @@ class TestRunStepPersistenceIntegration:
         assert refreshed.log_file is not None
 
         log_path = tmp_path / refreshed.log_file
-        log_text = log_path.read_text()
+        log_text = ops_log_path_for(log_path).read_text()
         assert '"subtype": "interrupt"' in log_text
         assert '"source": "watch_reconcile_no_activity"' in log_text
 
@@ -6264,16 +6265,21 @@ class TestTaskClaimSafety:
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == expected_reason
         assert refreshed.log_file is not None
-        log_content = (tmp_path / refreshed.log_file).read_text()
-        assert expected_reason in log_content
-        assert '"subtype": "execution"' in log_content
-        assert expected_message in log_content
+        transcript_content = (tmp_path / refreshed.log_file).read_text()
+        ops_log = (tmp_path / refreshed.log_file).with_name(
+            f"{Path(refreshed.log_file).stem}.ops.jsonl"
+        )
+        ops_content = ops_log.read_text()
+        assert transcript_content == ""
+        assert expected_reason in ops_content
+        assert '"subtype": "execution"' in ops_content
+        assert expected_message in ops_content
 
         import json
 
         execution_events = [
             json.loads(line)
-            for line in log_content.splitlines()
+            for line in ops_content.splitlines()
             if line.strip() and '"subtype": "execution"' in line
         ]
         assert execution_events
@@ -6340,7 +6346,7 @@ class TestTaskClaimSafety:
 
         import json
 
-        log_content = (tmp_path / refreshed.log_file).read_text()
+        log_content = ops_log_path_for(tmp_path / refreshed.log_file).read_text()
         execution_events = [
             json.loads(line)
             for line in log_content.splitlines()
@@ -6607,8 +6613,8 @@ class TestTaskClaimSafety:
         assert refreshed.failure_reason == "INTERRUPTED"
         assert refreshed.session_id == "sess-inline-resume-1"
 
-    def test_successful_run_keeps_preflight_and_runner_entries_in_one_log(self, tmp_path: Path):
-        """Successful run should keep preflight and provider-run entries in one canonical log."""
+    def test_successful_run_splits_preflight_and_runner_entries_into_ops_log(self, tmp_path: Path):
+        """Successful run should keep task.log_file as transcript and route gza entries to ops."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Single canonical log", task_type="implement")
@@ -6649,9 +6655,12 @@ class TestTaskClaimSafety:
         assert refreshed.log_file is not None
         assert refreshed.log_file.endswith(".log")
         assert not refreshed.log_file.endswith(".startup.log")
-        log_content = (config.project_dir / refreshed.log_file).read_text()
-        assert "preflight-ok" in log_content
-        assert "provider-run" in log_content
+        transcript_log = config.project_dir / refreshed.log_file
+        ops_log = transcript_log.with_name(f"{transcript_log.stem}.ops.jsonl")
+        assert transcript_log.read_text() == ""
+        ops_content = ops_log.read_text()
+        assert "preflight-ok" in ops_content
+        assert "provider-run" in ops_content
 
 
 class TestSameBranchLineageWalk:
@@ -9068,32 +9077,38 @@ class TestWriteLogEntry:
     """Tests for write_log_entry helper."""
 
     def test_creates_file_and_writes_jsonl(self, tmp_path: Path) -> None:
-        """write_log_entry creates the file and writes a valid JSONL entry."""
+        """write_log_entry keeps the transcript path and routes gza entries to ops."""
         import json
         log_file = tmp_path / "task.log"
         entry = {"type": "gza", "subtype": "info", "message": "Hello"}
         write_log_entry(log_file, entry)
         assert log_file.exists()
-        line = log_file.read_text().strip()
-        assert json.loads(line) == entry
+        assert log_file.read_text() == ""
+        line = ops_log_path_for(log_file).read_text().strip()
+        assert json.loads(line)["message"] == entry["message"]
+        assert json.loads(line)["subtype"] == entry["subtype"]
 
     def test_appends_multiple_entries(self, tmp_path: Path) -> None:
-        """write_log_entry appends without overwriting existing content."""
+        """write_log_entry appends gza entries to the derived ops stream."""
         import json
         log_file = tmp_path / "task.log"
         entry1 = {"type": "gza", "subtype": "info", "message": "First"}
         entry2 = {"type": "gza", "subtype": "branch", "message": "Second", "branch": "feat/x"}
         write_log_entry(log_file, entry1)
         write_log_entry(log_file, entry2)
-        lines = log_file.read_text().strip().splitlines()
+        assert log_file.read_text() == ""
+        lines = ops_log_path_for(log_file).read_text().strip().splitlines()
         assert len(lines) == 2
-        assert json.loads(lines[0]) == entry1
-        assert json.loads(lines[1]) == entry2
+        assert json.loads(lines[0])["message"] == entry1["message"]
+        assert json.loads(lines[1])["branch"] == entry2["branch"]
 
     def test_logs_warning_when_write_fails(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
         """write_log_entry logs a warning and does not raise when writing fails."""
-        bad_path = tmp_path / "nonexistent_dir" / "task.log"
-        with caplog.at_level("WARNING"):
+        bad_path = tmp_path / "task.log"
+        with (
+            caplog.at_level("WARNING"),
+            patch("builtins.open", side_effect=OSError("boom")),
+        ):
             write_log_entry(bad_path, {"type": "gza", "message": "x"})
 
         assert "Failed to write log entry" in caplog.text
@@ -9663,7 +9678,7 @@ class TestDependencyMergePrecondition:
 
         log_file = tmp_path / "logs" / f"{downstream.slug}.log"
         assert log_file.exists()
-        log_text = log_file.read_text()
+        log_text = ops_log_path_for(log_file).read_text()
         assert '"subtype": "outcome"' in log_text
         assert '"failure_reason": "PREREQUISITE_UNMERGED"' in log_text
         assert "test/dep-branch" in log_text
@@ -9683,7 +9698,7 @@ class TestDependencyMergePrecondition:
 
         log_file = tmp_path / "logs" / f"{downstream.slug}.log"
         assert log_file.exists()
-        log_text = log_file.read_text()
+        log_text = ops_log_path_for(log_file).read_text()
         retry_task = next(t for t in store.get_all() if t.prompt == "Retry upstream task")
         assert retry_task.id is not None
         assert "test/retry-upstream-branch" in log_text
@@ -9715,7 +9730,7 @@ class TestDependencyMergePrecondition:
 
         log_file = tmp_path / "logs" / f"{downstream.slug}.log"
         assert log_file.exists()
-        assert "Skipped dependency merge precondition check (--force)" in log_file.read_text()
+        assert "Skipped dependency merge precondition check (--force)" in ops_log_path_for(log_file).read_text()
 
     def test_followup_task_dependency_is_merge_gated_by_reviewed_implementation(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -9825,13 +9840,18 @@ class TestStartupLogHelpers:
         config = Config(project_dir=tmp_path, project_name="test-project")
         config.log_path.mkdir(parents=True, exist_ok=True)
         startup = config.log_path / "gza-1.startup.log"
+        startup_ops = config.log_path / "gza-1.startup.ops.jsonl"
         startup.write_text('{"subtype": "preflight"}\n')
+        startup_ops.write_text('{"subtype": "execution"}\n')
 
         final = rename_startup_log_to_slug(config, startup, "20260419-hello")
+        final_ops = config.log_path / "20260419-hello.ops.jsonl"
 
         assert not startup.exists()
+        assert not startup_ops.exists()
         assert final.name == "20260419-hello.log"
         assert final.read_text() == '{"subtype": "preflight"}\n'
+        assert final_ops.read_text() == '{"subtype": "execution"}\n'
 
     def test_rename_is_noop_when_paths_match(self, tmp_path: Path):
         config = Config(project_dir=tmp_path, project_name="test-project")

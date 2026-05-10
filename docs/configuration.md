@@ -574,11 +574,14 @@ gza log <identifier> [options]
 | `--tail N` | Show last N lines |
 | `--raw` | Show raw JSON lines |
 | `--verbose` | Keep formatted provider rendering, but expand generic fallback events with pretty JSON payloads |
+| `--conversation-only` | Show only the provider conversation transcript stream |
+| `--ops-only` | Show only the gza operational stream |
 | `--failure`, `-F` | Show failure-focused diagnostics for failed tasks (reason, summary, marker, agent explanation, and last verify/result context) |
 | `--page` | Pipe output through `$PAGER` (default: `less -R`); skipped for `--follow` and `--raw` |
 
 By default, the identifier is treated as a full task ID (for example `gza-1234`).
-If no main task log exists yet, `gza log` can fall back to worker startup logs in `.gza/workers/*-startup.log`.
+For split-layout task logs, `gza log` merges `.gza/logs/<slug>.log` (provider conversation transcript) with `.gza/logs/<slug>.ops.jsonl` (runner/provider operational events) in chronological order.
+If no main task log exists yet, `gza log` can fall back to startup logs and their paired startup ops siblings, including worker startup logs in `.gza/workers/*-startup.log` and `.gza/workers/*-startup.ops.jsonl`.
 Top-level provider `{"type":"error"}` events are rendered in normal log output; if the provider embeds a nested `error.message` JSON payload, `gza log` shows the readable message and keeps the full payload inline.
 When stream metadata is present, `gza log` also shows model parity in-session: configured model (from `gza/info`) vs provider-reported model, including a warning on mismatch or an explicit note when the provider does not echo a model.
 `--verbose` does not switch to raw JSONL. It preserves the curated formatted output and only expands generic fallback events so unknown provider payloads stay inspectable without losing the higher-level rendering.
@@ -1200,7 +1203,7 @@ gza clean [options]
 |--------|-------------|
 | `--worktrees` | Only clean up stale worktrees |
 | `--workers` | Only clean up stale worker metadata and startup logs |
-| `--logs` | Only clean up old log files |
+| `--logs` | Only clean up old log files (conversation `.log` and paired `.ops.jsonl` siblings together) |
 | `--backups` | Only clean up old backup files |
 | `--days N` | Remove items older than N days (default: from config cleanup_days, or 30) |
 | `--keep-unmerged` | Keep logs for tasks that are still unmerged |
@@ -1745,7 +1748,7 @@ Provider credentials (API keys) have their own precedence — see [Dotenv Files]
 | `.gza/` | Local state directory (add to `.gitignore`) |
 | `.gza/gza.db` | Default project-local SQLite task database |
 | `~/.gza/gza.db` | Optional shared SQLite task database (set `db_path` explicitly) |
-| `.gza/logs/` | Task execution logs |
+| `.gza/logs/` | Task transcripts (`*.log`) and paired operational logs (`*.ops.jsonl`) |
 | `.gza/workers/` | Worker metadata and startup logs |
 | `etc/Dockerfile.claude` | Generated Docker image for Claude |
 | `etc/Dockerfile.codex` | Generated Docker image for Codex |

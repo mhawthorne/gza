@@ -27,6 +27,7 @@ from .base import (
     build_docker_cmd,
     ensure_docker_image,
     verify_docker_credentials,
+    write_ops_event,
     write_preflight_entry,
 )
 from .log_rendering import (
@@ -592,21 +593,44 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         interactive: bool = False,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Claude to execute a task."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         if interactive:
             return self._run_interactive(
                 config,
                 prompt,
-                log_file,
+                conversation_log_file,
                 work_dir,
                 resume_session_id=resume_session_id,
                 on_session_id=on_session_id,
                 on_step_count=on_step_count,
+                ops_log_file=ops_log_file,
             )
         if config.use_docker:
-            return self._run_docker(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
-        return self._run_direct(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
+            return self._run_docker(
+                config,
+                prompt,
+                conversation_log_file,
+                work_dir,
+                resume_session_id,
+                on_session_id,
+                on_step_count,
+                ops_log_file=ops_log_file,
+            )
+        return self._run_direct(
+            config,
+            prompt,
+            conversation_log_file,
+            work_dir,
+            resume_session_id,
+            on_session_id,
+            on_step_count,
+            ops_log_file=ops_log_file,
+        )
 
     def _run_interactive(
         self,
@@ -617,26 +641,32 @@ class ClaudeProvider(Provider):
         resume_session_id: str | None = None,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Claude in foreground mode while preserving runner telemetry callbacks."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         if config.use_docker:
             return self._run_docker_interactive(
                 config,
                 prompt,
-                log_file,
+                conversation_log_file,
                 work_dir,
-                resume_session_id,
-                on_session_id,
-                on_step_count,
+                resume_session_id=resume_session_id,
+                on_session_id=on_session_id,
+                on_step_count=on_step_count,
+                ops_log_file=ops_log_file,
             )
         return self._run_direct_interactive(
             config,
             prompt,
-            log_file,
+            conversation_log_file,
             work_dir,
-            resume_session_id,
-            on_session_id,
-            on_step_count,
+            resume_session_id=resume_session_id,
+            on_session_id=on_session_id,
+            on_step_count=on_step_count,
+            ops_log_file=ops_log_file,
         )
 
     @staticmethod
@@ -699,8 +729,12 @@ class ClaudeProvider(Provider):
         resume_session_id: str | None = None,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Claude in foreground interactive mode in Docker."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         if config.claude.fetch_auth_token_from_keychain:
             sync_keychain_credentials()
         docker_config = _get_docker_config(f"{config.docker_image}-claude")
@@ -721,7 +755,8 @@ class ClaudeProvider(Provider):
         cmd.extend(self._build_claude_interactive_args(config, resume_session_id))
         return self._run_interactive_command(
             cmd,
-            log_file,
+            conversation_log_file,
+            ops_log_file,
             timeout_minutes=config.timeout_minutes,
             on_session_id=on_session_id,
             on_step_count=on_step_count,
@@ -738,13 +773,18 @@ class ClaudeProvider(Provider):
         resume_session_id: str | None = None,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Claude in foreground interactive mode on host."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         cmd = ["timeout", f"{config.timeout_minutes}m", "claude"]
         cmd.extend(self._build_claude_interactive_args(config, resume_session_id))
         return self._run_interactive_command(
             cmd,
-            log_file,
+            conversation_log_file,
+            ops_log_file,
             cwd=work_dir,
             timeout_minutes=config.timeout_minutes,
             on_session_id=on_session_id,
@@ -762,8 +802,12 @@ class ClaudeProvider(Provider):
         resume_session_id: str | None = None,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Claude in Docker container."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         if config.claude.fetch_auth_token_from_keychain:
             sync_keychain_credentials()
         docker_config = _get_docker_config(f"{config.docker_image}-claude")
@@ -777,10 +821,11 @@ class ClaudeProvider(Provider):
         cmd.extend(self._build_claude_args(config, resume_session_id))
 
         return self._run_with_output_parsing(
-            cmd, log_file, config.timeout_minutes, stdin_input=prompt, model=config.model,
+            cmd, conversation_log_file, config.timeout_minutes, stdin_input=prompt, model=config.model,
             chat_text_display_length=config.chat_text_display_length,
             on_session_id=on_session_id,
             on_step_count=on_step_count,
+            ops_log_file=ops_log_file,
         )
 
     def _run_direct(
@@ -792,20 +837,31 @@ class ClaudeProvider(Provider):
         resume_session_id: str | None = None,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Claude directly (no Docker)."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         # When running inside a tmux session, use interactive mode so the proxy
         # can auto-accept tool prompts and users can attach.
         if getattr(config.tmux, "session_name", None):
-            return self._run_direct_tmux(config, prompt, log_file, work_dir)
+            return self._run_direct_tmux(
+                config,
+                prompt,
+                conversation_log_file,
+                work_dir,
+                ops_log_file=ops_log_file,
+            )
 
         cmd = self.build_noninteractive_command(config, work_dir, resume_session_id)
 
         return self._run_with_output_parsing(
-            cmd, log_file, config.timeout_minutes, cwd=work_dir, stdin_input=prompt, model=config.model,
+            cmd, conversation_log_file, config.timeout_minutes, cwd=work_dir, stdin_input=prompt, model=config.model,
             chat_text_display_length=config.chat_text_display_length,
             on_session_id=on_session_id,
             on_step_count=on_step_count,
+            ops_log_file=ops_log_file,
         )
 
     def _run_direct_tmux(
@@ -814,6 +870,7 @@ class ClaudeProvider(Provider):
         prompt: str,
         log_file: Path,
         work_dir: Path,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Claude in interactive mode for tmux sessions.
 
@@ -823,14 +880,18 @@ class ClaudeProvider(Provider):
         ``tmux pipe-pane``; structured proxy events go to a separate
         ``*-proxy.log`` file so existing log parsers see clean output.
         """
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
+
         import json as _json
         import shlex as _shlex
 
-        log_file.parent.mkdir(parents=True, exist_ok=True)
+        conversation_log_file.parent.mkdir(parents=True, exist_ok=True)
 
         # Proxy structured events (JSONL) go to a separate file so they do not
         # mix with the raw terminal output captured in the main log file.
-        proxy_log_file = log_file.parent / f"{log_file.stem}-proxy.log"
+        proxy_log_file = conversation_log_file.parent / f"{conversation_log_file.stem}-proxy.log"
 
         with open(proxy_log_file, "a") as f:
             f.write(_json.dumps({
@@ -839,6 +900,13 @@ class ClaudeProvider(Provider):
                 "message": "Started in tmux interactive mode",
                 "session": config.tmux.session_name,
             }) + "\n")
+        write_ops_event(
+            ops_log_file,
+            subtype="tmux_start",
+            source="provider",
+            message="Started in tmux interactive mode",
+            session=config.tmux.session_name,
+        )
 
         # Capture raw terminal output from the tmux pane to the main log file.
         # This mirrors the output that humans see when they attach, and is what
@@ -847,7 +915,7 @@ class ClaudeProvider(Provider):
             subprocess.run(
                 [
                     "tmux", "pipe-pane", "-t", config.tmux.session_name,
-                    f"cat >> {_shlex.quote(str(log_file))}",
+                    f"cat >> {_shlex.quote(str(conversation_log_file))}",
                 ],
                 check=False,
             )
@@ -866,6 +934,13 @@ class ClaudeProvider(Provider):
                 "subtype": "tmux_end",
                 "exit_code": result.returncode,
             }) + "\n")
+        write_ops_event(
+            ops_log_file,
+            subtype="tmux_end",
+            source="provider",
+            message=f"tmux session exited with code {result.returncode}",
+            exit_code=result.returncode,
+        )
 
         return RunResult(exit_code=result.returncode)
 
@@ -889,7 +964,8 @@ class ClaudeProvider(Provider):
     def _run_interactive_command(
         self,
         cmd: list[str],
-        log_file: Path,
+        conversation_log_file: Path,
+        ops_log_file: Path,
         *,
         cwd: Path | None = None,
         timeout_minutes: int,
@@ -899,18 +975,19 @@ class ClaudeProvider(Provider):
         resume_session_id: str | None = None,
     ) -> RunResult:
         """Run an interactive Claude command in the foreground terminal."""
-        log_file.parent.mkdir(parents=True, exist_ok=True)
+        conversation_log_file.parent.mkdir(parents=True, exist_ok=True)
         launch_cmd = self._redact_interactive_launch_command(
             cmd,
             prompt_seed=stdin_input,
             resume_session_id=resume_session_id,
         )
-        with open(log_file, "a") as f:
-            f.write(json.dumps({
-                "type": "gza",
-                "subtype": "interactive_launch",
-                "command": launch_cmd,
-            }) + "\n")
+        write_ops_event(
+            ops_log_file,
+            subtype="interactive_launch",
+            source="provider",
+            message="Launching interactive Claude session",
+            command=launch_cmd,
+        )
 
         start_time = time.time()
         session_id: str | None = resume_session_id
@@ -993,17 +1070,14 @@ class ClaudeProvider(Provider):
                 except OSError:
                     error_message = "Failed to seed interactive stdin prompt; aborting interactive run."
                     logger.error(error_message, exc_info=True)
-                    with open(log_file, "a", encoding="utf-8") as f:
-                        f.write(
-                            json.dumps({
-                                "type": "gza",
-                                "subtype": "outcome",
-                                "message": error_message,
-                                "exit_code": 1,
-                                "failure_reason": "UNKNOWN",
-                            }) + "\n"
-                        )
-                        f.flush()
+                    write_ops_event(
+                        ops_log_file,
+                        subtype="outcome",
+                        source="provider",
+                        message=error_message,
+                        exit_code=1,
+                        failure_reason="UNKNOWN",
+                    )
                     sys.stderr.write(f"{error_message}\n")
                     sys.stderr.flush()
                     if process.poll() is None:
@@ -1028,7 +1102,7 @@ class ClaudeProvider(Provider):
             if isinstance(maybe_stdin_fd, int) and os.isatty(maybe_stdin_fd):
                 stdin_fd = maybe_stdin_fd
 
-            with open(log_file, "a", encoding="utf-8") as f:
+            with open(conversation_log_file, "a", encoding="utf-8") as f:
                 while True:
                     read_fds = [master_fd]
                     if stdin_fd is not None:
@@ -1117,8 +1191,12 @@ class ClaudeProvider(Provider):
         chat_text_display_length: int = 0,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run command and parse Claude's stream-json output."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         formatter = StreamOutputFormatter()
 
         def _ensure_step_store(data: dict) -> None:
@@ -1203,8 +1281,14 @@ class ClaudeProvider(Provider):
                         # Log timestamp to log file at start of each step
                         if log_handle:
                             timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-                            log_handle.write(f"--- Step {turn_count} at {timestamp_str} ---\n")
-                            log_handle.flush()
+                            write_ops_event(
+                                ops_log_file,
+                                subtype="step_marker",
+                                source="provider",
+                                message=f"Step {turn_count}",
+                                step=turn_count,
+                                step_timestamp=timestamp_str,
+                            )
 
                         # Add blank line before step (except first step)
                         formatter.print_step_header(
@@ -1390,7 +1474,13 @@ class ClaudeProvider(Provider):
                 print(line)
 
         result = self.run_with_logging(
-            cmd, log_file, timeout_minutes, cwd=cwd, parse_output=parse_claude_output, stdin_input=stdin_input
+            cmd,
+            conversation_log_file,
+            timeout_minutes,
+            cwd=cwd,
+            parse_output=parse_claude_output,
+            stdin_input=stdin_input,
+            ops_log_file=ops_log_file,
         )
 
         # Extract stats and error info from result event

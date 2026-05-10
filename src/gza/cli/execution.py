@@ -38,6 +38,7 @@ from ..extractions import (
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git
 from ..lineage import resolve_impl_task
+from ..log_paths import ops_log_path_for
 from ..prompts import PromptBuilder
 from ..query import (
     get_base_task_slug as _get_base_task_slug,
@@ -1406,41 +1407,61 @@ def _log_indicates_inline_skill(task: DbTask, config: Config) -> tuple[bool, str
     """
     if not task.log_file:
         return False, None
-    log_path = config.project_dir / Path(task.log_file)
-    if not log_path.exists():
+    conversation_path = config.project_dir / Path(task.log_file)
+    ops_path = ops_log_path_for(conversation_path)
+
+    def _scan(path: Path, display_path: str) -> tuple[bool, str | None]:
+        malformed_lines = 0
+        try:
+            with path.open(encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        malformed_lines += 1
+                        continue
+                    if entry.get("type") != "gza" or entry.get("subtype") != "provenance":
+                        continue
+                    if entry.get("inline") is True and entry.get("skill"):
+                        return True, None
+        except OSError as exc:
+            return (
+                False,
+                (
+                    f"Warning: Could not read task log '{display_path}' while checking inline provenance: "
+                    f"{exc.__class__.__name__}: {exc}"
+                ),
+            )
+        if malformed_lines:
+            return (
+                False,
+                (
+                    f"Warning: Found {malformed_lines} malformed JSON line(s) in task log "
+                    f"'{display_path}' while checking inline provenance; execution mode was not promoted."
+                ),
+            )
         return False, None
-    malformed_lines = 0
-    try:
-        with log_path.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    malformed_lines += 1
-                    continue
-                if entry.get("type") != "gza" or entry.get("subtype") != "provenance":
-                    continue
-                if entry.get("inline") is True and entry.get("skill"):
-                    return True, None
-    except OSError as exc:
-        return (
-            False,
-            (
-                f"Warning: Could not read task log '{task.log_file}' while checking inline provenance: "
-                f"{exc.__class__.__name__}: {exc}"
-            ),
-        )
-    if malformed_lines:
-        return (
-            False,
-            (
-                f"Warning: Found {malformed_lines} malformed JSON line(s) in task log "
-                f"'{task.log_file}' while checking inline provenance; execution mode was not promoted."
-            ),
-        )
+
+    warnings: list[str] = []
+    if ops_path.exists():
+        found, warning = _scan(ops_path, str(ops_path.relative_to(config.project_dir)))
+        if found:
+            return True, None
+        if warning:
+            warnings.append(warning)
+
+    if conversation_path.exists():
+        found, warning = _scan(conversation_path, task.log_file)
+        if found:
+            return True, None
+        if warning:
+            warnings.append(warning)
+
+    if warnings:
+        return False, " ".join(warnings)
     return False, None
 
 

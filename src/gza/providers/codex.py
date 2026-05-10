@@ -20,6 +20,7 @@ from .base import (
     build_docker_cmd,
     ensure_docker_image,
     verify_docker_credentials,
+    write_ops_event,
     write_preflight_entry,
 )
 from .log_rendering import (
@@ -455,12 +456,34 @@ class CodexProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         interactive: bool = False,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Codex to execute a task."""
         _ = interactive
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         if config.use_docker:
-            return self._run_docker(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
-        return self._run_direct(config, prompt, log_file, work_dir, resume_session_id, on_session_id, on_step_count)
+            return self._run_docker(
+                config,
+                prompt,
+                conversation_log_file,
+                work_dir,
+                resume_session_id,
+                on_session_id,
+                on_step_count,
+                ops_log_file=ops_log_file,
+            )
+        return self._run_direct(
+            config,
+            prompt,
+            conversation_log_file,
+            work_dir,
+            resume_session_id,
+            on_session_id,
+            on_step_count,
+            ops_log_file=ops_log_file,
+        )
 
     def _run_docker(
         self,
@@ -471,8 +494,12 @@ class CodexProvider(Provider):
         resume_session_id: str | None = None,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Codex in Docker container."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         docker_config = _get_docker_config(f"{config.docker_image}-codex")
 
         if not ensure_docker_image(docker_config, config.project_dir):
@@ -507,11 +534,12 @@ class CodexProvider(Provider):
             self._append_reasoning_effort_override(cmd, config.reasoning_effort)
 
         return self._run_with_output_parsing(
-            cmd, log_file, config.timeout_minutes, stdin_input=prompt,
+            cmd, conversation_log_file, config.timeout_minutes, stdin_input=prompt,
             model=config.model, max_steps=config.max_steps,
             chat_text_display_length=config.chat_text_display_length,
             on_session_id=on_session_id,
             on_step_count=on_step_count,
+            ops_log_file=ops_log_file,
         )
 
     def _run_direct(
@@ -523,17 +551,22 @@ class CodexProvider(Provider):
         resume_session_id: str | None = None,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Codex directly (no Docker)."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         cmd = self.build_noninteractive_command(config, work_dir, resume_session_id)
 
         return self._run_with_output_parsing(
-            cmd, log_file, config.timeout_minutes, cwd=work_dir,
+            cmd, conversation_log_file, config.timeout_minutes, cwd=work_dir,
             stdin_input=prompt, model=config.model,
             max_steps=config.max_steps,
             chat_text_display_length=config.chat_text_display_length,
             on_session_id=on_session_id,
             on_step_count=on_step_count,
+            ops_log_file=ops_log_file,
         )
 
     @classmethod
@@ -593,8 +626,12 @@ class CodexProvider(Provider):
         chat_text_display_length: int = 0,
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run command and parse Codex's JSON output."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         formatter = StreamOutputFormatter()
 
         def _ensure_step_store(data: dict) -> None:
@@ -824,8 +861,14 @@ class CodexProvider(Provider):
                         if log_handle:
                             from datetime import datetime
                             timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-                            log_handle.write(f"--- Step {step_num} at {timestamp_str} ---\n")
-                            log_handle.flush()
+                            write_ops_event(
+                                ops_log_file,
+                                subtype="step_marker",
+                                source="provider",
+                                message=f"Step {step_num}",
+                                step=step_num,
+                                step_timestamp=timestamp_str,
+                            )
 
                         formatter.print_step_header(
                             step_num,
@@ -899,7 +942,13 @@ class CodexProvider(Provider):
                 formatter.print_error(line)
 
         result = self.run_with_logging(
-            cmd, log_file, timeout_minutes, cwd=cwd, parse_output=parse_codex_output, stdin_input=stdin_input
+            cmd,
+            conversation_log_file,
+            timeout_minutes,
+            cwd=cwd,
+            parse_output=parse_codex_output,
+            stdin_input=stdin_input,
+            ops_log_file=ops_log_file,
         )
 
         # Extract stats from accumulated data

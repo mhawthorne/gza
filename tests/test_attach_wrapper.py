@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 from gza.attach_wrapper import main
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.log_paths import ops_log_path_for
 from gza.recovery_engine import decide_failed_task_recovery
 
 
@@ -29,7 +30,8 @@ def _setup_task_with_log(project_dir: Path, *, task_type: str = "implement") -> 
 
 
 def _read_log_events(log_path: Path) -> list[dict]:
-    return [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    ops_path = ops_log_path_for(log_path)
+    return [json.loads(line) for line in ops_path.read_text().splitlines() if line.strip()]
 
 
 def test_attach_wrapper_normal_exit_auto_resumes_when_task_incomplete(tmp_path: Path) -> None:

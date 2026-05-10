@@ -38,7 +38,7 @@ These create worktrees in `/tmp` (for Docker compatibility) based on the default
 
 Unlike code task worktrees, non-code task worktrees are **removed on success** after the report file is copied back to the project directory. They have no further use once the report is written. On failure, the worktree is preserved for debugging and its path is printed to the console.
 
-**Log-recovery path**: When the expected report artifact is missing but content can be recovered from the provider's JSONL log (a `{"type": "result"}` entry), the task completes successfully and the worktree is cleaned up normally — not preserved. This recovery is logged as a warning and the outcome is recorded as `completed (recovered from provider log)`.
+**Log-recovery path**: When the expected report artifact is missing but content can be recovered from the provider conversation log `.gza/logs/<slug>.log` (a `{"type": "result"}` entry), the task completes successfully and the worktree is cleaned up normally — not preserved. Operational events now live in the sibling `.ops.jsonl` file and are not used for report-content recovery. This recovery is logged as a warning and the outcome is recorded as `completed (recovered from provider log)`.
 
 **Single-file stale-name recovery**: If log recovery fails and the report directory contains exactly one other `*.md` file, gza treats that as a stale filename mismatch, copies its contents into the expected path, logs a warning naming both filenames, and completes normally. If there are zero or multiple mismatched `*.md` files, the task still fails with `MISSING_REPORT_ARTIFACT`.
 

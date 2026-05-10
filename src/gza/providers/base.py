@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -11,6 +12,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -435,9 +437,11 @@ def write_preflight_entry(
     """Append a preflight JSONL entry describing a verify subprocess call."""
     if log_file is None:
         return
-    import json
     entry = {
         "type": "gza",
+        "stream": "ops",
+        "source": "gza",
+        "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "subtype": "preflight",
         "event": event,
         "command": _format_command_for_log(command),
@@ -449,6 +453,34 @@ def write_preflight_entry(
     try:
         with open(log_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
+            f.flush()
+    except OSError:
+        pass
+
+
+def write_ops_event(
+    ops_log_file: Path | None,
+    *,
+    subtype: str,
+    message: str,
+    source: str = "gza",
+    **extra: Any,
+) -> None:
+    """Append a structured event to an ops log."""
+    if ops_log_file is None:
+        return
+    entry: dict[str, Any] = {
+        "type": "gza",
+        "stream": "ops",
+        "source": source,
+        "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "subtype": subtype,
+        "message": message,
+    }
+    entry.update(extra)
+    try:
+        with open(ops_log_file, "a") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
             f.flush()
     except OSError:
         pass
@@ -658,13 +690,14 @@ class Provider(ABC):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         interactive: bool = False,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run the provider to execute a task.
 
         Args:
             config: Gza configuration
             prompt: The task prompt
-            log_file: Path to write logs
+            log_file: Path to write provider conversation logs
             work_dir: Working directory for execution
             resume_session_id: Optional session ID to resume from
             on_session_id: Optional callback invoked with the session_id as soon
@@ -676,6 +709,8 @@ class Provider(ABC):
                 update the task record in real time.
             interactive: If True, run in provider-specific interactive foreground
                 mode when supported.
+            ops_log_file: Optional structured ops log path. Defaults to a
+                sibling ``.ops.jsonl`` next to ``log_file`` when omitted.
 
         Returns:
             RunResult with exit code and statistics
@@ -690,6 +725,7 @@ class Provider(ABC):
         cwd: Path | None = None,
         parse_output: Callable[[str, dict[str, Any], Any], None] | None = None,
         stdin_input: str | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run command with output to both console and log file.
 
@@ -697,7 +733,7 @@ class Provider(ABC):
 
         Args:
             cmd: Command and arguments to run
-            log_file: Path to log file
+            log_file: Path to provider conversation log file
             timeout_minutes: Timeout in minutes
             cwd: Working directory
             parse_output: Optional callback to parse each line of output.
@@ -710,26 +746,31 @@ class Provider(ABC):
             RunResult with exit code and duration. Stats should be filled
             in by parse_output callback or by caller.
         """
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         print(f"Running command: {_format_command_for_log(cmd)}")
-        print(f"Logging to: {log_file}")
+        print(f"Transcript log: {conversation_log_file}")
+        print(f"Ops log: {ops_log_file}")
         print(f"Timeout: {timeout_minutes} minutes")
         print("")
 
         # Write a breadcrumb so the exact command is captured even if the
         # subprocess hangs before producing any output.
-        import json
         try:
-            with open(log_file, "a") as log_breadcrumb:
-                log_breadcrumb.write(
-                    json.dumps({
-                        "type": "gza",
-                        "subtype": "command",
-                        "event": "provider_exec_start",
-                        "command": _format_command_for_log(cmd),
-                        "cwd": str(cwd) if cwd else None,
-                        "timeout_minutes": timeout_minutes,
-                    }) + "\n"
-                )
+            with open(ops_log_file, "a") as log_breadcrumb:
+                log_breadcrumb.write(json.dumps({
+                    "type": "gza",
+                    "stream": "ops",
+                    "source": "gza",
+                    "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "subtype": "command",
+                    "event": "provider_exec_start",
+                    "command": _format_command_for_log(cmd),
+                    "cwd": str(cwd) if cwd else None,
+                    "timeout_minutes": timeout_minutes,
+                    "message": f"Running command: {_format_command_for_log(cmd)}",
+                }) + "\n")
                 log_breadcrumb.flush()
         except OSError:
             pass
@@ -738,7 +779,7 @@ class Provider(ABC):
         accumulated_data: dict = {}
         startup_logged = False
 
-        with open(log_file, "a") as log:
+        with open(conversation_log_file, "a") as conversation_log, open(ops_log_file, "a") as ops_log:
             stdin_target = subprocess.PIPE if stdin_input is not None else subprocess.DEVNULL
             env = os.environ.copy()
             env.setdefault("RUST_BACKTRACE", "1")
@@ -759,20 +800,46 @@ class Provider(ABC):
 
             if process.stdout:
                 for line in process.stdout:
-                    log.write(line)
-                    line = line.strip()
-                    if not line:
+                    raw_line = line.rstrip("\n")
+                    stripped = raw_line.strip()
+                    if not stripped:
                         continue
 
+                    parsed_event: dict[str, Any] | None = None
+                    try:
+                        candidate = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        candidate = None
+                    if isinstance(candidate, dict):
+                        parsed_event = candidate
+
+                    if parsed_event is not None:
+                        if "timestamp" not in parsed_event:
+                            parsed_event["timestamp"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                        conversation_log.write(json.dumps(parsed_event) + "\n")
+                        conversation_log.flush()
+                    else:
+                        ops_log.write(json.dumps({
+                            "type": "gza",
+                            "stream": "ops",
+                            "source": "provider",
+                            "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                            "subtype": "process_output",
+                            "message": raw_line,
+                            "provider_output": raw_line,
+                            "output_stream": "stdout",
+                        }) + "\n")
+                        ops_log.flush()
+
                     if not startup_logged:
-                        startup_line = _extract_startup_log_line(line)
+                        startup_line = _extract_startup_log_line(stripped)
                         if startup_line:
                             print(f"Startup: {startup_line}")
-                            accumulated_data["_startup_line"] = line
+                            accumulated_data["_startup_line"] = stripped
                             startup_logged = True
 
                     if parse_output:
-                        parse_output(line, accumulated_data, log)
+                        parse_output(stripped, accumulated_data, ops_log)
                     if accumulated_data.get("__terminate_process__"):
                         process.terminate()
                         accumulated_data["__terminated_by_parser__"] = True

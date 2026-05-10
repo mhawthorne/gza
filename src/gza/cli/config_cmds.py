@@ -23,6 +23,7 @@ from ..db import SqliteTaskStore, Task, task_id_numeric_key
 from ..git import Git
 from ..importer import import_tasks, parse_import_file, validate_import
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
+from ..log_paths import paired_log_paths, slug_from_log_path
 from ..task_slug import get_slug_display_text
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import get_review_verdict, get_store, resolve_id
@@ -1674,27 +1675,33 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     logger.warning("Could not collect unmerged tasks during cleanup", exc_info=True)
                     print(f"Warning: Could not fetch unmerged tasks: {e}", file=sys.stderr)
 
+            processed_logs: set[Path] = set()
             for log_file in config.log_path.iterdir():
                 if not log_file.is_file():
                     continue
+                if log_file in processed_logs:
+                    continue
+                conversation_log, ops_log = paired_log_paths(log_file)
+                processed_logs.update({conversation_log, ops_log})
 
                 # Check if this log is for an unmerged task
                 if args.keep_unmerged:
-                    # Extract task_id from log filename (format: YYYYMMDD-slug.log or task-id.log)
-                    task_id = log_file.stem
+                    task_id = slug_from_log_path(log_file)
                     if task_id in unmerged_task_ids:
                         continue
 
                 # Check age
-                if log_file.stat().st_mtime < cutoff_timestamp:
+                existing_group = [path for path in (conversation_log, ops_log) if path.exists()]
+                if existing_group and max(path.stat().st_mtime for path in existing_group) < cutoff_timestamp:
                     if args.dry_run:
-                        cleaned_logs.append(log_file.name)
+                        cleaned_logs.extend(path.name for path in existing_group)
                     else:
-                        try:
-                            log_file.unlink()
-                            cleaned_logs.append(log_file.name)
-                        except OSError as e:
-                            errors.append((log_file.name, e))
+                        for path in existing_group:
+                            try:
+                                path.unlink()
+                                cleaned_logs.append(path.name)
+                            except OSError as e:
+                                errors.append((path.name, e))
 
     # 3. Clean up worker metadata for finished/stale/zombie workers
     if args.workers or no_scope:
@@ -1876,19 +1883,26 @@ def _clean_archive(config: Config, args: argparse.Namespace) -> int:
     if args.logs or no_scope:
         if config.log_path.exists():
             archives_logs_dir = archives_dir / "logs"
+            processed_logs: set[Path] = set()
             for log_file in config.log_path.iterdir():
                 if log_file.is_file():
-                    if log_file.stat().st_mtime < cutoff_timestamp:
+                    if log_file in processed_logs:
+                        continue
+                    conversation_log, ops_log = paired_log_paths(log_file)
+                    processed_logs.update({conversation_log, ops_log})
+                    existing_group = [path for path in (conversation_log, ops_log) if path.exists()]
+                    if existing_group and max(path.stat().st_mtime for path in existing_group) < cutoff_timestamp:
                         if args.dry_run:
-                            archived_logs.append(log_file)
+                            archived_logs.extend(existing_group)
                         else:
-                            try:
-                                archives_logs_dir.mkdir(parents=True, exist_ok=True)
-                                dest = archives_logs_dir / log_file.name
-                                shutil.move(str(log_file), str(dest))
-                                archived_logs.append(log_file)
-                            except OSError as e:
-                                errors.append((log_file, e))
+                            for path in existing_group:
+                                try:
+                                    archives_logs_dir.mkdir(parents=True, exist_ok=True)
+                                    dest = archives_logs_dir / path.name
+                                    shutil.move(str(path), str(dest))
+                                    archived_logs.append(path)
+                                except OSError as e:
+                                    errors.append((path, e))
 
     # Archive workers
     if args.workers or no_scope:

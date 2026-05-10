@@ -8,7 +8,7 @@ public: false
 
 # Gza Log Insights
 
-Analyze gza execution logs to find recurring anti-patterns, wasted compute, and actionable improvements. This skill scans the JSONL log files, aggregates patterns across many runs, and produces recommendations for AGENTS.md updates, prompt improvements, or workflow changes.
+Analyze gza execution logs to find recurring anti-patterns, wasted compute, and actionable improvements. This skill scans task transcript logs (`*.log`) and paired ops logs (`*.ops.jsonl`), aggregates patterns across many runs, and produces recommendations for AGENTS.md updates, prompt improvements, or workflow changes.
 
 ## Process
 
@@ -47,6 +47,7 @@ cfg = load_config()
 log_dir = cfg.get_log_dir()
 
 log_files = sorted(log_dir.glob('*.log'))
+ops_log_files = sorted(log_dir.glob('*.ops.jsonl'))
 if not log_files:
     print('No log files found.')
     sys.exit(0)
@@ -180,7 +181,7 @@ for logfile in log_files:
 # ========== OUTPUT ==========
 print('=' * 70)
 print('GZA LOG INSIGHTS REPORT')
-print(f'Analyzed {len(log_files)} log files')
+print(f'Analyzed {len(log_files)} transcript logs and {len(ops_log_files)} ops logs')
 print('=' * 70)
 
 # Section 1: Outcome summary

@@ -2141,7 +2141,7 @@ class TestClaudeStepMapping:
         assert "-p" not in launched_cmd
         assert "--output-format" not in launched_cmd
         assert "--max-turns" in launched_cmd
-        log_text = log_file.read_text()
+        log_text = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
         assert '"subtype": "interactive_launch"' in log_text
         assert prompt not in log_text
 
@@ -2189,7 +2189,7 @@ class TestClaudeStepMapping:
         assert "-p" not in launched_cmd
         assert "--output-format" not in launched_cmd
         assert "--max-turns" in launched_cmd
-        log_text = log_file.read_text()
+        log_text = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
         assert '"subtype": "interactive_launch"' in log_text
         assert prompt not in log_text
 
@@ -2339,7 +2339,7 @@ class TestClaudeStepMapping:
         assert result.error_type == "startup_failed"
         mock_process.terminate.assert_called_once()
         mock_process.wait.assert_called_once_with(timeout=2)
-        log_text = log_file.read_text()
+        log_text = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
         assert "Failed to seed interactive stdin prompt; aborting interactive run." in log_text
         assert '"subtype": "outcome"' in log_text
 
@@ -2890,8 +2890,9 @@ class TestStepTimestampLogging:
                 timeout_minutes=30,
             )
 
-        log_content = log_file.read_text()
-        assert "--- Step 1 at " in log_content
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        assert '"subtype": "step_marker"' in log_content
+        assert '"step": 1' in log_content
 
     def test_logs_timestamp_for_each_step(self, tmp_path):
         """Should write a timestamp line for each new step."""
@@ -2932,9 +2933,10 @@ class TestStepTimestampLogging:
                 timeout_minutes=30,
             )
 
-        log_content = log_file.read_text()
-        assert "--- Step 1 at " in log_content
-        assert "--- Step 2 at " in log_content
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        assert log_content.count('"subtype": "step_marker"') == 2
+        assert '"step": 1' in log_content
+        assert '"step": 2' in log_content
 
     def test_timestamp_format_matches_expected_pattern(self, tmp_path):
         """Timestamp should match YYYY-MM-DD HH:MM:SS TZ format."""
@@ -2972,9 +2974,8 @@ class TestStepTimestampLogging:
                 timeout_minutes=30,
             )
 
-        log_content = log_file.read_text()
-        # Pattern: "--- Step 1 at 2026-02-23 12:34:56 PST ---"
-        pattern = r"--- Step 1 at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        pattern = r'"subtype": "step_marker".*"step_timestamp": "\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+"'
         assert re.search(pattern, log_content), f"Expected timestamp pattern not found in: {log_content!r}"
 
     def test_no_duplicate_timestamps_for_same_message_id(self, tmp_path):
@@ -3017,10 +3018,9 @@ class TestStepTimestampLogging:
                 timeout_minutes=30,
             )
 
-        log_content = log_file.read_text()
-        # Only one Step 1 timestamp, no Step 2
-        assert log_content.count("--- Step ") == 1
-        assert "--- Step 2 at " not in log_content
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        assert log_content.count('"subtype": "step_marker"') == 1
+        assert '"step": 2' not in log_content
 
 
 class TestCodexStepTimestampLogging:
@@ -3056,8 +3056,9 @@ class TestCodexStepTimestampLogging:
                 timeout_minutes=30,
             )
 
-        log_content = log_file.read_text()
-        assert "--- Step 1 at " in log_content
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        assert '"subtype": "step_marker"' in log_content
+        assert '"step": 1' in log_content
 
     def test_logs_timestamp_for_each_turn(self, tmp_path):
         """Should write a timestamp line for each turn.started event."""
@@ -3094,9 +3095,10 @@ class TestCodexStepTimestampLogging:
                 timeout_minutes=30,
             )
 
-        log_content = log_file.read_text()
-        assert "--- Step 1 at " in log_content
-        assert "--- Step 2 at " in log_content
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        assert log_content.count('"subtype": "step_marker"') == 2
+        assert '"step": 1' in log_content
+        assert '"step": 2' in log_content
 
     def test_step_timestamp_format_matches_expected_pattern(self, tmp_path):
         """Codex step timestamp should match YYYY-MM-DD HH:MM:SS TZ format."""
@@ -3126,8 +3128,8 @@ class TestCodexStepTimestampLogging:
                 timeout_minutes=30,
             )
 
-        log_content = log_file.read_text()
-        pattern = r"--- Step 1 at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        pattern = r'"subtype": "step_marker".*"step_timestamp": "\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+"'
         assert re.search(pattern, log_content), f"Expected timestamp pattern not found in: {log_content!r}"
 
     def test_uses_step_header_not_turn_header(self, tmp_path, capsys):
@@ -3224,8 +3226,9 @@ class TestGeminiStepHeaderAndTimestampLogging:
                 model="gemini-2.5-flash",
             )
 
-        log_content = log_file.read_text()
-        assert "--- Step 1 at " in log_content
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        assert '"subtype": "step_marker"' in log_content
+        assert '"step": 1' in log_content
 
     def test_logs_timestamp_for_each_step(self, tmp_path):
         """Should write a timestamp line for each new assistant step."""
@@ -3258,9 +3261,10 @@ class TestGeminiStepHeaderAndTimestampLogging:
                 model="gemini-2.5-flash",
             )
 
-        log_content = log_file.read_text()
-        assert "--- Step 1 at " in log_content
-        assert "--- Step 2 at " in log_content
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        assert log_content.count('"subtype": "step_marker"') == 2
+        assert '"step": 1' in log_content
+        assert '"step": 2' in log_content
 
     def test_step_timestamp_format_matches_expected_pattern(self, tmp_path):
         """Gemini step timestamp should match YYYY-MM-DD HH:MM:SS TZ format."""
@@ -3291,8 +3295,8 @@ class TestGeminiStepHeaderAndTimestampLogging:
                 model="gemini-2.5-flash",
             )
 
-        log_content = log_file.read_text()
-        pattern = r"--- Step 1 at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        pattern = r'"subtype": "step_marker".*"step_timestamp": "\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+"'
         assert re.search(pattern, log_content), f"Expected timestamp pattern not found in: {log_content!r}"
 
     def test_no_step_header_for_existing_step_text_update(self, tmp_path, capsys):
@@ -5580,10 +5584,8 @@ class TestClaudeFullConversationSimulation:
                 timeout_minutes=30,
             )
 
-        log_content = log_file.read_text()
-        pattern = r"--- Step \d+ at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
-        matches = re.findall(pattern, log_content)
-        assert len(matches) == 3
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        assert log_content.count('"subtype": "step_marker"') == 3
 
 
 class TestCodexFullConversationSimulation:
@@ -5775,10 +5777,8 @@ class TestCodexFullConversationSimulation:
                 timeout_minutes=30,
             )
 
-        log_content = log_file.read_text()
-        pattern = r"--- Step \d+ at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
-        matches = re.findall(pattern, log_content)
-        assert len(matches) == 4
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        assert log_content.count('"subtype": "step_marker"') == 4
 
     def test_session_id_captured(self, tmp_path):
         """thread_id should be captured as session ID."""
@@ -5977,10 +5977,8 @@ class TestGeminiFullConversationSimulation:
                 model="gemini-2.5-flash",
             )
 
-        log_content = log_file.read_text()
-        pattern = r"--- Step \d+ at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ ---"
-        matches = re.findall(pattern, log_content)
-        assert len(matches) == 4
+        log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
+        assert log_content.count('"subtype": "step_marker"') == 4
 
 
 class TestPreflightLogging:

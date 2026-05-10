@@ -10209,6 +10209,31 @@ class TestMarkCompletedCommand:
         assert updated is not None
         assert updated.execution_mode == "skill_inline"
 
+    def test_mark_completed_promotes_unset_mode_to_skill_inline_from_ops_log(self, tmp_path: Path):
+        """Inline skill provenance in split ops logs should backfill execution_mode when unset."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Inline skill review task from ops log", task_type="review")
+        assert task.id is not None
+        task.status = "failed"
+        task.execution_mode = None
+        task.log_file = ".gza/logs/inline-ops.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "inline-ops.log").write_text('{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"legacy transcript"}]}}\n')
+        (log_dir / "inline-ops.ops.jsonl").write_text(
+            '{"type":"gza","subtype":"provenance","message":"Execution mode: inline skill","skill":"gza-task-run","inline":true}\n'
+        )
+
+        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.execution_mode == "skill_inline"
+
     def test_mark_completed_preserves_manual_mode_even_with_inline_provenance_log(self, tmp_path: Path):
         """Explicit manual mode should not be overwritten by log-based inline backfill."""
         setup_config(tmp_path)

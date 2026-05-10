@@ -21,6 +21,7 @@ from .base import (
     build_docker_cmd,
     ensure_docker_image,
     verify_docker_credentials,
+    write_ops_event,
     write_preflight_entry,
 )
 from .log_rendering import (
@@ -411,13 +412,31 @@ class GeminiProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         interactive: bool = False,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Gemini to execute a task."""
         _ = interactive
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         # Note: Gemini doesn't currently support session resumption
         if config.use_docker:
-            return self._run_docker(config, prompt, log_file, work_dir, on_step_count=on_step_count)
-        return self._run_direct(config, prompt, log_file, work_dir, on_step_count=on_step_count)
+            return self._run_docker(
+                config,
+                prompt,
+                conversation_log_file,
+                work_dir,
+                on_step_count=on_step_count,
+                ops_log_file=ops_log_file,
+            )
+        return self._run_direct(
+            config,
+            prompt,
+            conversation_log_file,
+            work_dir,
+            on_step_count=on_step_count,
+            ops_log_file=ops_log_file,
+        )
 
     def _run_docker(
         self,
@@ -426,8 +445,12 @@ class GeminiProvider(Provider):
         log_file: Path,
         work_dir: Path,
         on_step_count: Callable[[int], None] | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Gemini in Docker container."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         image_name = f"{config.docker_image}-gemini"
         docker_config = _get_docker_config(image_name)
 
@@ -452,11 +475,12 @@ class GeminiProvider(Provider):
 
         return self._run_with_output_parsing(
             cmd,
-            log_file,
+            conversation_log_file,
             config.timeout_minutes,
             config.model,
             max_steps=config.max_steps,
             on_step_count=on_step_count,
+            ops_log_file=ops_log_file,
         )
 
     def _run_direct(
@@ -466,8 +490,12 @@ class GeminiProvider(Provider):
         log_file: Path,
         work_dir: Path,
         on_step_count: Callable[[int], None] | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run Gemini directly."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         cmd = [
             "env", "GEMINI_SHELL_ENABLED=true", GEMINI_TRUST_WORKSPACE_ENV,
             "timeout", f"{config.timeout_minutes}m",
@@ -481,10 +509,11 @@ class GeminiProvider(Provider):
             cmd.extend(["-m", config.model])
 
         return self._run_with_output_parsing(
-            cmd, log_file, config.timeout_minutes, config.model, cwd=work_dir,
+            cmd, conversation_log_file, config.timeout_minutes, config.model, cwd=work_dir,
             chat_text_display_length=config.chat_text_display_length,
             max_steps=config.max_steps,
             on_step_count=on_step_count,
+            ops_log_file=ops_log_file,
         )
 
     def _run_with_output_parsing(
@@ -497,8 +526,12 @@ class GeminiProvider(Provider):
         chat_text_display_length: int = 0,
         max_steps: int = 50,
         on_step_count: Callable[[int], None] | None = None,
+        ops_log_file: Path | None = None,
     ) -> RunResult:
         """Run command and parse Gemini's stream-json output."""
+        conversation_log_file = log_file
+        if ops_log_file is None:
+            ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         formatter = StreamOutputFormatter()
 
         def _ensure_step_store(data: dict) -> None:
@@ -579,8 +612,14 @@ class GeminiProvider(Provider):
                                 )
                                 if log_handle:
                                     timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-                                    log_handle.write(f"--- Step {step_num} at {timestamp_str} ---\n")
-                                    log_handle.flush()
+                                    write_ops_event(
+                                        ops_log_file,
+                                        subtype="step_marker",
+                                        source="provider",
+                                        message=f"Step {step_num}",
+                                        step=step_num,
+                                        step_timestamp=timestamp_str,
+                                    )
                             # Display text to console (configurable length, 0 = unlimited)
                             if chat_text_display_length == 0:
                                 # Show full text
@@ -651,7 +690,12 @@ class GeminiProvider(Provider):
                 formatter.print_error(line)
 
         result = self.run_with_logging(
-            cmd, log_file, timeout_minutes, cwd=cwd, parse_output=parse_gemini_output
+            cmd,
+            conversation_log_file,
+            timeout_minutes,
+            cwd=cwd,
+            parse_output=parse_gemini_output,
+            ops_log_file=ops_log_file,
         )
 
         # Extract stats from result event

@@ -57,10 +57,16 @@ Summary:
   Added test for mobile viewport.
 ```
 
-For the full conversation:
+For the merged execution view (conversation plus runner ops):
 
 ```bash
 $ gza log gza-1 --steps
+```
+
+For the transcript only:
+
+```bash
+$ gza log gza-1 --conversation-only --steps
 ```
 
 ## Check unmerged work

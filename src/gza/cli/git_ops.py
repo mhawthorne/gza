@@ -33,6 +33,7 @@ from ..git import (
     resolve_ref_if_possible,
 )
 from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
+from ..log_paths import resolve_ops_log_path
 from ..pickup import (
     count_worker_consuming_actions,
     get_runnable_pending_tasks,
@@ -581,7 +582,7 @@ def _merge_single_task(
                 rebase_target,
                 config,
                 log_file=resolve_log,
-                logger=TaskExecutionLogger(resolve_log, echo=True),
+                logger=TaskExecutionLogger(resolve_ops_log_path(config, resolve_log), echo=True),
             )
 
             if not resolved:
@@ -830,7 +831,7 @@ def invoke_provider_resolve(
     log_file.parent.mkdir(parents=True, exist_ok=True)
     if not log_file.exists():
         log_file.touch()
-    task_logger = logger or TaskExecutionLogger(log_file, echo=True)
+    task_logger = logger or TaskExecutionLogger(resolve_ops_log_path(config, log_file), echo=True)
     task_id_label = getattr(task, "id", None)
     task_ref = f"{task_id_label}" if task_id_label is not None else "<unknown>"
 
@@ -892,7 +893,13 @@ def invoke_provider_resolve(
         extra={"provider": effective_provider, "command": skill_cmd},
     )
     try:
-        run_result = provider.run(resolve_config, skill_cmd, log_file, work_dir)
+        run_result = provider.run(
+            resolve_config,
+            skill_cmd,
+            log_file,
+            work_dir,
+            ops_log_file=resolve_ops_log_path(config, log_file),
+        )
     except Exception as exc:
         task_logger.error(f"Provider resolve failed with exception: {exc}")
         return False
@@ -924,7 +931,7 @@ def _run_task_backed_rebase(
     """Execute a foreground rebase flow with single-task log/state ownership."""
     git = Git(config.project_dir)
     log_file = ensure_task_log_path(config, store, rebase_task)
-    logger = TaskExecutionLogger(log_file, echo=True)
+    logger = TaskExecutionLogger(resolve_ops_log_path(config, log_file), echo=True)
     log_file_storage = task_log_storage_path(config, log_file)
 
     if rebase_task.status != "in_progress":

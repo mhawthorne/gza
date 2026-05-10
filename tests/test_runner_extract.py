@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 from gza.config import Config
 from gza.db import SqliteTaskStore, TaskStats
 from gza.git import Git, GitApplyResult, GitError
+from gza.log_paths import ops_log_path_for
 from gza.providers import RunResult
 from gza.runner import (
     EXTRACTION_ALREADY_MERGED_COMPLETION_REASON,
@@ -680,7 +681,7 @@ def test_run_continues_when_runtime_rederived_patch_applies_with_conflicts(tmp_p
     assert refreshed.failure_reason == "UNKNOWN"
     assert mock_provider.run.call_count == 1
     log_file = config.log_path / f"{task.slug}.log"
-    assert "runtime re-derived patch with conflicts" in log_file.read_text()
+    assert "runtime re-derived patch with conflicts" in ops_log_path_for(log_file).read_text()
 
 
 def test_run_continues_when_stored_fallback_patch_applies_with_conflicts(tmp_path: Path) -> None:
@@ -754,7 +755,7 @@ def test_run_continues_when_stored_fallback_patch_applies_with_conflicts(tmp_pat
     assert refreshed.failure_reason != EXTRACTION_PRECHECK_FAILURE_REASON
     assert mock_provider.run.call_count == 1
     log_file = config.log_path / f"{task.slug}.log"
-    assert "stored patch fallback with conflicts" in log_file.read_text()
+    assert "stored patch fallback with conflicts" in ops_log_path_for(log_file).read_text()
 
 
 def test_run_completes_without_provider_when_extraction_diff_is_already_merged(tmp_path: Path) -> None:

@@ -1024,6 +1024,32 @@ class TestCleanCommand:
         # Merged task log should be removed
         assert not merged_log.exists()
 
+    def test_clean_removes_paired_split_logs_together(self, tmp_path: Path):
+        """Clean should delete both transcript and ops siblings for an old split log."""
+        import time
+
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        log_dir = config.log_path
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        transcript_log = log_dir / "20200103-split.log"
+        ops_log = log_dir / "20200103-split.ops.jsonl"
+        transcript_log.write_text("conversation")
+        ops_log.write_text('{"type":"gza","subtype":"info","message":"ops"}\n')
+
+        old_time = time.time() - (60 * 24 * 60 * 60)
+        os.utime(transcript_log, (old_time, old_time))
+        os.utime(ops_log, (old_time, old_time))
+
+        result = run_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert not transcript_log.exists()
+        assert not ops_log.exists()
+
     def test_clean_lineage_aware_preserves_recent(self, tmp_path: Path):
         """Worktrees with recent lineage activity are preserved."""
         from gza.config import Config

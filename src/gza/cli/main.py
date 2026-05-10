@@ -1279,6 +1279,17 @@ def main() -> int:
         action="store_true",
         help="Show raw JSON lines instead of formatted output",
     )
+    stream_group = log_parser.add_mutually_exclusive_group()
+    stream_group.add_argument(
+        "--conversation-only",
+        action="store_true",
+        help="Render only the provider conversation transcript stream",
+    )
+    stream_group.add_argument(
+        "--ops-only",
+        action="store_true",
+        help="Render only the gza operational stream",
+    )
     log_parser.add_argument(
         "--verbose",
         action="store_true",

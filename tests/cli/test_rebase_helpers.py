@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.log_paths import ops_log_path_for
 from gza.providers.base import RunResult
 
 
@@ -145,7 +146,7 @@ def test_invoke_provider_resolve_returns_false_on_provider_exception(tmp_path: P
         result = invoke_provider_resolve(task, "feature", "main", config, log_file=log_file)
 
     assert result is False
-    log_text = log_file.read_text()
+    log_text = ops_log_path_for(log_file).read_text()
     assert "Provider resolve failed with exception: provider failure" in log_text
 
 
@@ -209,7 +210,7 @@ def test_invoke_provider_resolve_does_not_create_internal_tasks_and_logs_to_pare
 
     assert result is True
     assert store.get_history(limit=None, task_type="internal") == []
-    log_text = log_file.read_text()
+    log_text = ops_log_path_for(log_file).read_text()
     assert "Provider fallback" in log_text
     assert "Running provider command: /gza-rebase --auto --continue" in log_text
 

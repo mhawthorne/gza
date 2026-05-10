@@ -74,7 +74,7 @@ Background workers:
 
 - Spawn as detached processes (survive terminal close)
 - Atomically claim pending tasks (no conflicts with concurrent workers)
-- Write task logs to `.gza/logs/<task_id>.log`
+- Write provider transcripts to `.gza/logs/<slug>.log` and paired ops events to `.gza/logs/<slug>.ops.jsonl`
 - Capture startup output in `.gza/workers/<worker_id>-startup.log` until task logging is available
 - Update status in `.gza/workers/<worker_id>.json`
 - Clean up automatically on completion

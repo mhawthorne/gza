@@ -97,6 +97,192 @@ class TestLogCommand:
         assert "Steps: 2" in result.stdout
         assert "Cost: $0.1234" in result.stdout
 
+    def test_log_default_merges_conversation_and_ops_streams(self, tmp_path: Path):
+        """Default log view should merge transcript and ops sibling entries."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Merged split log")
+        task.status = "completed"
+        task.log_file = ".gza/logs/merged.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "merged.log").write_text(
+            json.dumps({"type": "assistant", "timestamp": "2026-05-08T10:00:02Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "assistant says hi"}]}})
+        )
+        (log_dir / "merged.ops.jsonl").write_text(
+            json.dumps({"type": "gza", "subtype": "info", "timestamp": "2026-05-08T10:00:01Z", "message": "runner info"})
+        )
+
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "assistant says hi" in result.stdout
+        assert "runner info" in result.stdout
+        assert "Transcript:" in result.stdout
+        assert "Ops:" in result.stdout
+
+    def test_log_default_handles_untimestamped_conversation_with_timestamped_ops(self, tmp_path: Path):
+        """Mixed timestamp presence across split logs should not crash merged rendering."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Untimestamped transcript with ops timestamp")
+        task.status = "completed"
+        task.log_file = ".gza/logs/untimestamped.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "untimestamped.log").write_text(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "conversation without timestamp"}],
+                    },
+                }
+            )
+        )
+        (log_dir / "untimestamped.ops.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "gza",
+                    "subtype": "info",
+                    "timestamp": "2026-05-08T10:00:01Z",
+                    "message": "ops with timestamp",
+                }
+            )
+        )
+
+        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "conversation without timestamp" in result.stdout
+        assert "ops with timestamp" in result.stdout
+
+    def test_log_conversation_only_suppresses_ops_entries(self, tmp_path: Path):
+        """--conversation-only should render only the transcript stream."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Conversation only")
+        task.status = "completed"
+        task.log_file = ".gza/logs/conversation.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "conversation.log").write_text(
+            json.dumps({"type": "assistant", "timestamp": "2026-05-08T10:00:02Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "transcript only"}]}})
+        )
+        (log_dir / "conversation.ops.jsonl").write_text(
+            json.dumps({"type": "gza", "subtype": "info", "timestamp": "2026-05-08T10:00:01Z", "message": "ops only"})
+        )
+
+        result = run_gza("log", str(task.id), "--conversation-only", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "transcript only" in result.stdout
+        assert "ops only" not in result.stdout
+
+    def test_log_ops_only_suppresses_conversation_entries(self, tmp_path: Path):
+        """--ops-only should render only the ops stream."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Ops only")
+        task.status = "completed"
+        task.log_file = ".gza/logs/ops.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "ops.log").write_text(
+            json.dumps({"type": "assistant", "timestamp": "2026-05-08T10:00:02Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "conversation hidden"}]}})
+        )
+        (log_dir / "ops.ops.jsonl").write_text(
+            json.dumps({"type": "gza", "subtype": "info", "timestamp": "2026-05-08T10:00:01Z", "message": "ops visible"})
+        )
+
+        result = run_gza("log", str(task.id), "--ops-only", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "ops visible" in result.stdout
+        assert "conversation hidden" not in result.stdout
+
+    @pytest.mark.parametrize(
+        ("flag", "create_empty_conversation"),
+        [
+            (None, False),
+            ("--ops-only", True),
+        ],
+        ids=["default", "ops-only"],
+    )
+    def test_log_startup_ops_sibling_is_visible_without_startup_transcript(
+        self,
+        tmp_path: Path,
+        flag: str | None,
+        create_empty_conversation: bool,
+    ):
+        """Startup fallback should include startup ops siblings even without transcript content."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Startup ops only failure")
+        assert task.id is not None
+        task.status = "failed"
+        task.log_file = f".gza/logs/{task.id}.startup.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        startup_log = log_dir / f"{task.id}.startup.log"
+        if create_empty_conversation:
+            startup_log.write_text("")
+        (log_dir / f"{task.id}.startup.ops.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "gza",
+                    "subtype": "preflight",
+                    "timestamp": "2026-05-08T10:00:00Z",
+                    "message": "provider credentials missing",
+                }
+            )
+        )
+
+        args = ["log", str(task.id)]
+        if flag is not None:
+            args.append(flag)
+        args.extend(["--project", str(tmp_path)])
+        result = run_gza(*args)
+
+        assert result.returncode == 0
+        assert "provider credentials missing" in result.stdout
+        assert "Ops:" in result.stdout
+
+    def test_log_raw_default_includes_stream_field_for_split_logs(self, tmp_path: Path):
+        """Default --raw on split logs should annotate entries with their stream."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Raw split log")
+        task.status = "completed"
+        task.log_file = ".gza/logs/raw.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "raw.log").write_text(
+            json.dumps({"type": "assistant", "timestamp": "2026-05-08T10:00:02Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "raw convo"}]}})
+        )
+        (log_dir / "raw.ops.jsonl").write_text(
+            json.dumps({"type": "gza", "subtype": "info", "timestamp": "2026-05-08T10:00:01Z", "message": "raw ops"})
+        )
+
+        result = run_gza("log", str(task.id), "--raw", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert '"stream": "conversation"' in result.stdout
+        assert '"stream": "ops"' in result.stdout
+
     def test_log_by_task_id_error_max_turns(self, tmp_path: Path):
         """Log command by task ID handles JSONL format with error_max_turns result."""
         import json
@@ -730,6 +916,80 @@ class TestLogCommand:
         assert "Task: Running task for follow" in output
         assert "ID:" in output
         assert "Status: in_progress" in output
+
+    def test_log_follow_merges_new_split_entries_by_timestamp(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+        """Follow mode should merge new conversation and ops batches chronologically."""
+        import argparse
+
+        from gza.cli.log import _tail_log_file
+
+        setup_config(tmp_path)
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        conversation_log = log_dir / "follow-merge.log"
+        ops_log = log_dir / "follow-merge.ops.jsonl"
+        conversation_log.write_text("")
+        ops_log.write_text("")
+
+        appended = {"done": False}
+
+        def fake_sleep(_seconds: float) -> None:
+            if not appended["done"]:
+                conversation_log.write_text(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": "2026-05-08T10:00:02Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "assistant second"}],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                ops_log.write_text(
+                    json.dumps(
+                        {
+                            "type": "gza",
+                            "subtype": "info",
+                            "timestamp": "2026-05-08T10:00:01Z",
+                            "message": "ops first",
+                        }
+                    )
+                    + "\n"
+                )
+                appended["done"] = True
+
+        class FakeRegistry:
+            def is_running(self, _worker_id: str) -> bool:
+                return False
+
+        monkeypatch.setattr("gza.cli.log.time.sleep", fake_sleep)
+        args = argparse.Namespace(
+            raw=False,
+            follow=True,
+            tail=None,
+            verbose=False,
+            conversation_only=False,
+            ops_only=False,
+            _log_provider_name=None,
+            _log_configured_model=None,
+            _ops_log_path=ops_log,
+        )
+
+        rc = _tail_log_file(
+            conversation_log,
+            args,
+            FakeRegistry(),
+            worker_id="w-follow",
+        )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "ops first" in output
+        assert "assistant second" in output
+        assert output.index("ops first") < output.index("assistant second")
 
     def test_log_follow_raw_by_task_skips_header_even_when_running(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
         """-t -f --raw should not print the task header banner."""

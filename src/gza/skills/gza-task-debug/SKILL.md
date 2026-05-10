@@ -29,7 +29,7 @@ Note the following fields for analysis:
 - `num_turns` — number of agent turns used
 - `duration_seconds` — total wall-clock time
 - `cost_usd` — API cost
-- `log_file` — path to the execution log
+- `log_file` — provider conversation transcript path; also inspect the sibling `<stem>.ops.jsonl` file for runner lifecycle, preflight, command, outcome, and stats events
 - `report_file` — path to the report (if any)
 - `branch` — git branch the task worked on
 
@@ -50,7 +50,11 @@ Calculate how far the failed task deviates:
 
 Do NOT just read the tail — scan the full log for repeated patterns.
 
-If `log_file` is set, run these grep-based checks:
+If `log_file` is set, run these grep-based checks against the conversation log first. Then inspect the sibling ops log for infrastructure/preflight/outcome clues:
+
+```bash
+ops_log="${log_file%.log}.ops.jsonl"
+```
 
 **Repeated file opens (same file opened 5+ times):**
 ```bash

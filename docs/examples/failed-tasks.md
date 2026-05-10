@@ -28,7 +28,7 @@ Error: max turns of 50 exceeded
 
 If git worktree metadata is unavailable, `uv run gza show` prints a warning so lookup failures are distinct from "no active worktree".
 
-View the conversation to understand what happened:
+View the merged log to understand what happened:
 
 ```bash
 $ uv run gza log gza-5 --steps

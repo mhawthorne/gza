@@ -40,6 +40,7 @@ from ..db import (
 )
 from ..failure_policy import is_resumable_failure_reason
 from ..failure_reasons import mark_task_failed_from_cause
+from ..log_paths import ops_log_path_for
 from ..prompts import PromptBuilder
 from ..recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from ..review_tasks import (
@@ -304,10 +305,22 @@ def _task_looks_stuck(config: Config, task: DbTask) -> bool:
     try:
         stat = log_path.stat()
     except OSError:
+        stat = None
+    ops_path = ops_log_path_for(log_path)
+    try:
+        ops_stat = ops_path.stat()
+    except OSError:
+        ops_stat = None
+    if stat is None and ops_stat is None:
         return True
-    if stat.st_size == 0:
+    total_size = (stat.st_size if stat is not None else 0) + (ops_stat.st_size if ops_stat is not None else 0)
+    if total_size == 0:
         return True
-    mtime_age = now.timestamp() - stat.st_mtime
+    latest_mtime = max(
+        stat.st_mtime if stat is not None else 0.0,
+        ops_stat.st_mtime if ops_stat is not None else 0.0,
+    )
+    mtime_age = now.timestamp() - latest_mtime
     return mtime_age > threshold
 
 
@@ -2182,7 +2195,7 @@ def _extract_interrupt_source(log_path: Path) -> str | None:
     from .log import _load_log_file_entries
 
     try:
-        entries = _load_log_file_entries(log_path)[1]
+        entries = _load_log_file_entries(ops_log_path_for(log_path) if ops_log_path_for(log_path).exists() else log_path)[1]
     except OSError:
         return None
 
@@ -2292,10 +2305,11 @@ def _precondition_blocking_dependency_id(task: DbTask, config: Config | None) ->
     from .log import _load_log_file_entries
 
     log_path = config.project_dir / task.log_file
-    if not log_path.exists():
+    source_path = ops_log_path_for(log_path) if ops_log_path_for(log_path).exists() else log_path
+    if not source_path.exists():
         return None
     try:
-        entries = _load_log_file_entries(log_path)[1]
+        entries = _load_log_file_entries(source_path)[1]
     except OSError:
         return None
 
