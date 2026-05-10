@@ -649,16 +649,24 @@ def _prepare_task_for_immediate_execution(
 ) -> DbTask | None:
     """Run the synchronous creator phase on the caller's stdout/stderr."""
     store = get_store(config)
+    original_slug = task.slug
+    original_log_file = task.log_file
     try:
         prepared = prepare_task_startup_phase(config, store, task)
     except Exception as exc:
-        failed_task = store.get(task.id) if task.id is not None else None
-        failed_task = failed_task or task
         if rollback_on_failure and task.id is not None:
-            remove_task_startup_artifacts(config, failed_task)
+            remove_task_startup_artifacts(config, task)
             if rollback_cleanup is not None:
                 rollback_cleanup()
             store.delete(task.id)
+        elif task.id is not None:
+            remove_task_startup_artifacts(config, task)
+            restored_task = store.get(task.id) or task
+            restored_task.slug = original_slug
+            restored_task.log_file = original_log_file
+            store.update(restored_task)
+            task.slug = original_slug
+            task.log_file = original_log_file
         print(f"Error: {exc}", file=sys.stderr)
         return None
     return prepared
