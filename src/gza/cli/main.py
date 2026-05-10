@@ -318,6 +318,11 @@ def main() -> int:
         help="Projection fields override (comma-separated; works in text or JSON mode)",
     )
     history_parser.add_argument(
+        "--list-fields",
+        action="store_true",
+        help="List valid --fields values for this command and exit",
+    )
+    history_parser.add_argument(
         "--json",
         action="store_true",
         help="Output JSON rows from the unified query API",
@@ -381,6 +386,11 @@ def main() -> int:
         "--fields",
         metavar="CSV",
         help="Projection fields override (comma-separated; works in text or JSON mode)",
+    )
+    incomplete_parser.add_argument(
+        "--list-fields",
+        action="store_true",
+        help="List valid --fields values for this command and exit",
     )
 
     # search command
@@ -482,6 +492,11 @@ def main() -> int:
         help="Projection fields override (comma-separated; works in text or JSON mode)",
     )
     search_parser.add_argument(
+        "--list-fields",
+        action="store_true",
+        help="List valid --fields values for this command and exit",
+    )
+    search_parser.add_argument(
         "--json",
         action="store_true",
         help="Output JSON rows from the unified query API",
@@ -541,6 +556,11 @@ def main() -> int:
         "--fields",
         metavar="CSV",
         help="Projection fields override (comma-separated; works in text or JSON mode)",
+    )
+    unmerged_parser.add_argument(
+        "--list-fields",
+        action="store_true",
+        help="List valid --fields values for this command and exit",
     )
     unmerged_parser.add_argument(
         "--json",
@@ -2215,6 +2235,11 @@ def main() -> int:
         help="Projection fields override for aggregate group rows (comma-separated; works in text or JSON mode)",
     )
     groups_parser.add_argument(
+        "--list-fields",
+        action="store_true",
+        help="List valid --fields values for this command and exit",
+    )
+    groups_parser.add_argument(
         "--json",
         action="store_true",
         help="Output aggregate group rows as JSON",
@@ -2226,6 +2251,11 @@ def main() -> int:
         "--fields",
         metavar="CSV",
         help="Projection fields override for aggregate group rows (comma-separated; works in text or JSON mode)",
+    )
+    groups_list_parser.add_argument(
+        "--list-fields",
+        action="store_true",
+        help="List valid --fields values for this command and exit",
     )
     groups_list_parser.add_argument(
         "--json",

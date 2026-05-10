@@ -994,6 +994,7 @@ uv run gza unmerged [options]
 | `--target BRANCH` | Compare against the specified branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 | `--json` | Output JSON rows from the unified query API |
 | `--fields CSV` | Projection field override (for example `id,prompt`). In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
+| `--list-fields` | List valid `--fields` values for this command and exit |
 
 `uv run gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills merge units when needed, refreshes canonical branch-cohort merge truth from local git plus any already-present `origin/<default-branch>` remote-tracking ref, persists merge-unit state and diff stats for the real default target branch, dual-writes compatibility task merge fields, and then prints the reconciled default-branch unmerged list. Same-branch improve/fix/rebase/review follow-ups may validly keep `merge_status = NULL` because the owning implementation row carries the shared branch merge truth while all related rows remain attached to the same merge unit.
 
@@ -1034,6 +1035,7 @@ gza groups
 | Option | Description |
 |--------|-------------|
 | `--fields CSV` | Projection fields override for aggregate group rows. In text mode, one field prints bare values and multiple fields print `field: value` blocks |
+| `--list-fields` | List valid `--fields` values for this command and exit |
 | `--json` | Output aggregate group rows as structured JSON objects |
 
 ### history
@@ -1062,6 +1064,7 @@ gza history [options]
 | `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
 | `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `effective`) |
 | `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
+| `--list-fields` | List valid `--fields` values for this command and exit |
 | `--json` | Output JSON rows from the unified query API |
 
 Positive and negative filters on the same field are applied in order: include matches for the positive flag first, then drop anything matching the corresponding `--...-not` flag. If the same value appears in both, the negative filter wins and that row is excluded.
@@ -1084,9 +1087,12 @@ gza incomplete [options]
 | `--verbose` | In one-line mode, show owner task details beneath each unresolved lineage |
 | `--blocked-by-dropped` | Switch to pending tasks blocked by dropped dependencies instead of unresolved lineages |
 | `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
+| `--list-fields` | List valid `--fields` values for this command and exit |
 | `--json` | Output JSON rows from the unified query API |
 
 Use `gza incomplete` for unresolved lineage triage. Use the more specific command surfaces when you want one domain only:
+
+`uv run gza incomplete --list-fields` prints the unresolved-lineage projection set. `uv run gza incomplete --blocked-by-dropped --list-fields` prints the blocked-dropped task projection set.
 
 Default text output stays to one wrapped line per lineage: the owner prompt is reduced to its first non-empty line and truncated, and `| unresolved: ...` appears only when multiple unresolved tasks remain for the same owner, summarized as task IDs plus failure/completion status.
 
@@ -1128,6 +1134,7 @@ gza search <term> [options]
 | `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |
 | `--any-tag` | With repeated `--tag` and/or `--tag-not` values, match any requested tag instead of all |
 | `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
+| `--list-fields` | List valid `--fields` values for this command and exit |
 | `--json` | Output JSON rows from the unified query API |
 
 Text output ends with a summary footer such as `Showing results 1-9 out of 55`.

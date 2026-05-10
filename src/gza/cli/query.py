@@ -146,6 +146,10 @@ _GROUPS_PROJECTION_FIELDS: tuple[str, ...] = (
     "unmerged",
     "dropped",
 )
+_UNMERGED_PROJECTION_FIELDS: tuple[str, ...] = _projection_fields(
+    _TaskProjectionSpec(preset=_TaskProjectionPreset.UNMERGED_DEFAULT),
+    scope="lineages",
+)
 
 _INCOMPLETE_DEPRECATION_LINES: tuple[str, ...] = (
     "Error: `gza incomplete` is deprecated and no longer supported.",
@@ -627,6 +631,9 @@ def cmd_history(args: argparse.Namespace) -> int:
     """List recent completed/failed tasks."""
     from gza.query import HistoryFilter, TaskLineageNode, query_history, query_history_with_lineage
 
+    if getattr(args, "list_fields", False):
+        return _print_projection_fields("history")
+
     config = Config.load(args.project_dir)
     store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
@@ -640,8 +647,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     lineage_depth = getattr(args, 'lineage_depth', 0)
     projection_fields = _validate_projection_fields(
         _parse_csv(getattr(args, "fields", None)),
-        command_name="gza history",
-        allowed_fields=_HISTORY_EXPLICIT_PROJECTION_FIELDS,
+        command_name="history",
     )
     if getattr(args, "fields", None) is not None and projection_fields is None:
         return 2
@@ -992,6 +998,9 @@ def _render_orphaned_task(task: "DbTask", c: dict) -> None:
 
 def cmd_search(args: argparse.Namespace) -> int:
     """Search tasks by substring in prompt text."""
+    if getattr(args, "list_fields", False):
+        return _print_projection_fields("search")
+
     config = Config.load(args.project_dir)
     store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
@@ -999,8 +1008,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     limit = None if args.last == 0 else args.last
     projection_fields = _validate_projection_fields(
         _parse_csv(getattr(args, "fields", None)),
-        command_name="gza search",
-        allowed_fields=_SEARCH_EXPLICIT_PROJECTION_FIELDS,
+        command_name="search",
     )
     if getattr(args, "fields", None) is not None and projection_fields is None:
         return 2
@@ -1158,22 +1166,20 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 def cmd_incomplete(args: argparse.Namespace) -> int:
     """Show unresolved task lineages that still need attention."""
+    blocked_by_dropped_only = bool(getattr(args, "blocked_by_dropped", False))
+    if getattr(args, "list_fields", False):
+        return _print_projection_fields("incomplete", blocked_by_dropped=blocked_by_dropped_only)
+
     config = Config.load(args.project_dir)
     store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
     limit = None if args.last == 0 else args.last
-    blocked_by_dropped_only = bool(getattr(args, "blocked_by_dropped", False))
     mode = cast(_PresentationMode, "tree" if getattr(args, "tree", False) else "one_line")
     task_type_filter: str | None = getattr(args, "type", None)
-    allowed_projection_fields = (
-        _INCOMPLETE_BLOCKED_DROPPED_PROJECTION_FIELDS
-        if blocked_by_dropped_only
-        else _INCOMPLETE_PROJECTION_FIELDS
-    )
     projection_fields = _validate_projection_fields(
         _parse_csv(getattr(args, "fields", None)),
-        command_name="gza incomplete",
-        allowed_fields=allowed_projection_fields,
+        command_name="incomplete",
+        blocked_by_dropped=blocked_by_dropped_only,
     )
     if getattr(args, "fields", None) is not None and projection_fields is None:
         return 2
@@ -1382,34 +1388,75 @@ def _descendants_only_unmerged_lineage_tree(
     return _build_node(owner_task, parent_task=None, depth=0)
 
 
-def _validate_unmerged_projection_fields(fields: tuple[str, ...] | None) -> tuple[str, ...] | None:
-    """Validate requested unmerged projection fields."""
-    return _validate_projection_fields(
-        fields,
-        command_name="gza unmerged",
-        allowed_fields=_projection_fields(
-            _TaskProjectionSpec(preset=_TaskProjectionPreset.UNMERGED_DEFAULT),
-            scope="lineages",
-        ),
+def _projection_field_choices(command_name: str, *, blocked_by_dropped: bool = False) -> tuple[str, ...]:
+    """Return the valid explicit projection fields for a query command surface."""
+    if command_name == "history":
+        return _HISTORY_EXPLICIT_PROJECTION_FIELDS
+    if command_name == "search":
+        return _SEARCH_EXPLICIT_PROJECTION_FIELDS
+    if command_name == "incomplete":
+        return (
+            _INCOMPLETE_BLOCKED_DROPPED_PROJECTION_FIELDS
+            if blocked_by_dropped
+            else _INCOMPLETE_PROJECTION_FIELDS
+        )
+    if command_name == "unmerged":
+        return _UNMERGED_PROJECTION_FIELDS
+    if command_name in {"groups", "groups list"}:
+        return _GROUPS_PROJECTION_FIELDS
+    raise ValueError(f"unknown projection command surface: {command_name}")
+
+
+def _projection_field_command_label(command_name: str) -> str:
+    """Return the user-facing command label for projection errors."""
+    return f"gza {command_name}"
+
+
+def _projection_field_invocation(command_name: str, *, blocked_by_dropped: bool = False) -> str:
+    """Return the exact command invocation for projection field discovery."""
+    if command_name == "incomplete" and blocked_by_dropped:
+        return "gza incomplete --blocked-by-dropped"
+    return f"gza {command_name}"
+
+
+def _projection_field_hint(command_name: str, *, blocked_by_dropped: bool = False) -> str:
+    """Return the actionable help hint for invalid projection requests."""
+    return (
+        "Run uv run "
+        f"{_projection_field_invocation(command_name, blocked_by_dropped=blocked_by_dropped)} "
+        "--list-fields to list valid fields."
     )
+
+
+def _format_projection_fields(fields: tuple[str, ...]) -> str:
+    """Format projection field lists in the canonical CLI order."""
+    return ", ".join(fields)
+
+
+def _print_projection_fields(command_name: str, *, blocked_by_dropped: bool = False) -> int:
+    """Print the valid projection fields for a command surface and exit."""
+    print(_format_projection_fields(_projection_field_choices(command_name, blocked_by_dropped=blocked_by_dropped)))
+    return 0
 
 
 def _validate_projection_fields(
     fields: tuple[str, ...] | None,
     *,
     command_name: str,
-    allowed_fields: tuple[str, ...],
+    blocked_by_dropped: bool = False,
 ) -> tuple[str, ...] | None:
     """Validate requested projection fields for a specific command."""
     if fields is None:
         return None
+    allowed_fields = _projection_field_choices(command_name, blocked_by_dropped=blocked_by_dropped)
     allowed = set(allowed_fields)
     invalid = tuple(field_name for field_name in fields if field_name not in allowed)
     if invalid:
         noun = "field" if len(invalid) == 1 else "fields"
         print(
-            f"error: unknown {noun} for {command_name}: {', '.join(invalid)}\n"
-            f"valid fields: {', '.join(allowed_fields)}",
+            f"error: unknown {noun} for {_projection_field_command_label(command_name)}: {', '.join(invalid)}\n"
+            f"valid fields: {_format_projection_fields(allowed_fields)}\n"
+            f"{_projection_field_hint(command_name, blocked_by_dropped=blocked_by_dropped)}",
             file=sys.stderr,
         )
         return None
@@ -1776,11 +1823,17 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
         except OSError:
             return False
 
+    if getattr(args, "list_fields", False):
+        return _print_projection_fields("unmerged")
+
     config = Config.load(args.project_dir)
     git_client: _UnmergedGit = git if git is not None else cast(_UnmergedGit, Git(config.project_dir))
     default_branch = git_client.default_branch()
     current_branch = git_client.current_branch()
-    projection_fields = _validate_unmerged_projection_fields(_parse_csv(getattr(args, "fields", None)))
+    projection_fields = _validate_projection_fields(
+        _parse_csv(getattr(args, "fields", None)),
+        command_name="unmerged",
+    )
     if getattr(args, "fields", None) is not None and projection_fields is None:
         return 2
     use_json = bool(getattr(args, "json", False))
@@ -1981,12 +2034,15 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
 
 def cmd_groups(args: argparse.Namespace) -> int:
     """List all tags with task counts (compatibility alias: groups)."""
+    command_name = "groups list" if getattr(args, "groups_action", None) == "list" else "groups"
+    if getattr(args, "list_fields", False):
+        return _print_projection_fields(command_name)
+
     config = Config.load(args.project_dir)
     store = get_store(config, open_mode="query_only")
     projection_fields = _validate_projection_fields(
         _parse_csv(getattr(args, "fields", None)),
-        command_name="gza groups",
-        allowed_fields=_GROUPS_PROJECTION_FIELDS,
+        command_name=command_name,
     )
     if getattr(args, "fields", None) is not None and projection_fields is None:
         return 2

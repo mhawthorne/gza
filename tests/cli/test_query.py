@@ -30,6 +30,12 @@ from .conftest import (
 )
 
 
+def _projection_list_stdout(command_name: str, *, blocked_by_dropped: bool = False) -> str:
+    return query_cli._format_projection_fields(  # noqa: SLF001
+        query_cli._projection_field_choices(command_name, blocked_by_dropped=blocked_by_dropped)  # noqa: SLF001
+    )
+
+
 def _mock_unmerged_git() -> MagicMock:
     git = MagicMock()
     git.default_branch.return_value = "main"
@@ -584,6 +590,16 @@ class TestHistoryCommand:
         assert "unknown field for gza history: nope" in result.stderr
         assert "valid fields:" in result.stderr
         assert "id" in result.stderr
+        assert "Run uv run gza history --list-fields to list valid fields." in result.stderr
+
+    def test_history_list_fields_prints_valid_projection_choices(self, tmp_path: Path):
+        setup_config(tmp_path)
+
+        result = run_gza("history", "--list-fields", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == _projection_list_stdout("history")
+        assert result.stderr == ""
 
     def test_history_rejects_next_action_projection_field(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -1615,6 +1631,16 @@ class TestSearchCommand:
         assert "unknown field for gza search: nope" in result.stderr
         assert "valid fields:" in result.stderr
         assert "id" in result.stderr
+        assert "Run uv run gza search --list-fields to list valid fields." in result.stderr
+
+    def test_search_list_fields_prints_valid_projection_choices(self, tmp_path: Path):
+        setup_config(tmp_path)
+
+        result = run_gza("search", "needle", "--list-fields", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == _projection_list_stdout("search")
+        assert result.stderr == ""
 
     def test_search_rejects_next_action_projection_field(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -4987,11 +5013,25 @@ class TestGroupsCommand:
         result = run_gza("groups", "list", "--fields", "group,nope", "--project", str(tmp_path))
 
         assert result.returncode == 2
-        assert "unknown field for gza groups: nope" in result.stderr
+        assert "unknown field for gza groups list: nope" in result.stderr
         assert "valid fields:" in result.stderr
         assert "group" in result.stderr
+        assert "Run uv run gza groups list --list-fields to list valid fields." in result.stderr
         assert "Release prompt" not in result.stdout
         assert "Backlog prompt" not in result.stdout
+
+    def test_groups_list_fields_print_valid_projection_choices_without_warning(self, tmp_path: Path):
+        setup_config(tmp_path)
+
+        alias_result = run_gza("groups", "--list-fields", "--project", str(tmp_path))
+        list_result = run_gza("groups", "list", "--list-fields", "--project", str(tmp_path))
+
+        assert alias_result.returncode == 0
+        assert alias_result.stdout.strip() == _projection_list_stdout("groups")
+        assert alias_result.stderr == ""
+        assert list_result.returncode == 0
+        assert list_result.stdout.strip() == _projection_list_stdout("groups list")
+        assert list_result.stderr == ""
 
 
 class TestStatusCommand:
@@ -9479,6 +9519,17 @@ class TestUnmergedUnifiedQueryOutput:
         captured = capsys.readouterr()
         assert result == 2
         assert "unknown field for gza unmerged: nope" in captured.err
+        assert "valid fields:" in captured.err
+        assert "Run uv run gza unmerged --list-fields to list valid fields." in captured.err
+
+    def test_unmerged_list_fields_prints_valid_projection_choices(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+
+        result = run_gza("unmerged", "--list-fields", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == _projection_list_stdout("unmerged")
+        assert result.stderr == ""
 
     @pytest.mark.parametrize("flag_args", [
         ("--view", "flat"),
@@ -11049,6 +11100,7 @@ class TestIncompleteCommand:
         assert "unknown field for gza incomplete: nope" in captured.err
         assert "valid fields:" in captured.err
         assert "id" in captured.err
+        assert "Run uv run gza incomplete --list-fields to list valid fields." in captured.err
 
     def test_incomplete_cli_text_single_field_prints_bare_values(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -11106,6 +11158,46 @@ class TestIncompleteCommand:
         assert "unknown field for gza incomplete: nope" in result.stderr
         assert "valid fields:" in result.stderr
         assert "id" in result.stderr
+        assert "Run uv run gza incomplete --list-fields to list valid fields." in result.stderr
+
+    def test_incomplete_cli_list_fields_prints_unresolved_projection_choices(self, tmp_path: Path):
+        setup_config(tmp_path)
+
+        result = run_gza("incomplete", "--list-fields", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == _projection_list_stdout("incomplete")
+        assert result.stderr == ""
+
+    def test_incomplete_cli_blocked_by_dropped_list_fields_prints_blocked_projection_choices(self, tmp_path: Path):
+        setup_config(tmp_path)
+
+        result = run_gza("incomplete", "--blocked-by-dropped", "--list-fields", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == _projection_list_stdout("incomplete", blocked_by_dropped=True)
+        assert result.stderr == ""
+
+    def test_incomplete_cli_blocked_by_dropped_unknown_fields_use_blocked_mode_hint(self, tmp_path: Path):
+        setup_config(tmp_path)
+        make_store(tmp_path).add("cli blocked-by-dropped unknown incomplete field", task_type="implement")
+
+        result = run_gza(
+            "incomplete",
+            "--blocked-by-dropped",
+            "--fields",
+            "nope",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 2
+        assert "unknown field for gza incomplete: nope" in result.stderr
+        assert (
+            f"valid fields: {_projection_list_stdout('incomplete', blocked_by_dropped=True)}"
+            in result.stderr
+        )
+        assert "Run uv run gza incomplete --blocked-by-dropped --list-fields to list valid fields." in result.stderr
 
     def test_incomplete_cli_default_one_line_is_compact_per_lineage(self, tmp_path: Path):
         setup_config(tmp_path)

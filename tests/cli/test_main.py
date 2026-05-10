@@ -96,6 +96,7 @@ class TestHelpOutput:
 
         history_help = run_gza("history", "--help", "--project", str(tmp_path))
         search_help = run_gza("search", "--help", "--project", str(tmp_path))
+        docs_text = Path("docs/configuration.md").read_text()
 
         assert history_help.returncode == 0
         assert "--status-not" in history_help.stdout
@@ -103,6 +104,7 @@ class TestHelpOutput:
         assert "--tag-not" in history_help.stdout
         assert "--preset" not in history_help.stdout
         assert "works in text or JSON mode" in history_help.stdout
+        assert "--list-fields" in history_help.stdout
         assert "--" + "incomplete" not in history_help.stdout
         assert "--tag/--tag-not values" in history_help.stdout
         assert search_help.returncode == 0
@@ -111,10 +113,12 @@ class TestHelpOutput:
         assert "--tag-not" in search_help.stdout
         assert "--preset" not in search_help.stdout
         assert "works in text or JSON mode" in search_help.stdout
+        assert "--list-fields" in search_help.stdout
         assert "--related-to-not" in search_help.stdout
         assert "Deprecated alias for --lineage-of" in search_help.stdout
         assert "--lineage-of-not" in search_help.stdout
         assert "--root-not" in search_help.stdout
+        assert docs_text.count("| `--list-fields` | List valid `--fields` values for this command and exit |") >= 5
 
     def test_history_and_search_reject_removed_preset_flag(self, tmp_path):
         setup_config(tmp_path)
@@ -155,9 +159,11 @@ class TestHelpOutput:
         assert result.returncode == 0
         assert "Show unresolved task lineages that still need attention" in result.stdout
         assert "--fields" in result.stdout
+        assert "--list-fields" in result.stdout
         assert "--json" in result.stdout
         assert "--blocked-by-dropped" in result.stdout
         assert "deprecated and no longer supported" not in result.stdout
+        assert "incomplete --blocked-by-dropped --list-fields" in Path("docs/configuration.md").read_text()
         assert result.stderr == ""
 
     def test_incomplete_command_dispatches_through_live_parser(self, tmp_path, monkeypatch):
@@ -540,6 +546,7 @@ class TestHelpOutput:
         assert "--target BRANCH" in unmerged_help.stdout
         assert "--json" in unmerged_help.stdout
         assert "--fields CSV" in unmerged_help.stdout
+        assert "--list-fields" in unmerged_help.stdout
         assert "Show last N unmerged tasks (default: 5, 0 for all)" in help_text
         assert "Fetch `origin` before the canonical default-branch refresh" in help_text
         assert "Has no effect with `--into-current` or `--target`" in help_text
@@ -553,6 +560,7 @@ class TestHelpOutput:
         assert "`--fetch` | Fetch `origin` before the canonical default-branch refresh" in docs_text
         assert "| `--json` | Output JSON rows from the unified query API |" in docs_text
         assert "| `--fields CSV` | Projection field override" in docs_text
+        assert "| `--list-fields` | List valid `--fields` values for this command and exit |" in docs_text
         assert "opens the task store read/write" in docs_text
         assert "By default, plain `uv run gza unmerged` does not initiate network I/O" in docs_text
         assert "This is the deliberate narrow exception to the usual read-only query convention" in docs_text
@@ -586,6 +594,7 @@ class TestHelpOutput:
         assert "### groups" in docs_text
         assert "gza groups" in docs_text
         assert "--fields CSV" in docs_text
+        assert "--list-fields" in docs_text
         assert "--json" in docs_text
 
         result = run_gza("groups", "--project", str(tmp_path))
