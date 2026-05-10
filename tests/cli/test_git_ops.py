@@ -2,13 +2,14 @@
 
 import argparse
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from gza.cli.git_ops import _merge_single_task, _run_task_backed_rebase
 from gza.config import Config
 
-from .conftest import make_store, setup_config
+from .conftest import make_store, run_gza, setup_config
 
 
 def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -> None:
@@ -146,3 +147,44 @@ def test_run_task_backed_rebase_surfaces_resolution_warnings_and_preserves_exist
     output = capsys.readouterr()
     assert "unexpected error resolving ref 'feature/rebased': boom" in output.err
     assert "unexpected error resolving ref 'main': boom" in output.err
+
+
+def test_rebase_background_creator_phase_failure_cleans_up_created_task_and_artifacts(tmp_path: Path) -> None:
+    """Background rebase must roll back the created child when startup preparation fails."""
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl_task = store.add("Implement feature", task_type="implement")
+    impl_task.status = "completed"
+    impl_task.branch = "test-project/20260129-implement-feature"
+    impl_task.completed_at = datetime.now(UTC)
+    store.update(impl_task)
+
+    git = SimpleNamespace(
+        current_branch=MagicMock(return_value="main"),
+        default_branch=MagicMock(return_value="main"),
+    )
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=git),
+        patch("gza.cli.git_ops._require_default_branch", return_value=True),
+        patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")),
+        patch(
+            "gza.cli.git_ops._spawn_background_worker",
+            side_effect=AssertionError("background worker should not spawn"),
+        ),
+    ):
+        result = run_gza("rebase", str(impl_task.id), "--background", "--project", str(tmp_path))
+
+    assert result.returncode == 1
+    assert "creator boom" in result.stderr
+    assert store.get_based_on_children(impl_task.id) == []
+
+    logs_dir = tmp_path / ".gza" / "logs"
+    if logs_dir.exists():
+        assert list(logs_dir.iterdir()) == []
+
+    workers_dir = tmp_path / ".gza" / "workers"
+    if workers_dir.exists():
+        assert list(workers_dir.iterdir()) == []
