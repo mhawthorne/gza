@@ -998,22 +998,38 @@ def _run_cycle(
 
         worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
 
-        def _watch_spawn_worker(task_id: str, task_kind: str) -> int:
+        def _watch_spawn_worker(task_obj: DbTask, task_kind: str) -> int:
+            assert task_obj.id is not None
+            task_id = str(task_obj.id)
             return _spawn_worker_with_failure_log(
                 quiet=quiet,
                 log=log,
                 failure_message=f"{task_id} {task_kind}: worker spawn failed",
                 dedupe_key=f"spawn-worker-failed:{task_id}",
-                spawn_fn=lambda: _spawn_background_worker(worker_args, config, task_id=task_id, quiet=quiet),
+                spawn_fn=lambda: _spawn_background_worker(
+                    worker_args,
+                    config,
+                    task_id=task_id,
+                    quiet=quiet,
+                    prepared_task=task_obj,
+                ),
             )
 
-        def _watch_spawn_resume_worker(task_id: str, task_kind: str) -> int:
+        def _watch_spawn_resume_worker(task_obj: DbTask, task_kind: str) -> int:
+            assert task_obj.id is not None
+            task_id = str(task_obj.id)
             return _spawn_worker_with_failure_log(
                 quiet=quiet,
                 log=log,
                 failure_message=f"{task_id} {task_kind}: resume worker spawn failed",
                 dedupe_key=f"spawn-resume-failed:{task_id}",
-                spawn_fn=lambda: _spawn_background_resume_worker(worker_args, config, new_task_id=task_id, quiet=quiet),
+                spawn_fn=lambda: _spawn_background_resume_worker(
+                    worker_args,
+                    config,
+                    new_task_id=task_id,
+                    quiet=quiet,
+                    prepared_task=task_obj,
+                ),
             )
 
         def _watch_spawn_iterate(task_obj: DbTask, task_kind: str) -> int:
@@ -1052,6 +1068,11 @@ def _run_cycle(
             max_resume_attempts=max_recovery_attempts,
             use_iterate_for_create_implement=True,
             use_iterate_for_needs_rebase=False,
+            prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
+                config,
+                task,
+                rollback_on_failure=rollback_on_failure,
+            ),
             prepare_create_review=lambda t: _prepare_create_review_action(store, t),
             create_resume_task=lambda t: _create_resume_task(store, t),
             create_rebase_task=_create_rebase_from_task,
