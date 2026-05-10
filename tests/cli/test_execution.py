@@ -1591,7 +1591,7 @@ class TestWorkCommandMultiTask:
     def test_work_background_subprocess_uses_project_flag(self, tmp_path: Path):
         """Background worker subprocess command uses --project flag, not bare positional arg."""
         import argparse
-        from unittest.mock import patch
+        from unittest.mock import MagicMock, patch
 
         from gza.cli import _spawn_background_worker
         from gza.config import Config
@@ -1608,12 +1608,12 @@ class TestWorkCommandMultiTask:
         config.tmux.enabled = False  # Test bare Popen path, not tmux
         args = argparse.Namespace(no_docker=True, max_turns=None)
 
-        with patch("gza.cli.subprocess.Popen") as mock_popen:
-            mock_popen.return_value.pid = 12345
+        with patch("gza.cli._spawn_detached_worker_process") as mock_spawn:
+            mock_spawn.return_value = (MagicMock(pid=12345), ".gza/workers/w-test-startup.log")
             _spawn_background_worker(args, config, task_id=task.id)
 
-            assert mock_popen.called
-            cmd = mock_popen.call_args[0][0]
+            assert mock_spawn.called
+            cmd = mock_spawn.call_args[0][0]
             # Project dir must be passed with --project flag, not as bare positional
             project_dir = str(config.project_dir.absolute())
             assert "--project" in cmd, f"--project flag missing from subprocess cmd: {cmd}"
@@ -2047,12 +2047,12 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
 
-        def capture_popen(cmd, **kwargs):
+        def capture_spawn(cmd, _config, worker_id):
             nonlocal captured_cmd
             captured_cmd = cmd
-            return mock_proc
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
-        with patch("gza.cli.subprocess.Popen", side_effect=capture_popen):
+        with patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn):
             _spawn_background_worker(args, config, task_id=task.id)
 
         assert captured_cmd is not None, "subprocess.Popen was not called"
@@ -2098,19 +2098,19 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 11111
 
-        def capture_popen(cmd, **kwargs):
+        def capture_spawn(cmd, _config, worker_id):
             nonlocal captured_cmd
             captured_cmd = cmd
-            return mock_proc
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
-        with patch("gza.cli.subprocess.Popen", side_effect=capture_popen):
+        with patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn):
             _spawn_background_worker(args, config, task_id=task.id)
 
         assert captured_cmd is not None
         assert "--pr" in captured_cmd
 
-    def test_background_worker_without_explicit_task_does_not_pass_task_id(self, tmp_path: Path):
-        """No-id background work should not pass a selected task ID to child runner."""
+    def test_background_worker_without_explicit_task_prepares_selection_and_passes_task_id(self, tmp_path: Path):
+        """No-id background work should prepare the selected task before detaching it."""
         import argparse
         from unittest.mock import MagicMock, patch
 
@@ -2120,7 +2120,7 @@ class TestBackgroundWorkerCommand:
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
-        store.add("Pending candidate")
+        task = store.add("Pending candidate")
 
         workers_path = tmp_path / ".gza" / "workers"
         workers_path.mkdir(parents=True, exist_ok=True)
@@ -2139,24 +2139,24 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
 
-        def capture_popen(cmd, **kwargs):
+        def capture_spawn(cmd, _config, worker_id):
             nonlocal captured_cmd
             captured_cmd = cmd
-            return mock_proc
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
-        with patch("gza.cli.subprocess.Popen", side_effect=capture_popen):
+        with patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn):
             rc = _spawn_background_worker(args, config)
 
         assert rc == 0
         assert captured_cmd is not None
         worker_mode_idx = captured_cmd.index("--worker-mode")
         assert worker_mode_idx + 1 < len(captured_cmd)
-        assert captured_cmd[worker_mode_idx + 1].startswith("--"), f"Unexpected explicit task id in command: {captured_cmd}"
+        assert captured_cmd[worker_mode_idx + 1] == str(task.id)
 
         registry = WorkerRegistry(config.workers_path)
         workers = registry.list_all(include_completed=True)
         assert len(workers) == 1
-        assert workers[0].task_id is None
+        assert workers[0].task_id == task.id
 
     def test_background_resume_worker_command_uses_project_flag(self, tmp_path: Path):
         """Background resume worker subprocess must pass project dir with --project flag.
@@ -2195,12 +2195,12 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
 
-        def capture_popen(cmd, **kwargs):
+        def capture_spawn(cmd, _config, worker_id):
             nonlocal captured_cmd
             captured_cmd = cmd
-            return mock_proc
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
-        with patch("gza.cli.subprocess.Popen", side_effect=capture_popen):
+        with patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn):
             _spawn_background_resume_worker(args, config, new_task_id=task.id)
 
         assert captured_cmd is not None, "subprocess.Popen was not called"
@@ -2244,8 +2244,11 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 22222
 
+        def capture_spawn(_cmd, _config, worker_id):
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
+
         with (
-            patch("gza.cli.subprocess.Popen", return_value=mock_proc),
+            patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn),
             console.capture() as capture,
         ):
             rc = _spawn_background_worker(args, config, task_id=task.id)
@@ -2285,8 +2288,11 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 33333
 
+        def capture_spawn(_cmd, _config, worker_id):
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
+
         with (
-            patch("gza.cli.subprocess.Popen", return_value=mock_proc),
+            patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn),
             console.capture() as capture,
         ):
             rc = _spawn_background_worker(args, config, task_id=task.id, quiet=True)
@@ -2340,7 +2346,6 @@ class TestBackgroundWorkerCommand:
     def test_background_worker_registers_startup_log_file(self, tmp_path: Path):
         """Background worker captures early stdout/stderr into startup log metadata."""
         import argparse
-        import subprocess as sp
         from unittest.mock import MagicMock, patch
 
         from gza.cli import _spawn_background_worker
@@ -2364,23 +2369,18 @@ class TestBackgroundWorkerCommand:
             project_dir=str(tmp_path),
         )
 
-        captured_kwargs = None
         mock_proc = MagicMock()
         mock_proc.pid = 99999
 
-        def capture_popen(cmd, **kwargs):
-            nonlocal captured_kwargs
-            captured_kwargs = kwargs
-            return mock_proc
+        def capture_spawn(_cmd, _config, worker_id):
+            startup_log_rel = f".gza/workers/{worker_id}-startup.log"
+            (tmp_path / startup_log_rel).touch()
+            return mock_proc, startup_log_rel
 
-        with patch("gza.cli.subprocess.Popen", side_effect=capture_popen):
+        with patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn):
             rc = _spawn_background_worker(args, config, task_id=task.id)
 
         assert rc == 0
-        assert captured_kwargs is not None
-        assert captured_kwargs["stderr"] == sp.STDOUT
-        assert captured_kwargs["stdout"] is not sp.DEVNULL
-        assert hasattr(captured_kwargs["stdout"], "name")
 
         registry = WorkerRegistry(config.workers_path)
         workers = registry.list_all(include_completed=True)
@@ -2389,6 +2389,98 @@ class TestBackgroundWorkerCommand:
         assert worker.startup_log_file == f".gza/workers/{worker.worker_id}-startup.log"
         assert worker.log_file is None
         assert (tmp_path / worker.startup_log_file).exists()
+
+    def test_work_background_existing_task_startup_failure_surfaces_before_detach(self, tmp_path: Path):
+        """Explicit background work should fail in the parent when startup preparation fails."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Parent-side startup failure")
+
+        with (
+            patch("gza.cli.prepare_task_startup_phase", side_effect=RuntimeError("startup boom")),
+            patch(
+                "gza.cli._spawn_detached_worker_process",
+                side_effect=AssertionError("worker process should not spawn"),
+            ),
+        ):
+            result = run_gza(
+                "work",
+                str(task.id),
+                "--background",
+                "--no-docker",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 1
+        assert "startup boom" in result.stderr
+        output = result.stdout + result.stderr
+        assert "Started task" not in output
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
+
+    def test_background_worker_tag_selection_prepares_selected_task_and_hands_off_that_task_id(
+        self,
+        tmp_path: Path,
+    ):
+        """Tag-selected background work should hand the prepared task ID to the child."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        selected = store.add("Selected tagged task", tags=("picked",))
+        other = store.add("Other tagged task", tags=("picked",))
+        assert selected.id is not None
+        assert other.id is not None
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        config = Config.load(tmp_path)
+        config.tmux.enabled = False
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+            tag=["picked"],
+            any_tag=False,
+        )
+
+        captured_cmd = None
+        mock_proc = MagicMock()
+        mock_proc.pid = 55555
+        prepared_ids: list[str] = []
+
+        def capture_spawn(cmd, _config, worker_id):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
+
+        def capture_prepare(_config, _store, task_to_prepare):
+            assert task_to_prepare.id is not None
+            prepared_ids.append(task_to_prepare.id)
+            return task_to_prepare
+
+        with (
+            patch("gza.cli.prepare_task_startup_phase", side_effect=capture_prepare),
+            patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn),
+        ):
+            rc = _spawn_background_worker(args, config)
+
+        assert rc == 0
+        assert prepared_ids == [selected.id]
+        assert captured_cmd is not None
+        worker_mode_idx = captured_cmd.index("--worker-mode")
+        assert captured_cmd[worker_mode_idx + 1] == str(selected.id)
+        assert "--tag" not in captured_cmd
 
     def test_background_iterate_worker_passes_worker_id_to_child(self, tmp_path: Path):
         """Background iterate workers must pass the generated worker_id to the child process."""
@@ -2467,11 +2559,14 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
 
-        with patch("gza.cli.subprocess.Popen", return_value=mock_proc) as mock_popen:
+        def capture_spawn(_cmd, _config, worker_id):
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
+
+        with patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn) as mock_spawn:
             rc = _spawn_background_worker(args, config, task_id=task.id)
 
         assert rc == 0
-        mock_popen.assert_called_once()
+        mock_spawn.assert_called_once()
 
     def test_background_worker_allows_failed_pr_required_task_with_persisted_create_pr(self, tmp_path: Path):
         """Background explicit work should allow retrying failed PR_REQUIRED tasks via stored create_pr intent."""
@@ -2507,11 +2602,14 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
 
-        with patch("gza.cli.subprocess.Popen", return_value=mock_proc) as mock_popen:
+        def capture_spawn(_cmd, _config, worker_id):
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
+
+        with patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn) as mock_spawn:
             rc = _spawn_background_worker(args, config, task_id=task.id)
 
         assert rc == 0
-        mock_popen.assert_called_once()
+        mock_spawn.assert_called_once()
 
     def test_background_worker_honors_task_providers_routing_for_fix(self, tmp_path: Path):
         """Fix task routed via task_providers.fix must pick provider-specific worker plumbing
@@ -2571,6 +2669,7 @@ class TestBackgroundWorkerCommand:
         # Pretend tmux is available so the provider-specific use_tmux decision
         # is observable in the final command.
         with (
+            patch("gza.cli.prepare_task_startup_phase", side_effect=lambda _c, _s, task: task),
             patch("gza.cli.shutil.which", return_value="/usr/bin/tmux"),
             patch("gza.cli.subprocess.Popen", return_value=mock_proc),
             patch("gza.cli.subprocess.run", side_effect=capture_run),

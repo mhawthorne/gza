@@ -857,6 +857,16 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
 
     assert selected_task is not None
 
+    prepared_task = _prepare_task_for_immediate_execution(
+        config,
+        selected_task,
+        rollback_on_failure=False,
+    )
+    if prepared_task is None:
+        return 1
+    selected_task = prepared_task
+    task_id_for_child = explicit_task_id or selected_task.id
+
     # Build inner command for the worker subprocess
     inner_cmd = [
         sys.executable, "-m", "gza",
@@ -866,8 +876,8 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     if resume_mode:
         inner_cmd.append("--resume")
 
-    if explicit_task_id is not None:
-        inner_cmd.append(str(explicit_task_id))
+    if task_id_for_child is not None:
+        inner_cmd.append(str(task_id_for_child))
     elif selected_tags:
         for tag in selected_tags:
             inner_cmd.extend(["--tag", tag])
@@ -916,7 +926,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
     if use_tmux:
         # Use explicit task ID for session name when available; fall back to worker-based name
         # (worker_id is generated below, so we use a placeholder key derived from the task)
-        session_task_id = explicit_task_id if explicit_task_id is not None else selected_task.id
+        session_task_id = task_id_for_child if task_id_for_child is not None else selected_task.id
         tmux_session = f"gza-{session_task_id}"
         inner_cmd.extend(["--tmux-session", tmux_session])
 
@@ -992,7 +1002,7 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         # Register worker
         worker_metadata = WorkerMetadata(
             worker_id=worker_id,
-            task_id=explicit_task_id,  # None when no explicit task; child runner claims the task
+            task_id=task_id_for_child,
             pid=pid,
             startup_log_file=startup_log_rel,
             tmux_session=tmux_session,
@@ -1359,15 +1369,18 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
 
         # Spawn one worker per task ID
         spawned_count = 0
+        had_error = False
         for task_id in args.task_ids:
             result = _spawn_background_worker(args, config, task_id=task_id)
             if result == 0:
                 spawned_count += 1
+            else:
+                had_error = True
 
         if len(args.task_ids) > 1:
             print(f"\n=== Spawned {spawned_count} background worker(s) for {len(args.task_ids)} task(s) ===")
 
-        return 0
+        return 1 if had_error else 0
 
     if selected_tags:
         pending_tasks = store.get_pending_pickup(limit=count, tags=selected_tags, any_tag=any_tag)
@@ -1375,38 +1388,45 @@ def _spawn_background_workers(args: argparse.Namespace, config: Config) -> int:
             print(format_no_runnable_message_for_tags(store, selected_tags, any_tag=any_tag))
             return 0
         spawned_count = 0
+        had_error = False
         for task in pending_tasks:
             if task.id is None:
                 continue
             result = _spawn_background_worker(args, config, task_id=task.id)
             if result == 0:
                 spawned_count += 1
+            else:
+                had_error = True
         if count > 1:
             print(
                 f"\n=== Attempted to spawn {count} background worker(s) "
                 f"for tags '{', '.join(selected_tags)}' ==="
             )
+        return 1 if had_error else 0
+
+    pending_tasks = store.get_pending_pickup(limit=count)
+    if not pending_tasks:
+        print("No pending tasks found")
         return 0
 
-    # Spawn N workers - each will atomically claim a pending task
-    # If there are fewer pending tasks than requested, some spawns will
-    # find no tasks and exit gracefully
     spawned_count = 0
+    had_error = False
 
-    for i in range(count):
-        # _spawn_background_worker will atomically claim next pending task
-        # It returns 0 if successful OR if no tasks are available
-        # It returns 1 only on actual errors
-        result = _spawn_background_worker(args, config)
+    for task in pending_tasks:
+        if task.id is None:
+            continue
+        result = _spawn_background_worker(args, config, task_id=task.id)
         if result == 0:
             spawned_count += 1
+        else:
+            had_error = True
 
     # Since _spawn_background_worker prints its own output for each worker,
     # we just print a summary if multiple workers were requested
     if count > 1:
         print(f"\n=== Attempted to spawn {count} background worker(s) ===")
 
-    return 0
+    return 1 if had_error else 0
 
 
 def _allow_pr_required_retry(args: argparse.Namespace, task: DbTask) -> bool:

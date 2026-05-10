@@ -654,6 +654,7 @@ class TestSpawnBackgroundWorkerTmux:
         with patch("gza.cli._common.subprocess.run", return_value=tmux_run_result) as mock_run, \
              patch("gza.cli._common.get_tmux_session_pid", return_value=mock_pid_result), \
              patch("gza.cli._common.get_store") as mock_get_store, \
+             patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, prepared_task: prepared_task), \
              patch("gza.cli._common.shutil.which", return_value="/usr/bin/tmux"):
             mock_get_store.return_value = store
             from gza.cli._common import _spawn_background_worker
@@ -696,6 +697,7 @@ class TestSpawnBackgroundWorkerTmux:
         with patch("gza.cli._common.subprocess.run", side_effect=side_effect_fn), \
              patch("gza.cli._common.get_tmux_session_pid", return_value=mock_pid_result), \
              patch("gza.cli._common.get_store") as mock_get_store, \
+             patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, prepared_task: prepared_task), \
              patch("gza.cli._common.shutil.which", return_value="/usr/bin/tmux"):
             mock_get_store.return_value = store
             from gza.cli._common import _spawn_background_worker
@@ -723,7 +725,8 @@ class TestSpawnBackgroundWorkerTmux:
 
         with patch("gza.cli._common.subprocess.Popen", return_value=mock_proc) as mock_popen, \
              patch("gza.cli._common.subprocess.run") as mock_run, \
-             patch("gza.cli._common.get_store") as mock_get_store:
+             patch("gza.cli._common.get_store") as mock_get_store, \
+             patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, prepared_task: prepared_task):
             mock_get_store.return_value = store
             from gza.cli._common import _spawn_background_worker
             result = _spawn_background_worker(args, config, task_id=task.id)
@@ -755,6 +758,7 @@ class TestSpawnBackgroundWorkerTmux:
         with patch("gza.cli._common.subprocess.run", return_value=tmux_run_result) as mock_run, \
              patch("gza.cli._common.get_tmux_session_pid", return_value=mock_pid_result), \
              patch("gza.cli._common.get_store") as mock_get_store, \
+             patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, prepared_task: prepared_task), \
              patch("gza.cli._common.shutil.which", return_value="/usr/bin/tmux"):
             mock_get_store.return_value = store
             from gza.cli._common import _spawn_background_worker
@@ -785,6 +789,7 @@ class TestSpawnBackgroundWorkerTmux:
 
         with patch("gza.cli._common.subprocess.Popen", return_value=mock_proc), \
              patch("gza.cli._common.get_store") as mock_get_store, \
+             patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, prepared_task: prepared_task), \
              patch("gza.cli._common.shutil.which", return_value=None):  # tmux not found
             mock_get_store.return_value = store
             from gza.cli._common import _spawn_background_worker
@@ -1020,6 +1025,7 @@ class TestClaudeProviderTmuxMode:
         with patch("gza.cli._common.subprocess.run", return_value=tmux_run_result) as mock_run, \
              patch("gza.cli._common.get_tmux_session_pid", return_value=9999), \
              patch("gza.cli._common.get_store") as mock_get_store, \
+             patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, prepared_task: prepared_task), \
              patch("gza.cli._common.shutil.which", return_value="/usr/bin/tmux"):
             mock_get_store.return_value = store
             from gza.cli._common import _spawn_background_worker
