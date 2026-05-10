@@ -188,3 +188,50 @@ def test_rebase_background_creator_phase_failure_cleans_up_created_task_and_arti
     workers_dir = tmp_path / ".gza" / "workers"
     if workers_dir.exists():
         assert list(workers_dir.iterdir()) == []
+
+
+def test_rebase_background_reuses_prepared_child_without_second_startup_pass(tmp_path: Path) -> None:
+    """Background rebase should hand the already-prepared child to the generic spawner."""
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl_task = store.add("Implement feature", task_type="implement")
+    assert impl_task.id is not None
+    impl_task.status = "completed"
+    impl_task.branch = "test-project/20260129-implement-feature"
+    impl_task.completed_at = datetime.now(UTC)
+    store.update(impl_task)
+
+    git = SimpleNamespace(
+        current_branch=MagicMock(return_value="main"),
+        default_branch=MagicMock(return_value="main"),
+    )
+    captured_spawn: dict[str, object] = {}
+
+    def prepare_once(_config, task, **_kwargs):
+        if prepare_once.called:
+            raise AssertionError("startup preparation ran twice")
+        prepare_once.called = True
+        return task
+
+    prepare_once.called = False  # type: ignore[attr-defined]
+
+    def fake_spawn(_args, _config, **kwargs):
+        captured_spawn.update(kwargs)
+        return 0
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=git),
+        patch("gza.cli.git_ops._require_default_branch", return_value=True),
+        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=prepare_once) as prepare_task,
+        patch("gza.cli.git_ops._spawn_background_worker", side_effect=fake_spawn),
+    ):
+        result = run_gza("rebase", str(impl_task.id), "--background", "--project", str(tmp_path))
+
+    assert result.returncode == 0
+    assert prepare_task.call_count == 1
+    assert captured_spawn["task_id"] is not None
+    prepared_task = captured_spawn["prepared_task"]
+    assert prepared_task is not None
+    assert getattr(prepared_task, "id", None) == captured_spawn["task_id"]
