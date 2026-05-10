@@ -2346,6 +2346,115 @@ class TestBackgroundWorkerCommand:
         assert "Prompt: Resume [literal] prompt" in output
         assert f"Use 'gza log {task.id} -f' to follow progress" in output
 
+    def test_review_background_reuses_prepared_task_without_second_prepare(self, tmp_path: Path):
+        """Review background handoff must reuse the prepared child instead of preparing twice."""
+        from gza.cli.execution import cmd_review
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.tmux.enabled = False
+        store = make_store(tmp_path)
+
+        impl = store.add("Completed implementation", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        args = argparse.Namespace(
+            task_id=impl.id,
+            project_dir=tmp_path,
+            no_docker=True,
+            queue=False,
+            background=True,
+            model=None,
+            provider=None,
+            open=False,
+            force=False,
+        )
+
+        prepare_calls = {"count": 0}
+        mock_proc = MagicMock()
+        mock_proc.pid = 45454
+
+        def prepare_once(_config, task, **_kwargs):
+            prepare_calls["count"] += 1
+            if prepare_calls["count"] > 1:
+                raise AssertionError("background review should not prepare twice")
+            return task
+
+        with (
+            patch("gza.cli._prepare_task_for_immediate_execution", side_effect=prepare_once),
+            patch(
+                "gza.cli._spawn_detached_worker_process",
+                return_value=(mock_proc, ".gza/workers/review-startup.log"),
+            ),
+        ):
+            rc = cmd_review(args)
+
+        assert rc == 0
+        assert prepare_calls["count"] == 1
+        review_tasks = store.get_reviews_for_task(impl.id)
+        assert len(review_tasks) == 1
+        review_task = review_tasks[0]
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        assert workers[0].task_id == review_task.id
+
+    def test_resume_background_reuses_prepared_task_without_second_prepare(self, tmp_path: Path):
+        """Resume background handoff must reuse the prepared child instead of preparing twice."""
+        from gza.cli.execution import cmd_resume
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "MAX_TURNS"
+        failed.session_id = "resume-session-1"
+        store.update(failed)
+
+        args = argparse.Namespace(
+            task_id=failed.id,
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            queue=False,
+            background=True,
+            force=False,
+        )
+
+        prepare_calls = {"count": 0}
+        mock_proc = MagicMock()
+        mock_proc.pid = 46464
+
+        def prepare_once(_config, task, **_kwargs):
+            prepare_calls["count"] += 1
+            if prepare_calls["count"] > 1:
+                raise AssertionError("background resume should not prepare twice")
+            return task
+
+        with (
+            patch("gza.cli._prepare_task_for_immediate_execution", side_effect=prepare_once),
+            patch(
+                "gza.cli._spawn_detached_worker_process",
+                return_value=(mock_proc, ".gza/workers/resume-startup.log"),
+            ),
+        ):
+            rc = cmd_resume(args)
+
+        assert rc == 0
+        assert prepare_calls["count"] == 1
+        children = store.get_based_on_children(failed.id)
+        assert len(children) == 1
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        assert workers[0].task_id == children[0].id
+
     def test_background_worker_registers_startup_log_file(self, tmp_path: Path):
         """Background worker captures early stdout/stderr into startup log metadata."""
         import argparse
@@ -7338,6 +7447,77 @@ class TestIterateCommand:
         assert run_foreground.call_args.kwargs.get("resume", False) is resume_mode
         assert expected_prefix in output
         assert len(store.get_based_on_children(impl.id)) == 1
+
+    @pytest.mark.parametrize(
+        ("start_flag", "resume_mode"),
+        [
+            ("--resume", True),
+            ("--retry", False),
+        ],
+    )
+    def test_failed_task_background_iterate_uses_prepared_child_for_output_and_worker_metadata(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        start_flag: str,
+        resume_mode: bool,
+    ) -> None:
+        """Background iterate recovery should point operators at the prepared recovery child log."""
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "failed"
+        impl.failure_reason = "MAX_TURNS"
+        if resume_mode:
+            impl.session_id = "resume-session-1"
+        store.update(impl)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=resume_mode,
+            retry=not resume_mode,
+            auto_iterate=False,
+            background=True,
+            force=False,
+            worker_id=None,
+            prepared_task_id=None,
+            prepared_resume=False,
+            prepared_phase=None,
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 56565
+
+        with (
+            patch("gza.cli._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+            patch(
+                "gza.cli._spawn_detached_worker_process",
+                return_value=(mock_proc, ".gza/workers/iterate-startup.log"),
+            ),
+        ):
+            rc = cmd_iterate(args)
+
+        assert rc == 0
+        children = store.get_based_on_children(impl.id)
+        assert len(children) == 1
+        prepared_child = children[0]
+        captured = capsys.readouterr()
+        output = captured.out + captured.err
+
+        registry = WorkerRegistry(config.workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        assert workers[0].task_id == prepared_child.id
+        assert f"Use 'gza log {prepared_child.id} -f' to follow progress" in output
+        assert f"Use 'gza log {impl.id} -f' to follow progress" not in output
 
     def test_failed_task_retry_runs_then_iterates(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """gza iterate --retry on a failed task retries it then enters the loop via real engine transitions."""

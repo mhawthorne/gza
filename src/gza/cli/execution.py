@@ -770,7 +770,12 @@ def cmd_implement(args: argparse.Namespace) -> int:
         assert impl_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [impl_task.id]
-        return _spawn_background_worker(worker_args, config, task_id=impl_task.id)
+        return _spawn_background_worker(
+            worker_args,
+            config,
+            task_id=impl_task.id,
+            prepared_task=impl_task,
+        )
 
     # Default: run the implement task immediately
     print(f"\nRunning implement task {impl_task.id}...")
@@ -1015,8 +1020,19 @@ def cmd_extract(args: argparse.Namespace) -> int:
     if hasattr(args, "background") and args.background:
         worker_args = _extract_run_args(args, [task.id for task in created_tasks if task.id is not None])
         if len(worker_args.task_ids) == 1:
-            return _spawn_background_worker(worker_args, config, task_id=worker_args.task_ids[0])
-        return _spawn_background_workers(worker_args, config)
+            prepared_task = next(task for task in created_tasks if task.id == worker_args.task_ids[0])
+            return _spawn_background_worker(
+                worker_args,
+                config,
+                task_id=worker_args.task_ids[0],
+                prepared_task=prepared_task,
+            )
+        prepared_task_map = {
+            str(task.id): task
+            for task in created_tasks
+            if task.id is not None
+        }
+        return _spawn_background_workers(worker_args, config, prepared_tasks=prepared_task_map)
 
     task_ids = [task.id for task in created_tasks if task.id is not None]
     if len(task_ids) == 1:
@@ -1523,7 +1539,12 @@ def cmd_retry(args: argparse.Namespace) -> int:
         assert new_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [new_task.id]
-        return _spawn_background_worker(worker_args, config, task_id=new_task.id)
+        return _spawn_background_worker(
+            worker_args,
+            config,
+            task_id=new_task.id,
+            prepared_task=new_task,
+        )
 
     # Default: run the new task immediately
     print(f"\nRunning task {new_task.id}...")
@@ -2005,7 +2026,12 @@ def cmd_improve(args: argparse.Namespace) -> int:
         assert improve_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [improve_task.id]
-        return _spawn_background_worker(worker_args, config, task_id=improve_task.id)
+        return _spawn_background_worker(
+            worker_args,
+            config,
+            task_id=improve_task.id,
+            prepared_task=improve_task,
+        )
 
     # Default: run the improve task immediately
     print(f"\nRunning improve task {improve_task.id}...")
@@ -2085,7 +2111,12 @@ def cmd_fix(args: argparse.Namespace) -> int:
     if hasattr(args, 'background') and args.background:
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [fix_task.id]
-        return _spawn_background_worker(worker_args, config, task_id=fix_task.id)
+        return _spawn_background_worker(
+            worker_args,
+            config,
+            task_id=fix_task.id,
+            prepared_task=fix_task,
+        )
 
     print(f"\nRunning fix task {fix_task.id}...")
     return _run_foreground(
@@ -2182,7 +2213,12 @@ def cmd_review(args: argparse.Namespace) -> int:
         assert review_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [review_task.id]
-        return _spawn_background_worker(worker_args, config, task_id=review_task.id)
+        return _spawn_background_worker(
+            worker_args,
+            config,
+            task_id=review_task.id,
+            prepared_task=review_task,
+        )
 
     # Default: run the review task immediately
     # Note: PR posting happens in _run_non_code_task, no need to do it here
@@ -3913,7 +3949,12 @@ def cmd_resume(args: argparse.Namespace) -> int:
     # Handle background mode
     if args.background:
         assert new_task.id is not None
-        return _spawn_background_resume_worker(args, config, new_task.id)
+        return _spawn_background_resume_worker(
+            args,
+            config,
+            new_task.id,
+            prepared_task=new_task,
+        )
 
     # Default: run the new resume task immediately
     return _run_foreground(

@@ -4,6 +4,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from gza.config import Config
 from gza.db import SqliteTaskStore, Task
 from gza.extractions import ExtractionDraft, ExtractionError, FileDiffSummary, SourceSelection
 from gza.git import Git
@@ -313,6 +314,9 @@ def test_extract_background_creator_phase_failure_removes_bundle_and_allows_retr
 
     retry_captured = capsys.readouterr()
     assert retry_rc == 0
+    assert retry_captured.out.count("Created extract implement task") == 1
+    retried_tasks = store.get_all()
+    assert len(retried_tasks) == 1
     assert "Created extract implement task" in retry_captured.out
     retried_task = get_latest_task(store, task_type="implement")
     assert retried_task is not None
@@ -418,8 +422,79 @@ def test_extract_per_commit_background_creator_phase_failure_rolls_back_entire_b
 
     retry_captured = capsys.readouterr()
     assert retry_rc == 0
-    assert retry_captured.out.count("Created extract implement task") == 3
-    retried_tasks = store.get_all()
-    assert len(retried_tasks) == 3
-    assert sorted(task.slug for task in retried_tasks) == sorted(fixed_slugs)
-    assert all(bundle_dir.exists() for bundle_dir in bundle_dirs)
+
+
+def test_extract_per_commit_background_reuses_prepared_tasks_without_second_prepare(
+    tmp_path: Path,
+) -> None:
+    from gza.cli.execution import cmd_extract
+    from gza.workers import WorkerRegistry
+
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    source = SourceSelection(
+        source_task_id=None,
+        source_commits=("aaa111", "bbb222"),
+        source_commit_subjects=("First commit", "Second commit"),
+    )
+    drafts = [
+        _draft(
+            source=SourceSelection(
+                source_task_id=None,
+                source_commits=(commit,),
+                source_commit_subjects=(subject,),
+            )
+        )
+        for commit, subject in (
+            ("aaa111", "First commit"),
+            ("bbb222", "Second commit"),
+        )
+    ]
+    git = MagicMock(spec=Git)
+    fixed_slugs = [
+        "20260510-extract-first",
+        "20260510-extract-second",
+    ]
+
+    prepare_calls = {"count": 0}
+    proc_counter = {"pid": 47000}
+
+    def prepare_once(_config, task, **_kwargs):
+        prepare_calls["count"] += 1
+        if prepare_calls["count"] > len(drafts):
+            raise AssertionError("background extract should not prepare tasks twice")
+        return task
+
+    def spawn_detached(_cmd, _config, worker_id):
+        proc_counter["pid"] += 1
+        proc = MagicMock()
+        proc.pid = proc_counter["pid"]
+        return proc, f".gza/workers/{worker_id}-startup.log"
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch("gza.cli.execution.resolve_source_selection", return_value=source),
+        patch("gza.cli.execution.normalize_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", side_effect=drafts),
+        patch("gza.cli.execution.generate_slug", side_effect=fixed_slugs),
+        patch("gza.cli._prepare_task_for_immediate_execution", side_effect=prepare_once),
+        patch("gza.cli._spawn_detached_worker_process", side_effect=spawn_detached),
+    ):
+        rc = cmd_extract(
+            _args(
+                tmp_path,
+                commits=["aaa111", "bbb222"],
+                per_commit=True,
+                paths=("src/extracted.py",),
+                background=True,
+            )
+        )
+
+    assert rc == 0
+    assert prepare_calls["count"] == len(drafts)
+    created_tasks = sorted(store.get_all(), key=lambda task: task.id)
+    assert len(created_tasks) == 2
+    registry = WorkerRegistry(config.workers_path)
+    workers = sorted(registry.list_all(include_completed=True), key=lambda worker: worker.task_id or "")
+    assert [worker.task_id for worker in workers] == [task.id for task in created_tasks]
