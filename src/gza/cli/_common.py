@@ -646,6 +646,7 @@ def _prepare_task_for_immediate_execution(
     task: DbTask,
     *,
     rollback_on_failure: bool,
+    rollback_cleanup: Callable[[], None] | None = None,
 ) -> DbTask | None:
     """Run the synchronous creator phase on the caller's stdout/stderr."""
     store = get_store(config)
@@ -656,6 +657,8 @@ def _prepare_task_for_immediate_execution(
         failed_task = failed_task or task
         if rollback_on_failure and task.id is not None:
             remove_task_startup_artifacts(config, failed_task)
+            if rollback_cleanup is not None:
+                rollback_cleanup()
             store.delete(task.id)
         print(f"Error: {exc}", file=sys.stderr)
         return None
