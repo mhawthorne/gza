@@ -1430,6 +1430,19 @@ class TestExtractionGitHelpers:
 
             assert git.resolve_merge_source_ref("feature/demo") == "origin/feature/demo"
 
+    def test_resolve_merge_source_ref_returns_none_when_no_local_or_remote_ref(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=1),  # branch_exists
+                MagicMock(returncode=1),  # ref_exists(origin/feature/demo)
+            ]
+
+            assert git.resolve_merge_source_ref("feature/demo") is None
+
     def test_get_diff_name_status_scoped_to_paths(self, tmp_path: Path):
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
