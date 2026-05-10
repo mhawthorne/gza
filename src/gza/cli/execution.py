@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import shutil
 import signal
 import sys
 import time
@@ -125,6 +126,7 @@ def _finalize_immediate_execution_task(
     task: DbTask,
     rollback_on_failure: bool,
     emit_created: Callable[[], None],
+    rollback_cleanup: Callable[[], None] | None = None,
 ) -> DbTask | None:
     """Print task creation only after immediate-execution preparation succeeds."""
     if getattr(args, "queue", False):
@@ -135,6 +137,7 @@ def _finalize_immediate_execution_task(
         config,
         task,
         rollback_on_failure=rollback_on_failure,
+        rollback_cleanup=rollback_cleanup,
     )
     if prepared_task is None:
         return None
@@ -903,7 +906,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
     skip_learnings = bool(getattr(args, "skip_learnings", False))
     base_branch = args.base_branch if hasattr(args, "base_branch") and args.base_branch else None
     created_tasks: list[DbTask] = []
-    created_task_summaries: list[tuple[DbTask, Callable[[], None]]] = []
+    created_task_summaries: list[tuple[DbTask, Callable[[], None], Callable[[], None]]] = []
 
     def _make_extract_created_emitter(
         *,
@@ -921,6 +924,12 @@ def cmd_extract(args: argparse.Namespace) -> int:
             )
 
         return _emit_created
+
+    def _make_extract_rollback_cleanup(bundle_dir: Path) -> Callable[[], None]:
+        def _cleanup() -> None:
+            shutil.rmtree(bundle_dir, ignore_errors=True)
+
+        return _cleanup
 
     for source, draft in drafts:
         try:
@@ -951,22 +960,24 @@ def cmd_extract(args: argparse.Namespace) -> int:
                     bundle_dir=bundle_dir,
                     impl_task=impl_task,
                 ),
+                _make_extract_rollback_cleanup(bundle_dir),
             )
         )
 
     if hasattr(args, "queue") and args.queue:
-        for _created_task, emit_created in created_task_summaries:
+        for _created_task, emit_created, _rollback_cleanup in created_task_summaries:
             emit_created()
         return 0
 
     prepared_tasks: list[DbTask] = []
-    for created_task, emit_created in created_task_summaries:
+    for created_task, emit_created, rollback_cleanup in created_task_summaries:
         prepared_task = _finalize_immediate_execution_task(
             args=args,
             config=config,
             task=created_task,
             rollback_on_failure=True,
             emit_created=emit_created,
+            rollback_cleanup=rollback_cleanup,
         )
         if prepared_task is None:
             return 1

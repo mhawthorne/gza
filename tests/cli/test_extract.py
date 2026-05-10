@@ -242,3 +242,78 @@ def test_extract_per_commit_background_preserves_task_id_order_but_uses_parallel
     mock_spawn_many.assert_called_once()
     worker_args = mock_spawn_many.call_args.args[0]
     assert worker_args.task_ids == ["gza-101", "gza-102"]
+
+
+def test_extract_background_creator_phase_failure_removes_bundle_and_allows_retry(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    from gza.cli.execution import cmd_extract
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    source = SourceSelection(
+        source_task_id=None,
+        source_branch="feature/source",
+        source_base_ref="main",
+    )
+    draft = _draft(source=source)
+    git = MagicMock(spec=Git)
+    git.branch_exists.return_value = False
+    fixed_slug = "20260427-target"
+    bundle_dir = tmp_path / ".gza" / "extractions" / fixed_slug
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch("gza.cli.execution.resolve_source_selection", return_value=source),
+        patch("gza.cli.execution.normalize_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", return_value=draft),
+        patch("gza.cli.execution.generate_slug", return_value=fixed_slug),
+        patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")),
+        patch(
+            "gza.cli.execution._spawn_background_worker",
+            side_effect=AssertionError("background worker should not spawn"),
+        ),
+    ):
+        rc = cmd_extract(
+            _args(
+                tmp_path,
+                branch="feature/source",
+                paths=("src/extracted.py",),
+                background=True,
+            )
+        )
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "creator boom" in captured.err
+    assert "Created extract implement task" not in captured.out
+    assert store.get_all() == []
+    assert not bundle_dir.exists()
+    logs_dir = tmp_path / ".gza" / "logs"
+    if logs_dir.exists():
+        assert list(logs_dir.iterdir()) == []
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch("gza.cli.execution.resolve_source_selection", return_value=source),
+        patch("gza.cli.execution.normalize_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", return_value=draft),
+        patch("gza.cli.execution.generate_slug", return_value=fixed_slug),
+    ):
+        retry_rc = cmd_extract(
+            _args(
+                tmp_path,
+                branch="feature/source",
+                paths=("src/extracted.py",),
+                queue=True,
+            )
+        )
+
+    retry_captured = capsys.readouterr()
+    assert retry_rc == 0
+    assert "Created extract implement task" in retry_captured.out
+    retried_task = get_latest_task(store, task_type="implement")
+    assert retried_task is not None
+    assert retried_task.slug == fixed_slug
+    assert bundle_dir.exists()
