@@ -2792,6 +2792,36 @@ class TestFailureReasonTracking:
         assert retrieved.failure_reason == "TEST_FAILURE"
         assert retrieved.completion_reason is None
 
+    def test_mark_failed_with_commits_creates_unmerged_merge_unit(self, tmp_path: Path) -> None:
+        """Failed tasks with commits should write merge-unit truth immediately."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Test task", task_type="implement")
+        store.mark_failed(
+            task,
+            log_file="logs/test.log",
+            branch="feature/test",
+            has_commits=True,
+            failure_reason="TEST_FAILURE",
+            head_sha="abc123",
+            base_sha="def456",
+        )
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.status == "failed"
+        assert retrieved.has_commits is True
+        assert retrieved.merge_status == "unmerged"
+
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.source_branch == "feature/test"
+        assert unit.target_branch == "main"
+        assert unit.state == "unmerged"
+        assert unit.head_sha == "abc123"
+        assert unit.base_sha == "def456"
+
     def test_get_resumable_failed_tasks_excludes_test_failure(self, tmp_path: Path):
         """Auto-resume query includes MAX_* failures only, not TEST_FAILURE."""
         db_path = tmp_path / "test.db"

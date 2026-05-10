@@ -1537,28 +1537,43 @@ def cmd_set_status(args: argparse.Namespace) -> int:
         return 1
 
     old_status = task.status
-    task.status = args.status
+    if args.status == "completed":
+        store.mark_completed(
+            task,
+            has_commits=bool(task.has_commits),
+            completion_reason=args.reason,
+        )
+    elif args.status == "failed":
+        mark_task_failed_from_cause(
+            task=task,
+            config=config,
+            store=store,
+            log_file=task.log_file,
+            branch=task.branch,
+            has_commits=bool(task.has_commits),
+            explicit_reason=args.reason,
+        )
+    else:
+        task.status = args.status
     if args.status == "in_progress":
         if args.execution_mode:
             task.execution_mode = args.execution_mode
         else:
             task.execution_mode = "manual"
-
-    if args.status in ("completed", "failed", "dropped"):
-        task.completed_at = datetime.now(UTC)
-    else:
         task.completed_at = None
-
-    if args.status == "failed" and args.reason:
-        task.failure_reason = args.reason
-    elif args.status != "failed":
         task.failure_reason = None
-    if args.status == "completed":
-        task.completion_reason = args.reason
-    else:
         task.completion_reason = None
-
-    store.update(task)
+        store.update(task)
+    elif args.status == "pending":
+        task.completed_at = None
+        task.failure_reason = None
+        task.completion_reason = None
+        store.update(task)
+    elif args.status == "dropped":
+        task.completed_at = datetime.now(UTC)
+        task.failure_reason = None
+        task.completion_reason = None
+        store.update(task)
     _cleanup_worker_registry(config, task_id)
 
     print(f"Task {task_id} status: {old_status} → {args.status}")

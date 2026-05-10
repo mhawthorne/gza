@@ -10430,6 +10430,38 @@ class TestSetStatusCommand:
         assert updated.failure_reason is None
         assert updated.completion_reason == "EXTRACTION_ALREADY_MERGED"
 
+    @pytest.mark.parametrize("target_status", ["completed", "failed"])
+    def test_set_status_with_commits_creates_unmerged_merge_unit(self, tmp_path: Path, target_status: str) -> None:
+        """Manual completed/failed transitions should use lifecycle write-through for merge units."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "in_progress", "task_type": "implement"},
+        ])
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        task.branch = "feature/manual-status"
+        task.has_commits = True
+        store.update(task)
+
+        args = ["set-status", str(task.id), target_status, "--project", str(tmp_path)]
+        if target_status == "completed":
+            args[3:3] = ["--reason", "EXTRACTION_ALREADY_MERGED"]
+        else:
+            args[3:3] = ["--reason", "TEST_FAILURE"]
+
+        result = run_gza(*args)
+        assert result.returncode == 0
+
+        updated = make_store(tmp_path).get(task.id)
+        assert updated is not None
+        assert updated.status == target_status
+        assert updated.has_commits is True
+        assert updated.merge_status == "unmerged"
+
+        unit = make_store(tmp_path).resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.source_branch == "feature/manual-status"
+        assert unit.state == "unmerged"
+
     def test_set_status_in_progress_defaults_execution_mode_to_manual(self, tmp_path: Path):
         """Manual in-progress transitions should stamp execution_mode=manual."""
         setup_db_with_tasks(tmp_path, [

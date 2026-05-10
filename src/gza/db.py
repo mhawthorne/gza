@@ -5389,12 +5389,16 @@ class SqliteTaskStore:
         stats: TaskStats | None = None,
         branch: str | None = None,
         failure_reason: str | None = None,
+        head_sha: str | None | object = DB_UNSET,
+        base_sha: str | None | object = DB_UNSET,
     ) -> None:
         """Mark a task as failed."""
         task.status = "failed"
         task.completed_at = datetime.now(UTC)
         task.running_pid = None
         task.has_commits = has_commits
+        if has_commits:
+            task.merge_status = "unmerged" if task_owns_merge_status(task) else None
         if log_file:
             task.log_file = log_file
         if branch:
@@ -5411,6 +5415,16 @@ class SqliteTaskStore:
         task.failure_reason = failure_reason if failure_reason is not None else "UNKNOWN"
         task.completion_reason = None
         self.update(task)
+        if has_commits and task.branch and task.id is not None and self.supports_merge_units():
+            unit = self.get_or_create_merge_unit_for_task(task)
+            if unit is not None:
+                self.attach_task_to_merge_unit(
+                    task.id,
+                    unit.id,
+                    "owner" if task.id == unit.owner_task_id else merge_unit_membership_role(task),
+                )
+                self.refresh_merge_unit_head(unit.id, head_sha, base_sha)
+                self.set_merge_unit_state(unit.id, "unmerged")
 
     def mark_unmerged(
         self,
