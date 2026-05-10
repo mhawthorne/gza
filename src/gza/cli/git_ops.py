@@ -2066,7 +2066,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             owner_rows = [
                 row
                 for row in owner_rows
-                if row.recovery_action_task is None
+                if row.lifecycle_action_task is not None or row.recovery_action_task is None
             ]
 
     if not owner_rows and not new_mode:

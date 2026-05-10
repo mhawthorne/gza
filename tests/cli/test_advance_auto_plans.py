@@ -73,6 +73,15 @@ def _create_completed_implement(store, prompt="Implement feature", based_on=None
     return task
 
 
+def _create_completed_review(store, impl, *, verdict: str = "APPROVED"):
+    review = store.add(f"Review {impl.id}", task_type="review", depends_on=impl.id, based_on=impl.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = f"**Verdict: {verdict}**"
+    store.update(review)
+    return review
+
+
 def test_advance_creates_implement_for_completed_plan(tmp_path: Path, capsys) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -196,6 +205,65 @@ def test_advance_dry_run_warns_once_when_failed_task_branch_reachability_is_unav
     assert "git branch reachability suppression is unavailable for this run" in captured.err
     assert "metadata-based same-lineage merged-task suppression may still apply" in captured.err
     assert "simulated reachability failure" in captured.err
+
+
+def test_advance_no_resume_failed_keeps_lifecycle_merge_rows_and_filters_recovery_only_rows(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = _create_completed_implement(store, "Implement mergeable owner")
+    assert impl.id is not None
+    _create_completed_review(store, impl)
+
+    failed_rebase = store.add(
+        "Failed rebase descendant",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    failed_rebase.completed_at = datetime.now(UTC)
+    failed_rebase.branch = impl.branch
+    failed_rebase.has_commits = True
+    store.update(failed_rebase)
+    store.get_or_create_merge_unit_for_task(failed_rebase)
+
+    failed_impl = store.add("Recover failed work", task_type="implement")
+    assert failed_impl.id is not None
+    failed_impl.status = "failed"
+    failed_impl.failure_reason = "MAX_TURNS"
+    failed_impl.session_id = "sess-failed"
+    failed_impl.branch = "feature/recovery-only"
+    failed_impl.completed_at = datetime.now(UTC)
+    store.update(failed_impl)
+
+    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
+        rc = cmd_advance(_advance_args(tmp_path, dry_run=True))
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "Would advance 2 task(s):" in captured.out
+    assert str(impl.id) in captured.out
+    assert "Merge" in captured.out
+    assert str(failed_impl.id) in captured.out
+    assert "Resume failed task (MAX_TURNS)" in captured.out
+
+    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
+        rc = cmd_advance(_advance_args(tmp_path, dry_run=True, no_resume_failed=True))
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "Would advance 1 task(s):" in captured.out
+    assert str(impl.id) in captured.out
+    assert "Merge" in captured.out
+    assert str(failed_impl.id) not in captured.out
+    assert "Resume failed task (MAX_TURNS)" not in captured.out
+    assert "No eligible tasks to advance" not in captured.out
 
 
 def test_advance_create_implement_respects_batch_limit(tmp_path: Path, capsys) -> None:
