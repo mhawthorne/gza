@@ -6888,6 +6888,189 @@ class TestIterateCommand:
         assert "--retry" in output
         assert "started iterate worker" not in output.lower()
 
+    @pytest.mark.parametrize(
+        ("start_flag", "resume_mode"),
+        [
+            ("--resume", True),
+            ("--retry", False),
+        ],
+    )
+    def test_failed_task_background_start_creator_phase_failure_surfaces_and_cleans_up(
+        self,
+        tmp_path: Path,
+        start_flag: str,
+        resume_mode: bool,
+    ) -> None:
+        """Background iterate must fail before detach when resume/retry startup preparation fails."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "failed"
+        impl.failure_reason = "MAX_TURNS"
+        if resume_mode:
+            impl.session_id = "resume-session-1"
+        store.update(impl)
+
+        with (
+            patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")),
+            patch(
+                "gza.cli.execution._spawn_background_iterate",
+                side_effect=AssertionError("background iterate should not spawn"),
+            ),
+        ):
+            result = run_gza(
+                "iterate",
+                str(impl.id),
+                start_flag,
+                "--background",
+                "--no-docker",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 1
+        assert "creator boom" in result.stderr
+        assert store.get_based_on_children(impl.id) == []
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert list(logs_dir.iterdir()) == []
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        ("resume_mode", "expected_prefix"),
+        [
+            (True, "Resuming failed implementation"),
+            (False, "Retrying failed implementation"),
+        ],
+    )
+    def test_background_iterate_failed_start_prepares_before_spawn_and_child_reuses_prepared_task(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        resume_mode: bool,
+        expected_prefix: str,
+    ) -> None:
+        """Background iterate should hand the detached child a single prepared recovery task."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "failed"
+        impl.failure_reason = "MAX_TURNS"
+        if resume_mode:
+            impl.session_id = "resume-session-1"
+        store.update(impl)
+
+        parent_args = argparse.Namespace(
+            project_dir=tmp_path,
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=resume_mode,
+            retry=not resume_mode,
+            auto_iterate=False,
+            background=True,
+            force=False,
+            worker_id=None,
+            prepared_task_id=None,
+            prepared_resume=False,
+            prepared_phase=None,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        captured_spawn: dict[str, object] = {}
+
+        def fake_spawn(_args, _config, spawn_impl_task, **kwargs):
+            assert spawn_impl_task.id == impl.id
+            captured_spawn.update(kwargs)
+            return 0
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task) as prepare_start,
+            patch("gza.cli.execution._spawn_background_iterate", side_effect=fake_spawn),
+        ):
+            parent_rc = cmd_iterate(parent_args)
+
+        assert parent_rc == 0
+        assert prepare_start.call_count == 1
+        prepared_task_id = captured_spawn.get("prepared_task_id")
+        assert isinstance(prepared_task_id, str)
+        assert captured_spawn == {
+            "max_iterations": 1,
+            "dry_run": False,
+            "prepared_task_id": prepared_task_id,
+            "prepared_resume": resume_mode,
+            "prepared_phase": "preloop",
+        }
+        children_after_parent = store.get_based_on_children(impl.id)
+        assert [task.id for task in children_after_parent] == [prepared_task_id]
+
+        child_args = argparse.Namespace(
+            project_dir=tmp_path,
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=resume_mode,
+            retry=not resume_mode,
+            auto_iterate=False,
+            background=False,
+            force=False,
+            worker_id=None,
+            prepared_task_id=prepared_task_id,
+            prepared_resume=resume_mode,
+            prepared_phase="preloop",
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        def fake_run_foreground(_config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task_id == prepared_task_id
+            assert resume is resume_mode
+            assert kwargs["invocation"].command == "iterate"
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+            patch("gza.cli.execution.determine_next_action", return_value={"type": "wait_review"}),
+        ):
+            child_rc = cmd_iterate(child_args)
+
+        output = capsys.readouterr().out
+
+        assert child_rc == 3
+        assert run_foreground.call_count == 1
+        assert run_foreground.call_args.kwargs["task_id"] == prepared_task_id
+        assert run_foreground.call_args.kwargs.get("resume", False) is resume_mode
+        assert expected_prefix in output
+        assert len(store.get_based_on_children(impl.id)) == 1
+
     def test_failed_task_retry_runs_then_iterates(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """gza iterate --retry on a failed task retries it then enters the loop via real engine transitions."""
         import argparse
@@ -9009,6 +9192,7 @@ class TestIterateCommand:
         with (
             patch("gza.cli.execution.Config.load", return_value=mock_config),
             patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
             patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
         ):
             result = cmd_iterate(args)
@@ -9016,7 +9200,11 @@ class TestIterateCommand:
 
         assert result == 0
         assert spawn_background.call_count == 1
-        assert store.get_based_on_children(failed_resume_descendant.id) == []
+        prepared_child_ids = [task.id for task in store.get_based_on_children(failed_resume_descendant.id)]
+        assert len(prepared_child_ids) == 1
+        assert spawn_background.call_args.kwargs["prepared_task_id"] == prepared_child_ids[0]
+        assert spawn_background.call_args.kwargs["prepared_resume"] is True
+        assert spawn_background.call_args.kwargs["prepared_phase"] == "preloop"
         assert (
             f"warning: task {failed_resume_descendant.id} has hit max auto-resume attempts; proceeding because this resume is manual"
             in captured.err
@@ -9173,6 +9361,7 @@ class TestIterateCommand:
         with (
             patch("gza.cli.execution.Config.load", return_value=mock_config),
             patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
             patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
         ):
             result = cmd_iterate(args)
@@ -9180,7 +9369,11 @@ class TestIterateCommand:
 
         assert result == 0
         assert spawn_background.call_count == 1
-        assert store.get_based_on_children(failed_resume_child.id) == []
+        prepared_child_ids = [task.id for task in store.get_based_on_children(failed_resume_child.id)]
+        assert len(prepared_child_ids) == 1
+        assert spawn_background.call_args.kwargs["prepared_task_id"] == prepared_child_ids[0]
+        assert spawn_background.call_args.kwargs["prepared_resume"] is True
+        assert spawn_background.call_args.kwargs["prepared_phase"] == "preloop"
         assert (
             f"warning: task {root.id} is blocked by newer failed recovery descendant {failed_resume_child.id}; "
             f"proceeding with manual resume from {failed_resume_child.id}"

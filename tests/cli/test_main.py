@@ -883,6 +883,7 @@ class TestWorkForceBackgroundDispatch:
                     str(tmp_path),
                 ],
             ),
+            patch("gza.cli.execution._prepare_task_for_immediate_execution", side_effect=lambda _c, prepared_task, **_k: prepared_task),
             patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
         ):
             rc = main()
@@ -987,6 +988,10 @@ class TestIterateBackgroundForceDispatch:
                     "--project",
                     str(tmp_path),
                 ],
+            ),
+            patch(
+                "gza.cli.execution._prepare_task_for_immediate_execution",
+                side_effect=lambda _c, prepared_task, **_k: prepared_task,
             ),
             patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
         ):
@@ -1130,6 +1135,7 @@ class TestIterateBackgroundForceDispatch:
         store = SqliteTaskStore(config.db_path)
         task = store.add("Failed implement for iterate restart", task_type="implement")
         task.status = "failed"
+        task.failure_reason = "MAX_TURNS"
         if restart_flag == "--resume":
             task.session_id = "resume-session"
         store.update(task)
@@ -1159,6 +1165,10 @@ class TestIterateBackgroundForceDispatch:
                     "--project",
                     str(tmp_path),
                 ],
+            ),
+            patch(
+                "gza.cli.execution._prepare_task_for_immediate_execution",
+                side_effect=lambda _c, prepared_task, **_k: prepared_task,
             ),
             patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
         ):
