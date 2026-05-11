@@ -159,3 +159,64 @@ def test_query_lineage_owner_rows_without_tag_filter_keeps_merge_unit_representa
     assert row.next_action is not None
     assert row.next_action["type"] in {"merge", "merge_with_followups"}
     assert "no branch" not in str(row.next_action.get("description", "")).lower()
+
+
+def test_query_lineage_owner_rows_hides_failed_resume_resolved_by_completed_sibling_resume(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    root = store.add("Failed plan root", task_type="plan")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "NO_ACTIVITY"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="resume")
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_resume.session_id = root.session_id
+    failed_resume.branch = root.branch
+    failed_resume.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    store.update(failed_resume)
+
+    completed_resume = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="resume")
+    assert completed_resume.id is not None
+    completed_resume.status = "completed"
+    completed_resume.session_id = root.session_id
+    completed_resume.branch = root.branch
+    completed_resume.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    store.update(completed_resume)
+
+    implement = store.add("Completed implement", task_type="implement", based_on=completed_resume.id)
+    assert implement.id is not None
+    implement.status = "completed"
+    implement.branch = "feature/impl"
+    implement.has_commits = True
+    implement.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    store.update(implement)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=MagicMock(),
+    )
+
+    assert rows
+    unresolved_ids = {task.id for row in rows for task in row.unresolved_tasks if task.id is not None}
+    failed_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert failed_resume.id not in unresolved_ids
+    assert failed_resume.id not in failed_leaf_ids

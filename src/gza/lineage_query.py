@@ -565,6 +565,7 @@ def query_lineage_owner_rows(
     from .recovery_engine import (
         decide_failed_task_recovery,
         get_completed_recovery_descendant,
+        get_completed_sibling_recovery,
         list_failed_tasks_for_recovery,
     )
     from .task_query import task_matches_tag_filters
@@ -627,6 +628,10 @@ def query_lineage_owner_rows(
                 completed_recovery = get_completed_recovery_descendant(store, task)
                 if completed_recovery is not None:
                     recovery_completed_by_failed_id[task.id] = completed_recovery
+                    continue
+                completed_sibling_recovery = get_completed_sibling_recovery(store, task)
+                if completed_sibling_recovery is not None:
+                    recovery_completed_by_failed_id[task.id] = completed_sibling_recovery
                     continue
                 if merged_owner_branch and task.task_type in {"review", "improve", "rebase"}:
                     continue

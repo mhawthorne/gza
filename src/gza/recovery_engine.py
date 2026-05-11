@@ -359,6 +359,38 @@ def get_completed_recovery_descendant(store: SqliteTaskStore, task: DbTask) -> D
     return _build_recovery_chain_snapshot(store, task).completed_terminal_descendant
 
 
+def get_completed_sibling_recovery(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+    """Return the newest completed automatic sibling recovery that resolves this failed task's parent."""
+    if (
+        task.id is None
+        or task.status != "failed"
+        or task.based_on is None
+        or task.recovery_origin not in {"resume", "retry"}
+    ):
+        return None
+
+    parent = store.get(task.based_on)
+    if parent is None or parent.id is None:
+        return None
+
+    candidates: list[DbTask] = []
+    for sibling in store.get_based_on_children_by_type(parent.id, task.task_type):
+        if sibling.id is None or sibling.id == task.id:
+            continue
+        if _classify_recovery_edge(parent, sibling) is None:
+            continue
+        if sibling.status == "completed":
+            candidates.append(sibling)
+            continue
+        completed_descendant = _build_recovery_chain_snapshot(store, sibling).completed_terminal_descendant
+        if completed_descendant is not None:
+            candidates.append(completed_descendant)
+
+    if not candidates:
+        return None
+    return max(candidates, key=_descendant_sort_key)
+
+
 def _resolve_impl_ancestor_by_based_on(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
     """Resolve the implementation ancestor by walking structured based_on edges."""
     visited: set[str] = set()

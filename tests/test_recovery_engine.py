@@ -12,6 +12,7 @@ from gza.recovery_engine import (
     _is_resolved_by_landed_lineage,
     decide_failed_task_recovery,
     get_completed_recovery_descendant,
+    get_completed_sibling_recovery,
     get_failed_recovery_needs_attention_reason,
     get_recovery_chain_root_task_id,
     get_recovery_chain_state,
@@ -604,6 +605,184 @@ def test_recovery_engine_marks_multi_step_resume_chain_as_resolved(tmp_path: Pat
     assert get_completed_recovery_descendant(store, root).id == completed_resume.id
     assert get_completed_recovery_descendant(store, failed_resume).id == completed_resume.id
     assert get_recovery_chain_root_task_id(store, completed_resume) == root.id
+
+
+def test_get_completed_sibling_recovery_returns_completed_resume_sibling(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="plan")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "NO_ACTIVITY"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="resume")
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_resume.session_id = root.session_id
+    failed_resume.branch = root.branch
+    failed_resume.completed_at = datetime.now(UTC)
+    store.update(failed_resume)
+
+    completed_resume = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="resume")
+    assert completed_resume.id is not None
+    completed_resume.status = "completed"
+    completed_resume.session_id = root.session_id
+    completed_resume.branch = root.branch
+    completed_resume.completed_at = datetime.now(UTC)
+    store.update(completed_resume)
+
+    assert get_completed_sibling_recovery(store, failed_resume).id == completed_resume.id
+
+
+def test_get_completed_sibling_recovery_returns_completed_descendant_of_failed_sibling(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="plan")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "NO_ACTIVITY"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="resume")
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_resume.session_id = root.session_id
+    failed_resume.branch = root.branch
+    failed_resume.completed_at = datetime.now(UTC)
+    store.update(failed_resume)
+
+    sibling_resume = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="resume")
+    assert sibling_resume.id is not None
+    sibling_resume.status = "failed"
+    sibling_resume.failure_reason = "INFRASTRUCTURE_ERROR"
+    sibling_resume.session_id = root.session_id
+    sibling_resume.branch = root.branch
+    sibling_resume.completed_at = datetime.now(UTC)
+    store.update(sibling_resume)
+
+    completed_grandchild = store.add(
+        sibling_resume.prompt,
+        task_type="plan",
+        based_on=sibling_resume.id,
+        recovery_origin="resume",
+    )
+    assert completed_grandchild.id is not None
+    completed_grandchild.status = "completed"
+    completed_grandchild.session_id = sibling_resume.session_id
+    completed_grandchild.branch = sibling_resume.branch
+    completed_grandchild.completed_at = datetime.now(UTC)
+    store.update(completed_grandchild)
+
+    assert get_completed_sibling_recovery(store, failed_resume).id == completed_grandchild.id
+
+
+def test_get_completed_sibling_recovery_ignores_unresolved_sibling_chain(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="plan")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "NO_ACTIVITY"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="resume")
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_resume.session_id = root.session_id
+    failed_resume.branch = root.branch
+    failed_resume.completed_at = datetime.now(UTC)
+    store.update(failed_resume)
+
+    sibling_resume = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="resume")
+    assert sibling_resume.id is not None
+    sibling_resume.status = "failed"
+    sibling_resume.failure_reason = "INFRASTRUCTURE_ERROR"
+    sibling_resume.session_id = root.session_id
+    sibling_resume.branch = root.branch
+    sibling_resume.completed_at = datetime.now(UTC)
+    store.update(sibling_resume)
+
+    assert get_completed_sibling_recovery(store, failed_resume) is None
+
+
+def test_get_completed_sibling_recovery_ignores_manual_sibling(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="plan")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "NO_ACTIVITY"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="resume")
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_resume.session_id = root.session_id
+    failed_resume.branch = root.branch
+    failed_resume.completed_at = datetime.now(UTC)
+    store.update(failed_resume)
+
+    manual_follow_up = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="manual")
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "completed"
+    manual_follow_up.session_id = "sess-manual"
+    manual_follow_up.branch = "feature/manual"
+    manual_follow_up.completed_at = datetime.now(UTC)
+    store.update(manual_follow_up)
+
+    assert get_completed_sibling_recovery(store, failed_resume) is None
+
+
+def test_get_completed_sibling_recovery_ignores_cross_type_sibling(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="plan")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "NO_ACTIVITY"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="resume")
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_resume.session_id = root.session_id
+    failed_resume.branch = root.branch
+    failed_resume.completed_at = datetime.now(UTC)
+    store.update(failed_resume)
+
+    completed_implement = store.add("Completed implement", task_type="implement", based_on=root.id)
+    assert completed_implement.id is not None
+    completed_implement.status = "completed"
+    completed_implement.completed_at = datetime.now(UTC)
+    store.update(completed_implement)
+
+    assert get_completed_sibling_recovery(store, failed_resume) is None
 
 
 def test_recovery_engine_non_recovery_based_on_descendant_does_not_resolve_parent(tmp_path: Path) -> None:
