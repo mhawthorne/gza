@@ -80,6 +80,8 @@ from ._common import (
     get_store,
     get_task_step_count,
     parse_cli_tag_filters,
+    phase1_error,
+    print_phase1_message,
     resolve_comments_improve_action,
     resolve_id,
     resolve_improve_action,
@@ -459,8 +461,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         selected_tags, any_tag = _selected_tag_filters(args)
     except ValueError as exc:
-        print(f"Error: {exc}")
-        return 1
+        return phase1_error(args, str(exc))
 
     # Handle background mode
     if args.background:
@@ -492,19 +493,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         for task_id in args.task_ids:
             task = store.get(task_id)
             if not task:
-                print(f"Error: Task {task_id} not found")
-                return 1
+                return phase1_error(args, f"Task {task_id} not found")
 
             allow_pr_retry = _allow_pr_required_retry(args, task)
             if task.status != "pending" and not allow_pr_retry:
-                print(f"Error: Task {task_id} is not pending (status: {task.status})")
-                return 1
+                return phase1_error(args, f"Task {task_id} is not pending (status: {task.status})")
 
             # Check if task is blocked by a dependency
             is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
             if is_blocked:
-                print(f"Error: Task {task_id} is blocked by task {blocking_id} ({blocking_status})")
-                return 1
+                return phase1_error(args, f"Task {task_id} is blocked by task {blocking_id} ({blocking_status})")
 
         task_id_for_registration = args.task_ids[0]
     else:
@@ -701,14 +699,11 @@ def cmd_implement(args: argparse.Namespace) -> int:
     plan_task_id = resolve_id(config, args.plan_task_id)
     plan_task = store.get(plan_task_id)
     if not plan_task:
-        print(f"Error: Task {plan_task_id} not found")
-        return 1
+        return phase1_error(args, f"Task {plan_task_id} not found")
     if plan_task.task_type != "plan":
-        print(f"Error: Task {plan_task.id} is a {plan_task.task_type} task. Expected a completed plan task.")
-        return 1
+        return phase1_error(args, f"Task {plan_task.id} is a {plan_task.task_type} task. Expected a completed plan task.")
     if plan_task.status != "completed":
-        print(f"Error: Task {plan_task.id} is {plan_task.status}. Plan task must be completed.")
-        return 1
+        return phase1_error(args, f"Task {plan_task.id} is {plan_task.status}. Plan task must be completed.")
 
     prompt = args.prompt
     if not prompt:
@@ -721,8 +716,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
     try:
         tags = _selected_tags_for_new_task(args)
     except ValueError as exc:
-        print(f"Error: {exc}")
-        return 1
+        return phase1_error(args, str(exc))
     create_review = args.review if hasattr(args, 'review') and args.review else False
     create_pr = bool(getattr(args, "create_pr", False))
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
@@ -820,14 +814,12 @@ def cmd_extract(args: argparse.Namespace) -> int:
                 files_from_path = config.project_dir / files_from_path
             selected_raw.extend(read_paths_file(files_from_path))
         except ExtractionError as exc:
-            print(f"Error: {exc}")
-            return 1
+            return phase1_error(args, str(exc))
 
     try:
         tags = _selected_tags_for_new_task(args)
     except ValueError as exc:
-        print(f"Error: {exc}")
-        return 1
+        return phase1_error(args, str(exc))
 
     git = Git(config.project_dir)
     if store is None:
@@ -839,34 +831,29 @@ def cmd_extract(args: argparse.Namespace) -> int:
             source_task_id = resolve_id(config, source_task_id_raw)
         except InvalidTaskIdError as exc:
             if source_branch or source_commits:
-                print(f"Error: {exc}")
-                return 1
+                return phase1_error(args, str(exc))
             selected_raw.insert(0, source_task_id_raw)
             source_task_id_raw = None
         else:
             if store.get(source_task_id) is None:
                 if source_branch or source_commits:
-                    print(f"Error: Task {source_task_id} not found")
-                    return 1
+                    return phase1_error(args, f"Task {source_task_id} not found")
                 selected_raw.insert(0, source_task_id_raw)
                 source_task_id = None
                 source_task_id_raw = None
 
     if getattr(args, "per_commit", False) and not source_commits:
-        print("Error: --per-commit requires one or more --commit values")
-        return 1
+        return phase1_error(args, "--per-commit requires one or more --commit values")
 
     if not source_task_id and not source_branch and not source_commits:
         try:
             source_branch = git.current_branch()
         except Exception as exc:
-            print(f"Error: failed to determine current branch for extract: {exc}")
-            return 1
+            return phase1_error(args, f"failed to determine current branch for extract: {exc}")
 
     selector_count = int(bool(source_task_id)) + int(bool(source_branch)) + int(bool(source_commits))
     if selector_count != 1:
-        print("Error: Specify exactly one source selector: SOURCE task ID, --branch, or --commit")
-        return 1
+        return phase1_error(args, "Specify exactly one source selector: SOURCE task ID, --branch, or --commit")
 
     try:
         resolved_source = resolve_source_selection(
@@ -879,8 +866,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
         )
         normalized_selected_paths = normalize_selected_paths(selected_raw) if selected_raw else None
     except ExtractionError as exc:
-        print(f"Error: {exc}")
-        return 1
+        return phase1_error(args, str(exc))
 
     per_commit = bool(getattr(args, "per_commit", False))
     if per_commit:
@@ -911,8 +897,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
             )
             drafts.append((source, draft))
     except ExtractionError as exc:
-        print(f"Error: {exc}")
-        return 1
+        return phase1_error(args, str(exc))
 
     if getattr(args, "dry_run", False):
         heading = "✓ Dry run: extraction plan preview"
@@ -977,8 +962,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
                 base_branch=base_branch,
             )
         except (ExtractionError, OSError) as exc:
-            print(f"Error: {exc}")
-            return 1
+            return phase1_error(args, str(exc))
         created_tasks.append(impl_task)
         created_task_summaries.append(
             _CreatedImmediateExecutionTask(
@@ -1214,8 +1198,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if not task:
-        print(f"Error: Task {task_id} not found")
-        return 1
+        return phase1_error(args, f"Task {task_id} not found")
 
     tag_mutation_flags: list[str] = []
     if getattr(args, "clear_tags", False):
@@ -1497,20 +1480,17 @@ def cmd_retry(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if not task:
-        print(f"Error: Task {task_id} not found")
-        return 1
+        return phase1_error(args, f"Task {task_id} not found")
 
     # Validate status
     if task.status not in ("completed", "failed"):
-        print(f"Error: Can only retry completed or failed tasks (task is {task.status})")
-        return 1
+        return phase1_error(args, f"Can only retry completed or failed tasks (task is {task.status})")
 
     # Check if task already has a successful retry
     children = store.get_based_on_children(task_id)
     successful_retry = next((c for c in children if c.status == "completed"), None)
     if successful_retry:
-        print(f"Error: Task {task_id} already has a successful retry ({successful_retry.id}).")
-        return 1
+        return phase1_error(args, f"Task {task_id} already has a successful retry ({successful_retry.id}).")
 
     new_task = _create_retry_task(store, task)
     assert new_task.id is not None
@@ -1807,8 +1787,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
 
     impl_task, err = resolve_impl_task(store, resolve_id(config, args.task_id))
     if err:
-        print(f"Error: {err}")
-        return 1
+        return phase1_error(args, err)
     assert impl_task is not None
     assert impl_task.id is not None
 
@@ -1820,37 +1799,36 @@ def cmd_improve(args: argparse.Namespace) -> int:
         resolved_review_id = resolve_id(config, review_id_override)
         review_task = store.get(resolved_review_id)
         if review_task is None:
-            print(f"Error: Review task {resolved_review_id} not found.")
-            return 1
+            return phase1_error(args, f"Review task {resolved_review_id} not found.")
         if review_task.task_type != "review":
-            print(
-                f"Error: Task {resolved_review_id} is a {review_task.task_type} task, not a review."
-            )
-            return 1
+            return phase1_error(args, f"Task {resolved_review_id} is a {review_task.task_type} task, not a review.")
         if not _review_targets_implementation(review_task, impl_task.id):
-            print(
-                f"Error: Review {resolved_review_id} reviews task "
+            return phase1_error(
+                args,
+                f"Review {resolved_review_id} reviews task "
                 f"{review_task.based_on or review_task.depends_on}, "
-                f"not implementation {impl_task.id}."
+                f"not implementation {impl_task.id}.",
             )
-            return 1
         if review_task.status in ("failed", "dropped"):
             # Terminal review statuses never produce feedback. Binding an
             # improve to one creates a permanently blocked task, so reject
             # rather than warn.
-            print(
+            print_phase1_message(
+                args,
                 f"Error: Review {review_task.id} is {review_task.status}; "
-                "terminal reviews cannot produce feedback."
+                "terminal reviews cannot produce feedback.",
             )
             if unresolved_comments:
-                print(
+                print_phase1_message(
+                    args,
                     f"Omit --review-id to run a comments-only improve from the "
-                    f"{len(unresolved_comments)} unresolved comment(s)."
+                    f"{len(unresolved_comments)} unresolved comment(s).",
                 )
             else:
-                print(
+                print_phase1_message(
+                    args,
                     "Run a new review, or add comments with "
-                    f"`gza comment {impl_task.id} <text>`."
+                    f"`gza comment {impl_task.id} <text>`.",
                 )
             return 1
         if review_task.status != "completed":
@@ -1879,19 +1857,21 @@ def cmd_improve(args: argparse.Namespace) -> int:
             statuses = ", ".join(
                 f"{r.id} ({r.status})" for r in review_tasks
             )
-            print(
+            print_phase1_message(
+                args,
                 f"Error: Task {impl_task.id} has no completed review "
-                f"(existing reviews: {statuses})."
+                f"(existing reviews: {statuses}).",
             )
-            print(
+            print_phase1_message(
+                args,
                 "Wait for a review to complete, add comments via "
                 f"`gza comment {impl_task.id} <text>`, or pass --review-id <id> "
-                "to target a specific review."
+                "to target a specific review.",
             )
             return 1
         else:
-            print(f"Error: Task {impl_task.id} has no review. Run a review first:")
-            print(f"  gza add --type review --depends-on {impl_task.id}")
+            print_phase1_message(args, f"Error: Task {impl_task.id} has no review. Run a review first:")
+            print_phase1_message(args, f"  gza add --type review --depends-on {impl_task.id}")
             return 1
 
     create_review = args.review if hasattr(args, 'review') and args.review else False
@@ -1920,31 +1900,31 @@ def cmd_improve(args: argparse.Namespace) -> int:
         )
         if comments_action == "wait_in_progress":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
-            print(
-                f"Error: Comments-only improve {existing_comments_improve.id} is already in progress. "
-                "Wait for it to finish."
+            return phase1_error(
+                args,
+                f"Comments-only improve {existing_comments_improve.id} is already in progress. "
+                "Wait for it to finish.",
             )
-            return 1
         if comments_action == "reuse_pending":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
             improve_task = _apply_comments_only_invocation_overrides(existing_comments_improve)
             action_message = f"Reusing pending improve task {improve_task.id}"
         elif comments_action == "give_up":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
-            print(
-                "Error: Comments-only improve automatic recovery is disabled "
+            return phase1_error(
+                args,
+                "Comments-only improve automatic recovery is disabled "
                 f"(max_resume_attempts={config.max_resume_attempts}); "
-                f"latest failure: {existing_comments_improve.id}"
+                f"latest failure: {existing_comments_improve.id}",
             )
-            return 1
         elif comments_action == "manual_review":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
             assert comments_decision is not None
-            print(
-                f"Error: Latest comments-only improve failure {existing_comments_improve.id} "
-                f"requires manual review ({comments_decision.reason_text})"
+            return phase1_error(
+                args,
+                f"Latest comments-only improve failure {existing_comments_improve.id} "
+                f"requires manual review ({comments_decision.reason_text})",
             )
-            return 1
         elif comments_action == "resume":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
             improve_task = _apply_comments_only_invocation_overrides(
@@ -1973,8 +1953,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
                     provider=provider,
                 )
             except ValueError as e:
-                print(f"Error: {e}")
-                return 1
+                return phase1_error(args, str(e))
     else:
         # Create improve task (using shared helper)
         try:
@@ -1988,8 +1967,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
                 provider=provider,
             )
         except ValueError as e:
-            print(f"Error: {e}")
-            return 1
+            return phase1_error(args, str(e))
 
     created_new_improve = not (review_task is None and comments_action == "reuse_pending")
     assert improve_task.id is not None
@@ -2056,17 +2034,16 @@ def cmd_fix(args: argparse.Namespace) -> int:
     store = get_store(config)
     impl_task, err = resolve_impl_task(store, resolve_id(config, args.task_id))
     if err:
-        print(f"Error: {err}")
-        return 1
+        return phase1_error(args, err)
     assert impl_task is not None
     assert impl_task.id is not None
 
     if impl_task.status in {"pending", "in_progress"}:
-        print(
-            f"Error: Task {impl_task.id} is {impl_task.status}. "
-            "Run/finish the implementation first, then run fix for stuck review/improve churn."
+        return phase1_error(
+            args,
+            f"Task {impl_task.id} is {impl_task.status}. "
+            "Run/finish the implementation first, then run fix for stuck review/improve churn.",
         )
-        return 1
 
     latest_review = _latest_completed_review_for_impl(store, impl_task.id)
     review_id = latest_review.id if latest_review is not None else None
@@ -2160,14 +2137,12 @@ def cmd_review(args: argparse.Namespace) -> int:
     # Resolve target implementation from provided task (accepts implement, improve, or review)
     impl_task, err = resolve_impl_task(store, resolve_id(config, args.task_id))
     if err:
-        print(f"Error: {err}")
-        return 1
+        return phase1_error(args, err)
     assert impl_task is not None
 
     # Check if task is completed
     if impl_task.status != "completed":
-        print(f"Error: Task {impl_task.id} is {impl_task.status}. Can only review completed tasks.")
-        return 1
+        return phase1_error(args, f"Task {impl_task.id} is {impl_task.status}. Can only review completed tasks.")
 
     # Create review task (using shared helper)
     model = args.model if hasattr(args, 'model') and args.model else None
@@ -2176,13 +2151,12 @@ def cmd_review(args: argparse.Namespace) -> int:
         review_task = _create_review_task(store, impl_task, model=model, provider=provider)
     except DuplicateReviewError as e:
         review = e.active_review
-        print(f"Warning: A review task already exists for implementation {impl_task.id}")
-        print(f"  Existing review: {review.id} (status: {review.status})")
-        print(f"  Use 'gza work' to run it, or 'gza review {impl_task.id}' after it completes.")
+        print_phase1_message(args, f"Warning: A review task already exists for implementation {impl_task.id}")
+        print_phase1_message(args, f"  Existing review: {review.id} (status: {review.status})")
+        print_phase1_message(args, f"  Use 'gza work' to run it, or 'gza review {impl_task.id}' after it completes.")
         return 1
     except ValueError as e:
-        print(f"Error: {e}")
-        return 1
+        return phase1_error(args, str(e))
     assert review_task.id is not None
 
     def _emit_review_created() -> None:
@@ -2312,8 +2286,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     max_iterations_arg = getattr(args, "max_iterations", None)
     max_iterations = max_iterations_arg if max_iterations_arg is not None else config.iterate_max_iterations
     if max_iterations <= 0:
-        print("Error: --max-iterations must be a positive integer.")
-        return 1
+        return phase1_error(args, "--max-iterations must be a positive integer.")
     dry_run: bool = getattr(args, 'dry_run', False)
     use_resume: bool = getattr(args, 'resume', False)
     use_retry: bool = getattr(args, 'retry', False)
@@ -2324,11 +2297,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     impl_task_id = resolve_id(config, args.impl_task_id)
     impl_task = store.get(impl_task_id)
     if not impl_task:
-        print(f"Error: Task {impl_task_id} not found")
-        return 1
+        return phase1_error(args, f"Task {impl_task_id} not found")
     if impl_task.task_type != "implement":
-        print(f"Error: Task {impl_task.id} is a {impl_task.task_type} task. Expected an implement task.")
-        return 1
+        return phase1_error(args, f"Task {impl_task.id} is a {impl_task.task_type} task. Expected an implement task.")
 
     requested_impl_task = impl_task
     resolved_impl_task = resolve_recovery_planning_task(store, impl_task)
@@ -2338,12 +2309,16 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
 
     allowed_statuses = {"completed", "pending", "failed"}
     if impl_task.status not in allowed_statuses:
-        print(f"Error: Task {impl_task.id} is {impl_task.status}. Can only iterate completed, pending, or failed tasks.")
-        return 1
+        return phase1_error(
+            args,
+            f"Task {impl_task.id} is {impl_task.status}. Can only iterate completed, pending, or failed tasks.",
+        )
 
     if impl_task.status == "failed" and not use_resume and not use_retry:
-        print(f"Error: Task {impl_task.id} is failed. Use --resume or --retry to specify how to restart it.")
-        return 1
+        return phase1_error(
+            args,
+            f"Task {impl_task.id} is failed. Use --resume or --retry to specify how to restart it.",
+        )
 
     if (use_resume or use_retry) and impl_task.status != "failed":
         if resolved_from_failed_ancestor and requested_impl_task.status == "failed":
@@ -2351,14 +2326,15 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             use_retry = False
         else:
             flag = "--resume" if use_resume else "--retry"
-            print(f"Error: {flag} is only valid for failed tasks (task {impl_task.id} is {impl_task.status}).")
-            return 1
+            return phase1_error(
+                args,
+                f"{flag} is only valid for failed tasks (task {impl_task.id} is {impl_task.status}).",
+            )
 
     assert impl_task.id is not None
 
     if impl_task.status == "failed" and use_resume and not impl_task.session_id:
-        print(f"Error: Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
-        return 1
+        return phase1_error(args, f"Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
 
     effective_max_resume_attempts = _int_config(
         getattr(config, "max_resume_attempts", None),
@@ -2472,9 +2448,10 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 if target_decision.reuse_existing and target_decision.recovery_task_id is not None:
                     existing_resume = store.get(target_decision.recovery_task_id)
                     if existing_resume is None:
-                        print(
+                        print_phase1_message(
+                            args,
                             f"Error: pending resume child {target_decision.recovery_task_id} "
-                            "selected by recovery policy was not found."
+                            "selected by recovery policy was not found.",
                         )
                         return None, None
                     return (existing_resume, target_decision), None
@@ -2485,9 +2462,10 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         if decision.reuse_existing and decision.recovery_task_id is not None:
             existing_resume = store.get(decision.recovery_task_id)
             if existing_resume is None:
-                print(
+                print_phase1_message(
+                    args,
                     f"Error: pending resume child {decision.recovery_task_id} "
-                    "selected by recovery policy was not found."
+                    "selected by recovery policy was not found.",
                 )
                 return None, None
             return (existing_resume, decision), None
@@ -2802,7 +2780,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                         return None, None
                     rollback_on_failure = False
                 except ValueError as exc:
-                    print(f"  Error creating review: {exc}")
+                    print_phase1_message(args, f"  Error creating review: {exc}")
                     return None, 1
                 prepared_task = _prepare_task_for_immediate_execution(
                     config,
@@ -2899,7 +2877,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     try:
                         action_task = _create_improve_task(store, iterate_task, review_task)
                     except ValueError as exc:
-                        print(f"  Error creating improve task: {exc}")
+                        print_phase1_message(args, f"  Error creating improve task: {exc}")
                         return None, 1
                     rollback_on_failure = True
                 prepared_task = _prepare_task_for_immediate_execution(
@@ -2963,9 +2941,10 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     )
                     if exit_code is not None:
                         return None, exit_code
-                    print(
+                    print_phase1_message(
+                        args,
                         f"Error: Cannot resume failed implementation {iterate_task.id}: "
-                        f"{resume_blocked_decision.reason_text}."
+                        f"{resume_blocked_decision.reason_text}.",
                     )
                 return None, 1
             run_start_task, decision = resume_start
@@ -4150,12 +4129,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)
     if not task:
-        print(f"Error: Task {task_id} not found")
-        return 1
+        return phase1_error(args, f"Task {task_id} not found")
 
     if task.status not in ("failed", "in_progress"):
-        print(f"Error: Can only resume failed or orphaned tasks (task is {task.status})")
-        return 1
+        return phase1_error(args, f"Can only resume failed or orphaned tasks (task is {task.status})")
 
     if task.status == "in_progress":
         # Allow resume only if the task is orphaned (no live worker)
@@ -4163,16 +4140,16 @@ def cmd_resume(args: argparse.Namespace) -> int:
         registry = WorkerRegistry(config.workers_path)
         running_worker = _running_worker_id_for_task(registry, task.id)
         if running_worker is not None:
-            print(f"Error: Task {task_id} is still running (worker {running_worker})")
-            print("Use 'gza cancel' to stop it first, or wait for it to finish")
+            print_phase1_message(args, f"Error: Task {task_id} is still running (worker {running_worker})")
+            print_phase1_message(args, "Use 'gza cancel' to stop it first, or wait for it to finish")
             return 1
         print(f"Note: Task {task_id} appears orphaned (in_progress but no live worker), resuming...")
     elif task.status == "failed" and task.failure_reason == "WORKER_DIED":
         print(f"Note: Task {task_id} appears orphaned (worker died), resuming...")
 
     if not task.session_id:
-        print(f"Error: Task {task_id} has no session ID (cannot resume)")
-        print("Use 'gza retry' to start fresh instead")
+        print_phase1_message(args, f"Error: Task {task_id} has no session ID (cannot resume)")
+        print_phase1_message(args, "Use 'gza retry' to start fresh instead")
         return 1
 
     # Create a new task (like retry) to track this resumed run.

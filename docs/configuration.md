@@ -942,6 +942,8 @@ gza retry <task_id> [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when starting the retry task |
 
+For immediate-start commands that hand work off to detached workers (`work`, `resume`, `retry`, `implement`, `extract`, `review`, `improve`, `fix`, `iterate`, `rebase`, and `advance --new`), any parent-side validation or startup-preparation failure is reported on the caller's stderr before the worker detaches. Success, queue, and no-op status messages remain on stdout.
+
 ### mark-completed
 
 Manually complete a task when automation failed. Defaults are task-type aware:
