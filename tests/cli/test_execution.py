@@ -46,6 +46,179 @@ def _clear_foreground_worker_env():
         yield
 
 
+def _background_work_status_error(tmp_path: Path) -> tuple[list[str], str]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Completed task")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+    return (
+        ["work", str(task.id), "--background", "--no-docker", "--project", str(tmp_path)],
+        f"Error: Task {task.id} is not pending (status: completed)",
+    )
+
+
+def _background_implement_status_error(tmp_path: Path) -> tuple[list[str], str]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    plan = store.add("Plan task", task_type="plan")
+    return (
+        ["implement", str(plan.id), "--background", "--no-docker", "--project", str(tmp_path)],
+        f"Error: Task {plan.id} is pending. Plan task must be completed.",
+    )
+
+
+def _background_extract_selector_error(tmp_path: Path) -> tuple[list[str], str]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    source = store.add("Source task", task_type="implement")
+    return (
+        ["extract", str(source.id), "--branch", "main", "--background", "--no-docker", "--project", str(tmp_path)],
+        "Error: Specify exactly one source selector: SOURCE task ID, --branch, or --commit",
+    )
+
+
+def _background_extract_per_commit_error(tmp_path: Path) -> tuple[list[str], str]:
+    setup_config(tmp_path)
+    return (
+        ["extract", "--per-commit", "--background", "--no-docker", "--project", str(tmp_path)],
+        "Error: --per-commit requires one or more --commit values",
+    )
+
+
+def _background_retry_status_error(tmp_path: Path) -> tuple[list[str], str]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Pending retry task")
+    return (
+        ["retry", str(task.id), "--background", "--no-docker", "--project", str(tmp_path)],
+        "Error: Can only retry completed or failed tasks (task is pending)",
+    )
+
+
+def _background_resume_session_error(tmp_path: Path) -> tuple[list[str], str]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Failed resume task")
+    task.status = "failed"
+    task.failure_reason = "MAX_STEPS"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+    return (
+        ["resume", str(task.id), "--background", "--no-docker", "--project", str(tmp_path)],
+        f"Error: Task {task.id} has no session ID (cannot resume)",
+    )
+
+
+def _background_improve_missing_review_error(tmp_path: Path) -> tuple[list[str], str]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl = store.add("Completed implementation", task_type="implement")
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    store.update(impl)
+    return (
+        ["improve", str(impl.id), "--background", "--no-docker", "--project", str(tmp_path)],
+        f"Error: Task {impl.id} has no review. Run a review first:",
+    )
+
+
+def _background_fix_status_error(tmp_path: Path) -> tuple[list[str], str]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl = store.add("Pending implementation", task_type="implement")
+    return (
+        ["fix", str(impl.id), "--background", "--no-docker", "--project", str(tmp_path)],
+        f"Error: Task {impl.id} is pending. Run/finish the implementation first, then run fix for stuck review/improve churn.",
+    )
+
+
+def _background_review_status_error(tmp_path: Path) -> tuple[list[str], str]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl = store.add("Pending implementation", task_type="implement")
+    return (
+        ["review", str(impl.id), "--background", "--no-docker", "--project", str(tmp_path)],
+        f"Error: Task {impl.id} is pending. Can only review completed tasks.",
+    )
+
+
+def _background_iterate_restart_error(tmp_path: Path) -> tuple[list[str], str]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl = store.add("Failed implementation", task_type="implement")
+    impl.status = "failed"
+    impl.failure_reason = "MAX_STEPS"
+    impl.completed_at = datetime.now(UTC)
+    store.update(impl)
+    return (
+        ["iterate", str(impl.id), "--background", "--no-docker", "--project", str(tmp_path)],
+        f"Error: Task {impl.id} is failed. Use --resume or --retry to specify how to restart it.",
+    )
+
+
+def _background_rebase_branch_error(tmp_path: Path) -> tuple[list[str], str]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "file.txt").write_text("initial")
+    git._run("add", "file.txt")
+    git._run("commit", "-m", "Initial commit")
+    task = store.add("Completed implementation", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+    return (
+        ["rebase", str(task.id), "--background", "--project", str(tmp_path)],
+        f"Error: Task {task.id} has no branch",
+    )
+
+
+def _advance_new_batch_error(tmp_path: Path) -> tuple[list[str], str]:
+    setup_config(tmp_path)
+    return (
+        ["advance", "--new", "--project", str(tmp_path)],
+        "Error: --new requires --batch",
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_name", "setup_case"),
+    [
+        ("work", _background_work_status_error),
+        ("implement", _background_implement_status_error),
+        ("extract", _background_extract_selector_error),
+        ("extract-per-commit", _background_extract_per_commit_error),
+        ("retry", _background_retry_status_error),
+        ("resume", _background_resume_session_error),
+        ("improve", _background_improve_missing_review_error),
+        ("fix", _background_fix_status_error),
+        ("review", _background_review_status_error),
+        ("iterate", _background_iterate_restart_error),
+        ("rebase", _background_rebase_branch_error),
+        ("advance-new", _advance_new_batch_error),
+    ],
+)
+def test_background_phase1_validation_errors_write_to_stderr_only(
+    tmp_path: Path,
+    case_name: str,
+    setup_case,
+) -> None:
+    del case_name
+    argv, expected = setup_case(tmp_path)
+
+    result = run_gza(*argv)
+
+    assert result.returncode == 1
+    assert expected in result.stderr
+    assert expected not in result.stdout
+    assert "Error:" not in result.stdout
+
+
 class TestAddCommand:
     """Tests for 'gza add' command."""
 

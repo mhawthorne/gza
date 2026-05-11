@@ -537,6 +537,27 @@ def _print_work_message(message: str, *, color: str | None = None) -> None:
     console.print(f"[{message_color}]{rich_escape(message)}[/{message_color}]")
 
 
+def _phase1_uses_stderr(args: argparse.Namespace) -> bool:
+    """Return whether this parent-side startup path should write diagnostics to stderr."""
+    return bool(getattr(args, "background", False) or getattr(args, "new", False))
+
+
+def print_phase1_message(args: argparse.Namespace, message: str) -> None:
+    """Print a Phase 1 parent-side diagnostic to the caller's shell."""
+    print(message, file=sys.stderr if _phase1_uses_stderr(args) else sys.stdout)
+
+
+def phase1_error(args: argparse.Namespace, message: str) -> int:
+    """Print a parent-side startup error on the correct stream and return failure."""
+    print_phase1_message(args, f"Error: {message}")
+    return 1
+
+
+def _print_background_phase1_error(message: str) -> None:
+    """Print detached-worker startup errors to the caller's stderr."""
+    print(f"Error: {message}", file=sys.stderr)
+
+
 def _print_background_worker_started(
     task: DbTask,
     *,
@@ -818,43 +839,39 @@ def _spawn_background_worker(
     if explicit_task_id is not None:
         task = prepared_task or store.get(explicit_task_id)
         if not task:
-            _print_work_message(f"Error: Task {explicit_task_id} not found", color=_colors.WORK_COLORS.error)
+            _print_background_phase1_error(f"Task {explicit_task_id} not found")
             return 1
 
         if resume_mode:
             if task.status not in ("pending", "failed"):
-                _print_work_message(
-                    f"Error: Task {explicit_task_id} is not resumable (status: {task.status})",
-                    color=_colors.WORK_COLORS.error,
+                _print_background_phase1_error(
+                    f"Task {explicit_task_id} is not resumable (status: {task.status})"
                 )
                 return 1
             if not task.session_id:
-                _print_work_message(
-                    f"Error: Task {explicit_task_id} has no session ID (cannot resume)",
-                    color=_colors.WORK_COLORS.error,
+                _print_background_phase1_error(
+                    f"Task {explicit_task_id} has no session ID (cannot resume)"
                 )
                 return 1
         else:
             allow_pr_retry = _allow_pr_required_retry(args, task)
             if task.status != "pending" and not allow_pr_retry:
-                _print_work_message(
-                    f"Error: Task {explicit_task_id} is not pending (status: {task.status})",
-                    color=_colors.WORK_COLORS.error,
+                _print_background_phase1_error(
+                    f"Task {explicit_task_id} is not pending (status: {task.status})"
                 )
                 return 1
 
             # Check if task is blocked
             is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
             if is_blocked:
-                _print_work_message(
-                    f"Error: Task {explicit_task_id} is blocked by task {blocking_id} ({blocking_status})",
-                    color=_colors.WORK_COLORS.error,
+                _print_background_phase1_error(
+                    f"Task {explicit_task_id} is blocked by task {blocking_id} ({blocking_status})"
                 )
                 return 1
         selected_task = task
     else:
         if resume_mode:
-            _print_work_message("Error: Cannot resume without specifying a task ID", color=_colors.WORK_COLORS.error)
+            _print_background_phase1_error("Cannot resume without specifying a task ID")
             return 1
         # Select a candidate for UX; actual claim happens in the child runner.
         selected_task = store.get_next_pending(tags=selected_tags, any_tag=any_tag)
@@ -1034,7 +1051,7 @@ def _spawn_background_worker(
             proc=proc,
             tmux_session=tmux_session,
         )
-        _print_work_message(f"Error spawning background worker: {e}", color=_colors.WORK_COLORS.error)
+        _print_background_phase1_error(f"spawning background worker: {e}")
         return 1
 
 
@@ -1215,7 +1232,7 @@ def _spawn_background_resume_worker(
     # Get the new resume task
     task = prepared_task or store.get(new_task_id)
     if not task:
-        _print_work_message(f"Error: Task {new_task_id} not found", color=_colors.WORK_COLORS.error)
+        _print_background_phase1_error(f"Task {new_task_id} not found")
         return 1
     if prepared_task is None:
         task = _prepare_task_for_immediate_execution(
@@ -1272,7 +1289,7 @@ def _spawn_background_resume_worker(
             worker_id=worker_id,
             proc=proc,
         )
-        _print_work_message(f"Error spawning background worker: {e}", color=_colors.WORK_COLORS.error)
+        _print_background_phase1_error(f"spawning background worker: {e}")
         return 1
 
 
@@ -1355,7 +1372,7 @@ def _spawn_background_iterate_worker(
             worker_id=worker_id,
             proc=proc,
         )
-        _print_work_message(f"Error spawning background iterate worker: {e}", color=_colors.WORK_COLORS.error)
+        _print_background_phase1_error(f"spawning background iterate worker: {e}")
         return 1
 
 

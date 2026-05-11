@@ -71,6 +71,7 @@ from ._common import (
     _spawn_background_worker,
     get_review_verdict,  # noqa: F401  # re-exported for test patching
     get_store,
+    phase1_error,
     resolve_id,
 )
 from .advance_engine import (
@@ -401,7 +402,13 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     return 0
 
 
-def _require_default_branch(git: Git, current_branch: str, command: str) -> bool:
+def _require_default_branch(
+    git: Git,
+    current_branch: str,
+    command: str,
+    *,
+    to_stderr: bool = False,
+) -> bool:
     """Enforce that a command is being run from the repo's default branch.
 
     Returns True if on default branch; prints an error and returns False otherwise.
@@ -410,7 +417,8 @@ def _require_default_branch(git: Git, current_branch: str, command: str) -> bool
     if current_branch != default:
         print(
             f"Error: `gza {command}` must be run from the default branch "
-            f"'{default}' (currently on '{current_branch}')."
+            f"'{default}' (currently on '{current_branch}').",
+            file=sys.stderr if to_stderr else sys.stdout,
         )
         return False
     return True
@@ -1216,7 +1224,12 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     git = Git(config.project_dir)
 
     current_branch = git.current_branch()
-    if not _require_default_branch(git, current_branch, "rebase"):
+    if not _require_default_branch(
+        git,
+        current_branch,
+        "rebase",
+        to_stderr=bool(getattr(args, "background", False)),
+    ):
         return 1
 
     # Handle background mode - create a rebase task and run through the standard runner
@@ -1224,11 +1237,9 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         store = get_store(config)
         task = store.get(task_id)
         if not task:
-            print(f"Error: Task {task_id} not found")
-            return 1
+            return phase1_error(args, f"Task {task_id} not found")
         if not task.branch:
-            print(f"Error: Task {task_id} has no branch")
-            return 1
+            return phase1_error(args, f"Task {task_id} has no branch")
         target = getattr(args, 'onto', None) or git.default_branch()
         if getattr(args, 'remote', False):
             target = f"origin/{target}"
@@ -2008,12 +2019,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
         config.merge_squash_threshold = squash_threshold_override
 
     if new_mode and batch_limit is None:
-        print("Error: --new requires --batch", file=sys.stderr)
-        return 1
+        return phase1_error(args, "--new requires --batch")
 
     if batch_limit is not None and batch_limit < 1:
-        print("Error: --batch must be a positive integer", file=sys.stderr)
-        return 1
+        return phase1_error(args, "--batch must be a positive integer")
 
     # --unimplemented mode: list completed plans/explores without implementations
     # Legacy --plans is supported as an alias scoped to plans only.
@@ -2037,16 +2046,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
     if task_id is not None:
         task = store.get(task_id)
         if not task:
-            print(f"Error: Task {task_id} not found")
-            return 1
+            return phase1_error(args, f"Task {task_id} not found")
         if task.status == 'failed':
             if no_resume_failed:
-                print(f"Error: Task {task_id} is not completed (status: {task.status})")
-                return 1
+                return phase1_error(args, f"Task {task_id} is not completed (status: {task.status})")
         else:
             if task.status != 'completed':
-                print(f"Error: Task {task_id} is not completed (status: {task.status})")
-                return 1
+                return phase1_error(args, f"Task {task_id} is not completed (status: {task.status})")
             if _task_is_already_merged(store, task):
                 print(f"Task {task_id} is already merged")
                 return 0
