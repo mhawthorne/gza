@@ -7568,6 +7568,138 @@ class TestIterateCommand:
         if workers_dir.exists():
             assert list(workers_dir.iterdir()) == []
 
+    def test_completed_task_background_git_preflight_failure_surfaces_before_detach(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Completed background iterate must fail in Phase 1 when git preflight cannot determine the target branch."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        assert impl.id is not None
+        store.set_merge_status(impl.id, "unmerged")
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.side_effect = RuntimeError("branch boom")
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution._spawn_background_iterate",
+                side_effect=AssertionError("background iterate should not spawn"),
+            ),
+        ):
+            rc = cmd_iterate(args)
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert f"Error: failed to initialize iterate background preflight for task {impl.id}: branch boom" in captured.err
+        assert "started iterate worker" not in captured.out.lower()
+        assert store.get_reviews_for_task(impl.id) == []
+        assert store.get_based_on_children(impl.id) == []
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert not any(path.is_file() for path in logs_dir.rglob("*"))
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
+
+    def test_completed_task_background_action_planning_failure_surfaces_before_detach(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Completed background iterate must fail in Phase 1 when determining the first action raises."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        assert impl.id is not None
+        store.set_merge_status(impl.id, "unmerged")
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                side_effect=RuntimeError("plan boom"),
+            ),
+            patch(
+                "gza.cli.execution._spawn_background_iterate",
+                side_effect=AssertionError("background iterate should not spawn"),
+            ),
+        ):
+            rc = cmd_iterate(args)
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert f"Error: failed to determine iterate background start for task {impl.id}: plan boom" in captured.err
+        assert "started iterate worker" not in captured.out.lower()
+        assert store.get_reviews_for_task(impl.id) == []
+        assert store.get_based_on_children(impl.id) == []
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert not any(path.is_file() for path in logs_dir.rglob("*"))
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
+
     @pytest.mark.parametrize(
         ("resume_mode", "expected_prefix"),
         [
@@ -10532,6 +10664,7 @@ class TestIterateCommand:
                 "gza.cli.execution.determine_next_action",
                 return_value={"type": "improve", "description": "Create improve task", "review_task": review},
             ),
+            patch("gza.cli.execution._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
             patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
         ):
             result = cmd_iterate(args)
@@ -10539,13 +10672,18 @@ class TestIterateCommand:
 
         assert result == 0
         assert spawn_background.call_count == 1
-        assert store.get_based_on_children(failed_resume.id) == []
+        prepared_children = store.get_based_on_children(failed_resume.id)
+        assert len(prepared_children) == 1
+        assert spawn_background.call_args.kwargs["prepared_task_id"] == prepared_children[0].id
+        assert spawn_background.call_args.kwargs["prepared_resume"] is True
+        assert spawn_background.call_args.kwargs["prepared_phase"] == "iteration"
+        assert spawn_background.call_args.kwargs["prepared_action_type"] == "improve"
         assert (
             f"warning: task {failed_resume.id} has hit max auto-resume attempts; proceeding because this resume is manual"
             in captured.err
         )
 
-    def test_background_iterate_manual_improve_override_git_preflight_failure_warns_before_spawn(
+    def test_background_iterate_manual_improve_override_git_preflight_failure_surfaces_before_spawn(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         import argparse
@@ -10603,72 +10741,24 @@ class TestIterateCommand:
             patch("gza.cli.execution.Config.load", return_value=mock_config),
             patch("gza.cli.execution.get_store", return_value=store),
             patch("gza.cli.execution.Git", return_value=mock_git),
-            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+            patch(
+                "gza.cli.execution._spawn_background_iterate",
+                side_effect=AssertionError("background iterate should not spawn"),
+            ),
         ):
             result = cmd_iterate(args)
         captured = capsys.readouterr()
 
-        assert result == 0
-        assert spawn_background.call_count == 1
-        assert (
-            f"Warning: could not evaluate iterate background preflight for task {impl.id} before handoff: branch boom"
-            in captured.err
-        )
+        assert result == 1
+        assert f"Error: failed to initialize iterate background preflight for task {impl.id}: branch boom" in captured.err
         assert store.get_based_on_children(failed_resume.id) == []
-        assert WorkerRegistry(mock_config.workers_path).list_all(include_completed=True) == []
-
-    def test_background_iterate_auto_completed_preflight_failure_warns_before_spawn(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        import argparse
-        from unittest.mock import MagicMock, patch
-
-        from gza.cli.execution import cmd_iterate
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        impl = self._make_completed_impl(store)
-
-        args = argparse.Namespace(
-            impl_task_id=impl.id,
-            max_iterations=1,
-            dry_run=False,
-            project_dir=tmp_path,
-            no_docker=True,
-            resume=False,
-            retry=False,
-            auto_iterate=True,
-            background=True,
-        )
-        mock_config = MagicMock(
-            project_dir=tmp_path,
-            use_docker=False,
-            project_prefix="testproject",
-            max_resume_attempts=1,
-            max_review_cycles=3,
-            advance_requires_review=True,
-            advance_create_reviews=True,
-            workers_path=tmp_path / ".gza" / "workers",
-        )
-        mock_git = MagicMock()
-        mock_git.current_branch.side_effect = RuntimeError("branch boom")
-
-        with (
-            patch("gza.cli.execution.Config.load", return_value=mock_config),
-            patch("gza.cli.execution.get_store", return_value=store),
-            patch("gza.cli.execution.Git", return_value=mock_git),
-            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
-        ):
-            result = cmd_iterate(args)
-        captured = capsys.readouterr()
-
-        assert result == 0
-        assert spawn_background.call_count == 1
-        assert (
-            f"Warning: could not evaluate iterate background preflight for task {impl.id} before handoff: branch boom"
-            in captured.err
-        )
-        assert WorkerRegistry(mock_config.workers_path).list_all(include_completed=True) == []
+        assert store.get_reviews_for_task(impl.id) == [review]
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert not any(path.is_file() for path in logs_dir.rglob("*"))
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
 
     def test_iterate_in_loop_manual_failure_uses_shared_attention(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

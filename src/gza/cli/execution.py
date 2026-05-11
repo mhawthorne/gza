@@ -2751,23 +2751,29 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 git_runtime: Any = Git(config.project_dir)
                 target_branch = git_runtime.current_branch()
             except Exception as exc:
-                if not manual_iterate:
-                    task_label = iterate_task.id or "<unknown>"
-                    print(
-                        "Warning: could not evaluate iterate background preflight "
-                        f"for task {task_label} before handoff: {exc}",
-                        file=sys.stderr,
-                    )
-                return None, None
+                task_label = iterate_task.id or "<unknown>"
+                print_phase1_message(
+                    args,
+                    f"Error: failed to initialize iterate background preflight for task {task_label}: {exc}",
+                )
+                return None, 1
 
-            initial_action = determine_next_action(
-                config,
-                store,
-                git_runtime,
-                iterate_task,
-                target_branch,
-                max_resume_attempts=effective_max_resume_attempts,
-            )
+            try:
+                initial_action = determine_next_action(
+                    config,
+                    store,
+                    git_runtime,
+                    iterate_task,
+                    target_branch,
+                    max_resume_attempts=effective_max_resume_attempts,
+                )
+            except Exception as exc:
+                task_label = iterate_task.id or "<unknown>"
+                print_phase1_message(
+                    args,
+                    f"Error: failed to determine iterate background start for task {task_label}: {exc}",
+                )
+                return None, 1
             action_type = initial_action["type"]
 
             if action_type == "create_review":
@@ -2854,6 +2860,19 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     review_task.id,
                     max_resume_attempts=effective_max_resume_attempts,
                 )
+                if (
+                    manual_iterate
+                    and improve_action == "manual_review"
+                    and failed_improve is not None
+                    and improve_decision is not None
+                ):
+                    manual_override = _emit_manual_resume_override_warnings(
+                        failed_improve,
+                        improve_decision,
+                    )
+                    if manual_override is not None:
+                        failed_improve, improve_decision = manual_override
+                        improve_action = "resume"
                 attention_result = build_improve_needs_attention_result(
                     store=store,
                     impl_task=iterate_task,
