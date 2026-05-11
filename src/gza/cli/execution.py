@@ -276,6 +276,57 @@ def _extract_run_args(args: argparse.Namespace, task_ids: list[str]) -> argparse
     return worker_args
 
 
+@dataclass
+class _CreatedImmediateExecutionTask:
+    """Task plus rollback hooks for delayed immediate execution."""
+
+    task: DbTask
+    emit_created: Callable[[], None]
+    rollback_cleanup: Callable[[], None]
+
+
+def _rollback_created_immediate_execution_tasks(
+    *,
+    config: Config,
+    created_tasks: list[_CreatedImmediateExecutionTask],
+) -> None:
+    """Best-effort rollback for a command-scoped immediate-execution batch."""
+    store = get_store(config)
+    for created in created_tasks:
+        if created.task.id is not None:
+            remove_task_startup_artifacts(config, created.task)
+        created.rollback_cleanup()
+        if created.task.id is not None:
+            store.delete(created.task.id)
+
+
+def _rollback_created_extract_task(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    task: DbTask,
+    bundle_dir: Path | None,
+    failure_reason: str,
+) -> None:
+    """Best-effort rollback for extract creator-phase failures before worker handoff."""
+    if task.id is None:
+        return
+    remove_task_startup_artifacts(config, task)
+    if bundle_dir is not None:
+        shutil.rmtree(bundle_dir, ignore_errors=True)
+    if store.delete(task.id):
+        return
+    created_task = store.get(task.id)
+    if created_task is not None:
+        mark_task_failed_from_cause(
+            task=created_task,
+            config=config,
+            store=store,
+            log_file=None,
+            explicit_reason=failure_reason,
+        )
+
+
 def _maybe_reinterpret_extract_source_as_path(
     config: Config,
     source_task_id_raw: str | None,
@@ -383,42 +434,46 @@ def _create_extract_task(
         skip_learnings=skip_learnings,
     )
 
-    if impl_task.slug is None:
-        slug_prompt = next(
-            (line.strip() for line in draft.prompt.splitlines() if line.strip()),
-            draft.prompt,
-        )
-        impl_task.slug = generate_slug(
-            slug_prompt,
-            existing_id=None,
-            log_path=config.log_path,
-            git=git,
-            store=store,
-            exclude_task_id=impl_task.id,
-            project_name=config.project_name,
-            project_prefix=config.project_prefix,
-            branch_strategy=config.branch_strategy,
-            explicit_type=impl_task.task_type_hint,
-        )
-        store.update(impl_task)
-
+    bundle_dir: Path | None = None
+    bundle_write_started = False
     try:
+        if impl_task.slug is None:
+            slug_prompt = next(
+                (line.strip() for line in draft.prompt.splitlines() if line.strip()),
+                draft.prompt,
+            )
+            impl_task.slug = generate_slug(
+                slug_prompt,
+                existing_id=None,
+                log_path=config.log_path,
+                git=git,
+                store=store,
+                exclude_task_id=impl_task.id,
+                project_name=config.project_name,
+                project_prefix=config.project_prefix,
+                branch_strategy=config.branch_strategy,
+                explicit_type=impl_task.task_type_hint,
+            )
+            store.update(impl_task)
+
+        bundle_write_started = True
         bundle_dir = write_extraction_bundle(
             project_dir=config.project_dir,
             task=impl_task,
             draft=draft,
         )
-    except (ExtractionError, OSError):
-        if impl_task.id and not store.delete(impl_task.id):
-            created_task = store.get(impl_task.id)
-            if created_task is not None:
-                mark_task_failed_from_cause(
-                    task=created_task,
-                    config=config,
-                    store=store,
-                    log_file=None,
-                    explicit_reason="EXTRACTION_BUNDLE_WRITE_FAILED",
-                )
+    except Exception:
+        _rollback_created_extract_task(
+            config=config,
+            store=store,
+            task=impl_task,
+            bundle_dir=bundle_dir,
+            failure_reason=(
+                "EXTRACTION_BUNDLE_WRITE_FAILED"
+                if bundle_write_started
+                else "EXTRACTION_TASK_CREATE_FAILED"
+            ),
+        )
         raise
 
     return impl_task, bundle_dir
@@ -937,7 +992,11 @@ def cmd_extract(args: argparse.Namespace) -> int:
                 skip_learnings=skip_learnings,
                 base_branch=base_branch,
             )
-        except (ExtractionError, OSError) as exc:
+        except Exception as exc:
+            _rollback_created_immediate_execution_tasks(
+                config=config,
+                created_tasks=created_task_summaries,
+            )
             return phase1_error(args, str(exc))
         created_tasks.append(impl_task)
         created_task_summaries.append(

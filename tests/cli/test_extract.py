@@ -323,6 +323,59 @@ def test_extract_background_creator_phase_failure_removes_bundle_and_allows_retr
     assert bundle_dir.exists()
 
 
+def test_extract_background_slug_generation_failure_rolls_back_task_and_bundle(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    from gza.cli.execution import cmd_extract
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    source = SourceSelection(
+        source_task_id=None,
+        source_branch="feature/source",
+        source_base_ref="main",
+    )
+    draft = _draft(source=source)
+    git = MagicMock(spec=Git)
+    git.branch_exists.return_value = False
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch("gza.cli.execution.resolve_source_selection", return_value=source),
+        patch("gza.cli.execution.normalize_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", return_value=draft),
+        patch("gza.cli.execution.generate_slug", side_effect=RuntimeError("slug boom")),
+        patch(
+            "gza.cli.execution._spawn_background_worker",
+            side_effect=AssertionError("background worker should not spawn"),
+        ),
+    ):
+        rc = cmd_extract(
+            _args(
+                tmp_path,
+                branch="feature/source",
+                paths=("src/extracted.py",),
+                background=True,
+            )
+        )
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "slug boom" in captured.err
+    assert "Created extract implement task" not in captured.out
+    assert store.get_all() == []
+    extraction_root = tmp_path / ".gza" / "extractions"
+    if extraction_root.exists():
+        assert list(extraction_root.iterdir()) == []
+    logs_dir = tmp_path / ".gza" / "logs"
+    if logs_dir.exists():
+        assert list(logs_dir.iterdir()) == []
+    workers_dir = tmp_path / ".gza" / "workers"
+    if workers_dir.exists():
+        assert list(workers_dir.iterdir()) == []
+
+
 def test_extract_per_commit_background_creator_phase_failure_rolls_back_entire_batch(
     tmp_path: Path,
     capsys,
@@ -426,6 +479,74 @@ def test_extract_per_commit_background_creator_phase_failure_rolls_back_entire_b
     assert len(retried_tasks) == 3
     assert sorted(task.slug for task in retried_tasks) == sorted(fixed_slugs)
     assert all(bundle_dir.exists() for bundle_dir in bundle_dirs)
+
+
+def test_extract_per_commit_background_slug_generation_failure_rolls_back_prior_tasks(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    from gza.cli.execution import cmd_extract
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    source = SourceSelection(
+        source_task_id=None,
+        source_commits=("aaa111", "bbb222"),
+        source_commit_subjects=("First commit", "Second commit"),
+    )
+    drafts = [
+        _draft(
+            source=SourceSelection(
+                source_task_id=None,
+                source_commits=(commit,),
+                source_commit_subjects=(subject,),
+            )
+        )
+        for commit, subject in (
+            ("aaa111", "First commit"),
+            ("bbb222", "Second commit"),
+        )
+    ]
+    git = MagicMock(spec=Git)
+    first_slug = "20260511-extract-first"
+    first_bundle_dir = tmp_path / ".gza" / "extractions" / first_slug
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch("gza.cli.execution.resolve_source_selection", return_value=source),
+        patch("gza.cli.execution.normalize_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", side_effect=drafts),
+        patch("gza.cli.execution.generate_slug", side_effect=[first_slug, RuntimeError("slug boom")]),
+        patch(
+            "gza.cli.execution._spawn_background_workers",
+            side_effect=AssertionError("background workers should not spawn"),
+        ),
+    ):
+        rc = cmd_extract(
+            _args(
+                tmp_path,
+                commits=["aaa111", "bbb222"],
+                per_commit=True,
+                paths=("src/extracted.py",),
+                background=True,
+            )
+        )
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "slug boom" in captured.err
+    assert "Created extract implement task" not in captured.out
+    assert store.get_all() == []
+    assert not first_bundle_dir.exists()
+    extraction_root = tmp_path / ".gza" / "extractions"
+    if extraction_root.exists():
+        assert list(extraction_root.iterdir()) == []
+    logs_dir = tmp_path / ".gza" / "logs"
+    if logs_dir.exists():
+        assert list(logs_dir.iterdir()) == []
+    workers_dir = tmp_path / ".gza" / "workers"
+    if workers_dir.exists():
+        assert list(workers_dir.iterdir()) == []
 
 
 def test_extract_per_commit_background_reuses_prepared_tasks_without_second_prepare(
