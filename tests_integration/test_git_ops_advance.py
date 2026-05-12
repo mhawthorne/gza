@@ -3,6 +3,7 @@
 
 import argparse
 import io
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -88,6 +89,135 @@ class TestAdvanceCommand:
         assert result.returncode == 0
         assert "Would advance" in result.stdout
         assert str(task.id) in result.stdout
+
+    def test_advance_explicit_impl_ignores_divergent_orphan_branch_across_worktrees(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Explicit impl dry-run should keep proposing the canonical impl across real divergent worktrees."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+
+        agent_branch = "agent/session"
+        impl_branch = "feature/canonical"
+        orphan_branch = "feature/orphan"
+
+        git._run("checkout", "-b", agent_branch)
+        (tmp_path / "shared.txt").write_text("agent session branch\n")
+        git._run("add", "shared.txt")
+        git._run("commit", "-m", "Add agent session change")
+        git._run("checkout", "main")
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        git._run("checkout", "-b", impl_branch)
+        (tmp_path / "shared.txt").write_text("canonical implementation branch\n")
+        (tmp_path / "canonical.txt").write_text("canonical implementation\n")
+        git._run("add", "shared.txt", "canonical.txt")
+        git._run("commit", "-m", "Add canonical implementation")
+        impl_head_sha = git._run("rev-parse", impl_branch).stdout.strip()
+        main_sha = git._run("rev-parse", "main").stdout.strip()
+        git._run("checkout", "main")
+
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        impl.branch = impl_branch
+        impl.has_commits = True
+        store.update(impl)
+
+        impl_unit = store.create_merge_unit(
+            source_branch=impl_branch,
+            target_branch="main",
+            owner_task_id=impl.id,
+            state="unmerged",
+            head_sha=impl_head_sha,
+            base_sha=main_sha,
+        )
+        store.attach_task_to_merge_unit(impl.id, impl_unit.id, "owner")
+        store.dual_write_legacy_merge_status(impl_unit.id)
+
+        review = store.add(
+            f"Review {impl.id}",
+            task_type="review",
+            depends_on=impl.id,
+            based_on=impl.id,
+        )
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "**Verdict: APPROVED**"
+        store.update(review)
+
+        orphan = store.add(
+            "Completed orphan rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert orphan.id is not None
+        git._run("checkout", "-b", orphan_branch)
+        (tmp_path / "orphan.txt").write_text("orphan rebase branch\n")
+        git._run("add", "orphan.txt")
+        git._run("commit", "-m", "Add orphan rebase change")
+        orphan_head_sha = git._run("rev-parse", orphan_branch).stdout.strip()
+        git._run("checkout", "main")
+
+        assert (
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", orphan_branch, impl_branch],
+                cwd=tmp_path,
+                check=False,
+            ).returncode
+            == 1
+        )
+        assert (
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", impl_branch, orphan_branch],
+                cwd=tmp_path,
+                check=False,
+            ).returncode
+            == 1
+        )
+
+        orphan.status = "completed"
+        orphan.completed_at = datetime.now(UTC)
+        orphan.branch = orphan_branch
+        orphan.has_commits = True
+        store.update(orphan)
+
+        orphan_unit = store.create_merge_unit(
+            source_branch=orphan_branch,
+            target_branch="main",
+            owner_task_id=orphan.id,
+            state="unmerged",
+            head_sha=orphan_head_sha,
+            base_sha=main_sha,
+        )
+        store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
+        store.dual_write_legacy_merge_status(orphan_unit.id)
+
+        agent_worktree = tmp_path / ".gza-test-worktrees" / "agent-session"
+        impl_worktree = tmp_path / ".gza-test-worktrees" / "feature-canonical"
+        git._run("worktree", "add", str(agent_worktree), agent_branch)
+        git._run("worktree", "add", str(impl_worktree), impl_branch)
+
+        outputs = {
+            "main": run_gza("advance", str(impl.id), "--dry-run", cwd=tmp_path),
+            "agent_worktree": run_gza("advance", str(impl.id), "--dry-run", cwd=agent_worktree),
+            "impl_worktree": run_gza("advance", str(impl.id), "--dry-run", cwd=impl_worktree),
+        }
+
+        for result in outputs.values():
+            assert result.returncode == 0
+            assert "Would advance 1 task(s):" in result.stdout
+            assert str(impl.id) in result.stdout
+            assert "Merge (review APPROVED)" in result.stdout
+            assert str(orphan.id) not in result.stdout
+            assert "Needs attention" not in result.stdout
+
+        assert outputs["main"].stdout == outputs["agent_worktree"].stdout
+        assert outputs["main"].stdout == outputs["impl_worktree"].stdout
 
     def test_advance_dry_run_excludes_same_branch_fix_child_from_roots(self, tmp_path: Path):
         """advance plans only the implementation root when a completed fix child exists on same branch."""
