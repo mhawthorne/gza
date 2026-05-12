@@ -2599,10 +2599,18 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         iterate_task: DbTask,
         preflight_context: _IterateBackgroundPreflightContext | None,
     ) -> int | None:
-        initial_action = _warn_manual_background_iterate_override_if_needed(
-            iterate_task,
-            preflight_context,
-        )
+        try:
+            initial_action = _warn_manual_background_iterate_override_if_needed(
+                iterate_task,
+                preflight_context,
+            )
+        except Exception as exc:
+            task_label = iterate_task.id or "<unknown>"
+            print_phase1_message(
+                args,
+                f"Error: failed to determine iterate background start for task {task_label}: {exc}",
+            )
+            return 1
         if iterate_task.status != "completed":
             return None
         if preflight_context is None:
@@ -2624,14 +2632,22 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             print(f"No remaining iterate action: implementation {iterate_task.id} is already merged.")
             return 0
         if initial_action is None:
-            initial_action = determine_next_action(
-                engine_config,
-                store,
-                preflight_context.git_runtime,
-                iterate_task,
-                preflight_context.target_branch,
-                max_resume_attempts=effective_max_resume_attempts,
-            )
+            try:
+                initial_action = determine_next_action(
+                    engine_config,
+                    store,
+                    preflight_context.git_runtime,
+                    iterate_task,
+                    preflight_context.target_branch,
+                    max_resume_attempts=effective_max_resume_attempts,
+                )
+            except Exception as exc:
+                task_label = iterate_task.id or "<unknown>"
+                print_phase1_message(
+                    args,
+                    f"Error: failed to determine iterate background start for task {task_label}: {exc}",
+                )
+                return 1
 
         action_type = initial_action["type"]
         if action_type == "improve":

@@ -9483,6 +9483,11 @@ class TestIterateCommand:
             impl,
             max_iterations=1,
             dry_run=False,
+            prepared_task_id=None,
+            prepared_resume=False,
+            prepared_phase=None,
+            prepared_action_type=None,
+            prepared_review_task_id=None,
         )
         assert "No remaining iterate action: implementation" not in output
         assert "ready to merge" not in output
@@ -9556,6 +9561,11 @@ class TestIterateCommand:
             impl,
             max_iterations=1,
             dry_run=False,
+            prepared_task_id=pending_improve.id,
+            prepared_resume=False,
+            prepared_phase="iteration",
+            prepared_action_type="run_improve",
+            prepared_review_task_id=review.id,
         )
         assert "Next action: run_improve" not in output
         assert "Iterate blocked:" not in output
