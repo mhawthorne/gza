@@ -647,7 +647,7 @@ def test_completed_orphan_rebase_does_not_invalidate_review_on_impl_branch(tmp_p
     assert action["description"] == "Merge (review APPROVED)"
 
 
-def test_failed_rebase_is_ignored_when_origin_tip_is_already_mergeable(
+def test_failed_rebase_is_ignored_after_later_approved_review(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -667,7 +667,7 @@ def test_failed_rebase_is_ignored_when_origin_tip_is_already_mergeable(
 
     review = store.add("Review", task_type="review", depends_on=impl.id)
     review.status = "completed"
-    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
     review.report_file = "reviews/fake.md"
     store.update(review)
 
@@ -764,8 +764,8 @@ def test_failed_rebase_without_review_still_requires_manual_resolution(tmp_path:
         config,
         store,
         _FakeGit(
-            can_merge=False,
-            can_merge_by_ref={("origin/feat/no-review-failed-rebase", "main"): False},
+            can_merge=True,
+            can_merge_by_ref={("origin/feat/no-review-failed-rebase", "main"): True},
             existing_refs={"origin/feat/no-review-failed-rebase"},
         ),
         impl,
@@ -774,6 +774,7 @@ def test_failed_rebase_without_review_still_requires_manual_resolution(tmp_path:
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+    assert "failed, needs manual resolution" in action["description"]
 
 
 def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: Path) -> None:
@@ -823,7 +824,9 @@ def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: 
     assert ctx_with_stale_local_branch.can_merge is True
 
 
-def test_real_git_remote_tracking_ref_unblocks_failed_rebase_merge(tmp_path: Path, monkeypatch) -> None:
+def test_real_git_remote_tracking_ref_unblocks_failed_rebase_after_later_approved_review(
+    tmp_path: Path, monkeypatch
+) -> None:
     from gza import advance_engine as advance_engine_module
 
     store = _make_store(tmp_path)
@@ -842,7 +845,7 @@ def test_real_git_remote_tracking_ref_unblocks_failed_rebase_merge(tmp_path: Pat
 
     review = store.add("Review", task_type="review", depends_on=impl.id)
     review.status = "completed"
-    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
     review.report_file = "reviews/fake.md"
     store.update(review)
 

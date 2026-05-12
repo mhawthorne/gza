@@ -90,24 +90,24 @@ def _add_mergeable_impl_with_failed_rebase(store, branch: str):
     task = store.add("Implement feature", task_type="implement")
     assert task.id is not None
     task.status = "completed"
-    task.completed_at = datetime.now(UTC)
+    task.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
     task.branch = branch
     task.merge_status = "unmerged"
     task.has_commits = True
     store.update(task)
 
-    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
-    review.status = "completed"
-    review.completed_at = datetime.now(UTC)
-    review.report_file = "reviews/fake.md"
-    store.update(review)
-
     failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=task.id, same_branch=True)
     failed_rebase.status = "failed"
-    failed_rebase.completed_at = datetime.now(UTC)
+    failed_rebase.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
     failed_rebase.branch = branch
     failed_rebase.failure_reason = "MERGE_CONFLICT"
     store.update(failed_rebase)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
     return task
 
 

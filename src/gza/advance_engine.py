@@ -338,6 +338,32 @@ def _task_event_time(task: DbTask) -> datetime:
     return _normalize_time(task.completed_at or task.created_at)
 
 
+def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
+    """Return True when a failed rebase remains the latest unresolved lineage state.
+
+    A clean current branch tip is not enough to clear failed rebase residue. We only
+    treat the lineage as having moved past that failure once a later successful review
+    outcome exists on the same implementation lineage.
+    """
+    failed_rebase = ctx.rebase_failed
+    if failed_rebase is None:
+        return False
+
+    latest_review = ctx.latest_completed_review
+    if latest_review is None:
+        return True
+
+    failed_rebase_time = _task_event_time(failed_rebase)
+    latest_review_time = _task_event_time(latest_review)
+    if latest_review_time < failed_rebase_time:
+        return True
+
+    if ctx.review_cleared:
+        return False
+
+    return ctx.review_verdict not in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
+
+
 def _latest_unresolved_comment_time(store: SqliteTaskStore, task_id: str) -> datetime | None:
     unresolved_comments = store.get_comments(task_id, unresolved_only=True)
     if not unresolved_comments:
@@ -647,7 +673,8 @@ def resolve_advance_context(
         if child.task_type == "rebase" and (task.branch is None or child.branch is None or child.branch == task.branch)
     ]
     rebase_pending_or_running = next((c for c in rebase_children if c.status in {"pending", "in_progress"}), None)
-    rebase_failed = next((c for c in rebase_children if c.status == "failed"), None)
+    failed_rebases = [c for c in rebase_children if c.status == "failed"]
+    rebase_failed = max(failed_rebases, key=_task_event_time) if failed_rebases else None
 
     latest_completed_rebase: DbTask | None = None
     completed_rebases = [
@@ -798,7 +825,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="conflict_rebase_failed",
-        matches=lambda ctx: not ctx.can_merge and ctx.rebase_failed is not None,
+        matches=lambda ctx: not ctx.can_merge and _failed_rebase_still_blocks_advance(ctx),
         action=lambda ctx: with_needs_attention(
             {
                 "type": "needs_discussion",
@@ -834,6 +861,17 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="post_rebase_create_review",
         matches=lambda ctx: ctx.rebase_invalidates_review,
         action=lambda ctx: {"type": "create_review", "description": _rebase_create_review_description(ctx.review_invalidated_by_rebase)},
+    ),
+    AdvanceRule(
+        name="failed_rebase_without_successful_review",
+        matches=lambda ctx: _failed_rebase_still_blocks_advance(ctx),
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
+            },
+            reason="rebase-failed-needs-manual-resolution",
+        ),
     ),
     AdvanceRule(
         name="closing_review_invariant",

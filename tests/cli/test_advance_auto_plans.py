@@ -278,9 +278,9 @@ def test_advance_no_resume_failed_keeps_lifecycle_merge_rows_and_filters_recover
     captured = capsys.readouterr()
 
     assert rc == 0
-    assert "Would advance 2 task(s):" in captured.out
+    assert "Would advance 1 task(s):" in captured.out
     assert str(impl.id) in captured.out
-    assert "Merge" in captured.out
+    assert "reason=rebase-failed-needs-manual-resolution" in captured.out
     assert str(failed_impl.id) in captured.out
     assert "Resume failed task (MAX_TURNS)" in captured.out
 
@@ -289,9 +289,9 @@ def test_advance_no_resume_failed_keeps_lifecycle_merge_rows_and_filters_recover
     captured = capsys.readouterr()
 
     assert rc == 0
-    assert "Would advance 1 task(s):" in captured.out
+    assert "Would advance 1 task(s):" not in captured.out
     assert str(impl.id) in captured.out
-    assert "Merge" in captured.out
+    assert "reason=rebase-failed-needs-manual-resolution" in captured.out
     assert str(failed_impl.id) not in captured.out
     assert "Resume failed task (MAX_TURNS)" not in captured.out
     assert "No eligible tasks to advance" not in captured.out

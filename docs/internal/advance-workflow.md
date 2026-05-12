@@ -89,6 +89,8 @@ Conflict detection uses the same target-branch resolution as task collection:
 | Branch cannot merge into the resolved target branch AND rebase child is `failed` | `needs_discussion` — manual intervention required |
 | Branch cannot merge into the resolved target branch AND no active rebase child | `needs_rebase` — create rebase task |
 
+A failed rebase is not cleared just because the latest implementation tip becomes mergeable again. If an implementation lineage still has no later approved or cleared review after that failed rebase, advance continues to surface `rebase-failed-needs-manual-resolution` instead of creating a first review from the now-clean tip.
+
 ### 5. Post-rebase review invalidation
 
 | Condition | Action |
