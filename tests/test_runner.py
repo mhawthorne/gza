@@ -9065,6 +9065,88 @@ class TestExtractedRunInnerHelpers:
         assert refreshed is not None
         assert refreshed.status == "completed"
 
+    def test_rebase_task_fails_when_provider_leaves_rebase_in_progress(self, tmp_path: Path, capsys) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "provider: codex\n"
+            "model: gpt-5\n"
+            "project_name: runner-rebase-progress\n"
+            "use_docker: false\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        parent.branch = "feat/parent"
+        store.update(parent)
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        assert task.id is not None
+        task.slug = "20260512-runner-rebase-in-progress"
+        store.update(task)
+
+        worktree_path = config.worktree_path / task.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.check_credentials.return_value = True
+        mock_provider.verify_credentials.return_value = True
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=2.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.worktree_list.return_value = []
+
+        mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.status_porcelain.return_value = set()
+        mock_worktree_git.has_changes.return_value = False
+        mock_worktree_git.rev_parse.return_value = "same-head"
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner.capture_rebase_validation_baseline", return_value=("same-head", set())),
+            patch("gza.runner.is_rebase_in_progress", return_value=True),
+            patch("gza.runner.validate_rebase_resolution_output", side_effect=AssertionError("should fail before validation")),
+            patch("gza.runner._complete_code_task", side_effect=AssertionError("should fail before completion")),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = run(config, task_id=task.id)
+
+        assert rc == 0
+        mock_worktree_git.push_force_with_lease.assert_not_called()
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "REBASE_VALIDATION_FAILED"
+
+        surfaced = capsys.readouterr()
+        assert "Rebase still in progress after provider success." in surfaced.err
+
+        assert refreshed.log_file is not None
+        log_file = config.project_dir / refreshed.log_file
+        log_text = ops_log_path_for(log_file).read_text()
+        assert "Rebase still in progress after provider success." in log_text
+        assert '"failure_reason": "REBASE_VALIDATION_FAILED"' in log_text
+
     def test_complete_code_task_uses_summary_for_commit_subject(self, tmp_path: Path):
         """Commit subject should come from worktree summary when present."""
         db_path = tmp_path / "test.db"
