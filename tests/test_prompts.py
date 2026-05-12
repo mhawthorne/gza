@@ -142,9 +142,20 @@ class TestPromptBuilderBuild:
         result = PromptBuilder().build(task, config, store, summary_path=summary_path)
 
         assert str(summary_path) in result
-        assert "Your job is to address all **Blockers** only." in result
+        assert (
+            "Treat review **Must-Fix** items as **Blockers** for this pass, and address every such item when a review section is present."
+            in result
+        )
+        assert "Your job is to address all **Blockers** only." not in result
         assert "The review item you addressed" in result
-        assert "If a Blocker item no longer applies" in result
+        assert (
+            "If a Blocker (review Must-Fix item) or comment no longer applies"
+            in result
+        )
+        assert (
+            "If a Must-Fix/Blocker item no longer applies because the code already satisfies it"
+            not in result
+        )
         assert "Treat a cited path or line range as an instance of a class of issue" in result
         assert '"Extra scope" means unrelated changes, not other instances of the same blocker class.' in result
 

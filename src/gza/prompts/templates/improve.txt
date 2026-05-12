@@ -6,8 +6,7 @@ This is an improve task. Your feedback context can come from two sources:
 One or both of these sections may appear above. If a review is present, it will be under a `## Review feedback to address:` heading. If comments are present, they will be under a `## Comments:` heading. Treat whichever sections are present as the authoritative feedback for this pass. If no review section is present, comments alone are sufficient to drive this improve — you are not required to fabricate Must-Fix structure when the feedback source is comments only.
 
 Your job is to address every blocking feedback item presented:
-Your job is to address all **Blockers** only.
-- Address all **Must-Fix**/**Blocker** items from the review, when a review section is present.
+- Treat review **Must-Fix** items as **Blockers** for this pass, and address every such item when a review section is present.
 - Address every unresolved entry in the Comments section, when it is present.
 - Treat review **Suggestions**/**Follow-Ups** as optional follow-up work unless the task prompt or review explicitly says they are required in this pass.
 
@@ -25,8 +24,7 @@ Before finishing, verify that every blocking item has an explicit closure condit
 - The targeted test you added or updated
 - Any docs/help/operator-facing text you updated, if applicable
 
-If a Blocker item no longer applies because the code already satisfies it or the review was stale, say that explicitly and cite the current code/tests that prove it instead of making unnecessary changes.
-If a Must-Fix/Blocker item no longer applies because the code already satisfies it or the review was stale, say that explicitly and cite the current code/tests that prove it instead of making unnecessary changes. Apply the same rule to comments.
+If a Blocker (review Must-Fix item) or comment no longer applies because the code already satisfies it or the feedback was stale, say that explicitly and cite the current code/tests that prove it instead of making unnecessary changes.
 
 Do not leave blocking feedback items partially addressed. The goal is to resolve all gating feedback in a single pass without creating extra scope.
 Treat a cited path or line range as an instance of a class of issue, not the full scope of the fix. If a blocker calls out one path for a broader issue, audit every analogous path for the same problem and fix them in this pass. When multiple sites share the same fix shape, prefer a centralized helper or shared code path over per-call-site patches. "Extra scope" means unrelated changes, not other instances of the same blocker class.
