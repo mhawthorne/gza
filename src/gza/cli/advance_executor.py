@@ -39,7 +39,12 @@ class AdvanceActionExecutionContext:
     create_implement_task: Callable[[DbTask], DbTask]
     spawn_worker: Callable[[DbTask, str], int]
     spawn_resume_worker: Callable[[DbTask, str], int]
-    spawn_iterate_worker: Callable[[DbTask, str], int]
+    # Signature: (task, kind, *, prepared_task=None, prepared_phase=None,
+    # prepared_action_type=None) -> int. Callers that route through iterate without
+    # a parent-prepared child (e.g. _maybe_route_action_through_iterate,
+    # create_implement) omit the kwargs; the needs_rebase iterate path passes
+    # prepared_task=<rebase child> so worker metadata points at the prepared row.
+    spawn_iterate_worker: Callable[..., int]
     prefer_iterate_for_action: Callable[
         [DbTask, dict[str, Any]],
         DbTask | AdvanceActionExecutionResult | None,
@@ -783,27 +788,40 @@ def execute_advance_action(
                 work_done=True,
             )
 
-        if context.use_iterate_for_needs_rebase:
-            rc = context.spawn_iterate_worker(task, "rebase")
-            return _spawn_result(
-                action_type=action_type,
-                rc=rc,
-                handled_task_id=task.id,
-                worker_label="iterate",
-                created_task=task,
-            )
-
         rebase_task = context.create_rebase_task(task)
-        assert rebase_task.id is not None
-        rc = context.spawn_worker(rebase_task.id, "rebase")
+        prepared_rebase_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=rebase_task,
+            worker_label="rebase",
+            rollback_on_failure=True,
+        )
+        if prepared_rebase_task is None:
+            assert prepare_error is not None
+            return prepare_error
+
+        assert prepared_rebase_task.id is not None
+        if context.use_iterate_for_needs_rebase:
+            rc = context.spawn_iterate_worker(
+                task,
+                "rebase",
+                prepared_task=prepared_rebase_task,
+                prepared_phase="iteration",
+                prepared_action_type="needs_rebase",
+            )
+            worker_label = "iterate"
+        else:
+            rc = context.spawn_worker(prepared_rebase_task, "rebase")
+            worker_label = "rebase"
+
         result = _spawn_result(
             action_type=action_type,
             rc=rc,
-            handled_task_id=rebase_task.id,
-            worker_label="rebase",
-            created_task=rebase_task,
+            handled_task_id=prepared_rebase_task.id,
+            worker_label=worker_label,
+            created_task=prepared_rebase_task,
         )
-        result.success_message = f"Created rebase task {rebase_task.id}"
+        result.success_message = f"Created rebase task {prepared_rebase_task.id}"
         return result
 
     return AdvanceActionExecutionResult(

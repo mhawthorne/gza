@@ -690,3 +690,146 @@ def test_needs_rebase_dry_run_does_not_create_task(tmp_path: Path) -> None:
     assert result.status == "dry_run"
     assert result.worker_consuming is True
     assert len(store.get_all()) == before_count
+
+
+def test_needs_rebase_iterate_rolls_back_when_prepare_fails(tmp_path: Path) -> None:
+    """advance_mode=iterate must create+prepare the rebase child in the parent and
+    surface preparation failures without spawning iterate or leaving an orphan row."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/needs-rebase-iterate-fail")
+    store.update(impl)
+
+    before_count = len(store.get_all())
+    rollback_calls: list[bool] = []
+
+    def _create_rebase(parent: DbTask) -> DbTask:
+        assert parent.id is not None
+        assert parent.branch is not None
+        return store.add(
+            prompt=f"Rebase {parent.branch}",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+
+    def _prepare_fails(task: DbTask, rollback_on_failure: bool) -> DbTask | None:
+        rollback_calls.append(rollback_on_failure)
+        if rollback_on_failure and task.id is not None:
+            store.delete(task.id)
+        return None
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=True,
+        use_iterate_for_needs_rebase=True,
+        prepare_task_for_background_start=_prepare_fails,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=_create_rebase,
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("worker spawn must not run when prepare fails"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda *a, **kw: pytest.fail("iterate spawn must not run when prepare fails"),
+    )
+
+    result = execute_advance_action(task=impl, action={"type": "needs_rebase"}, context=context)
+
+    assert result.status == "error"
+    assert result.error_message  # caller-visible failure surface
+    assert rollback_calls == [True]
+    # The just-created rebase row was rolled back: no new tasks remain.
+    assert len(store.get_all()) == before_count
+    rebase_rows = [t for t in store.get_all() if t.task_type == "rebase"]
+    assert rebase_rows == []
+
+
+def test_needs_rebase_iterate_hands_prepared_metadata_to_spawn(tmp_path: Path) -> None:
+    """advance_mode=iterate's needs_rebase path must spawn iterate with the
+    prepared rebase task id and action metadata, and point worker output at the
+    rebase child rather than the original implementation."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/needs-rebase-iterate-ok")
+    store.update(impl)
+
+    captured: dict[str, object] = {}
+
+    def _create_rebase(parent: DbTask) -> DbTask:
+        assert parent.id is not None
+        assert parent.branch is not None
+        return store.add(
+            prompt=f"Rebase {parent.branch}",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+
+    def _prepare_returns_task(task: DbTask, rollback_on_failure: bool) -> DbTask | None:
+        captured["prepare_rollback"] = rollback_on_failure
+        captured["prepare_task_id"] = task.id
+        return task
+
+    def _spawn_iterate(
+        task_obj: DbTask,
+        kind: str,
+        *,
+        prepared_task: DbTask | None = None,
+        prepared_phase: str | None = None,
+        prepared_action_type: str | None = None,
+    ) -> int:
+        captured["spawn_task_id"] = task_obj.id
+        captured["spawn_kind"] = kind
+        captured["spawn_prepared_task_id"] = prepared_task.id if prepared_task else None
+        captured["spawn_prepared_phase"] = prepared_phase
+        captured["spawn_prepared_action_type"] = prepared_action_type
+        return 0
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=True,
+        use_iterate_for_needs_rebase=True,
+        prepare_task_for_background_start=_prepare_returns_task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=_create_rebase,
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("plain worker must not run in iterate mode"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=_spawn_iterate,
+    )
+
+    result = execute_advance_action(task=impl, action={"type": "needs_rebase"}, context=context)
+
+    rebase_rows = [t for t in store.get_all() if t.task_type == "rebase"]
+    assert len(rebase_rows) == 1
+    rebase = rebase_rows[0]
+    assert rebase.id is not None
+
+    assert captured["prepare_rollback"] is True
+    assert captured["prepare_task_id"] == rebase.id
+    # Iterate runs against the implementation task, but the prepared metadata
+    # points the worker at the rebase child.
+    assert captured["spawn_task_id"] == impl.id
+    assert captured["spawn_kind"] == "rebase"
+    assert captured["spawn_prepared_task_id"] == rebase.id
+    assert captured["spawn_prepared_phase"] == "iteration"
+    assert captured["spawn_prepared_action_type"] == "needs_rebase"
+
+    assert result.status == "success"
+    assert result.worker_label == "iterate"
+    assert result.created_task is not None
+    # Worker metadata + handled id reflect the prepared rebase row, not the impl.
+    assert result.created_task.id == rebase.id
+    assert result.handled_task_id == rebase.id
+    assert result.success_message == f"Created rebase task {rebase.id}"

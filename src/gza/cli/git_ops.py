@@ -2178,7 +2178,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             spawn_resume_worker=lambda prepared_task, _kind: _spawn_background_resume_worker(
                 _worker_args(), config, str(prepared_task.id), quiet=True, prepared_task=prepared_task
             ),
-            spawn_iterate_worker=lambda task_obj, _kind: _spawn_background_iterate_worker(
+            spawn_iterate_worker=lambda task_obj, _kind, *, prepared_task=None, prepared_phase=None, prepared_action_type=None: _spawn_background_iterate_worker(
                 argparse.Namespace(
                     no_docker=getattr(args, 'no_docker', False),
                     force=force,
@@ -2188,6 +2188,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 max_iterations=config.iterate_max_iterations,
                 auto_iterate=True,
                 quiet=True,
+                prepared_task_id=str(prepared_task.id) if prepared_task is not None and prepared_task.id is not None else None,
+                prepared_phase=prepared_phase,
+                prepared_action_type=prepared_action_type,
             ),
             spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_background_iterate_worker(
                 argparse.Namespace(
