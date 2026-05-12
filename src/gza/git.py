@@ -765,6 +765,9 @@ class Git:
         """Check if a branch can be merged cleanly (no conflicts).
 
         Uses git merge-tree to simulate a merge without touching the worktree.
+        Accepts either a local branch name or any other resolvable commit ref,
+        such as ``origin/<branch>`` when advance planning is reconciling across
+        worktrees.
 
         Args:
             branch: The branch to check
@@ -776,7 +779,7 @@ class Git:
         if into is None:
             into = self.default_branch()
 
-        if not self.branch_exists(branch):
+        if not self.branch_exists(branch) and not self.ref_exists(branch):
             return False
 
         # git merge-tree returns 0 for clean merge, 1 for conflicts

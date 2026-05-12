@@ -927,10 +927,26 @@ class TestMergeOperations:
         repo_dir.mkdir()
         git = Git(repo_dir)
 
-        with patch.object(git, 'branch_exists', return_value=False):
+        with patch.object(git, 'branch_exists', return_value=False), \
+             patch.object(git, 'ref_exists', return_value=False):
             result = git.can_merge("nonexistent")
 
             assert result is False
+
+    def test_can_merge_accepts_remote_tracking_ref(self, tmp_path: Path):
+        """Remote-tracking refs should be valid mergeability inputs."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "branch_exists", return_value=False), \
+             patch.object(git, "ref_exists", return_value=True), \
+             patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+            result = git.can_merge("origin/feature", "main")
+
+            assert result is True
 
     def test_can_merge_with_into_parameter(self, tmp_path: Path):
         """Test can_merge with into parameter specified."""
