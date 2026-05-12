@@ -79,12 +79,13 @@ def test_improve_dry_run_modes_do_not_mutate_db(
         max_resume_attempts=3,
         use_iterate_for_create_implement=False,
         use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
         prepare_create_review=lambda _task: pytest.fail("create_review should not run in dry-run"),
         create_resume_task=lambda _task: pytest.fail("create_resume should not run in dry-run"),
         create_rebase_task=lambda _task: pytest.fail("create_rebase should not run in dry-run"),
         create_implement_task=lambda _task: pytest.fail("create_implement should not run in dry-run"),
-        spawn_worker=lambda _task_id, _kind: pytest.fail("spawn_worker should not run in dry-run"),
-        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("spawn_resume should not run in dry-run"),
+        spawn_worker=lambda _task, _kind: pytest.fail("spawn_worker should not run in dry-run"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("spawn_resume should not run in dry-run"),
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("spawn_iterate should not run in dry-run"),
     )
 
@@ -154,12 +155,13 @@ def test_improve_manual_review_returns_skip_without_mutation(tmp_path: Path) -> 
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
         use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
         prepare_create_review=lambda _task: pytest.fail("unused"),
         create_resume_task=lambda _task: pytest.fail("unused"),
         create_rebase_task=lambda _task: pytest.fail("unused"),
         create_implement_task=lambda _task: pytest.fail("unused"),
-        spawn_worker=lambda _task_id, _kind: pytest.fail("unused"),
-        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
     )
 
@@ -321,12 +323,13 @@ def test_improve_give_up_reports_automatic_recovery_disabled(tmp_path: Path) -> 
         max_resume_attempts=0,
         use_iterate_for_create_implement=False,
         use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
         prepare_create_review=lambda _task: pytest.fail("unused"),
         create_resume_task=lambda _task: pytest.fail("unused"),
         create_rebase_task=lambda _task: pytest.fail("unused"),
         create_implement_task=lambda _task: pytest.fail("unused"),
-        spawn_worker=lambda _task_id, _kind: pytest.fail("unused"),
-        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
     )
 
@@ -393,12 +396,13 @@ def test_improve_retry_preserves_review_backed_execution_settings(tmp_path: Path
         max_resume_attempts=3,
         use_iterate_for_create_implement=False,
         use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
         prepare_create_review=lambda _task: pytest.fail("unused"),
         create_resume_task=lambda _task: pytest.fail("unused"),
         create_rebase_task=lambda _task: pytest.fail("unused"),
         create_implement_task=lambda _task: pytest.fail("unused"),
-        spawn_worker=lambda task_id, kind: spawned.append((task_id, kind)) or 0,
-        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_worker=lambda task_obj, kind: spawned.append((str(task_obj.id), kind)) or 0,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
     )
 
@@ -437,6 +441,7 @@ def test_create_review_skip_propagates_message_without_spawning(tmp_path: Path) 
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
         use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
         prepare_create_review=lambda _task: type(
             "_R",
             (),
@@ -445,8 +450,8 @@ def test_create_review_skip_propagates_message_without_spawning(tmp_path: Path) 
         create_resume_task=lambda _task: pytest.fail("unused"),
         create_rebase_task=lambda _task: pytest.fail("unused"),
         create_implement_task=lambda _task: pytest.fail("unused"),
-        spawn_worker=lambda _task_id, _kind: pytest.fail("spawn should not run"),
-        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("spawn should not run"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
     )
 
@@ -473,12 +478,13 @@ def test_create_review_can_route_through_iterate_before_creating_child(tmp_path:
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
         use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
         prepare_create_review=lambda _task: pytest.fail("plain review creation should not run"),
         create_resume_task=lambda _task: pytest.fail("unused"),
         create_rebase_task=lambda _task: pytest.fail("unused"),
         create_implement_task=lambda _task: pytest.fail("unused"),
-        spawn_worker=lambda _task_id, _kind: pytest.fail("plain worker should not run"),
-        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("plain worker should not run"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
         spawn_iterate_worker=lambda task_obj, kind: spawned.append((str(task_obj.id), kind)) or 0,
         prefer_iterate_for_action=lambda task, _action: task,
     )
@@ -528,12 +534,13 @@ def test_run_improve_can_return_fail_closed_iterate_skip_result(tmp_path: Path) 
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
         use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
         prepare_create_review=lambda _task: pytest.fail("unused"),
         create_resume_task=lambda _task: pytest.fail("unused"),
         create_rebase_task=lambda _task: pytest.fail("unused"),
         create_implement_task=lambda _task: pytest.fail("unused"),
-        spawn_worker=lambda _task_id, _kind: pytest.fail("plain worker should not run"),
-        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("plain worker should not run"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("iterate spawn should not run"),
         prefer_iterate_for_action=lambda _task, _action: expected,
     )
@@ -587,12 +594,13 @@ def test_reused_failed_task_recovery_reports_reuse_message(
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
         use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
         prepare_create_review=lambda _task: pytest.fail("unused"),
         create_resume_task=lambda _task: pytest.fail("should reuse existing task"),
         create_rebase_task=lambda _task: pytest.fail("unused"),
         create_implement_task=lambda _task: pytest.fail("unused"),
-        spawn_worker=lambda task_id, kind: spawned.append((task_id, kind)) or 0,
-        spawn_resume_worker=lambda task_id, kind: spawned.append((task_id, kind)) or 0,
+        spawn_worker=lambda task_obj, kind: spawned.append((str(task_obj.id), kind)) or 0,
+        spawn_resume_worker=lambda task_obj, kind: spawned.append((str(task_obj.id), kind)) or 0,
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         create_retry_task=lambda _task: pytest.fail("should reuse existing task"),
     )
@@ -642,12 +650,13 @@ def test_create_implement_uses_shared_lineage_and_selected_spawn_path(tmp_path: 
         max_resume_attempts=1,
         use_iterate_for_create_implement=True,
         use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
         prepare_create_review=lambda _task: pytest.fail("unused"),
         create_resume_task=lambda _task: pytest.fail("unused"),
         create_rebase_task=lambda _task: pytest.fail("unused"),
         create_implement_task=_create_implement,
-        spawn_worker=lambda _task_id, _kind: spawned.__setitem__("worker", spawned["worker"] + 1) or 0,
-        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: spawned.__setitem__("worker", spawned["worker"] + 1) or 0,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
         spawn_iterate_worker=lambda _task, _kind: spawned.__setitem__("iterate", spawned["iterate"] + 1) or 0,
     )
 
@@ -676,12 +685,13 @@ def test_needs_rebase_dry_run_does_not_create_task(tmp_path: Path) -> None:
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
         use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
         prepare_create_review=lambda _task: pytest.fail("unused"),
         create_resume_task=lambda _task: pytest.fail("unused"),
         create_rebase_task=lambda _task: pytest.fail("should not create rebase task in dry-run"),
         create_implement_task=lambda _task: pytest.fail("unused"),
-        spawn_worker=lambda _task_id, _kind: pytest.fail("unused"),
-        spawn_resume_worker=lambda _task_id, _kind: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
     )
 
@@ -690,3 +700,146 @@ def test_needs_rebase_dry_run_does_not_create_task(tmp_path: Path) -> None:
     assert result.status == "dry_run"
     assert result.worker_consuming is True
     assert len(store.get_all()) == before_count
+
+
+def test_needs_rebase_iterate_rolls_back_when_prepare_fails(tmp_path: Path) -> None:
+    """advance_mode=iterate must create+prepare the rebase child in the parent and
+    surface preparation failures without spawning iterate or leaving an orphan row."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/needs-rebase-iterate-fail")
+    store.update(impl)
+
+    before_count = len(store.get_all())
+    rollback_calls: list[bool] = []
+
+    def _create_rebase(parent: DbTask) -> DbTask:
+        assert parent.id is not None
+        assert parent.branch is not None
+        return store.add(
+            prompt=f"Rebase {parent.branch}",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+
+    def _prepare_fails(task: DbTask, rollback_on_failure: bool) -> DbTask | None:
+        rollback_calls.append(rollback_on_failure)
+        if rollback_on_failure and task.id is not None:
+            store.delete(task.id)
+        return None
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=True,
+        use_iterate_for_needs_rebase=True,
+        prepare_task_for_background_start=_prepare_fails,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=_create_rebase,
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("worker spawn must not run when prepare fails"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda *a, **kw: pytest.fail("iterate spawn must not run when prepare fails"),
+    )
+
+    result = execute_advance_action(task=impl, action={"type": "needs_rebase"}, context=context)
+
+    assert result.status == "error"
+    assert result.error_message  # caller-visible failure surface
+    assert rollback_calls == [True]
+    # The just-created rebase row was rolled back: no new tasks remain.
+    assert len(store.get_all()) == before_count
+    rebase_rows = [t for t in store.get_all() if t.task_type == "rebase"]
+    assert rebase_rows == []
+
+
+def test_needs_rebase_iterate_hands_prepared_metadata_to_spawn(tmp_path: Path) -> None:
+    """advance_mode=iterate's needs_rebase path must spawn iterate with the
+    prepared rebase task id and action metadata, and point worker output at the
+    rebase child rather than the original implementation."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/needs-rebase-iterate-ok")
+    store.update(impl)
+
+    captured: dict[str, object] = {}
+
+    def _create_rebase(parent: DbTask) -> DbTask:
+        assert parent.id is not None
+        assert parent.branch is not None
+        return store.add(
+            prompt=f"Rebase {parent.branch}",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+
+    def _prepare_returns_task(task: DbTask, rollback_on_failure: bool) -> DbTask | None:
+        captured["prepare_rollback"] = rollback_on_failure
+        captured["prepare_task_id"] = task.id
+        return task
+
+    def _spawn_iterate(
+        task_obj: DbTask,
+        kind: str,
+        *,
+        prepared_task: DbTask | None = None,
+        prepared_phase: str | None = None,
+        prepared_action_type: str | None = None,
+    ) -> int:
+        captured["spawn_task_id"] = task_obj.id
+        captured["spawn_kind"] = kind
+        captured["spawn_prepared_task_id"] = prepared_task.id if prepared_task else None
+        captured["spawn_prepared_phase"] = prepared_phase
+        captured["spawn_prepared_action_type"] = prepared_action_type
+        return 0
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=True,
+        use_iterate_for_needs_rebase=True,
+        prepare_task_for_background_start=_prepare_returns_task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=_create_rebase,
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("plain worker must not run in iterate mode"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=_spawn_iterate,
+    )
+
+    result = execute_advance_action(task=impl, action={"type": "needs_rebase"}, context=context)
+
+    rebase_rows = [t for t in store.get_all() if t.task_type == "rebase"]
+    assert len(rebase_rows) == 1
+    rebase = rebase_rows[0]
+    assert rebase.id is not None
+
+    assert captured["prepare_rollback"] is True
+    assert captured["prepare_task_id"] == rebase.id
+    # Iterate runs against the implementation task, but the prepared metadata
+    # points the worker at the rebase child.
+    assert captured["spawn_task_id"] == impl.id
+    assert captured["spawn_kind"] == "rebase"
+    assert captured["spawn_prepared_task_id"] == rebase.id
+    assert captured["spawn_prepared_phase"] == "iteration"
+    assert captured["spawn_prepared_action_type"] == "needs_rebase"
+
+    assert result.status == "success"
+    assert result.worker_label == "iterate"
+    assert result.created_task is not None
+    # Worker metadata + handled id reflect the prepared rebase row, not the impl.
+    assert result.created_task.id == rebase.id
+    assert result.handled_task_id == rebase.id
+    assert result.success_message == f"Created rebase task {rebase.id}"

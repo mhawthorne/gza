@@ -70,11 +70,13 @@ from ._common import (
     _create_review_task,
     _get_pager,
     _looks_like_task_id,
+    _prepare_task_for_immediate_execution,
     _spawn_background_iterate_worker,
     _spawn_background_resume_worker,
     _spawn_background_worker,
     get_review_verdict,  # noqa: F401  # re-exported for test patching
     get_store,
+    phase1_error,
     resolve_id,
 )
 from .advance_engine import (
@@ -269,6 +271,34 @@ def _advance_uses_iterate(config: Config) -> bool:
     return getattr(config, "advance_mode", "default") == "iterate"
 
 
+def _spawn_prepared_background_iterate(
+    args: argparse.Namespace,
+    config: Config,
+    impl_task: DbTask,
+    *,
+    max_iterations: int,
+    auto_iterate: bool = False,
+    quiet: bool = False,
+) -> int:
+    prepared_task = _prepare_task_for_immediate_execution(
+        config,
+        impl_task,
+        rollback_on_failure=False,
+    )
+    if prepared_task is None:
+        return 1
+    return _spawn_background_iterate_worker(
+        args,
+        config,
+        prepared_task,
+        max_iterations=max_iterations,
+        auto_iterate=auto_iterate,
+        quiet=quiet,
+        prepared_task_id=prepared_task.id,
+        prepared_phase="preloop",
+    )
+
+
 def _collect_advance_completed_tasks(
     store: SqliteTaskStore,
     *,
@@ -377,7 +407,13 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     return 0
 
 
-def _require_default_branch(git: Git, current_branch: str, command: str) -> bool:
+def _require_default_branch(
+    git: Git,
+    current_branch: str,
+    command: str,
+    *,
+    to_stderr: bool = False,
+) -> bool:
     """Enforce that a command is being run from the repo's default branch.
 
     Returns True if on default branch; prints an error and returns False otherwise.
@@ -386,7 +422,8 @@ def _require_default_branch(git: Git, current_branch: str, command: str) -> bool
     if current_branch != default:
         print(
             f"Error: `gza {command}` must be run from the default branch "
-            f"'{default}' (currently on '{current_branch}')."
+            f"'{default}' (currently on '{current_branch}').",
+            file=sys.stderr if to_stderr else sys.stdout,
         )
         return False
     return True
@@ -1201,7 +1238,12 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     git = Git(config.project_dir)
 
     current_branch = git.current_branch()
-    if not _require_default_branch(git, current_branch, "rebase"):
+    if not _require_default_branch(
+        git,
+        current_branch,
+        "rebase",
+        to_stderr=bool(getattr(args, "background", False)),
+    ):
         return 1
 
     # Handle background mode - create a rebase task and run through the standard runner
@@ -1209,17 +1251,31 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         store = get_store(config)
         task = store.get(task_id)
         if not task:
-            print(f"Error: Task {task_id} not found")
-            return 1
+            return phase1_error(args, f"Task {task_id} not found")
         if not task.branch:
-            print(f"Error: Task {task_id} has no branch")
-            return 1
+            return phase1_error(args, f"Task {task_id} has no branch")
         target = getattr(args, 'onto', None) or git.default_branch()
         if getattr(args, 'remote', False):
             target = f"origin/{target}"
         rebase_task = _create_rebase_task(store, task_id, task.branch, target)
-        worker_args = argparse.Namespace(no_docker=False, max_turns=None)
-        return _spawn_background_worker(worker_args, config, task_id=rebase_task.id)
+        prepared_rebase_task = _prepare_task_for_immediate_execution(
+            config,
+            rebase_task,
+            rollback_on_failure=True,
+        )
+        if prepared_rebase_task is None:
+            return 1
+        assert prepared_rebase_task.id is not None
+        worker_args = argparse.Namespace(
+            no_docker=getattr(args, "no_docker", False),
+            max_turns=None,
+        )
+        return _spawn_background_worker(
+            worker_args,
+            config,
+            task_id=prepared_rebase_task.id,
+            prepared_task=prepared_rebase_task,
+        )
 
     store = get_store(config)
 
@@ -1988,12 +2044,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
         config.merge_squash_threshold = squash_threshold_override
 
     if new_mode and batch_limit is None:
-        print("Error: --new requires --batch", file=sys.stderr)
-        return 1
+        return phase1_error(args, "--new requires --batch")
 
     if batch_limit is not None and batch_limit < 1:
-        print("Error: --batch must be a positive integer", file=sys.stderr)
-        return 1
+        return phase1_error(args, "--batch must be a positive integer")
 
     # --unimplemented mode: list completed plans/explores without implementations
     # Legacy --plans is supported as an alias scoped to plans only.
@@ -2017,16 +2071,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
     if task_id is not None:
         task = store.get(task_id)
         if not task:
-            print(f"Error: Task {task_id} not found")
-            return 1
+            return phase1_error(args, f"Task {task_id} not found")
         if task.status == 'failed':
             if no_resume_failed:
-                print(f"Error: Task {task_id} is not completed (status: {task.status})")
-                return 1
+                return phase1_error(args, f"Task {task_id} is not completed (status: {task.status})")
         else:
             if task.status != 'completed':
-                print(f"Error: Task {task_id} is not completed (status: {task.status})")
-                return 1
+                return phase1_error(args, f"Task {task_id} is not completed (status: {task.status})")
             if _task_is_already_merged(store, task):
                 print(f"Task {task_id} is already merged")
                 return 0
@@ -2141,18 +2192,23 @@ def cmd_advance(args: argparse.Namespace) -> int:
             max_resume_attempts=max_resume_attempts,
             use_iterate_for_create_implement=use_iterate_mode,
             use_iterate_for_needs_rebase=use_iterate_mode,
+            prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
+                config,
+                task,
+                rollback_on_failure=rollback_on_failure,
+            ),
             prepare_create_review=lambda t: _prepare_create_review_action(store, t),
             create_resume_task=lambda t: _create_resume_task(store, t),
             create_retry_task=lambda t: _create_retry_task(store, t),
             create_rebase_task=_create_rebase_from_task,
             create_implement_task=_create_implement_from_task,
-            spawn_worker=lambda task_id, _kind: _spawn_background_worker(
-                _worker_args(), config, task_id=task_id, quiet=True
+            spawn_worker=lambda task_obj, _kind: _spawn_background_worker(
+                _worker_args(), config, task_id=str(task_obj.id), quiet=True, prepared_task=task_obj
             ),
-            spawn_resume_worker=lambda task_id, _kind: _spawn_background_resume_worker(
-                _worker_args(), config, task_id, quiet=True
+            spawn_resume_worker=lambda task_obj, _kind: _spawn_background_resume_worker(
+                _worker_args(), config, str(task_obj.id), quiet=True, prepared_task=task_obj
             ),
-            spawn_iterate_worker=lambda task_obj, _kind: _spawn_background_iterate_worker(
+            spawn_iterate_worker=lambda task_obj, _kind, *, prepared_task=None, prepared_phase=None, prepared_action_type=None: _spawn_background_iterate_worker(
                 argparse.Namespace(
                     no_docker=getattr(args, 'no_docker', False),
                     force=force,
@@ -2162,8 +2218,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 max_iterations=config.iterate_max_iterations,
                 auto_iterate=True,
                 quiet=True,
+                prepared_task_id=str(prepared_task.id) if prepared_task is not None and prepared_task.id is not None else None,
+                prepared_phase=prepared_phase,
+                prepared_action_type=prepared_action_type,
             ),
-            spawn_iterate_recovery=lambda task_obj, mode: _spawn_background_iterate_worker(
+            spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_background_iterate_worker(
                 argparse.Namespace(
                     no_docker=getattr(args, 'no_docker', False),
                     force=force,
@@ -2175,6 +2234,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 retry=mode == "retry",
                 auto_iterate=True,
                 quiet=True,
+                prepared_task_id=str(prepared_task.id),
+                prepared_resume=mode == "resume",
+                prepared_phase="preloop",
             ),
         )
 
@@ -2507,7 +2569,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     no_docker=getattr(args, 'no_docker', False),
                     force=force,
                 )
-                rc = _spawn_background_iterate_worker(
+                rc = _spawn_prepared_background_iterate(
                     iterate_args,
                     config,
                     pt,
@@ -2519,6 +2581,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 worker_args = _worker_args()
                 rc = _spawn_background_worker(worker_args, config, task_id=pt.id, quiet=True)
             if rc != 0:
+                error_count += 1
                 break  # error spawning
             new_started += 1
             workers_started += 1

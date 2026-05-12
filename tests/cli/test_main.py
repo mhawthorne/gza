@@ -863,10 +863,10 @@ class TestWorkForceBackgroundDispatch:
         mock_proc = MagicMock()
         mock_proc.pid = 4242
 
-        def capture_popen(cmd, **_kwargs):
+        def capture_spawn(cmd, _config, worker_id):
             nonlocal captured_cmd
             captured_cmd = cmd
-            return mock_proc
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
         with (
             patch.object(
@@ -883,7 +883,8 @@ class TestWorkForceBackgroundDispatch:
                     str(tmp_path),
                 ],
             ),
-            patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
+            patch("gza.cli.execution._prepare_task_for_immediate_execution", side_effect=lambda _c, prepared_task, **_k: prepared_task),
+            patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn),
         ):
             rc = main()
 
@@ -968,10 +969,10 @@ class TestIterateBackgroundForceDispatch:
         mock_proc = MagicMock()
         mock_proc.pid = 5252
 
-        def capture_popen(cmd, **_kwargs):
+        def capture_spawn(cmd, _config, worker_id):
             nonlocal captured_cmd
             captured_cmd = cmd
-            return mock_proc
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
         with (
             patch.object(
@@ -988,7 +989,11 @@ class TestIterateBackgroundForceDispatch:
                     str(tmp_path),
                 ],
             ),
-            patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
+            patch(
+                "gza.cli.execution._prepare_task_for_immediate_execution",
+                side_effect=lambda _c, prepared_task, **_k: prepared_task,
+            ),
+            patch("gza.cli._common._spawn_detached_worker_process", side_effect=capture_spawn),
         ):
             rc = main()
 
@@ -1010,10 +1015,10 @@ class TestIterateBackgroundForceDispatch:
         mock_proc = MagicMock()
         mock_proc.pid = 5353
 
-        def capture_popen(cmd, **_kwargs):
+        def capture_spawn(cmd, _config, worker_id):
             nonlocal captured_cmd
             captured_cmd = cmd
-            return mock_proc
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
         with (
             patch.object(
@@ -1031,7 +1036,11 @@ class TestIterateBackgroundForceDispatch:
                     str(tmp_path),
                 ],
             ),
-            patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
+            patch(
+                "gza.cli.execution._prepare_task_for_immediate_execution",
+                side_effect=lambda _c, prepared_task, **_k: prepared_task,
+            ),
+            patch("gza.cli._common._spawn_detached_worker_process", side_effect=capture_spawn),
         ):
             rc = main()
 
@@ -1059,10 +1068,10 @@ class TestIterateBackgroundForceDispatch:
         mock_proc = MagicMock()
         mock_proc.pid = 5454
 
-        def capture_popen(cmd, **_kwargs):
+        def capture_spawn(cmd, _config, worker_id):
             nonlocal captured_cmd
             captured_cmd = cmd
-            return mock_proc
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
         with (
             patch.object(
@@ -1078,7 +1087,11 @@ class TestIterateBackgroundForceDispatch:
                     str(tmp_path),
                 ],
             ),
-            patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
+            patch(
+                "gza.cli.execution._prepare_task_for_immediate_execution",
+                side_effect=lambda _c, prepared_task, **_k: prepared_task,
+            ),
+            patch("gza.cli._common._spawn_detached_worker_process", side_effect=capture_spawn),
         ):
             rc = main()
 
@@ -1130,6 +1143,7 @@ class TestIterateBackgroundForceDispatch:
         store = SqliteTaskStore(config.db_path)
         task = store.add("Failed implement for iterate restart", task_type="implement")
         task.status = "failed"
+        task.failure_reason = "MAX_TURNS"
         if restart_flag == "--resume":
             task.session_id = "resume-session"
         store.update(task)
@@ -1159,6 +1173,10 @@ class TestIterateBackgroundForceDispatch:
                     "--project",
                     str(tmp_path),
                 ],
+            ),
+            patch(
+                "gza.cli.execution._prepare_task_for_immediate_execution",
+                side_effect=lambda _c, prepared_task, **_k: prepared_task,
             ),
             patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
         ):
