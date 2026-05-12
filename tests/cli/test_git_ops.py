@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from gza.cli.git_ops import _merge_single_task, _run_task_backed_rebase, cmd_advance
+from gza.cli.git_ops import _build_auto_merge_args, _merge_single_task, _resolve_merge_subject, _run_task_backed_rebase, cmd_advance
 from gza.config import Config
 from gza.git import Git
 from gza.rebase_diff import RebaseDiffResult
@@ -83,6 +83,64 @@ def _init_repo_with_stale_local_and_clean_origin(tmp_path: Path, branch: str) ->
     git._run("add", "shared.txt")
     git._run("commit", "-m", "Main branch change")
     git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
+    return git
+
+
+def _init_repo_with_stale_origin_and_local_ahead(tmp_path: Path, branch: str) -> Git:
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "shared.txt").write_text("base\n")
+    git._run("add", "shared.txt")
+    git._run("commit", "-m", "Initial commit")
+
+    git._run("checkout", "-b", branch)
+    (tmp_path / "feature.txt").write_text("remote tip\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Remote feature tip")
+    remote_sha = git.rev_parse("HEAD")
+
+    (tmp_path / "feature.txt").write_text("remote tip\nlocal tip\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Local branch ahead")
+    git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
+    git._run("checkout", "main")
+    return git
+
+
+def _init_repo_with_diverged_local_and_origin(tmp_path: Path, branch: str) -> Git:
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "shared.txt").write_text("base\n")
+    git._run("add", "shared.txt")
+    git._run("commit", "-m", "Initial commit")
+
+    git._run("checkout", "-b", branch)
+    (tmp_path / "feature.txt").write_text("local tip\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Local feature tip")
+    local_sha = git.rev_parse("HEAD")
+
+    git._run("checkout", "main")
+    git._run("update-ref", f"refs/remotes/origin/{branch}", local_sha)
+    git._run("checkout", branch)
+    (tmp_path / "feature.txt").write_text("local tip\nlocal only\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Local branch diverges")
+
+    git._run("checkout", "main")
+    git._run("update-ref", f"refs/remotes/origin/{branch}", local_sha)
+    git._run("checkout", "--detach", local_sha)
+    (tmp_path / "feature.txt").write_text("local tip\nremote only\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Remote branch diverges")
+    remote_sha = git.rev_parse("HEAD")
+    git._run("checkout", branch)
+    git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
+    git._run("checkout", "main")
     return git
 
 
@@ -518,6 +576,83 @@ def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
     output = capsys.readouterr().out
     assert f"Merging 'origin/{branch}' into 'main'" in output
     assert f"Merging '{branch}' into 'main'" not in output
+
+
+def test_advance_execution_prefers_local_branch_when_origin_is_stale(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    config.merge_squash_threshold = 1
+    store = make_store(tmp_path)
+    branch = "feature/advance-local-ahead"
+    git = _init_repo_with_stale_origin_and_local_ahead(tmp_path, branch)
+    task = _add_mergeable_impl_with_failed_rebase(store, branch)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    resolved = _resolve_merge_subject(store, git, task.id, target_branch="main")
+    assert resolved is not None
+    assert resolved.merge_source_ref == branch
+    merge_args = _build_auto_merge_args(config, git, resolved.merge_source_ref, "main")
+
+    rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    assert merge_args.squash is True
+    assert rc == 0
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+    assert git.is_merged(branch, "main") is True
+    assert (tmp_path / "feature.txt").read_text() == "remote tip\nlocal tip\n"
+
+    output = capsys.readouterr().out
+    assert f"Merging '{branch}' into 'main'" in output
+    assert f"Merging 'origin/{branch}' into 'main'" not in output
+
+
+def test_advance_dry_run_surfaces_diverged_merge_source_for_manual_resolution(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    branch = "feature/advance-diverged"
+    git = _init_repo_with_diverged_local_and_origin(tmp_path, branch)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = branch
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    args = _advance_args(tmp_path, task.id)
+    args.dry_run = True
+
+    with patch("gza.cli.git_ops.Git", return_value=git):
+        rc = cmd_advance(args)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "Needs attention" in output
+    assert "merge-source-needs-manual-resolution" in output
+    assert f"origin/{branch}" in output
+    assert "diverged" in output
 
 
 def test_rebase_background_creator_phase_failure_cleans_up_created_task_and_artifacts(tmp_path: Path) -> None:

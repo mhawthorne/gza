@@ -28,6 +28,7 @@ from ..failure_reasons import mark_task_failed_from_cause
 from ..git import (
     Git,
     GitError,
+    ResolvedMergeSourceRef,
     active_worktree_path_for_branch,
     cleanup_worktree_for_branch,
     resolve_ref_if_possible,
@@ -109,30 +110,43 @@ class _ResolvedMergeSubject:
     merge_unit_id: str | None
     merge_branch: str | None
     merge_source_ref: str | None
+    merge_source_warning: str | None
 
 
-def _resolve_fresh_merge_source_ref(git: Git, branch: str | None) -> str | None:
+def _resolve_fresh_merge_source(git: Git, branch: str | None) -> ResolvedMergeSourceRef:
     """Return the freshest merge source ref supported by this git runtime."""
     if not branch:
-        return None
+        return ResolvedMergeSourceRef(None)
 
-    resolve_fresh = getattr(git, "resolve_fresh_merge_source_ref", None)
+    resolve_fresh = getattr(git, "resolve_fresh_merge_source", None)
     if callable(resolve_fresh):
-        return resolve_fresh(branch)
+        resolved = resolve_fresh(branch)
+        if isinstance(resolved, ResolvedMergeSourceRef):
+            return resolved
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            return ResolvedMergeSourceRef(resolved[0], resolved[1])
+        if isinstance(resolved, str):
+            return ResolvedMergeSourceRef(resolved)
+        if resolved is None:
+            return ResolvedMergeSourceRef(None)
+
+    resolve_fresh_ref = getattr(git, "resolve_fresh_merge_source_ref", None)
+    if callable(resolve_fresh_ref):
+        return ResolvedMergeSourceRef(resolve_fresh_ref(branch))
 
     ref_exists = getattr(git, "ref_exists", None)
     if callable(ref_exists):
         remote_ref = f"origin/{branch}"
         if ref_exists(remote_ref):
-            return remote_ref
+            return ResolvedMergeSourceRef(remote_ref)
 
     branch_exists = getattr(git, "branch_exists", None)
     if callable(branch_exists):
         if branch_exists(branch):
-            return branch
-        return None
+            return ResolvedMergeSourceRef(branch)
+        return ResolvedMergeSourceRef(None)
 
-    return branch
+    return ResolvedMergeSourceRef(branch)
 
 
 def _task_is_already_merged(store: SqliteTaskStore, task: DbTask) -> bool:
@@ -552,7 +566,7 @@ def _resolve_merge_subject(
     trigger_task = store.get(task_id)
     if trigger_task is None:
         return None
-    trigger_source_ref = _resolve_fresh_merge_source_ref(git, trigger_task.branch)
+    trigger_source = _resolve_fresh_merge_source(git, trigger_task.branch)
     if trigger_task.id is None:
         return _ResolvedMergeSubject(
             trigger_task=trigger_task,
@@ -560,7 +574,8 @@ def _resolve_merge_subject(
             merge_subject=trigger_task,
             merge_unit_id=None,
             merge_branch=trigger_task.branch,
-            merge_source_ref=trigger_source_ref,
+            merge_source_ref=trigger_source.ref,
+            merge_source_warning=trigger_source.warning,
         )
 
     unit = store.resolve_merge_unit_for_task(trigger_task.id)
@@ -573,7 +588,8 @@ def _resolve_merge_subject(
             merge_subject=trigger_task,
             merge_unit_id=None,
             merge_branch=trigger_task.branch,
-            merge_source_ref=trigger_source_ref,
+            merge_source_ref=trigger_source.ref,
+            merge_source_warning=trigger_source.warning,
         )
 
     merge_subject = store.resolve_merge_unit_owner_task(unit) or trigger_task
@@ -584,14 +600,15 @@ def _resolve_merge_subject(
     )
     if execution_task is None:
         execution_task = trigger_task if trigger_task.branch == unit.source_branch else merge_subject
-    merge_source_ref = _resolve_fresh_merge_source_ref(git, unit.source_branch)
+    merge_source = _resolve_fresh_merge_source(git, unit.source_branch)
     return _ResolvedMergeSubject(
         trigger_task=trigger_task,
         execution_task=execution_task,
         merge_subject=merge_subject,
         merge_unit_id=unit.id,
         merge_branch=unit.source_branch,
-        merge_source_ref=merge_source_ref,
+        merge_source_ref=merge_source.ref,
+        merge_source_warning=merge_source.warning,
     )
 
 
@@ -626,6 +643,9 @@ def _merge_single_task(
 
     if not merge_branch or not merge_source_ref:
         print(f"Error: Task {merge_subject.id} has no branch")
+        return 1
+    if resolved.merge_source_warning:
+        print(f"Error: {resolved.merge_source_warning}")
         return 1
 
     # Handle --mark-only flag

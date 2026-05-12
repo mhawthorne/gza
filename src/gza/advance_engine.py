@@ -10,6 +10,7 @@ from typing import Any
 
 from gza.console import prompt_available_width, shorten_prompt
 from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from gza.git import ResolvedMergeSourceRef
 from gza.query import get_code_changing_descendants_for_root, get_reviews_for_root
 from gza.recovery_engine import (
     FailedRecoveryDecision,
@@ -59,6 +60,8 @@ class AdvanceContext:
     active_implement_child: DbTask | None = None
     has_non_dropped_plan_or_implement_descendant: bool = False
 
+    merge_source_ref: str | None = None
+    merge_source_warning: str | None = None
     can_merge: bool = True
     rebase_pending_or_running: DbTask | None = None
     rebase_failed: DbTask | None = None
@@ -99,26 +102,30 @@ class AdvanceRule:
     action: Callable[[AdvanceContext], dict[str, Any]]
 
 
-def _resolve_current_merge_source_ref(git: Any, branch: str) -> str:
-    """Return the freshest available ref for mergeability checks.
-
-    Prefer ``origin/<branch>`` when it exists so advance planning is stable across
-    worktrees whose local branch refs may be missing or stale after an operator
-    pushes corrected commits from another checkout. Fall back to the local branch
-    name so existing tests and lightweight git doubles keep working.
-    """
-    resolve_fresh = getattr(git, "resolve_fresh_merge_source_ref", None)
+def _resolve_current_merge_source(git: Any, branch: str) -> ResolvedMergeSourceRef:
+    """Return the merge source chosen for advance planning and any warning."""
+    resolve_fresh = getattr(git, "resolve_fresh_merge_source", None)
     if callable(resolve_fresh):
         resolved = resolve_fresh(branch)
-        if resolved:
+        if isinstance(resolved, ResolvedMergeSourceRef):
             return resolved
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            return ResolvedMergeSourceRef(resolved[0], resolved[1])
+        if isinstance(resolved, str):
+            return ResolvedMergeSourceRef(resolved)
+        if resolved is None:
+            return ResolvedMergeSourceRef(None)
+
+    resolve_fresh_ref = getattr(git, "resolve_fresh_merge_source_ref", None)
+    if callable(resolve_fresh_ref):
+        return ResolvedMergeSourceRef(resolve_fresh_ref(branch))
 
     ref_exists = getattr(git, "ref_exists", None)
     if callable(ref_exists):
         remote_ref = f"origin/{branch}"
         if ref_exists(remote_ref):
-            return remote_ref
-    return branch
+            return ResolvedMergeSourceRef(remote_ref)
+    return ResolvedMergeSourceRef(branch)
 
 
 def is_resumable_failure_reason(failure_reason: str | None) -> bool:
@@ -666,7 +673,8 @@ def resolve_advance_context(
             failure_reason=task.failure_reason,
         )
 
-    can_merge = git.can_merge(_resolve_current_merge_source_ref(git, task.branch), target_branch)
+    merge_source = _resolve_current_merge_source(git, task.branch)
+    can_merge = bool(merge_source.ref) and git.can_merge(merge_source.ref, target_branch)
     rebase_children = [
         child
         for child in store.get_lineage_children(task.id)
@@ -731,6 +739,8 @@ def resolve_advance_context(
         has_non_dropped_plan_or_implement_descendant=has_non_dropped_plan_or_implement_descendant,
         failed_recovery_decision=failed_recovery_decision,
         failed_recovery_attention_reason=failed_recovery_attention_reason,
+        merge_source_ref=merge_source.ref,
+        merge_source_warning=merge_source.warning,
         can_merge=can_merge,
         rebase_pending_or_running=rebase_pending_or_running,
         rebase_failed=rebase_failed,
@@ -814,6 +824,17 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="no_branch",
         matches=lambda ctx: not ctx.has_branch,
         action=lambda ctx: {"type": "skip", "description": _no_branch_description(ctx)},
+    ),
+    AdvanceRule(
+        name="merge_source_needs_manual_resolution",
+        matches=lambda ctx: ctx.merge_source_warning is not None,
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": f"SKIP: {ctx.merge_source_warning}",
+            },
+            reason="merge-source-needs-manual-resolution",
+        ),
     ),
     AdvanceRule(
         name="conflict_rebase_running",

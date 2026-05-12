@@ -3405,6 +3405,7 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
     git.count_commits_ahead.return_value = 3
+    source_ref = "origin/feature/watch-squash"
     captured: dict[str, object] = {}
 
     def fake_execute_merge_action(
@@ -3423,7 +3424,8 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
 
         from gza.cli.git_ops import _build_auto_merge_args
 
-        captured["merge_args"] = _build_auto_merge_args(config_arg, git_arg, task_arg, target_branch)
+        assert task_arg.branch == "feature/watch-squash"
+        captured["merge_args"] = _build_auto_merge_args(config_arg, git_arg, source_ref, target_branch)
         return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
 
     with (
@@ -3433,6 +3435,8 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
         patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
     ):
+        from gza.cli.git_ops import _build_auto_merge_args
+
         _run_cycle(
             config=config,
             store=store,
@@ -3442,11 +3446,11 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
             log=log,
         )
         watch_merge_args = captured["merge_args"]
-        from gza.cli.git_ops import _build_auto_merge_args
-        advance_merge_args = _build_auto_merge_args(config, git, task, "main")
+        advance_merge_args = _build_auto_merge_args(config, git, source_ref, "main")
 
     assert watch_merge_args.squash is True
     assert advance_merge_args.squash is True
+    git.count_commits_ahead.assert_called_with(source_ref, "main")
 
 
 def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(

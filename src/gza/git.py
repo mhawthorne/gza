@@ -34,6 +34,14 @@ class ResolvedGitRef:
     warning: str | None = None
 
 
+@dataclass(frozen=True)
+class ResolvedMergeSourceRef:
+    """Selected merge source ref plus any operator-visible warning."""
+
+    ref: str | None
+    warning: str | None = None
+
+
 def _unquote_c_style_path(path: str) -> str:
     """Decode git C-style quoted paths from porcelain output."""
     if not (len(path) >= 2 and path[0] == '"' and path[-1] == '"'):
@@ -575,12 +583,46 @@ class Git:
         branch. Fall back to the local branch when no remote-tracking ref is
         available.
         """
+        return self.resolve_fresh_merge_source(branch, remote=remote).ref
+
+    def resolve_fresh_merge_source(self, branch: str, *, remote: str = "origin") -> ResolvedMergeSourceRef:
+        """Return the freshest safe ref for merge planning/execution.
+
+        Compare the local branch and remote-tracking ref when both exist. Prefer
+        ``<remote>/<branch>`` when it is equal to or ahead of the local branch,
+        prefer the local branch when it is strictly ahead, and fail closed with
+        a warning when the two refs have diverged.
+        """
         remote_ref = f"{remote}/{branch}"
-        if self.ref_exists(remote_ref):
-            return remote_ref
-        if self.branch_exists(branch):
-            return branch
-        return None
+        has_local = self.branch_exists(branch)
+        has_remote = self.ref_exists(remote_ref)
+
+        if has_local and has_remote:
+            local_sha = self.rev_parse_if_exists(branch)
+            remote_sha = self.rev_parse_if_exists(remote_ref)
+            if local_sha and remote_sha:
+                if local_sha == remote_sha:
+                    return ResolvedMergeSourceRef(remote_ref)
+
+                local_ahead = self.count_commits_ahead(branch, remote_ref)
+                remote_ahead = self.count_commits_ahead(remote_ref, branch)
+                if local_ahead > 0 and remote_ahead == 0:
+                    return ResolvedMergeSourceRef(branch)
+                if remote_ahead > 0 and local_ahead == 0:
+                    return ResolvedMergeSourceRef(remote_ref)
+                return ResolvedMergeSourceRef(
+                    None,
+                    (
+                        f"Local branch '{branch}' and remote-tracking ref '{remote_ref}' diverged. "
+                        "Push, fetch, or reconcile them before advancing or merging."
+                    ),
+                )
+
+        if has_remote:
+            return ResolvedMergeSourceRef(remote_ref)
+        if has_local:
+            return ResolvedMergeSourceRef(branch)
+        return ResolvedMergeSourceRef(None)
 
     def rev_parse(self, ref: str) -> str:
         """Resolve a ref to its commit SHA."""

@@ -30,11 +30,13 @@ class _FakeGit:
         can_merge_by_ref: dict[tuple[str, str], bool] | None = None,
         existing_branches: set[str] | None = None,
         existing_refs: set[str] | None = None,
+        merge_source_result: tuple[str | None, str | None] | None = None,
     ):
         self._can_merge = can_merge
         self._can_merge_by_ref = can_merge_by_ref or {}
         self._existing_branches = existing_branches or set()
         self._existing_refs = existing_refs or set()
+        self._merge_source_result = merge_source_result
 
     def can_merge(self, source_branch: str, target_branch: str) -> bool:
         return self._can_merge_by_ref.get((source_branch, target_branch), self._can_merge)
@@ -44,6 +46,19 @@ class _FakeGit:
 
     def ref_exists(self, ref: str) -> bool:
         return ref in self._existing_refs
+
+    def resolve_fresh_merge_source(self, branch: str):
+        from gza.git import ResolvedMergeSourceRef
+
+        if self._merge_source_result is not None:
+            ref, warning = self._merge_source_result
+            return ResolvedMergeSourceRef(ref, warning)
+        remote_ref = f"origin/{branch}"
+        if remote_ref in self._existing_refs:
+            return ResolvedMergeSourceRef(remote_ref)
+        if branch in self._existing_branches:
+            return ResolvedMergeSourceRef(branch)
+        return ResolvedMergeSourceRef(branch)
 
 
 def _make_store(tmp_path: Path) -> SqliteTaskStore:
@@ -822,6 +837,79 @@ def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: 
 
     assert ctx_without_local_branch.can_merge is True
     assert ctx_with_stale_local_branch.can_merge is True
+
+
+def test_resolve_context_prefers_local_branch_when_origin_is_stale(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    git = Git(tmp_path)
+    branch = "feat/local-ahead"
+
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "base.txt").write_text("base\n")
+    git._run("add", "base.txt")
+    git._run("commit", "-m", "Initial commit")
+
+    git._run("checkout", "-b", branch)
+    (tmp_path / "feature.txt").write_text("remote tip\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Remote tip")
+    remote_sha = git.rev_parse("HEAD")
+
+    (tmp_path / "feature.txt").write_text("remote tip\nlocal tip\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Local tip")
+    git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
+    git._run("checkout", "main")
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = branch
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+
+    assert ctx.merge_source_ref == branch
+    assert ctx.merge_source_warning is None
+    assert ctx.can_merge is True
+
+
+def test_diverged_local_and_origin_need_manual_resolution(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feat/diverged"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            merge_source_result=(
+                None,
+                "Local branch 'feat/diverged' and remote-tracking ref 'origin/feat/diverged' diverged. "
+                "Push, fetch, or reconcile them before advancing or merging.",
+            )
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert "diverged" in action["description"]
 
 
 def test_real_git_remote_tracking_ref_unblocks_failed_rebase_after_later_approved_review(
