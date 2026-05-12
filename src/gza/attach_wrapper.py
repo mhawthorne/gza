@@ -169,7 +169,7 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
         if decision.reuse_existing and decision.recovery_task_id is not None:
             retry_task_id = decision.recovery_task_id
         else:
-            retry_task = _create_retry_task(store, task)
+            retry_task = _create_retry_task(store, task, automatic_recovery=True)
             assert retry_task.id is not None
             retry_task_id = str(retry_task.id)
         return _AttachHandoffTarget(
@@ -185,7 +185,7 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
             resume_mode=False,
             launch_mode="worker",
         )
-    retry_task = _create_retry_task(store, task)
+    retry_task = _create_retry_task(store, task, automatic_recovery=True)
     assert retry_task.id is not None
     return _AttachHandoffTarget(
         task_id=str(retry_task.id),

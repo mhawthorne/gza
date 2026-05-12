@@ -881,6 +881,68 @@ class TestRetryCommand:
         assert retry_task.base_branch == "feature/old"
         assert retry_task.recovery_origin == "retry"
 
+    def test_create_retry_task_manual_rebase_retry_keeps_fresh_branch_contract(self, tmp_path: Path):
+        """Manual rebase retry should still fork a fresh branch from the failed branch."""
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/impl"
+        store.update(impl)
+
+        failed_rebase = store.add(
+            "Rebase impl branch",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.branch = impl.branch
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        retry_task = _create_retry_task(store, failed_rebase)
+        assert retry_task.based_on == failed_rebase.id
+        assert retry_task.same_branch is False
+        assert retry_task.base_branch == impl.branch
+        assert retry_task.branch is None
+        assert retry_task.recovery_origin == "retry"
+
+    def test_retry_cli_manual_rebase_retry_keeps_fresh_branch_contract(self, tmp_path: Path):
+        """`gza retry` should preserve the historical rebase retry branch contract."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/impl"
+        store.update(impl)
+
+        failed_rebase = store.add(
+            "Rebase impl branch",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.branch = impl.branch
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        result = run_gza("retry", str(failed_rebase.id), "--queue", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        retry_task = get_latest_task(store, based_on=failed_rebase.id, task_type="rebase")
+        assert retry_task is not None
+        assert retry_task.same_branch is False
+        assert retry_task.base_branch == impl.branch
+        assert retry_task.branch is None
+
     def test_retry_does_not_copy_non_explicit_provider(self, tmp_path: Path):
         """Retry should not preserve provider that came from resolved default state."""
 

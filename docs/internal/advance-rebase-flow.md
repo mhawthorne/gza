@@ -37,7 +37,9 @@ The worktree may have uncommitted changes (e.g., from provider initialization). 
 
 ## Failure handling
 
-If a rebase task fails, `gza advance` reports `needs_discussion` — manual intervention is required. Rebases are not automatically retried. The user can manually retry with `gza retry <id>` or rebase interactively with `gza rebase <id>`.
+If a rebase task fails for an automatically recoverable reason, the standard failed-task recovery engine may create a follow-up rebase attempt. Those recovery retries must keep `same_branch=True` semantics against the original implementation branch so the completed rebase force-pushes back to the implementation branch instead of creating a sibling `*-rebase-branch-*` orphan. Recovery branch resolution must walk past any failed orphan recovery descendants and re-anchor on the original implementation branch (or the oldest recorded rebase branch if the implementation row no longer has one recorded).
+
+Existing orphan recovery branches created before this behavior was fixed are left in place intentionally. Per project policy, branch cleanup is an operator concern rather than an automatic migration; future automatic recoveries simply stop targeting those orphan branches.
 
 ## Relationship to `gza rebase` CLI command
 

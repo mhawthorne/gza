@@ -19,6 +19,7 @@ from typing import Any, cast
 import gza.colors as _colors
 
 from .branch_naming import generate_branch_name
+from .branch_resolution import resolve_rebase_target_branch
 from .commit_messages import build_task_commit_message
 from .config import (
     APP_NAME,
@@ -3135,6 +3136,16 @@ def _resolve_code_task_branch_name(
         return branch_name
 
     if task.same_branch:
+        if task.task_type == "rebase":
+            rebase_branch = resolve_rebase_target_branch(store, task)
+            if rebase_branch and git.branch_exists(rebase_branch):
+                console.print(f"Using rebase target branch: [blue]{rebase_branch}[/blue]")
+                return rebase_branch
+            if rebase_branch:
+                error_message(
+                    f"Error: Rebase task {task.id} resolved target branch {rebase_branch} but it does not exist"
+                )
+                return None
         # Use the branch from based_on task (for improve tasks) or depends_on task (fallback).
         # Walk the based_on chain until we find an ancestor with a valid, existing branch.
         source_task = None

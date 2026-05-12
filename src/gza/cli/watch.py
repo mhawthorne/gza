@@ -1470,7 +1470,7 @@ def _run_cycle(
                 assert existing_recovered_task is not None
                 recovered_task = existing_recovered_task
             else:
-                recovered_task = _create_retry_task(store, failed)
+                recovered_task = _create_retry_task(store, failed, automatic_recovery=True)
                 assert recovered_task.id is not None
                 recovered_task_id = str(recovered_task.id)
             pending_recovery_task_ids.add(recovered_task_id)

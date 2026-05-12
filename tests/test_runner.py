@@ -7092,6 +7092,90 @@ class TestExtractedRunInnerHelpers:
         branch_name = _resolve_code_task_branch_name(retry, config, store, git, resume=False)
         assert branch_name == "test/impl"
 
+    def test_rebase_recovery_chain_reuses_impl_branch_and_pushes_it(self, tmp_path: Path):
+        """Chained rebase recoveries should keep resolving and pushing the impl branch."""
+        from gza.cli._common import _create_retry_task
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        config = self._make_config(tmp_path)
+
+        impl = store.add(prompt="impl", task_type="implement")
+        assert impl.id is not None
+        impl.slug = "20260512-impl"
+        impl.branch = "feature/impl"
+        store.update(impl)
+
+        failed_rebase = store.add(
+            prompt="rebase1",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.slug = "20260512-rebase1"
+        failed_rebase.status = "failed"
+        failed_rebase.failure_reason = "WORKER_DIED"
+        failed_rebase.branch = impl.branch
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        first_recovery = _create_retry_task(store, failed_rebase, automatic_recovery=True)
+        assert first_recovery.id is not None
+        first_recovery.slug = "20260512-rebase-branch-orphan"
+        first_recovery.status = "failed"
+        first_recovery.failure_reason = "TIMEOUT"
+        first_recovery.branch = "20260512-rebase-branch-orphan"
+        first_recovery.completed_at = datetime.now(UTC)
+        store.update(first_recovery)
+
+        second_recovery = _create_retry_task(store, first_recovery, automatic_recovery=True)
+        assert second_recovery.id is not None
+        second_recovery.slug = "20260512-rebase-branch-orphan-2"
+        assert second_recovery.same_branch is True
+        assert second_recovery.base_branch is None
+        assert second_recovery.branch == impl.branch
+
+        git = Mock(spec=Git)
+        git.branch_exists.side_effect = lambda branch: branch == impl.branch
+
+        branch_name = _resolve_code_task_branch_name(second_recovery, config, store, git, resume=False)
+        assert branch_name == impl.branch
+        second_recovery.branch = branch_name
+        store.update(second_recovery)
+        persisted_recovery = store.get(second_recovery.id)
+        assert persisted_recovery is not None
+        assert persisted_recovery.branch == impl.branch
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{second_recovery.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = ""
+
+        with patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+            rc = _complete_code_task(
+                second_recovery,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                branch_name,
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "missing-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{second_recovery.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+                skip_commit=True,
+            )
+
+        assert rc == 0
+        worktree_git.push_force_with_lease.assert_called_once_with(impl.branch)
+
     def test_select_worktree_base_ref_prefers_origin_when_origin_ahead(self):
         """Base ref selection should choose origin/main when origin is strictly ahead."""
         git = Mock(spec=Git)

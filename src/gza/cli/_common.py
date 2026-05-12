@@ -23,6 +23,7 @@ from rich.markup import escape as rich_escape
 from rich.pager import Pager
 from rich.panel import Panel
 
+from ..branch_resolution import resolve_rebase_target_branch
 from ..config import Config
 from ..console import (
     MAX_PROMPT_DISPLAY,
@@ -1815,20 +1816,34 @@ def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask
     return new_task
 
 
-def _create_retry_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask:
+def _create_retry_task(
+    store: SqliteTaskStore,
+    original_task: DbTask,
+    *,
+    automatic_recovery: bool = False,
+) -> DbTask:
     """Create a fresh retry task pointing to the original task.
 
     For same-branch tasks that already ran on a branch, retries fork a fresh
     branch from that prior branch via ``base_branch``.
+
+    Automatic rebase recoveries are the exception: they must keep targeting the
+    shared implementation branch across the entire recovery chain instead of
+    creating orphan sibling branches from the last failed attempt. Manual
+    ``gza retry`` keeps the historical fresh-branch retry contract.
     """
     assert original_task.id is not None
     retry_same_branch = original_task.same_branch
     retry_base_branch: str | None = None
-    if original_task.same_branch and original_task.branch:
+    if (
+        original_task.same_branch
+        and original_task.branch
+        and not (automatic_recovery and original_task.task_type == "rebase")
+    ):
         retry_same_branch = False
         retry_base_branch = original_task.branch
 
-    return store.add(
+    retry_task = store.add(
         prompt=original_task.prompt,
         task_type=original_task.task_type,
         tags=original_task.tags,
@@ -1845,6 +1860,16 @@ def _create_retry_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask:
         base_branch=retry_base_branch,
         recovery_origin="retry",
     )
+    if (
+        automatic_recovery
+        and original_task.task_type == "rebase"
+        and retry_task.same_branch
+    ):
+        target_branch = resolve_rebase_target_branch(store, original_task)
+        if target_branch:
+            retry_task.branch = target_branch
+            store.update(retry_task)
+    return retry_task
 
 
 def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
@@ -1958,7 +1983,7 @@ def run_with_recovery(
             retry_task = store.get(decision.recovery_task_id)
             assert retry_task is not None
         else:
-            retry_task = _create_retry_task(store, refreshed)
+            retry_task = _create_retry_task(store, refreshed, automatic_recovery=True)
         if on_recovery is not None:
             on_recovery(refreshed, retry_task, decision)
         current_task = retry_task
