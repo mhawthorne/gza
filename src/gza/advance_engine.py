@@ -874,6 +874,17 @@ ADVANCE_RULES: list[AdvanceRule] = [
         ),
     ),
     AdvanceRule(
+        name="failed_rebase_without_successful_review",
+        matches=lambda ctx: _failed_rebase_still_blocks_advance(ctx),
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
+            },
+            reason="rebase-failed-needs-manual-resolution",
+        ),
+    ),
+    AdvanceRule(
         name="closing_review_invariant",
         matches=lambda ctx: ctx.closing_review_action is not None,
         action=lambda ctx: dict(ctx.closing_review_action or {}),
