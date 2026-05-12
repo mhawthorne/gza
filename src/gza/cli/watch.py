@@ -1071,6 +1071,7 @@ def _run_cycle(
             display_task = row.owner_task
             action_type = action.get("type")
             if classify_advance_action(action) == "needs_attention":
+                # Lineage-progress attention comes from the advance action plan only.
                 log.emit_attention(
                     attention_key=f"advance-attention:{display_task.id}:{action_type}",
                     message=_watch_needs_attention_message(display_task, action),
@@ -1241,6 +1242,8 @@ def _run_cycle(
                     message = f"{display_task.id}: {message}"
                 attention = resolve_execution_needs_attention(task, exec_result)
                 if attention is not None and display_task.id is not None:
+                    # Orthogonal to advance-plan classification: the action tried to run
+                    # and the execution layer reported a worker/startup attention state.
                     log.emit_attention(
                         attention_key=f"advance-attention:{display_task.id}:{attention.action['type']}",
                         message=_watch_needs_attention_message(display_task, attention.action),
@@ -1341,21 +1344,6 @@ def _run_cycle(
         decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
         failed_decisions.append((failed, decision))
         if decision.action == "skip":
-            failed_action = _failed_recovery_attention_action(
-                store=store,
-                task=failed,
-                decision=decision,
-                max_recovery_attempts=max_recovery_attempts,
-            )
-            if failed_action is not None:
-                log.emit_attention(
-                    attention_key=(
-                        f"recovery-attention:{failed.id}:"
-                        f"{failed_action.get('needs_attention_reason') or decision.reason_code}"
-                    ),
-                    message=_watch_needs_attention_message(failed, failed_action),
-                )
-                continue
             if restart_failed and show_skipped:
                 log.emit(
                     "SKIP",

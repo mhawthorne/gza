@@ -43,6 +43,47 @@ def _task_count(store) -> int:
     return int(row["c"])
 
 
+def _make_watch_git() -> MagicMock:
+    git = MagicMock()
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.ref_exists.return_value = False
+    git.can_merge.return_value = True
+    git.is_merged.return_value = False
+    git.count_commits_ahead.return_value = 1
+    git.get_diff_stat_parsed.return_value = (1, 1, 0)
+    git.get_diff_numstat.return_value = "1\t0\tfeature.txt\n"
+    return git
+
+
+def _setup_watch_owner_with_failed_rebase(tmp_path: Path, *, failure_reason: str):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Watch implement owner", task_type="implement")
+    store.mark_completed(impl, has_commits=True, branch="feature/watch-owner-attention")
+    assert impl.id is not None
+    store.get_or_create_merge_unit_for_task(impl)
+
+    failed_rebase = store.add(
+        "Failed rebase descendant",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.failure_reason = failure_reason
+    failed_rebase.completed_at = datetime.now(UTC)
+    failed_rebase.branch = "feature/watch-owner-attention"
+    failed_rebase.has_commits = True
+    store.update(failed_rebase)
+    store.get_or_create_merge_unit_for_task(failed_rebase)
+
+    return store, impl, failed_rebase
+
+
 def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: Path) -> None:
     """Pending implement tasks use iterate workers, while plan tasks use plain workers."""
     setup_config(tmp_path)
@@ -888,6 +929,162 @@ def test_watch_cycle_default_mode_attempt_cap_skips_failed_resume_and_starts_pen
     assert spawn_iterate.call_count == 0
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == pending.id
+
+
+def test_watch_cycle_skipped_failed_descendant_does_not_emit_attention_without_owner_plan_attention(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store, _, failed_rebase = _setup_watch_owner_with_failed_rebase(tmp_path, failure_reason="MERGE_CONFLICT")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={"type": "wait_review", "description": "SKIP: waiting for review"},
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is False
+    text = log_path.read_text()
+    assert "ATTENTION" not in text
+    assert failed_rebase.id not in text
+
+
+def test_watch_cycle_owner_plan_attention_emits_once_even_with_skipped_failed_descendant(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store, impl, failed_rebase = _setup_watch_owner_with_failed_rebase(tmp_path, failure_reason="MERGE_CONFLICT")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={
+                "type": "wait_review",
+                "description": "Owner requires manual review",
+                "needs_attention_reason": "owner-needs-attention",
+            },
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is False
+    attention_lines = [line for line in log_path.read_text().splitlines() if "ATTENTION" in line]
+    assert len(attention_lines) == 1
+    assert impl.id in attention_lines[0]
+    assert failed_rebase.id not in attention_lines[0]
+
+
+def test_watch_cycle_actionable_failed_descendant_still_spawns_recovery_worker(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store, _, failed_rebase = _setup_watch_owner_with_failed_rebase(tmp_path, failure_reason="INFRASTRUCTURE_ERROR")
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = _make_watch_git()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={"type": "wait_review", "description": "SKIP: waiting for review"},
+        ),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count + spawn_worker.call_count == 1
+    recovery_children = store.get_based_on_children(failed_rebase.id)
+    assert len(recovery_children) == 1
+    assert recovery_children[0].id != failed_rebase.id
+
+
+def test_watch_cycle_show_skipped_emits_skip_for_failed_descendant_without_attention(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store, impl, failed_rebase = _setup_watch_owner_with_failed_rebase(tmp_path, failure_reason="MERGE_CONFLICT")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={"type": "wait_review", "description": "SKIP: waiting for review"},
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+            show_skipped=True,
+        )
+
+    assert result.work_done is False
+    text = log_path.read_text()
+    assert "ATTENTION" not in text
+    assert any(
+        "SKIP" in line and f"{impl.id} failed rebase: manual_failure_reason" in line
+        for line in text.splitlines()
+    )
+    assert failed_rebase.id not in text
 
 
 def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tmp_path: Path) -> None:
@@ -4869,7 +5066,7 @@ def test_watch_cycle_dedupes_merge_not_default_skip_across_cycles(tmp_path: Path
 
 
 def test_watch_cycle_dedupes_attempt_cap_skip_across_cycles(tmp_path: Path) -> None:
-    """Persistent attempt-cap skip should only log once while condition is unchanged."""
+    """Persistent attempt-cap skip should stay informational and dedupe across cycles."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -4914,8 +5111,9 @@ def test_watch_cycle_dedupes_attempt_cap_skip_across_cycles(tmp_path: Path) -> N
         )
 
     text = log_path.read_text()
-    assert text.count("ATTENTION") == 2
-    assert f'{failed.id} implement "Failed resume attempt" reason=automatic-recovery-disabled automatic recovery is disabled' in text
+    assert text.count("ATTENTION") == 0
+    assert text.count("SKIP") == 1
+    assert f"{failed.id} failed implement: automatic_recovery_disabled" in text
 
 
 def test_watch_cycle_dedupes_wait_review_skip_across_cycles(tmp_path: Path) -> None:
