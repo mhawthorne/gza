@@ -36,7 +36,7 @@ class ResolvedGitRef:
 
 @dataclass(frozen=True)
 class ResolvedMergeSourceRef:
-    """Selected merge source ref plus any operator-visible warning."""
+    """Freshest merge-source selection for advance and merge workflows."""
 
     ref: str | None
     warning: str | None = None
@@ -575,16 +575,6 @@ class Git:
 
         return None
 
-    def resolve_fresh_merge_source_ref(self, branch: str, *, remote: str = "origin") -> str | None:
-        """Return the freshest available ref for merge planning/execution.
-
-        Prefer ``<remote>/<branch>`` when it exists so callers that need the
-        latest pushed tip do not accidentally validate or merge a stale local
-        branch. Fall back to the local branch when no remote-tracking ref is
-        available.
-        """
-        return self.resolve_fresh_merge_source(branch, remote=remote).ref
-
     def resolve_fresh_merge_source(self, branch: str, *, remote: str = "origin") -> ResolvedMergeSourceRef:
         """Return the freshest safe ref for merge planning/execution.
 
@@ -594,35 +584,46 @@ class Git:
         a warning when the two refs have diverged.
         """
         remote_ref = f"{remote}/{branch}"
-        has_local = self.branch_exists(branch)
-        has_remote = self.ref_exists(remote_ref)
+        local_exists = self.branch_exists(branch)
+        remote_exists = self.ref_exists(remote_ref)
 
-        if has_local and has_remote:
-            local_sha = self.rev_parse_if_exists(branch)
-            remote_sha = self.rev_parse_if_exists(remote_ref)
-            if local_sha and remote_sha:
-                if local_sha == remote_sha:
-                    return ResolvedMergeSourceRef(remote_ref)
-
-                local_ahead = self.count_commits_ahead(branch, remote_ref)
-                remote_ahead = self.count_commits_ahead(remote_ref, branch)
-                if local_ahead > 0 and remote_ahead == 0:
-                    return ResolvedMergeSourceRef(branch)
-                if remote_ahead > 0 and local_ahead == 0:
-                    return ResolvedMergeSourceRef(remote_ref)
-                return ResolvedMergeSourceRef(
-                    None,
-                    (
-                        f"Local branch '{branch}' and remote-tracking ref '{remote_ref}' diverged. "
-                        "Push, fetch, or reconcile them before advancing or merging."
-                    ),
-                )
-
-        if has_remote:
+        if remote_exists and not local_exists:
             return ResolvedMergeSourceRef(remote_ref)
-        if has_local:
+        if local_exists and not remote_exists:
             return ResolvedMergeSourceRef(branch)
-        return ResolvedMergeSourceRef(None)
+        if not local_exists and not remote_exists:
+            return ResolvedMergeSourceRef(None)
+
+        local_sha = self.rev_parse_if_exists(branch)
+        remote_sha = self.rev_parse_if_exists(remote_ref)
+        if local_sha and remote_sha and local_sha == remote_sha:
+            return ResolvedMergeSourceRef(remote_ref)
+
+        local_ahead = self.count_commits_ahead(branch, remote_ref)
+        remote_ahead = self.count_commits_ahead(remote_ref, branch)
+        if remote_ahead > 0 and local_ahead == 0:
+            return ResolvedMergeSourceRef(remote_ref)
+        if local_ahead > 0 and remote_ahead == 0:
+            return ResolvedMergeSourceRef(branch)
+        if local_ahead > 0 and remote_ahead > 0:
+            return ResolvedMergeSourceRef(
+                None,
+                (
+                    f"Local branch '{branch}' and remote-tracking ref '{remote_ref}' diverged. "
+                    "Push, fetch, or reconcile them before advancing or merging."
+                ),
+            )
+        return ResolvedMergeSourceRef(
+            None,
+            (
+                f"Unable to determine the freshest merge source between '{branch}' "
+                f"and '{remote_ref}'. Reconcile the refs before advancing or merging."
+            ),
+        )
+
+    def resolve_fresh_merge_source_ref(self, branch: str, *, remote: str = "origin") -> str | None:
+        """Return the freshest merge source ref when it is unambiguous."""
+        return self.resolve_fresh_merge_source(branch, remote=remote).ref
 
     def rev_parse(self, ref: str) -> str:
         """Resolve a ref to its commit SHA."""

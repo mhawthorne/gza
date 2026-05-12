@@ -6,7 +6,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from gza.cli.git_ops import _build_auto_merge_args, _merge_single_task, _resolve_merge_subject, _run_task_backed_rebase, cmd_advance
+from gza.cli.git_ops import (
+    _build_auto_merge_args,
+    _merge_single_task,
+    _resolve_merge_subject,
+    _run_task_backed_rebase,
+    cmd_advance,
+)
 from gza.config import Config
 from gza.git import Git
 from gza.rebase_diff import RebaseDiffResult
@@ -66,6 +72,7 @@ def _init_repo_with_stale_local_and_clean_origin(tmp_path: Path, branch: str) ->
     (tmp_path / "shared.txt").write_text("base\n")
     git._run("add", "shared.txt")
     git._run("commit", "-m", "Initial commit")
+    base_sha = git.rev_parse("HEAD")
 
     git._run("checkout", "-b", branch)
     (tmp_path / "feature.txt").write_text("remote tip\n")
@@ -73,16 +80,9 @@ def _init_repo_with_stale_local_and_clean_origin(tmp_path: Path, branch: str) ->
     git._run("commit", "-m", "Remote feature tip")
     remote_sha = git.rev_parse("HEAD")
 
-    git._run("reset", "--hard", "main")
-    (tmp_path / "shared.txt").write_text("stale local change\n")
-    git._run("add", "shared.txt")
-    git._run("commit", "-m", "Stale local branch")
-
     git._run("checkout", "main")
-    (tmp_path / "shared.txt").write_text("main change\n")
-    git._run("add", "shared.txt")
-    git._run("commit", "-m", "Main branch change")
     git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
+    git._run("update-ref", f"refs/heads/{branch}", base_sha)
     return git
 
 
@@ -91,19 +91,19 @@ def _init_repo_with_stale_origin_and_local_ahead(tmp_path: Path, branch: str) ->
     git._run("init", "-b", "main")
     git._run("config", "user.name", "Test User")
     git._run("config", "user.email", "test@example.com")
-    (tmp_path / "shared.txt").write_text("base\n")
-    git._run("add", "shared.txt")
+    (tmp_path / "base.txt").write_text("base\n")
+    git._run("add", "base.txt")
     git._run("commit", "-m", "Initial commit")
 
     git._run("checkout", "-b", branch)
     (tmp_path / "feature.txt").write_text("remote tip\n")
     git._run("add", "feature.txt")
-    git._run("commit", "-m", "Remote feature tip")
+    git._run("commit", "-m", "Remote tip")
     remote_sha = git.rev_parse("HEAD")
 
     (tmp_path / "feature.txt").write_text("remote tip\nlocal tip\n")
     git._run("add", "feature.txt")
-    git._run("commit", "-m", "Local branch ahead")
+    git._run("commit", "-m", "Local tip")
     git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
     git._run("checkout", "main")
     return git
@@ -114,32 +114,27 @@ def _init_repo_with_diverged_local_and_origin(tmp_path: Path, branch: str) -> Gi
     git._run("init", "-b", "main")
     git._run("config", "user.name", "Test User")
     git._run("config", "user.email", "test@example.com")
-    (tmp_path / "shared.txt").write_text("base\n")
-    git._run("add", "shared.txt")
+    (tmp_path / "base.txt").write_text("base\n")
+    git._run("add", "base.txt")
     git._run("commit", "-m", "Initial commit")
+    base_sha = git.rev_parse("HEAD")
 
     git._run("checkout", "-b", branch)
-    (tmp_path / "feature.txt").write_text("local tip\n")
-    git._run("add", "feature.txt")
-    git._run("commit", "-m", "Local feature tip")
+    (tmp_path / "local.txt").write_text("local\n")
+    git._run("add", "local.txt")
+    git._run("commit", "-m", "Local only")
     local_sha = git.rev_parse("HEAD")
 
-    git._run("checkout", "main")
-    git._run("update-ref", f"refs/remotes/origin/{branch}", local_sha)
+    git._run("update-ref", f"refs/heads/{branch}", base_sha)
     git._run("checkout", branch)
-    (tmp_path / "feature.txt").write_text("local tip\nlocal only\n")
-    git._run("add", "feature.txt")
-    git._run("commit", "-m", "Local branch diverges")
-
-    git._run("checkout", "main")
-    git._run("update-ref", f"refs/remotes/origin/{branch}", local_sha)
-    git._run("checkout", "--detach", local_sha)
-    (tmp_path / "feature.txt").write_text("local tip\nremote only\n")
-    git._run("add", "feature.txt")
-    git._run("commit", "-m", "Remote branch diverges")
+    (tmp_path / "remote.txt").write_text("remote\n")
+    git._run("add", "remote.txt")
+    git._run("commit", "-m", "Remote only")
     remote_sha = git.rev_parse("HEAD")
-    git._run("checkout", branch)
     git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
+
+    git._run("update-ref", f"refs/heads/{branch}", local_sha)
+    git._run("checkout", branch)
     git._run("checkout", "main")
     return git
 
@@ -561,7 +556,7 @@ def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
     )
 
     assert git.branch_exists(branch) is True
-    assert git.can_merge(branch, "main") is False
+    assert git.is_merged(branch, "main") is True
     assert git.can_merge(f"origin/{branch}", "main") is True
 
     rc = cmd_advance(_advance_args(tmp_path, task.id))
@@ -571,7 +566,6 @@ def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
     assert refreshed is not None
     assert refreshed.merge_status == "merged"
     assert git.is_merged(f"origin/{branch}", "main") is True
-    assert git.is_merged(branch, "main") is False
 
     output = capsys.readouterr().out
     assert f"Merging 'origin/{branch}' into 'main'" in output

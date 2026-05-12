@@ -630,7 +630,7 @@ def _merge_single_task(
     merge_subject = resolved.merge_subject
     assert merge_subject.id is not None
     merge_branch = resolved.merge_branch or execution_task.branch
-    merge_source_ref = resolved.merge_source_ref or merge_branch
+    merge_source_ref = resolved.merge_source_ref
     merge_unit_id = resolved.merge_unit_id
 
     # Validate task state
@@ -641,8 +641,12 @@ def _merge_single_task(
         )
         return 1
 
+    if resolved.merge_source_warning:
+        print(f"Error: {resolved.merge_source_warning}")
+        return 1
+
     if not merge_branch or not merge_source_ref:
-        print(f"Error: Task {merge_subject.id} has no branch")
+        print(f"Error: Task {merge_subject.id} has no resolvable merge source")
         return 1
     if resolved.merge_source_warning:
         print(f"Error: {resolved.merge_source_warning}")
