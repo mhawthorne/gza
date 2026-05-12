@@ -1718,14 +1718,25 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
 
 def cmd_set_status(args: argparse.Namespace) -> int:
     """Manually force a task's status to any valid value."""
+    if args.status == "in_progress":
+        print(
+            "Error: 'in_progress' is set by a running worker, not by manual operator action.\n"
+            "       To start work on a task, run `gza work <id>` for pending tasks,\n"
+            "       `gza resume <id>` to reattach to running work, `gza retry <id>`\n"
+            "       for failed tasks, or let `gza watch` pick up a pending task."
+        )
+        return 1
+    if args.status not in {"pending", "completed", "failed", "dropped"}:
+        print(
+            f"Error: Invalid status '{args.status}'. "
+            "Valid statuses: pending, completed, failed, dropped."
+        )
+        return 1
     if args.reason and args.status not in {"failed", "completed"}:
         print(
             "Warning: --reason is only meaningful for 'failed' or 'completed' status "
             f"(current target: '{args.status}')"
         )
-    if args.execution_mode and args.status != "in_progress":
-        print("Error: --execution-mode is only valid when setting status to 'in_progress'")
-        return 1
 
     config = Config.load(args.project_dir)
     store = get_store(config)
@@ -1755,16 +1766,7 @@ def cmd_set_status(args: argparse.Namespace) -> int:
         )
     else:
         task.status = args.status
-    if args.status == "in_progress":
-        if args.execution_mode:
-            task.execution_mode = args.execution_mode
-        else:
-            task.execution_mode = "manual"
-        task.completed_at = None
-        task.failure_reason = None
-        task.completion_reason = None
-        store.update(task)
-    elif args.status == "pending":
+    if args.status == "pending":
         task.completed_at = None
         task.failure_reason = None
         task.completion_reason = None

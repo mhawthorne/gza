@@ -6,7 +6,6 @@ from pathlib import Path
 
 from ..config import Config, ConfigError, discover_project_dir, persist_project_id_if_missing
 from ..db import (
-    KNOWN_EXECUTION_MODES,
     InvalidTaskIdError,
     ManualMigrationRequired,
     MergeTargetResolutionError,
@@ -2415,7 +2414,7 @@ def main() -> int:
     # set-status command
     set_status_parser = subparsers.add_parser(
         "set-status",
-        help="Manually force a task's status (pending, in_progress, completed, failed, dropped)",
+        help="Manually force a task's status (pending, completed, failed, dropped)",
     )
     set_status_parser.add_argument(
         "task_id",
@@ -2424,20 +2423,15 @@ def main() -> int:
     )
     set_status_parser.add_argument(
         "status",
-        choices=["pending", "in_progress", "completed", "failed", "dropped"],
         # 'unmerged' is intentionally excluded: that transition is managed
         # exclusively by the 'advance' workflow and should not be forced manually.
-        help="New status for the task",
+        metavar="STATUS",
+        help="New status for the task (pending, completed, failed, dropped)",
     )
     set_status_parser.add_argument(
         "--reason",
         default=None,
         help="Failure reason for failed status, or completion reason for completed status",
-    )
-    set_status_parser.add_argument(
-        "--execution-mode",
-        choices=sorted(KNOWN_EXECUTION_MODES),
-        help="Execution provenance to persist when status is in_progress",
     )
     add_common_args(set_status_parser)
 

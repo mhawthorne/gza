@@ -12637,7 +12637,6 @@ class TestSetStatusCommand:
         pytest.param("completed", "in_progress", True, id="in_progress-to-completed"),
         pytest.param("dropped", "in_progress", True, id="in_progress-to-dropped"),
         pytest.param("pending", "failed", False, id="failed-to-pending"),
-        pytest.param("in_progress", "failed", False, id="failed-to-in_progress"),
     ])
     def test_set_status_transition(self, tmp_path: Path, target_status: str, initial_status: str, completed_at_set: bool):
         """set-status transitions correctly and manages completed_at."""
@@ -12747,83 +12746,36 @@ class TestSetStatusCommand:
         assert unit.source_branch == "feature/manual-status"
         assert unit.state == "unmerged"
 
-    def test_set_status_in_progress_defaults_execution_mode_to_manual(self, tmp_path: Path):
-        """Manual in-progress transitions should stamp execution_mode=manual."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "A task", "status": "pending"},
-        ])
-        store = make_store(tmp_path)
-        task = store.get_all()[0]
-
-        result = run_gza("set-status", str(task.id), "in_progress", "--project", str(tmp_path))
-        assert result.returncode == 0
-
-        updated = store.get(task.id)
-        assert updated is not None
-        assert updated.execution_mode == "manual"
-
-    @pytest.mark.parametrize("existing_mode", ["worker_foreground", "skill_inline"])
-    def test_set_status_in_progress_without_mode_overwrites_existing_mode_to_manual(
-        self, tmp_path: Path, existing_mode: str
-    ):
-        """Manual in-progress transitions should override stale prior execution provenance."""
+    def test_set_status_in_progress_is_rejected_without_writing_db(self, tmp_path: Path):
+        """Manual in-progress transitions should fail and leave the task unchanged."""
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "failed", "task_type": "review"},
         ])
         store = make_store(tmp_path)
         task = store.get_all()[0]
-        task.execution_mode = existing_mode
+        task.execution_mode = "skill_inline"
+        task.failure_reason = "Original failure"
         store.update(task)
-
-        result = run_gza("set-status", str(task.id), "in_progress", "--project", str(tmp_path))
-        assert result.returncode == 0
-
-        updated = store.get(task.id)
-        assert updated is not None
-        assert updated.execution_mode == "manual"
-
-        shown = run_gza("show", str(task.id), "--project", str(tmp_path))
-        assert shown.returncode == 0
-        assert "Execution Mode: manual" in shown.stdout
-
-    def test_set_status_in_progress_accepts_explicit_execution_mode(self, tmp_path: Path):
-        """in_progress transitions can persist explicit execution provenance."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "A task", "status": "pending", "task_type": "review"},
-        ])
-        store = make_store(tmp_path)
-        task = store.get_all()[0]
 
         result = run_gza(
             "set-status",
             str(task.id),
             "in_progress",
-            "--execution-mode",
-            "skill_inline",
             "--project",
             str(tmp_path),
         )
-        assert result.returncode == 0
-
-        # Simulate inline runner synthetic provenance log written after transition.
-        reloaded = store.get(task.id)
-        assert reloaded is not None
-        reloaded.log_file = ".gza/logs/inline-in-progress.log"
-        store.update(reloaded)
-        log_path = tmp_path / reloaded.log_file
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(
-            '{"type":"gza","subtype":"provenance","message":"Execution mode: inline skill","skill":"gza-task-run","inline":true}\n'
-        )
-
-        shown = run_gza("show", str(task.id), "--project", str(tmp_path))
-        assert shown.returncode == 0
-        assert "Execution Mode: skill_inline" in shown.stdout
+        assert result.returncode == 1
+        assert "'in_progress' is set by a running worker" in result.stdout
+        assert "gza work <id>" in result.stdout
+        assert "gza resume <id>" in result.stdout
+        assert "gza retry <id>" in result.stdout
+        assert "gza watch" in result.stdout
 
         updated = store.get(task.id)
         assert updated is not None
-        assert updated.status == "in_progress"
+        assert updated.status == "failed"
         assert updated.execution_mode == "skill_inline"
+        assert updated.failure_reason == "Original failure"
 
     def test_set_status_failed_preserves_skill_inline_execution_mode(self, tmp_path: Path):
         """Inline runs that fail before mark-completed should retain skill_inline provenance."""
@@ -12832,17 +12784,9 @@ class TestSetStatusCommand:
         ])
         store = make_store(tmp_path)
         task = store.get_all()[0]
-
-        result = run_gza(
-            "set-status",
-            str(task.id),
-            "in_progress",
-            "--execution-mode",
-            "skill_inline",
-            "--project",
-            str(tmp_path),
-        )
-        assert result.returncode == 0
+        task.execution_mode = "skill_inline"
+        task.status = "in_progress"
+        store.update(task)
 
         fail_result = run_gza(
             "set-status",
@@ -12864,8 +12808,8 @@ class TestSetStatusCommand:
         assert updated.status == "failed"
         assert updated.execution_mode == "skill_inline"
 
-    def test_set_status_execution_mode_rejected_for_non_in_progress(self, tmp_path: Path):
-        """--execution-mode should be rejected unless status is in_progress."""
+    def test_set_status_removed_execution_mode_flag_errors(self, tmp_path: Path):
+        """The removed --execution-mode flag should be rejected by the parser."""
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "pending"},
         ])
@@ -12882,8 +12826,8 @@ class TestSetStatusCommand:
             str(tmp_path),
         )
 
-        assert result.returncode == 1
-        assert "--execution-mode is only valid" in result.stdout
+        assert result.returncode == 2
+        assert "unrecognized arguments: --execution-mode skill_inline" in result.stderr
 
     def test_set_status_reason_warns_for_statuses_without_reason_support(self, tmp_path: Path):
         """set-status warns when --reason is used outside failed/completed transitions."""
@@ -12916,6 +12860,18 @@ class TestSetStatusCommand:
         result = run_gza("set-status", str(task.id), "bogus", "--project", str(tmp_path))
 
         assert result.returncode != 0
+        assert "Valid statuses: pending, completed, failed, dropped." in result.stdout
+
+    def test_set_status_help_omits_in_progress_and_execution_mode(self, tmp_path: Path):
+        """set-status help should only advertise operator-assertable statuses."""
+        setup_db_with_tasks(tmp_path, [])
+
+        result = run_gza("set-status", "--help", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "pending, completed, failed, dropped" in result.stdout
+        assert "in_progress" not in result.stdout
+        assert "--execution-mode" not in result.stdout
 
     @pytest.mark.parametrize("target_status", ["pending", "dropped"])
     def test_set_status_clears_failure_reason(self, tmp_path: Path, target_status: str):

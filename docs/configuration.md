@@ -883,7 +883,7 @@ When execution provenance is known, `gza show` also includes:
 - `Execution Mode: worker_background` for detached worker runs
 - `Execution Mode: worker_foreground` for foreground worker runs
 - `Execution Mode: foreground_inline` for `gza run-inline` runner-managed foreground runs
-- `Execution Mode: manual` for manual `set-status ... in_progress` transitions without an explicit mode
+- `Execution Mode: manual` for legacy tasks that were manually forced to `in_progress` in older releases
 - `Execution Mode: skill_inline` for inline skill runs (for example `gza-task-run`)
 
 For completed `review` tasks, `gza show` also includes:
@@ -1636,18 +1636,19 @@ When shared DB mode is active (explicit `db_path`) and a legacy local `.gza/gza.
 Manually force a task's status.
 
 ```bash
-uv run gza set-status <task_id> <status> [--reason <text>] [--execution-mode <mode>]
+uv run gza set-status <task_id> <status> [--reason <text>]
 ```
 
 `task_id` must be a full prefixed task ID (for example `gza-1234`).
 
-Valid statuses: `pending`, `in_progress`, `completed`, `failed`, `dropped`.
+Valid statuses: `pending`, `completed`, `failed`, `dropped`.
+
+`in_progress` is rejected. That state is set by a running worker, not by manual
+operator action. To start work on a task, use `gza work <task_id>`, `gza resume
+<task_id>`, `gza retry <task_id>`, or let `gza watch` pick up a pending task.
 
 `--reason` stores a failure reason for `failed` tasks and a completion reason for
 `completed` tasks. Other statuses ignore it and emit a warning.
-
-`--execution-mode` is only valid with `in_progress`, and accepts:
-`worker_background`, `worker_foreground`, `foreground_inline`, `foreground_attach_resume`, `manual`, `skill_inline`.
 
 ### sync-report
 
