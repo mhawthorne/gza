@@ -923,6 +923,130 @@ def test_failed_rebase_with_only_older_review_still_requires_manual_resolution(
     assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
 
 
+def test_failed_rebase_is_superseded_by_later_review_clear_event(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/failed-rebase-cleared-late"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Initial review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    failed_rebase.branch = impl.branch
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    store.update(failed_rebase)
+
+    impl.review_cleared_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    store.update(impl)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            can_merge_by_ref={("origin/feat/failed-rebase-cleared-late", "main"): True},
+            existing_refs={"origin/feat/failed-rebase-cleared-late"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge (previous review addressed)"
+
+
+def test_failed_rebase_with_older_review_clear_event_still_requires_manual_resolution(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/failed-rebase-cleared-too-early"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Initial review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    failed_rebase.branch = impl.branch
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    store.update(failed_rebase)
+
+    impl.review_cleared_at = datetime(2026, 5, 10, 10, 30, tzinfo=UTC)
+    store.update(impl)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            can_merge_by_ref={("origin/feat/failed-rebase-cleared-too-early", "main"): True},
+            existing_refs={"origin/feat/failed-rebase-cleared-too-early"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+
+
 def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)

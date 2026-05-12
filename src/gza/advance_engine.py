@@ -365,6 +365,10 @@ def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
         if latest_completed_rebase_time > failed_rebase_time:
             return False
 
+    review_cleared_at = ctx.task.review_cleared_at
+    if review_cleared_at is not None and _normalize_time(review_cleared_at) >= failed_rebase_time:
+        return False
+
     latest_review = ctx.latest_completed_review
     if latest_review is None:
         return True
@@ -372,9 +376,6 @@ def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
     latest_review_time = _task_event_time(latest_review)
     if latest_review_time < failed_rebase_time:
         return True
-
-    if ctx.review_cleared:
-        return False
 
     return ctx.review_verdict not in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
 
