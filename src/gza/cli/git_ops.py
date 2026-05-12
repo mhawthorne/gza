@@ -22,7 +22,7 @@ from ..console import (
     prompt_available_width,
     shorten_prompt,
 )
-from ..db import DB_UNSET, SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from ..db import DB_UNSET, MergeTargetResolutionError, SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..dependency_preconditions import task_is_merged
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import (
@@ -431,6 +431,20 @@ def _task_merge_unit_state(store: SqliteTaskStore, task: DbTask, *, target_branc
         if unit is not None:
             return unit.state
     return task.merge_status
+
+
+def _resolve_advance_target_branch(
+    store: SqliteTaskStore,
+    git: Git,
+    *,
+    task: DbTask | None,
+) -> str:
+    if task is not None and task.id is not None:
+        unit = store.resolve_merge_unit_for_task(task.id)
+        if unit is not None and unit.target_branch:
+            return unit.target_branch
+        return store.default_merge_target(strict=True)
+    return git.current_branch()
 
 
 def _resolve_merge_target_task(
@@ -1836,6 +1850,17 @@ def _execute_merge_action(
     merge_subject = resolved_subject.merge_subject if resolved_subject is not None else task
     assert merge_subject.id is not None
 
+    if execution_branch != target_branch:
+        print(
+            f"Error: Advance merge for task {merge_subject.id} targets '{target_branch}', "
+            f"but the active checkout is '{execution_branch}'. Switch to '{target_branch}' and rerun."
+        )
+        return _MergeActionResult(
+            rc=1,
+            created_followups=created_followups,
+            reused_followups=reused_followups,
+        )
+
     if action.get("type") == "merge_with_followups":
         review_task = action.get("review_task")
         followup_findings = action.get("followup_findings")
@@ -2005,7 +2030,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if _task_is_already_merged(store, task):
                 print(f"Task {task_id} is already merged")
                 return 0
-        target_branch = git.current_branch()
+        try:
+            target_branch = _resolve_advance_target_branch(store, git, task=task)
+        except MergeTargetResolutionError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         owner_rows = list(
             query_lineage_owner_rows(
                 store,
@@ -2045,7 +2074,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 )
             ]
     else:
-        target_branch = git.current_branch()
+        target_branch = _resolve_advance_target_branch(store, git, task=None)
         owner_rows = list(
             query_lineage_owner_rows(
                 store,
@@ -2079,8 +2108,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     # Use the currently checked-out branch as the target for conflict checks,
     # merge execution, and rebase task creation.
+    actual_current_branch = git.current_branch()
     if target_branch is None:
-        target_branch = git.current_branch()
+        target_branch = actual_current_branch
     use_iterate_mode = _advance_uses_iterate(config)
 
     def _worker_args() -> argparse.Namespace:
@@ -2151,13 +2181,23 @@ def cmd_advance(args: argparse.Namespace) -> int:
     plan: list[tuple[LineageOwnerRow, DbTask, dict[str, Any]]] = []
     for row in owner_rows:
         action_task = row.lifecycle_action_task or row.recovery_action_task or row.owner_task
-        action = determine_next_action(
+        precomputed_action = row.next_action
+        action = (
+            precomputed_action
+            if (
+                precomputed_action is not None
+                and str(precomputed_action.get("type", "")) != "unknown"
+                and row.lifecycle_action_task is None
+                and row.recovery_action_task is None
+            )
+            else determine_next_action(
             config,
             store,
             git,
             action_task,
             target_branch,
             max_resume_attempts=max_resume_attempts,
+            )
         )
         plan.append((row, action_task, action))
 
@@ -2249,7 +2289,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 _color = _advance_action_color(action['type'])
                 console.print(f"      [{_color}]→ {description}[/{_color}]")
                 print()
-        else:
+        elif not preview_attention_plan:
             print("No eligible tasks to advance")
         _print_needs_attention_section(preview_attention_plan)
         if plan:
@@ -2296,7 +2336,6 @@ def cmd_advance(args: argparse.Namespace) -> int:
             _print_needs_attention_section(preview_attention_plan)
             print()
     elif preview_attention_plan:
-        print("No eligible tasks to advance")
         _print_needs_attention_section(preview_attention_plan)
         print()
 
@@ -2399,7 +2438,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 task,
                 action,
                 target_branch=target_branch,
-                current_branch=target_branch,
+                current_branch=actual_current_branch,
             )
             if merge_result.created_followups:
                 created_ids = ", ".join(str(t.id) for t in merge_result.created_followups if t.id is not None)

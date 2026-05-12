@@ -89,6 +89,7 @@ class _LineageIndexes:
     root_by_task_id: dict[str, DbTask]
     owner_by_task_id: dict[str, DbTask]
     members_by_owner_id: dict[str, list[DbTask]]
+    skipped_same_branch_members_by_root_id: dict[str, list[DbTask]]
     merge_units_by_task_id: dict[str, MergeUnit]
     impl_based_on_ids: set[str]
 
@@ -103,6 +104,16 @@ def _normalize_dt(value: datetime | None) -> datetime:
 
 def _task_event_time(task: DbTask) -> datetime:
     return _normalize_dt(task.completed_at or task.created_at)
+
+
+def _actionable_lifecycle_tasks(unresolved_tasks: Sequence[DbTask]) -> list[DbTask]:
+    return [task for task in unresolved_tasks if task.status in {"completed", "unmerged", "dropped"}]
+
+
+def _canonical_impl_branch_candidates(owner: DbTask, actionable_tasks: Sequence[DbTask]) -> list[DbTask]:
+    if owner.task_type != "implement" or not owner.branch:
+        return []
+    return [task for task in actionable_tasks if task.branch == owner.branch]
 
 
 def _matches_task_filters(
@@ -311,6 +322,7 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
     root_by_task_id: dict[str, DbTask] = {}
     owner_by_task_id: dict[str, DbTask] = {}
     members_by_owner_id: dict[str, list[DbTask]] = defaultdict(list)
+    skipped_same_branch_members_by_root_id: dict[str, list[DbTask]] = defaultdict(list)
 
     for task in tasks:
         if task.id is None:
@@ -335,6 +347,8 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
         owner_by_task_id[task.id] = owner
         if owner.id is not None:
             members_by_owner_id[owner.id].append(task)
+        if _is_broken_same_branch_owner(owner=owner, root=root) and root.id is not None:
+            skipped_same_branch_members_by_root_id[root.id].append(task)
 
     return _LineageIndexes(
         tasks=tasks,
@@ -344,6 +358,7 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
         root_by_task_id=root_by_task_id,
         owner_by_task_id=owner_by_task_id,
         members_by_owner_id=members_by_owner_id,
+        skipped_same_branch_members_by_root_id=skipped_same_branch_members_by_root_id,
         merge_units_by_task_id=merge_units_by_task_id,
         impl_based_on_ids=store.get_impl_based_on_ids(),
     )
@@ -447,10 +462,23 @@ def _select_representative_completed_task(
     owner = snapshot.owner_task
     if owner.id is not None and owner.task_type in {"plan", "explore"} and owner.id not in impl_based_on_ids:
         return owner
-    actionable = [task for task in unresolved_tasks if task.status in {"completed", "unmerged", "dropped"}]
+    actionable = _actionable_lifecycle_tasks(unresolved_tasks)
     if not actionable:
         return None
     owner_unit = snapshot.merge_units_by_task_id.get(owner.id or "")
+    if owner.task_type == "implement" and owner.branch and owner_unit is not None:
+        rep = store.resolve_merge_unit_representative_task(
+            owner_unit,
+            preferred_task_id=owner.id,
+            require_actionable=True,
+        )
+        if rep is not None and rep.branch == owner.branch:
+            return rep
+    canonical_branch_tasks = _canonical_impl_branch_candidates(owner, actionable)
+    if canonical_branch_tasks:
+        return max(canonical_branch_tasks, key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)))
+    if owner.task_type == "implement" and owner.branch and any(task.branch for task in actionable):
+        return None
     if owner_unit is not None:
         rep = store.resolve_merge_unit_representative_task(
             owner_unit,
@@ -460,6 +488,27 @@ def _select_representative_completed_task(
         if rep is not None:
             return rep
     return max(actionable, key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)))
+
+
+def _requires_impl_branch_manual_resolution(owner: DbTask, unresolved_tasks: Sequence[DbTask]) -> bool:
+    actionable = _actionable_lifecycle_tasks(unresolved_tasks)
+    if not actionable:
+        return False
+    if _canonical_impl_branch_candidates(owner, actionable):
+        return False
+    if owner.task_type != "implement" or not owner.branch:
+        return False
+    return any(task.branch for task in actionable)
+
+
+def _is_broken_same_branch_owner(*, owner: DbTask, root: DbTask) -> bool:
+    if owner.id is None or root.id is None or owner.id == root.id:
+        return False
+    if root.task_type != "implement":
+        return False
+    if not owner.same_branch or not owner.branch or not root.branch:
+        return False
+    return owner.branch != root.branch
 
 
 def _has_completed_same_type_descendant(indexes: _LineageIndexes, task: DbTask) -> bool:
@@ -590,6 +639,8 @@ def query_lineage_owner_rows(
             if task_ids_filter is None or not any(task.id in task_ids_filter for task in owner_members if task.id is not None):
                 continue
         root = indexes.root_by_task_id.get(owner.id or "", owner)
+        if _is_broken_same_branch_owner(owner=owner, root=root):
+            continue
         merge_units_by_member = {
             task.id: indexes.merge_units_by_task_id[task.id]
             for task in owner_members
@@ -598,6 +649,7 @@ def query_lineage_owner_rows(
         failed_leaves: list[DbTask] = []
         recovery_completed_by_failed_id: dict[str, DbTask] = {}
         unresolved_tasks: list[DbTask] = []
+        skipped_same_branch_members = indexes.skipped_same_branch_members_by_root_id.get(owner_id, ())
 
         merged_owner_branch = any(
             _task_is_effectively_merged(task, merge_units_by_task_id=merge_units_by_member)
@@ -651,6 +703,24 @@ def query_lineage_owner_rows(
             if is_lineage_complete(task, store=store):
                 continue
             if matches:
+                unresolved_tasks.append(task)
+
+        for task in sorted(
+            skipped_same_branch_members,
+            key=lambda item: (_task_event_time(item), task_id_numeric_key(item.id)),
+        ):
+            if task.id is None:
+                continue
+            merge_unit = indexes.merge_units_by_task_id.get(task.id)
+            if not _matches_task_filters(
+                task,
+                query,
+                tag_matcher=task_matches_tag_filters,
+                merge_unit=merge_unit,
+            ):
+                continue
+            explicit_merge_state = _effective_merge_state(task, merge_unit=merge_unit)
+            if task.status in {"completed", "unmerged"} and explicit_merge_state == "unmerged":
                 unresolved_tasks.append(task)
 
         snapshot = LineageOwnerSnapshot(
@@ -735,11 +805,18 @@ def query_lineage_owner_rows(
             recovery_action_task = recovery_leaf_task
         if planning_task is None:
             planning_task = recovery_action_task
-        if planning_task is None:
+        action: dict[str, Any] | None = None
+        if planning_task is None and _requires_impl_branch_manual_resolution(owner, unresolved_tasks):
+            action = {
+                "type": "needs_discussion",
+                "description": "SKIP: no descendant on the impl branch; manual resolution required",
+                "needs_attention_reason": "no-descendant-on-the-impl-branch",
+            }
+        if planning_task is None and action is None:
             continue
 
-        action: dict[str, Any] | None = None
-        if config is not None and git is not None and target_branch:
+        if action is None and config is not None and git is not None and target_branch:
+            assert planning_task is not None
             action = determine_next_action(
                 config,
                 store,

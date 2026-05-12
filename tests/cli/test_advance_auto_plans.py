@@ -9,7 +9,6 @@ from unittest.mock import Mock, patch
 from gza.cli.git_ops import cmd_advance
 from gza.git import GitError
 from gza.recovery_engine import _MergeContext
-
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -288,6 +287,151 @@ def test_advance_create_implement_respects_batch_limit(tmp_path: Path, capsys) -
     assert rc == 0
     assert len(spawn_calls) == 1
     assert "batch limit reached" in output
+
+
+def test_advance_explicit_impl_uses_canonical_target_and_skips_orphan_rebase_branch(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = _create_completed_implement(store, "Implement feature")
+    assert impl.id is not None
+    _create_completed_review(store, impl, verdict="APPROVED")
+
+    orphan = store.add("Completed orphan rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert orphan.id is not None
+    orphan.status = "completed"
+    orphan.completed_at = datetime.now(UTC)
+    orphan.branch = "feature/orphan"
+    orphan.merge_status = "unmerged"
+    orphan.has_commits = True
+    store.update(orphan)
+
+    orphan_unit = store.create_merge_unit(
+        source_branch=orphan.branch,
+        target_branch="main",
+        owner_task_id=orphan.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
+    store.dual_write_legacy_merge_status(orphan_unit.id)
+
+    outputs: list[str] = []
+    for current_branch in ("main", impl.branch):
+        with patch("gza.cli.git_ops.Git", return_value=_mock_git(current_branch=current_branch)):
+            rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
+        assert rc == 0
+        captured = capsys.readouterr()
+        outputs.append(captured.out)
+        assert "Would advance 1 task(s):" in captured.out
+        assert str(impl.id) in captured.out
+        assert "Merge (review APPROVED)" in captured.out
+        assert str(orphan.id) not in captured.out
+        assert "Merge task (no review yet)" not in captured.out
+
+    assert outputs[0] == outputs[1]
+
+
+def test_advance_explicit_task_without_merge_unit_uses_strict_non_main_default_target(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/no-merge-unit"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    called_targets: list[str] = []
+
+    def _record_target(*args, **kwargs):
+        called_targets.append(args[4])
+        return {"type": "skip", "description": "no-op for target capture"}
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git(current_branch="feature/local")),
+        patch("gza.git.Git.default_branch", return_value="release"),
+        patch("gza.cli.git_ops.determine_next_action", side_effect=_record_target),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
+
+    assert rc == 0
+    assert called_targets == ["release"]
+
+
+def test_advance_explicit_task_errors_when_default_target_cannot_be_resolved(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/no-default-target"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    with patch("gza.git.Git.default_branch", side_effect=RuntimeError("git failure")):
+        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Could not determine default merge target" in captured.err
+    assert "git failure" in captured.err
+    assert "Would advance" not in captured.out
+
+
+def test_advance_dry_run_shows_attention_for_orphan_owned_merge_unit_without_noop_banner(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "in_progress"
+    impl.branch = "feature/canonical"
+    impl.has_commits = True
+    store.update(impl)
+
+    orphan = store.add("Completed orphan rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert orphan.id is not None
+    orphan.status = "completed"
+    orphan.completed_at = datetime.now(UTC)
+    orphan.branch = "feature/orphan"
+    orphan.merge_status = "unmerged"
+    orphan.has_commits = True
+    store.update(orphan)
+
+    orphan_unit = store.create_merge_unit(
+        source_branch=orphan.branch,
+        target_branch="main",
+        owner_task_id=orphan.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
+    store.dual_write_legacy_merge_status(orphan_unit.id)
+
+    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
+        rc = cmd_advance(_advance_args(tmp_path, dry_run=True))
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Would advance" not in captured.out
+    assert "No eligible tasks to advance" not in captured.out
+    assert "Needs attention" in captured.out
+    assert str(impl.id) in captured.out
+    assert "no descendant on the impl branch" in captured.out
 
 
 def test_advance_new_pending_implement_iterate_spawn_marks_auto_iterate(tmp_path: Path) -> None:

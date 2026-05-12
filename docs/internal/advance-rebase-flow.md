@@ -4,7 +4,7 @@
 
 When `gza advance` encounters a completed task whose branch has merge conflicts with the currently checked-out branch (the advance target branch), it follows this flow (see `evaluate_advance_rules` in `src/gza/advance_engine.py`):
 
-1. **Detect conflicts**: `git.can_merge(task.branch, target_branch)` returns `False`, where `target_branch` is determined at runtime via `git.current_branch()`
+1. **Detect conflicts**: `git.can_merge(task.branch, target_branch)` returns `False`, where `target_branch` is the explicit advance target for the lineage. In the default multi-task flow this is `git.current_branch()`, while explicit `gza advance <task-id>` planning uses the lineage's canonical merge target so the result is stable across worktrees. For non-dry explicit merges, advance also requires the active checkout to already be on that resolved target branch; otherwise it refuses execution instead of mutating a different checkout.
 2. **Check for existing rebase children**: Query `store.get_lineage_children(task.id)` for any child tasks with `task_type="rebase"`
 3. **Decide action based on rebase child status**:
    - `pending` or `in_progress` → skip (rebase already running, avoid duplicates)
@@ -40,7 +40,7 @@ The worktree may have uncommitted changes (e.g., from provider initialization). 
 
 If a rebase task fails for an automatically recoverable reason, the standard failed-task recovery engine may create a follow-up rebase attempt. Those recovery retries must keep `same_branch=True` semantics against the original implementation branch so the completed rebase force-pushes back to the implementation branch instead of creating a sibling `*-rebase-branch-*` orphan. Recovery branch resolution must walk past any failed orphan recovery descendants and re-anchor on the original implementation branch (or the oldest recorded rebase branch if the implementation row no longer has one recorded).
 
-Existing orphan recovery branches created before this behavior was fixed are left in place intentionally. Per project policy, branch cleanup is an operator concern rather than an automatic migration; future automatic recoveries simply stop targeting those orphan branches.
+Existing orphan recovery branches created before this behavior was fixed are left in place intentionally. Per project policy, branch cleanup is an operator concern rather than an automatic migration; future automatic recoveries simply stop targeting those orphan branches, and advance planning ignores divergent `same_branch=True` fork owners instead of treating them as merge candidates.
 
 ## Relationship to `gza rebase` CLI command
 

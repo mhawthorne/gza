@@ -2,11 +2,13 @@
 
 import argparse
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from gza.cli.git_ops import _merge_single_task, _run_task_backed_rebase
+from gza.cli.git_ops import _merge_single_task, _run_task_backed_rebase, cmd_advance
 from gza.config import Config
+from gza.git import Git
 
 from .conftest import make_store, setup_config
 
@@ -146,3 +148,88 @@ def test_run_task_backed_rebase_surfaces_resolution_warnings_and_preserves_exist
     output = capsys.readouterr()
     assert "unexpected error resolving ref 'feature/rebased': boom" in output.err
     assert "unexpected error resolving ref 'main': boom" in output.err
+
+
+def test_advance_explicit_merge_refuses_when_checkout_does_not_match_canonical_target(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_text = config_path.read_text()
+    config_path.write_text(config_text + "advance_requires_review: false\n")
+
+    store = make_store(tmp_path)
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "file.txt").write_text("initial")
+    git._run("add", "file.txt")
+    git._run("commit", "-m", "Initial commit")
+    git._run("add", "gza.yaml")
+    git._run("commit", "-m", "Track config")
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/advance-explicit-refusal"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: APPROVED**"
+    store.update(review)
+
+    git._run("checkout", "-b", task.branch)
+    (tmp_path / "feature.txt").write_text("feature content\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Add feature")
+    git._run("checkout", "main")
+
+    worktree_path = tmp_path / "worktrees" / "advance-explicit-refusal"
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    git._run("worktree", "add", str(worktree_path), task.branch)
+    real_worktree_git = Git(worktree_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_id=task.id,
+        dry_run=False,
+        auto=True,
+        max=None,
+        batch=None,
+        no_docker=True,
+        force=False,
+        plans=False,
+        unimplemented=False,
+        create=False,
+        no_resume_failed=False,
+        max_resume_attempts=None,
+        advance_type=None,
+        new=False,
+        max_review_cycles=None,
+        squash_threshold=None,
+    )
+
+    with patch("gza.cli.git_ops.Git", return_value=real_worktree_git):
+        rc = cmd_advance(args)
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "Will advance 1 task(s):" in output
+    assert "Merge (review APPROVED)" in output
+    assert (
+        f"Error: Advance merge for task {task.id} targets 'main', but the active checkout is "
+        f"'{task.branch}'. Switch to 'main' and rerun."
+    ) in output
+    assert "1 errors" in output
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+    assert git.is_merged(task.branch, "main") is False

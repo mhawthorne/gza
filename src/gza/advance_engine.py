@@ -546,7 +546,11 @@ def resolve_advance_context(
         )
 
     can_merge = git.can_merge(task.branch, target_branch)
-    rebase_children = [child for child in store.get_lineage_children(task.id) if child.task_type == "rebase"]
+    rebase_children = [
+        child
+        for child in store.get_lineage_children(task.id)
+        if child.task_type == "rebase" and (task.branch is None or child.branch is None or child.branch == task.branch)
+    ]
     rebase_pending_or_running = next((c for c in rebase_children if c.status in {"pending", "in_progress"}), None)
     rebase_failed = next((c for c in rebase_children if c.status == "failed"), None)
 

@@ -34,7 +34,7 @@ Advance collects owner rows from one shared source:
 
 1. **Lineage owner rows**: `src/gza/lineage_query.py::query_lineage_owner_rows(...)` materializes one in-memory lineage snapshot from `store.get_all()`, groups tasks by branch/merge ownership, evaluates one lineage-resolved predicate, and returns one canonical row per unresolved owner. The same owner-row query now feeds `gza incomplete`, `gza advance`, and the `gza watch --restart-failed` recovery queue.
 
-2. **Completed lifecycle work inside the owner row**: Completed `merge_status='unmerged'` compatibility rows, merge-unit-backed unmerged work, and completed plan/explore sources all surface through the row's `lifecycle_action_task` and `next_action`. Merge lifecycle collection is merge-unit scoped: each active unit contributes at most one lifecycle owner candidate, and merge execution attributes provenance back to the unit owner even when a descendant task triggered the action. In the no-explicit-task path, `cmd_advance()` passes `git.current_branch()` as the target branch, so completed work only participates when its merge unit targets the currently checked-out branch. Legacy rows with no resolvable merge unit remain compatibility-oriented fallback candidates instead of being branch-target-filtered away.
+2. **Completed lifecycle work inside the owner row**: Completed `merge_status='unmerged'` compatibility rows, merge-unit-backed unmerged work, and completed plan/explore sources all surface through the row's `lifecycle_action_task` and `next_action`. Merge lifecycle collection is merge-unit scoped: each active unit contributes at most one lifecycle owner candidate, and merge execution attributes provenance back to the unit owner even when a descendant task triggered the action. In the no-explicit-task path, `cmd_advance()` passes `git.current_branch()` as the target branch, so completed work only participates when its merge unit targets the currently checked-out branch. For explicit `gza advance <task-id>` planning, `cmd_advance()` instead resolves the lineage's canonical merge target (the task's merge-unit target when present, otherwise the project's strict default merge target) so the next action is deterministic across worktrees. Non-dry explicit merge execution must still run on that exact target branch; if the active checkout differs, advance fails closed and tells the operator to switch branches instead of merging on the wrong checkout. Legacy rows with no resolvable merge unit remain compatibility-oriented fallback candidates instead of being branch-target-filtered away.
 
 3. **Failed-task recovery inside the owner row**: Failed leaves are filtered through the same bounded recovery policy used by `decide_failed_task_recovery(...)`. That policy can classify candidates as `resume`, `retry`, or manual review required, but the command no longer performs a second standalone failed-task sweep to build the plan. Rows whose authoritative action is recovery expose `row.recovery_action_task` / `row.recovery_leaf_task`; rows whose failed leaf has already handed off to newer completed lifecycle work keep the owner row and its `lifecycle_action_task` so merge/review/rebase planning remains eligible independently. Failed ancestors are omitted silently once the same automatic recovery intent has completed, whether that completion sits on the failed task's own recovery-only `based_on` chain or on a sibling resume/retry of the same failed parent. The completed recovery task is then handled through the ordinary completed-task rules (merge, rebase, review, or dependency wait) instead of re-printing a permanent `SKIP: recovery child/descendant already completed` row. Failed `review` and `rebase` tasks whose structured target implementation is already `merged` are omitted silently because no advance/watch/iterate action can move them forward. Completed same-branch `improve` tasks still remain visible because they can represent real post-merge follow-up work, but failed same-branch improves fall back to the landed-lineage suppression check because a failed attempt on an already merged branch did not land any additional work. Failed tasks are also omitted when their own branch tip is already reachable from the default branch, or when another merged task in the same canonical lineage owns the same branch/implementation branch, because the code has already landed even if the failed row's `merge_status` is stale. If branch reachability probes fail after the default branch is known, `advance --dry-run` surfaces one warning that only git branch reachability suppression is unavailable for this run; metadata-based same-lineage merged-task suppression may still apply, so failed-row visibility remains conservative only for the git-reachability decision. If a project-backed store cannot resolve the real default merge target at all, failed-task recovery now raises `MergeTargetResolutionError` instead of silently assuming `main`.
 
@@ -71,19 +71,22 @@ For each task, `evaluate_advance_rules()` returns an action from `src/gza/advanc
 
 ### 3. Merge conflicts
 
-Conflict detection uses the currently checked-out branch as the merge target (`target_branch = git.current_branch()`).
+Conflict detection uses the same target-branch resolution as task collection:
+
+- Default `gza advance` uses the currently checked-out branch as the merge target (`target_branch = git.current_branch()`).
+- Explicit `gza advance <task-id>` uses the lineage's canonical merge target (`_resolve_advance_target_branch()`): the task's merge-unit target when present, otherwise the project's strict default merge target. If that target cannot be resolved, the command errors instead of silently assuming `main`.
 
 | Condition | Action |
 |-----------|--------|
-| Branch cannot merge into current branch AND rebase child is `pending`/`in_progress` | `skip` — rebase already running |
-| Branch cannot merge into current branch AND rebase child is `failed` | `needs_discussion` — manual intervention required |
-| Branch cannot merge into current branch AND no active rebase child | `needs_rebase` — create rebase task |
+| Branch cannot merge into the resolved target branch AND rebase child is `pending`/`in_progress` | `skip` — rebase already running |
+| Branch cannot merge into the resolved target branch AND rebase child is `failed` | `needs_discussion` — manual intervention required |
+| Branch cannot merge into the resolved target branch AND no active rebase child | `needs_rebase` — create rebase task |
 
 ### 4. Post-rebase review invalidation
 
 | Condition | Action |
 |-----------|--------|
-| A completed rebase exists that is newer than the latest review | `create_review` — rebase may have introduced changes |
+| A completed rebase on the implementation branch exists that is newer than the latest review | `create_review` — rebase may have introduced changes |
 
 ### 5. Review state (when reviews exist)
 

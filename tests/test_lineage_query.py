@@ -220,3 +220,126 @@ def test_query_lineage_owner_rows_hides_failed_resume_resolved_by_completed_sibl
     }
     assert failed_resume.id not in unresolved_ids
     assert failed_resume.id not in failed_leaf_ids
+
+
+def test_query_lineage_owner_rows_prefers_impl_branch_over_orphan_rebase_owner(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _set_completed(
+        impl,
+        when=datetime(2026, 5, 12, 9, 0, tzinfo=UTC),
+        branch="feature/canonical",
+        has_commits=True,
+    )
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    impl_unit = store.create_merge_unit(
+        source_branch=impl.branch,
+        target_branch="main",
+        owner_task_id=impl.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(impl.id, impl_unit.id, "owner")
+
+    review = store.add("Approved review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 12, 10, 0, tzinfo=UTC)
+    review.output_content = "**Verdict: APPROVED**"
+    store.update(review)
+    store.attach_task_to_merge_unit(review.id, impl_unit.id, "review")
+
+    orphan = store.add("Completed orphan rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert orphan.id is not None
+    _set_completed(
+        orphan,
+        when=datetime(2026, 5, 12, 11, 0, tzinfo=UTC),
+        branch="feature/orphan",
+        has_commits=True,
+    )
+    orphan.merge_status = "unmerged"
+    store.update(orphan)
+
+    orphan_unit = store.create_merge_unit(
+        source_branch=orphan.branch,
+        target_branch="main",
+        owner_task_id=orphan.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert [row.owner_task.id for row in rows] == [impl.id]
+    row = rows[0]
+    assert row.lifecycle_action_task is not None
+    assert row.lifecycle_action_task.id == impl.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "merge"
+    assert row.next_action["description"] == "Merge (review APPROVED)"
+
+
+def test_query_lineage_owner_rows_marks_orphan_only_impl_lineage_for_manual_resolution(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "in_progress"
+    impl.branch = "feature/canonical"
+    impl.has_commits = True
+    store.update(impl)
+
+    orphan = store.add("Completed orphan rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert orphan.id is not None
+    _set_completed(
+        orphan,
+        when=datetime(2026, 5, 12, 11, 0, tzinfo=UTC),
+        branch="feature/orphan",
+        has_commits=True,
+    )
+    orphan.merge_status = "unmerged"
+    store.update(orphan)
+    orphan_unit = store.create_merge_unit(
+        source_branch=orphan.branch,
+        target_branch="main",
+        owner_task_id=orphan.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == impl.id
+    assert row.lifecycle_action_task is None
+    assert row.next_action is not None
+    assert row.next_action["type"] == "needs_discussion"
+    assert row.next_action["needs_attention_reason"] == "no-descendant-on-the-impl-branch"
+    assert "no descendant on the impl branch" in row.next_action["description"]
+    assert {task.id for task in row.unresolved_tasks if task.id is not None} == {orphan.id}

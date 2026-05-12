@@ -12,12 +12,12 @@ from gza.advance_engine import (
     classify_advance_action,
     evaluate_advance_rules,
     failed_recovery_decision_to_action,
-    resolve_closing_review_action,
     resolve_advance_context,
+    resolve_closing_review_action,
 )
-from gza.recovery_engine import decide_failed_task_recovery
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.recovery_engine import decide_failed_task_recovery
 from gza.review_verdict import ParsedReviewReport
 
 
@@ -293,6 +293,50 @@ def test_completed_improve_without_review_clear_creates_closing_review(
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
     assert action["type"] == "create_review", action
     assert action["description"] == "Create closing review (code changed since the last review)"
+
+
+def test_completed_orphan_rebase_does_not_invalidate_review_on_impl_branch(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/canonical"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    store.update(review)
+
+    orphan_rebase = store.add("Rebase orphan", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert orphan_rebase.id is not None
+    orphan_rebase.status = "completed"
+    orphan_rebase.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    orphan_rebase.branch = "feat/orphan"
+    orphan_rebase.has_commits = True
+    store.update(orphan_rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge (review APPROVED)"
 
 
 @pytest.mark.parametrize(
