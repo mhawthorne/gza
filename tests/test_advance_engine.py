@@ -22,11 +22,27 @@ from gza.review_verdict import ParsedReviewReport
 
 
 class _FakeGit:
-    def __init__(self, can_merge: bool = True):
+    def __init__(
+        self,
+        can_merge: bool = True,
+        *,
+        can_merge_by_ref: dict[tuple[str, str], bool] | None = None,
+        existing_branches: set[str] | None = None,
+        existing_refs: set[str] | None = None,
+    ):
         self._can_merge = can_merge
+        self._can_merge_by_ref = can_merge_by_ref or {}
+        self._existing_branches = existing_branches or set()
+        self._existing_refs = existing_refs or set()
 
     def can_merge(self, source_branch: str, target_branch: str) -> bool:
-        return self._can_merge
+        return self._can_merge_by_ref.get((source_branch, target_branch), self._can_merge)
+
+    def branch_exists(self, branch: str) -> bool:
+        return branch in self._existing_branches
+
+    def ref_exists(self, ref: str) -> bool:
+        return ref in self._existing_refs
 
 
 def _make_store(tmp_path: Path) -> SqliteTaskStore:
@@ -607,6 +623,182 @@ def test_completed_orphan_rebase_does_not_invalidate_review_on_impl_branch(tmp_p
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
     assert action["type"] == "merge"
     assert action["description"] == "Merge (review APPROVED)"
+
+
+def test_failed_rebase_is_ignored_when_origin_tip_is_already_mergeable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/mergeable-origin-tip"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    failed_rebase.status = "failed"
+    failed_rebase.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    failed_rebase.branch = impl.branch
+    failed_rebase.failure_reason = "WORKER_DIED"
+    store.update(failed_rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=False,
+            can_merge_by_ref={("origin/feat/mergeable-origin-tip", "main"): True},
+            existing_refs={"origin/feat/mergeable-origin-tip"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge (review APPROVED)"
+
+
+def test_failed_rebase_still_blocks_when_current_tip_needs_rebase(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feat/still-conflicts"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    failed_rebase.status = "failed"
+    failed_rebase.completed_at = datetime.now(UTC)
+    failed_rebase.branch = impl.branch
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    store.update(failed_rebase)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=False,
+            can_merge_by_ref={("origin/feat/still-conflicts", "main"): False},
+            existing_refs={"origin/feat/still-conflicts"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+
+
+def test_failed_rebase_without_review_still_requires_manual_resolution(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feat/no-review-failed-rebase"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    failed_rebase.status = "failed"
+    failed_rebase.completed_at = datetime.now(UTC)
+    failed_rebase.branch = impl.branch
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    store.update(failed_rebase)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=False,
+            can_merge_by_ref={("origin/feat/no-review-failed-rebase", "main"): False},
+            existing_refs={"origin/feat/no-review-failed-rebase"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+
+
+def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feat/worktree-stable"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    git_without_local_branch = _FakeGit(
+        can_merge=False,
+        can_merge_by_ref={("origin/feat/worktree-stable", "main"): True},
+        existing_refs={"origin/feat/worktree-stable"},
+    )
+    git_with_stale_local_branch = _FakeGit(
+        can_merge=False,
+        can_merge_by_ref={
+            ("feat/worktree-stable", "main"): False,
+            ("origin/feat/worktree-stable", "main"): True,
+        },
+        existing_branches={"feat/worktree-stable"},
+        existing_refs={"origin/feat/worktree-stable"},
+    )
+
+    ctx_without_local_branch = resolve_advance_context(
+        config,
+        store,
+        git_without_local_branch,
+        impl,
+        "main",
+    )
+    ctx_with_stale_local_branch = resolve_advance_context(
+        config,
+        store,
+        git_with_stale_local_branch,
+        impl,
+        "main",
+    )
+
+    assert ctx_without_local_branch.can_merge is True
+    assert ctx_with_stale_local_branch.can_merge is True
 
 
 @pytest.mark.parametrize(

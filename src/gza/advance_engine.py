@@ -99,6 +99,22 @@ class AdvanceRule:
     action: Callable[[AdvanceContext], dict[str, Any]]
 
 
+def _resolve_current_merge_source_ref(git: Any, branch: str) -> str:
+    """Return the freshest available ref for mergeability checks.
+
+    Prefer ``origin/<branch>`` when it exists so advance planning is stable across
+    worktrees whose local branch refs may be missing or stale after an operator
+    pushes corrected commits from another checkout. Fall back to the local branch
+    name so existing tests and lightweight git doubles keep working.
+    """
+    ref_exists = getattr(git, "ref_exists", None)
+    if callable(ref_exists):
+        remote_ref = f"origin/{branch}"
+        if ref_exists(remote_ref):
+            return remote_ref
+    return branch
+
+
 def is_resumable_failure_reason(failure_reason: str | None) -> bool:
     """Return True when a failure reason is auto-resumable by advance."""
     return classify_failure_reason(failure_reason) == "timeout"
@@ -618,7 +634,7 @@ def resolve_advance_context(
             failure_reason=task.failure_reason,
         )
 
-    can_merge = git.can_merge(task.branch, target_branch)
+    can_merge = git.can_merge(_resolve_current_merge_source_ref(git, task.branch), target_branch)
     rebase_children = [
         child
         for child in store.get_lineage_children(task.id)
