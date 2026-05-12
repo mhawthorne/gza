@@ -8,7 +8,7 @@ When `gza advance` encounters a completed task whose branch has merge conflicts 
 2. **Check for existing rebase children**: Query `store.get_lineage_children(task.id)` for any child tasks with `task_type="rebase"`
 3. **Decide action based on rebase child status**:
    - `pending` or `in_progress` → skip (rebase already running, avoid duplicates)
-   - `failed` → `needs_discussion` (manual intervention required)
+   - `failed` with no later successful same-branch rebase/recovery and no later approved/cleared review → `needs_discussion` (manual intervention required)
    - `completed` or no rebase child → create a new rebase task (`needs_rebase` action)
 
 ## How rebase tasks are created

@@ -349,18 +349,26 @@ def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
     """Return True when a failed rebase remains the latest unresolved lineage state.
 
     A clean current branch tip is not enough to clear failed rebase residue. We only
-    treat the lineage as having moved past that failure once a later successful review
-    outcome exists on the same implementation lineage.
+    treat the lineage as having moved past that failure once later successful same-branch
+    progress exists on the implementation lineage, either via a completed rebase/recovery
+    or a later successful review outcome.
     """
     failed_rebase = ctx.rebase_failed
     if failed_rebase is None:
         return False
 
+    failed_rebase_time = _task_event_time(failed_rebase)
+
+    latest_completed_rebase = ctx.latest_completed_rebase
+    if latest_completed_rebase is not None:
+        latest_completed_rebase_time = _task_event_time(latest_completed_rebase)
+        if latest_completed_rebase_time > failed_rebase_time:
+            return False
+
     latest_review = ctx.latest_completed_review
     if latest_review is None:
         return True
 
-    failed_rebase_time = _task_event_time(failed_rebase)
     latest_review_time = _task_event_time(latest_review)
     if latest_review_time < failed_rebase_time:
         return True

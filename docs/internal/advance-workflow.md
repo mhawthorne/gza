@@ -235,7 +235,7 @@ When advance detects merge conflicts:
 5. On completion, the host runner force-pushes the rebased branch (`git push --force-with-lease`)
 6. Advance sees no more conflicts on next run
 7. If a completed rebase is newer than the latest review → advance creates a fresh review before merging
-8. If the rebase task fails → advance reports `needs_discussion` (no automatic retry)
+8. If the latest rebase task fails and there is no later successful same-branch rebase/recovery or later approved/cleared review → advance reports `needs_discussion` (no automatic retry)
 
 ### Docker considerations
 

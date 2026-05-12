@@ -321,6 +321,65 @@ def test_advance_create_implement_respects_batch_limit(tmp_path: Path, capsys) -
     assert "batch limit reached" in output
 
 
+def test_advance_dry_run_uses_post_rebase_review_after_later_completed_rebase(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl = _create_completed_implement(store, "Implement feature with recovery")
+    review = _create_completed_review(store, impl)
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    store.update(review)
+
+    failed_rebase = store.add(
+        "Failed rebase descendant",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    failed_rebase.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    failed_rebase.branch = impl.branch
+    failed_rebase.has_commits = True
+    store.update(failed_rebase)
+
+    completed_rebase = store.add(
+        "Recovered rebase descendant",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert completed_rebase.id is not None
+    completed_rebase.status = "completed"
+    completed_rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    completed_rebase.branch = impl.branch
+    completed_rebase.has_commits = True
+    store.update(completed_rebase)
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch(
+            "gza.advance_engine.get_review_report",
+            return_value=SimpleNamespace(
+                verdict="APPROVED",
+                findings=(),
+                format_version="legacy",
+            ),
+        ),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Would advance 1 task(s):" in captured.out
+    assert str(impl.id) in captured.out
+    assert "Create review (code changed by rebase since last review)" in captured.out
+    assert "reason=rebase-failed-needs-manual-resolution" not in captured.out
+
+
 def test_advance_explicit_impl_uses_canonical_target_and_skips_orphan_rebase_branch(
     tmp_path: Path,
     capsys,

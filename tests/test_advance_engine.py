@@ -792,6 +792,137 @@ def test_failed_rebase_without_review_still_requires_manual_resolution(tmp_path:
     assert "failed, needs manual resolution" in action["description"]
 
 
+def test_failed_rebase_is_superseded_by_later_completed_same_branch_rebase(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/rebase-supersedes-failure"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Initial review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    failed_rebase.branch = impl.branch
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    store.update(failed_rebase)
+
+    completed_rebase = store.add(
+        "Completed recovery rebase",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert completed_rebase.id is not None
+    completed_rebase.status = "completed"
+    completed_rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    completed_rebase.branch = impl.branch
+    completed_rebase.has_commits = True
+    store.update(completed_rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            can_merge_by_ref={("origin/feat/rebase-supersedes-failure", "main"): True},
+            existing_refs={"origin/feat/rebase-supersedes-failure"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "create_review"
+    assert action["description"] == "Create review (code changed by rebase since last review)"
+
+
+def test_failed_rebase_with_only_older_review_still_requires_manual_resolution(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/failed-rebase-still-blocked"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Initial review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    failed_rebase.branch = impl.branch
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    store.update(failed_rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            can_merge_by_ref={("origin/feat/failed-rebase-still-blocked", "main"): True},
+            existing_refs={"origin/feat/failed-rebase-still-blocked"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+
+
 def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
