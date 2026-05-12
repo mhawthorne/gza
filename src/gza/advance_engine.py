@@ -107,6 +107,12 @@ def _resolve_current_merge_source_ref(git: Any, branch: str) -> str:
     pushes corrected commits from another checkout. Fall back to the local branch
     name so existing tests and lightweight git doubles keep working.
     """
+    resolve_fresh = getattr(git, "resolve_fresh_merge_source_ref", None)
+    if callable(resolve_fresh):
+        resolved = resolve_fresh(branch)
+        if resolved:
+            return resolved
+
     ref_exists = getattr(git, "ref_exists", None)
     if callable(ref_exists):
         remote_ref = f"origin/{branch}"

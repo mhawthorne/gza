@@ -14,6 +14,103 @@ from gza.rebase_diff import RebaseDiffResult
 from .conftest import make_store, run_gza, setup_config
 
 
+def _advance_args(tmp_path: Path, task_id: str) -> argparse.Namespace:
+    return argparse.Namespace(
+        project_dir=tmp_path,
+        task_id=task_id,
+        dry_run=False,
+        auto=True,
+        max=None,
+        batch=None,
+        no_docker=True,
+        force=False,
+        plans=False,
+        unimplemented=False,
+        create=False,
+        no_resume_failed=False,
+        max_resume_attempts=None,
+        advance_type=None,
+        new=False,
+        max_review_cycles=None,
+        squash_threshold=None,
+    )
+
+
+def _init_repo_with_remote_only_feature(tmp_path: Path, branch: str) -> Git:
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "base.txt").write_text("base\n")
+    git._run("add", "base.txt")
+    git._run("commit", "-m", "Initial commit")
+
+    git._run("checkout", "-b", branch)
+    feature_file = tmp_path / f"{branch.replace('/', '_')}.txt"
+    feature_file.write_text("remote tip\n")
+    git._run("add", str(feature_file.name))
+    git._run("commit", "-m", "Remote feature tip")
+    remote_sha = git.rev_parse("HEAD")
+
+    git._run("checkout", "main")
+    git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
+    git._run("branch", "-D", branch)
+    return git
+
+
+def _init_repo_with_stale_local_and_clean_origin(tmp_path: Path, branch: str) -> Git:
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "shared.txt").write_text("base\n")
+    git._run("add", "shared.txt")
+    git._run("commit", "-m", "Initial commit")
+
+    git._run("checkout", "-b", branch)
+    (tmp_path / "feature.txt").write_text("remote tip\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Remote feature tip")
+    remote_sha = git.rev_parse("HEAD")
+
+    git._run("reset", "--hard", "main")
+    (tmp_path / "shared.txt").write_text("stale local change\n")
+    git._run("add", "shared.txt")
+    git._run("commit", "-m", "Stale local branch")
+
+    git._run("checkout", "main")
+    (tmp_path / "shared.txt").write_text("main change\n")
+    git._run("add", "shared.txt")
+    git._run("commit", "-m", "Main branch change")
+    git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
+    return git
+
+
+def _add_mergeable_impl_with_failed_rebase(store, branch: str):
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = branch
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=task.id, same_branch=True)
+    failed_rebase.status = "failed"
+    failed_rebase.completed_at = datetime.now(UTC)
+    failed_rebase.branch = branch
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    store.update(failed_rebase)
+    return task
+
+
 def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -340,6 +437,87 @@ def test_advance_explicit_merge_refuses_when_checkout_does_not_match_canonical_t
     assert refreshed is not None
     assert refreshed.merge_status == "unmerged"
     assert git.is_merged(task.branch, "main") is False
+
+
+def test_advance_execution_merges_remote_tracking_ref_when_local_branch_is_missing(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    branch = "feature/advance-remote-only"
+    git = _init_repo_with_remote_only_feature(tmp_path, branch)
+    task = _add_mergeable_impl_with_failed_rebase(store, branch)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    assert git.branch_exists(branch) is False
+    assert git.ref_exists(f"origin/{branch}") is True
+
+    rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    assert rc == 0
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+    assert git.branch_exists(branch) is False
+    assert git.is_merged(f"origin/{branch}", "main") is True
+
+    output = capsys.readouterr().out
+    assert f"Merging 'origin/{branch}' into 'main'" in output
+    assert "✓ Merged" in output
+
+
+def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    branch = "feature/advance-stale-local"
+    git = _init_repo_with_stale_local_and_clean_origin(tmp_path, branch)
+    task = _add_mergeable_impl_with_failed_rebase(store, branch)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    assert git.branch_exists(branch) is True
+    assert git.can_merge(branch, "main") is False
+    assert git.can_merge(f"origin/{branch}", "main") is True
+
+    rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    assert rc == 0
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+    assert git.is_merged(f"origin/{branch}", "main") is True
+    assert git.is_merged(branch, "main") is False
+
+    output = capsys.readouterr().out
+    assert f"Merging 'origin/{branch}' into 'main'" in output
+    assert f"Merging '{branch}' into 'main'" not in output
 
 
 def test_rebase_background_creator_phase_failure_cleans_up_created_task_and_artifacts(tmp_path: Path) -> None:

@@ -567,6 +567,21 @@ class Git:
 
         return None
 
+    def resolve_fresh_merge_source_ref(self, branch: str, *, remote: str = "origin") -> str | None:
+        """Return the freshest available ref for merge planning/execution.
+
+        Prefer ``<remote>/<branch>`` when it exists so callers that need the
+        latest pushed tip do not accidentally validate or merge a stale local
+        branch. Fall back to the local branch when no remote-tracking ref is
+        available.
+        """
+        remote_ref = f"{remote}/{branch}"
+        if self.ref_exists(remote_ref):
+            return remote_ref
+        if self.branch_exists(branch):
+            return branch
+        return None
+
     def rev_parse(self, ref: str) -> str:
         """Resolve a ref to its commit SHA."""
         result = self._run("rev-parse", "--verify", f"{ref}^{{commit}}")
