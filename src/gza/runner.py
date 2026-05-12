@@ -62,7 +62,12 @@ from .prompt_sanitization import sanitize_provider_prompt
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .providers.base import PreflightCheckResult
-from .rebase_validation import RuffDiagnostic, capture_rebase_validation_baseline, validate_rebase_resolution_output
+from .rebase_validation import (
+    RuffDiagnostic,
+    capture_rebase_validation_baseline,
+    is_rebase_in_progress,
+    validate_rebase_resolution_output,
+)
 from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
 from .review_verdict import (
     compute_review_score,
@@ -4206,6 +4211,20 @@ def _run_inner(
         if task.task_type == "rebase":
             assert rebase_validation_state is not None
             before_head, pre_existing_diagnostics = rebase_validation_state
+            if is_rebase_in_progress(worktree_git.repo_dir):
+                task_logger.error("Rebase still in progress after provider success.")
+                _save_wip_changes(task, worktree_git, config, branch_name)
+                _record_run_failure(
+                    task=task,
+                    config=config,
+                    store=store,
+                    log_file=log_file,
+                    stats=stats,
+                    failure=_rebase_validation_failure(),
+                    exit_code=1,
+                    branch=branch_name,
+                )
+                return 0
             if not validate_rebase_resolution_output(
                 git=worktree_git,
                 before_head=before_head,

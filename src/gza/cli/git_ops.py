@@ -42,6 +42,7 @@ from ..pickup import (
 from ..pr_ops import build_task_pr_content, ensure_task_pr
 from ..rebase_validation import (
     capture_rebase_validation_baseline,
+    is_rebase_in_progress as _shared_is_rebase_in_progress,
     validate_rebase_resolution_output as _validate_provider_resolve_output,
 )
 from ..recovery_engine import list_failed_tasks_for_recovery, resolve_recovery_planning_task
@@ -859,25 +860,8 @@ def ensure_skill(skill_name: str, provider: str, project_dir: Path) -> bool:
 
 
 def _is_rebase_in_progress(worktree_path: Path) -> bool:
-    """Check if a git rebase is in progress in the given directory.
-
-    Handles both regular repositories and git worktrees (where .git is a file
-    pointing to the actual gitdir).
-    """
-    git_file = worktree_path / ".git"
-    if git_file.is_file():
-        try:
-            git_dir_text = git_file.read_text().strip()
-            if git_dir_text.startswith("gitdir: "):
-                raw = git_dir_text[len("gitdir: "):]
-                git_dir: Path = Path(raw) if Path(raw).is_absolute() else (worktree_path / raw).resolve()
-            else:
-                git_dir = git_file
-        except OSError:
-            git_dir = worktree_path / ".git"
-    else:
-        git_dir = worktree_path / ".git"
-    return (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
+    """Backward-compatible wrapper for shared rebase-state detection."""
+    return _shared_is_rebase_in_progress(worktree_path)
 
 
 def _branch_has_commits(config: Config, branch: str | None) -> bool:
