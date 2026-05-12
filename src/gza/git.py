@@ -1,6 +1,7 @@
 """Git operations for Gza."""
 
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -335,18 +336,21 @@ class Git:
 
         return path
 
-    def worktree_remove(self, path: Path, force: bool = False) -> None:
+    def worktree_remove(self, path: Path, force: bool = False) -> subprocess.CompletedProcess:
         """Remove a worktree.
 
         Args:
             path: Path to the worktree to remove
             force: Force removal even if worktree is dirty
+
+        Returns:
+            CompletedProcess result from ``git worktree remove``.
         """
         args = ["worktree", "remove"]
         if force:
             args.append("--force")
         args.append(str(path))
-        self._run(*args, check=False)
+        return self._run(*args, check=False)
 
     def worktree_list(self) -> list[dict]:
         """List all worktrees.
@@ -899,6 +903,7 @@ def cleanup_worktree_for_branch(git: "Git", branch: str, force: bool = False) ->
     """
     worktree_path = active_worktree_path_for_branch(git, branch)
 
+    remove_succeeded = False
     if worktree_path:
         # Check if worktree has uncommitted changes
         worktree_git = Git(worktree_path)
@@ -911,17 +916,29 @@ def cleanup_worktree_for_branch(git: "Git", branch: str, force: bool = False) ->
             )
 
         # Remove the worktree
-        git.worktree_remove(worktree_path, force=force)
-
-    # Prune stale registrations whether or not we removed a live worktree path.
-    registered_path = _registered_worktree_path_for_branch(git.worktree_list(), branch)
-    if registered_path is not None:
-        git._run("worktree", "prune", "--expire", "now", check=False)
-        still_registered = _registered_worktree_path_for_branch(git.worktree_list(), branch)
-        if still_registered is not None:
+        remove_result = git.worktree_remove(worktree_path, force=force)
+        if remove_result.returncode != 0:
+            error_output = remove_result.stderr or remove_result.stdout
             raise GitError(
-                f"worktree for branch '{branch}' is still registered at '{still_registered}' after cleanup"
+                f"git worktree remove failed for branch '{branch}' at '{worktree_path}':\n{error_output}"
             )
+        remove_succeeded = True
+
+    registration_dir = _worktree_registration_dir_for_branch(git, branch)
+    should_remove_registration = worktree_path is None or remove_succeeded
+    if should_remove_registration and registration_dir is not None:
+        try:
+            shutil.rmtree(registration_dir)
+        except OSError as exc:
+            raise GitError(
+                f"failed to remove stale worktree registration for branch '{branch}' at '{registration_dir}': {exc}"
+            ) from exc
+
+    still_registered = _registered_worktree_path_for_branch(git.worktree_list(), branch)
+    if still_registered is not None:
+        raise GitError(
+            f"worktree for branch '{branch}' is still registered at '{still_registered}' after cleanup"
+        )
 
     return worktree_path
 
@@ -942,6 +959,51 @@ def _registered_worktree_path_for_branch(worktrees: list[dict], branch: str) -> 
             if isinstance(wt_path, str) and wt_path:
                 return Path(wt_path)
     return None
+
+
+def _worktree_registration_dir_for_branch(git: "Git", branch: str) -> Path | None:
+    """Return the registration directory for a branch under ``.git/worktrees``."""
+    worktrees_dir = _git_common_dir(git) / "worktrees"
+    if not worktrees_dir.is_dir():
+        return None
+
+    for registration_dir in worktrees_dir.iterdir():
+        if not registration_dir.is_dir():
+            continue
+        registration_branch = _worktree_registration_branch(registration_dir)
+        if registration_branch and _branch_matches_worktree_ref(registration_branch, branch):
+            return registration_dir
+    return None
+
+
+def _git_common_dir(git: "Git") -> Path:
+    """Return the repository's common git directory."""
+    result = git._run("rev-parse", "--git-common-dir")
+    stdout = result.stdout if isinstance(result.stdout, str) else ""
+    common_dir = stdout.strip()
+    if not common_dir:
+        repo_dir = git.repo_dir if isinstance(git.repo_dir, Path) else None
+        if repo_dir is not None:
+            return (repo_dir / ".git").resolve()
+        return Path(".git").resolve()
+    path = Path(common_dir)
+    if path.is_absolute():
+        return path
+    return (git.repo_dir / path).resolve()
+
+
+def _worktree_registration_branch(registration_dir: Path) -> str | None:
+    """Return the branch ref recorded in a worktree registration directory."""
+    head_path = registration_dir / "HEAD"
+    try:
+        head_content = head_path.read_text().strip()
+    except OSError:
+        return None
+
+    ref_prefix = "ref: "
+    if not head_content.startswith(ref_prefix):
+        return None
+    return head_content[len(ref_prefix):]
 
 
 def active_worktree_path_for_branch(git: "Git", branch: str) -> Path | None:

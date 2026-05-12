@@ -30,16 +30,38 @@ class TestGitInit:
 class TestCleanupWorktreeForBranch:
     """Tests for cleanup_worktree_for_branch helper."""
 
+    def test_raises_when_live_worktree_remove_fails_without_deleting_registration(self, tmp_path: Path):
+        """A failed live remove must preserve the branch registration."""
+        git = Git(tmp_path)
+        registration_dir = tmp_path / ".git" / "worktrees" / "feature-test"
+        registration_dir.mkdir(parents=True)
+
+        with patch.object(git, "worktree_list", return_value=[
+            {"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}
+        ]), \
+             patch.object(
+                 git,
+                 "worktree_remove",
+                 return_value=MagicMock(returncode=1, stdout="", stderr="worktree is locked"),
+             ) as mock_remove, \
+             patch("gza.git._worktree_registration_dir_for_branch", return_value=registration_dir), \
+             patch("gza.git.Git.has_changes", return_value=False):
+            with pytest.raises(GitError, match="git worktree remove failed"):
+                cleanup_worktree_for_branch(git, "feature/test", force=True)
+
+            mock_remove.assert_called_once_with(Path("/tmp/gza/branch"), force=True)
+            assert registration_dir.exists()
+
     def test_raises_when_worktree_still_registered_after_remove(self, tmp_path: Path):
         """A failed remove should not be reported as successful."""
         git = Git(tmp_path)
 
         with patch.object(git, "worktree_list") as mock_list, \
-             patch.object(git, "_run") as mock_run, \
              patch.object(git, "worktree_remove") as mock_remove, \
+             patch("gza.git._worktree_registration_dir_for_branch", return_value=None), \
              patch("gza.git.Git.has_changes", return_value=False):
+            mock_remove.return_value = MagicMock(returncode=0, stdout="", stderr="")
             mock_list.side_effect = [
-                [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
                 [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
                 [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
             ]
@@ -48,18 +70,19 @@ class TestCleanupWorktreeForBranch:
                 cleanup_worktree_for_branch(git, "feature/test", force=True)
 
             mock_remove.assert_called_once_with(Path("/tmp/gza/branch"), force=True)
-            mock_run.assert_called_once_with("worktree", "prune", "--expire", "now", check=False)
 
-    def test_prunes_stale_registration_after_remove(self, tmp_path: Path):
-        """Pruning should clear stale worktree registrations after removal."""
+    def test_removes_targeted_registration_after_remove(self, tmp_path: Path):
+        """A stale registration for the same branch is removed directly."""
         git = Git(tmp_path)
+        registration_dir = tmp_path / ".git" / "worktrees" / "feature-test"
+        registration_dir.mkdir(parents=True)
 
         with patch.object(git, "worktree_list") as mock_list, \
-             patch.object(git, "_run") as mock_run, \
              patch.object(git, "worktree_remove") as mock_remove, \
+             patch("gza.git._worktree_registration_dir_for_branch", return_value=registration_dir), \
              patch("gza.git.Git.has_changes", return_value=False):
+            mock_remove.return_value = MagicMock(returncode=0, stdout="", stderr="")
             mock_list.side_effect = [
-                [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
                 [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
                 [],
             ]
@@ -68,17 +91,18 @@ class TestCleanupWorktreeForBranch:
 
             assert result == Path("/tmp/gza/branch")
             mock_remove.assert_called_once_with(Path("/tmp/gza/branch"), force=True)
-            mock_run.assert_called_once_with("worktree", "prune", "--expire", "now", check=False)
+            assert not registration_dir.exists()
 
-    def test_prunes_prunable_only_registration(self, tmp_path: Path):
-        """Pruning still runs when only a prunable registration remains."""
+    def test_removes_prunable_only_target_registration(self, tmp_path: Path):
+        """A prunable registration is removed without touching unrelated cleanup."""
         git = Git(tmp_path)
+        registration_dir = tmp_path / ".git" / "worktrees" / "feature-test"
+        registration_dir.mkdir(parents=True)
 
         with patch.object(git, "worktree_list") as mock_list, \
-             patch.object(git, "_run") as mock_run, \
-             patch.object(git, "worktree_remove") as mock_remove:
+             patch.object(git, "worktree_remove") as mock_remove, \
+             patch("gza.git._worktree_registration_dir_for_branch", return_value=registration_dir):
             mock_list.side_effect = [
-                [{"path": "/tmp/gza/stale", "branch": "refs/heads/feature/test", "prunable": "gone"}],
                 [{"path": "/tmp/gza/stale", "branch": "refs/heads/feature/test", "prunable": "gone"}],
                 [],
             ]
@@ -87,7 +111,7 @@ class TestCleanupWorktreeForBranch:
 
             assert result is None
             mock_remove.assert_not_called()
-            mock_run.assert_called_once_with("worktree", "prune", "--expire", "now", check=False)
+            assert not registration_dir.exists()
 
 
 class TestGitRun:
@@ -595,12 +619,14 @@ class TestWorktreeOperations:
         worktree_path = tmp_path / "worktrees" / "feature"
 
         with patch.object(git, '_run') as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-            git.worktree_remove(worktree_path)
+            result = MagicMock(returncode=0, stdout="", stderr="")
+            mock_run.return_value = result
+            returned = git.worktree_remove(worktree_path)
 
             # Verify worktree remove was called without --force
             calls = [str(call) for call in mock_run.call_args_list]
             assert any("worktree" in call and "remove" in call and "--force" not in call for call in calls)
+            assert returned is result
 
     def test_worktree_remove_with_force(self, tmp_path: Path):
         """Test removing a worktree with force."""
@@ -611,13 +637,15 @@ class TestWorktreeOperations:
         worktree_path = tmp_path / "worktrees" / "feature"
 
         with patch.object(git, '_run') as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-            git.worktree_remove(worktree_path, force=True)
+            result = MagicMock(returncode=0, stdout="", stderr="")
+            mock_run.return_value = result
+            returned = git.worktree_remove(worktree_path, force=True)
 
             # Verify --force was included
             mock_run.assert_called_once()
             call_args = str(mock_run.call_args)
             assert "--force" in call_args
+            assert returned is result
 
     def test_worktree_list_empty(self, tmp_path: Path):
         """Test listing worktrees when none exist."""
