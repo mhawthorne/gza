@@ -145,6 +145,8 @@ class TestPromptBuilderBuild:
         assert "Your job is to address all **Blockers** only." in result
         assert "The review item you addressed" in result
         assert "If a Blocker item no longer applies" in result
+        assert "Treat a cited path or line range as an instance of a class of issue" in result
+        assert '"Extra scope" means unrelated changes, not other instances of the same blocker class.' in result
 
     def test_build_improve_comments_only_context_does_not_require_must_fix_structure(
         self, tmp_path: Path
