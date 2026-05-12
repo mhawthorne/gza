@@ -62,6 +62,7 @@ from .prompt_sanitization import sanitize_provider_prompt
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .providers.base import PreflightCheckResult
+from .rebase_validation import RuffDiagnostic, capture_rebase_validation_baseline, validate_rebase_resolution_output
 from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
 from .review_verdict import (
     compute_review_score,
@@ -87,6 +88,7 @@ EXTRACTION_PRECHECK_FAILURE_REASON = "EXTRACTION_PRECHECK_FAILED"
 EXTRACTION_ALREADY_MERGED_COMPLETION_REASON = "EXTRACTION_ALREADY_MERGED"
 
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
+REBASE_VALIDATION_FAILURE_REASON = "REBASE_VALIDATION_FAILED"
 
 
 @dataclass(frozen=True)
@@ -113,6 +115,14 @@ class ResolvedRunFailure:
     reason: str
     status: str
     outcome_message: str
+
+
+def _rebase_validation_failure() -> ResolvedRunFailure:
+    return ResolvedRunFailure(
+        reason=REBASE_VALIDATION_FAILURE_REASON,
+        status="failed",
+        outcome_message=f"Outcome: failed ({REBASE_VALIDATION_FAILURE_REASON})",
+    )
 
 
 def _interrupt_signal_name() -> str | None:
@@ -4107,6 +4117,25 @@ def _run_inner(
 
     # Snapshot worktree state before provider runs so we can selectively stage only new changes
     pre_run_status = worktree_git.status_porcelain()
+    task_logger = TaskExecutionLogger(resolve_ops_log_path(config, log_file), echo=True)
+    rebase_validation_state: tuple[str, set[RuffDiagnostic]] | None = None
+    if task.task_type == "rebase":
+        try:
+            rebase_validation_state = capture_rebase_validation_baseline(worktree_git)
+        except RuntimeError as exc:
+            task_logger.error(f"Pre-rebase ruff validation failed to run: {exc}")
+            _save_wip_changes(task, worktree_git, config, branch_name)
+            _record_run_failure(
+                task=task,
+                config=config,
+                store=store,
+                log_file=log_file,
+                stats=TaskStats(duration_seconds=0.0, num_steps_reported=0, cost_usd=0.0),
+                failure=_rebase_validation_failure(),
+                exit_code=1,
+                branch=branch_name,
+            )
+            return 0
     fix_commits_ahead_before_run: int | None = None
     fix_default_branch: str | None = None
     if task.task_type == "fix":
@@ -4173,6 +4202,28 @@ def _run_inner(
                 branch=branch_name,
             )
             return 0
+
+        if task.task_type == "rebase":
+            assert rebase_validation_state is not None
+            before_head, pre_existing_diagnostics = rebase_validation_state
+            if not validate_rebase_resolution_output(
+                git=worktree_git,
+                before_head=before_head,
+                pre_existing_diagnostics=pre_existing_diagnostics,
+                task_logger=task_logger,
+            ):
+                _save_wip_changes(task, worktree_git, config, branch_name)
+                _record_run_failure(
+                    task=task,
+                    config=config,
+                    store=store,
+                    log_file=log_file,
+                    stats=stats,
+                    failure=_rebase_validation_failure(),
+                    exit_code=1,
+                    branch=branch_name,
+                )
+                return 0
 
         return _complete_code_task(
             task,

@@ -2,20 +2,67 @@
 
 
 import argparse
+from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
-
-from gza.config import Config
-from gza.db import SqliteTaskStore
+from unittest.mock import Mock, patch
 
 import pytest
 
+from gza.config import Config
+from gza.db import SqliteTaskStore
+from gza.log_paths import ops_log_path_for
+from gza.providers.base import RunResult
 from tests.cli.conftest import (
+    make_store,
     run_gza,
+    setup_config,
     setup_git_repo_with_task_branch,
 )
 
 pytestmark = pytest.mark.integration
+
+
+def _setup_rebase_conflict_fixture(
+    tmp_path: Path,
+    *,
+    branch_name: str,
+    repo_file: str,
+    base_content: str,
+    feature_content: str,
+    main_content: str,
+) -> tuple[SqliteTaskStore, object, object]:
+    from gza.git import Git
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+
+    file_path = tmp_path / repo_file
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(base_content)
+    git._run("add", repo_file)
+    git._run("commit", "-m", "Base file")
+
+    task = store.add(f"Rebase conflict fixture for {branch_name}")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = branch_name
+    store.update(task)
+
+    git._run("checkout", "-b", branch_name)
+    file_path.write_text(feature_content)
+    git._run("add", repo_file)
+    git._run("commit", "-m", "Feature change")
+
+    git._run("checkout", "main")
+    file_path.write_text(main_content)
+    git._run("add", repo_file)
+    git._run("commit", "-m", "Main change")
+
+    return store, git, task
 
 
 class TestRebaseCommand:
@@ -191,7 +238,7 @@ class TestRebaseCommand:
         assert rebase_task.log_file is not None
         log_path = config.project_dir / rebase_task.log_file
         assert log_path.exists()
-        log_text = log_path.read_text()
+        log_text = ops_log_path_for(log_path).read_text()
         assert "Rebasing task" in log_text
 
     def test_rebase_fetch_failure_marks_git_error_via_shared_helper(self, tmp_path: Path):
@@ -279,3 +326,129 @@ class TestRebaseCommand:
         assert mock_mark_failed.call_count == 1
         assert mock_mark_failed.call_args.kwargs["task"].id == rebase_task.id
         assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "TEST_FAILURE"
+
+    def test_rebase_rejects_assignment_deletion_resolution_with_new_f821(self, tmp_path: Path):
+        """Provider-backed auto-resolve must halt when it drops needed assignments."""
+        _store, _git, task = _setup_rebase_conflict_fixture(
+            tmp_path,
+            branch_name="feature/test-f821-assignments",
+            repo_file="src/gza/example_assignments.py",
+            base_content=(
+                "def resume(action: dict[str, object]) -> object | None:\n"
+                "    existing = action.get('existing')\n"
+                "    return existing\n"
+            ),
+            feature_content=(
+                "def resume(action: dict[str, object]) -> object | None:\n"
+                "    resume_task_id = action.get('recovery_task_id')\n"
+                "    reuse_existing = bool(action.get('reuse_existing', False))\n"
+                "    existing = action.get('existing')\n"
+                "    if reuse_existing and isinstance(resume_task_id, str):\n"
+                "        return resume_task_id\n"
+                "    return existing\n"
+            ),
+            main_content=(
+                "def resume(action: dict[str, object]) -> object | None:\n"
+                "    branch_name = action.get('branch_name')\n"
+                "    existing = action.get('existing')\n"
+                "    if branch_name:\n"
+                "        return branch_name\n"
+                "    return existing\n"
+            ),
+        )
+
+        def provider_run(_cfg, _prompt, _log_file, work_dir, **_kwargs):
+            (work_dir / "src" / "gza" / "example_assignments.py").write_text(
+                "def resume(action: dict[str, object]) -> object | None:\n"
+                "    branch_name = action.get('branch_name')\n"
+                "    existing = action.get('existing')\n"
+                "    if branch_name:\n"
+                "        return branch_name\n"
+                "    if reuse_existing and isinstance(resume_task_id, str):\n"
+                "        return resume_task_id\n"
+                "    return existing\n"
+            )
+            return RunResult(exit_code=0)
+
+        with (
+            patch("gza.cli.ensure_skill", return_value=True),
+            patch("gza.providers.get_provider", return_value=Mock(run=provider_run)),
+            patch("gza.skills_utils.copy_skill", return_value=(True, "installed")),
+            patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False),
+        ):
+            result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
+
+        output = result.stdout + result.stderr
+        assert result.returncode == 1
+        assert "Post-rebase ruff validation found new F401/F821 diagnostics" in output
+        assert "src/gza/example_assignments.py:6:38: F821" in output
+        assert "src/gza/example_assignments.py:7:16: F821" in output
+
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        rebases = [child for child in store.get_based_on_children(task.id) if child.task_type == "rebase"]
+        assert len(rebases) == 1
+        assert rebases[0].status == "failed"
+        assert rebases[0].failure_reason == "TEST_FAILURE"
+
+    def test_rebase_rejects_import_deletion_resolution_with_new_f821(self, tmp_path: Path):
+        """Provider-backed auto-resolve must halt when it drops an imported symbol still in use."""
+        (tmp_path / "src" / "gza").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "src" / "gza" / "helpers.py").write_text(
+            "def prepare_task_for_immediate_execution() -> str:\n"
+            "    return 'prepared'\n"
+        )
+
+        _store, _git, task = _setup_rebase_conflict_fixture(
+            tmp_path,
+            branch_name="feature/test-f821-imports",
+            repo_file="src/gza/example_watch.py",
+            base_content=(
+                "from pathlib import Path\n\n"
+                "def watcher() -> Path:\n"
+                "    return Path('base')\n"
+            ),
+            feature_content=(
+                "from pathlib import Path\n"
+                "from gza.helpers import prepare_task_for_immediate_execution\n\n"
+                "def watcher() -> Path:\n"
+                "    root = prepare_task_for_immediate_execution()\n"
+                "    return Path(root)\n"
+            ),
+            main_content=(
+                "from pathlib import Path\n"
+                "from typing import Any\n\n"
+                "def watcher(payload: Any) -> Path:\n"
+                "    return Path(str(payload))\n"
+            ),
+        )
+
+        def provider_run(_cfg, _prompt, _log_file, work_dir, **_kwargs):
+            (work_dir / "src" / "gza" / "example_watch.py").write_text(
+                "from pathlib import Path\n"
+                "from typing import Any\n\n"
+                "def watcher(payload: Any) -> Path:\n"
+                "    root = prepare_task_for_immediate_execution()\n"
+                "    return Path(root)\n"
+            )
+            return RunResult(exit_code=0)
+
+        with (
+            patch("gza.cli.ensure_skill", return_value=True),
+            patch("gza.providers.get_provider", return_value=Mock(run=provider_run)),
+            patch("gza.skills_utils.copy_skill", return_value=(True, "installed")),
+            patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False),
+        ):
+            result = run_gza("rebase", str(task.id), "--project", str(tmp_path))
+
+        output = result.stdout + result.stderr
+        assert result.returncode == 1
+        assert "Post-rebase ruff validation found new F401/F821 diagnostics" in output
+        assert "src/gza/example_watch.py:5:12: F821" in output
+
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        rebases = [child for child in store.get_based_on_children(task.id) if child.task_type == "rebase"]
+        assert len(rebases) == 1
+        assert rebases[0].status == "failed"
+        assert rebases[0].failure_reason == "TEST_FAILURE"

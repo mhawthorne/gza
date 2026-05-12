@@ -43,6 +43,8 @@ def test_invoke_provider_resolve_uses_effective_codex_provider(tmp_path: Path) -
         patch("gza.cli.ensure_skill", return_value=True),
         patch("gza.providers.get_provider") as mock_get_provider,
         patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False),
+        patch("gza.cli.git_ops.capture_rebase_validation_baseline", return_value=("abc123", set())),
+        patch("gza.cli.git_ops._validate_provider_resolve_output", return_value=True),
     ):
         mock_provider = Mock()
         mock_provider.run.return_value = RunResult(exit_code=0)
@@ -71,6 +73,8 @@ def test_invoke_provider_resolve_uses_worktree_mode_without_continue(tmp_path: P
         patch("gza.providers.get_provider") as mock_get_provider,
         patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False),
         patch("gza.skills_utils.copy_skill", return_value=(True, "installed")),
+        patch("gza.cli.git_ops.capture_rebase_validation_baseline", return_value=("abc123", set())),
+        patch("gza.cli.git_ops._validate_provider_resolve_output", return_value=True),
     ):
         mock_provider = Mock()
         mock_provider.run.return_value = RunResult(exit_code=0)
@@ -117,6 +121,8 @@ def test_invoke_provider_resolve_honors_use_docker_override(tmp_path: Path) -> N
         patch("gza.cli.ensure_skill", return_value=True),
         patch("gza.providers.get_provider") as mock_get_provider,
         patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False),
+        patch("gza.cli.git_ops.capture_rebase_validation_baseline", return_value=("abc123", set())),
+        patch("gza.cli.git_ops._validate_provider_resolve_output", return_value=True),
     ):
         mock_provider = Mock()
         mock_provider.run.return_value = RunResult(exit_code=0)
@@ -138,6 +144,7 @@ def test_invoke_provider_resolve_returns_false_on_provider_exception(tmp_path: P
     with (
         patch("gza.cli.ensure_skill", return_value=True),
         patch("gza.providers.get_provider") as mock_get_provider,
+        patch("gza.cli.git_ops.capture_rebase_validation_baseline", return_value=("abc123", set())),
     ):
         mock_provider = Mock()
         mock_provider.run.side_effect = RuntimeError("provider failure")
@@ -160,6 +167,7 @@ def test_invoke_provider_resolve_returns_false_if_rebase_still_in_progress(tmp_p
         patch("gza.cli.ensure_skill", return_value=True),
         patch("gza.providers.get_provider") as mock_get_provider,
         patch("gza.cli.git_ops._is_rebase_in_progress", return_value=True),
+        patch("gza.cli.git_ops.capture_rebase_validation_baseline", return_value=("abc123", set())),
     ):
         mock_provider = Mock()
         mock_provider.run.return_value = RunResult(exit_code=0)
@@ -179,6 +187,7 @@ def test_invoke_provider_resolve_returns_false_on_nonzero_exit(tmp_path: Path) -
     with (
         patch("gza.cli.ensure_skill", return_value=True),
         patch("gza.providers.get_provider") as mock_get_provider,
+        patch("gza.cli.git_ops.capture_rebase_validation_baseline", return_value=("abc123", set())),
     ):
         mock_provider = Mock()
         mock_provider.run.return_value = RunResult(exit_code=1)
@@ -201,6 +210,8 @@ def test_invoke_provider_resolve_does_not_create_internal_tasks_and_logs_to_pare
         patch("gza.cli.ensure_skill", return_value=True),
         patch("gza.providers.get_provider") as mock_get_provider,
         patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False),
+        patch("gza.cli.git_ops.capture_rebase_validation_baseline", return_value=("abc123", set())),
+        patch("gza.cli.git_ops._validate_provider_resolve_output", return_value=True),
     ):
         mock_provider = Mock()
         mock_provider.run.return_value = RunResult(exit_code=0)

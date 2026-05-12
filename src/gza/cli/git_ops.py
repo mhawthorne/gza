@@ -40,6 +40,10 @@ from ..pickup import (
     is_worker_consuming_advance_action,
 )
 from ..pr_ops import build_task_pr_content, ensure_task_pr
+from ..rebase_validation import (
+    capture_rebase_validation_baseline,
+    validate_rebase_resolution_output as _validate_provider_resolve_output,
+)
 from ..recovery_engine import list_failed_tasks_for_recovery, resolve_recovery_planning_task
 from ..runner import (
     TaskExecutionLogger,
@@ -954,13 +958,18 @@ def invoke_provider_resolve(
 
     load_dotenv(config.project_dir)
     provider = get_provider(resolve_config)
+    work_dir = worktree_path if worktree_path is not None else config.project_dir
+    worktree_git = Git(work_dir)
+    try:
+        before_head, pre_existing_diagnostics = capture_rebase_validation_baseline(worktree_git)
+    except RuntimeError as exc:
+        task_logger.error(f"Pre-rebase ruff validation failed to run: {exc}")
+        return False
 
     if worktree_path is not None:
         skill_cmd = "/gza-rebase --auto"
-        work_dir = worktree_path
     else:
         skill_cmd = "/gza-rebase --auto --continue"
-        work_dir = config.project_dir
 
     task_logger.phase(
         f"Provider fallback: resolving conflicts for task {task_ref} branch '{branch}' onto '{target}'.",
@@ -989,6 +998,13 @@ def invoke_provider_resolve(
     rebase_in_progress = _is_rebase_in_progress(worktree_path or config.project_dir)
     if rebase_in_progress:
         task_logger.error(f"Rebase still in progress after {skill_cmd}.")
+        return False
+    if not _validate_provider_resolve_output(
+        git=worktree_git,
+        before_head=before_head,
+        pre_existing_diagnostics=pre_existing_diagnostics,
+        task_logger=task_logger,
+    ):
         return False
 
     task_logger.info("Provider resolve completed successfully.")

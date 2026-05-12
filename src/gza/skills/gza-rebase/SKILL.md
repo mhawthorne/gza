@@ -1,7 +1,7 @@
 ---
 name: gza-rebase
 description: Rebase current branch on main, with interactive conflict resolution. Use when rebasing, merging, or resolving git conflicts.
-allowed-tools: Read, Edit, Glob, Grep, Bash(git:*), Bash(uv run python -m py_compile:*)
+allowed-tools: Read, Edit, Glob, Grep, Bash(git:*), Bash(uv run python -m py_compile:*), Bash(python -m ruff check:*)
 version: 1.0.0
 public: true
 ---
@@ -21,6 +21,7 @@ Rebase the current branch onto a local target branch, resolving any merge confli
 - `--auto` mode: unattended rebase for background workers. Same as default mode but:
   - Do NOT use AskUserQuestion — resolve all conflicts autonomously using best judgment.
   - If a conflict is truly ambiguous and cannot be resolved confidently, abort the rebase and report failure.
+  - Treat edit-vs-delete and two-sided-modification conflicts as ambiguous unless you can preserve every still-referenced symbol with high confidence. Do not silently prefer deletion.
   - Uncommitted changes may be present in the working tree (e.g. leftover from an interrupted run). Stash them before rebasing and restore with `git stash pop` afterwards.
   - Do NOT use remote git operations. Do not run `git fetch`, `git ls-remote`, HTTPS fallback fetches, or modify git remotes/config. Use only local refs already present in the repo. If the required local target is missing, stop and report failure.
 
@@ -57,7 +58,7 @@ For each conflicted file:
 4. **Propose a resolution** - Suggest how to combine the changes (usually keeping both)
 5. **Ask for approval** - Use AskUserQuestion to confirm the resolution approach before editing
 6. **Apply the fix** - Edit the file to resolve the conflict, removing all conflict markers
-7. **Verify syntax** - For Python files, run `uv run python -m py_compile <file>`
+7. **Verify Python safety** - For Python files, run both `uv run python -m py_compile <file>` and a targeted undefined-name/import check such as `python -m ruff check --select F401,F821 <file>`
 8. **Stage the file** - Run `git add <file>`
 
 Repeat for each conflicted file.
@@ -68,7 +69,8 @@ After all conflicts are resolved:
 
 1. Run `git rebase --continue`
 2. If more conflicts appear (from subsequent commits), repeat Step 4
-3. Continue until rebase completes
+3. Before declaring success, run a targeted `ruff` pass covering the Python files changed by the resolution and stop if it introduces new `F401` or `F821` diagnostics
+4. Continue until rebase completes
 
 ### Step 6: Restore stashed changes
 
@@ -86,5 +88,5 @@ Show:
 - **Never force-push automatically** - always let the caller/user do this manually
 - **Always ask before resolving ambiguous conflicts** (unless in `--auto` mode) - if the intent isn't clear, ask
 - **Preserve both changes when possible** - most conflicts in this project are additive (both sides adding new code)
-- **Check Python syntax after each resolution** - catch errors early
+- **Check Python semantics, not just syntax** - `py_compile` alone misses dropped-symbol failures like undefined names and import deletions
 - **No remote creativity** - if remote access is unavailable or the local target ref is missing, stop and report instead of trying SSH workarounds, HTTPS fallbacks, or git-config changes
