@@ -85,6 +85,7 @@ from ._common import (
 )
 from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
+    WORKER_CONSUMING_ACTIONS,
     classify_advance_action,
     determine_next_action,
     format_needs_attention_entry_for_display,
@@ -105,6 +106,14 @@ def _foreground_command_invocation(command: str) -> RunInvocationContext:
         command=command,
         execution_mode="foreground_worker",
     )
+
+
+@dataclass(frozen=True)
+class _IterateBackgroundPreflightContext:
+    """Prepared git context for completed-task iterate background preflight."""
+
+    git_runtime: Git
+    target_branch: str
 
 
 def _resolve_iterate_merge_state_for_current_target(
@@ -2057,6 +2066,14 @@ class _AdvanceEngineConfigAdapter:
     max_resume_attempts: int
 
 
+def _iterate_action_description(action: dict[str, Any]) -> str:
+    """Return a user-facing description for an iterate action."""
+    description = action.get("description")
+    if isinstance(description, str) and description:
+        return description.removeprefix("SKIP: ").strip()
+    return str(action.get("type", "skip"))
+
+
 def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     """Run an automated lifecycle loop for an implementation task."""
     store = get_store(config)
@@ -2236,41 +2253,60 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             return (existing_resume, decision), None
         return (_create_resume_task(store, failed_task), decision), None
 
-    def _warn_manual_background_iterate_override_if_needed(iterate_task: DbTask) -> None:
-        if not manual_iterate:
-            return
-        if iterate_task.status == "failed" and use_resume:
-            _emit_manual_resume_override_warnings(
-                iterate_task,
-                _decide_failed_iterate_resume_start(iterate_task),
-            )
-            return
+    engine_config = _AdvanceEngineConfigAdapter(
+        project_dir=config.project_dir,
+        advance_requires_review=bool(getattr(config, "advance_requires_review", True)),
+        advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
+        max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
+        max_resume_attempts=effective_max_resume_attempts,
+    )
+
+    def _prepare_iterate_background_preflight_context(
+        iterate_task: DbTask,
+    ) -> _IterateBackgroundPreflightContext | None:
         if iterate_task.status != "completed":
-            return
+            return None
         try:
             git_runtime: Any = Git(config.project_dir)
             target_branch = git_runtime.current_branch()
         except Exception as exc:
             task_label = iterate_task.id or "<unknown>"
             print(
-                "Warning: could not evaluate manual iterate background preflight "
+                "Warning: could not evaluate iterate background preflight "
                 f"for task {task_label} before handoff: {exc}",
                 file=sys.stderr,
             )
-            return
+            return None
+        return _IterateBackgroundPreflightContext(
+            git_runtime=git_runtime,
+            target_branch=target_branch,
+        )
+
+    def _warn_manual_background_iterate_override_if_needed(
+        iterate_task: DbTask,
+        preflight_context: _IterateBackgroundPreflightContext | None,
+    ) -> dict[str, Any] | None:
+        if manual_iterate and iterate_task.status == "failed" and use_resume:
+            _emit_manual_resume_override_warnings(
+                iterate_task,
+                _decide_failed_iterate_resume_start(iterate_task),
+            )
+            return None
+        if iterate_task.status != "completed" or preflight_context is None:
+            return None
         initial_action = determine_next_action(
-            config,
+            engine_config,
             store,
-            git_runtime,
+            preflight_context.git_runtime,
             iterate_task,
-            target_branch,
+            preflight_context.target_branch,
             max_resume_attempts=effective_max_resume_attempts,
         )
         if initial_action.get("type") != "improve":
-            return
+            return initial_action
         review_task = initial_action.get("review_task")
         if not isinstance(review_task, DbTask):
-            return
+            return initial_action
         assert iterate_task.id is not None
         assert review_task.id is not None
         improve_action, failed_improve, improve_decision = resolve_improve_action(
@@ -2280,15 +2316,149 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             max_resume_attempts=effective_max_resume_attempts,
         )
         if (
-            improve_action == "manual_review"
+            manual_iterate
+            and improve_action == "manual_review"
             and failed_improve is not None
             and improve_decision is not None
         ):
-            _emit_manual_resume_override_warnings(failed_improve, improve_decision)
+            manual_override = _emit_manual_resume_override_warnings(failed_improve, improve_decision)
+            if manual_override is not None:
+                failed_improve, improve_decision = manual_override
+                improve_action = "resume"
+        attention_result = build_improve_needs_attention_result(
+            store=store,
+            impl_task=iterate_task,
+            review_task=review_task,
+            improve_mode=improve_action,
+            failed_improve=failed_improve,
+            improve_decision=improve_decision,
+            max_resume_attempts=effective_max_resume_attempts,
+        )
+        if attention_result is not None and failed_improve is not None:
+            initial_action = dict(initial_action)
+            initial_action["_improve_attention_result"] = attention_result
+            initial_action["_improve_failed_task"] = failed_improve
+            initial_action["_improve_decision"] = improve_decision
+            return initial_action
+        return initial_action
+
+    def _maybe_surface_background_iterate_preflight_decision(
+        iterate_task: DbTask,
+        preflight_context: _IterateBackgroundPreflightContext | None,
+    ) -> int | None:
+        initial_action = _warn_manual_background_iterate_override_if_needed(
+            iterate_task,
+            preflight_context,
+        )
+        if iterate_task.status != "completed":
+            return None
+        if preflight_context is None:
+            return None
+
+        resolved_merge_state = _resolve_iterate_merge_state_for_current_target(
+            store=store,
+            impl_task=iterate_task,
+            git_runtime=preflight_context.git_runtime,
+            target_branch=preflight_context.target_branch,
+        )
+        if resolved_from_failed_ancestor and resolved_merge_state == "merged":
+            print(
+                "No remaining iterate action: "
+                f"failed implementation {requested_impl_task.id} was fully recovered by merged descendant {iterate_task.id}."
+            )
+            return 0
+        if resolved_merge_state == "merged":
+            print(f"No remaining iterate action: implementation {iterate_task.id} is already merged.")
+            return 0
+        if initial_action is None:
+            initial_action = determine_next_action(
+                engine_config,
+                store,
+                preflight_context.git_runtime,
+                iterate_task,
+                preflight_context.target_branch,
+                max_resume_attempts=effective_max_resume_attempts,
+            )
+
+        action_type = initial_action["type"]
+        if action_type == "improve":
+            attention_result = initial_action.get("_improve_attention_result")
+            if attention_result is None:
+                return None
+            failed_improve = initial_action.get("_improve_failed_task")
+            if not isinstance(failed_improve, DbTask):
+                return None
+            print("Next action: improve")
+            attention = resolve_execution_needs_attention(iterate_task, attention_result)
+            if attention is not None:
+                print(
+                    f"{NEEDS_ATTENTION_LABEL}: "
+                    f"{format_needs_attention_entry_for_display(attention.task, action=attention.action, prefix=len(attention.task.id or '') + 4)}"
+                )
+                if attention.action.get("needs_attention_reason") in {
+                    "review-max-cycles-reached",
+                    "automatic-recovery-disabled",
+                    "max-resume-attempts-reached",
+                }:
+                    print(f"Recommended next step: uv run gza fix {iterate_task.id}")
+            else:
+                print(f"Iterate blocked: {attention_result.message.removeprefix('SKIP: ')}")
+            return 3
+        if action_type in WORKER_CONSUMING_ACTIONS:
+            return None
+
+        if action_type == "merge_with_followups":
+            return None
+
+        print(f"Next action: {action_type}")
+        if action_type == "merge":
+            print(f"No remaining iterate action: implementation {iterate_task.id} is ready to merge.")
+            return 0
+        if action_type == "wait_review":
+            print("Iterate waiting: review_in_progress. Existing task is already in progress.")
+            return 3
+        if action_type == "wait_improve":
+            print("Iterate waiting: improve_in_progress. Existing task is already in progress.")
+            return 3
+        if action_type == "max_cycles_reached":
+            print(
+                f"{NEEDS_ATTENTION_LABEL}: "
+                f"{format_needs_attention_entry_for_display(iterate_task, action=initial_action, prefix=len(iterate_task.id or '') + 4)}"
+            )
+            assert iterate_task.id is not None
+            completed_review_cycles = count_completed_review_cycles(store, iterate_task.id)
+            print(
+                "Review-cycle accounting: "
+                f"completed={completed_review_cycles}, "
+                f"max_review_cycles={engine_config.max_review_cycles}, "
+                "consumed_this_invocation=0"
+            )
+            print(f"Recommended next step: uv run gza fix {iterate_task.id}")
+            return 3
+        if classify_advance_action(initial_action) == "needs_attention":
+            print(
+                f"{NEEDS_ATTENTION_LABEL}: "
+                f"{format_needs_attention_entry_for_display(iterate_task, action=initial_action, prefix=len(iterate_task.id or '') + 4)}"
+            )
+            if initial_action.get("needs_attention_reason") in {
+                "review-max-cycles-reached",
+                "automatic-recovery-disabled",
+                "max-resume-attempts-reached",
+            }:
+                print(f"Recommended next step: uv run gza fix {iterate_task.id}")
+            return 3
+        print(f"Iterate blocked: {_iterate_action_description(initial_action)}")
+        return 3
 
     # Handle background mode: re-exec this command as a detached process.
     if background:
-        _warn_manual_background_iterate_override_if_needed(impl_task)
+        background_preflight_context = _prepare_iterate_background_preflight_context(impl_task)
+        preflight_result = _maybe_surface_background_iterate_preflight_decision(
+            impl_task,
+            background_preflight_context,
+        )
+        if preflight_result is not None:
+            return preflight_result
         return _spawn_background_iterate(
             args,
             config,

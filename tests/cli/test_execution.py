@@ -6579,6 +6579,7 @@ class TestIterateCommand:
             max_review_cycles=3,
             advance_requires_review=True,
             advance_create_reviews=True,
+            workers_path=tmp_path / ".gza" / "workers",
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
@@ -8059,6 +8060,402 @@ class TestIterateCommand:
         assert expected_line.count("\n") == 0
         assert "Implement feature with a very long opening line that should be shortened\nSecond line" not in output
 
+    def test_background_iterate_max_cycles_reached_surfaces_decision_before_spawn(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        config = Config.load(tmp_path)
+        config.max_review_cycles = 3
+        config.max_resume_attempts = 1
+        config.advance_requires_review = True
+        config.advance_create_reviews = True
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "max_cycles_reached", "description": "Reached max review cycles"},
+            ),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        spawn_background.assert_not_called()
+        assert "Next action: max_cycles_reached" in output
+        assert "Review-cycle accounting: completed=0, max_review_cycles=3, consumed_this_invocation=0" in output
+        assert f"Recommended next step: uv run gza fix {impl.id}" in output
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+
+    def test_background_iterate_skip_surfaces_decision_before_spawn(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        config = Config.load(tmp_path)
+        config.max_resume_attempts = 1
+        config.advance_requires_review = True
+        config.advance_create_reviews = True
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "skip", "description": "SKIP: task has no branch (no commits)"},
+            ),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        spawn_background.assert_not_called()
+        assert "Next action: skip" in output
+        assert "Iterate blocked: task has no branch (no commits)" in output
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+
+    def test_background_iterate_merge_with_followups_spawns_worker_instead_of_noop(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: APPROVED_WITH_FOLLOWUPS**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        config = Config.load(tmp_path)
+        config.max_resume_attempts = 1
+        config.advance_requires_review = True
+        config.advance_create_reviews = True
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={
+                    "type": "merge_with_followups",
+                    "description": "Merge (review APPROVED_WITH_FOLLOWUPS)",
+                    "review_task": review,
+                    "followup_findings": (MagicMock(id="F1"),),
+                },
+            ),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        spawn_background.assert_called_once_with(
+            args,
+            config,
+            impl,
+            max_iterations=1,
+            dry_run=False,
+        )
+        assert "No remaining iterate action: implementation" not in output
+        assert "ready to merge" not in output
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+
+    def test_background_iterate_run_improve_spawns_worker_instead_of_blocking(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        pending_improve = store.add("Pending improve", task_type="improve", based_on=impl.id, depends_on=review.id)
+        pending_improve.status = "pending"
+        store.update(pending_improve)
+        assert pending_improve.id is not None
+
+        config = Config.load(tmp_path)
+        config.max_resume_attempts = 1
+        config.advance_requires_review = True
+        config.advance_create_reviews = True
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={
+                    "type": "run_improve",
+                    "description": f"Run pending improve {pending_improve.id}",
+                    "improve_task": pending_improve,
+                },
+            ),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        spawn_background.assert_called_once_with(
+            args,
+            config,
+            impl,
+            max_iterations=1,
+            dry_run=False,
+        )
+        assert "Next action: run_improve" not in output
+        assert "Iterate blocked:" not in output
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+
+    def test_background_auto_iterate_nested_improve_noop_surfaces_before_spawn(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        first = store.add("Improve 1", task_type="improve", based_on=impl.id, depends_on=review.id)
+        first.status = "failed"
+        first.failure_reason = "MAX_STEPS"
+        first.session_id = "improve-session"
+        store.update(first)
+
+        failed_resume = store.add("Improve 2", task_type="improve", based_on=first.id, depends_on=review.id)
+        failed_resume.status = "failed"
+        failed_resume.failure_reason = "MAX_STEPS"
+        failed_resume.session_id = first.session_id
+        store.update(failed_resume)
+
+        config = Config.load(tmp_path)
+        config.max_resume_attempts = 1
+        config.max_review_cycles = 3
+        config.advance_requires_review = True
+        config.advance_create_reviews = True
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=True,
+            background=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "improve", "description": "Create improve task", "review_task": review},
+            ),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        spawn_background.assert_not_called()
+        assert "Next action: improve" in output
+        assert "Needs attention:" in output
+        assert "reason=max-resume-attempts-reached" in output
+        assert f"Recommended next step: uv run gza fix {impl.id}" in output
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+
+    def test_background_iterate_disabled_improve_recovery_surfaces_before_spawn(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        failed_improve = store.add(
+            "Failed improve",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+        )
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_STEPS"
+        failed_improve.session_id = "improve-session"
+        store.update(failed_improve)
+        assert failed_improve.id is not None
+
+        config = Config.load(tmp_path)
+        config.max_resume_attempts = 0
+        config.max_review_cycles = 3
+        config.advance_requires_review = True
+        config.advance_create_reviews = True
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "improve", "description": "Create improve task", "review_task": review},
+            ),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        spawn_background.assert_not_called()
+        assert "Next action: improve" in output
+        assert self._expected_improve_attention_line(
+            store=store,
+            impl=impl,
+            review=review,
+            max_resume_attempts=0,
+        ) in output
+        assert "reason=automatic-recovery-disabled" in output
+        assert "automatic improve recovery is disabled (max_resume_attempts=0)" in output
+        assert f"Recommended next step: uv run gza fix {impl.id}" in output
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+
     def test_iterate_failed_improve_attention_uses_shortened_single_line_prompt(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -8233,6 +8630,7 @@ class TestIterateCommand:
             max_review_cycles=3,
             advance_requires_review=True,
             advance_create_reviews=True,
+            workers_path=tmp_path / ".gza" / "workers",
         )
 
         def fake_run_foreground(config, task_id, resume=False, **kwargs):
@@ -8318,6 +8716,7 @@ class TestIterateCommand:
             max_review_cycles=3,
             advance_requires_review=True,
             advance_create_reviews=True,
+            workers_path=tmp_path / ".gza" / "workers",
         )
 
         def fake_run_foreground(config, task_id, resume=False, **kwargs):
@@ -9077,10 +9476,64 @@ class TestIterateCommand:
         assert result == 0
         assert spawn_background.call_count == 1
         assert (
-            f"Warning: could not evaluate manual iterate background preflight for task {impl.id} before handoff: branch boom"
+            f"Warning: could not evaluate iterate background preflight for task {impl.id} before handoff: branch boom"
             in captured.err
         )
         assert store.get_based_on_children(failed_resume.id) == []
+        assert WorkerRegistry(mock_config.workers_path).list_all(include_completed=True) == []
+
+    def test_background_iterate_auto_completed_preflight_failure_warns_before_spawn(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=True,
+            background=True,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+            workers_path=tmp_path / ".gza" / "workers",
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.side_effect = RuntimeError("branch boom")
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+        captured = capsys.readouterr()
+
+        assert result == 0
+        assert spawn_background.call_count == 1
+        assert (
+            f"Warning: could not evaluate iterate background preflight for task {impl.id} before handoff: branch boom"
+            in captured.err
+        )
+        assert WorkerRegistry(mock_config.workers_path).list_all(include_completed=True) == []
 
     def test_iterate_in_loop_manual_failure_uses_shared_attention(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
