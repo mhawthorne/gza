@@ -389,7 +389,7 @@ class TestHelpOutput:
         assert "uv run gza sync [task_id ...] [options]" in docs_text
         assert "Use `uv run gza unmerged` for the daily \"what still needs to be merged?\" check." in docs_text
         assert "`uv run gza sync` remains the broader explicit branch and PR reconciliation command." in docs_text
-        assert "The only GitHub-side exception outside `uv run gza sync` is improve completion with `--review`" in docs_text
+        assert "The only GitHub-side exceptions outside `uv run gza sync` are improve and fix completion with `--review`" in docs_text
         assert "Run `uv run gza sync` after those merges" in docs_text
 
     def test_improve_help_and_docs_describe_narrow_pr_sync_before_auto_review(self, tmp_path):
@@ -406,6 +406,21 @@ class TestHelpOutput:
         assert expected in help_text
         assert expected in docs_text
         assert "If GitHub is unavailable, lookup fails, or no live PR exists, improve preserves the normal auto-review flow." in docs_text
+
+    def test_fix_help_and_docs_describe_narrow_pr_sync_before_auto_review(self, tmp_path):
+        """`fix --help` and docs should explain the same-branch push-before-review exception."""
+        setup_config(tmp_path)
+
+        fix_help = run_gza("fix", "--help", "--project", str(tmp_path))
+        assert fix_help.returncode == 0
+
+        help_text = " ".join(fix_help.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        expected = "if the branch already has an open PR, push same-branch fix commits first"
+        assert expected in help_text
+        assert expected in docs_text
+        assert "If GitHub is unavailable, lookup fails, or no live PR exists, fix preserves the normal auto-review flow." in docs_text
 
     def test_watch_and_queue_tag_help_point_to_same_scoped_pickup_preview(self, tmp_path):
         """Help/docs should make `queue --tag` the preview for `watch --tag`."""

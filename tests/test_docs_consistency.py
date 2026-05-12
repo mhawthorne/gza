@@ -144,7 +144,7 @@ def test_configuration_docs_describe_sync_as_broader_explicit_reconciliation_sur
         "uv run gza sync [task_id ...] [options]",
         "Use `uv run gza unmerged` for the daily \"what still needs to be merged?\" check.",
         "`uv run gza sync` remains the broader explicit branch and PR reconciliation command.",
-        "The only GitHub-side exception outside `uv run gza sync` is improve completion with `--review`",
+        "The only GitHub-side exceptions outside `uv run gza sync` are improve and fix completion with `--review`",
         "`gza pr` does not reconcile or close stale GitHub PRs",
         "`gza merge` only performs the local git merge/rebase path",
         "`uv run gza sync <impl_id>`",

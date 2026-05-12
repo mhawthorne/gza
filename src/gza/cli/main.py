@@ -1759,6 +1759,11 @@ def main() -> int:
         help="Full prefixed task ID (implement, improve, review, or fix — resolves to owning implementation)",
     )
     fix_parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Auto-create review task on completion; if the branch already has an open PR, push same-branch fix commits first",
+    )
+    fix_parser.add_argument(
         "--queue", "-q",
         action="store_true",
         help="Add task to queue without executing immediately",

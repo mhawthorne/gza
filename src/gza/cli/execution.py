@@ -1898,12 +1898,14 @@ def cmd_fix(args: argparse.Namespace) -> int:
     latest_review = _latest_completed_review_for_impl(store, impl_task.id)
     review_id = latest_review.id if latest_review is not None else None
     fix_prompt = PromptBuilder().fix_task_prompt(impl_task.id, review_id)
+    create_review = args.review if hasattr(args, "review") and args.review else False
     fix_task = store.add(
         fix_prompt,
         task_type="fix",
         based_on=impl_task.id,
         depends_on=review_id,
         same_branch=True,
+        create_review=create_review,
         tags=impl_task.tags,
         model=args.model if hasattr(args, "model") and args.model else None,
         provider=args.provider if hasattr(args, "provider") and args.provider else None,

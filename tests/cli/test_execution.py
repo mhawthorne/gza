@@ -4392,6 +4392,27 @@ class TestFixCommand:
         assert fix_task.based_on == impl_task.id
         assert fix_task.depends_on == review_task.id
 
+    def test_fix_with_review_flag(self, tmp_path: Path):
+        """Fix command with --review flag sets create_review."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Implement auth", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        review_task = store.add("Review auth", task_type="review", depends_on=impl_task.id)
+        review_task.status = "completed"
+        review_task.completed_at = datetime.now(UTC)
+        store.update(review_task)
+
+        result = run_gza("fix", str(impl_task.id), "--review", "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        fix_task = [t for t in store.get_all() if t.task_type == "fix"][0]
+        assert fix_task.create_review is True
+
     def test_fix_accepts_chained_improve_task_id_and_resolves_root_impl(self, tmp_path: Path):
         """Fix command resolves chained improve IDs back to the root implementation."""
         setup_config(tmp_path)

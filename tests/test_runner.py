@@ -7535,6 +7535,71 @@ class TestExtractedRunInnerHelpers:
         assert rc == 11
         assert call_order == ["sync", "review"]
 
+    def test_post_complete_fix_syncs_live_pr_before_auto_review(self, tmp_path: Path):
+        """Successful fix completion should sync a live PR before follow-up review work."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with review", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/fix-review-order"
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(
+            prompt="Review before fix",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        fix = store.add(
+            prompt="Fix with review",
+            task_type="fix",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+            create_review=True,
+        )
+        fix.status = "completed"
+        fix.branch = impl.branch
+        store.update(fix)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+        worktree_git.count_commits_ahead.return_value = 3
+        call_order: list[str] = []
+
+        def _sync_branch(*_args, **_kwargs):
+            call_order.append("sync")
+            return Mock(ok=True, status="pushed")
+
+        def _run_review(*_args, **_kwargs):
+            call_order.append("review")
+            return 13
+
+        with (
+            patch("gza.runner.sync_task_branch_if_live_pr", side_effect=_sync_branch),
+            patch("gza.runner._create_and_run_review_task", side_effect=_run_review),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                fix,
+                config,
+                store,
+                worktree_git,
+                fix.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                fix_commits_ahead_before_run=2,
+                fix_default_branch="main",
+            )
+
+        assert rc == 13
+        assert call_order == ["sync", "review"]
+
     def test_post_complete_improve_sync_failure_skips_auto_review_without_failing_task(
         self,
         tmp_path: Path,

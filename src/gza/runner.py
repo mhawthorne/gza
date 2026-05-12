@@ -2219,6 +2219,15 @@ def _create_and_run_review_task(
             )
             return 0
         review_target = resolved_impl
+    elif completed_task.task_type == "fix":
+        resolved_impl = _resolve_root_implementation_for_fix(completed_task, store)
+        if resolved_impl is None:
+            console.print(
+                f"\n[yellow]Could not resolve the implementation ancestor for fix task {completed_task.id}; "
+                "skipping auto-review.[/yellow]"
+            )
+            return 0
+        review_target = resolved_impl
 
     try:
         review_task = create_review_task(
@@ -2244,36 +2253,37 @@ def _create_and_run_review_task(
     return run(config, task_id=review_task.id)
 
 
-def _sync_completed_improve_branch_for_live_pr(
+def _sync_completed_code_task_branch_for_live_pr(
     task: Task,
     store: SqliteTaskStore,
     git: Git,
 ) -> bool:
-    """Best-effort sync for improve branches that already have an open PR.
+    """Best-effort sync for same-branch code tasks that already have an open PR.
 
     Returns False only when follow-up review should be held until the branch is
     published. Lookup or `gh` availability gaps preserve the historical
-    improve-time review flow because no PR-facing action can be taken anyway.
+    auto-review flow because no PR-facing action can be taken anyway.
     """
+    task_label = f"{task.task_type.capitalize()} task {task.id}"
     result = sync_task_branch_if_live_pr(task, store, git)
     if result.ok or result.status == "gh_unavailable":
         return True
 
     if result.status == "lookup_failed":
         print(
-            f"Warning: Improve task {task.id} completed, but gza could not look up a live PR for "
+            f"Warning: {task_label} completed, but gza could not look up a live PR for "
             f"branch '{task.branch}': {result.error}. Continuing with auto-review without PR sync."
         )
         return True
     if result.status == "push_failed":
         pr_ref = f"PR #{result.pr_number}" if result.pr_number is not None else "the live PR"
         print(
-            f"Warning: Improve task {task.id} completed, but branch '{task.branch}' could not be "
+            f"Warning: {task_label} completed, but branch '{task.branch}' could not be "
             f"pushed to {pr_ref}: {result.error}"
         )
     else:
         print(
-            f"Warning: Improve task {task.id} completed, but branch '{task.branch}' could not be "
+            f"Warning: {task_label} completed, but branch '{task.branch}' could not be "
             "synchronized for follow-up PR actions."
         )
     return False
@@ -3530,6 +3540,8 @@ def _post_complete_code_task(
     """Run shared post-completion side effects for completed code tasks."""
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
     improve_follow_up_ready = True
+    fix_code_changed = False
+    fix_auto_review_ready = True
     impl_ancestor: Task | None = None
 
     # Clear review state on the root implementation task after improve completes.
@@ -3554,7 +3566,7 @@ def _post_complete_code_task(
             ) == "merged":
                 store.set_merge_status(refreshed_impl.id, "unmerged")
         if task.create_review:
-            improve_follow_up_ready = _sync_completed_improve_branch_for_live_pr(task, store, worktree_git)
+            improve_follow_up_ready = _sync_completed_code_task_branch_for_live_pr(task, store, worktree_git)
         if improve_follow_up_ready and impl_ancestor and impl_ancestor.id is not None:
             store.clear_review_state(impl_ancestor.id)
             store.resolve_comments(
@@ -3581,16 +3593,20 @@ def _post_complete_code_task(
         worktree_git.push_force_with_lease(branch_name)
 
     if task.task_type == "fix":
-        _handle_fix_follow_up_review(
+        fix_code_changed = _prepare_fix_follow_up_review(
             task,
             store,
             worktree_git,
             branch_name,
-            target_branch=target_branch,
             fix_commits_ahead_before_run=fix_commits_ahead_before_run,
             fix_default_branch=fix_default_branch,
             fix_was_merged_before_run=fix_was_merged_before_run,
         )
+        if fix_code_changed:
+            if task.create_review:
+                fix_auto_review_ready = _sync_completed_code_task_branch_for_live_pr(task, store, worktree_git)
+            else:
+                _create_fix_follow_up_review_task(task, store)
 
     console.print("")
     task_footer(
@@ -3616,6 +3632,21 @@ def _post_complete_code_task(
                     "Warning: Skipping auto-review until the improve branch is safely published."
                 )
             return 0
+        if task.task_type == "fix":
+            if not fix_code_changed:
+                return 0
+            if not fix_auto_review_ready:
+                review_target = _resolve_root_implementation_for_fix(task, store)
+                if review_target and review_target.id is not None:
+                    print(
+                        "Warning: Skipping auto-review until the fix branch is safely published. "
+                        f"After resolving the PR sync issue, run `uv run gza review {review_target.id}`."
+                    )
+                else:
+                    print(
+                        "Warning: Skipping auto-review until the fix branch is safely published."
+                    )
+                return 0
         if target_branch is None:
             return _create_and_run_review_task(task, config, store)
         return _create_and_run_review_task(task, config, store)
@@ -3623,21 +3654,20 @@ def _post_complete_code_task(
     return 0
 
 
-def _handle_fix_follow_up_review(
+def _prepare_fix_follow_up_review(
     task: Task,
     store: SqliteTaskStore,
     worktree_git: Git,
     branch_name: str,
     *,
-    target_branch: str | None,
     fix_commits_ahead_before_run: int | None,
     fix_default_branch: str | None,
     fix_was_merged_before_run: bool = False,
-) -> None:
-    """Create a follow-up review task for fix runs when the run added commits."""
+) -> bool:
+    """Return True when a completed fix added commits that require follow-up review."""
     root_impl = _resolve_root_implementation_for_fix(task, store)
     if root_impl is None or root_impl.id is None:
-        return
+        return False
     root_impl_id = root_impl.id
     default_branch = fix_default_branch
 
@@ -3652,7 +3682,7 @@ def _handle_fix_follow_up_review(
         _restore_prior_merged_state()
         print("Warning: Could not determine fix commit baseline before run")
         print("Warning: Could not determine whether the fix run changed code")
-        return
+        return False
 
     if not default_branch:
         try:
@@ -3661,7 +3691,7 @@ def _handle_fix_follow_up_review(
             _restore_prior_merged_state()
             print(f"Warning: Could not determine fix commit delta: {exc}")
             print("Warning: Could not determine whether the fix run changed code")
-            return
+            return False
 
     try:
         commits_after = worktree_git.count_commits_ahead(branch_name, default_branch)
@@ -3669,13 +3699,13 @@ def _handle_fix_follow_up_review(
         _restore_prior_merged_state()
         print(f"Warning: Could not determine fix commit delta: {exc}")
         print("Warning: Could not determine whether the fix run changed code")
-        return
+        return False
 
     commits_before = fix_commits_ahead_before_run
     if commits_after <= commits_before:
         _restore_prior_merged_state()
         print("Fix completed without new commits; no follow-up review was auto-created.")
-        return
+        return False
 
     store.clear_review_state(root_impl_id)
     refreshed_impl = store.get(root_impl_id)
@@ -3688,6 +3718,15 @@ def _handle_fix_follow_up_review(
         refreshed_unit.state if refreshed_unit is not None else refreshed_impl.merge_status
     ) == "merged":
         store.set_merge_status(refreshed_impl.id, "unmerged")
+
+    return True
+
+
+def _create_fix_follow_up_review_task(task: Task, store: SqliteTaskStore) -> None:
+    """Create a pending follow-up review task for a completed fix run."""
+    root_impl = _resolve_root_implementation_for_fix(task, store)
+    if root_impl is None or root_impl.id is None:
+        return
 
     try:
         review_task = create_review_task(store, root_impl, prompt_mode="auto")

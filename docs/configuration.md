@@ -1267,6 +1267,7 @@ gza fix <task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `task_id` | Full prefixed task ID (implement, improve, review, or fix — auto-resolves to root implementation; e.g. `gza-1234`) |
+| `--review` | Auto-create review task on completion; if the branch already has an open PR, push same-branch fix commits first |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
@@ -1274,6 +1275,8 @@ gza fix <task_id> [options]
 | `--model MODEL` | Override model for this task |
 | `--provider PROVIDER` | Override provider for this task |
 | `--force` | Skip dependency precondition checks when running the fix task |
+
+When a fix run completes with `--review`, gza performs the same narrow PR check before the follow-up review: if GitHub can confirm that the branch already has an open PR, gza pushes any new same-branch commits first so the review sees the published code. If GitHub is unavailable, lookup fails, or no live PR exists, fix preserves the normal auto-review flow.
 
 ### review
 
@@ -1578,7 +1581,7 @@ Use `uv run gza unmerged` for the daily "what still needs to be merged?" check. 
 - discovers PRs by branch for bounded candidates that need PR reconciliation
 - auto-closes stale open PRs only after posting a comment and only when a fresh `origin/<default-branch>` fetch proves the branch content is already present upstream
 
-The only GitHub-side exception outside `uv run gza sync` is improve completion with `--review`: before auto-running the follow-up review, gza may do a narrow branch-scoped live-PR check and push for that same branch. It does not replace `uv run gza sync` for broader cache refresh, merge-state reconciliation, or stale-PR cleanup.
+The only GitHub-side exceptions outside `uv run gza sync` are improve and fix completion with `--review`: before auto-running the follow-up review, gza may do a narrow branch-scoped live-PR check and push for that same branch. It does not replace `uv run gza sync` for broader cache refresh, merge-state reconciliation, or stale-PR cleanup.
 
 Default `uv run gza sync` scope is intentionally bounded. It includes unresolved branches, tasks with known or unknown open-PR cache state, and recently touched PR-intended work. Pass explicit task IDs to force-sync specific branch cohorts outside that default window. That bounded scope is acceptable because `uv run gza sync` is no longer the primary daily merge-truth refresh surface.
 
