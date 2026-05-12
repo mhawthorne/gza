@@ -2673,12 +2673,12 @@ def _started_at(worker: WorkerMetadata | None, task: DbTask | None) -> datetime 
 
 def _ended_at(worker: WorkerMetadata | None, task: DbTask | None = None) -> datetime | None:
     """Get completed timestamp when available."""
+    if task and task.status in ("completed", "failed") and task.completed_at:
+        return task.completed_at
     if worker:
         ended = _parse_iso(worker.completed_at)
         if ended:
             return ended
-    if task and task.status in ("completed", "failed") and task.completed_at:
-        return task.completed_at
     return None
 
 

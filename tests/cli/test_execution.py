@@ -12724,6 +12724,146 @@ class TestForegroundInvocationContextWiring:
         assert worker.exit_code == 0
         assert worker.task_id == impl.id
 
+    def test_background_iterate_launch_failure_after_child_noop_cleans_up_worker_registry(self, tmp_path: Path):
+        """Launch rollback should remove worker rows even if the child already registered one."""
+        from gza.cli._common import _spawn_background_iterate_worker
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Iterate launch cleanup target", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        spawn_args = argparse.Namespace(
+            no_docker=True,
+            force=False,
+        )
+        iterate_args = argparse.Namespace(
+            project_dir=tmp_path,
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        def fake_spawn(_cmd: list[str], _config: Config, worker_id: str):
+            iterate_args.worker_id = worker_id
+            with patch("gza.cli.execution._cmd_iterate_impl", return_value=3):
+                assert cmd_iterate(iterate_args) == 3
+            raise RuntimeError("launch boom after child noop")
+
+        with patch("gza.cli._common._spawn_detached_worker_process", side_effect=fake_spawn):
+            rc = _spawn_background_iterate_worker(spawn_args, config, impl, max_iterations=1)
+
+        assert rc == 1
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+
+    def test_background_iterate_launch_cleanup_failure_marks_worker_terminal(self, tmp_path: Path):
+        """Rollback should terminalize a running worker row when registry removal fails."""
+        from gza.cli._common import _spawn_background_iterate_worker
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Iterate cleanup fallback target", task_type="implement")
+        assert impl.id is not None
+
+        spawn_args = argparse.Namespace(
+            no_docker=True,
+            force=False,
+        )
+
+        captured_worker_id: str | None = None
+
+        def fake_spawn(_cmd: list[str], _config: Config, worker_id: str):
+            nonlocal captured_worker_id
+            captured_worker_id = worker_id
+            registry = WorkerRegistry(config.workers_path)
+            registry.ensure_running(
+                WorkerMetadata(
+                    worker_id=worker_id,
+                    task_id=impl.id,
+                    pid=os.getpid(),
+                    status="running",
+                    startup_log_file=f".gza/workers/{worker_id}-startup.log",
+                )
+            )
+            raise RuntimeError("launch boom after child registered")
+
+        with (
+            patch("gza.cli._common._spawn_detached_worker_process", side_effect=fake_spawn),
+            patch.object(WorkerRegistry, "remove", side_effect=OSError("unlink boom")),
+        ):
+            rc = _spawn_background_iterate_worker(spawn_args, config, impl, max_iterations=1)
+
+        assert rc == 1
+        assert captured_worker_id is not None
+        worker = WorkerRegistry(config.workers_path).get(captured_worker_id)
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == 1
+        assert worker.completed_at is not None
+
+    def test_background_iterate_launch_cleanup_failure_warns_when_terminal_fallback_fails(self, tmp_path: Path, capsys):
+        """Rollback should warn when neither removal nor terminal fallback can repair worker state."""
+        from gza.cli._common import _spawn_background_iterate_worker
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Iterate cleanup warning target", task_type="implement")
+        assert impl.id is not None
+
+        spawn_args = argparse.Namespace(
+            no_docker=True,
+            force=False,
+        )
+
+        captured_worker_id: str | None = None
+
+        def fake_spawn(_cmd: list[str], _config: Config, worker_id: str):
+            nonlocal captured_worker_id
+            captured_worker_id = worker_id
+            registry = WorkerRegistry(config.workers_path)
+            registry.ensure_running(
+                WorkerMetadata(
+                    worker_id=worker_id,
+                    task_id=impl.id,
+                    pid=os.getpid(),
+                    status="running",
+                    startup_log_file=f".gza/workers/{worker_id}-startup.log",
+                )
+            )
+            raise RuntimeError("launch boom after child registered")
+
+        with (
+            patch("gza.cli._common._spawn_detached_worker_process", side_effect=fake_spawn),
+            patch.object(WorkerRegistry, "remove", side_effect=OSError("unlink boom")),
+            patch.object(WorkerRegistry, "mark_completed", side_effect=OSError("mark boom")),
+        ):
+            rc = _spawn_background_iterate_worker(spawn_args, config, impl, max_iterations=1)
+
+        assert rc == 1
+        assert captured_worker_id is not None
+        worker = WorkerRegistry(config.workers_path).get(captured_worker_id)
+        assert worker is not None
+        assert worker.status == "running"
+        assert worker.completed_at is None
+        assert (
+            f"Warning: failed to clean up background worker {captured_worker_id} after launch failure: "
+            "remove failed with unlink boom; terminal fallback failed with mark boom"
+        ) in capsys.readouterr().err
+
 
 class TestRunAsWorker:
     """Tests for _run_as_worker() helper."""

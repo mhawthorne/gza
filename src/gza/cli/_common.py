@@ -590,6 +590,50 @@ def _spawn_detached_worker_process(
     return proc, str(startup_log_path.relative_to(config.project_dir))
 
 
+def _rollback_background_worker_launch(
+    *,
+    registry: WorkerRegistry,
+    worker_id: str,
+    proc: subprocess.Popen | None = None,
+    tmux_session: str | None = None,
+) -> None:
+    """Best-effort cleanup when a detached worker launch fails mid-handoff."""
+    if tmux_session:
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["tmux", "kill-session", "-t", tmux_session],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+    if proc is not None:
+        with contextlib.suppress(Exception):
+            proc.terminate()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=1)
+        if proc.poll() is None:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=1)
+    try:
+        registry.remove(worker_id)
+    except Exception as cleanup_exc:
+        try:
+            registry.mark_completed(
+                worker_id,
+                exit_code=1,
+                status="failed",
+                completion_reason="background launch rollback after registry cleanup failure",
+            )
+        except Exception as mark_exc:
+            print(
+                f"Warning: failed to clean up background worker {worker_id} after launch failure: "
+                f"remove failed with {cleanup_exc}; terminal fallback failed with {mark_exc}",
+                file=sys.stderr,
+            )
+
+
 def _run_foreground(
     config: Config,
     task_id: str | None,
@@ -846,8 +890,9 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         inner_cmd.extend(["--tmux-session", tmux_session])
 
     # Spawn detached process
+    worker_id = registry.generate_worker_id()
+    proc: subprocess.Popen | None = None
     try:
-        worker_id = registry.generate_worker_id()
         inner_cmd.extend(["--worker-id", worker_id])
 
         startup_log_rel: str | None = None
@@ -928,6 +973,12 @@ def _spawn_background_worker(args: argparse.Namespace, config: Config, task_id: 
         return 0
 
     except Exception as e:
+        _rollback_background_worker_launch(
+            registry=registry,
+            worker_id=worker_id,
+            proc=proc,
+            tmux_session=tmux_session,
+        )
         _print_work_message(f"Error spawning background worker: {e}", color=_colors.WORK_COLORS.error)
         return 1
 
@@ -1127,9 +1178,9 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
     cmd.extend(["--project", str(config.project_dir.absolute())])
 
     # Spawn detached process
+    worker_id = registry.generate_worker_id()
+    proc: subprocess.Popen | None = None
     try:
-        # Generate worker ID
-        worker_id = registry.generate_worker_id()
         cmd.extend(["--worker-id", worker_id])
         proc, startup_log_rel = _spawn_detached_worker_process(cmd, config, worker_id)
 
@@ -1147,6 +1198,11 @@ def _spawn_background_resume_worker(args: argparse.Namespace, config: Config, ne
         return 0
 
     except Exception as e:
+        _rollback_background_worker_launch(
+            registry=registry,
+            worker_id=worker_id,
+            proc=proc,
+        )
         _print_work_message(f"Error spawning background worker: {e}", color=_colors.WORK_COLORS.error)
         return 1
 
@@ -1192,7 +1248,7 @@ def _spawn_background_iterate_worker(
 
     worker_id = registry.generate_worker_id()
     inner_cmd.extend(["--worker-id", worker_id])
-
+    proc: subprocess.Popen | None = None
     try:
         proc, startup_log_rel = _spawn_detached_worker_process(inner_cmd, config, worker_id)
         worker = WorkerMetadata(
@@ -1205,6 +1261,11 @@ def _spawn_background_iterate_worker(
         _print_background_worker_started(impl_task, pid=proc.pid, quiet=quiet)
         return 0
     except Exception as e:
+        _rollback_background_worker_launch(
+            registry=registry,
+            worker_id=worker_id,
+            proc=proc,
+        )
         _print_work_message(f"Error spawning background iterate worker: {e}", color=_colors.WORK_COLORS.error)
         return 1
 

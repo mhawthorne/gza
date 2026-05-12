@@ -5686,6 +5686,57 @@ class TestPsCommand:
         assert rows[0]["task"] != ""
         assert not rows[0]["task"].startswith("task ")
 
+    def test_ps_duration_prefers_terminal_task_completed_at_over_dangling_worker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Completed tasks should not inherit runaway runtime from stale worker rows."""
+        import os
+
+        from gza.cli.query import _build_ps_rows
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Completed task with stale worker")
+        task.status = "completed"
+        task.started_at = datetime(2026, 1, 8, 0, 0, tzinfo=UTC)
+        task.completed_at = datetime(2026, 1, 8, 0, 14, 5, tzinfo=UTC)
+        store.update(task)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-stale-terminal-runtime",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at="2026-01-08T00:00:00+00:00",
+                status="running",
+                completed_at=None,
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        fixed_now = datetime(2026, 1, 10, 12, 0, tzinfo=UTC)
+
+        class _FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return fixed_now.replace(tzinfo=None)
+                return fixed_now.astimezone(tz)
+
+        monkeypatch.setattr(query_cli, "datetime", _FixedDateTime)
+
+        rows, _ = _build_ps_rows(registry, store, include_completed=True)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["ended_at"] == "2026-01-08T00:14:05+00:00"
+        assert rows[0]["duration"] == "14m 5s"
+
     def test_ps_does_not_flag_foreground_task_with_live_pid_as_orphaned(self, tmp_path: Path):
         """A foreground in_progress task (running_pid alive, no worker) is not orphaned.
 
