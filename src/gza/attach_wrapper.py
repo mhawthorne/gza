@@ -11,7 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from .cli._common import _create_resume_task, _create_retry_task, _spawn_background_worker, get_store
+from .cli._common import (
+    _create_resume_task,
+    _create_retry_task,
+    _prepare_task_for_immediate_execution,
+    _spawn_background_worker,
+    get_store,
+)
 from .cli.execution import _spawn_background_iterate
 from .config import Config
 from .providers.base import build_docker_cmd, ensure_docker_image
@@ -120,6 +126,15 @@ class _AttachHandoffTarget:
     resume_mode: bool
     launch_mode: Literal["worker", "iterate"]
     iterate_task_id: str | None = None
+    # For iterate handoffs, the recovery (resume/retry) task whose identity is
+    # prepared in the parent before detachment, so the detached iterate worker
+    # inherits durable slug/log paths and can surface its startup failures.
+    # Always set when launch_mode == "iterate".
+    recovery_task_id: str | None = None
+    # True when this attach run freshly created the recovery task row. The
+    # spawn block uses this to decide whether to roll back the row on
+    # preparation failure (fresh = roll back; reused = leave intact).
+    recovery_task_freshly_created: bool = False
 
 
 def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget | None:
@@ -145,11 +160,21 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
 
     if decision.action == "resume":
         if decision.launch_mode == "iterate":
+            if decision.reuse_existing and decision.recovery_task_id is not None:
+                resume_task_id = decision.recovery_task_id
+                freshly_created = False
+            else:
+                resume_task = _create_resume_task(store, task)
+                assert resume_task.id is not None
+                resume_task_id = str(resume_task.id)
+                freshly_created = True
             return _AttachHandoffTarget(
-                task_id=decision.recovery_task_id or str(task.id),
+                task_id=resume_task_id,
                 resume_mode=True,
                 launch_mode="iterate",
                 iterate_task_id=str(task.id),
+                recovery_task_id=resume_task_id,
+                recovery_task_freshly_created=freshly_created,
             )
         if decision.reuse_existing and decision.recovery_task_id is not None:
             return _AttachHandoffTarget(
@@ -168,15 +193,19 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
     if decision.launch_mode == "iterate":
         if decision.reuse_existing and decision.recovery_task_id is not None:
             retry_task_id = decision.recovery_task_id
+            freshly_created = False
         else:
             retry_task = _create_retry_task(store, task, automatic_recovery=True)
             assert retry_task.id is not None
             retry_task_id = str(retry_task.id)
+            freshly_created = True
         return _AttachHandoffTarget(
             task_id=retry_task_id,
             resume_mode=False,
             launch_mode="iterate",
             iterate_task_id=retry_task_id,
+            recovery_task_id=retry_task_id,
+            recovery_task_freshly_created=freshly_created,
         )
 
     if decision.reuse_existing and decision.recovery_task_id is not None:
@@ -298,23 +327,40 @@ def main() -> int:
                     )
                 else:
                     assert handoff.iterate_task_id is not None
+                    assert handoff.recovery_task_id is not None
                     iterate_task = store.get(handoff.iterate_task_id)
-                    if iterate_task is None:
+                    recovery_task = store.get(handoff.recovery_task_id)
+                    if iterate_task is None or recovery_task is None:
                         spawn_rc = 1
                     else:
-                        iterate_args = argparse.Namespace(
-                            no_docker=args.no_docker,
-                            force=args.force,
-                            max_iterations=config.iterate_max_iterations,
-                            resume=handoff_resume_mode,
-                            retry=False,
-                            auto_iterate=True,
-                        )
-                        spawn_rc = _spawn_background_iterate(
-                            iterate_args,
+                        # Phase 1: run the parent-side preparation on the
+                        # recovery row so slug/log identity is durable before
+                        # detachment. Roll back the row only if this attach run
+                        # created it; reused pending rows must survive.
+                        prepared_recovery = _prepare_task_for_immediate_execution(
                             config,
-                            iterate_task,
+                            recovery_task,
+                            rollback_on_failure=handoff.recovery_task_freshly_created,
                         )
+                        if prepared_recovery is None or prepared_recovery.id is None:
+                            spawn_rc = 1
+                        else:
+                            iterate_args = argparse.Namespace(
+                                no_docker=args.no_docker,
+                                force=args.force,
+                                max_iterations=config.iterate_max_iterations,
+                                resume=handoff_resume_mode,
+                                retry=False,
+                                auto_iterate=True,
+                            )
+                            spawn_rc = _spawn_background_iterate(
+                                iterate_args,
+                                config,
+                                iterate_task,
+                                prepared_task_id=str(prepared_recovery.id),
+                                prepared_resume=handoff_resume_mode,
+                                prepared_phase="preloop",
+                            )
                 if log_file is not None:
                     handoff_event = "resume" if handoff_resume_mode else "retry"
                     handoff_failed_event = "resume_failed" if handoff_resume_mode else "retry_failed"
