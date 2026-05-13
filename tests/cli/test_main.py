@@ -372,8 +372,10 @@ class TestHelpOutput:
         setup_config(tmp_path)
 
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        retired = "gza sta" "tus"
 
-        assert "`gza ps`/`gza status` only prune dead worker metadata" in docs_text
+        assert "`gza ps` only prune dead worker metadata" in docs_text
+        assert f"`{retired}`" not in docs_text
         assert "On CLI startup, `in_progress` tasks are reconciled and auto-failed" not in docs_text
 
     def test_add_next_help_and_docs_describe_front_of_urgent_lane(self, tmp_path):
@@ -802,19 +804,17 @@ class TestReconciliationWarnings:
         assert "Warning: In-progress reconciliation failed: boom" in captured.err
 
     @pytest.mark.parametrize(
-        ("command", "patched_command"),
+        "command",
         [
-            ("ps", "cmd_ps"),
-            ("status", "cmd_ps"),
+            "ps",
         ],
     )
     def test_main_skips_task_reconciliation_for_query_worker_views(
         self,
         tmp_path,
         command: str,
-        patched_command: str,
     ) -> None:
-        """ps/status should prune worker metadata without reconciling DB task state."""
+        """ps should prune worker metadata without reconciling DB task state."""
         from gza.cli.main import main
 
         setup_config(tmp_path)
@@ -823,7 +823,7 @@ class TestReconciliationWarnings:
             patch.object(sys, "argv", ["gza", command, "--project", str(tmp_path)]),
             patch("gza.cli.main.reconcile_in_progress_tasks") as reconcile,
             patch("gza.cli.main.prune_terminal_dead_workers") as prune,
-            patch(f"gza.cli.main.{patched_command}", return_value=0),
+            patch("gza.cli.main.cmd_ps", return_value=0),
         ):
             rc = main()
 
@@ -852,6 +852,17 @@ class TestReconciliationWarnings:
 
 class TestCommandAliases:
     """Tests for CLI command dispatch behavior."""
+
+    def test_status_command_is_rejected(self, tmp_path):
+        """Removed `status` alias should fail at parser validation."""
+        setup_config(tmp_path)
+        retired = "sta" "tus"
+
+        result = run_gza(retired, "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert f"invalid choice: '{retired}'" in result.stderr
+        assert "ps" in result.stderr
 
     def test_cycle_command_is_rejected(self, tmp_path):
         """Removed `cycle` command should now fail at parser validation."""

@@ -666,14 +666,6 @@ gza import [file] [options]
 | `--dry-run` | Preview without creating tasks |
 | `--force`, `-f` | Skip duplicate detection |
 
-### status
-
-List active workers and startup failures (alias for `ps`).
-
-```bash
-gza status
-```
-
 ### attach
 
 Attach to a running task. Claude uses an interactive kill/resume handoff session; Codex/Gemini attach read-only. See [Tmux Sessions](tmux.md) for details.
@@ -704,7 +696,7 @@ gza ps [options]
 
 Runtime reconciliation notes:
 - Task lifecycle state is derived from the DB `tasks` table (`status`, `started_at`, `running_pid`), while worker metadata is a process index.
-- On CLI startup, `gza ps`/`gza status` only prune dead worker metadata; they do not reconcile or auto-fail `in_progress` DB tasks.
+- On CLI startup, `gza ps` only prune dead worker metadata; it does not reconcile or auto-fail `in_progress` DB tasks.
 - DB reconciliation for stale `in_progress` tasks still happens on mutating lifecycle commands such as `gza work`, where tasks may be auto-failed as:
   - `WORKER_DIED` when `running_pid` is missing/invalid or the PID is no longer alive.
   - `TIMEOUT` when runtime exceeds configured `timeout_minutes`.

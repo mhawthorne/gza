@@ -2229,43 +2229,42 @@ def main() -> int:
     )
     add_common_args(import_parser)
 
-    # ps command (status is an alias for ps)
-    for ps_cmd in ("ps", "status"):
-        ps_parser = subparsers.add_parser(
-            ps_cmd,
-            help="List active workers and startup failures" if ps_cmd == "ps" else "List active workers and startup failures (alias for ps)",
-        )
-        ps_parser.add_argument(
-            "--all", "-a",
-            action="store_true",
-            help="Include all completed/failed workers (not just startup failures)",
-        )
-        ps_parser.add_argument(
-            "--quiet", "-q",
-            action="store_true",
-            help="Only show worker IDs",
-        )
-        ps_parser.add_argument(
-            "--json",
-            action="store_true",
-            help="Output as JSON",
-        )
-        ps_parser.add_argument(
-            "--poll",
-            nargs="?",
-            const=5,
-            type=int,
-            metavar="SECS",
-            help="Refresh output every SECS seconds (default: 5 if flag given without value)",
-        )
-        ps_parser.add_argument(
-            "--recent-minutes",
-            type=int,
-            default=1,
-            metavar="MINUTES",
-            help="In --poll mode, include terminal rows that ended within the last MINUTES (default: 1)",
-        )
-        add_common_args(ps_parser)
+    # ps command
+    ps_parser = subparsers.add_parser(
+        "ps",
+        help="List active workers and startup failures",
+    )
+    ps_parser.add_argument(
+        "--all", "-a",
+        action="store_true",
+        help="Include all completed/failed workers (not just startup failures)",
+    )
+    ps_parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Only show worker IDs",
+    )
+    ps_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output as JSON",
+    )
+    ps_parser.add_argument(
+        "--poll",
+        nargs="?",
+        const=5,
+        type=int,
+        metavar="SECS",
+        help="Refresh output every SECS seconds (default: 5 if flag given without value)",
+    )
+    ps_parser.add_argument(
+        "--recent-minutes",
+        type=int,
+        default=1,
+        metavar="MINUTES",
+        help="In --poll mode, include terminal rows that ended within the last MINUTES (default: 1)",
+    )
+    add_common_args(ps_parser)
 
     # kill command
     kill_parser = subparsers.add_parser("kill", help="Kill a running task")
@@ -2410,7 +2409,7 @@ def main() -> int:
                     reconcile_in_progress_tasks(cfg)
                 except Exception as exc:
                     print(f"Warning: In-progress reconciliation failed: {exc}", file=sys.stderr)
-        if args.command in {"ps", "status"}:
+        if args.command == "ps":
             try:
                 cfg = Config.load(args.project_dir, discover=not project_explicit)
             except Exception as exc:
@@ -2504,7 +2503,7 @@ def main() -> int:
             return cmd_sync_report(args)
         elif args.command == "import":
             return cmd_import(args)
-        elif args.command in ("ps", "status"):
+        elif args.command == "ps":
             return cmd_ps(args)
         elif args.command == "kill":
             return cmd_kill(args)

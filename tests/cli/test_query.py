@@ -5691,11 +5691,6 @@ class TestPsCommand:
         assert "ordinary-failed-worker" in result_all.stdout
         assert "completed-worker" in result_all.stdout
 
-        # status --all (alias) also works
-        result_status = run_gza("status", "--all", "--project", str(tmp_path))
-        assert result_status.returncode == 0
-        assert "completed-worker" in result_status.stdout
-
         registry.remove("w-all-failed")
         registry.remove("w-all-completed")
 
