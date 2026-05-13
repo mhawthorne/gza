@@ -2564,28 +2564,57 @@ def _failure_next_steps(task: DbTask, reason: str, *, config: Config | None = No
 
 
 class GzaArgumentParser(argparse.ArgumentParser):
-    """ArgumentParser with compact unknown-command errors and generic flag fallback."""
+    """ArgumentParser with compact unknown-command errors and retired-flag fallbacks."""
 
     _INVALID_CHOICE_RE = re.compile(
-        r"argument (?:[\w-]+|\{[^}]+\}): invalid choice: ['\"]?(?P<cmd>[^'\"\s]+)['\"]?"
+        r"argument (?P<argument>[\w-]+|\{[^}]+\}): invalid choice: ['\"]?(?P<cmd>[^'\"\s]+)['\"]?"
     )
+    _RETIRED_INVALID_CHOICE_FLAGS = frozenset({
+        "--continue",
+        "--depends-on",
+        "--execution-mode",
+        "--group",
+        "--preset",
+        "--view",
+    })
+
+    @classmethod
+    def _retired_invalid_choice_message(cls, cmd: str, argv: list[str]) -> str | None:
+        """Map retired flag parse fallthroughs back to `unrecognized arguments` errors."""
+        if cmd not in argv:
+            return None
+
+        cmd_index = argv.index(cmd)
+        if cmd in cls._RETIRED_INVALID_CHOICE_FLAGS:
+            trailing_value = ""
+            if cmd_index + 1 < len(argv) and not argv[cmd_index + 1].startswith("-"):
+                trailing_value = f" {argv[cmd_index + 1]}"
+            return f"unrecognized arguments: {cmd}{trailing_value}"
+
+        if cmd_index == 0:
+            return None
+
+        previous = argv[cmd_index - 1]
+        if previous not in cls._RETIRED_INVALID_CHOICE_FLAGS:
+            return None
+        return f"unrecognized arguments: {previous} {cmd}"
+
+    @staticmethod
+    def _is_command_choice_argument(argument: str) -> bool:
+        """Return whether an invalid-choice error came from command selection."""
+        return argument == "command" or argument.startswith("{")
 
     def error(self, message: str) -> NoReturn:
         match = self._INVALID_CHOICE_RE.match(message)
         if match:
+            argument = match.group("argument")
             cmd = match.group("cmd")
-            if cmd in sys.argv:
-                cmd_index = sys.argv.index(cmd)
-                if cmd.startswith("-"):
-                    trailing_value = ""
-                    if cmd_index + 1 < len(sys.argv) and not sys.argv[cmd_index + 1].startswith("-"):
-                        trailing_value = f" {sys.argv[cmd_index + 1]}"
-                    super().error(f"unrecognized arguments: {cmd}{trailing_value}")
-                if cmd_index > 0:
-                    previous = sys.argv[cmd_index - 1]
-                    if previous.startswith("-"):
-                        super().error(f"unrecognized arguments: {previous} {cmd}")
-            # Plain-word invalid choices keep argparse's native wording so the
+            retired_message = self._retired_invalid_choice_message(cmd, sys.argv)
+            if retired_message is not None:
+                super().error(retired_message)
+            if not self._is_command_choice_argument(argument):
+                super().error(message)
+            # Plain-word invalid commands keep argparse's native wording so the
             # user sees the full choice list. Hyphenated pseudo-commands get
             # the terse git-style message below.
             if cmd.isalpha():
