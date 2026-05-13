@@ -1,6 +1,7 @@
 """Packaging configuration regression tests."""
 
 import ast
+import importlib.util
 import os
 import subprocess
 import tomllib
@@ -8,20 +9,14 @@ from pathlib import Path
 
 import pytest
 
-_PYTEST_TIMEOUT_DECORATOR = "@pytest.mark." "timeout"
 
-
-def _find_timeout_decorator_occurrences(root: Path) -> list[str]:
-    """Return every file/line under root that contains a timeout decorator."""
-    occurrences: list[str] = []
-    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
-        if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
-            continue
-        file_text = path.read_text(encoding="utf-8", errors="ignore")
-        for lineno, line in enumerate(file_text.splitlines(), start=1):
-            if _PYTEST_TIMEOUT_DECORATOR in line:
-                occurrences.append(f"{path.relative_to(root)}:{lineno}")
-    return occurrences
+def _load_module(path: Path, module_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_hatch_vcs_does_not_write_source_version_file() -> None:
@@ -34,7 +29,7 @@ def test_hatch_vcs_does_not_write_source_version_file() -> None:
 
 
 def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
-    """pytest-timeout remains available without a global unit-suite watchdog."""
+    """pytest-timeout remains suite-scoped rather than globally configured."""
     repo_root = Path(__file__).resolve().parents[1]
     pyproject = repo_root / "pyproject.toml"
     config = tomllib.loads(pyproject.read_text())
@@ -45,24 +40,6 @@ def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
 
     pytest_options = config.get("tool", {}).get("pytest", {}).get("ini_options", {})
     assert "timeout" not in pytest_options
-
-    unit_conftest_path = repo_root / "tests" / "conftest.py"
-    unit_conftest = ast.parse(unit_conftest_path.read_text(), filename=str(unit_conftest_path))
-    unit_timeout_calls = [
-        node
-        for node in ast.walk(unit_conftest)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "timeout"
-        and isinstance(node.func.value, ast.Attribute)
-        and node.func.value.attr == "mark"
-        and isinstance(node.func.value.value, ast.Name)
-        and node.func.value.value.id == "pytest"
-    ]
-    assert len(unit_timeout_calls) == 1
-    assert len(unit_timeout_calls[0].args) == 1
-    assert isinstance(unit_timeout_calls[0].args[0], ast.Name)
-    assert unit_timeout_calls[0].args[0].id == "FUNCTIONAL_TEST_TIMEOUT_SECONDS"
 
     integration_conftest_path = repo_root / "tests_integration" / "conftest.py"
     integration_conftest = ast.parse(
@@ -85,36 +62,44 @@ def test_pytest_timeout_watchdogs_are_scoped_by_suite() -> None:
     assert integration_timeout_calls[0].args[0].id == "INTEGRATION_TEST_TIMEOUT_SECONDS"
 
 
-def test_unit_tests_do_not_carry_per_test_pytest_timeout_overrides() -> None:
-    """Unit tests should not carry timeout decorators anywhere under tests/."""
-    tests_root = Path(__file__).resolve().parents[1] / "tests"
-    timeout_overrides = _find_timeout_decorator_occurrences(tests_root)
+def test_unit_test_conftest_injects_unit_and_functional_watchdogs() -> None:
+    """tests/conftest.py should assign the unit or functional watchdog by marker."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    module = _load_module(conftest_path, "tests_timeout_conftest")
 
-    assert not timeout_overrides, f"Found timeout overrides in tests/: {timeout_overrides}"
+    class FakeItem:
+        def __init__(self, *, functional: bool = False, timeout: bool = False) -> None:
+            self._functional = functional
+            self._timeout = timeout
+            self.markers: list[pytest.MarkDecorator] = []
 
+        def get_closest_marker(self, name: str):
+            if name == "functional" and self._functional:
+                return object()
+            if name == "timeout" and self._timeout:
+                return object()
+            return None
 
-def test_timeout_decorator_scan_covers_all_files_under_tests_tree(tmp_path: Path) -> None:
-    """The timeout-decorator guard should catch non-test helper files too."""
-    tests_root = tmp_path / "tests"
-    (tests_root / "cli").mkdir(parents=True)
-    (tests_root / "helpers").mkdir()
-    (tests_root / "cli" / "conftest.py").write_text(
-        "import pytest\n\n"
-        + _PYTEST_TIMEOUT_DECORATOR
-        + "(5, method='signal')\n"
-        "def pytest_collection_modifyitems(items):\n"
-        "    return None\n"
-    )
-    (tests_root / "helpers" / "timeout_notes.txt").write_text(
-        "Do not add "
-        + _PYTEST_TIMEOUT_DECORATOR
-        + " to helper modules.\n"
-    )
+        def add_marker(self, marker: pytest.MarkDecorator) -> None:
+            self.markers.append(marker)
 
-    assert _find_timeout_decorator_occurrences(tests_root) == [
-        "cli/conftest.py:3",
-        "helpers/timeout_notes.txt:1",
-    ]
+    plain_unit = FakeItem()
+    functional_unit = FakeItem(functional=True)
+    explicit_timeout = FakeItem(timeout=True)
+
+    module.pytest_collection_modifyitems([plain_unit, functional_unit, explicit_timeout])
+
+    assert len(plain_unit.markers) == 1
+    assert plain_unit.markers[0].mark.name == "timeout"
+    assert plain_unit.markers[0].mark.args == (module.UNIT_TEST_TIMEOUT_SECONDS,)
+    assert plain_unit.markers[0].mark.kwargs == {"method": "signal"}
+
+    assert len(functional_unit.markers) == 1
+    assert functional_unit.markers[0].mark.name == "timeout"
+    assert functional_unit.markers[0].mark.args == (module.FUNCTIONAL_TEST_TIMEOUT_SECONDS,)
+    assert functional_unit.markers[0].mark.kwargs == {"method": "signal"}
+
+    assert explicit_timeout.markers == []
 
 
 def test_functional_subprocess_timeouts_within_watchdog() -> None:
@@ -210,53 +195,6 @@ def test_functional_subprocess_timeouts_within_watchdog() -> None:
         "Inner subprocess.run timeouts exceed the functional watchdog; the watchdog will fire first "
         "and the inner timeout can never trip:\n  " + "\n  ".join(inversions)
     )
-
-
-def test_unit_test_conftest_skips_unit_timeout_injection() -> None:
-    """tests/conftest.py should not inject timeout markers into plain unit tests."""
-    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
-    module = ast.parse(conftest_path.read_text(), filename=str(conftest_path))
-
-    timeout_targets: list[str] = []
-    collection_hooks: list[int] = []
-    assigned_names: set[str] = set()
-    marker_lookups: list[str] = []
-
-    for node in ast.walk(module):
-        if isinstance(node, ast.FunctionDef) and node.name == "pytest_collection_modifyitems":
-            collection_hooks.append(node.lineno)
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    assigned_names.add(target.id)
-        if not isinstance(node, ast.Call):
-            continue
-        if (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "get_closest_marker"
-            and len(node.args) == 1
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-        ):
-            marker_lookups.append(node.args[0].value)
-        if not (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "timeout"
-            and isinstance(node.func.value, ast.Attribute)
-            and node.func.value.attr == "mark"
-            and isinstance(node.func.value.value, ast.Name)
-            and node.func.value.value.id == "pytest"
-        ):
-            continue
-        assert len(node.args) == 1
-        assert isinstance(node.args[0], ast.Name)
-        timeout_targets.append(node.args[0].id)
-
-    assert len(collection_hooks) == 1
-    assert "UNIT_TEST_TIMEOUT_SECONDS" not in assigned_names
-    assert timeout_targets == ["FUNCTIONAL_TEST_TIMEOUT_SECONDS"]
-    assert "functional" in marker_lookups
-    assert "timeout" in marker_lookups
 
 
 def _run_bin_tests(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:

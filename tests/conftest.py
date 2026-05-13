@@ -4,15 +4,21 @@ import os
 
 import pytest
 
+UNIT_TEST_TIMEOUT_SECONDS = int(os.environ.get("GZA_UNIT_TEST_TIMEOUT_SECONDS", "1"))
 FUNCTIONAL_TEST_TIMEOUT_SECONDS = int(os.environ.get("GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS", "4"))
 
 
 def pytest_collection_modifyitems(items):
-    """Apply the subprocess watchdog only to functional tests in the unit suite."""
+    """Apply the unit/functional suite watchdogs unless a test sets its own timeout."""
+    unit_timeout_marker = pytest.mark.timeout(UNIT_TEST_TIMEOUT_SECONDS, method="signal")
     functional_timeout_marker = pytest.mark.timeout(FUNCTIONAL_TEST_TIMEOUT_SECONDS, method="signal")
     for item in items:
-        if item.get_closest_marker("functional") is not None and item.get_closest_marker("timeout") is None:
+        if item.get_closest_marker("timeout") is not None:
+            continue
+        if item.get_closest_marker("functional") is not None:
             item.add_marker(functional_timeout_marker)
+        else:
+            item.add_marker(unit_timeout_marker)
 
 
 @pytest.fixture(autouse=True)
