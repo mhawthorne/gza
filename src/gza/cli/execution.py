@@ -1661,7 +1661,11 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
 
     if mode == "force":
         old_status = task.status
-        store.mark_completed(task, branch=task.branch if task.branch else None)
+        store.mark_completed(
+            task,
+            branch=task.branch if task.branch else None,
+            completion_reason=args.reason,
+        )
         _cleanup_worker_registry(config, task_id)
         print(f"✓ Task {task_id} status changed: {old_status} → completed (status-only)")
         return 0
@@ -1680,7 +1684,12 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
     commit_count = git.count_commits_ahead(task.branch, default_branch)
     if commit_count <= 0:
         print(f"Note: No commits found on branch '{task.branch}' compared to '{default_branch}'")
-        store.mark_completed(task, branch=task.branch, has_commits=False)
+        store.mark_completed(
+            task,
+            branch=task.branch,
+            has_commits=False,
+            completion_reason=args.reason,
+        )
         _cleanup_worker_registry(config, task_id)
         print(f"✓ Task {task_id} marked as completed")
         return 0
@@ -1691,6 +1700,7 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
         has_commits=True,
         head_sha=git.rev_parse_if_exists(task.branch),
         base_sha=git.rev_parse_if_exists(default_branch),
+        completion_reason=args.reason,
     )
     _cleanup_worker_registry(config, task_id)
     print(f"✓ Task {task_id} marked as completed (unmerged, {commit_count} commit(s) on branch '{task.branch}')")
@@ -1699,7 +1709,7 @@ def cmd_mark_completed(args: argparse.Namespace) -> int:
 
 
 def cmd_set_status(args: argparse.Namespace) -> int:
-    """Manually force a task's status to any valid value."""
+    """Manually force a task's status to an operator-assertable value."""
     if args.status == "in_progress":
         print(
             "Error: 'in_progress' is set by a running worker, not by manual operator action.\n"
@@ -1708,15 +1718,21 @@ def cmd_set_status(args: argparse.Namespace) -> int:
             "       for failed tasks, or let `gza watch` pick up a pending task."
         )
         return 1
-    if args.status not in {"pending", "completed", "failed", "dropped"}:
+    if args.status == "completed":
         print(
-            f"Error: Invalid status '{args.status}'. "
-            "Valid statuses: pending, completed, failed, dropped."
+            "Error: 'completed' cannot be set via set-status. Use `gza mark-completed <id>` "
+            "(supports --verify-git and --force)."
         )
         return 1
-    if args.reason and args.status not in {"failed", "completed"}:
+    if args.status not in {"pending", "failed", "dropped"}:
         print(
-            "Warning: --reason is only meaningful for 'failed' or 'completed' status "
+            f"Error: Invalid status '{args.status}'. "
+            "Valid statuses: pending, failed, dropped."
+        )
+        return 1
+    if args.reason and args.status != "failed":
+        print(
+            "Warning: --reason is only meaningful for 'failed' status "
             f"(current target: '{args.status}')"
         )
 
@@ -1730,13 +1746,7 @@ def cmd_set_status(args: argparse.Namespace) -> int:
         return 1
 
     old_status = task.status
-    if args.status == "completed":
-        store.mark_completed(
-            task,
-            has_commits=bool(task.has_commits),
-            completion_reason=args.reason,
-        )
-    elif args.status == "failed":
+    if args.status == "failed":
         mark_task_failed_from_cause(
             task=task,
             config=config,

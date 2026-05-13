@@ -1192,8 +1192,8 @@ class TestRetryCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        # Run retry without any flags (will fail due to missing API key, but we can verify it tries)
-        result = run_gza("retry", str(task.id), "--no-docker", "--project", str(tmp_path))
+        with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
+            result = run_gza("retry", str(task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the new task was created and run was attempted
         assert "Created task " in result.stdout
@@ -1205,6 +1205,7 @@ class TestRetryCommand:
         assert new_task.id != task.id
         assert new_task.prompt == "Failed task to retry"
         assert new_task.based_on == task.id
+        assert run_foreground.call_args.kwargs["task_id"] == new_task.id
 
     def test_retry_with_queue_flag(self, tmp_path: Path):
         """Retry command with --queue adds task to queue without executing."""
@@ -1447,8 +1448,8 @@ class TestResumeCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        # Run resume without any special flags (will fail due to missing API key, but we can verify it tries)
-        result = run_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
+        with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
+            result = run_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the command creates a new task
         assert "resume of " in result.stdout
@@ -1462,6 +1463,9 @@ class TestResumeCommand:
         assert new_task.id != task.id
         assert new_task.based_on == task.id
         assert new_task.session_id == "test-session-123"
+        assert run_foreground.call_args.kwargs["resume"] is True
+        assert run_foreground.call_args.kwargs["task_id"] == new_task.id
+        assert run_foreground.call_args.kwargs["invocation"].command == "resume"
 
     def test_resume_with_queue_flag(self, tmp_path: Path):
         """Resume command with --queue adds task to queue without executing."""
@@ -1562,8 +1566,8 @@ class TestResumeCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        # Run resume (will fail trying to run due to missing API key/git, but task should be created)
-        result = run_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
+        with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
+            result = run_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify output
         assert "resume of " in result.stdout
@@ -1585,12 +1589,13 @@ class TestResumeCommand:
         assert new_task.task_type == "implement"
         assert new_task.based_on == task.id
         assert new_task.session_id == "session-abc-123"
+        assert run_foreground.call_args.kwargs["resume"] is True
+        assert run_foreground.call_args.kwargs["task_id"] == new_task.id
         # New task starts with no stats
         assert new_task.num_turns_reported is None
         assert new_task.cost_usd is None
-        # A startup log is now opened as soon as the task is claimed, so the
-        # resume task has a log file pointing at its own run's log (not the
-        # original task's log).
+        # The command claims the new task before dispatching to the runner, so
+        # it already has its own startup log path at this layer.
         assert new_task.log_file is not None
         assert new_task.log_file != ".gza/logs/20260101-implement-feature-x.log"
 
@@ -12272,7 +12277,7 @@ class TestMarkCompletedCommand:
         assert "Use --force" in result.stdout
 
     def test_mark_completed_with_commits_sets_unmerged(self, tmp_path: Path):
-        """mark-completed sets status='unmerged' when branch has commits."""
+        """mark-completed with --reason stores completion_reason when branch has commits."""
         store = self._setup_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
 
@@ -12288,7 +12293,14 @@ class TestMarkCompletedCommand:
         task.branch = "gza/1-task-with-commits"
         store.update(task)
 
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        result = run_gza(
+            "mark-completed",
+            str(task.id),
+            "--reason",
+            "EXTRACTION_ALREADY_MERGED",
+            "--project",
+            str(tmp_path),
+        )
 
         assert result.returncode == 0
         assert "unmerged" in result.stdout
@@ -12298,9 +12310,10 @@ class TestMarkCompletedCommand:
         assert updated.status == "completed"
         assert updated.merge_status == "unmerged"
         assert updated.has_commits is True
+        assert updated.completion_reason == "EXTRACTION_ALREADY_MERGED"
 
     def test_mark_completed_without_commits_marks_completed(self, tmp_path: Path):
-        """mark-completed sets status='completed' when branch has no commits."""
+        """mark-completed with --reason stores completion_reason when branch has no commits."""
         store = self._setup_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
 
@@ -12313,7 +12326,14 @@ class TestMarkCompletedCommand:
         task.branch = "gza/1-empty-branch"
         store.update(task)
 
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        result = run_gza(
+            "mark-completed",
+            str(task.id),
+            "--reason",
+            "EXTRACTION_ALREADY_MERGED",
+            "--project",
+            str(tmp_path),
+        )
 
         assert result.returncode == 0
         assert "No commits found" in result.stdout
@@ -12323,16 +12343,25 @@ class TestMarkCompletedCommand:
         assert updated is not None
         assert updated.status == "completed"
         assert updated.has_commits is False
+        assert updated.completion_reason == "EXTRACTION_ALREADY_MERGED"
 
     def test_mark_completed_force_stale_in_progress_recovery(self, tmp_path: Path):
-        """--force supports stale in_progress recovery without git validation."""
+        """--force with --reason stores completion_reason without git validation."""
         store = self._setup_store(tmp_path)
 
         task = store.add("Stale worker task", task_type="implement")
         task.status = "in_progress"
         store.update(task)
 
-        result = run_gza("mark-completed", str(task.id), "--force", "--project", str(tmp_path))
+        result = run_gza(
+            "mark-completed",
+            str(task.id),
+            "--force",
+            "--reason",
+            "MANUAL_RECOVERY",
+            "--project",
+            str(tmp_path),
+        )
 
         assert result.returncode == 0
         assert "in_progress → completed" in result.stdout
@@ -12340,6 +12369,7 @@ class TestMarkCompletedCommand:
         updated = store.get(task.id)
         assert updated is not None
         assert updated.status == "completed"
+        assert updated.completion_reason == "MANUAL_RECOVERY"
 
     def test_mark_completed_failed_task_no_warning(self, tmp_path: Path):
         """mark-completed does not warn when task is in failed status."""
@@ -12608,7 +12638,6 @@ class TestSetStatusCommand:
 
     @pytest.mark.parametrize("target_status,initial_status,completed_at_set", [
         pytest.param("failed", "in_progress", True, id="in_progress-to-failed"),
-        pytest.param("completed", "in_progress", True, id="in_progress-to-completed"),
         pytest.param("dropped", "in_progress", True, id="in_progress-to-dropped"),
         pytest.param("pending", "failed", False, id="failed-to-pending"),
     ])
@@ -12659,8 +12688,8 @@ class TestSetStatusCommand:
         assert updated.status == "failed"
         assert updated.failure_reason == "Process killed"
 
-    def test_set_status_with_reason_for_completed(self, tmp_path: Path):
-        """set-status --reason sets completion_reason for completed status without a false warning."""
+    def test_set_status_completed_rejected_with_guidance(self, tmp_path: Path):
+        """set-status rejects completed and points operators at mark-completed."""
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "in_progress"},
         ])
@@ -12671,26 +12700,23 @@ class TestSetStatusCommand:
             "set-status",
             str(task.id),
             "completed",
-            "--reason",
-            "EXTRACTION_ALREADY_MERGED",
             "--project",
             str(tmp_path),
         )
 
-        assert result.returncode == 0
-        assert "Warning" not in result.stdout
-        assert "Warning" not in result.stderr
+        assert result.returncode == 1
+        assert "'completed' cannot be set via set-status" in result.stdout
+        assert "Use `gza mark-completed <id>`" in result.stdout
+        assert "--verify-git and --force" in result.stdout
 
         store = make_store(tmp_path)
         updated = store.get(task.id)
         assert updated is not None
-        assert updated.status == "completed"
-        assert updated.failure_reason is None
-        assert updated.completion_reason == "EXTRACTION_ALREADY_MERGED"
+        assert updated.status == "in_progress"
+        assert updated.completion_reason is None
 
-    @pytest.mark.parametrize("target_status", ["completed", "failed"])
-    def test_set_status_with_commits_creates_unmerged_merge_unit(self, tmp_path: Path, target_status: str) -> None:
-        """Manual completed/failed transitions should use lifecycle write-through for merge units."""
+    def test_set_status_failed_with_commits_creates_unmerged_merge_unit(self, tmp_path: Path) -> None:
+        """Manual failed transitions should use lifecycle write-through for merge units."""
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "in_progress", "task_type": "implement"},
         ])
@@ -12700,18 +12726,22 @@ class TestSetStatusCommand:
         task.has_commits = True
         store.update(task)
 
-        args = ["set-status", str(task.id), target_status, "--project", str(tmp_path)]
-        if target_status == "completed":
-            args[3:3] = ["--reason", "EXTRACTION_ALREADY_MERGED"]
-        else:
-            args[3:3] = ["--reason", "TEST_FAILURE"]
+        args = [
+            "set-status",
+            str(task.id),
+            "failed",
+            "--reason",
+            "TEST_FAILURE",
+            "--project",
+            str(tmp_path),
+        ]
 
         result = run_gza(*args)
         assert result.returncode == 0
 
         updated = make_store(tmp_path).get(task.id)
         assert updated is not None
-        assert updated.status == target_status
+        assert updated.status == "failed"
         assert updated.has_commits is True
         assert updated.merge_status == "unmerged"
 
@@ -12804,7 +12834,7 @@ class TestSetStatusCommand:
         assert "unrecognized arguments: --execution-mode skill_inline" in result.stderr
 
     def test_set_status_reason_warns_for_statuses_without_reason_support(self, tmp_path: Path):
-        """set-status warns when --reason is used outside failed/completed transitions."""
+        """set-status warns when --reason is used outside failed transitions."""
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "in_progress"},
         ])
@@ -12817,6 +12847,7 @@ class TestSetStatusCommand:
 
         assert result.returncode == 0
         assert "Warning" in result.stdout or "warning" in result.stdout.lower()
+        assert "--reason is only meaningful for 'failed' status" in result.stdout
 
         updated = make_store(tmp_path).get(task.id)
         assert updated is not None
@@ -12834,18 +12865,40 @@ class TestSetStatusCommand:
         result = run_gza("set-status", str(task.id), "bogus", "--project", str(tmp_path))
 
         assert result.returncode != 0
-        assert "Valid statuses: pending, completed, failed, dropped." in result.stdout
+        assert "Valid statuses: pending, failed, dropped." in result.stdout
 
     def test_set_status_help_omits_in_progress_and_execution_mode(self, tmp_path: Path):
-        """set-status help should only advertise operator-assertable statuses."""
+        """set-status subcommand help should only advertise operator-assertable statuses."""
         setup_db_with_tasks(tmp_path, [])
 
         result = run_gza("set-status", "--help", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "pending, completed, failed, dropped" in result.stdout
+        assert "pending, failed, dropped" in result.stdout
         assert "in_progress" not in result.stdout
         assert "--execution-mode" not in result.stdout
+
+    def test_mark_completed_help_mentions_reason(self, tmp_path: Path):
+        """mark-completed subcommand help should advertise the --reason flag."""
+        setup_db_with_tasks(tmp_path, [])
+
+        result = run_gza("mark-completed", "--help", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "--reason REASON" in result.stdout
+        assert "Completion reason persisted to task.completion_reason" in result.stdout
+
+    def test_top_level_help_points_set_status_completed_users_at_mark_completed(self, tmp_path: Path):
+        """Top-level help should advertise mark-completed as the completion path."""
+        setup_db_with_tasks(tmp_path, [])
+
+        result = run_gza("--help", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "mark-completed        Mark a task as completed (defaults by task type;" in result.stdout
+        assert "supports --verify-git, --force, --reason" in result.stdout
+        assert "set-status            Manually force a task's status (pending, failed," in result.stdout
+        assert "To complete: `mark-completed`" in result.stdout
 
     @pytest.mark.parametrize("target_status", ["pending", "dropped"])
     def test_set_status_clears_failure_reason(self, tmp_path: Path, target_status: str):

@@ -2289,7 +2289,7 @@ def main() -> int:
     # mark-completed command
     mark_completed_parser = subparsers.add_parser(
         "mark-completed",
-        help="Mark a task as completed (defaults by task type; supports --verify-git or --force)",
+        help="Mark a task as completed (defaults by task type; supports --verify-git, --force, --reason)",
     )
     mark_completed_parser.add_argument(
         "task_id",
@@ -2307,12 +2307,17 @@ def main() -> int:
         action="store_true",
         help="Status-only completion (for non-code tasks or infrastructure recovery)",
     )
+    mark_completed_parser.add_argument(
+        "--reason",
+        default=None,
+        help="Completion reason persisted to task.completion_reason",
+    )
     add_common_args(mark_completed_parser)
 
     # set-status command
     set_status_parser = subparsers.add_parser(
         "set-status",
-        help="Manually force a task's status (pending, completed, failed, dropped)",
+        help="Manually force a task's status (pending, failed, dropped). To complete: `mark-completed`. To re-run a failed task: `retry`.",
     )
     set_status_parser.add_argument(
         "task_id",
@@ -2324,12 +2329,12 @@ def main() -> int:
         # 'unmerged' is intentionally excluded: that transition is managed
         # exclusively by the 'advance' workflow and should not be forced manually.
         metavar="STATUS",
-        help="New status for the task (pending, completed, failed, dropped)",
+        help="New status for the task (pending, failed, dropped)",
     )
     set_status_parser.add_argument(
         "--reason",
         default=None,
-        help="Failure reason for failed status, or completion reason for completed status",
+        help="Failure reason for failed status",
     )
     add_common_args(set_status_parser)
 

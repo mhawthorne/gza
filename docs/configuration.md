@@ -925,7 +925,7 @@ Manually complete a task when automation failed. Defaults are task-type aware:
 - `explore`, `plan`, `review` default to status-only completion
 
 ```bash
-gza mark-completed <task_id> [--verify-git | --force]
+gza mark-completed <task_id> [--verify-git | --force] [--reason <text>]
 ```
 
 | Option | Description |
@@ -933,6 +933,7 @@ gza mark-completed <task_id> [--verify-git | --force]
 | `task_id` | Full prefixed task ID to mark as completed (e.g. `gza-1234`) |
 | `--verify-git` | Validate branch and commits before completion |
 | `--force` | Status-only completion (for non-code tasks or stale in_progress recovery) |
+| `--reason <text>` | Persist a completion reason to `task.completion_reason` |
 
 `force-complete` is deprecated. Use `mark-completed <task_id> --force`.
 
@@ -1595,14 +1596,18 @@ uv run gza set-status <task_id> <status> [--reason <text>]
 
 `task_id` must be a full prefixed task ID (for example `gza-1234`).
 
-Valid statuses: `pending`, `completed`, `failed`, `dropped`.
+Valid statuses: `pending`, `failed`, `dropped`.
+
+`completed` is rejected. To complete a task, use `uv run gza mark-completed
+<task_id>`, which also handles worker cleanup, provenance backfill, and optional
+`--reason`.
 
 `in_progress` is rejected. That state is set by a running worker, not by manual
 operator action. To start work on a task, use `gza work <task_id>`, `gza resume
 <task_id>`, `gza retry <task_id>`, or let `gza watch` pick up a pending task.
 
-`--reason` stores a failure reason for `failed` tasks and a completion reason for
-`completed` tasks. Other statuses ignore it and emit a warning.
+`--reason` stores a failure reason for `failed` tasks. Other statuses ignore it
+and emit a warning.
 
 ### sync-report
 
