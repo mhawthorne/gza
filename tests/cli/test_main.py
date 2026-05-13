@@ -118,7 +118,7 @@ class TestHelpOutput:
         assert "Deprecated alias for --lineage-of" in search_help.stdout
         assert "--lineage-of-not" in search_help.stdout
         assert "--root-not" in search_help.stdout
-        assert docs_text.count("| `--list-fields` | List valid `--fields` values for this command and exit |") >= 5
+        assert docs_text.count("| `--list-fields` | List valid `--fields` values for this command and exit |") >= 4
 
     def test_history_and_search_reject_removed_preset_flag(self, tmp_path):
         setup_config(tmp_path)
@@ -397,7 +397,7 @@ class TestHelpOutput:
         assert "remain pending-only" in normalized_help
         assert "remain pending-only" in docs_text
 
-        for flag in ("--add-tag", "--remove-tag", "--clear-tags", "--set-tags", "--group"):
+        for flag in ("--add-tag", "--remove-tag", "--clear-tags", "--set-tags"):
             assert flag in normalized_help
             assert flag in docs_text
 
@@ -651,40 +651,48 @@ class TestHelpOutput:
         assert "as JSON" not in help_text
         assert "| `--prompt` | Print only the fully built prompt text for this task and exit |" in docs_text
 
-    def test_groups_alias_docs_and_dispatch_remain_aligned(self, tmp_path):
-        """`gza groups` docs invocation should match runtime deprecation-alias behavior."""
-        setup_config(tmp_path)
-        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
-        store.add("Grouped task", tags=("release",))
-
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
-        assert "### groups" in docs_text
-        assert "gza groups" in docs_text
-        assert "--fields CSV" in docs_text
-        assert "--list-fields" in docs_text
-        assert "--json" in docs_text
-
-        result = run_gza("groups", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Warning: 'gza groups' is deprecated; use 'gza groups list'." in result.stdout
-        assert "release" in result.stdout
-        assert "usage:" not in result.stdout
-
-    def test_group_help_and_docs_describe_view_modes(self, tmp_path):
-        """group --help and docs should advertise query presentation modes."""
+    def test_removed_group_commands_are_absent_from_docs_and_rejected(self, tmp_path):
+        """Retired group command spellings should be undocumented and fail in argparse."""
         setup_config(tmp_path)
 
-        group_help = run_gza("group", "--help", "--project", str(tmp_path))
-        assert group_help.returncode == 0
-
-        help_text = " ".join(group_help.stdout.split())
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        assert "### groups" not in docs_text
+        groups_cmd = "gza " + "groups"
+        group_cmd = "gza " + "group"
+        assert groups_cmd not in docs_text
+        assert group_cmd not in docs_text
 
-        assert "--view" in help_text
-        assert "{flat,lineage,tree,json}" in help_text
-        assert "Presentation mode (default: flat)" in help_text
-        assert "| `--view MODE` | Presentation mode: `flat`, `lineage`, `tree`, or `json` (default: `flat`) |" in docs_text
+        for argv in (
+            ("groups",),
+            ("groups", "list"),
+            ("groups", "rename", "old", "new"),
+            ("group", "release"),
+        ):
+            result = run_gza(*argv, "--project", str(tmp_path))
+            assert result.returncode == 2
+            assert "invalid choice" in result.stderr
+
+    def test_retired_tag_alias_flag_is_rejected_on_all_former_cli_surfaces(self, tmp_path):
+        """All retired group-flag spellings should fail in argparse."""
+        setup_config(tmp_path)
+
+        legacy_flag = "--" + "group"
+        cases = (
+            ("work", legacy_flag, "release"),
+            ("next", legacy_flag, "release"),
+            ("watch", legacy_flag, "release"),
+            ("queue", legacy_flag, "release"),
+            ("queue", "bump", "gza-1", legacy_flag, "release"),
+            ("add", "Prompt", legacy_flag, "release"),
+            ("edit", "gza-1", legacy_flag, "release"),
+            ("implement", "gza-1", legacy_flag, "release"),
+            ("extract", "gza-1", legacy_flag, "release"),
+        )
+
+        for argv in cases:
+            result = run_gza(*argv, "--project", str(tmp_path))
+            assert result.returncode == 2
+            assert f"unrecognized arguments: {legacy_flag}" in result.stderr
 
     def test_search_command_help_mentions_prompt_substring_scope(self, tmp_path):
         """`search --help` should describe prompt-only substring matching."""
@@ -773,7 +781,7 @@ class TestReconciliationWarnings:
         ("command", "patched_command"),
         [
             ("ps", "cmd_ps"),
-            ("status", "cmd_status"),
+            ("status", "cmd_ps"),
         ],
     )
     def test_main_skips_task_reconciliation_for_query_worker_views(

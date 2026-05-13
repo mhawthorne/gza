@@ -1,6 +1,6 @@
 """CLI commands for querying and displaying task state.
 
-Covers: next, history, unmerged, groups, status, ps, kill, delete, show, attach.
+Covers: next, history, unmerged, ps, kill, delete, show, attach.
 """
 
 import argparse
@@ -139,16 +139,6 @@ _INCOMPLETE_BLOCKED_DROPPED_PROJECTION_FIELDS: tuple[str, ...] = (
     "blocked",
     "blocking_id",
     "blocking_status",
-)
-_GROUPS_PROJECTION_FIELDS: tuple[str, ...] = (
-    "group",
-    "total",
-    "pending",
-    "in_progress",
-    "completed",
-    "failed",
-    "unmerged",
-    "dropped",
 )
 _UNMERGED_PROJECTION_FIELDS: tuple[str, ...] = _projection_fields(
     _TaskProjectionSpec(preset=_TaskProjectionPreset.UNMERGED_DEFAULT),
@@ -1450,8 +1440,6 @@ def _projection_field_choices(command_name: str, *, blocked_by_dropped: bool = F
         )
     if command_name == "unmerged":
         return _UNMERGED_PROJECTION_FIELDS
-    if command_name in {"groups", "groups list"}:
-        return _GROUPS_PROJECTION_FIELDS
     raise ValueError(f"unknown projection command surface: {command_name}")
 
 
@@ -2077,169 +2065,6 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
         else:
             console.print(footer)
 
-    return 0
-
-
-def cmd_groups(args: argparse.Namespace) -> int:
-    """List all tags with task counts (compatibility alias: groups)."""
-    command_name = "groups list" if getattr(args, "groups_action", None) == "list" else "groups"
-    if getattr(args, "list_fields", False):
-        return _print_projection_fields(command_name)
-
-    config = Config.load(args.project_dir)
-    store = get_store(config, open_mode="query_only")
-    projection_fields = _validate_projection_fields(
-        _parse_csv(getattr(args, "fields", None)),
-        command_name=command_name,
-    )
-    if getattr(args, "fields", None) is not None and projection_fields is None:
-        return 2
-    use_json = bool(getattr(args, "json", False))
-
-    if use_json or projection_fields is not None:
-        print("Warning: 'gza groups' is deprecated; use 'gza groups list'.", file=sys.stderr)
-    else:
-        print("Warning: 'gza groups' is deprecated; use 'gza groups list'.")
-    groups = store.get_groups()
-
-    if not groups:
-        if use_json:
-            print("[]")
-        else:
-            print("No tasks found")
-        return 0
-
-    if use_json or projection_fields is not None:
-        query = _TaskQuery(
-            scope="tasks",
-            limit=None,
-            projection=_TaskProjectionSpec(fields=projection_fields or _GROUPS_PROJECTION_FIELDS),
-            presentation=_TaskPresentationSpec(mode="json" if use_json else "blocks"),
-        )
-        rows: tuple[_TaskRow, ...] = tuple(
-            _TaskRow(
-                task=DbTask(id=None, prompt=group_name, group=group_name, tags=(group_name,)),
-                values=_apply_query_projection_values(
-                    {
-                        "group": group_name,
-                        "total": sum(status_counts.values()),
-                        "pending": status_counts.get("pending", 0),
-                        "in_progress": status_counts.get("in_progress", 0),
-                        "completed": status_counts.get("completed", 0),
-                        "failed": status_counts.get("failed", 0),
-                        "unmerged": status_counts.get("unmerged", 0),
-                        "dropped": status_counts.get("dropped", 0),
-                    },
-                    query.projection,
-                    scope="tasks",
-                ),
-            )
-            for group_name, status_counts in sorted(groups.items())
-        )
-        _render_projection_result(
-            _TaskQueryResult(query=query, rows=rows, total_count=len(rows)),
-            use_json=use_json,
-        )
-        return 0
-
-    # Sort groups by name
-    for group_name in sorted(groups.keys()):
-        status_counts = groups[group_name]
-        total = sum(status_counts.values())
-
-        # Build status summary
-        parts = []
-        for status in ["pending", "in_progress", "completed", "failed", "unmerged", "dropped"]:
-            if status in status_counts and status_counts[status] > 0:
-                parts.append(f"{status_counts[status]} {status}")
-
-        status_str = ", ".join(parts) if parts else "0 tasks"
-        print(f"{group_name:<20} {total} tasks ({status_str})")
-
-    return 0
-
-
-def cmd_status(args: argparse.Namespace) -> int:
-    """Show tasks by a single tag (compatibility alias: group)."""
-    config = Config.load(args.project_dir)
-    store = get_store(config, open_mode="query_only")
-    service = _TaskQueryService(store)
-    try:
-        groups = validate_cli_tag_values((args.group,))
-    except ValueError as exc:
-        print(f"Error: {exc}")
-        return 1
-    group_name = groups[0]
-
-    raw_view = str(getattr(args, "view", "flat"))
-    view_mode = cast(
-        Literal["flat", "lineage", "tree", "json"],
-        raw_view if raw_view in {"flat", "lineage", "tree", "json"} else "flat",
-    )
-    if view_mode == "json":
-        print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.", file=sys.stderr)
-    else:
-        print("Warning: 'gza group <name>' is deprecated; use 'gza search --tag <name>'.")
-    query_scope: Literal["tasks", "lineages"] = "lineages" if view_mode in {"lineage", "tree"} else "tasks"
-    presentation_mode = cast(_PresentationMode, view_mode)
-
-    query = _TaskQuery(
-        scope=query_scope,
-        limit=None,
-        groups=groups,
-        sort=_TaskSortSpec(field="created_at", descending=False),
-        projection=_TaskProjectionSpec(preset="history_default"),
-        presentation=_TaskPresentationSpec(mode=presentation_mode),
-    )
-    result = service.run(query)
-
-    if not result.rows:
-        if view_mode == "json":
-            print("[]")
-        else:
-            print(f"No tasks found in group '{group_name}'")
-        return 0
-
-    if view_mode != "json":
-        print(f"Tag: {group_name}")
-        print()
-
-    rendered = result.render()
-    if rendered:
-        if view_mode == "json":
-            print(rendered)
-        else:
-            # Preserve literal prompt text (including bracketed segments) in
-            # human-readable output.
-            console.print(rendered, markup=False)
-
-    # Preserve orphaned-task warning behavior for this tag slice.
-    registry = WorkerRegistry(config.workers_path)
-    orphaned = _get_orphaned_tasks(registry, store)
-    group_orphaned = [task for task in orphaned if group_name in task.tags]
-    if group_orphaned:
-        _print_orphaned_warning(group_orphaned, to_stderr=view_mode == "json")
-
-    return 0
-
-
-def cmd_group_rename(args: argparse.Namespace) -> int:
-    """Rename a tag across all attached tasks (compatibility alias)."""
-    config = Config.load(args.project_dir)
-    store = get_store(config)
-
-    print("Warning: 'gza groups rename' is deprecated and will be removed in a future release.")
-    try:
-        updated = store.rename_group(args.old_group, args.new_group)
-    except ValueError as exc:
-        print(f"Error: {exc}")
-        return 1
-
-    if args.old_group.strip() == args.new_group.strip():
-        print(f"✓ Group '{args.old_group.strip()}' already has that name ({updated} tasks unchanged)")
-        return 0
-
-    print(f"✓ Renamed group '{args.old_group.strip()}' to '{args.new_group.strip()}' ({updated} tasks updated)")
     return 0
 
 

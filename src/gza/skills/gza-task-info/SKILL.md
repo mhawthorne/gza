@@ -29,7 +29,7 @@ This will show:
 - branch, log_file, report_file
 - has_commits, duration_seconds, num_turns_reported, num_turns_computed, cost_usd
 - created_at, started_at, completed_at
-- group, depends_on, based_on, spec
+- tags, depends_on, based_on, spec
 - create_review, same_branch, task_type_hint
 - output_content, session_id
 
@@ -130,7 +130,7 @@ Log shows: verify_command failed — mypy found 3 type errors in src/gza/db.py
 Task gza-v: pending
 Type: implement
 Depends on: Task gza-u (still in_progress)
-Group: metrics-v2
+Tags: metrics-v2
 Prompt: "Implement CSV export for metrics data"
 ```
 

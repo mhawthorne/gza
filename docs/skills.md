@@ -259,7 +259,7 @@ New skills are auto-discovered — adding a directory under `src/gza/skills/` wi
 ```yaml
 ---
 name: gza-task-add
-description: Create a well-formed gza task with appropriate type, group, and prompt
+description: Create a well-formed gza task with appropriate type, tags, and prompt
 allowed-tools: Read, Bash(uv run gza add:*), AskUserQuestion
 version: 1.0.0
 public: true

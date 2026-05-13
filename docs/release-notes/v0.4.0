@@ -8,7 +8,7 @@ This release brings significant orchestration improvements, expanded skill ecosy
 
 - **Removed legacy YAML-based task serialization**: Tasks are now stored exclusively in SQLite
 - **Deleted `src/gza/tasks.py`**: Legacy task storage module removed; use CLI or API
-- **`gza status` renamed to `gza group`**: Update scripts and workflows accordingly
+- **Task-list query aliases changed**: The old single-tag task-list alias introduced in this release was later retired in v0.5.0; use tag-based query commands in current scripts.
 - **Require `gza improve` for task creation**: Direct improve task creation no longer allowed; use `gza improve` after task completion
 
 ## New Features
@@ -17,7 +17,7 @@ This release brings significant orchestration improvements, expanded skill ecosy
 - **`gza advance`**: Intelligently orchestrate batch workflow with `--batch B` option to spawn multiple parallel workers
 - **`gza implement`**: Create and run implementation tasks from plans (replaces manual workflow)
 - **`gza iterate`**: Automated review/improve iterations with configurable max iteration limits
-- **`gza group`**: Renamed from `gza status`; display task status groupings
+- **Single-tag task query alias**: This release introduced a task-list alias for viewing one tag slice; later releases standardized on direct tag filters instead.
 - **`gza set-status`**: Manually force task status updates
 - **`gza mark-completed`**: Mark tasks as completed with cleanup
 

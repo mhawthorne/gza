@@ -5,14 +5,14 @@ A multi-phase workflow for larger features requiring design review.
 ## Phase 1: Create and run a plan
 
 ```bash
-$ uv run gza add --type plan --group auth-refactor
+$ uv run gza add --type plan --tag auth-refactor
 # Opens $EDITOR to write the prompt
 ```
 
 Or provide the prompt directly:
 
 ```bash
-$ uv run gza add --type plan --group auth-refactor \
+$ uv run gza add --type plan --tag auth-refactor \
   "Design a new authentication system using JWT tokens. Consider:
    - Token refresh strategy
    - Secure storage on client
@@ -20,10 +20,10 @@ $ uv run gza add --type plan --group auth-refactor \
    - Migration path from current cookie-based auth"
 
 Created task gza-1: 20260108-design-a-new-authentication (plan)
-Group: auth-refactor
+Tags: auth-refactor
 ```
 
-> **Note:** The `--group` flag is optional. Groups make it easier to track the status of related tasks with `uv run gza status <group>`.
+> **Note:** The `--tag` flag is optional. Tags make it easier to track related tasks with commands such as `uv run gza search --tag auth-refactor`.
 
 Run the plan task:
 
@@ -54,11 +54,11 @@ The plan content is also stored in the database, so it's available to dependent 
 After reviewing and approving the plan, create an implementation task:
 
 ```bash
-$ uv run gza add --type implement --based-on gza-1 --group auth-refactor \
+$ uv run gza add --type implement --based-on gza-1 --tag auth-refactor \
   "Implement the JWT authentication system per the plan"
 
 Created task gza-2: 20260108-implement-the-jwt-authentication (implement)
-Group: auth-refactor
+Tags: auth-refactor
 Based on: gza-1
 ```
 
@@ -197,11 +197,10 @@ Verdict: APPROVED
 
 ## Phase 5: Create PR and merge
 
-Check the group status:
+Check the related tasks by tag:
 
 ```bash
-$ uv run gza status auth-refactor
-Group: auth-refactor
+$ uv run gza search --tag auth-refactor
 
   ✓ gza-1 20260108-design-a-new-authentication (plan)
       completed - 8m 12s

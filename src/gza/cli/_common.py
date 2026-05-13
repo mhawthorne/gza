@@ -213,17 +213,10 @@ def parse_cli_tag_filters(
     args: argparse.Namespace,
     *,
     tags_attr: str = "tags",
-    group_attr: str = "group",
     any_tag_attr: str = "any_tag",
-    warn_on_group_alias: bool = True,
 ) -> tuple[tuple[str, ...] | None, bool]:
-    """Parse and validate tag/group filter flags from argparse args."""
+    """Parse and validate CLI tag filter flags from argparse args."""
     selected_tags = [_validate_tag_value(raw) for raw in (getattr(args, tags_attr, None) or [])]
-    legacy_group = getattr(args, group_attr, None) if hasattr(args, group_attr) else None
-    if legacy_group is not None:
-        selected_tags.append(_validate_tag_value(legacy_group))
-        if warn_on_group_alias:
-            print("Warning: --group is deprecated; use --tag instead.", file=sys.stderr)
     return (tuple(selected_tags) if selected_tags else None, bool(getattr(args, any_tag_attr, False)))
 
 
@@ -2578,11 +2571,25 @@ class GzaArgumentParser(argparse.ArgumentParser):
     )
 
     def error(self, message: str) -> NoReturn:
+        legacy_tag_alias_flag = "--" + "group"
+        if (
+            message.startswith("argument queue_action: invalid choice:")
+            and legacy_tag_alias_flag in sys.argv
+        ):
+            group_index = sys.argv.index(legacy_tag_alias_flag)
+            group_value = ""
+            if group_index + 1 < len(sys.argv):
+                group_value = f" {sys.argv[group_index + 1]}"
+            super().error(f"unrecognized arguments: {legacy_tag_alias_flag}{group_value}")
         match = self._INVALID_CHOICE_RE.match(message)
         if match:
             cmd = match.group("cmd")
-            # Let retired hidden commands fall back to argparse's native invalid-choice error.
+            # Let retired command spellings fall back to argparse's native
+            # invalid-choice error when the exact argparse wording is the
+            # operator-facing contract.
             if cmd == "cycle":
+                super().error(message)
+            if cmd in {"group", "groups"}:
                 super().error(message)
             self.exit(
                 2,

@@ -1244,13 +1244,11 @@ def cmd_edit(args: argparse.Namespace) -> int:
         tag_mutation_flags.append("--add-tag")
     if getattr(args, "remove_tags", None):
         tag_mutation_flags.append("--remove-tag")
-    if hasattr(args, "group_flag") and args.group_flag is not None:
-        tag_mutation_flags.append("--group")
 
     if len(tag_mutation_flags) > 1:
         print(
             "Error: Tag mutation flags are mutually exclusive; "
-            "choose exactly one of --clear-tags, --set-tags, --add-tag, --remove-tag, or --group.",
+            "choose exactly one of --clear-tags, --set-tags, --add-tag, or --remove-tag.",
         )
         return 1
 
@@ -1283,7 +1281,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if task.status != "pending" and (pending_only_flags or not tag_mutation_flags):
         print(
             f"Error: Task {task_id} is {task.status}; non-pending tasks only allow "
-            "tag edits via --set-tags, --add-tag, --remove-tag, --clear-tags, or deprecated --group.",
+            "tag edits via --set-tags, --add-tag, --remove-tag, or --clear-tags.",
         )
         if pending_only_flags:
             print(f"Error: Pending-only edit flags requested: {', '.join(pending_only_flags)}")
@@ -1359,22 +1357,6 @@ def cmd_edit(args: argparse.Namespace) -> int:
     elif getattr(args, "remove_tags", None):
         tag_action = "remove"
         tag_values = tuple(args.remove_tags)
-    elif hasattr(args, "group_flag") and args.group_flag is not None:
-        print(
-            "Warning: --group is deprecated; use --add-tag/--remove-tag/--clear-tags/--set-tags.",
-            file=sys.stderr,
-        )
-        if args.group_flag == "":
-            if len(task.tags) > 1:
-                print(
-                    "Error: --group \"\" is ambiguous for tasks with multiple tags; "
-                    "use --remove-tag TAG or --clear-tags instead.",
-                )
-                return 1
-            tag_action = "clear"
-        else:
-            tag_action = "set"
-            tag_values = (args.group_flag,)
 
     update_messages: list[str] = []
     info_messages: list[str] = []

@@ -839,7 +839,6 @@ def _run_cycle(
     dry_run: bool,
     log: _WatchLog,
     tags: tuple[str, ...] | None = None,
-    group: str | None = None,
     any_tag: bool = False,
     quiet: bool = False,
     restart_failed: bool = False,
@@ -849,10 +848,6 @@ def _run_cycle(
 ) -> _CycleResult:
     from ._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
 
-    if group:
-        merged_tags = list(tags or ())
-        merged_tags.append(group)
-        tags = tuple(merged_tags)
     tags = normalize_tag_filters(tags)
 
     log.begin_cycle()

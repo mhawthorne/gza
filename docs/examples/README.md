@@ -54,7 +54,7 @@ Practical examples showing common workflows with Gza.
 | Rebase a branch | `gza rebase <task_id>` |
 | Create PR | `gza pr <task_id>` |
 | Merge to main | `gza merge <task_id> --squash` |
-| View group tasks | `gza group <group>` |
+| View tasks by tag | `gza search --tag <tag>` |
 | View history | `gza history` |
 | View review stats | `gza stats reviews` |
 | View iteration activity | `gza stats iterations --hours 12` |

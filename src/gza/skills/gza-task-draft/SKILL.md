@@ -81,7 +81,7 @@ Do **not** use `"$(cat <<'EOF' ... EOF)"` to inline multi-line prompts — backt
 Flags to consider:
 - `--type` — task (default), explore, plan, implement, review
 - `--review` — auto-create review task after implementation (for significant changes)
-- `--tag TAG` — attach a tag to group with related tasks (repeatable)
+- `--tag TAG` — attach a tag to relate the task to other work (repeatable)
 - `--depends-on ID` — task cannot start until another completes
 - `--based-on ID` — implementation draws from a previous task's output
 - No flag needed for simple tasks

@@ -138,7 +138,7 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 - Task ID: `<IMPL_TASK_ID>`
 - Task type: `<impl_task_type>`
 - Branch: `<impl_branch>`
-- Group: `<impl_group>`
+- Tags: `<impl_tags>`
 
 **Step 1**: Read `REVIEW.md` from the project root for review guidelines and criteria.
 

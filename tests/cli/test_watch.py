@@ -396,8 +396,8 @@ def test_watch_cycle_prefers_freshly_bumped_task_over_older_urgent(tmp_path: Pat
     assert spawn_worker.call_args.kwargs["task_id"] == bumped.id
 
 
-def test_watch_cycle_group_filters_pending_pickup(tmp_path: Path) -> None:
-    """Group-scoped watch should only start pending tasks from the selected group."""
+def test_watch_cycle_tag_filters_pending_pickup(tmp_path: Path) -> None:
+    """Tag-scoped watch should only start pending tasks from the selected tag."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -421,7 +421,7 @@ def test_watch_cycle_group_filters_pending_pickup(tmp_path: Path) -> None:
             max_iterations=10,
             dry_run=False,
             log=log,
-            group="release-1",
+            tags=("release-1",),
         )
 
     assert result.work_done is True
@@ -429,8 +429,8 @@ def test_watch_cycle_group_filters_pending_pickup(tmp_path: Path) -> None:
     assert spawn_worker.call_args.kwargs["task_id"] == release_task.id
 
 
-def test_watch_cycle_group_prefers_explicit_queue_order(tmp_path: Path) -> None:
-    """Group-scoped watch should respect explicit queue positions before urgent/FIFO fallback."""
+def test_watch_cycle_tag_prefers_explicit_queue_order(tmp_path: Path) -> None:
+    """Tag-scoped watch should respect explicit queue positions before urgent/FIFO fallback."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -455,7 +455,7 @@ def test_watch_cycle_group_prefers_explicit_queue_order(tmp_path: Path) -> None:
             max_iterations=10,
             dry_run=False,
             log=log,
-            group="release",
+            tags=("release",),
         )
 
     assert result.work_done is True
@@ -2390,8 +2390,8 @@ def test_watch_log_aligns_multiline_messages(tmp_path: Path) -> None:
     )
 
 
-def test_watch_cycle_logs_group_scoped_pending_count_in_wake_line(tmp_path: Path) -> None:
-    """WAKE line should report runnable pending tasks using the selected group filter."""
+def test_watch_cycle_logs_tag_scoped_pending_count_in_wake_line(tmp_path: Path) -> None:
+    """WAKE line should report runnable pending tasks using the selected tag filter."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -2417,7 +2417,7 @@ def test_watch_cycle_logs_group_scoped_pending_count_in_wake_line(tmp_path: Path
             max_iterations=10,
             dry_run=False,
             log=log,
-            group="release-1",
+            tags=("release-1",),
         )
 
     assert "WAKE      checking... (0 running, 2 pending, 1 slots)" in log_path.read_text()

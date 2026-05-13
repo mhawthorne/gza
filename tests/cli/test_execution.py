@@ -306,7 +306,17 @@ class TestAddCommand:
         prompt_file = tmp_path / "task_prompt.txt"
         prompt_file.write_text("Implement feature X")
 
-        result = run_gza("add", "--prompt-file", str(prompt_file), "--type", "implement", "--group", "features", "--project", str(tmp_path))
+        result = run_gza(
+            "add",
+            "--prompt-file",
+            str(prompt_file),
+            "--type",
+            "implement",
+            "--tag",
+            "features",
+            "--project",
+            str(tmp_path),
+        )
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
@@ -317,7 +327,7 @@ class TestAddCommand:
         assert task is not None
         assert task.prompt == "Implement feature X"
         assert task.task_type == "implement"
-        assert task.group == "features"
+        assert task.tags == ("features",)
 
     def test_add_with_pr_flag_persists_create_pr(self, tmp_path: Path):
         """Add command with --pr stores automatic PR intent on the task."""
@@ -356,8 +366,8 @@ class TestAddCommand:
 class TestEditCommand:
     """Tests for 'gza edit' command."""
 
-    def test_edit_group(self, tmp_path: Path):
-        """Edit command can change task group."""
+    def test_edit_set_tags(self, tmp_path: Path):
+        """Edit command can replace task tags."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -365,48 +375,12 @@ class TestEditCommand:
         task = store.add("Test task")
         assert task.group is None
 
-        result = run_gza("edit", str(task.id), "--group", "new-group", "--project", str(tmp_path))
+        result = run_gza("edit", str(task.id), "--set-tags", "new-group", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
-        # Verify group was updated
         updated = store.get(task.id)
-        assert updated.group == "new-group"
-
-    def test_edit_group_empty_string_clears_single_tag_only(self, tmp_path: Path):
-        """Legacy --group '' should only clear when exactly one tag exists."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        task = store.add("Test task", group="old-group")
-        assert task.group == "old-group"
-
-        result = run_gza("edit", str(task.id), "--group", "", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        updated = store.get(task.id)
-        assert updated.group is None or updated.group == ""
-        assert updated.tags == ()
-
-    def test_edit_group_empty_string_rejects_multi_tag_clear(self, tmp_path: Path):
-        """Legacy --group '' should fail for multi-tag tasks with actionable guidance."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        task = store.add("Test task", tags=("release-1.2", "backend"))
-        assert len(task.tags) == 2
-
-        result = run_gza("edit", str(task.id), "--group", "", "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert 'Error: --group "" is ambiguous for tasks with multiple tags' in result.stdout
-        assert "--remove-tag TAG or --clear-tags" in result.stdout
-
-        updated = store.get(task.id)
-        assert updated is not None
-        assert updated.tags == ("backend", "release-1.2")
+        assert updated.tags == ("new-group",)
 
     def test_edit_clear_tags_still_clears_multi_tag_task(self, tmp_path: Path):
         """--clear-tags remains the explicit path for clearing all tags."""
@@ -1969,8 +1943,8 @@ class TestWorkCommandMultiTask:
         assert rc == 0
         assert seen_create_pr == [True]
 
-    def test_work_group_runs_only_tasks_from_selected_group(self, tmp_path: Path):
-        """work --group should select and run only tasks from that group."""
+    def test_work_tag_runs_only_tasks_from_selected_tag(self, tmp_path: Path):
+        """work --tag should select and run only tasks from that tag."""
         from gza.cli.execution import cmd_run
 
         setup_config(tmp_path)
@@ -1992,7 +1966,7 @@ class TestWorkCommandMultiTask:
             force=False,
             resume=False,
             create_pr=False,
-            group="release-1",
+            tags=["release-1"],
         )
 
         seen_task_ids: list[str] = []
@@ -2011,11 +1985,11 @@ class TestWorkCommandMultiTask:
         assert rc == 0
         assert seen_task_ids == [release_task.id]
 
-    def test_work_group_rejects_empty_value_without_traceback(self, tmp_path: Path):
-        """Deprecated --group alias should reject empty values cleanly."""
+    def test_work_tag_rejects_empty_value_without_traceback(self, tmp_path: Path):
+        """work --tag '' should reject empty values cleanly."""
         setup_config(tmp_path)
 
-        result = run_gza("work", "--group", "", "--project", str(tmp_path))
+        result = run_gza("work", "--tag", "", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Error: tag must not be empty" in result.stdout

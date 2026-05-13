@@ -72,8 +72,6 @@ from .log import cmd_log
 from .query import (
     cmd_attach,
     cmd_delete,
-    cmd_group_rename,
-    cmd_groups,
     cmd_history,
     cmd_incomplete,
     cmd_kill,
@@ -82,7 +80,6 @@ from .query import (
     cmd_ps,
     cmd_search,
     cmd_show,
-    cmd_status,
     cmd_unmerged,
 )
 from .tv import cmd_tv
@@ -203,11 +200,6 @@ def main() -> int:
         help="Create/reuse a GitHub PR after successful code-task completion (when branch has commits)",
     )
     work_parser.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Deprecated alias for --tag (single value)",
-    )
-    work_parser.add_argument(
         "--tag",
         action="append",
         dest="tags",
@@ -273,11 +265,6 @@ def main() -> int:
         "--all",
         action="store_true",
         help="Show all pending tasks including blocked ones",
-    )
-    next_parser.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Deprecated alias for --tag (single value)",
     )
     next_parser.add_argument(
         "--tag",
@@ -766,11 +753,6 @@ def main() -> int:
         help="Skip confirmation prompt before the first watch pass",
     )
     watch_parser.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Deprecated alias for --tag (single value)",
-    )
-    watch_parser.add_argument(
         "--tag",
         action="append",
         dest="tags",
@@ -791,11 +773,6 @@ def main() -> int:
     )
     add_common_args(queue_parser)
     queue_parser.set_defaults(limit=10, all=False)
-    queue_parser.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Deprecated alias for --tag (single value)",
-    )
     queue_parser.add_argument(
         "--tag",
         action="append",
@@ -824,11 +801,6 @@ def main() -> int:
 
     def _add_queue_tag_scope_args(subparser: argparse.ArgumentParser, *, action: str) -> None:
         """Add queue management tag-scope filters for runnable status messages."""
-        subparser.add_argument(
-            "--group",
-            metavar="NAME",
-            help=f"Deprecated alias for --tag; check runnable status within this tag scope while {action}",
-        )
         subparser.add_argument(
             "--tag",
             action="append",
@@ -1379,11 +1351,6 @@ def main() -> int:
         help="Create an explore task (shorthand for --type explore)",
     )
     add_parser.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Deprecated alias for --tag",
-    )
-    add_parser.add_argument(
         "--tag",
         action="append",
         dest="tags",
@@ -1459,7 +1426,7 @@ def main() -> int:
         description="Edit an existing task. Pending tasks may use any supported edit flag.",
         epilog=(
             "Non-pending tasks may only use tag mutation flags "
-            "(`--add-tag`, `--remove-tag`, `--clear-tags`, `--set-tags`, or deprecated `--group`). "
+            "(`--add-tag`, `--remove-tag`, `--clear-tags`, or `--set-tags`). "
             "All other edit flags (`--based-on`, `--depends-on`, `--explore`, `--task`, "
             "`--review`, `--pr`, `--prompt`, `--prompt-file`, `--model`, `--provider`, "
             "and `--no-learnings`) remain pending-only."
@@ -1469,12 +1436,6 @@ def main() -> int:
         "task_id",
         type=str,
         help="Full prefixed task ID to edit",
-    )
-    edit_parser.add_argument(
-        "--group",
-        dest="group_flag",
-        metavar="NAME",
-        help="Deprecated alias for tag edits (empty string clears all tags); mutually exclusive with other tag mutation flags",
     )
     edit_parser.add_argument(
         "--add-tag",
@@ -1931,11 +1892,6 @@ def main() -> int:
         help="Auto-create/reuse a GitHub PR after successful code-task completion",
     )
     implement_parser.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Deprecated alias for --tag",
-    )
-    implement_parser.add_argument(
         "--tag",
         action="append",
         dest="tags",
@@ -2060,11 +2016,6 @@ def main() -> int:
         action="store_true",
         dest="create_pr",
         help="Auto-create/reuse a GitHub PR after successful code-task completion",
-    )
-    extract_parser.add_argument(
-        "--group",
-        metavar="NAME",
-        help="Deprecated alias for --tag",
     )
     extract_parser.add_argument(
         "--tag",
@@ -2277,67 +2228,6 @@ def main() -> int:
         help="Skip duplicate detection and import all tasks",
     )
     add_common_args(import_parser)
-
-    # groups command
-    groups_parser = subparsers.add_parser("groups", help="Deprecated tag-management commands")
-    add_common_args(groups_parser)
-    groups_parser.add_argument(
-        "--fields",
-        metavar="CSV",
-        help="Projection fields override for aggregate group rows (comma-separated; works in text or JSON mode)",
-    )
-    groups_parser.add_argument(
-        "--list-fields",
-        action="store_true",
-        help="List valid --fields values for this command and exit",
-    )
-    groups_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output aggregate group rows as JSON",
-    )
-    groups_subparsers = groups_parser.add_subparsers(dest="groups_action")
-    groups_list_parser = groups_subparsers.add_parser("list", help="List tags with task counts")
-    add_common_args(groups_list_parser)
-    groups_list_parser.add_argument(
-        "--fields",
-        metavar="CSV",
-        help="Projection fields override for aggregate group rows (comma-separated; works in text or JSON mode)",
-    )
-    groups_list_parser.add_argument(
-        "--list-fields",
-        action="store_true",
-        help="List valid --fields values for this command and exit",
-    )
-    groups_list_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output aggregate group rows as JSON",
-    )
-    groups_rename_parser = groups_subparsers.add_parser("rename", help="Rename a tag across all attached tasks")
-    groups_rename_parser.add_argument(
-        "old_group",
-        help="Current group name",
-    )
-    groups_rename_parser.add_argument(
-        "new_group",
-        help="New group name",
-    )
-    add_common_args(groups_rename_parser)
-
-    # group command
-    group_parser = subparsers.add_parser("group", help="Deprecated alias for tasks filtered by one tag")
-    group_parser.add_argument(
-        "group",
-        help="Group name to show tasks for",
-    )
-    group_parser.add_argument(
-        "--view",
-        choices=["flat", "lineage", "tree", "json"],
-        default="flat",
-        help="Presentation mode (default: flat)",
-    )
-    add_common_args(group_parser)
 
     # ps command (status is an alias for ps)
     for ps_cmd in ("ps", "status"):
@@ -2614,12 +2504,6 @@ def main() -> int:
             return cmd_sync_report(args)
         elif args.command == "import":
             return cmd_import(args)
-        elif args.command == "groups":
-            if getattr(args, "groups_action", None) == "rename":
-                return cmd_group_rename(args)
-            return cmd_groups(args)
-        elif args.command == "group":
-            return cmd_status(args)
         elif args.command in ("ps", "status"):
             return cmd_ps(args)
         elif args.command == "kill":

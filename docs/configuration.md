@@ -490,7 +490,6 @@ gza work [task_id...] [options]
 | `--pr` | Create/reuse a GitHub PR for completed code tasks before auto-created review runs (when the branch has commits) |
 | `--tag TAG` | Only pick pending tasks matching tag filters when no task IDs are specified (repeatable) |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
-| `--group NAME` | Deprecated alias for `--tag NAME` |
 
 ### add
 
@@ -508,7 +507,6 @@ gza add [prompt] [options]
 | `--branch-type TYPE` | Set branch type hint for naming |
 | `--explore` | Create explore task (shorthand) |
 | `--tag TAG` | Add task tag (repeatable) |
-| `--group NAME` | Deprecated alias for `--tag NAME` |
 | `--based-on ID` | Base on previous task by full prefixed task ID (e.g. `gza-1234`) |
 | `--depends-on ID` | Set dependency on another task by full prefixed task ID (e.g. `gza-1234`) |
 | `--review` | Auto-create review task on completion |
@@ -536,7 +534,6 @@ gza edit <task_id> [options]
 | `--remove-tag TAG` | Remove one or more tags (repeatable, mutually exclusive with other tag mutation flags) |
 | `--clear-tags` | Remove all tags from task (mutually exclusive with other tag mutation flags) |
 | `--set-tags CSV` | Replace all tags with comma-separated tags (mutually exclusive with other tag mutation flags) |
-| `--group NAME` | Deprecated alias; maps to tag mutation compatibility behavior and is mutually exclusive with other tag mutation flags |
 | `--based-on ID` | Set lineage/parent relationship using a full prefixed task ID (branch inheritance and context; e.g. `gza-1234`) |
 | `--depends-on ID` | Set execution dependency using a full prefixed task ID (blocks task until dependency completes; e.g. `gza-1234`) |
 | `--explore` | Convert to explore task |
@@ -549,7 +546,7 @@ gza edit <task_id> [options]
 | `--provider PROVIDER` | Override provider for this task |
 | `--no-learnings` | Skip injecting learnings context |
 
-Pending tasks may use any supported edit flag. Non-pending tasks may only use tag mutation flags (`--add-tag`, `--remove-tag`, `--clear-tags`, `--set-tags`, or deprecated `--group`).
+Pending tasks may use any supported edit flag. Non-pending tasks may only use tag mutation flags (`--add-tag`, `--remove-tag`, `--clear-tags`, or `--set-tags`).
 All other edit flags (`--based-on`, `--depends-on`, `--explore`, `--task`, `--review`, `--pr`, `--prompt`, `--prompt-file`, `--model`, `--provider`, and `--no-learnings`) remain pending-only.
 
 Non-conflicting edit mutations can be combined in one invocation. Tag mutation flags remain mutually exclusive with each other.
@@ -668,21 +665,6 @@ gza import [file] [options]
 | `file` | YAML file to import from |
 | `--dry-run` | Preview without creating tasks |
 | `--force`, `-f` | Skip duplicate detection |
-
-### group
-
-Deprecated alias for tag-scoped listing.
-
-```bash
-gza group <group> [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `group` | Group/tag name to filter by |
-| `--view MODE` | Presentation mode: `flat`, `lineage`, `tree`, or `json` (default: `flat`) |
-
-`--view json` emits JSON rows to stdout (`[]` when no rows). Deprecation and orphaned-task warnings are written to stderr.
 
 ### status
 
@@ -1027,22 +1009,6 @@ For each unmerged implementation in the default text view, output includes:
   - `review stale` when code-changing work (for example an improve task) happened after the latest review.
 - When a completed review has a stored derived score, verdict badges include it as `(<score>)`, for example `✓ approved (82)`.
 
-### groups
-
-Deprecated alias for tag listing commands.
-
-```bash
-gza groups
-```
-
-`gza groups` remains an aggregate group-count summary command (`gza groups list`), separate from task/lineage query presentation.
-
-| Option | Description |
-|--------|-------------|
-| `--fields CSV` | Projection fields override for aggregate group rows. In text mode, one field prints bare values and multiple fields print `field: value` blocks |
-| `--list-fields` | List valid `--fields` values for this command and exit |
-| `--json` | Output aggregate group rows as structured JSON objects |
-
 ### history
 
 List recent completed or failed tasks.
@@ -1311,7 +1277,7 @@ gza next [options]
 ```
 
 Shows pending tasks that are ready to run (dependencies satisfied). Tasks blocked by dependencies are listed separately.
-Use `--tag TAG` (repeatable) to scope the list to matching tags. `--group NAME` remains as a deprecated alias for one tag.
+Use `--tag TAG` (repeatable) to scope the list to matching tags.
 
 ### queue
 
@@ -1332,7 +1298,6 @@ gza queue clear <task_id>
 | `position` | 1-based explicit queue position for `queue move` |
 | `--tag TAG` | Only list runnable tasks matching tag filters (repeatable; same scoped pickup order used by `gza watch --tag TAG`) |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
-| `--group NAME` | Deprecated alias for `--tag NAME` |
 | `-n, --limit N` | Show first N runnable tasks (default: 10; use `0`, `-1`, or `--all` for all) |
 | `--all` | Show all runnable tasks |
 
@@ -1365,7 +1330,6 @@ gza implement <plan_task_id> [prompt] [options]
 | `--review` | Auto-create review task on completion |
 | `--pr` | Auto-create/reuse a GitHub PR after successful code-task completion |
 | `--tag TAG` | Add task tag (repeatable) |
-| `--group NAME` | Deprecated alias for `--tag NAME` |
 | `--same-branch` | Continue on depends_on task's branch instead of creating new |
 | `--branch-type TYPE` | Set branch type hint for branch naming |
 | `--model MODEL` | Override model for this task |
@@ -1401,7 +1365,6 @@ gza extract SOURCE --files-from FILE [options]
 | `--review` | Auto-create review task on completion |
 | `--pr` | Auto-create/reuse a GitHub PR after successful code-task completion |
 | `--tag TAG` | Add task tag (repeatable) |
-| `--group NAME` | Deprecated alias for `--tag NAME` |
 | `--branch-type TYPE` | Set branch type hint for branch naming |
 | `--base-branch BRANCH` | Override base branch used for source diff and new task branch creation |
 | `--model MODEL` | Override model for this task |
@@ -1507,7 +1470,6 @@ uv run gza watch [options]
 | `--quiet` | Write events to `.gza/watch.log` only |
 | `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG` to preview the same scoped pickup order |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
-| `--group NAME` | Deprecated alias for `--tag NAME` |
 
 When `main_checkout_isolate: true`, watch preflights a dedicated detached checkout reset to the default-branch tip and executes merge attempts there. If the isolated merge succeeds, watch then fast-forwards the real default-branch ref to that detached merge commit and syncs any attached default-branch checkout back to a clean state before marking the task merged. If the initial refresh fails because that checkout is stale or conflicted, watch rebuilds it once from scratch before giving up on merge actions for that watch pass. The integration checkout does not directly check out the shared default-branch ref, so an operator checkout already on that branch stays clean. Conflict rebases still run on task branches via standard rebase tasks.
 

@@ -1,6 +1,6 @@
 ---
 name: gza-task-add
-description: Create a well-formed gza task with appropriate type, group, and prompt
+description: Create a well-formed gza task with appropriate type, tags, and prompt
 allowed-tools: Read, Bash(uv run gza add:*), AskUserQuestion
 version: 1.0.0
 public: true
@@ -33,7 +33,7 @@ Ask the user what they want to accomplish. Use AskUserQuestion to gather:
    - `improve` - Address review feedback and/or unresolved task comments on an implementation. Runs from review findings, from unresolved comments, or from both; comments-only improve is supported when no usable review exists (use `uv run gza improve <impl-id>`)
 
 3. **Additional context** (optional):
-   - Should this be tagged to group with related tasks? (--tag TAG, repeatable)
+   - Should this be tagged to relate it to other tasks? (--tag TAG, repeatable)
    - Does this depend on another task? (--depends-on ID)
    - For implement tasks: Should auto-create a review task? (--review)
    - For chained work: Is this based on a previous task's output? (--based-on ID)
