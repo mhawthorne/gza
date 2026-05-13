@@ -141,6 +141,25 @@ class TestHelpOutput:
         assert result.returncode == 2
         assert f"unrecognized arguments: {legacy_flag}" in result.stderr
 
+    @pytest.mark.parametrize(
+        ("argv", "expected_value"),
+        [
+            (("history", "--status", "bogus"), "bogus"),
+            (("add", "--type", "bogus"), "bogus"),
+        ],
+    )
+    def test_valid_choice_flags_keep_argparse_invalid_choice_errors(
+        self, tmp_path: Path, argv: tuple[str, ...], expected_value: str
+    ) -> None:
+        """Valid flags with invalid values should keep argparse's native invalid-choice wording."""
+        setup_config(tmp_path)
+
+        result = run_gza(*argv, "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert f"invalid choice: '{expected_value}'" in result.stderr
+        assert "unrecognized arguments" not in result.stderr
+
     def test_top_level_help_shows_incomplete_command(self, tmp_path):
         """Top-level help should advertise `gza incomplete`."""
         setup_config(tmp_path)
