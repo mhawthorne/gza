@@ -2093,6 +2093,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     limit=None,
                     task_types=(advance_type,) if advance_type else None,
                     include_skipped=True,
+                    exclude_dropped_from_planning=True,
                     max_recovery_attempts=max_resume_attempts,
                 ),
                 config=config,
@@ -2107,7 +2108,32 @@ def cmd_advance(args: argparse.Namespace) -> int:
             or any(member.id == task.id for member in row.members if member.id is not None)
             or any(member.id == task.id for member in row.unresolved_tasks if member.id is not None)
         ]
-        if not owner_rows:
+        dropped_owner_lineage = False
+        if not owner_rows and task.status != "dropped":
+            dropped_owner_rows = [
+                row
+                for row in query_lineage_owner_rows(
+                    store,
+                    LineageOwnerQuery(
+                        limit=None,
+                        task_types=(advance_type,) if advance_type else None,
+                        include_skipped=True,
+                        max_recovery_attempts=max_resume_attempts,
+                    ),
+                    config=config,
+                    git=git,
+                    target_branch=target_branch,
+                )
+                if row.owner_task.status == "dropped"
+                and (
+                    task.id == row.owner_task.id
+                    or any(member.id == task.id for member in row.members if member.id is not None)
+                    or any(member.id == task.id for member in row.unresolved_tasks if member.id is not None)
+                )
+            ]
+            if dropped_owner_rows:
+                dropped_owner_lineage = True
+        if not owner_rows and task.status != "dropped" and not dropped_owner_lineage:
             planning_task = resolve_recovery_planning_task(store, task) if task.status == "failed" else task
             owner_rows = [
                 LineageOwnerRow(
@@ -2133,6 +2159,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     limit=None,
                     task_types=(advance_type,) if advance_type else None,
                     include_skipped=True,
+                    exclude_dropped_from_planning=True,
                     max_recovery_attempts=max_resume_attempts,
                 ),
                 config=config,

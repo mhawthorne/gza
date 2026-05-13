@@ -168,6 +168,7 @@ def _query_owner_rows(
                 tags=tags,
                 any_tag=any_tag,
                 include_skipped=include_skipped,
+                exclude_dropped_from_planning=True,
                 max_recovery_attempts=max_recovery_attempts,
             ),
             config=config,

@@ -12926,6 +12926,46 @@ class TestSetStatusCommand:
         assert result.returncode == 0
         assert "No eligible tasks" in result.stdout
 
+    def test_advance_explicit_completed_descendant_in_dropped_owner_lineage_is_ineligible(self, tmp_path: Path):
+        """Explicit advance must not rebuild a synthetic plan row for a dropped owner lineage."""
+        from gza.db import SqliteTaskStore as _Store
+        from gza.git import Git
+
+        setup_config(tmp_path)
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = _Store(db_path)
+
+        git = Git(tmp_path)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (tmp_path / "README.md").write_text("initial")
+        git._run("add", "README.md")
+        git._run("commit", "-m", "Initial commit")
+
+        owner = store.add("Dropped implement owner", task_type="implement")
+        owner.status = "dropped"
+        owner.completed_at = datetime.now(UTC)
+        owner.branch = "feature/dropped-owner"
+        owner.has_commits = True
+        owner.merge_status = "unmerged"
+        store.update(owner)
+        assert owner.id is not None
+
+        descendant = store.add("Completed rebase descendant", task_type="rebase", based_on=owner.id, same_branch=True)
+        descendant.status = "completed"
+        descendant.completed_at = datetime.now(UTC)
+        descendant.branch = owner.branch
+        descendant.has_commits = True
+        descendant.merge_status = "unmerged"
+        store.update(descendant)
+        assert descendant.id is not None
+
+        result = run_gza("advance", str(descendant.id), "--dry-run", "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "No eligible tasks to advance" in result.stdout
+
     def test_dropped_task_blocks_dependent(self, tmp_path: Path):
         """A task that depends_on a dropped task is reported as blocked."""
         from gza.db import SqliteTaskStore as _Store

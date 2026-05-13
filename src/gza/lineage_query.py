@@ -74,6 +74,7 @@ class LineageOwnerQuery:
     any_tag: bool = False
     date_filter: DateFilter | None = None
     include_skipped: bool = False
+    exclude_dropped_from_planning: bool = False
     max_recovery_attempts: int | None = None
     groups: tuple[str, ...] | None = None
     owner_task_ids: tuple[str, ...] | None = None
@@ -106,8 +107,15 @@ def _task_event_time(task: DbTask) -> datetime:
     return _normalize_dt(task.completed_at or task.created_at)
 
 
-def _actionable_lifecycle_tasks(unresolved_tasks: Sequence[DbTask]) -> list[DbTask]:
-    return [task for task in unresolved_tasks if task.status in {"completed", "unmerged", "dropped"}]
+def _actionable_lifecycle_tasks(
+    unresolved_tasks: Sequence[DbTask],
+    *,
+    include_dropped: bool,
+) -> list[DbTask]:
+    allowed_statuses = {"completed", "unmerged"}
+    if include_dropped:
+        allowed_statuses.add("dropped")
+    return [task for task in unresolved_tasks if task.status in allowed_statuses]
 
 
 def _canonical_impl_branch_candidates(owner: DbTask, actionable_tasks: Sequence[DbTask]) -> list[DbTask]:
@@ -457,12 +465,13 @@ def _select_representative_completed_task(
     snapshot: LineageOwnerSnapshot,
     unresolved_tasks: Sequence[DbTask],
     *,
+    include_dropped: bool,
     impl_based_on_ids: set[str],
 ) -> DbTask | None:
     owner = snapshot.owner_task
     if owner.id is not None and owner.task_type in {"plan", "explore"} and owner.id not in impl_based_on_ids:
         return owner
-    actionable = _actionable_lifecycle_tasks(unresolved_tasks)
+    actionable = _actionable_lifecycle_tasks(unresolved_tasks, include_dropped=include_dropped)
     if not actionable:
         return None
     owner_unit = snapshot.merge_units_by_task_id.get(owner.id or "")
@@ -490,8 +499,13 @@ def _select_representative_completed_task(
     return max(actionable, key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)))
 
 
-def _requires_impl_branch_manual_resolution(owner: DbTask, unresolved_tasks: Sequence[DbTask]) -> bool:
-    actionable = _actionable_lifecycle_tasks(unresolved_tasks)
+def _requires_impl_branch_manual_resolution(
+    owner: DbTask,
+    unresolved_tasks: Sequence[DbTask],
+    *,
+    include_dropped: bool,
+) -> bool:
+    actionable = _actionable_lifecycle_tasks(unresolved_tasks, include_dropped=include_dropped)
     if not actionable:
         return False
     if _canonical_impl_branch_candidates(owner, actionable):
@@ -635,6 +649,8 @@ def query_lineage_owner_rows(
         owner = indexes.task_by_id.get(owner_id)
         if owner is None:
             continue
+        if query.exclude_dropped_from_planning and owner.status == "dropped":
+            continue
         if owner_ids_filter is not None and owner_id not in owner_ids_filter:
             if task_ids_filter is None or not any(task.id in task_ids_filter for task in owner_members if task.id is not None):
                 continue
@@ -660,6 +676,8 @@ def query_lineage_owner_rows(
             if task.id is None:
                 continue
             if task.status not in {"failed", "completed", "unmerged", "dropped"}:
+                continue
+            if query.exclude_dropped_from_planning and task.status == "dropped":
                 continue
             merge_unit = merge_units_by_member.get(task.id)
             matches = _matches_task_filters(
@@ -761,6 +779,7 @@ def query_lineage_owner_rows(
             store,
             snapshot,
             unresolved_tasks,
+            include_dropped=not query.exclude_dropped_from_planning,
             impl_based_on_ids=indexes.impl_based_on_ids,
         )
         planning_task = lifecycle_action_task
@@ -806,7 +825,11 @@ def query_lineage_owner_rows(
         if planning_task is None:
             planning_task = recovery_action_task
         action: dict[str, Any] | None = None
-        if planning_task is None and _requires_impl_branch_manual_resolution(owner, unresolved_tasks):
+        if planning_task is None and _requires_impl_branch_manual_resolution(
+            owner,
+            unresolved_tasks,
+            include_dropped=not query.exclude_dropped_from_planning,
+        ):
             action = {
                 "type": "needs_discussion",
                 "description": "SKIP: no descendant on the impl branch; manual resolution required",

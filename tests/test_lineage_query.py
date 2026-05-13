@@ -17,6 +17,13 @@ def _set_completed(task, *, when: datetime, branch: str | None, has_commits: boo
     task.has_commits = has_commits
 
 
+def _set_dropped(task, *, when: datetime, branch: str | None, has_commits: bool) -> None:
+    task.status = "dropped"
+    task.completed_at = when
+    task.branch = branch
+    task.has_commits = has_commits
+
+
 def _build_tag_filtered_merge_unit_case(tmp_path: Path) -> tuple[SqliteTaskStore, str, str, str]:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -343,3 +350,165 @@ def test_query_lineage_owner_rows_marks_orphan_only_impl_lineage_for_manual_reso
     assert row.next_action["needs_attention_reason"] == "no-descendant-on-the-impl-branch"
     assert "no descendant on the impl branch" in row.next_action["description"]
     assert {task.id for task in row.unresolved_tasks if task.id is not None} == {orphan.id}
+
+
+def test_query_lineage_owner_rows_planning_excludes_dropped_descendant_rebase(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _set_completed(
+        impl,
+        when=datetime(2026, 5, 12, 9, 0, tzinfo=UTC),
+        branch="feature/canonical",
+        has_commits=True,
+    )
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    review = store.add("Approved review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 12, 10, 0, tzinfo=UTC)
+    review.output_content = "**Verdict: APPROVED**"
+    store.update(review)
+
+    dropped_rebase = store.add("Dropped orphan rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert dropped_rebase.id is not None
+    _set_dropped(
+        dropped_rebase,
+        when=datetime(2026, 5, 12, 11, 0, tzinfo=UTC),
+        branch="feature/orphan",
+        has_commits=True,
+    )
+    dropped_rebase.merge_status = "unmerged"
+    store.update(dropped_rebase)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == impl.id
+    assert row.lifecycle_action_task is not None
+    assert row.lifecycle_action_task.id == impl.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "merge"
+    unresolved_ids = {task.id for task in row.unresolved_tasks if task.id is not None}
+    assert dropped_rebase.id not in unresolved_ids
+
+
+def test_query_lineage_owner_rows_planning_skips_dropped_owner_lineage(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Dropped implement owner", task_type="implement")
+    assert impl.id is not None
+    _set_dropped(
+        impl,
+        when=datetime(2026, 5, 12, 9, 0, tzinfo=UTC),
+        branch="feature/dropped-owner",
+        has_commits=True,
+    )
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    descendant = store.add("Completed descendant rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert descendant.id is not None
+    _set_completed(
+        descendant,
+        when=datetime(2026, 5, 12, 10, 0, tzinfo=UTC),
+        branch="feature/dropped-owner",
+        has_commits=True,
+    )
+    descendant.merge_status = "unmerged"
+    store.update(descendant)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert rows == ()
+
+
+def test_query_lineage_owner_rows_planning_keeps_completed_and_failed_live_tasks(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    completed_impl = store.add("Completed implement", task_type="implement")
+    assert completed_impl.id is not None
+    _set_completed(
+        completed_impl,
+        when=datetime(2026, 5, 12, 9, 0, tzinfo=UTC),
+        branch="feature/completed-live",
+        has_commits=True,
+    )
+    completed_impl.merge_status = "unmerged"
+    store.update(completed_impl)
+
+    failed_impl = store.add("Failed implement", task_type="implement")
+    assert failed_impl.id is not None
+    failed_impl.status = "failed"
+    failed_impl.failure_reason = "MAX_STEPS"
+    failed_impl.session_id = "sess-failed"
+    failed_impl.completed_at = datetime(2026, 5, 12, 10, 0, tzinfo=UTC)
+    failed_impl.branch = "feature/failed-live"
+    failed_impl.has_commits = True
+    store.update(failed_impl)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    rows_by_owner = {row.owner_task.id: row for row in rows if row.owner_task.id is not None}
+    assert completed_impl.id in rows_by_owner
+    assert failed_impl.id in rows_by_owner
+    assert rows_by_owner[completed_impl.id].lifecycle_action_task is not None
+    assert rows_by_owner[completed_impl.id].lifecycle_action_task.id == completed_impl.id
+    assert rows_by_owner[completed_impl.id].next_action is not None
+    assert rows_by_owner[completed_impl.id].next_action["type"] == "create_review"
+    assert rows_by_owner[failed_impl.id].recovery_action_task is not None
+    assert rows_by_owner[failed_impl.id].recovery_action_task.id == failed_impl.id
+    assert rows_by_owner[failed_impl.id].next_action is not None
+    assert rows_by_owner[failed_impl.id].next_action["type"] == "resume"
