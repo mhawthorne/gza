@@ -9154,6 +9154,103 @@ class TestExtractedRunInnerHelpers:
             recovered=True,
         )
 
+    def test_run_inner_marks_retry_recovery_rebase_baseline_as_recovered(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Automatic retry recovery rebase children must also fail closed."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.slug = "20260512-parent-impl"
+        parent.branch = "feature/rebase-parent"
+        store.mark_in_progress(parent)
+        store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
+
+        failed_rebase = store.add(
+            prompt="Failed rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.slug = "20260512-failed-rebase"
+        failed_rebase.branch = parent.branch
+        store.mark_failed(failed_rebase, log_file="logs/rebase.log", stats=None)
+
+        task = store.add(
+            prompt="Retry rebase parent branch",
+            task_type="rebase",
+            based_on=failed_rebase.id,
+            same_branch=True,
+            recovery_origin="retry",
+        )
+        assert task.id is not None
+        task.slug = "20260512-runner-rebase-retry"
+
+        worktree_path = config.worktree_path / task.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=2.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            session_id=None,
+            error_type=None,
+        )
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+
+        mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.status_porcelain.return_value = set()
+
+        def capture_baseline(_git: Git, *, branch: str, target: str, recovered: bool = False) -> RebaseDiffBaseline:
+            assert branch == parent.branch
+            assert target == "main"
+            assert recovered is True
+            return RebaseDiffBaseline(
+                old_tip="old-tip",
+                target_at_start="start-target",
+                merge_base_at_start="merge-base",
+                recovered=True,
+            )
+
+        with (
+            patch("gza.runner.Git", return_value=mock_worktree_git),
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner._restore_wip_changes"),
+            patch("gza.skills_utils.ensure_all_skills", return_value=0),
+            patch("gza.runner._snapshot_task_db_to_worktree"),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner.capture_rebase_validation_baseline", return_value=("same-head", set())),
+            patch("gza.runner.capture_rebase_diff_baseline", side_effect=capture_baseline),
+            patch("gza.runner.validate_rebase_resolution_output", return_value=True),
+            patch("gza.runner._complete_code_task", return_value=0) as mock_complete,
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 0
+        assert mock_complete.call_args.kwargs["rebase_diff_baseline"] == RebaseDiffBaseline(
+            old_tip="old-tip",
+            target_at_start="start-target",
+            merge_base_at_start="merge-base",
+            recovered=True,
+        )
+
     def test_post_complete_resumed_rebase_marks_changed_diff_unknown_and_invalidates_review(
         self,
         tmp_path: Path,
@@ -9228,6 +9325,102 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_parent is not None
         assert refreshed_parent.review_cleared_at is None
         assert refreshed_parent.merge_status == "unmerged"
+
+        surfaced = capsys.readouterr().out
+        assert "Warning: rebase diff comparison unavailable for recovered/resumed rebase; treating as changed" in surfaced
+        assert "Changed Diff: yes (review must be refreshed)" in surfaced
+        assert "rebase diff comparison unavailable for recovered/resumed rebase; treating as changed" in caplog.text
+
+    def test_post_complete_retry_recovery_rebase_invalidates_impl_review_state(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Recovered retry rebase descendants must clear the implementation review state, not the failed rebase row."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.branch = "feature/rebase-parent"
+        parent.merge_status = "merged"
+        parent.status = "completed"
+        store.update(parent)
+
+        review = store.add(prompt="Review parent", task_type="review", depends_on=parent.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        store.clear_review_state(parent.id)
+        parent_before_rebase = store.get(parent.id)
+        assert parent_before_rebase is not None
+        assert parent_before_rebase.review_cleared_at is not None
+
+        failed_rebase = store.add(
+            prompt="Failed rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.branch = parent.branch
+        store.update(failed_rebase)
+
+        task = store.add(
+            prompt="Recovered retry rebase parent branch",
+            task_type="rebase",
+            based_on=failed_rebase.id,
+            same_branch=True,
+            recovery_origin="retry",
+        )
+        assert task.id is not None
+        task.slug = "20260512-runner-rebase-retry"
+        task.status = "completed"
+        task.branch = parent.branch
+        store.update(task)
+
+        mock_worktree_git = Mock(spec=Git)
+        config = self._make_config(tmp_path)
+
+        caplog.set_level(logging.WARNING)
+
+        with (
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = _post_complete_code_task(
+                task,
+                config,
+                store,
+                mock_worktree_git,
+                parent.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                target_branch="main",
+                rebase_diff_baseline=RebaseDiffBaseline(
+                    old_tip="old-tip",
+                    target_at_start="start-target",
+                    merge_base_at_start="merge-base",
+                    recovered=True,
+                ),
+            )
+
+        assert rc == 0
+        mock_worktree_git.push_force_with_lease.assert_called_once_with(parent.branch)
+
+        refreshed_rebase = store.get(task.id)
+        assert refreshed_rebase is not None
+        assert refreshed_rebase.changed_diff is True
+
+        refreshed_parent = store.get(parent.id)
+        assert refreshed_parent is not None
+        assert refreshed_parent.review_cleared_at is None
+        assert refreshed_parent.merge_status == "unmerged"
+
+        refreshed_failed_rebase = store.get(failed_rebase.id)
+        assert refreshed_failed_rebase is not None
+        assert refreshed_failed_rebase.review_cleared_at is None
 
         surfaced = capsys.readouterr().out
         assert "Warning: rebase diff comparison unavailable for recovered/resumed rebase; treating as changed" in surfaced

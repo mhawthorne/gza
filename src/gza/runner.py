@@ -1913,6 +1913,15 @@ def _resolve_impl_ancestor(store: SqliteTaskStore, task: Task) -> Task | None:
     return None
 
 
+def _is_recovered_rebase_lineage(task: Task, *, resume: bool) -> bool:
+    """Return whether rebase diff classification must fail closed for this run."""
+    if task.task_type != "rebase":
+        return False
+    if resume:
+        return True
+    return task.recovery_origin in {"resume", "retry"}
+
+
 def _normalize_repeated_blocker_text(text: str) -> str:
     """Normalize blocker text for repeated-fix matching."""
     return " ".join(text.split()).strip().lower()
@@ -3654,6 +3663,7 @@ def _post_complete_code_task(
     # Invalidate review state after rebase completes only when the patch changed
     # or equivalence could not be proven.
     if task.task_type == "rebase" and task.based_on:
+        impl_ancestor = _resolve_impl_ancestor(store, task)
         comparison = compute_rebase_changed_diff(
             worktree_git,
             baseline=(
@@ -3671,9 +3681,12 @@ def _post_complete_code_task(
         if comparison.warning:
             logger.warning(comparison.warning)
             console.print(f"[yellow]Warning: {comparison.warning}[/yellow]")
+        rebase_review_target_id = (
+            impl_ancestor.id if impl_ancestor and impl_ancestor.id is not None else task.based_on
+        )
         if comparison.changed_diff:
-            store.invalidate_review_state(task.based_on)
-        parent = store.get(task.based_on)
+            store.invalidate_review_state(rebase_review_target_id)
+        parent = store.get(rebase_review_target_id)
         parent_unit = (
             store.resolve_merge_unit_for_task(parent.id) if parent and parent.id is not None else None
         )
@@ -4204,7 +4217,7 @@ def _run_inner(
                 worktree_git,
                 branch=branch_name,
                 target=default_branch,
-                recovered=resume,
+                recovered=_is_recovered_rebase_lineage(task, resume=resume),
             )
         except RuntimeError as exc:
             task_logger.error(f"Pre-rebase ruff validation failed to run: {exc}")
