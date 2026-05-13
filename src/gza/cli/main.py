@@ -122,6 +122,18 @@ def _parse_queue_limit(value: str) -> int:
     return parsed
 
 
+HIDDEN_COMMANDS: set[str] = set()
+
+
+def add_hidden_parser(subparsers, name: str, **kwargs):
+    """Register a subcommand that remains dispatchable but stays out of top-level help."""
+    parser = subparsers.add_parser(name, help=argparse.SUPPRESS, **kwargs)
+    # Argparse still renders suppressed subparsers unless we remove their choice action manually.
+    subparsers._choices_actions = [action for action in subparsers._choices_actions if action.dest != name]
+    HIDDEN_COMMANDS.add(name)
+    return parser
+
+
 def main() -> int:
     parser = GzaArgumentParser(
         description="Gza - AI agent task runner",
@@ -243,7 +255,11 @@ def main() -> int:
     add_common_args(run_inline_parser)
 
     # attach command
-    attach_parser = subparsers.add_parser("attach", help="Attach to a running task (interactive for Claude, observe-only for Codex/Gemini)")
+    attach_parser = add_hidden_parser(
+        subparsers,
+        "attach",
+        description="Attach to a running task (interactive for Claude, observe-only for Codex/Gemini)",
+    )
     attach_parser.add_argument(
         "worker_id",
         help="Worker ID (e.g. w-20260301-1) or full prefixed task ID (e.g. gza-1234) to attach to",
@@ -2470,7 +2486,9 @@ def main() -> int:
     )
     add_common_args(migrate_parser)
 
-    visible_commands = sorted(subparsers.choices)
+    visible_commands = sorted(
+        command for command in subparsers.choices if command not in HIDDEN_COMMANDS
+    )
     subparsers.metavar = "{" + ",".join(visible_commands) + "}"
 
     args = parser.parse_args()

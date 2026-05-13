@@ -150,6 +150,50 @@ class TestHelpOutput:
         assert result.returncode == 0
         assert "incomplete" in result.stdout
 
+    def test_hidden_attach_command_is_absent_from_help_but_still_dispatches(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Hidden subcommands should disappear from top-level help while remaining callable."""
+        setup_config(tmp_path)
+
+        cli_main_module = importlib.import_module("gza.cli.main")
+
+        with patch.object(sys, "argv", ["gza", "--help", "--project", str(tmp_path)]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli_main_module.main()
+
+        assert excinfo.value.code == 0
+        help_output = capsys.readouterr().out
+        command_block = re.search(r"\{([^}]+)\}", help_output)
+        assert command_block is not None
+        assert "attach" not in command_block.group(1).split(",")
+        assert "\n  attach " not in help_output
+        assert "attach                 ==SUPPRESS==" not in help_output
+
+        captured = {}
+
+        def fake_cmd_attach(args):
+            captured["command"] = args.command
+            captured["worker_id"] = args.worker_id
+            captured["project_dir"] = args.project_dir
+            return 0
+
+        monkeypatch.setattr(cli_main_module, "cmd_attach", fake_cmd_attach)
+
+        with patch.object(
+            sys,
+            "argv",
+            ["gza", "attach", "w-20260301-1", "--project", str(tmp_path)],
+        ):
+            result = cli_main_module.main()
+
+        assert result == 0
+        assert captured == {
+            "command": "attach",
+            "worker_id": "w-20260301-1",
+            "project_dir": tmp_path.resolve(),
+        }
+
     def test_incomplete_command_help_describes_live_projection_surface(self, tmp_path):
         """`gza incomplete --help` should show the live projection options."""
         setup_config(tmp_path)
@@ -280,7 +324,7 @@ class TestHelpOutput:
         """Attach help/docs should reflect Claude interactive + Codex/Gemini observe-only semantics."""
         setup_config(tmp_path)
 
-        result = run_gza("--help", "--project", str(tmp_path))
+        result = run_gza("attach", "--help", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "interactive for Claude" in result.stdout
         assert "observe-only for Codex/Gemini" in result.stdout
