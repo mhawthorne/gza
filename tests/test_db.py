@@ -8190,6 +8190,82 @@ class TestSharedDbIsolationAndImportGating:
         assert migrated is not None
         assert migrated.create_pr is False
 
+    def test_run_v27_migration_defaults_missing_legacy_attach_columns_to_null(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, created_at) VALUES (1, 'parent', '2024-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        run_v25_migration(db_path, "gza")
+        run_v26_migration(db_path)
+        _drop_tasks_column(db_path, "attach_count")
+        _drop_tasks_column(db_path, "attach_duration_seconds")
+
+        run_v27_migration(db_path)
+
+        conn = sqlite3.connect(db_path)
+        columns = {
+            row[1]: row[3]
+            for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        row = conn.execute(
+            "SELECT attach_count, attach_duration_seconds FROM tasks WHERE id = ?",
+            ("gza-1",),
+        ).fetchone()
+        conn.close()
+
+        assert version == 27
+        assert "attach_count" in columns
+        assert "attach_duration_seconds" in columns
+        assert columns["attach_count"] == 0
+        assert columns["attach_duration_seconds"] == 0
+        assert row == (None, None)
+
+    def test_run_v27_migration_preserves_legacy_attach_values_when_columns_exist(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        _make_v24_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO tasks (id, prompt, created_at) VALUES (1, 'parent', '2024-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        run_v25_migration(db_path, "gza")
+        run_v26_migration(db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "UPDATE tasks SET attach_count = ?, attach_duration_seconds = ? WHERE id = ?",
+            (3, 12.5, "gza-1"),
+        )
+        conn.commit()
+        conn.close()
+
+        run_v27_migration(db_path)
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        row = conn.execute(
+            "SELECT attach_count, attach_duration_seconds FROM tasks WHERE id = ?",
+            ("gza-1",),
+        ).fetchone()
+        conn.close()
+
+        assert version == 27
+        assert row == (3, 12.5)
+
     def test_v24_to_v27_chains_via_gza_migrate(self, tmp_path: Path) -> None:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
