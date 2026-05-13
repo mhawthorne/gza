@@ -4204,6 +4204,7 @@ def _run_inner(
                 worktree_git,
                 branch=branch_name,
                 target=default_branch,
+                recovered=resume,
             )
         except RuntimeError as exc:
             task_logger.error(f"Pre-rebase ruff validation failed to run: {exc}")

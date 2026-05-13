@@ -87,3 +87,19 @@ def test_compute_rebase_changed_diff_detects_content_change(tmp_path: Path) -> N
 
     assert comparison.changed_diff is True
     assert comparison.detail == "yes (review must be refreshed)"
+
+
+def test_compute_rebase_changed_diff_treats_recovered_baseline_as_changed(tmp_path: Path) -> None:
+    repo_dir, git = _init_repo(tmp_path)
+
+    git._run("checkout", "-b", "feature")
+    _commit_file(git, repo_dir, "feature.txt", "one\n", "Add feature")
+
+    baseline = capture_rebase_diff_baseline(git, branch="feature", target="main", recovered=True)
+    comparison = compute_rebase_changed_diff(git, baseline=baseline, branch="feature", target="main")
+
+    assert comparison.changed_diff is True
+    assert comparison.detail == "yes (review must be refreshed)"
+    assert comparison.warning == (
+        "rebase diff comparison unavailable for recovered/resumed rebase; treating as changed"
+    )
