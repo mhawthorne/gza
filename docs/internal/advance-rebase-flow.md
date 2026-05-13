@@ -68,7 +68,7 @@ Existing orphan recovery branches created before this behavior was fixed are lef
 
 If the latest completed rebase after the latest review has `changed_diff = 0`, the prior approved review is carried across that rebase. If `changed_diff = 1` or `NULL`, lifecycle behavior stays conservative and requires a fresh review.
 
-Resumed or recovered rebase runs are intentionally fail-closed. The runner records their baseline with `recovered=True`, so completion persists `changed_diff = 1` and surfaces a warning instead of claiming the diff was preserved from the original pre-rebase state.
+Resumed or recovered rebase runs are intentionally fail-closed. This includes direct provider resumes and automatic failed-task recovery descendants such as retry-created rebase children. The runner records those baselines with `recovered=True`, so completion persists `changed_diff = 1` and surfaces a warning instead of claiming the diff was preserved from the original pre-rebase state.
 
 The `--resolve` and `--force` flags are accepted for backward compatibility but are no-ops — conflict resolution is always attempted automatically, and existing worktrees are always force-removed before creating a fresh one.
 
