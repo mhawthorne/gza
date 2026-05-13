@@ -76,7 +76,6 @@ class LineageOwnerQuery:
     include_skipped: bool = False
     exclude_dropped_from_planning: bool = False
     max_recovery_attempts: int | None = None
-    groups: tuple[str, ...] | None = None
     owner_task_ids: tuple[str, ...] | None = None
     task_ids: tuple[str, ...] | None = None
 
@@ -151,12 +150,6 @@ def _matches_task_filters(
         return False
     if query.exclude_task_types is not None and task.task_type in set(query.exclude_task_types):
         return False
-    if query.groups is not None:
-        task_groups = set(task.tags)
-        if task.group:
-            task_groups.add(task.group)
-        if not task_groups.intersection(query.groups):
-            return False
     if query.tags is not None and not tag_matcher(task_tags=task.tags, tag_filters=query.tags, any_tag=query.any_tag):
         return False
     if query.exclude_tags is not None and tag_matcher(task_tags=task.tags, tag_filters=query.exclude_tags, any_tag=query.any_tag):

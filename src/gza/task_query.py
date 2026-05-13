@@ -84,7 +84,6 @@ class TaskQuery:
     branch_owner_ids: tuple[str, ...] | None = None
     branch_owner_mode: BranchOwnerMode = "generic"
     merge_unit_ids: tuple[str, ...] | None = None
-    groups: tuple[str, ...] | None = None
     tag_filters: tuple[str, ...] | None = None
     exclude_tag_filters: tuple[str, ...] | None = None
     any_tag: bool = False
@@ -319,20 +318,16 @@ class TaskQueryPresets:
     def queue(
         *,
         limit: int | None = 10,
-        group: str | None = None,
         tags: tuple[str, ...] | None = None,
         any_tag: bool = False,
     ) -> TaskQuery:
-        group_tags = (group,) if group is not None else ()
-        combined_tags = normalize_tag_filters((*group_tags, *(tags or ())))
         return TaskQuery(
             scope="tasks",
             limit=limit,
             statuses=("pending",),
             exclude_task_types=("internal",),
             dependency_state=("unblocked",),
-            groups=None if group is None else (group,),
-            tag_filters=combined_tags,
+            tag_filters=normalize_tag_filters(tags),
             any_tag=any_tag,
             pickup_only=True,
             sort=SortSpec(field="pickup_order", descending=False),
@@ -469,7 +464,6 @@ class TaskQueryService:
                     any_tag=query.any_tag,
                     date_filter=query.date_filter,
                     include_skipped=True,
-                    groups=query.groups,
                     task_ids=query.task_ids,
                     owner_task_ids=query.branch_owner_ids,
                 ),
@@ -515,7 +509,6 @@ class TaskQueryService:
                     branch_owner_ids=query.branch_owner_ids,
                     branch_owner_mode=query.branch_owner_mode,
                     merge_unit_ids=query.merge_unit_ids,
-                    groups=query.groups,
                     tag_filters=query.tag_filters,
                     exclude_tag_filters=query.exclude_tag_filters,
                     any_tag=query.any_tag,
@@ -543,7 +536,7 @@ class TaskQueryService:
                     sorted(owner_members, key=lambda t: self._sort_key(t, DEFAULT_SORT), reverse=True)
                 )
 
-                if query.groups is not None or query.tag_filters is not None:
+                if query.tag_filters is not None:
                     keep_ids = {task.id for task in owner_members if task.id is not None}
                     if owner.id is not None:
                         keep_ids.add(owner.id)
@@ -670,8 +663,8 @@ class TaskQueryService:
                 and self._store.task_is_attached_to_merge_unit_ids(task.id, query.merge_unit_ids)
             ]
 
-        if query.groups is not None or query.tag_filters is not None or query.exclude_tag_filters is not None:
-            filtered = [task for task in filtered if self._matches_group_and_tag_filters(task, query)]
+        if query.tag_filters is not None or query.exclude_tag_filters is not None:
+            filtered = [task for task in filtered if self._matches_tag_filters(task, query)]
 
         if query.merge_chain_state is not None:
             merge_states = set(query.merge_chain_state)
@@ -689,16 +682,7 @@ class TaskQueryService:
 
         return filtered
 
-    def _matches_group_and_tag_filters(self, task: DbTask, query: TaskQuery) -> bool:
-        if query.groups is not None:
-            allowed_groups = set(normalize_tag_filters(query.groups) or ())
-            task_group_values = set(task.tags or ())
-            matches_group = bool(task_group_values & allowed_groups) or (
-                task.group is not None and task.group in allowed_groups
-            )
-            if not matches_group:
-                return False
-
+    def _matches_tag_filters(self, task: DbTask, query: TaskQuery) -> bool:
         if query.tag_filters is not None:
             required = normalize_tag_filters(query.tag_filters)
             if not task_matches_tag_filters(task_tags=task.tags, tag_filters=required, any_tag=query.any_tag):

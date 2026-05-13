@@ -1,6 +1,7 @@
 """Tests for unified task query service."""
 
-from dataclasses import replace
+import inspect
+from dataclasses import fields, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -464,21 +465,21 @@ def test_queue_preset_matches_runnable_pickup_order(tmp_path: Path) -> None:
     assert prompts == ["Bumped task", "First runnable", "Blocking task"]
 
 
-def test_queue_preset_filters_to_group(tmp_path: Path) -> None:
+def test_queue_preset_filters_to_tags(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    release = store.add("Release runnable", group="release")
-    backlog = store.add("Backlog runnable", group="backlog")
+    release = store.add("Release runnable", tags=("release",))
+    backlog = store.add("Backlog runnable", tags=("backlog",))
     assert release.id is not None
     assert backlog.id is not None
 
     service = TaskQueryService(store)
-    result = service.run(TaskQueryPresets.queue(limit=None, group="release"))
+    result = service.run(TaskQueryPresets.queue(limit=None, tags=("release",)))
 
     prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
     assert prompts == ["Release runnable"]
 
 
-def test_task_query_group_filter_matches_any_of_selected_group_names(tmp_path: Path) -> None:
+def test_task_query_tag_filter_matches_any_of_selected_tags(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.add("Release task", tags=("release",))
     store.add("Backlog task", tags=("backlog",))
@@ -488,7 +489,8 @@ def test_task_query_group_filter_matches_any_of_selected_group_names(tmp_path: P
     result = service.run(
         TaskQuery(
             scope="tasks",
-            groups=("release", "ops"),
+            tag_filters=("release", "ops"),
+            any_tag=True,
             limit=None,
         )
     )
@@ -499,18 +501,18 @@ def test_task_query_group_filter_matches_any_of_selected_group_names(tmp_path: P
     assert "Backlog task" not in prompts
 
 
-def test_lineage_scope_group_filter_prunes_tree_to_matching_members_and_ancestors(tmp_path: Path) -> None:
+def test_lineage_scope_tag_filter_prunes_tree_to_matching_members_and_ancestors(tmp_path: Path) -> None:
     store = _store(tmp_path)
     root = store.add("Shared root owner", task_type="implement")
     assert root.id is not None
-    store.add("Release child", task_type="implement", group="release", based_on=root.id, same_branch=True)
-    store.add("Backlog sibling", task_type="implement", group="backlog", based_on=root.id, same_branch=True)
+    store.add("Release child", task_type="implement", tags=("release",), based_on=root.id, same_branch=True)
+    store.add("Backlog sibling", task_type="implement", tags=("backlog",), based_on=root.id, same_branch=True)
 
     service = TaskQueryService(store)
     result = service.run(
         TaskQuery(
             scope="lineages",
-            groups=("release",),
+            tag_filters=("release",),
             limit=None,
         )
     )
@@ -537,49 +539,20 @@ def test_lineage_scope_group_filter_prunes_tree_to_matching_members_and_ancestor
     assert "Backlog sibling" not in tree_prompts
 
 
-def test_lineages_incomplete_group_filter_excludes_unrelated_owners(tmp_path: Path) -> None:
+def test_lineages_incomplete_tag_filter_excludes_unrelated_owners(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
-    release_failed = store.add("Release failed", task_type="implement", group="release")
+    release_failed = store.add("Release failed", task_type="implement", tags=("release",))
     release_failed.status = "failed"
     release_failed.completed_at = datetime.now(UTC)
     release_failed.failure_reason = "TEST_FAILURE"
     store.update(release_failed)
 
-    backlog_failed = store.add("Backlog failed", task_type="implement", group="backlog")
+    backlog_failed = store.add("Backlog failed", task_type="implement", tags=("backlog",))
     backlog_failed.status = "failed"
     backlog_failed.completed_at = datetime.now(UTC)
     backlog_failed.failure_reason = "TEST_FAILURE"
     store.update(backlog_failed)
-
-    service = TaskQueryService(store)
-    result = service.run(
-        TaskQuery(
-            scope="lineages",
-            lifecycle_state=("incomplete",),
-            groups=("release",),
-            limit=None,
-        )
-    )
-
-    owners = [row.owner_task.prompt for row in result.rows if hasattr(row, "owner_task")]
-    assert owners == ["Release failed"]
-
-
-def test_lineages_incomplete_tag_filter_excludes_unrelated_owners(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-
-    tagged_failed = store.add("Tagged failed", task_type="implement", tags=("release", "beta"))
-    tagged_failed.status = "failed"
-    tagged_failed.completed_at = datetime.now(UTC)
-    tagged_failed.failure_reason = "TEST_FAILURE"
-    store.update(tagged_failed)
-
-    other_failed = store.add("Other failed", task_type="implement", tags=("backlog",))
-    other_failed.status = "failed"
-    other_failed.completed_at = datetime.now(UTC)
-    other_failed.failure_reason = "TEST_FAILURE"
-    store.update(other_failed)
 
     service = TaskQueryService(store)
     result = service.run(
@@ -592,20 +565,19 @@ def test_lineages_incomplete_tag_filter_excludes_unrelated_owners(tmp_path: Path
     )
 
     owners = [row.owner_task.prompt for row in result.rows if hasattr(row, "owner_task")]
-    assert owners == ["Tagged failed"]
-
+    assert owners == ["Release failed"]
 
 def test_lineage_presentation_mode_renders_tree_layout(tmp_path: Path) -> None:
     store = _store(tmp_path)
     root = store.add("Lineage root owner", task_type="implement")
     assert root.id is not None
-    store.add("Tagged release child", task_type="implement", group="release", based_on=root.id, same_branch=True)
+    store.add("Tagged release child", task_type="implement", tags=("release",), based_on=root.id, same_branch=True)
 
     service = TaskQueryService(store)
     result = service.run(
         TaskQuery(
             scope="lineages",
-            groups=("release",),
+            tag_filters=("release",),
             limit=None,
             presentation=PresentationSpec(mode="lineage"),
         )
@@ -627,6 +599,11 @@ def test_default_projection_uses_tags_without_group_field(tmp_path: Path) -> Non
     assert rows
     assert "group" not in rows[0]
     assert rows[0]["tags"] == ["release"]
+
+
+def test_query_api_surfaces_do_not_expose_group_filters() -> None:
+    assert "groups" not in {field.name for field in fields(TaskQuery)}
+    assert "group" not in inspect.signature(TaskQueryPresets.queue).parameters
 
 
 def test_dependency_state_blocked_by_dropped_dep_filters_pending_only(tmp_path: Path) -> None:
