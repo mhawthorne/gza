@@ -373,6 +373,7 @@ class Task:
     diff_files_changed: int | None = None  # Files changed vs. main (v13)
     diff_lines_added: int | None = None    # Lines added vs. main (v13)
     diff_lines_removed: int | None = None  # Lines removed vs. main (v13)
+    changed_diff: bool | None = None  # Rebase-only: whether rebasing changed the reviewed implementation diff
     review_cleared_at: datetime | None = None  # When review state was cleared by an improve task (v14)
     review_score: int | None = None  # Derived deterministic score for completed review tasks (v33)
     log_schema_version: int = 1  # 1=legacy logs, 2=message-step logs
@@ -605,8 +606,13 @@ CREATE INDEX IF NOT EXISTS idx_merge_unit_tasks_project_unit_role
     ON merge_unit_tasks(project_id, merge_unit_id, role);
 """
 
+# Migration from v42 to v43: persisted rebase diff change signal
+MIGRATION_V42_TO_V43 = """
+ALTER TABLE tasks ADD COLUMN changed_diff INTEGER;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 42
+SCHEMA_VERSION = 43
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -860,6 +866,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 diff_files_changed INTEGER,
                 diff_lines_added INTEGER,
                 diff_lines_removed INTEGER,
+                changed_diff INTEGER,
                 review_cleared_at TEXT,
                 review_score INTEGER,
                 log_schema_version INTEGER DEFAULT 1,
@@ -953,6 +960,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "group", "depends_on", "spec", "create_review", "create_pr", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
             "pr_state", "pr_last_synced_at", "sync_last_synced_at", "model", "provider", "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
             "merge_status", "merged_at", "failure_reason", "completion_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
+            "changed_diff",
             "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch", "recovery_origin",
         )
         task_defaults: dict[str, str] = {
@@ -993,7 +1001,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 "group", depends_on, spec, create_review, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
                 pr_state, pr_last_synced_at, sync_last_synced_at, model, provider, provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
                 merge_status, merged_at, failure_reason, completion_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
-                review_cleared_at, review_score, log_schema_version, execution_mode, base_branch, recovery_origin
+                changed_diff, review_cleared_at, review_score, log_schema_version, execution_mode, base_branch, recovery_origin
             )
             SELECT
                 {tasks_project_expr}, {", ".join(task_select_exprs)}
@@ -1249,7 +1257,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "base_branch",
 )
 
-_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset({40, 41, 42})
+_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset({40, 41, 42, 43})
 
 
 def _missing_required_columns(conn: sqlite3.Connection, table: str, required_columns: tuple[str, ...]) -> list[str]:
@@ -1408,6 +1416,7 @@ def _ensure_required_auto_migration_artifacts(
         (38, "tasks", "pr_last_synced_at", "ALTER TABLE tasks ADD COLUMN pr_last_synced_at TEXT"),
         (39, "tasks", "sync_last_synced_at", "ALTER TABLE tasks ADD COLUMN sync_last_synced_at TEXT"),
         (41, "tasks", "recovery_origin", "ALTER TABLE tasks ADD COLUMN recovery_origin TEXT"),
+        (43, "tasks", "changed_diff", "ALTER TABLE tasks ADD COLUMN changed_diff INTEGER"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -1542,6 +1551,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     diff_files_changed INTEGER,
     diff_lines_added INTEGER,
     diff_lines_removed INTEGER,
+    changed_diff INTEGER,
     review_cleared_at TEXT,
     review_score INTEGER,
     log_schema_version INTEGER DEFAULT 1,
@@ -1957,6 +1967,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (40, MIGRATION_V39_TO_V40),
     (41, MIGRATION_V40_TO_V41),
     (42, MIGRATION_V41_TO_V42),
+    (43, MIGRATION_V42_TO_V43),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -2370,6 +2381,11 @@ class SqliteTaskStore:
                 "Query-only DB open detected missing optional column tasks.completion_reason; "
                 "completion metadata will be unavailable."
             )
+        if not self._query_only_has_column("tasks", "changed_diff"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing optional column tasks.changed_diff; "
+                "rebase review-preservation metadata will be unavailable."
+            )
         if not self._query_only_has_column("tasks", "recovery_origin"):
             self._startup_warnings.append(
                 "Query-only DB open detected missing optional column tasks.recovery_origin; "
@@ -2626,6 +2642,7 @@ class SqliteTaskStore:
             diff_files_changed=row["diff_files_changed"] if "diff_files_changed" in keys else None,
             diff_lines_added=row["diff_lines_added"] if "diff_lines_added" in keys else None,
             diff_lines_removed=row["diff_lines_removed"] if "diff_lines_removed" in keys else None,
+            changed_diff=bool(row["changed_diff"]) if "changed_diff" in keys and row["changed_diff"] is not None else None,
             review_cleared_at=_parse_db_timestamp(row["review_cleared_at"]) if "review_cleared_at" in keys else None,
             review_score=row["review_score"] if "review_score" in keys else None,
             log_schema_version=(
@@ -2969,6 +2986,7 @@ class SqliteTaskStore:
                     diff_files_changed = ?,
                     diff_lines_added = ?,
                     diff_lines_removed = ?,
+                    changed_diff = ?,
                     review_cleared_at = ?,
                     review_score = ?,
                     log_schema_version = ?,
@@ -3026,6 +3044,7 @@ class SqliteTaskStore:
                     task.diff_files_changed,
                     task.diff_lines_added,
                     task.diff_lines_removed,
+                    1 if task.changed_diff else (0 if task.changed_diff is False else None),
                     task.review_cleared_at.isoformat() if task.review_cleared_at else None,
                     task.review_score,
                     task.log_schema_version,
@@ -4528,6 +4547,14 @@ class SqliteTaskStore:
                 (self._project_id, task_id),
             )
 
+    def set_rebase_changed_diff(self, task_id: str, changed_diff: bool) -> None:
+        """Persist the completed rebase diff-change signal."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET changed_diff = ? WHERE project_id = ? AND id = ?",
+                (1 if changed_diff else 0, self._project_id, task_id),
+            )
+
     def set_log_schema_version(self, task_id: str, version: int) -> None:
         """Set the persisted log schema marker for a task/run."""
         with self._connect() as conn:
@@ -5393,6 +5420,7 @@ class SqliteTaskStore:
         diff_files_changed: int | None = None,
         diff_lines_added: int | None = None,
         diff_lines_removed: int | None = None,
+        changed_diff: bool | None | object = DB_UNSET,
         head_sha: str | None | object = DB_UNSET,
         base_sha: str | None | object = DB_UNSET,
         completion_reason: str | None = None,
@@ -5426,6 +5454,8 @@ class SqliteTaskStore:
         task.diff_files_changed = diff_files_changed
         task.diff_lines_added = diff_lines_added
         task.diff_lines_removed = diff_lines_removed
+        if changed_diff is not DB_UNSET:
+            task.changed_diff = cast("bool | None", changed_diff)
         self.update(task)
         if has_commits and task.branch and task.id is not None and self.supports_merge_units():
             unit = self.get_or_create_merge_unit_for_task(task)
@@ -5881,7 +5911,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "pr_last_synced_at", "sync_last_synced_at", "model", "provider",
         "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
         "merge_status", "merged_at", "failure_reason", "completion_reason", "skip_learnings", "diff_files_changed", "diff_lines_added",
-        "diff_lines_removed", "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
+        "diff_lines_removed", "changed_diff", "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
         "recovery_origin",
     )
     task_import_columns_sql = ", ".join(f'"{c}"' if c == "group" else c for c in task_import_columns)
@@ -5891,6 +5921,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "pr_last_synced_at": "NULL",
         "sync_last_synced_at": "NULL",
         "completion_reason": "NULL",
+        "changed_diff": "NULL",
         "recovery_origin": "NULL",
     }
     project_id, project_prefix = _project_identity_from_config(config)
@@ -6420,6 +6451,7 @@ def _task_to_dict(task: "Task") -> dict:
         "diff_files_changed": task.diff_files_changed,
         "diff_lines_added": task.diff_lines_added,
         "diff_lines_removed": task.diff_lines_removed,
+        "changed_diff": task.changed_diff,
         "review_cleared_at": task.review_cleared_at.isoformat() if task.review_cleared_at else None,
         "review_score": task.review_score,
         "log_schema_version": task.log_schema_version,
@@ -6706,6 +6738,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                 diff_files_changed INTEGER,
                 diff_lines_added INTEGER,
                 diff_lines_removed INTEGER,
+                changed_diff INTEGER,
                 review_cleared_at TEXT,
                 log_schema_version INTEGER DEFAULT 1,
                 cycle_id INTEGER,
@@ -6733,11 +6766,11 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                     "group", depends_on, spec, create_review, create_pr, same_branch, task_type_hint,
                     output_content, session_id, pr_number, model, provider, provider_is_explicit, recovery_origin,
                     input_tokens, output_tokens, merge_status, merged_at, failure_reason, completion_reason,
-                    skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
+                    skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed, changed_diff,
                     review_cleared_at, log_schema_version, cycle_id, cycle_iteration_index,
                     cycle_role
                 ) VALUES (
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
                 )
                 """,
                 (
@@ -6778,6 +6811,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                     row["diff_files_changed"] if "diff_files_changed" in row.keys() else None,
                     row["diff_lines_added"] if "diff_lines_added" in row.keys() else None,
                     row["diff_lines_removed"] if "diff_lines_removed" in row.keys() else None,
+                    row["changed_diff"] if "changed_diff" in row.keys() else None,
                     row["review_cleared_at"] if "review_cleared_at" in row.keys() else None,
                     row["log_schema_version"] if "log_schema_version" in row.keys() else 1,
                     row["cycle_id"] if "cycle_id" in row.keys() else None,
@@ -7284,6 +7318,7 @@ def run_v27_migration(db_path: Path) -> None:
                 diff_files_changed INTEGER,
                 diff_lines_added INTEGER,
                 diff_lines_removed INTEGER,
+                changed_diff INTEGER,
                 review_cleared_at TEXT,
                 log_schema_version INTEGER DEFAULT 1
             )
@@ -7302,7 +7337,7 @@ def run_v27_migration(db_path: Path) -> None:
                 output_content, session_id, pr_number, model, provider,
                 provider_is_explicit, recovery_origin, input_tokens, output_tokens, merge_status,
                 merged_at, failure_reason, completion_reason, skip_learnings, diff_files_changed,
-                diff_lines_added, diff_lines_removed, review_cleared_at, log_schema_version
+                diff_lines_added, diff_lines_removed, changed_diff, review_cleared_at, log_schema_version
             )
             SELECT
                 id, prompt, status, task_type, slug, branch, log_file, report_file,
@@ -7314,7 +7349,7 @@ def run_v27_migration(db_path: Path) -> None:
                 output_content, session_id, pr_number, model, provider,
                 provider_is_explicit, NULL AS recovery_origin, input_tokens, output_tokens, merge_status,
                 merged_at, failure_reason, NULL AS completion_reason, skip_learnings, diff_files_changed,
-                diff_lines_added, diff_lines_removed, review_cleared_at, log_schema_version
+                diff_lines_added, diff_lines_removed, NULL AS changed_diff, review_cleared_at, log_schema_version
             FROM tasks
         """)
 

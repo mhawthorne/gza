@@ -40,6 +40,7 @@ from ..pickup import (
     is_worker_consuming_advance_action,
 )
 from ..pr_ops import build_task_pr_content, ensure_task_pr
+from ..rebase_diff import capture_rebase_diff_baseline, compute_rebase_changed_diff
 from ..rebase_validation import (
     capture_rebase_validation_baseline,
     is_rebase_in_progress as _shared_is_rebase_in_progress,
@@ -1127,6 +1128,11 @@ def _run_task_backed_rebase(
         return 1
 
     worktree_git = Git(worktree_path)
+    rebase_diff_baseline = capture_rebase_diff_baseline(
+        worktree_git,
+        branch=branch,
+        target=rebase_target,
+    )
 
     try:
         logger.command(f"Rebasing '{branch}' onto '{rebase_target}'...")
@@ -1180,18 +1186,27 @@ def _run_task_backed_rebase(
         for warning in (head_ref.warning, base_ref.warning):
             if warning:
                 logger.warning(warning)
+        comparison = compute_rebase_changed_diff(
+            worktree_git,
+            baseline=rebase_diff_baseline,
+            branch=branch,
+            target=rebase_target,
+        )
+        if comparison.warning:
+            logger.warning(comparison.warning)
         store.mark_completed(
             rebase_task,
             branch=branch,
             log_file=log_file_storage,
             output_content=output_content,
             has_commits=has_commits,
+            changed_diff=comparison.changed_diff,
             head_sha=head_ref.sha if head_ref.sha is not None else DB_UNSET,
             base_sha=base_ref.sha if base_ref.sha is not None else DB_UNSET,
         )
 
         target_parent_id = parent_task_id or rebase_task.based_on
-        if target_parent_id:
+        if target_parent_id and comparison.changed_diff:
             store.invalidate_review_state(target_parent_id)
             parent = store.get(target_parent_id)
             if parent and parent.id is not None and _task_merge_unit_state(
@@ -1200,6 +1215,8 @@ def _run_task_backed_rebase(
                 target_branch=rebase_target,
             ) == "merged":
                 store.set_merge_status(parent.id, "unmerged")
+
+        logger.info(f"Changed Diff: {comparison.detail}")
 
         if resolved_by_provider:
             logger.info(f"✓ Successfully rebased {branch} with provider assistance")

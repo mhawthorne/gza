@@ -101,7 +101,12 @@ from ._common import (
     resolve_id,
     validate_cli_tag_values,
 )
-from .advance_engine import classify_advance_action, determine_next_action, format_needs_attention_lifecycle
+from .advance_engine import (
+    classify_advance_action,
+    determine_next_action,
+    format_needs_attention_lifecycle,
+    resolve_advance_context,
+)
 
 _LINEAGE_REL_LABELS = _QUERY_LINEAGE_REL_LABELS
 _QueryDateField = Literal["created", "completed", "effective"]
@@ -194,6 +199,37 @@ class _LifecycleSummary:
 
 def _with_recovered_lifecycle_prefix(detail: str, *, recovered: bool, severity: _LifecycleSeverity) -> _LifecycleSummary:
     return _LifecycleSummary(f"recovered, {detail}" if recovered else detail, severity)
+
+
+def _format_changed_diff_label(changed_diff: bool | None) -> str:
+    if changed_diff is False:
+        return "no"
+    if changed_diff is True:
+        return "yes"
+    return "unknown (treated as yes)"
+
+
+def _implementation_review_rebase_detail(
+    task: DbTask,
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+) -> str | None:
+    if task.task_type != "implement" or not task.branch:
+        return None
+    try:
+        git = Git(config.project_dir)
+        target_branch = git.default_branch()
+        ctx = resolve_advance_context(config, store, git, task, target_branch)
+    except (GitError, OSError, ValueError):
+        return None
+
+    if ctx.review_preserved_by_rebase is not None and ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}:
+        return f"{ctx.review_verdict} (carried across rebase {ctx.review_preserved_by_rebase.id})"
+    if ctx.review_invalidated_by_rebase is not None:
+        reason = "diff changed" if ctx.review_invalidated_by_rebase.changed_diff is True else "change unknown"
+        return f"invalidated by rebase {ctx.review_invalidated_by_rebase.id} ({reason})"
+    return None
 
 
 def _resolve_show_lifecycle_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
@@ -3133,6 +3169,11 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Failure Reason:[/{c['label']}] [{c['value']}]{task.failure_reason}[/{c['value']}]")
     if task.completion_reason:
         console.print(f"[{c['label']}]Completion Reason:[/{c['label']}] [{c['value']}]{task.completion_reason}[/{c['value']}]")
+    if task.task_type == "rebase":
+        console.print(
+            f"[{c['label']}]Changed Diff:[/{c['label']}] "
+            f"[{c['value']}]{_format_changed_diff_label(task.changed_diff)}[/{c['value']}]"
+        )
     if task.merge_status and task_owns_merge_status(task):
         console.print(f"[{c['label']}]Merge Status:[/{c['label']}] [{c['value']}]{task.merge_status}[/{c['value']}]")
     console.print(f"[{c['label']}]Type:[/{c['label']}] [{c['value']}]{task.task_type}[/{c['value']}]")
@@ -3156,6 +3197,9 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Tags:[/{c['label']}] [{c['value']}]{', '.join(task.tags)}[/{c['value']}]")
     if task.spec:
         console.print(f"[{c['label']}]Spec:[/{c['label']}] [{c['value']}]{task.spec}[/{c['value']}]")
+    review_rebase_detail = _implementation_review_rebase_detail(task, config=config, store=store)
+    if review_rebase_detail is not None:
+        console.print(f"[{c['label']}]Review:[/{c['label']}] [{c['value']}]{review_rebase_detail}[/{c['value']}]")
     if task.skip_learnings:
         console.print(f"[{c['label']}]Skip Learnings:[/{c['label']}] [green]yes[/green]")
     if task.branch:

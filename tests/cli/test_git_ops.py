@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 from gza.cli.git_ops import _merge_single_task, _run_task_backed_rebase, cmd_advance
 from gza.config import Config
 from gza.git import Git
+from gza.rebase_diff import RebaseDiffResult
 
 from .conftest import make_store, run_gza, setup_config
 
@@ -148,6 +149,112 @@ def test_run_task_backed_rebase_surfaces_resolution_warnings_and_preserves_exist
     output = capsys.readouterr()
     assert "unexpected error resolving ref 'feature/rebased': boom" in output.err
     assert "unexpected error resolving ref 'main': boom" in output.err
+
+
+def test_run_task_backed_rebase_preserves_review_state_when_diff_is_unchanged(tmp_path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    parent.review_cleared_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
+    assert parent.id is not None
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.return_value = None
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/rebased": "head-new",
+        "main": "base-new",
+    }.get(ref)
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+        patch(
+            "gza.cli.git_ops.compute_rebase_changed_diff",
+            return_value=RebaseDiffResult(changed_diff=False, detail="no (review can be preserved)"),
+        ),
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 0
+    refreshed_parent = store.get(parent.id)
+    assert refreshed_parent is not None
+    assert refreshed_parent.review_cleared_at == parent.review_cleared_at
+    refreshed_rebase = store.get(rebase_task.id)
+    assert refreshed_rebase is not None
+    assert refreshed_rebase.changed_diff is False
+
+
+def test_run_task_backed_rebase_invalidates_review_state_when_diff_changes(tmp_path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    parent.review_cleared_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
+    assert parent.id is not None
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.return_value = None
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/rebased": "head-new",
+        "main": "base-new",
+    }.get(ref)
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+        patch(
+            "gza.cli.git_ops.compute_rebase_changed_diff",
+            return_value=RebaseDiffResult(changed_diff=True, detail="yes (review must be refreshed)"),
+        ),
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 0
+    refreshed_parent = store.get(parent.id)
+    assert refreshed_parent is not None
+    assert refreshed_parent.review_cleared_at is None
+    refreshed_rebase = store.get(rebase_task.id)
+    assert refreshed_rebase is not None
+    assert refreshed_rebase.changed_diff is True
 
 
 def test_advance_explicit_merge_refuses_when_checkout_does_not_match_canonical_target(

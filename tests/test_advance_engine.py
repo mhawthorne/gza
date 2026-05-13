@@ -139,6 +139,120 @@ def test_evaluate_runs_pending_review_when_no_in_progress_exists(tmp_path: Path)
     assert action["review_task"].id == pending.id
 
 
+def test_rebase_after_review_with_unchanged_diff_preserves_approved_review(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    task.branch = "feature/rebase-preserved"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", based_on=task.id, depends_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    store.update(review)
+
+    rebase = store.add(f"Rebase {task.id}", task_type="rebase", based_on=task.id, same_branch=True)
+    rebase.status = "completed"
+    rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    rebase.branch = task.branch
+    rebase.changed_diff = False
+    store.update(rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    assert action["type"] == "merge"
+    assert action["description"] == f"Merge (review APPROVED, preserved across rebase {rebase.id})"
+
+
+def test_rebase_after_review_with_changed_diff_requires_fresh_review(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    task.branch = "feature/rebase-changed"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", based_on=task.id, depends_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    store.update(review)
+
+    rebase = store.add(f"Rebase {task.id}", task_type="rebase", based_on=task.id, same_branch=True)
+    rebase.status = "completed"
+    rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    rebase.branch = task.branch
+    rebase.changed_diff = True
+    store.update(rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    assert action["type"] == "create_review"
+    assert action["description"] == f"Create review (rebase {rebase.id} changed diff)"
+
+
+def test_rebase_after_review_with_unknown_diff_requires_fresh_review(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    task.branch = "feature/rebase-unknown"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", based_on=task.id, depends_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    store.update(review)
+
+    rebase = store.add(f"Rebase {task.id}", task_type="rebase", based_on=task.id, same_branch=True)
+    rebase.status = "completed"
+    rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    rebase.branch = task.branch
+    rebase.changed_diff = None
+    store.update(rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    assert action["type"] == "create_review"
+    assert action["description"] == f"Create review (rebase {rebase.id} change unknown)"
+
+
 def test_evaluate_resumes_timeout_retry_descendant_once(tmp_path: Path):
     (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
     config = Config.load(tmp_path)

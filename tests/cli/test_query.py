@@ -18,6 +18,7 @@ from gza.console import truncate
 from gza.db import Task
 from gza.git import GitError
 from gza.pr_ops import LookupTaskPrResult
+from gza.review_verdict import ParsedReviewReport
 from gza.sync_ops import BranchSyncResult
 
 from .conftest import (
@@ -3785,6 +3786,175 @@ class TestShowCommand:
         assert f"Lifecycle: recovered, review in_progress ({review.id})" not in output
         assert "implement task already exists for this plan" not in output
         assert "lifecycle unavailable" not in output
+
+    @pytest.mark.parametrize(
+        ("changed_diff", "expected"),
+        [
+            (False, "Changed Diff: no"),
+            (True, "Changed Diff: yes"),
+            (None, "Changed Diff: unknown (treated as yes)"),
+        ],
+    )
+    def test_show_rebase_renders_changed_diff_states(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        changed_diff: bool | None,
+        expected: str,
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        rebase = store.add("Rebase feature", task_type="rebase")
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        rebase.branch = "feature/rebase-show"
+        rebase.changed_diff = changed_diff
+        store.update(rebase)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(rebase.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert expected in output
+
+    def test_show_implement_renders_review_carried_across_rebase(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gza import advance_engine as advance_engine_module
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement feature", task_type="implement")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        task.branch = "feature/review-preserved-show"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        review = store.add(f"Review {task.id}", task_type="review", based_on=task.id, depends_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        store.update(review)
+
+        rebase = store.add(f"Rebase {task.id}", task_type="rebase", based_on=task.id, same_branch=True)
+        rebase.status = "completed"
+        rebase.completed_at = datetime(2026, 5, 4, 10, 20, 0, tzinfo=UTC)
+        rebase.branch = task.branch
+        rebase.changed_diff = False
+        store.update(rebase)
+
+        monkeypatch.setattr(
+            advance_engine_module,
+            "get_review_report",
+            lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+        )
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(task.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert f"Review: APPROVED (carried across rebase {rebase.id})" in output
+
+    def test_show_implement_renders_review_invalidated_by_rebase(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gza import advance_engine as advance_engine_module
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement feature", task_type="implement")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        task.branch = "feature/review-invalidated-show"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        review = store.add(f"Review {task.id}", task_type="review", based_on=task.id, depends_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        store.update(review)
+
+        rebase = store.add(f"Rebase {task.id}", task_type="rebase", based_on=task.id, same_branch=True)
+        rebase.status = "completed"
+        rebase.completed_at = datetime(2026, 5, 4, 10, 20, 0, tzinfo=UTC)
+        rebase.branch = task.branch
+        rebase.changed_diff = True
+        store.update(rebase)
+
+        monkeypatch.setattr(
+            advance_engine_module,
+            "get_review_report",
+            lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+        )
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(task.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert f"Review: invalidated by rebase {rebase.id} (diff changed)" in output
 
     def test_show_changes_requested_lifecycle_reports_active_improve_id(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

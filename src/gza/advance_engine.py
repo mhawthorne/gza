@@ -54,7 +54,10 @@ class AdvanceContext:
     can_merge: bool = True
     rebase_pending_or_running: DbTask | None = None
     rebase_failed: DbTask | None = None
+    latest_completed_rebase: DbTask | None = None
     rebase_invalidates_review: bool = False
+    review_preserved_by_rebase: DbTask | None = None
+    review_invalidated_by_rebase: DbTask | None = None
 
     reviews: list[DbTask] | None = None
     active_review: DbTask | None = None
@@ -108,6 +111,33 @@ def _task_id(task: DbTask | None) -> str:
     if task is None or task.id is None:
         return "unknown"
     return task.id
+
+
+def _rebase_change_reason(rebase_task: DbTask | None) -> str:
+    if rebase_task is None or rebase_task.changed_diff is True:
+        return "changed diff"
+    return "change unknown"
+
+
+def _rebase_create_review_description(rebase_task: DbTask | None) -> str:
+    task_id = _task_id(rebase_task)
+    if rebase_task is not None and rebase_task.changed_diff is None:
+        return f"Create review (rebase {task_id} change unknown)"
+    return f"Create review (rebase {task_id} changed diff)"
+
+
+def _rebase_pending_review_description(review_task: DbTask | None, rebase_task: DbTask | None) -> str:
+    return f"Run pending review {_task_id(review_task)} (rebase {_task_id(rebase_task)} {_rebase_change_reason(rebase_task)})"
+
+
+def _rebase_wait_review_description(review_task: DbTask | None, rebase_task: DbTask | None) -> str:
+    return f"SKIP: review {_task_id(review_task)} in progress (rebase {_task_id(rebase_task)} {_rebase_change_reason(rebase_task)})"
+
+
+def _merge_review_description(verdict: str, preserved_rebase: DbTask | None) -> str:
+    if preserved_rebase is None:
+        return f"Merge (review {verdict})"
+    return f"Merge (review {verdict}, preserved across rebase {_task_id(preserved_rebase)})"
 
 
 def _failed_task_skip_action(ctx: AdvanceContext) -> dict[str, Any]:
@@ -580,13 +610,20 @@ def resolve_advance_context(
 ) = _resolve_review_state(config, store, task)
 
     rebase_invalidates_review = False
+    review_preserved_by_rebase: DbTask | None = None
+    review_invalidated_by_rebase: DbTask | None = None
     if (
         latest_completed_rebase is not None
         and latest_completed_review is not None
         and latest_completed_rebase.completed_at is not None
         and latest_completed_review.completed_at is not None
+        and latest_completed_rebase.completed_at > latest_completed_review.completed_at
     ):
-        rebase_invalidates_review = latest_completed_rebase.completed_at > latest_completed_review.completed_at
+        if latest_completed_rebase.changed_diff is False:
+            review_preserved_by_rebase = latest_completed_rebase
+        else:
+            rebase_invalidates_review = True
+            review_invalidated_by_rebase = latest_completed_rebase
 
     return AdvanceContext(
         task=task,
@@ -601,7 +638,10 @@ def resolve_advance_context(
         can_merge=can_merge,
         rebase_pending_or_running=rebase_pending_or_running,
         rebase_failed=rebase_failed,
+        latest_completed_rebase=latest_completed_rebase,
         rebase_invalidates_review=rebase_invalidates_review,
+        review_preserved_by_rebase=review_preserved_by_rebase,
+        review_invalidated_by_rebase=review_invalidated_by_rebase,
         reviews=reviews,
         active_review=active_review,
         latest_completed_review=latest_completed_review,
@@ -682,7 +722,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         matches=lambda ctx: ctx.rebase_invalidates_review and ctx.active_review is not None and ctx.active_review.status == "pending",
         action=lambda ctx: {
             "type": "run_review",
-            "description": f"Run pending review {_task_id(ctx.active_review)} (post-rebase)",
+            "description": _rebase_pending_review_description(ctx.active_review, ctx.review_invalidated_by_rebase),
             "review_task": ctx.active_review,
         },
     ),
@@ -691,14 +731,14 @@ ADVANCE_RULES: list[AdvanceRule] = [
         matches=lambda ctx: ctx.rebase_invalidates_review and ctx.active_review is not None and ctx.active_review.status == "in_progress",
         action=lambda ctx: {
             "type": "wait_review",
-            "description": f"SKIP: review {_task_id(ctx.active_review)} in progress (post-rebase)",
+            "description": _rebase_wait_review_description(ctx.active_review, ctx.review_invalidated_by_rebase),
             "review_task": ctx.active_review,
         },
     ),
     AdvanceRule(
         name="post_rebase_create_review",
         matches=lambda ctx: ctx.rebase_invalidates_review,
-        action=lambda ctx: {"type": "create_review", "description": "Create review (code changed by rebase since last review)"},
+        action=lambda ctx: {"type": "create_review", "description": _rebase_create_review_description(ctx.review_invalidated_by_rebase)},
     ),
     AdvanceRule(
         name="closing_review_invariant",
@@ -779,7 +819,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         and bool(ctx.followup_findings),
         action=lambda ctx: {
             "type": "merge_with_followups",
-            "description": "Merge (review APPROVED_WITH_FOLLOWUPS)",
+            "description": _merge_review_description("APPROVED_WITH_FOLLOWUPS", ctx.review_preserved_by_rebase),
             "review_task": ctx.latest_completed_review,
             "followup_findings": ctx.followup_findings,
         },
@@ -789,7 +829,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         matches=lambda ctx: (not ctx.review_cleared) and ctx.latest_completed_review is not None and ctx.review_verdict == "APPROVED",
         action=lambda ctx: {
             "type": "merge",
-            "description": "Merge (review APPROVED)",
+            "description": _merge_review_description("APPROVED", ctx.review_preserved_by_rebase),
             "review_task": ctx.latest_completed_review,
         },
     ),

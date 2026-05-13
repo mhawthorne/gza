@@ -62,6 +62,11 @@ from .prompt_sanitization import sanitize_provider_prompt
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .providers.base import PreflightCheckResult
+from .rebase_diff import (
+    RebaseDiffBaseline,
+    capture_rebase_diff_baseline,
+    compute_rebase_changed_diff,
+)
 from .rebase_validation import (
     RuffDiagnostic,
     capture_rebase_validation_baseline,
@@ -3371,6 +3376,7 @@ def _complete_code_task(
     fix_commits_ahead_before_run: int | None = None,
     fix_default_branch: str | None = None,
     seeded_paths: set[str] | None = None,
+    rebase_diff_baseline: RebaseDiffBaseline | None = None,
 ) -> int:
     """Handle successful code-task completion (staging, commit, completion state, output).
 
@@ -3589,6 +3595,7 @@ def _complete_code_task(
         fix_commits_ahead_before_run=fix_commits_ahead_before_run,
         fix_default_branch=fix_default_branch,
         fix_was_merged_before_run=fix_was_merged_before_run,
+        rebase_diff_baseline=rebase_diff_baseline,
     )
 
 
@@ -3604,6 +3611,7 @@ def _post_complete_code_task(
     fix_commits_ahead_before_run: int | None = None,
     fix_default_branch: str | None = None,
     fix_was_merged_before_run: bool = False,
+    rebase_diff_baseline: RebaseDiffBaseline | None = None,
 ) -> int:
     """Run shared post-completion side effects for completed code tasks."""
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
@@ -3642,10 +3650,29 @@ def _post_complete_code_task(
                 created_on_or_before=task.created_at,
             )
 
-    # Invalidate review state after rebase completes, since conflict resolution
-    # may have introduced changes not covered by prior reviews.
+    rebase_changed_diff: bool | None = None
+    # Invalidate review state after rebase completes only when the patch changed
+    # or equivalence could not be proven.
     if task.task_type == "rebase" and task.based_on:
-        store.invalidate_review_state(task.based_on)
+        comparison = compute_rebase_changed_diff(
+            worktree_git,
+            baseline=(
+                rebase_diff_baseline
+                if rebase_diff_baseline is not None
+                else RebaseDiffBaseline(old_tip=None, target_at_start=None, merge_base_at_start=None, recovered=True)
+            ),
+            branch=branch_name,
+            target=target_branch if target_branch is not None else worktree_git.default_branch(),
+        )
+        rebase_changed_diff = comparison.changed_diff
+        assert task.id is not None
+        store.set_rebase_changed_diff(task.id, comparison.changed_diff)
+        task.changed_diff = comparison.changed_diff
+        if comparison.warning:
+            logger.warning(comparison.warning)
+            console.print(f"[yellow]Warning: {comparison.warning}[/yellow]")
+        if comparison.changed_diff:
+            store.invalidate_review_state(task.based_on)
         parent = store.get(task.based_on)
         parent_unit = (
             store.resolve_merge_unit_for_task(parent.id) if parent and parent.id is not None else None
@@ -3677,6 +3704,9 @@ def _post_complete_code_task(
                 _create_fix_follow_up_review_task(task, store)
 
     console.print("")
+    if task.task_type == "rebase" and rebase_changed_diff is not None:
+        changed_diff_text = "yes (review must be refreshed)" if rebase_changed_diff else "no (review can be preserved)"
+        console.print(f"Changed Diff: {changed_diff_text}")
     task_footer(
         task,
         stats,
@@ -4166,9 +4196,15 @@ def _run_inner(
     pre_run_status = worktree_git.status_porcelain()
     task_logger = TaskExecutionLogger(resolve_ops_log_path(config, log_file), echo=True)
     rebase_validation_state: tuple[str, set[RuffDiagnostic]] | None = None
+    rebase_diff_baseline: RebaseDiffBaseline | None = None
     if task.task_type == "rebase":
         try:
             rebase_validation_state = capture_rebase_validation_baseline(worktree_git)
+            rebase_diff_baseline = capture_rebase_diff_baseline(
+                worktree_git,
+                branch=branch_name,
+                target=default_branch,
+            )
         except RuntimeError as exc:
             task_logger.error(f"Pre-rebase ruff validation failed to run: {exc}")
             _save_wip_changes(task, worktree_git, config, branch_name)
@@ -4305,6 +4341,7 @@ def _run_inner(
             fix_commits_ahead_before_run=fix_commits_ahead_before_run,
             fix_default_branch=fix_default_branch,
             seeded_paths=seeded_paths,
+            rebase_diff_baseline=rebase_diff_baseline,
         )
 
     except GitError as e:

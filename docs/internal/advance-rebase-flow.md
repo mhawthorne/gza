@@ -29,6 +29,10 @@ Rebase tasks go through the **code task path** in `runner.py:_run_inner` (not th
 - Reject provider `exit_code=0` if git still reports `rebase-merge` or `rebase-apply`, then validate the Python files changed by the provider-backed resolution against the pre-resolve `ruff` baseline before accepting success
 - On completion, `skip_commit=True` is set (rebase tasks don't need runner commits)
 - After completion, the host runner force-pushes the rebased branch (`git push --force-with-lease`)
+- On successful completion, the runner also computes and persists `changed_diff` on the rebase task:
+  - `0` means the normalized implementation patch before and after the rebase is identical, so prior review evidence may be preserved
+  - `1` means the patch changed or equivalence could not be proven, so prior review evidence must be refreshed
+  - legacy `NULL` values are treated conservatively as changed
 
 ## Docker considerations
 
@@ -52,7 +56,17 @@ Existing orphan recovery branches created before this behavior was fixed are lef
 4. If conflicts arise, the rebase is aborted and `invoke_provider_resolve` runs the provider (Claude) inside the same worktree via `/gza-rebase --auto`.
 5. Before treating that provider run as success, the host first rejects any still-active `rebase-merge` or `rebase-apply` state, then compares `ruff check --select F401,F821` diagnostics on the provider-touched Python files against the pre-resolve baseline. If unfinished rebase metadata or new undefined-name / unused-import errors appear, the rebase task fails instead of continuing silently.
 6. On success, the rebased branch is force-pushed from the worktree.
-7. The worktree is removed on all exit paths (success, failure, exception) via a `try/finally` block.
+7. The completed rebase row persists the same `changed_diff` signal used by runner-owned rebase tasks, and review invalidation only happens when that signal is not `False`.
+8. The worktree is removed on all exit paths (success, failure, exception) via a `try/finally` block.
+
+## Review invalidation after rebase
+
+`gza advance`, `gza watch`, and `gza show` no longer treat every later completed rebase as invalidating review evidence. They now look at both:
+
+1. whether the rebase completed after the latest completed review
+2. whether the rebase task's persisted `changed_diff` signal is not `False`
+
+If the latest completed rebase after the latest review has `changed_diff = 0`, the prior approved review is carried across that rebase. If `changed_diff = 1` or `NULL`, lifecycle behavior stays conservative and requires a fresh review.
 
 The `--resolve` and `--force` flags are accepted for backward compatibility but are no-ops — conflict resolution is always attempted automatically, and existing worktrees are always force-removed before creating a fresh one.
 
