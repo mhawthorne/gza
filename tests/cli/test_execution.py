@@ -7622,6 +7622,7 @@ class TestIterateCommand:
         captured = capsys.readouterr()
         assert rc == 1
         assert f"Error: failed to initialize iterate background preflight for task {impl.id}: branch boom" in captured.err
+        assert "could not evaluate iterate background preflight" not in captured.err
         assert "started iterate worker" not in captured.out.lower()
         assert store.get_reviews_for_task(impl.id) == []
         assert store.get_based_on_children(impl.id) == []
@@ -10761,6 +10762,7 @@ class TestIterateCommand:
 
         assert result == 1
         assert f"Error: failed to initialize iterate background preflight for task {impl.id}: branch boom" in captured.err
+        assert "could not evaluate iterate background preflight" not in captured.err
         assert store.get_based_on_children(failed_resume.id) == []
         assert store.get_reviews_for_task(impl.id) == [review]
         logs_dir = tmp_path / ".gza" / "logs"

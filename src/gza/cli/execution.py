@@ -2518,23 +2518,25 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
 
     def _prepare_iterate_background_preflight_context(
         iterate_task: DbTask,
-    ) -> _IterateBackgroundPreflightContext | None:
+    ) -> tuple[_IterateBackgroundPreflightContext | None, int | None]:
         if iterate_task.status != "completed":
-            return None
+            return None, None
         try:
             git_runtime: Any = Git(config.project_dir)
             target_branch = git_runtime.current_branch()
         except Exception as exc:
             task_label = iterate_task.id or "<unknown>"
-            print(
-                "Warning: could not evaluate iterate background preflight "
-                f"for task {task_label} before handoff: {exc}",
-                file=sys.stderr,
+            print_phase1_message(
+                args,
+                f"Error: failed to initialize iterate background preflight for task {task_label}: {exc}",
             )
-            return None
-        return _IterateBackgroundPreflightContext(
-            git_runtime=git_runtime,
-            target_branch=target_branch,
+            return None, 1
+        return (
+            _IterateBackgroundPreflightContext(
+                git_runtime=git_runtime,
+                target_branch=target_branch,
+            ),
+            None,
         )
 
     def _warn_manual_background_iterate_override_if_needed(
@@ -2780,6 +2782,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
 
     def _prepare_background_iterate_start(
         iterate_task: DbTask,
+        preflight_context: _IterateBackgroundPreflightContext | None,
     ) -> tuple[_PreparedIterateStart | None, int | None]:
         if dry_run:
             return None, None
@@ -2800,14 +2803,11 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 None,
             )
         if iterate_task.status == "completed":
-            try:
-                git_runtime: Any = Git(config.project_dir)
-                target_branch = git_runtime.current_branch()
-            except Exception as exc:
+            if preflight_context is None:
                 task_label = iterate_task.id or "<unknown>"
                 print_phase1_message(
                     args,
-                    f"Error: failed to initialize iterate background preflight for task {task_label}: {exc}",
+                    f"Error: missing iterate background preflight context for task {task_label}.",
                 )
                 return None, 1
 
@@ -2815,9 +2815,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 initial_action = determine_next_action(
                     config,
                     store,
-                    git_runtime,
+                    preflight_context.git_runtime,
                     iterate_task,
-                    target_branch,
+                    preflight_context.target_branch,
                     max_resume_attempts=effective_max_resume_attempts,
                 )
             except Exception as exc:
@@ -2883,7 +2883,12 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 if not iterate_task.branch:
                     return None, None
                 assert iterate_task.id is not None
-                action_task = _create_rebase_task(store, iterate_task.id, iterate_task.branch, target_branch)
+                action_task = _create_rebase_task(
+                    store,
+                    iterate_task.id,
+                    iterate_task.branch,
+                    preflight_context.target_branch,
+                )
                 prepared_task = _prepare_task_for_immediate_execution(
                     config,
                     action_task,
@@ -3079,7 +3084,11 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
 
     # Handle background mode: re-exec this command as a detached process.
     if background:
-        background_preflight_context = _prepare_iterate_background_preflight_context(impl_task)
+        background_preflight_context, background_preflight_rc = (
+            _prepare_iterate_background_preflight_context(impl_task)
+        )
+        if background_preflight_rc is not None:
+            return background_preflight_rc
         preflight_result = _maybe_surface_background_iterate_preflight_decision(
             impl_task,
             background_preflight_context,
@@ -3088,6 +3097,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             return preflight_result
         prepared_background_start, background_prepare_rc = _prepare_background_iterate_start(
             impl_task,
+            background_preflight_context,
         )
         if background_prepare_rc is not None:
             return background_prepare_rc
