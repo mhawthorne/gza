@@ -671,6 +671,7 @@ class TestHelpOutput:
             result = run_gza(*argv, "--project", str(tmp_path))
             assert result.returncode == 2
             assert "invalid choice" in result.stderr
+            assert "is not a gza command" not in result.stderr
 
     def test_retired_tag_alias_flag_is_rejected_on_all_former_cli_surfaces(self, tmp_path):
         """All retired group-flag spellings should fail in argparse."""
@@ -693,6 +694,7 @@ class TestHelpOutput:
             result = run_gza(*argv, "--project", str(tmp_path))
             assert result.returncode == 2
             assert f"unrecognized arguments: {legacy_flag}" in result.stderr
+            assert "invalid choice" not in result.stderr
 
     def test_search_command_help_mentions_prompt_substring_scope(self, tmp_path):
         """`search --help` should describe prompt-only substring matching."""

@@ -2564,32 +2564,31 @@ def _failure_next_steps(task: DbTask, reason: str, *, config: Config | None = No
 
 
 class GzaArgumentParser(argparse.ArgumentParser):
-    """ArgumentParser that prints a terse git-style error for unknown subcommands."""
+    """ArgumentParser with compact unknown-command errors and generic flag fallback."""
 
     _INVALID_CHOICE_RE = re.compile(
-        r"argument (?:command|\{[^}]+\}): invalid choice: ['\"]?(?P<cmd>[^'\"\s]+)['\"]?"
+        r"argument (?:[\w-]+|\{[^}]+\}): invalid choice: ['\"]?(?P<cmd>[^'\"\s]+)['\"]?"
     )
 
     def error(self, message: str) -> NoReturn:
-        legacy_tag_alias_flag = "--" + "group"
-        if (
-            message.startswith("argument queue_action: invalid choice:")
-            and legacy_tag_alias_flag in sys.argv
-        ):
-            group_index = sys.argv.index(legacy_tag_alias_flag)
-            group_value = ""
-            if group_index + 1 < len(sys.argv):
-                group_value = f" {sys.argv[group_index + 1]}"
-            super().error(f"unrecognized arguments: {legacy_tag_alias_flag}{group_value}")
         match = self._INVALID_CHOICE_RE.match(message)
         if match:
             cmd = match.group("cmd")
-            # Let retired command spellings fall back to argparse's native
-            # invalid-choice error when the exact argparse wording is the
-            # operator-facing contract.
-            if cmd == "cycle":
-                super().error(message)
-            if cmd in {"group", "groups"}:
+            if cmd in sys.argv:
+                cmd_index = sys.argv.index(cmd)
+                if cmd.startswith("-"):
+                    trailing_value = ""
+                    if cmd_index + 1 < len(sys.argv) and not sys.argv[cmd_index + 1].startswith("-"):
+                        trailing_value = f" {sys.argv[cmd_index + 1]}"
+                    super().error(f"unrecognized arguments: {cmd}{trailing_value}")
+                if cmd_index > 0:
+                    previous = sys.argv[cmd_index - 1]
+                    if previous.startswith("-"):
+                        super().error(f"unrecognized arguments: {previous} {cmd}")
+            # Plain-word invalid choices keep argparse's native wording so the
+            # user sees the full choice list. Hyphenated pseudo-commands get
+            # the terse git-style message below.
+            if cmd.isalpha():
                 super().error(message)
             self.exit(
                 2,

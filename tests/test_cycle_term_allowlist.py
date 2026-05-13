@@ -16,7 +16,6 @@ SELF_PATH = Path(__file__).resolve()
 ALLOWED_CYCLE_LINES = {
     ("docs/internal/stats-subcommands.md", "Ports the functionality of the former `bin/review-cycle-stats.py` script into the CLI. Shows per-implementation-task review iteration stats, weekly groupings, iteration-count distribution, and per-model issue counts."),
     ("docs/internal/stats-subcommands.md", "- `bin/review-cycle-stats.py` was removed in the same PR this subcommand was added. Use `gza stats reviews` instead."),
-    ("src/gza/cli/_common.py", '            if cmd == "cycle":'),
     ("src/gza/lineage.py", '                return None, f"{label} task {task.id} has a cycle in its based_on chain"'),
     ("src/gza/runner.py", '                "Slug override cycle detected for task #%s while walking based_on chain: "'),
     ("src/gza/runner.py", "            # Walk up the based_on chain, with cycle detection"),

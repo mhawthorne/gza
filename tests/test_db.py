@@ -525,8 +525,8 @@ class TestTaskChaining:
         count = store.count_blocked_tasks()
         assert count == 0
 
-    def test_get_groups(self, tmp_path: Path):
-        """Test get_groups returns correct group statistics."""
+    def test_get_tag_status_counts(self, tmp_path: Path):
+        """Tag status counts should come from the canonical tag API."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -541,13 +541,13 @@ class TestTaskChaining:
         task1.completed_at = datetime.now(UTC)
         store.update(task1)
 
-        groups = store.get_groups()
+        tag_counts = store.get_tag_status_counts()
 
-        assert "group-a" in groups
-        assert "group-b" in groups
-        assert groups["group-a"]["completed"] == 1
-        assert groups["group-a"]["pending"] == 1
-        assert groups["group-b"]["pending"] == 1
+        assert "group-a" in tag_counts
+        assert "group-b" in tag_counts
+        assert tag_counts["group-a"]["completed"] == 1
+        assert tag_counts["group-a"]["pending"] == 1
+        assert tag_counts["group-b"]["pending"] == 1
 
 
 class TestConnectionLifecycle:
@@ -603,8 +603,8 @@ class TestConnectionLifecycle:
 
         assert seen_pragmas == ["PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"]
 
-    def test_get_by_group(self, tmp_path: Path):
-        """Test get_by_group returns tasks in correct order."""
+    def test_get_by_tag(self, tmp_path: Path):
+        """Tag lookups should return tasks in creation order."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -613,13 +613,13 @@ class TestConnectionLifecycle:
         task2 = store.add("Second", group="test-group")
         store.add("Third", group="other-group")
 
-        tasks = store.get_by_group("test-group")
+        tasks = store.get_by_tag("test-group")
         assert len(tasks) == 2
         assert tasks[0].id == task1.id
         assert tasks[1].id == task2.id
 
-    def test_rename_group_updates_all_attached_tasks(self, tmp_path: Path):
-        """Renaming a group should update every task in that group."""
+    def test_rename_tag_updates_all_attached_tasks(self, tmp_path: Path):
+        """Renaming a tag should update every task carrying that tag."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -627,7 +627,7 @@ class TestConnectionLifecycle:
         second = store.add("Second", group="release")
         other = store.add("Other", group="backlog")
 
-        updated = store.rename_group("release", "launch")
+        updated = store.rename_tag("release", "launch")
 
         assert updated == 2
         refreshed_first = store.get(first.id)
@@ -640,8 +640,8 @@ class TestConnectionLifecycle:
         assert refreshed_second.group == "launch"
         assert refreshed_other.group == "backlog"
 
-    def test_rename_group_rejects_existing_destination_group(self, tmp_path: Path):
-        """Renaming into an existing group should fail instead of merging."""
+    def test_rename_tag_rejects_existing_destination_tag(self, tmp_path: Path):
+        """Renaming into an existing tag should fail instead of merging."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -649,7 +649,16 @@ class TestConnectionLifecycle:
         store.add("Backlog task", group="backlog")
 
         with pytest.raises(ValueError, match="already exists"):
-            store.rename_group("release", "backlog")
+            store.rename_tag("release", "backlog")
+
+    def test_group_named_tag_apis_are_removed(self, tmp_path: Path):
+        """Retired group-named tag helpers should not remain callable."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        assert not hasattr(store, "get_groups")
+        assert not hasattr(store, "get_by_group")
+        assert not hasattr(store, "rename_group")
 
     def test_next_task_after_follows_sequence_and_skips_gaps(self, tmp_path: Path):
         """next_task_after finds the next existing sequence ID, not +1 arithmetic."""

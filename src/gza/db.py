@@ -5180,12 +5180,8 @@ class SqliteTaskStore:
         """Return all known tags sorted alphabetically."""
         return tuple(self.get_tag_counts().keys())
 
-    def get_groups(self) -> dict[str, dict[str, int]]:
-        """Compatibility alias: return tag counts by status.
-
-        Returns:
-            Dict mapping tag to dict of status counts.
-        """
+    def get_tag_status_counts(self) -> dict[str, dict[str, int]]:
+        """Return status counts for every known tag."""
         if not self._query_only_supports_tags():
             return {}
         with self._connect() as conn:
@@ -5199,21 +5195,21 @@ class SqliteTaskStore:
                 """,
                 (self._project_id,),
             )
-            groups: dict[str, dict[str, int]] = {}
+            counts: dict[str, dict[str, int]] = {}
             for row in cur.fetchall():
-                group_name = row["tag"]
+                tag = row["tag"]
                 status = row["status"]
                 count = row["count"]
-                if group_name not in groups:
-                    groups[group_name] = {}
-                groups[group_name][status] = count
-            return groups
+                if tag not in counts:
+                    counts[tag] = {}
+                counts[tag][status] = count
+            return counts
 
-    def get_by_group(self, group: str) -> list[Task]:
-        """Compatibility alias: get all tasks carrying a tag."""
+    def get_by_tag(self, tag: str) -> list[Task]:
+        """Get all tasks carrying a tag."""
         if not self._query_only_supports_tags():
             return []
-        normalized = _normalize_tag(group)
+        normalized = _normalize_tag(tag)
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -5227,17 +5223,17 @@ class SqliteTaskStore:
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
-    def rename_group(self, old_group: str, new_group: str) -> int:
-        """Compatibility alias: rename a tag across all tasks.
+    def rename_tag(self, old_tag: str, new_tag: str) -> int:
+        """Rename a tag across all tasks.
 
         Returns the number of updated tasks.
 
         Raises:
-            ValueError: If either name is empty, the source group does not exist,
-                or the destination group already exists.
+            ValueError: If either name is empty, the source tag does not exist,
+                or the destination tag already exists.
         """
-        old_name = _normalize_tag(old_group)
-        new_name = _normalize_tag(new_group)
+        old_name = _normalize_tag(old_tag)
+        new_name = _normalize_tag(new_tag)
 
         with self._connect() as conn:
             existing_old = conn.execute(
@@ -5247,7 +5243,7 @@ class SqliteTaskStore:
             assert existing_old is not None
             old_count = int(existing_old["count"])
             if old_count == 0:
-                raise ValueError(f"group '{old_name}' not found")
+                raise ValueError(f"tag '{old_name}' not found")
 
             if old_name == new_name:
                 return old_count
@@ -5257,7 +5253,7 @@ class SqliteTaskStore:
                 (self._project_id, new_name),
             ).fetchone()
             if existing_new is not None:
-                raise ValueError(f"group '{new_name}' already exists")
+                raise ValueError(f"tag '{new_name}' already exists")
 
             cur = conn.execute(
                 "UPDATE task_tags SET tag = ? WHERE project_id = ? AND tag = ?",
