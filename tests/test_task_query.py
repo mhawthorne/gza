@@ -566,7 +566,6 @@ def test_lineages_incomplete_tag_filter_excludes_unrelated_owners(tmp_path: Path
 
     owners = [row.owner_task.prompt for row in result.rows if hasattr(row, "owner_task")]
     assert owners == ["Release failed"]
-
 def test_lineage_presentation_mode_renders_tree_layout(tmp_path: Path) -> None:
     store = _store(tmp_path)
     root = store.add("Lineage root owner", task_type="implement")
@@ -604,6 +603,43 @@ def test_default_projection_uses_tags_without_group_field(tmp_path: Path) -> Non
 def test_query_api_surfaces_do_not_expose_group_filters() -> None:
     assert "groups" not in {field.name for field in fields(TaskQuery)}
     assert "group" not in inspect.signature(TaskQueryPresets.queue).parameters
+
+
+def test_explicit_group_projection_returns_no_group_key_for_tasks(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.add("Release task", group="legacy-group", tags=("release",))
+
+    service = TaskQueryService(store)
+    rows = service.run(
+        TaskQuery(
+            scope="tasks",
+            limit=None,
+            projection=ProjectionSpec(fields=("group",)),
+        )
+    ).to_json()
+
+    assert rows == [{}]
+
+
+def test_explicit_group_projection_returns_no_group_key_for_lineages(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    owner = store.add("Release owner", group="legacy-group", tags=("release",))
+    owner.status = "failed"
+    owner.completed_at = datetime.now(UTC)
+    owner.failure_reason = "TEST_FAILURE"
+    store.update(owner)
+
+    service = TaskQueryService(store)
+    rows = service.run(
+        TaskQuery(
+            scope="lineages",
+            lifecycle_state=("incomplete",),
+            limit=None,
+            projection=ProjectionSpec(fields=("group",)),
+        )
+    ).to_json()
+
+    assert rows == [{}]
 
 
 def test_dependency_state_blocked_by_dropped_dep_filters_pending_only(tmp_path: Path) -> None:
