@@ -54,7 +54,7 @@ print(json.dumps({
     'impl_id': impl.id if impl else None,
     'impl_branch': impl.branch if impl else None,
     'impl_prompt': impl.prompt if impl else None,
-    'impl_group': impl.group if impl else None,
+    'impl_tags': list(impl.tags) if impl else [],
     'verify_command': config.verify_command,
     'reviews': [
         {'id': r.id, 'report_file': r.report_file, 'output_content': r.output_content, 'completed_at': str(r.completed_at)}
@@ -169,7 +169,7 @@ created = store.add(
     depends_on='<LATEST_REVIEW_ID_OR_NONE>',
     based_on='<IMPL_ID>',
     same_branch=True,
-    group='<IMPL_GROUP_OR_NONE>',
+    tags=<IMPL_TAGS>,
 )
 assert created.id is not None
 

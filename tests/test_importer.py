@@ -51,62 +51,68 @@ tasks:
         assert group is None
         assert spec is None
 
-    def test_parse_with_file_level_defaults(self, tmp_path: Path):
-        """Parse file with group and spec defaults."""
+    def test_parse_with_file_level_tag_defaults(self, tmp_path: Path):
+        """Parse file with tags and spec defaults."""
         import_file = tmp_path / "tasks.yaml"
         import_file.write_text("""
-group: my-feature
+tags:
+  - my-feature
 spec: specs/feature.md
 
 tasks:
   - prompt: "Task with defaults"
   - prompt: "Task with override"
-    group: other-group
+    tags:
+      - other-group
 """)
         tasks, group, spec, errors = parse_import_file(import_file)
 
         assert len(errors) == 0
-        assert group == "my-feature"
+        assert group is None
         assert spec == "specs/feature.md"
-        assert tasks[0].group == "my-feature"
+        assert tasks[0].tags == ("my-feature",)
         assert tasks[0].spec == "specs/feature.md"
-        assert tasks[1].group == "other-group"
+        assert tasks[1].tags == ("other-group",)
         assert tasks[1].spec == "specs/feature.md"
 
-    def test_parse_with_null_override(self, tmp_path: Path):
-        """Null can override file-level defaults."""
+    def test_parse_task_tags_override_file_level_defaults(self, tmp_path: Path):
+        """Task-level tags replace file-level default tags."""
         import_file = tmp_path / "tasks.yaml"
         import_file.write_text("""
-group: default-group
+tags:
+  - default-group
 
 tasks:
   - prompt: "Task with group"
-  - prompt: "Task without group"
-    group: null
+  - prompt: "Task with override"
+    tags:
+      - other-group
 """)
         tasks, group, spec, errors = parse_import_file(import_file)
 
         assert len(errors) == 0
-        assert tasks[0].group == "default-group"
-        assert tasks[1].group is None
+        assert group is None
+        assert spec is None
+        assert tasks[0].tags == ("default-group",)
+        assert tasks[1].tags == ("other-group",)
 
-    def test_parse_group_null_clears_inherited_group_tag(self, tmp_path: Path):
-        """Task-level `group: null` clears inherited file-level group tag."""
+    def test_parse_empty_task_tags_clear_inherited_default_tags(self, tmp_path: Path):
+        """Task-level empty tags clear inherited file-level default tags."""
         import_file = tmp_path / "tasks.yaml"
         import_file.write_text("""
-group: rel-1
 tags:
   - core
+  - rel-1
 tasks:
   - prompt: "inherits defaults"
-  - prompt: "clears group default"
-    group: null
+  - prompt: "clears default tags"
+    tags: []
 """)
         tasks, _, _, errors = parse_import_file(import_file)
 
         assert len(errors) == 0
         assert tasks[0].tags == ("core", "rel-1")
-        assert tasks[1].tags == ("core",)
+        assert tasks[1].tags == ()
 
     def test_parse_with_dependencies(self, tmp_path: Path):
         """Parse tasks with depends_on."""
@@ -196,7 +202,8 @@ tasks:
         """Error when no tasks in file."""
         import_file = tmp_path / "tasks.yaml"
         import_file.write_text("""
-group: my-group
+tags:
+  - my-group
 tasks: []
 """)
         tasks, _, _, errors = parse_import_file(import_file)
@@ -262,8 +269,8 @@ tasks:
         assert errors[0].task_index == 1
         assert errors[0].message == "'tags' must contain only strings"
 
-    def test_parse_rejects_task_level_non_string_group_alias(self, tmp_path: Path):
-        """Task-level group alias must be string-or-null with precise error text."""
+    def test_parse_rejects_task_level_group_alias(self, tmp_path: Path):
+        """Task-level group alias should direct operators to tags."""
         import_file = tmp_path / "tasks.yaml"
         import_file.write_text("""
 tasks:
@@ -275,10 +282,10 @@ tasks:
         assert len(tasks) == 1
         assert len(errors) == 1
         assert errors[0].task_index == 1
-        assert errors[0].message == "'group' must be a string or null"
+        assert errors[0].message == "`group` is retired; use `tags` instead"
 
-    def test_parse_rejects_file_level_non_string_group_alias(self, tmp_path: Path):
-        """File-level group alias must be string-or-null and reported as file-level."""
+    def test_parse_rejects_file_level_group_alias(self, tmp_path: Path):
+        """File-level group alias should direct operators to tags."""
         import_file = tmp_path / "tasks.yaml"
         import_file.write_text("""
 group: 123
@@ -290,10 +297,10 @@ tasks:
         assert len(tasks) == 1
         assert len(errors) == 1
         assert errors[0].task_index is None
-        assert errors[0].message == "'group' must be a string or null"
+        assert errors[0].message == "`group` is retired; use `tags` instead"
 
     def test_parse_reports_mixed_group_alias_and_tag_type_errors(self, tmp_path: Path):
-        """Invalid group alias and tags shape should both surface with task attribution."""
+        """Retired group alias and invalid tags shape should both surface with task attribution."""
         import_file = tmp_path / "tasks.yaml"
         import_file.write_text("""
 tasks:
@@ -307,7 +314,7 @@ tasks:
         assert len(errors) == 2
         assert all(error.task_index == 1 for error in errors)
         assert {error.message for error in errors} == {
-            "'group' must be a string or null",
+            "`group` is retired; use `tags` instead",
             "'tags' must contain only strings",
         }
 
@@ -317,7 +324,7 @@ tasks:
         import_file.write_text("""
 tasks:
   - prompt: "Task with empty normalized tag"
-    group: "   "
+    tags: ["   "]
 """)
         tasks, _, _, errors = parse_import_file(import_file)
 
@@ -401,22 +408,22 @@ class TestFindDuplicate:
 
     def test_find_duplicate_by_prompt(self, store: SqliteTaskStore):
         """Find duplicate by matching prompt."""
-        task = store.add("Existing task", group="my-group")
+        task = store.add("Existing task", tags=("my-group",))
 
         result = find_duplicate(store, "Existing task", "my-group")
         assert result is not None
         assert result.id == task.id
 
-    def test_no_duplicate_different_group(self, store: SqliteTaskStore):
-        """No duplicate when group differs."""
-        store.add("Existing task", group="group-a")
+    def test_no_duplicate_different_tags(self, store: SqliteTaskStore):
+        """No duplicate when tags differ."""
+        store.add("Existing task", tags=("group-a",))
 
         result = find_duplicate(store, "Existing task", "group-b")
         assert result is None
 
     def test_no_duplicate_completed_task(self, store: SqliteTaskStore):
         """No duplicate when existing task is completed."""
-        task = store.add("Existing task", group="my-group")
+        task = store.add("Existing task", tags=("my-group",))
         task.status = "completed"
         store.update(task)
 
@@ -425,7 +432,7 @@ class TestFindDuplicate:
 
     def test_duplicate_ignores_whitespace(self, store: SqliteTaskStore):
         """Duplicate detection normalizes whitespace."""
-        store.add("Existing task  ", group="my-group")
+        store.add("Existing task  ", tags=("my-group",))
 
         result = find_duplicate(store, "  Existing task", "my-group")
         assert result is not None
@@ -472,16 +479,16 @@ class TestImportTasks:
         assert db_task2.depends_on == task1_id
         assert db_task3.depends_on == task2_id
 
-    def test_import_with_group(self, store: SqliteTaskStore, project_dir: Path):
-        """Import tasks with group."""
+    def test_import_with_tags(self, store: SqliteTaskStore, project_dir: Path):
+        """Import tasks with tags."""
         tasks = [
-            ImportTask(prompt="Task", group="my-feature"),
+            ImportTask(prompt="Task", tags=("my-feature",)),
         ]
 
         results, _ = import_tasks(store, tasks, project_dir)
 
         db_task = store.get(results[0].task.id)
-        assert db_task.group == "my-feature"
+        assert db_task.tags == ("my-feature",)
 
     def test_import_dry_run(self, store: SqliteTaskStore, project_dir: Path):
         """Dry run doesn't create tasks."""
@@ -502,11 +509,11 @@ class TestImportTasks:
     def test_import_skip_duplicates(self, store: SqliteTaskStore, project_dir: Path):
         """Skip duplicate tasks by default."""
         # Create existing task
-        store.add("Existing task", group="my-group")
+        store.add("Existing task", tags=("my-group",))
 
         tasks = [
-            ImportTask(prompt="Existing task", group="my-group"),
-            ImportTask(prompt="New task", group="my-group"),
+            ImportTask(prompt="Existing task", tags=("my-group",)),
+            ImportTask(prompt="New task", tags=("my-group",)),
         ]
 
         results, messages = import_tasks(store, tasks, project_dir)
@@ -518,17 +525,18 @@ class TestImportTasks:
         all_tasks = store.get_pending()
         assert len(all_tasks) == 2  # 1 existing + 1 new
 
-    def test_import_group_null_duplicate_uses_cleared_effective_tags(
+    def test_import_empty_tags_duplicate_uses_cleared_effective_tags(
         self, store: SqliteTaskStore, project_dir: Path
     ):
-        """Imported `group: null` tasks should duplicate-match against untagged tasks."""
+        """Imported `tags: []` tasks should duplicate-match against untagged tasks."""
         store.add("Legacy prompt")
         import_file = project_dir / "tasks.yaml"
         import_file.write_text("""
-group: rel-1
+tags:
+  - rel-1
 tasks:
   - prompt: "Legacy prompt"
-    group: null
+    tags: []
 """)
         tasks, _, _, parse_errors = parse_import_file(import_file)
         assert parse_errors == []
@@ -542,10 +550,10 @@ tasks:
 
     def test_import_force_duplicates(self, store: SqliteTaskStore, project_dir: Path):
         """Force flag creates duplicates."""
-        store.add("Existing task", group="my-group")
+        store.add("Existing task", tags=("my-group",))
 
         tasks = [
-            ImportTask(prompt="Existing task", group="my-group"),
+            ImportTask(prompt="Existing task", tags=("my-group",)),
         ]
 
         results, messages = import_tasks(store, tasks, project_dir, force=True)
@@ -565,7 +573,7 @@ tasks:
             ImportTask(
                 prompt="Full task",
                 task_type="implement",
-                group="my-feature",
+                tags=("my-feature",),
                 spec="specs/test.md",
                 review=True,
             ),
@@ -576,7 +584,7 @@ tasks:
         db_task = store.get(results[0].task.id)
         assert db_task.prompt == "Full task"
         assert db_task.task_type == "implement"
-        assert db_task.group == "my-feature"
+        assert db_task.tags == ("my-feature",)
         assert db_task.spec == "specs/test.md"
         assert db_task.create_review is True
 

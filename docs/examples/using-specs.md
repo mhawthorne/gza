@@ -97,7 +97,8 @@ When importing multiple tasks, set a spec for all of them:
 
 ```yaml
 # tasks.yaml
-group: user-preferences
+tags:
+  - user-preferences
 spec: specs/user-preferences.md
 
 tasks:
@@ -122,7 +123,7 @@ tasks:
 
 ```bash
 $ gza import tasks.yaml
-Imported 4 tasks to group: user-preferences
+Imported 4 tasks
 All tasks include spec: specs/user-preferences.md
 ```
 

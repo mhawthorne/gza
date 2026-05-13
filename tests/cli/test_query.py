@@ -601,7 +601,22 @@ class TestHistoryCommand:
 
         assert result.returncode == 0
         assert result.stdout.strip() == _projection_list_stdout("history")
+        assert "group" not in result.stdout.split()
         assert result.stderr == ""
+
+    def test_history_rejects_group_projection_field(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("history retired group field", task_type="implement", tags=("release",))
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("history", "--fields", "group", "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "unknown field for gza history: group" in result.stderr
+        assert "Run uv run gza history --list-fields to list valid fields." in result.stderr
 
     def test_history_rejects_next_action_projection_field(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -1642,7 +1657,18 @@ class TestSearchCommand:
 
         assert result.returncode == 0
         assert result.stdout.strip() == _projection_list_stdout("search")
+        assert "group" not in result.stdout.split()
         assert result.stderr == ""
+
+    def test_search_rejects_group_projection_field(self, tmp_path: Path):
+        setup_config(tmp_path)
+        make_store(tmp_path).add("needle retired group field", task_type="implement", tags=("release",))
+
+        result = run_gza("search", "needle", "--fields", "group", "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "unknown field for gza search: group" in result.stderr
+        assert "Run uv run gza search --list-fields to list valid fields." in result.stderr
 
     def test_search_rejects_next_action_projection_field(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -11162,6 +11188,7 @@ class TestIncompleteCommand:
 
         assert result.returncode == 0
         assert result.stdout.strip() == _projection_list_stdout("incomplete")
+        assert "group" not in result.stdout.split()
         assert result.stderr == ""
 
     def test_incomplete_cli_blocked_by_dropped_list_fields_prints_blocked_projection_choices(self, tmp_path: Path):

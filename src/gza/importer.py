@@ -71,12 +71,8 @@ def _parse_tags_field(raw_tags: Any, *, task_index: int | None = None) -> tuple[
 
 
 def _parse_group_field(raw_group: Any, *, task_index: int | None = None) -> tuple[str | None, list[ValidationError]]:
-    """Validate and parse deprecated group alias field value."""
-    if raw_group is None:
-        return None, []
-    if not isinstance(raw_group, str):
-        return None, [ValidationError("'group' must be a string or null", task_index=task_index)]
-    return raw_group, []
+    """Reject retired group alias field value with precise operator guidance."""
+    return None, [ValidationError("`group` is retired; use `tags` instead", task_index=task_index)]
 
 
 def parse_import_file(
@@ -107,7 +103,7 @@ def parse_import_file(
     # Extract file-level defaults
     default_group: str | None = None
     if "group" in data:
-        default_group, group_errors = _parse_group_field(data["group"])
+        _, group_errors = _parse_group_field(data["group"])
         errors.extend(group_errors)
     default_tags: tuple[str, ...] = ()
     if "tags" in data:
@@ -172,11 +168,11 @@ def _parse_task(
             task_index=index
         ))
 
-    # Group/tag compatibility: tags are canonical, group is a deprecated alias.
+    # Tags are canonical; group is no longer accepted in import files.
     group = default_group
     tags: list[str] = list(default_tags)
     if "group" in data:
-        group, group_errors = _parse_group_field(data["group"], task_index=index)
+        _, group_errors = _parse_group_field(data["group"], task_index=index)
         errors.extend(group_errors)
     if "tags" in data:
         parsed_tags, tag_errors = _parse_tags_field(data["tags"], task_index=index)

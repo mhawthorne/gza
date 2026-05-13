@@ -69,7 +69,7 @@ print(json.dumps({
     'impl_branch': impl_task.branch,
     'impl_prompt': impl_task.prompt,
     'impl_status': impl_task.status,
-    'impl_group': impl_task.group,
+    'impl_tags': list(impl_task.tags),
     'has_existing_review': latest_review is not None,
     'existing_review_id': latest_review.id if latest_review else None,
     'verify_command': config.verify_command,
@@ -249,7 +249,7 @@ created = store.add(
     prompt='Manual review via /gza-task-review',
     task_type='review',
     depends_on='<IMPL_TASK_ID>',
-    group=<impl_group_or_None>,
+    tags=<impl_tags>,
 )
 assert created.id is not None
 

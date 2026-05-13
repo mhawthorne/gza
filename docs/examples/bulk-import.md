@@ -6,7 +6,8 @@ Import multiple related tasks from a YAML file.
 
 ```yaml
 # tasks.yaml
-group: api-v2
+tags:
+  - api-v2
 spec: specs/api-v2-design.md
 
 tasks:
@@ -50,7 +51,7 @@ Would create 5 tasks:
 
 ```bash
 $ gza import tasks.yaml
-Imported 5 tasks to group: api-v2
+Imported 5 tasks
 
 Created:
   20260108-design-the-new-rest-api (plan)
@@ -78,8 +79,9 @@ $ for i in {1..3}; do gza work --background; done
 ## Import file format reference
 
 ```yaml
-# Optional: group all imported tasks
-group: my-group
+# Optional: apply tags to all imported tasks
+tags:
+  - my-group
 
 # Optional: spec file to include as context for all tasks
 spec: path/to/spec.md

@@ -238,6 +238,38 @@ def test_summary_docs_and_skill_use_dedicated_triage_surfaces() -> None:
     assert "Keep failed history, unmerged work, unimplemented follow-up, and queue state on their dedicated surfaces." in skill_content
 
 
+def test_bulk_import_examples_use_tags_not_retired_group_aliases() -> None:
+    """Operator import examples should teach canonical tags syntax only."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs" / "examples"
+    checked_files = [
+        docs_root / "bulk-import.md",
+        docs_root / "using-specs.md",
+    ]
+
+    for path in checked_files:
+        content = path.read_text()
+        assert "group:" not in content
+        assert "to group:" not in content
+        assert "tags:" in content
+
+
+def test_source_skills_use_impl_tags_not_retired_group_placeholders() -> None:
+    """Bundled source skills should pass tags through improve/review flows."""
+    skills_root = Path(__file__).resolve().parents[1] / "src" / "gza" / "skills"
+    checked_files = [
+        skills_root / "gza-task-fix" / "SKILL.md",
+        skills_root / "gza-task-review" / "SKILL.md",
+    ]
+
+    for path in checked_files:
+        content = path.read_text()
+        assert "impl_group" not in content
+        assert "group=<" not in content
+        assert "group='" not in content
+        assert "impl_tags" in content
+        assert "tags=<" in content
+
+
 def test_operator_facing_unmerged_examples_use_uv_run_prefix() -> None:
     """Operator-facing docs should use the canonical uv-run invocation for unmerged."""
     repo_root = Path(__file__).resolve().parents[1]

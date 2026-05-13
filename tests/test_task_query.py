@@ -617,16 +617,16 @@ def test_lineage_presentation_mode_renders_tree_layout(tmp_path: Path) -> None:
     assert "└──" in rendered or "├──" in rendered
 
 
-def test_default_projection_includes_group_field(tmp_path: Path) -> None:
+def test_default_projection_uses_tags_without_group_field(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    store.add("Release task", group="release")
+    store.add("Release task", tags=("release",))
 
     service = TaskQueryService(store)
     rows = service.run(TaskQueryPresets.search("Release", limit=None)).to_json()
 
     assert rows
-    assert "group" in rows[0]
-    assert rows[0]["group"] == "release"
+    assert "group" not in rows[0]
+    assert rows[0]["tags"] == ["release"]
 
 
 def test_dependency_state_blocked_by_dropped_dep_filters_pending_only(tmp_path: Path) -> None:
