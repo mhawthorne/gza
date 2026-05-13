@@ -352,6 +352,63 @@ def test_query_lineage_owner_rows_marks_orphan_only_impl_lineage_for_manual_reso
     assert {task.id for task in row.unresolved_tasks if task.id is not None} == {orphan.id}
 
 
+def test_query_lineage_owner_rows_excludes_orphan_rebase_descendant_from_actionable_plan(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _set_completed(
+        impl,
+        when=datetime(2026, 5, 12, 9, 0, tzinfo=UTC),
+        branch="feature/canonical",
+        has_commits=True,
+    )
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    orphan = store.add("Completed orphan rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert orphan.id is not None
+    _set_completed(
+        orphan,
+        when=datetime(2026, 5, 12, 10, 0, tzinfo=UTC),
+        branch="feature/orphan",
+        has_commits=True,
+    )
+    orphan.merge_status = "unmerged"
+    store.update(orphan)
+
+    orphan_unit = store.create_merge_unit(
+        source_branch=orphan.branch,
+        target_branch="main",
+        owner_task_id=orphan.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
+
+    git = MagicMock()
+    git.can_merge.return_value = False
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == impl.id
+    assert row.lifecycle_action_task is not None
+    assert row.lifecycle_action_task.id == impl.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "needs_rebase"
+    unresolved_ids = {task.id for task in row.unresolved_tasks if task.id is not None}
+    assert orphan.id not in unresolved_ids
+
+
 def test_query_lineage_owner_rows_planning_excludes_dropped_descendant_rebase(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -457,6 +514,60 @@ def test_query_lineage_owner_rows_planning_skips_dropped_owner_lineage(tmp_path:
     )
 
     assert rows == ()
+
+
+def test_query_lineage_owner_rows_keeps_legitimate_impl_branch_rebase_descendant_actionable(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _set_completed(
+        impl,
+        when=datetime(2026, 5, 12, 9, 0, tzinfo=UTC),
+        branch="feature/canonical",
+        has_commits=True,
+    )
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    review = store.add("Approved review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 12, 10, 0, tzinfo=UTC)
+    review.output_content = "**Verdict: APPROVED**"
+    store.update(review)
+
+    descendant = store.add("Completed descendant rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert descendant.id is not None
+    _set_completed(
+        descendant,
+        when=datetime(2026, 5, 12, 11, 0, tzinfo=UTC),
+        branch="feature/canonical",
+        has_commits=True,
+    )
+    descendant.merge_status = "unmerged"
+    store.update(descendant)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == impl.id
+    assert row.lifecycle_action_task is not None
+    assert row.lifecycle_action_task.id == descendant.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "merge"
 
 
 def test_query_lineage_owner_rows_planning_keeps_completed_and_failed_live_tasks(tmp_path: Path) -> None:

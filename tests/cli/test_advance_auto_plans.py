@@ -366,6 +366,45 @@ def test_advance_explicit_impl_uses_canonical_target_and_skips_orphan_rebase_bra
     assert outputs[0] == outputs[1]
 
 
+def test_advance_explicit_impl_conflict_plan_skips_orphan_rebase_branch_for_non_merge_action(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = _create_completed_implement(store, "Implement feature")
+    assert impl.id is not None
+
+    orphan = store.add("Completed orphan rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert orphan.id is not None
+    orphan.status = "completed"
+    orphan.completed_at = datetime.now(UTC)
+    orphan.branch = "feature/orphan"
+    orphan.merge_status = "unmerged"
+    orphan.has_commits = True
+    store.update(orphan)
+
+    orphan_unit = store.create_merge_unit(
+        source_branch=orphan.branch,
+        target_branch="main",
+        owner_task_id=orphan.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
+    store.dual_write_legacy_merge_status(orphan_unit.id)
+
+    with patch("gza.cli.git_ops.Git", return_value=_mock_git(can_merge=False)):
+        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Would advance 1 task(s):" in captured.out
+    assert str(impl.id) in captured.out
+    assert "rebase --resolve (conflicts detected)" in captured.out
+    assert str(orphan.id) not in captured.out
+
+
 def test_advance_explicit_task_without_merge_unit_uses_strict_non_main_default_target(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

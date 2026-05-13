@@ -501,13 +501,16 @@ def _select_representative_completed_task(
 
 def _requires_impl_branch_manual_resolution(
     owner: DbTask,
-    unresolved_tasks: Sequence[DbTask],
+    actionable_tasks: Sequence[DbTask],
+    orphaned_same_branch_tasks: Sequence[DbTask],
     *,
     include_dropped: bool,
 ) -> bool:
-    actionable = _actionable_lifecycle_tasks(unresolved_tasks, include_dropped=include_dropped)
+    actionable = _actionable_lifecycle_tasks(actionable_tasks, include_dropped=include_dropped)
     if not actionable:
-        return False
+        actionable = _actionable_lifecycle_tasks(orphaned_same_branch_tasks, include_dropped=include_dropped)
+        if not actionable:
+            return False
     if _canonical_impl_branch_candidates(owner, actionable):
         return False
     if owner.task_type != "implement" or not owner.branch:
@@ -515,14 +518,18 @@ def _requires_impl_branch_manual_resolution(
     return any(task.branch for task in actionable)
 
 
-def _is_broken_same_branch_owner(*, owner: DbTask, root: DbTask) -> bool:
-    if owner.id is None or root.id is None or owner.id == root.id:
+def _is_orphan_same_branch_task(*, task: DbTask, root: DbTask) -> bool:
+    if task.id is None or root.id is None or task.id == root.id:
         return False
     if root.task_type != "implement":
         return False
-    if not owner.same_branch or not owner.branch or not root.branch:
+    if not task.same_branch or not task.branch or not root.branch:
         return False
-    return owner.branch != root.branch
+    return task.branch != root.branch
+
+
+def _is_broken_same_branch_owner(*, owner: DbTask, root: DbTask) -> bool:
+    return _is_orphan_same_branch_task(task=owner, root=root)
 
 
 def _has_completed_same_type_descendant(indexes: _LineageIndexes, task: DbTask) -> bool:
@@ -665,6 +672,7 @@ def query_lineage_owner_rows(
         failed_leaves: list[DbTask] = []
         recovery_completed_by_failed_id: dict[str, DbTask] = {}
         unresolved_tasks: list[DbTask] = []
+        orphaned_same_branch_tasks: list[DbTask] = []
         skipped_same_branch_members = indexes.skipped_same_branch_members_by_root_id.get(owner_id, ())
 
         merged_owner_branch = any(
@@ -739,7 +747,7 @@ def query_lineage_owner_rows(
                 continue
             explicit_merge_state = _effective_merge_state(task, merge_unit=merge_unit)
             if task.status in {"completed", "unmerged"} and explicit_merge_state == "unmerged":
-                unresolved_tasks.append(task)
+                orphaned_same_branch_tasks.append(task)
 
         snapshot = LineageOwnerSnapshot(
             owner_task=owner,
@@ -753,7 +761,8 @@ def query_lineage_owner_rows(
         if target_branch and owner_merge_unit is not None and owner_merge_unit.target_branch != target_branch:
             continue
         if not unresolved_tasks:
-            continue
+            if not orphaned_same_branch_tasks:
+                continue
         resolution = is_lineage_resolved(snapshot)
         has_unimplemented_source = (
             owner.id is not None
@@ -828,6 +837,7 @@ def query_lineage_owner_rows(
         if planning_task is None and _requires_impl_branch_manual_resolution(
             owner,
             unresolved_tasks,
+            orphaned_same_branch_tasks,
             include_dropped=not query.exclude_dropped_from_planning,
         ):
             action = {
@@ -837,6 +847,10 @@ def query_lineage_owner_rows(
             }
         if planning_task is None and action is None:
             continue
+
+        displayed_unresolved_tasks = tuple(unresolved_tasks)
+        if action is not None and action.get("needs_attention_reason") == "no-descendant-on-the-impl-branch":
+            displayed_unresolved_tasks = tuple([*unresolved_tasks, *orphaned_same_branch_tasks])
 
         if action is None and config is not None and git is not None and target_branch:
             assert planning_task is not None
@@ -866,7 +880,7 @@ def query_lineage_owner_rows(
                 task_type=task.task_type,
                 reason=task.failure_reason or task.completion_reason,
             )
-            for task in unresolved_tasks
+            for task in displayed_unresolved_tasks
             if task.id is not None
         )
         rows.append(
@@ -877,7 +891,7 @@ def query_lineage_owner_rows(
                 lineage_status=lineage_status,
                 next_action=action,
                 next_action_reason=str(action.get("description", "")) if action is not None else "",
-                unresolved_tasks=tuple(unresolved_tasks),
+                unresolved_tasks=displayed_unresolved_tasks,
                 unresolved_leaf_summary=summaries,
                 lifecycle_action_task=lifecycle_action_task,
                 recovery_action_task=recovery_action_task,
