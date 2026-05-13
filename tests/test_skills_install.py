@@ -1,5 +1,6 @@
 """Tests for the skills-install command."""
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
@@ -41,6 +42,8 @@ def _assign_slug_like_runner(task, store, config, *, git=None) -> None:
         existing_id=None,
         log_path=config.log_path,
         git=git,
+        store=store,
+        exclude_task_id=task.id,
         project_name=config.project_name,
         project_prefix=config.project_prefix,
         slug_override=slug_override,
@@ -48,6 +51,31 @@ def _assign_slug_like_runner(task, store, config, *, git=None) -> None:
         explicit_type=task.task_type_hint,
     )
     store.update(task)
+
+
+def _extract_generate_slug_calls(snippet: str) -> list[str]:
+    calls: list[str] = []
+    start = 0
+    marker = "generate_slug("
+
+    while True:
+        idx = snippet.find(marker, start)
+        if idx == -1:
+            return calls
+
+        depth = 0
+        for pos in range(idx, len(snippet)):
+            char = snippet[pos]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    calls.append(snippet[idx : pos + 1])
+                    start = pos + 1
+                    break
+        else:
+            raise AssertionError("Unbalanced generate_slug() call in skill snippet")
 
 
 class TestSkillsInstallClaudeTarget:
@@ -201,6 +229,75 @@ class TestSkillsInstallClaudeTarget:
         assert "Bash(git:*)" not in refreshed
         assert "Run `verify_command` from `gza.yaml` as part of every review cycle." in refreshed
         assert "Pass the result forward as a `## verify_command result` section." in refreshed
+
+    def test_update_flag_refreshes_manual_skill_generate_slug_collision_guards(self, tmp_path: Path):
+        """--update should restore collision-aware generate_slug() kwargs in installed manual skills."""
+        from gza.skills_utils import get_skills_source_path
+
+        setup_config(tmp_path)
+
+        skill_names = ["gza-task-fix", "gza-task-improve", "gza-task-review"]
+        result1 = run_gza("skills-install", "--target", "claude", *skill_names, "--project", str(tmp_path))
+        assert result1.returncode == 0
+
+        stale_contents = {
+            "gza-task-fix": (
+                "```python\n"
+                "created.slug = generate_slug(\n"
+                "    created.prompt,\n"
+                "    existing_id=created.id,\n"
+                "    log_path=config.log_path,\n"
+                "    git=Git(config.project_dir),\n"
+                ")\n"
+                "```\n"
+            ),
+            "gza-task-improve": (
+                "```python\n"
+                "created.slug = generate_slug(\n"
+                "    created.prompt,\n"
+                "    existing_id=created.id,\n"
+                "    log_path=config.log_path,\n"
+                "    git=Git(config.project_dir),\n"
+                ")\n"
+                "```\n"
+            ),
+            "gza-task-review": (
+                "```python\n"
+                "created.slug = generate_slug(\n"
+                "    created.prompt,\n"
+                "    existing_id=created.id,\n"
+                "    log_path=config.log_path,\n"
+                "    git=None,\n"
+                "    store=store,\n"
+                ")\n"
+                "```\n"
+            ),
+        }
+
+        for skill_name, stale_content in stale_contents.items():
+            skill_file = tmp_path / ".claude" / "skills" / skill_name / "SKILL.md"
+            skill_file.write_text(stale_content)
+
+        result2 = run_gza(
+            "skills-install",
+            "--target",
+            "claude",
+            "--update",
+            *skill_names,
+            "--project",
+            str(tmp_path),
+        )
+        assert result2.returncode == 0
+        assert "updated 3" in result2.stdout
+
+        skills_path = get_skills_source_path()
+        for skill_name in skill_names:
+            refreshed = (tmp_path / ".claude" / "skills" / skill_name / "SKILL.md").read_text()
+            bundled = (skills_path / skill_name / "SKILL.md").read_text()
+            assert refreshed == bundled
+            assert "generate_slug(" in refreshed
+            assert "store=store," in refreshed
+            assert "exclude_task_id=created.id," in refreshed
 
     def test_overwrite_with_force_flag(self, tmp_path: Path):
         """Existing skills are overwritten with --force flag."""
@@ -453,6 +550,33 @@ class TestSkillContentValidation:
         assert "Git(config.project_dir)" not in content
         assert "git=None," in content
         assert "store=store," in content
+        assert "exclude_task_id=created.id," in content
+
+    def test_all_skill_generate_slug_invocations_pass_store_and_exclude_task_id(self):
+        """Bundled skills must pass store and exclude_task_id to every generate_slug() call."""
+        from gza.skills_utils import get_available_skills, get_skills_source_path
+
+        skills_path = get_skills_source_path()
+
+        for skill_name in get_available_skills():
+            skill_file = skills_path / skill_name / "SKILL.md"
+            content = skill_file.read_text()
+            if "generate_slug(" not in content:
+                continue
+
+            snippets = re.findall(r"```(?:python|bash)\n(.*?)```", content, flags=re.DOTALL)
+            calls = [
+                call
+                for snippet in snippets
+                for call in _extract_generate_slug_calls(snippet)
+            ]
+            assert calls, f"{skill_name} contains generate_slug text but no fenced-code call"
+
+            for call in calls:
+                assert "store=" in call, f"{skill_name} generate_slug() must pass store="
+                assert "exclude_task_id=" in call, (
+                    f"{skill_name} generate_slug() must pass exclude_task_id="
+                )
 
     @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
     def test_manual_review_improve_persistence_snippets_keep_completed_at_as_datetime(
@@ -595,6 +719,53 @@ class TestSkillContentValidation:
         impl_refreshed = store.get(impl_task.id)
         assert impl_refreshed is not None
         assert impl_refreshed.review_cleared_at is not None
+
+    @pytest.mark.parametrize(
+        ("prompt", "task_type", "path_kind"),
+        [
+            ("Manual rescue via /gza-task-fix", "fix", "summary"),
+            ("Manual improve via /gza-task-improve", "improve", "summary"),
+        ],
+    )
+    def test_manual_skill_slug_assignment_suffixes_collisions(
+        self, tmp_path: Path, prompt: str, task_type: str, path_kind: str
+    ):
+        """Repeated manual skill persistence should allocate distinct slugs and output paths."""
+        from gza.runner import get_task_output_paths
+
+        setup_config(tmp_path)
+        config, store = _create_store_for_project(tmp_path)
+
+        first = store.add(prompt=prompt, task_type=task_type)
+        second = store.add(prompt=prompt, task_type=task_type)
+        assert first.id is not None
+        assert second.id is not None
+
+        mock_git = Mock()
+        mock_git.branch_exists.return_value = False
+
+        _assign_slug_like_runner(first, store, config, git=mock_git)
+        _assign_slug_like_runner(second, store, config, git=mock_git)
+
+        first = store.get(first.id)
+        second = store.get(second.id)
+        assert first is not None
+        assert second is not None
+        assert first.slug is not None
+        assert second.slug is not None
+        assert first.slug != second.slug
+        assert second.slug.endswith("-2")
+
+        first_report_path, first_summary_path = get_task_output_paths(first, config.project_dir)
+        second_report_path, second_summary_path = get_task_output_paths(second, config.project_dir)
+        if path_kind == "summary":
+            assert first_summary_path is not None
+            assert second_summary_path is not None
+            assert first_summary_path != second_summary_path
+        else:
+            assert first_report_path is not None
+            assert second_report_path is not None
+            assert first_report_path != second_report_path
 
     def test_manual_improve_skill_documents_review_linkage(self):
         """gza-task-improve should document persists with depends_on review linkage."""

@@ -192,6 +192,8 @@ if created.slug is None:
         existing_id=None,
         log_path=config.log_path,
         git=Git(config.project_dir),
+        store=store,
+        exclude_task_id=created.id,
         project_name=config.project_name,
         project_prefix=config.project_prefix,
         slug_override=slug_override,

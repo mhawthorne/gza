@@ -260,12 +260,13 @@ if created.slug is None:
         existing_id=None,
         log_path=config.log_path,
         git=None,
+        store=store,
+        exclude_task_id=created.id,
         project_name=config.project_name,
         project_prefix=config.project_prefix,
         slug_override=slug_override,
         branch_strategy=config.branch_strategy,
         explicit_type=created.task_type_hint,
-        store=store,
     )
     store.update(created)
 
