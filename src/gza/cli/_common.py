@@ -2581,6 +2581,9 @@ class GzaArgumentParser(argparse.ArgumentParser):
         match = self._INVALID_CHOICE_RE.match(message)
         if match:
             cmd = match.group("cmd")
+            # Let retired hidden commands fall back to argparse's native invalid-choice error.
+            if cmd == "cycle":
+                super().error(message)
             self.exit(
                 2,
                 f"{self.prog}: '{cmd}' is not a gza command. See 'gza --help'.\n",

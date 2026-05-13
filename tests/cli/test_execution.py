@@ -5979,7 +5979,7 @@ class TestIterateCommand:
         prior_review.completed_at = datetime.now(UTC)
         store.update(prior_review)
 
-        # Mark review as cleared and ensure no newer review/improve cycle exists,
+        # Mark review as cleared and ensure no newer review/improve iteration exists,
         # so shared engine returns the "reviews_all_cleared" merge path.
         impl.review_cleared_at = datetime.now(UTC)
         store.update(impl)
@@ -8412,14 +8412,12 @@ class TestIterateCommand:
         assert result.returncode != 0
         assert "unrecognized arguments: --continue" in (result.stderr or result.stdout)
 
-    def test_cycle_alias_runs_iterate(self, tmp_path: Path):
+    def test_cycle_command_is_rejected(self, tmp_path: Path):
         setup_config(tmp_path)
-        self._init_git_repo(tmp_path)
-        store = make_store(tmp_path)
-        impl = self._make_completed_impl(store)
-        result = run_gza("cycle", str(impl.id), "--dry-run", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "would iterate implementation" in result.stdout.lower()
+        result = run_gza("cycle", "testproject-1", "--dry-run", "--project", str(tmp_path))
+        assert result.returncode == 2
+        assert "invalid choice: 'cycle'" in result.stderr
+        assert "iterate" in result.stderr
 
     def test_reuses_latest_changes_requested_review_for_first_iteration(self, tmp_path: Path):
         from unittest.mock import MagicMock
@@ -9249,7 +9247,7 @@ class TestIterateCommand:
             {"type": "max_cycles_reached", "description": "Reached max review cycles"},
         )
         assert expected_line in output
-        assert "Review-cycle accounting: completed=7, max_review_cycles=7, consumed_this_invocation=2" in output
+        assert "Review-iteration accounting: completed=7, max_review_cycles=7, consumed_this_invocation=2" in output
         assert f"Recommended next step: uv run gza fix {impl.id}" in output
 
     def test_iterate_max_cycles_attention_uses_shortened_single_line_prompt(
@@ -9366,7 +9364,7 @@ class TestIterateCommand:
         assert result == 3
         spawn_background.assert_not_called()
         assert "Next action: max_cycles_reached" in output
-        assert "Review-cycle accounting: completed=0, max_review_cycles=3, consumed_this_invocation=0" in output
+        assert "Review-iteration accounting: completed=0, max_review_cycles=3, consumed_this_invocation=0" in output
         assert f"Recommended next step: uv run gza fix {impl.id}" in output
         assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 

@@ -496,7 +496,7 @@ def _cmd_stats_reviews(
                 }
             )
 
-    # Per-model review cycle stats
+    # Per-model review iteration stats
     model_cycles: dict[str, list[int]] = defaultdict(list)
     for root_id in reviewed_impls:
         models = root_review_models.get(root_id, [])
@@ -549,7 +549,7 @@ def _cmd_stats_reviews(
                 }
             )
 
-    # Per-implementer-model review cycle stats
+    # Per-implementer-model review iteration stats
     impl_model_cycles: dict[str, list[int]] = defaultdict(list)
     for root_id in reviewed_impls:
         root_impl = tasks_by_id.get(root_id)
@@ -576,7 +576,7 @@ def _cmd_stats_reviews(
                 }
             )
 
-    # Per-pair (implement model × review model) cycle stats
+    # Per-pair (implement model × review model) iteration stats
     pair_cycles: dict[tuple[str, str], list[int]] = defaultdict(list)
     for root_id in reviewed_impls:
         root_impl = tasks_by_id.get(root_id)

@@ -12,13 +12,13 @@ Review tasks run in isolated git worktrees that only contain git-tracked files.
     - `## Original request:` fallback when no linked plan exists
     - If neither source exists, both sections are intentionally omitted and reviewers should state `No plan or request provided.`
    - `## verify_command result` when `verify_command` is configured for the project
-     - The host runner executes the literal command once per autonomous review cycle in the review worktree.
+     - The host runner executes the literal command once per autonomous review iteration in the review worktree.
      - The prompt includes pass/fail status, exit status, and trimmed failing output when non-zero.
      - Hung review verification is bounded to 120 seconds; timeouts are converted into a failed `## verify_command result` section with timeout evidence and any partial output captured so the review still runs.
-     - Reviews must keep doing the normal code review in the same cycle; verify failure is additional blocker evidence, not a short-circuit.
+     - Reviews must keep doing the normal code review in the same iteration; verify failure is additional blocker evidence, not a short-circuit.
    - Implementation diff context for `main...{impl_branch}` (small/full/excerpted depending on size thresholds)
    - Improve-lineage context when applicable
-     - This is metadata-only coordination context for prior review/improve cycles.
+     - This is metadata-only coordination context for prior review/improve iterations.
      - It intentionally excludes prior review prose, improve summaries, and copied blocker text.
      - Reviewers must prove current blockers from current code/diff, not from lineage history.
    - Explicit blocker markers when linked review/plan output exists but cannot be loaded on the current machine

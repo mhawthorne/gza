@@ -2330,7 +2330,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     background: bool = getattr(args, 'background', False)
 
     # cmd_iterate intentionally only accepts implement task IDs (not improve/review);
-    # it manages the full review/improve cycle lifecycle and requires the root impl task.
+    # it manages the full review/improve iteration lifecycle and requires the root impl task.
     impl_task_id = resolve_id(config, args.impl_task_id)
     impl_task = store.get(impl_task_id)
     if not impl_task:
@@ -2701,7 +2701,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             assert iterate_task.id is not None
             completed_review_cycles = count_completed_review_cycles(store, iterate_task.id)
             print(
-                "Review-cycle accounting: "
+                "Review-iteration accounting: "
                 f"completed={completed_review_cycles}, "
                 f"max_review_cycles={engine_config.max_review_cycles}, "
                 "consumed_this_invocation=0"
@@ -4156,7 +4156,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         else:
             print(f"Iterate blocked: {final_stop_reason}.")
         print(
-            "Review-cycle accounting: "
+            "Review-iteration accounting: "
             f"completed={completed_review_cycles}, "
             f"max_review_cycles={engine_config.max_review_cycles}, "
             f"consumed_this_invocation={consumed_this_invocation}"

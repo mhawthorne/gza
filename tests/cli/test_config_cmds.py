@@ -1729,7 +1729,7 @@ class TestStatsReviewsCommand:
         assert "Rvws" in result.stdout
 
     def test_stats_reviews_with_reviewed_impl(self, tmp_path: Path):
-        """gza stats reviews shows cycle stats for a reviewed implementation task."""
+        """gza stats reviews shows iteration stats for a reviewed implementation task."""
         from gza.db import TaskStats
 
         setup_config(tmp_path)
@@ -1751,7 +1751,7 @@ class TestStatsReviewsCommand:
         assert "Reviewed:        1/1" in result.stdout
 
     def test_stats_reviews_unreviewed_impl(self, tmp_path: Path):
-        """gza stats reviews shows impl count but no cycle stats for unreviewed impls."""
+        """gza stats reviews shows impl count but no iteration stats for unreviewed impls."""
         from gza.db import TaskStats
 
         setup_config(tmp_path)
@@ -1792,7 +1792,7 @@ class TestStatsReviewsCommand:
         assert "Reviewed:        0/1" in result.stdout
 
     def test_stats_reviews_cycle_distribution(self, tmp_path: Path):
-        """gza stats reviews shows cycle distribution for reviewed impls."""
+        """gza stats reviews shows iteration distribution for reviewed impls."""
         from gza.db import TaskStats
 
         setup_config(tmp_path)

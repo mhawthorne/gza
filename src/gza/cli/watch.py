@@ -1801,7 +1801,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         failure_streak = 0
         previous_snapshot = _task_snapshot(store)
 
-        # Preview first cycle and ask for confirmation before executing
+        # Preview the first watch pass and ask for confirmation before executing
         if restart_failed and dry_run:
             _emit_recovery_dry_run_report(
                 store=store,

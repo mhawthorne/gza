@@ -1477,8 +1477,8 @@ Before `--background` detaches, iterate now also evaluates the current lifecycle
 
 If that manual resume completes successfully, operator-facing lifecycle readouts move forward from the completed resume descendant instead of leaving the capped failed row as the active unit of work. The older failed row remains in task history, but shared lineage/lifecycle surfaces treat it as recovered: owner-row listings continue from the descendant, and `uv run gza show` on the older failed row renders `Lifecycle: recovered, ...` based on the descendant's next action or terminal state.
 
-When iterate stops with `max_cycles_reached`, it now prints review-cycle accounting with:
-- task `completed` review-cycle count
+When iterate stops with `max_cycles_reached`, it now prints review-iteration accounting with:
+- task `completed` review-iteration count
 - configured `max_review_cycles`
 - `consumed_this_invocation` cycles
 
@@ -1509,7 +1509,7 @@ uv run gza watch [options]
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
 | `--group NAME` | Deprecated alias for `--tag NAME` |
 
-When `main_checkout_isolate: true`, watch preflights a dedicated detached checkout reset to the default-branch tip and executes merge attempts there. If the isolated merge succeeds, watch then fast-forwards the real default-branch ref to that detached merge commit and syncs any attached default-branch checkout back to a clean state before marking the task merged. If the initial refresh fails because that checkout is stale or conflicted, watch rebuilds it once from scratch before giving up on merge actions for the cycle. The integration checkout does not directly check out the shared default-branch ref, so an operator checkout already on that branch stays clean. Conflict rebases still run on task branches via standard rebase tasks.
+When `main_checkout_isolate: true`, watch preflights a dedicated detached checkout reset to the default-branch tip and executes merge attempts there. If the isolated merge succeeds, watch then fast-forwards the real default-branch ref to that detached merge commit and syncs any attached default-branch checkout back to a clean state before marking the task merged. If the initial refresh fails because that checkout is stale or conflicted, watch rebuilds it once from scratch before giving up on merge actions for that watch pass. The integration checkout does not directly check out the shared default-branch ref, so an operator checkout already on that branch stays clean. Conflict rebases still run on task branches via standard rebase tasks.
 
 Watch also has a separate worker-silence threshold:
 

@@ -763,7 +763,7 @@ def main() -> int:
     watch_parser.add_argument(
         "-y", "--yes",
         action="store_true",
-        help="Skip confirmation prompt before first cycle",
+        help="Skip confirmation prompt before the first watch pass",
     )
     watch_parser.add_argument(
         "--group",
@@ -1904,13 +1904,6 @@ def main() -> int:
     )
     _add_iterate_args(iterate_parser)
 
-    # Backward-compat parser for legacy command spelling.
-    cycle_parser = subparsers.add_parser(
-        "cycle",
-        help=argparse.SUPPRESS,
-    )
-    _add_iterate_args(cycle_parser)
-
     # implement command
     implement_parser = subparsers.add_parser(
         "implement",
@@ -2603,7 +2596,7 @@ def main() -> int:
             return cmd_improve(args)
         elif args.command == "fix":
             return cmd_fix(args)
-        elif args.command in ("iterate", "cycle"):
+        elif args.command == "iterate":
             return cmd_iterate(args)
         elif args.command == "implement":
             return cmd_implement(args)

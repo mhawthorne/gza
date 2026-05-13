@@ -1350,7 +1350,7 @@ def _format_review_verify_failure(
 
 
 def _format_review_verify_result(command: str, result: subprocess.CompletedProcess[str]) -> str:
-    """Format a review-cycle verify result as prompt context."""
+    """Format a review-iteration verify result as prompt context."""
     status = "passed" if result.returncode == 0 else "failed"
     lines = [
         "## verify_command result",
@@ -1382,7 +1382,7 @@ def _run_review_verify_command(
     cwd: Path,
     timeout_seconds: int = REVIEW_VERIFY_TIMEOUT_SECONDS,
 ) -> str:
-    """Run the configured verify command for an autonomous review cycle."""
+    """Run the configured verify command for an autonomous review iteration."""
     try:
         result = subprocess.run(
             ["bash", "-lc", verify_command],
@@ -1507,7 +1507,7 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
 
     included = prior_improves[:REVIEW_IMPROVE_LINEAGE_LIMIT]
     omitted_count = max(0, len(prior_improves) - len(included))
-    n_cycles = len(prior_improves)
+    n_iterations = len(prior_improves)
     latest_improve = prior_improves[0]
     latest_review_task = store.get(latest_improve.depends_on) if latest_improve.depends_on else None
     latest_review_report = (
@@ -1516,7 +1516,7 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
         else None
     )
     state_parts = [
-        f"prior cycles: {n_cycles}",
+        f"prior iterations: {n_iterations}",
         f"latest review: {latest_improve.depends_on or 'unknown'}",
         f"verdict={latest_review_report.verdict if latest_review_report is not None and latest_review_report.verdict else 'unknown'}",
         f"score={latest_review_task.review_score if latest_review_task is not None and latest_review_task.review_score is not None else 'unknown'}",
@@ -1524,33 +1524,33 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
         f"status={latest_improve.status or 'unknown'}",
     ]
     if omitted_count:
-        state_parts.append(f"older cycles omitted: {omitted_count}")
+        state_parts.append(f"older iterations omitted: {omitted_count}")
 
     lines = [
         "## Improve Lineage Context",
         "",
-        "Prior cycle history is coordination context only; it is not evidence that any blocker is still open.",
+        "Prior iteration history is coordination context only; it is not evidence that any blocker is still open.",
         "Current state: " + ", ".join(state_parts) + ".",
         "",
     ]
 
     for index, improve in enumerate(included, start=1):
-        cycle_number = n_cycles - (index - 1)
-        review_task_for_cycle = store.get(improve.depends_on) if improve.depends_on else None
+        iteration_number = n_iterations - (index - 1)
+        review_task_for_iteration = store.get(improve.depends_on) if improve.depends_on else None
         review_report = (
-            parse_review_report(_get_task_output(review_task_for_cycle, project_dir))
-            if review_task_for_cycle is not None
+            parse_review_report(_get_task_output(review_task_for_iteration, project_dir))
+            if review_task_for_iteration is not None
             else None
         )
         verdict = review_report.verdict if review_report is not None else None
         score = (
-            review_task_for_cycle.review_score
-            if review_task_for_cycle is not None and review_task_for_cycle.review_score is not None
+            review_task_for_iteration.review_score
+            if review_task_for_iteration is not None and review_task_for_iteration.review_score is not None
             else "unknown"
         )
         completed = improve.completed_at.isoformat() if improve.completed_at is not None else "unknown"
         lines.append(
-            f"- cycle {cycle_number}: review {improve.depends_on or '?'} "
+            f"- iteration {iteration_number}: review {improve.depends_on or '?'} "
             f"verdict={verdict or 'unknown'} score={score} -> "
             f"improve {improve.id or '?'} status={improve.status or 'unknown'} completed={completed}"
         )

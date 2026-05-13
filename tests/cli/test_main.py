@@ -819,16 +819,26 @@ class TestReconciliationWarnings:
 
 
 class TestCommandAliases:
-    """Tests for CLI command alias dispatch behavior."""
+    """Tests for CLI command dispatch behavior."""
 
-    def test_cycle_alias_dispatches_to_cmd_iterate(self, tmp_path):
-        """Legacy `cycle` command should route to cmd_iterate."""
+    def test_cycle_command_is_rejected(self, tmp_path):
+        """Removed `cycle` command should now fail at parser validation."""
+        setup_config(tmp_path)
+
+        result = run_gza("cycle", "testproject-1", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "invalid choice: 'cycle'" in result.stderr
+        assert "iterate" in result.stderr
+
+    def test_iterate_dispatches_to_cmd_iterate(self, tmp_path):
+        """`iterate` command should parse args and dispatch to cmd_iterate."""
         from gza.cli.main import main
 
         setup_config(tmp_path)
 
         with (
-            patch.object(sys, "argv", ["gza", "cycle", "testproject-1", "--dry-run", "--project", str(tmp_path)]),
+            patch.object(sys, "argv", ["gza", "iterate", "testproject-1", "--dry-run", "--project", str(tmp_path)]),
             patch("gza.cli.main.cmd_iterate", return_value=0) as cmd_iterate,
         ):
             rc = main()

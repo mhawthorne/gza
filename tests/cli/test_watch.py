@@ -1626,7 +1626,7 @@ def test_watch_cycle_restart_failed_drains_failed_queue_before_pending_queue(tmp
 
 
 def test_watch_cycle_pending_queue_starts_only_after_recovery_exhaustion(tmp_path: Path) -> None:
-    """Pending work should begin on a later cycle only after recovery work is fully exhausted."""
+    """Pending work should begin on a later watch pass only after recovery work is fully exhausted."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -2037,7 +2037,7 @@ def test_watch_cycle_restart_failed_in_progress_recovery_child_blocks_pending_qu
 def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3(
     tmp_path: Path, action_type: str, child_type: str
 ) -> None:
-    """Task-creating advance children should not be retried via generic pickup in same cycle."""
+    """Task-creating advance children should not be retried via generic pickup in the same watch pass."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -2047,7 +2047,7 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
     root.status = "completed"
     root.completed_at = datetime.now(UTC)
     if action_type != "create_implement":
-        root.branch = "feature/same-cycle-no-retry"
+        root.branch = "feature/same-watch-pass-no-retry"
     store.update(root)
     if action_type != "create_implement":
         store.set_merge_status(root.id, "unmerged")
@@ -2667,7 +2667,7 @@ def test_watch_cycle_with_isolation_enabled_preflights_and_merges_in_isolated_ch
 def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_failure_and_merges(
     tmp_path: Path,
 ) -> None:
-    """A stale isolated checkout at cycle start should rebuild once and still allow same-cycle merges."""
+    """A stale isolated checkout at watch-pass start should rebuild once and still allow same-pass merges."""
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
@@ -2922,7 +2922,7 @@ def test_isolated_watch_merge_promotion_rollback_keeps_task_unmerged_when_attach
 
 
 def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_continues_merging(tmp_path: Path) -> None:
-    """Cleanup failures in isolated mode should rebuild checkout and continue later merges in-cycle."""
+    """Cleanup failures in isolated mode should rebuild checkout and continue later merges in the same pass."""
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
@@ -3696,7 +3696,7 @@ def test_emit_transition_events_includes_followup_ids_for_review(tmp_path: Path)
 
 
 def test_cmd_watch_logs_completed_review_before_same_cycle_merge(tmp_path: Path) -> None:
-    """Pre-cycle transitions should land before merge logs from the same watch pass."""
+    """Pre-pass transitions should land before merge logs from the same watch pass."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -4812,7 +4812,7 @@ def test_run_cycle_dry_run_real_helpers_does_not_reconcile_or_prune(tmp_path: Pa
     registry = WorkerRegistry(tmp_path / ".gza" / "workers")
     registry.register(
         WorkerMetadata(
-            worker_id="w-watch-dry-run-cycle",
+            worker_id="w-watch-dry-run-pass",
             task_id=task.id,
             pid=dead_pid,
             status="running",
@@ -4822,7 +4822,7 @@ def test_run_cycle_dry_run_real_helpers_does_not_reconcile_or_prune(tmp_path: Pa
 
     before_row = store.get(task.id)
     assert before_row is not None
-    before_worker = registry.get("w-watch-dry-run-cycle")
+    before_worker = registry.get("w-watch-dry-run-pass")
     assert before_worker is not None
 
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
@@ -4838,7 +4838,7 @@ def test_run_cycle_dry_run_real_helpers_does_not_reconcile_or_prune(tmp_path: Pa
     assert result.work_done is False
     after_row = store.get(task.id)
     assert after_row is not None
-    after_worker = registry.get("w-watch-dry-run-cycle")
+    after_worker = registry.get("w-watch-dry-run-pass")
     assert after_worker is not None
 
     assert after_row.status == "in_progress"
@@ -5301,7 +5301,7 @@ def test_watch_cycle_improve_routes_impl_chain_through_iterate_without_creating_
 
 
 def test_watch_cycle_dedupes_merge_not_default_skip_across_cycles(tmp_path: Path) -> None:
-    """Persistent 'not on default branch' skip should not spam every cycle."""
+    """Persistent 'not on default branch' skip should not spam every watch pass."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -5421,7 +5421,7 @@ def test_watch_cycle_dedupes_wait_review_skip_across_cycles(tmp_path: Path) -> N
 
 
 def test_watch_log_inserts_blank_line_between_cycles(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """Each watch cycle should be visually separated in stdout and watch.log."""
+    """Each watch pass should be visually separated in stdout and watch.log."""
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=False)
 

@@ -8,7 +8,7 @@ public: true
 
 # Gza Task Review
 
-Run an interactive code review for a specific gza task. Every review cycle must do both the normal code review work and an independent `verify_command` run from `gza.yaml`; verify is not a short-circuit. Produces structured review output that `/gza-task-improve` can consume. Use this when automated review cycles are exhausted, or when you want to review a task interactively.
+Run an interactive code review for a specific gza task. Every review iteration must do both the normal code review work and an independent `verify_command` run from `gza.yaml`; verify is not a short-circuit. Produces structured review output that `/gza-task-improve` can consume. Use this when automated review iterations are exhausted, or when you want to review a task interactively.
 
 ## Inputs
 
@@ -112,12 +112,12 @@ If neither source exists, stop and ask the user for the authoritative implementa
 
 ### Step 6: Run verify_command
 
-Run `verify_command` from `gza.yaml` as part of every review cycle. This is required even when the diff already has obvious code-review blockers; do not skip verify just because the code review may fail.
+Run `verify_command` from `gza.yaml` as part of every review iteration. This is required even when the diff already has obvious code-review blockers; do not skip verify just because the code review may fail.
 
 - If `verify_command` is empty or unset, note that verify is not configured and continue with the code review.
 - If `verify_command` is configured, run it from the project root only when this workspace/worktree was already prepared on `<impl_branch>` or equivalent implementation content. If the current checkout is not known to match the implementation, stop and ask the user for a prepared review environment rather than running verify against the wrong source tree.
 - Capture the exit status and keep a trimmed diagnostic excerpt for the reviewer. If the output is huge, keep the most useful failing excerpt (for example, the failing tool header plus the first ~120 lines and last ~40 lines).
-- If the verify run hangs, stop it after a bounded wait and pass the timeout forward as a failed `## verify_command result` with timeout evidence and any partial output captured so the review still happens in the same cycle.
+- If the verify run hangs, stop it after a bounded wait and pass the timeout forward as a failed `## verify_command result` with timeout evidence and any partial output captured so the review still happens in the same iteration.
 - Do not fix the branch during review. The point here is to independently detect verify failures and fold them into the review findings.
 
 Pass the result forward as a `## verify_command result` section. Include:
@@ -150,7 +150,7 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 
 **Step 4**: Review the diff against the provided ask context (`## Original plan:` or `## Original request:`). Evaluate whether the implementation actually achieves that ask, not just whether the code is clean.
 
-**Step 4.5**: Independently evaluate the provided `## verify_command result` section in addition to the normal code review. Both signals matter every cycle.
+**Step 4.5**: Independently evaluate the provided `## verify_command result` section in addition to the normal code review. Both signals matter every iteration.
 
 - If verify passed, do not add findings just because verify ran.
 - If verify failed, synthesize one or more blocking findings alongside the code-review findings. Clearly label each verify-driven blocker title with `verify_command failure` so humans and `/gza-task-improve` can distinguish them from code-quality blockers.
@@ -299,7 +299,7 @@ After the subagent completes:
 ## Important notes
 
 - **Ask-adherence is mandatory** — use the Summary checklist item for `## Original plan:` or `## Original request:` to confirm the implementation matches the requested behavior, and treat unexplained deviations as blocker findings.
-- **Verify is part of review, not a separate gate** — run `verify_command` every cycle in addition to the normal code review, and fold any failures into the same structured blocker list.
+- **Verify is part of review, not a separate gate** — run `verify_command` every iteration in addition to the normal code review, and fold any failures into the same structured blocker list.
 - **Structured output matters** — the review format (B1, B2, F1, F2) must be compatible with `/gza-task-improve` and follow-up automation.
 - **Clearly label verify-driven blockers** — titles should include `verify_command failure`, and `Evidence:` should carry the trimmed failing output so improve can act on it without rerunning history reconstruction.
 - **Don't duplicate existing reviews** — if there's already a recent review, inform the user and ask before creating another one.

@@ -6,7 +6,7 @@ The provided diff is authoritative - do not use git commands to reconstruct, re-
 
 Project-specific guidance:
 - Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.
-- Independently evaluate any provided `## verify_command result` section in addition to the normal code review; verify is not a short-circuit and both signals matter each cycle.
+- Independently evaluate any provided `## verify_command result` section in addition to the normal code review; verify is not a short-circuit and both signals matter each iteration.
 - Keep this review stack-agnostic. If project verification instructions are missing, state that explicitly in assumptions/risks.
 
 Output format contract (use this exact section order and exact headings):

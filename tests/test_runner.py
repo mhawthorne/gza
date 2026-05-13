@@ -777,15 +777,15 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(review3, store, tmp_path, git=None)
 
         assert "## Improve Lineage Context" in context
-        assert f"cycle 2: review {review2.id}" in context
-        assert f"cycle 1: review {review1.id}" in context
+        assert f"iteration 2: review {review2.id}" in context
+        assert f"iteration 1: review {review1.id}" in context
         assert f"improve {improve1.id}" in context
         assert f"improve {improve2.id}" in context
         assert "Fix flaky tests" not in context
         assert "Reduced retry loops" not in context
 
     def test_review_context_bounds_improve_lineage_and_reports_omitted(self, tmp_path: Path):
-        """Review context includes only recent cycle rows and reports omitted count."""
+        """Review context includes only recent iteration rows and reports omitted count."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -813,8 +813,8 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
         assert "## Improve Lineage Context" in context
-        assert f"prior cycles: {REVIEW_IMPROVE_LINEAGE_LIMIT + 2}" in context
-        assert "older cycles omitted: 2" in context
+        assert f"prior iterations: {REVIEW_IMPROVE_LINEAGE_LIMIT + 2}" in context
+        assert "older iterations omitted: 2" in context
 
         for improve_id in improve_ids[-REVIEW_IMPROVE_LINEAGE_LIMIT:]:
             assert f"improve {improve_id}" in context
@@ -827,7 +827,7 @@ class TestReviewContextFromChain:
             assert f"Improve summary {idx}" not in context
 
     def test_review_context_includes_retry_improves_in_same_chain(self, tmp_path: Path):
-        """Review context includes retry/resume improve attempts as metadata-only cycle rows."""
+        """Review context includes retry/resume improve attempts as metadata-only iteration rows."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -865,8 +865,8 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
         assert "## Improve Lineage Context" in context
-        assert f"cycle 2: review {review2.id}" in context
-        assert f"cycle 1: review {review1.id}" in context
+        assert f"iteration 2: review {review2.id}" in context
+        assert f"iteration 1: review {review1.id}" in context
         assert f"improve {improve_a.id}" in context
         assert f"improve {improve_b.id}" in context
         assert "Direct improve" not in context
@@ -905,8 +905,8 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
         assert "## Improve Lineage Context" in context
-        assert f"prior cycles: {REVIEW_IMPROVE_LINEAGE_LIMIT + 2}" in context
-        assert "older cycles omitted: 2" in context
+        assert f"prior iterations: {REVIEW_IMPROVE_LINEAGE_LIMIT + 2}" in context
+        assert "older iterations omitted: 2" in context
 
         for improve_id in improve_ids[-REVIEW_IMPROVE_LINEAGE_LIMIT:]:
             assert f"improve {improve_id}" in context
@@ -958,7 +958,7 @@ class TestReviewContextFromChain:
         context = _build_review_improve_lineage_context(review_task, impl_task, store, tmp_path)
 
         assert f"improve {older_improve.id}" in context
-        assert "cycle 1:" in context
+        assert "iteration 1:" in context
         assert f"Improve {later_improve.id}" not in context
         assert "later improve" not in context
 
@@ -1003,12 +1003,12 @@ class TestReviewContextFromChain:
         context = _build_review_improve_lineage_context(review_task, impl_task, store, tmp_path)
 
         assert f"improve {older_improve.id}" in context
-        assert "cycle 1:" in context
+        assert "iteration 1:" in context
         assert f"Improve {later_improve.id}" not in context
         assert "later improve 11" not in context
 
-    def test_review_context_includes_metadata_only_lineage_when_prior_cycles_exist(self, tmp_path: Path):
-        """Review context includes metadata-only lineage when prior review/improve cycles exist."""
+    def test_review_context_includes_metadata_only_lineage_when_prior_iterations_exist(self, tmp_path: Path):
+        """Review context includes metadata-only lineage when prior review/improve iterations exist."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -1033,15 +1033,15 @@ class TestReviewContextFromChain:
         current_review = store.add(prompt="Review current", task_type="review", depends_on=impl_task.id)
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
-        assert "Prior cycle history is coordination context only" in context
-        assert "Current state: prior cycles: 1" in context
+        assert "Prior iteration history is coordination context only" in context
+        assert "Current state: prior iterations: 1" in context
         assert f"latest review: {review1.id}" in context
         assert f"latest improve: {improve1.id}" in context
         assert "uv run gza show <id>" not in context
         assert "cat <report_file>" not in context
 
-    def test_review_context_includes_bounded_cycle_rows_without_summary_prose(self, tmp_path: Path):
-        """Review context includes bounded cycle rows and excludes prior improve summary prose."""
+    def test_review_context_includes_bounded_iteration_rows_without_summary_prose(self, tmp_path: Path):
+        """Review context includes bounded iteration rows and excludes prior improve summary prose."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -1082,14 +1082,14 @@ class TestReviewContextFromChain:
         current_review = store.add(prompt="Review current", task_type="review", depends_on=impl_task.id)
         context = _build_context_from_chain(current_review, store, tmp_path, git=None)
 
-        assert f"cycle 2: review {review2.id}" in context
-        assert f"cycle 1: review {review1.id}" in context
+        assert f"iteration 2: review {review2.id}" in context
+        assert f"iteration 1: review {review1.id}" in context
         assert f"improve {improve1.id}" in context
         assert f"improve {improve2.id}" in context
         assert "Round 1 fix" not in context
         assert "Round 2 fix" not in context
         assert "Lineage:" not in context
-        assert "prior cycles: 2" in context
+        assert "prior iterations: 2" in context
 
     def test_improve_context_marks_unavailable_review_feedback(self, tmp_path: Path):
         """Improve context marks review-feedback unavailability as a blocker."""
@@ -1304,7 +1304,7 @@ class TestReviewContextFromChain:
         first_review = store.add(prompt="Review first", task_type="review", depends_on=impl_task.id)
         context = _build_context_from_chain(first_review, store, tmp_path, git=None)
 
-        assert "prior review/improve cycle" not in context
+        assert "prior review/improve iteration" not in context
         assert "Current state:" not in context
 
     def test_fix_context_includes_repeated_blockers_and_latest_failed_attempt(self, tmp_path: Path):

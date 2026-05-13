@@ -196,7 +196,7 @@ These actions create background workers and count toward the batch limit. The so
 | `wait_review` | Review in progress, wait for it |
 | `wait_improve` | Improve in progress, wait for it |
 | `needs_discussion` | Requires manual intervention (shown in attention summary) |
-| `max_cycles_reached` | Review cycle limit exceeded (shown in attention summary) |
+| `max_cycles_reached` | Review iteration limit exceeded (shown in attention summary) |
 
 ## Execution Order
 

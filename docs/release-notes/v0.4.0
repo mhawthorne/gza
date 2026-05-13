@@ -16,7 +16,7 @@ This release brings significant orchestration improvements, expanded skill ecosy
 ### Commands
 - **`gza advance`**: Intelligently orchestrate batch workflow with `--batch B` option to spawn multiple parallel workers
 - **`gza implement`**: Create and run implementation tasks from plans (replaces manual workflow)
-- **`gza iterate`**: Renamed from `gza cycle`; automated review/improve cycles with configurable max cycle limits
+- **`gza iterate`**: Automated review/improve iterations with configurable max iteration limits
 - **`gza group`**: Renamed from `gza status`; display task status groupings
 - **`gza set-status`**: Manually force task status updates
 - **`gza mark-completed`**: Mark tasks as completed with cleanup

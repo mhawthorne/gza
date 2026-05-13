@@ -133,7 +133,7 @@ Based on all evidence, determine the root cause. Common failure patterns:
 
 **1. Max-turns with loop (stuck agent)**
 - Evidence: Same file opened repeatedly, same error repeated, test run 10+ times
-- Cause: Agent got stuck trying to fix a specific error and couldn't break the cycle
+- Cause: Agent got stuck trying to fix a specific error and couldn't break the loop
 - Fix: Add context to the prompt about the specific problem area; break into explore-then-implement
 
 **2. Max-turns with scope creep**

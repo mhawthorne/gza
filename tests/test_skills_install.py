@@ -227,7 +227,7 @@ class TestSkillsInstallClaudeTarget:
         bundled = (get_skills_source_path() / "gza-task-review" / "SKILL.md").read_text()
         assert refreshed == bundled
         assert "Bash(git:*)" not in refreshed
-        assert "Run `verify_command` from `gza.yaml` as part of every review cycle." in refreshed
+        assert "Run `verify_command` from `gza.yaml` as part of every review iteration." in refreshed
         assert "Pass the result forward as a `## verify_command result` section." in refreshed
 
     def test_update_flag_refreshes_manual_skill_generate_slug_collision_guards(self, tmp_path: Path):
@@ -819,7 +819,7 @@ class TestSkillContentValidation:
         skill_file = get_skills_source_path() / "gza-task-review" / "SKILL.md"
         content = skill_file.read_text()
 
-        assert "Every review cycle must do both the normal code review work and an independent `verify_command` run" in content
+        assert "Every review iteration must do both the normal code review work and an independent `verify_command` run" in content
         assert "This is required even when the diff already has obvious code-review blockers; do not skip verify" in content
         assert "If verify passed, do not add findings just because verify ran." in content
         assert "If verify failed, synthesize one or more blocking findings" in content
@@ -850,7 +850,7 @@ class TestSkillContentValidation:
         assert "git checkout <START_CHECKOUT>" not in content
         assert "git checkout --detach <START_CHECKOUT>" not in content
         assert "Do not run `git checkout`, `git switch`, or other manual branch-switching commands as part of this skill." in content
-        assert "Run `verify_command` from `gza.yaml` as part of every review cycle." in content
+        assert "Run `verify_command` from `gza.yaml` as part of every review iteration." in content
         assert "Pass the result forward as a `## verify_command result` section." in content
 
     def test_gza_task_run_no_longer_documents_manual_mark_completed_recovery(self):
