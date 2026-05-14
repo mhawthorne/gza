@@ -10742,7 +10742,7 @@ class TestProviderPromptSanitization:
             "gza.runner.subprocess.run",
             side_effect=subprocess.TimeoutExpired(
                 cmd=["bash", "-lc", config.verify_command],
-                timeout=120,
+                timeout=240,
                 output="partial pytest output\n",
                 stderr="still running\n",
             ),
@@ -10755,7 +10755,7 @@ class TestProviderPromptSanitization:
         assert "## verify_command result" in prompt
         assert "- Status: failed" in prompt
         assert "- Exit status: timed out" in prompt
-        assert "verify_command timed out after 120s" in prompt
+        assert "verify_command timed out after 240s" in prompt
         assert "partial pytest output" in prompt
         assert "still running" in prompt
         assert "## Original request:" in prompt
