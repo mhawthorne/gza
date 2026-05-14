@@ -6,12 +6,162 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from gza.cli.git_ops import _merge_single_task, _run_task_backed_rebase, cmd_advance
+from gza.cli.git_ops import (
+    _build_auto_merge_args,
+    _merge_single_task,
+    _resolve_merge_subject,
+    _run_task_backed_rebase,
+    cmd_advance,
+)
 from gza.config import Config
 from gza.git import Git
 from gza.rebase_diff import RebaseDiffResult
 
 from .conftest import make_store, run_gza, setup_config
+
+
+def _advance_args(tmp_path: Path, task_id: str) -> argparse.Namespace:
+    return argparse.Namespace(
+        project_dir=tmp_path,
+        task_id=task_id,
+        dry_run=False,
+        auto=True,
+        max=None,
+        batch=None,
+        no_docker=True,
+        force=False,
+        plans=False,
+        unimplemented=False,
+        create=False,
+        no_resume_failed=False,
+        max_resume_attempts=None,
+        advance_type=None,
+        new=False,
+        max_review_cycles=None,
+        squash_threshold=None,
+    )
+
+
+def _init_repo_with_remote_only_feature(tmp_path: Path, branch: str) -> Git:
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "base.txt").write_text("base\n")
+    git._run("add", "base.txt")
+    git._run("commit", "-m", "Initial commit")
+
+    git._run("checkout", "-b", branch)
+    feature_file = tmp_path / f"{branch.replace('/', '_')}.txt"
+    feature_file.write_text("remote tip\n")
+    git._run("add", str(feature_file.name))
+    git._run("commit", "-m", "Remote feature tip")
+    remote_sha = git.rev_parse("HEAD")
+
+    git._run("checkout", "main")
+    git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
+    git._run("branch", "-D", branch)
+    return git
+
+
+def _init_repo_with_stale_local_and_clean_origin(tmp_path: Path, branch: str) -> Git:
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "shared.txt").write_text("base\n")
+    git._run("add", "shared.txt")
+    git._run("commit", "-m", "Initial commit")
+    base_sha = git.rev_parse("HEAD")
+
+    git._run("checkout", "-b", branch)
+    (tmp_path / "feature.txt").write_text("remote tip\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Remote feature tip")
+    remote_sha = git.rev_parse("HEAD")
+
+    git._run("checkout", "main")
+    git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
+    git._run("update-ref", f"refs/heads/{branch}", base_sha)
+    return git
+
+
+def _init_repo_with_stale_origin_and_local_ahead(tmp_path: Path, branch: str) -> Git:
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "base.txt").write_text("base\n")
+    git._run("add", "base.txt")
+    git._run("commit", "-m", "Initial commit")
+
+    git._run("checkout", "-b", branch)
+    (tmp_path / "feature.txt").write_text("remote tip\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Remote tip")
+    remote_sha = git.rev_parse("HEAD")
+
+    (tmp_path / "feature.txt").write_text("remote tip\nlocal tip\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Local tip")
+    git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
+    git._run("checkout", "main")
+    return git
+
+
+def _init_repo_with_diverged_local_and_origin(tmp_path: Path, branch: str) -> Git:
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "base.txt").write_text("base\n")
+    git._run("add", "base.txt")
+    git._run("commit", "-m", "Initial commit")
+    base_sha = git.rev_parse("HEAD")
+
+    git._run("checkout", "-b", branch)
+    (tmp_path / "local.txt").write_text("local\n")
+    git._run("add", "local.txt")
+    git._run("commit", "-m", "Local only")
+    local_sha = git.rev_parse("HEAD")
+
+    git._run("update-ref", f"refs/heads/{branch}", base_sha)
+    git._run("checkout", branch)
+    (tmp_path / "remote.txt").write_text("remote\n")
+    git._run("add", "remote.txt")
+    git._run("commit", "-m", "Remote only")
+    remote_sha = git.rev_parse("HEAD")
+    git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
+
+    git._run("update-ref", f"refs/heads/{branch}", local_sha)
+    git._run("checkout", branch)
+    git._run("checkout", "main")
+    return git
+
+
+def _add_mergeable_impl_with_failed_rebase(store, branch: str):
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    task.branch = branch
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=task.id, same_branch=True)
+    failed_rebase.status = "failed"
+    failed_rebase.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    failed_rebase.branch = branch
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    store.update(failed_rebase)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+    return task
 
 
 def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -> None:
@@ -340,6 +490,214 @@ def test_advance_explicit_merge_refuses_when_checkout_does_not_match_canonical_t
     assert refreshed is not None
     assert refreshed.merge_status == "unmerged"
     assert git.is_merged(task.branch, "main") is False
+
+
+def test_advance_execution_merges_remote_tracking_ref_when_local_branch_is_missing(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.git import ResolvedMergeSourceRef
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    branch = "feature/advance-remote-only"
+    task = _add_mergeable_impl_with_failed_rebase(store, branch)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.side_effect = lambda b: b != branch
+    fake_git.ref_exists.side_effect = lambda r: r == f"origin/{branch}"
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(f"origin/{branch}")
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+    fake_git.merge.return_value = None
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    assert rc == 0
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+
+    fake_git.merge.assert_called_once()
+    merge_call_args, _ = fake_git.merge.call_args
+    assert merge_call_args[0] == f"origin/{branch}"
+
+    output = capsys.readouterr().out
+    assert f"Merging 'origin/{branch}' into 'main'" in output
+    assert "✓ Merged" in output
+
+
+def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.git import ResolvedMergeSourceRef
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    branch = "feature/advance-stale-local"
+    task = _add_mergeable_impl_with_failed_rebase(store, branch)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(f"origin/{branch}")
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+    fake_git.merge.return_value = None
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    assert rc == 0
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+
+    fake_git.merge.assert_called_once()
+    merge_call_args, _ = fake_git.merge.call_args
+    assert merge_call_args[0] == f"origin/{branch}"
+
+    output = capsys.readouterr().out
+    assert f"Merging 'origin/{branch}' into 'main'" in output
+    assert f"Merging '{branch}' into 'main'" not in output
+
+
+def test_advance_execution_prefers_local_branch_when_origin_is_stale(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.git import ResolvedMergeSourceRef
+
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    config.merge_squash_threshold = 1
+    store = make_store(tmp_path)
+    branch = "feature/advance-local-ahead"
+    task = _add_mergeable_impl_with_failed_rebase(store, branch)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(branch)
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+    fake_git.merge.return_value = None
+
+    resolved = _resolve_merge_subject(store, fake_git, task.id, target_branch="main")
+    assert resolved is not None
+    assert resolved.merge_source_ref == branch
+    merge_args = _build_auto_merge_args(config, fake_git, resolved.merge_source_ref, "main")
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    assert merge_args.squash is True
+    assert rc == 0
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+
+    fake_git.merge.assert_called_once()
+    merge_call_args, _ = fake_git.merge.call_args
+    assert merge_call_args[0] == branch
+
+    output = capsys.readouterr().out
+    assert f"Merging '{branch}' into 'main'" in output
+    assert f"Merging 'origin/{branch}' into 'main'" not in output
+
+
+def test_advance_dry_run_surfaces_diverged_merge_source_for_manual_resolution(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    branch = "feature/advance-diverged"
+    git = _init_repo_with_diverged_local_and_origin(tmp_path, branch)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = branch
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    args = _advance_args(tmp_path, task.id)
+    args.dry_run = True
+
+    with patch("gza.cli.git_ops.Git", return_value=git):
+        rc = cmd_advance(args)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "Needs attention" in output
+    assert "merge-source-needs-manual-resolution" in output
+    assert f"origin/{branch}" in output
+    assert "diverged" in output
 
 
 def test_rebase_background_creator_phase_failure_cleans_up_created_task_and_artifacts(tmp_path: Path) -> None:

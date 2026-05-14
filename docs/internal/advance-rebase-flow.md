@@ -4,11 +4,11 @@
 
 When `gza advance` encounters a completed task whose branch has merge conflicts with the currently checked-out branch (the advance target branch), it follows this flow (see `evaluate_advance_rules` in `src/gza/advance_engine.py`):
 
-1. **Detect conflicts**: `git.can_merge(task.branch, target_branch)` returns `False`, where `target_branch` is the explicit advance target for the lineage. In the default multi-task flow this is `git.current_branch()`, while explicit `gza advance <task-id>` planning uses the lineage's canonical merge target so the result is stable across worktrees. For non-dry explicit merges, advance also requires the active checkout to already be on that resolved target branch; otherwise it refuses execution instead of mutating a different checkout.
+1. **Detect conflicts**: advance first resolves the freshest available source ref for the implementation branch by comparing the local branch and `origin/<branch>` when both exist. It prefers `origin/<branch>` when the refs are equal or the remote-tracking ref is ahead, prefers the local branch when it is strictly ahead, and fails closed with an operator-visible manual-resolution warning when the two refs diverge. It then calls `git.can_merge(source_ref, target_branch)`. This keeps planning stable across worktrees whose local feature branches may be missing or stale after an operator pushes corrected commits elsewhere, without silently validating or merging stale remote content when local commits are newer. The resolved `source_ref` is also carried into merge execution, already-merged detection, and auto-squash commit counting so dry-run and non-dry execution validate and merge the same tip. `target_branch` is still the explicit advance target for the lineage: in the default multi-task flow this is `git.current_branch()`, while explicit `gza advance <task-id>` planning uses the lineage's canonical merge target so the result is stable across worktrees. For non-dry explicit merges, advance also requires the active checkout to already be on that resolved target branch; otherwise it refuses execution instead of mutating a different checkout.
 2. **Check for existing rebase children**: Query `store.get_lineage_children(task.id)` for any child tasks with `task_type="rebase"`
 3. **Decide action based on rebase child status**:
    - `pending` or `in_progress` → skip (rebase already running, avoid duplicates)
-   - `failed` → `needs_discussion` (manual intervention required)
+   - `failed` with no later successful same-branch rebase/recovery and no later approved/cleared review → `needs_discussion` (manual intervention required)
    - `completed` or no rebase child → create a new rebase task (`needs_rebase` action)
 
 ## How rebase tasks are created

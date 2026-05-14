@@ -89,6 +89,8 @@ Conflict detection uses the same target-branch resolution as task collection:
 | Branch cannot merge into the resolved target branch AND rebase child is `failed` | `needs_discussion` — manual intervention required |
 | Branch cannot merge into the resolved target branch AND no active rebase child | `needs_rebase` — create rebase task |
 
+A failed rebase is not cleared just because the latest implementation tip becomes mergeable again. If an implementation lineage still has no later approved or cleared review after that failed rebase, advance continues to surface `rebase-failed-needs-manual-resolution` instead of creating a first review from the now-clean tip.
+
 ### 5. Post-rebase review invalidation
 
 | Condition | Action |
@@ -233,7 +235,7 @@ When advance detects merge conflicts:
 5. On completion, the host runner force-pushes the rebased branch (`git push --force-with-lease`)
 6. Advance sees no more conflicts on next run
 7. If a completed rebase is newer than the latest review → advance creates a fresh review before merging
-8. If the rebase task fails → advance reports `needs_discussion` (no automatic retry)
+8. If the latest rebase task fails and there is no later successful same-branch rebase/recovery or later approved/cleared review → advance reports `needs_discussion` (no automatic retry)
 
 ### Docker considerations
 

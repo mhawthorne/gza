@@ -10,6 +10,7 @@ from typing import Any
 
 from gza.console import prompt_available_width, shorten_prompt
 from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from gza.git import ResolvedMergeSourceRef
 from gza.query import get_code_changing_descendants_for_root, get_reviews_for_root
 from gza.recovery_engine import (
     FailedRecoveryDecision,
@@ -59,6 +60,8 @@ class AdvanceContext:
     active_implement_child: DbTask | None = None
     has_non_dropped_plan_or_implement_descendant: bool = False
 
+    merge_source_ref: str | None = None
+    merge_source_warning: str | None = None
     can_merge: bool = True
     rebase_pending_or_running: DbTask | None = None
     rebase_failed: DbTask | None = None
@@ -97,6 +100,32 @@ class AdvanceRule:
     name: str
     matches: Callable[[AdvanceContext], bool]
     action: Callable[[AdvanceContext], dict[str, Any]]
+
+
+def _resolve_current_merge_source(git: Any, branch: str) -> ResolvedMergeSourceRef:
+    """Return the merge source chosen for advance planning and any warning."""
+    resolve_fresh = getattr(git, "resolve_fresh_merge_source", None)
+    if callable(resolve_fresh):
+        resolved = resolve_fresh(branch)
+        if isinstance(resolved, ResolvedMergeSourceRef):
+            return resolved
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            return ResolvedMergeSourceRef(resolved[0], resolved[1])
+        if isinstance(resolved, str):
+            return ResolvedMergeSourceRef(resolved)
+        if resolved is None:
+            return ResolvedMergeSourceRef(None)
+
+    resolve_fresh_ref = getattr(git, "resolve_fresh_merge_source_ref", None)
+    if callable(resolve_fresh_ref):
+        return ResolvedMergeSourceRef(resolve_fresh_ref(branch))
+
+    ref_exists = getattr(git, "ref_exists", None)
+    if callable(ref_exists):
+        remote_ref = f"origin/{branch}"
+        if ref_exists(remote_ref):
+            return ResolvedMergeSourceRef(remote_ref)
+    return ResolvedMergeSourceRef(branch)
 
 
 def is_resumable_failure_reason(failure_reason: str | None) -> bool:
@@ -314,6 +343,41 @@ def _normalize_time(value: datetime | None) -> datetime:
 def _task_event_time(task: DbTask) -> datetime:
     """Return the best available lifecycle timestamp for ordering tasks."""
     return _normalize_time(task.completed_at or task.created_at)
+
+
+def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
+    """Return True when a failed rebase remains the latest unresolved lineage state.
+
+    A clean current branch tip is not enough to clear failed rebase residue. We only
+    treat the lineage as having moved past that failure once later successful same-branch
+    progress exists on the implementation lineage, either via a completed rebase/recovery
+    or a later successful review outcome.
+    """
+    failed_rebase = ctx.rebase_failed
+    if failed_rebase is None:
+        return False
+
+    failed_rebase_time = _task_event_time(failed_rebase)
+
+    latest_completed_rebase = ctx.latest_completed_rebase
+    if latest_completed_rebase is not None:
+        latest_completed_rebase_time = _task_event_time(latest_completed_rebase)
+        if latest_completed_rebase_time > failed_rebase_time:
+            return False
+
+    review_cleared_at = ctx.task.review_cleared_at
+    if review_cleared_at is not None and _normalize_time(review_cleared_at) >= failed_rebase_time:
+        return False
+
+    latest_review = ctx.latest_completed_review
+    if latest_review is None:
+        return True
+
+    latest_review_time = _task_event_time(latest_review)
+    if latest_review_time < failed_rebase_time:
+        return True
+
+    return ctx.review_verdict not in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
 
 
 def _latest_unresolved_comment_time(store: SqliteTaskStore, task_id: str) -> datetime | None:
@@ -618,14 +682,16 @@ def resolve_advance_context(
             failure_reason=task.failure_reason,
         )
 
-    can_merge = git.can_merge(task.branch, target_branch)
+    merge_source = _resolve_current_merge_source(git, task.branch)
+    can_merge = bool(merge_source.ref) and git.can_merge(merge_source.ref, target_branch)
     rebase_children = [
         child
         for child in store.get_lineage_children(task.id)
         if child.task_type == "rebase" and (task.branch is None or child.branch is None or child.branch == task.branch)
     ]
     rebase_pending_or_running = next((c for c in rebase_children if c.status in {"pending", "in_progress"}), None)
-    rebase_failed = next((c for c in rebase_children if c.status == "failed"), None)
+    failed_rebases = [c for c in rebase_children if c.status == "failed"]
+    rebase_failed = max(failed_rebases, key=_task_event_time) if failed_rebases else None
 
     latest_completed_rebase: DbTask | None = None
     completed_rebases = [
@@ -682,6 +748,8 @@ def resolve_advance_context(
         has_non_dropped_plan_or_implement_descendant=has_non_dropped_plan_or_implement_descendant,
         failed_recovery_decision=failed_recovery_decision,
         failed_recovery_attention_reason=failed_recovery_attention_reason,
+        merge_source_ref=merge_source.ref,
+        merge_source_warning=merge_source.warning,
         can_merge=can_merge,
         rebase_pending_or_running=rebase_pending_or_running,
         rebase_failed=rebase_failed,
@@ -767,6 +835,17 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=lambda ctx: {"type": "skip", "description": _no_branch_description(ctx)},
     ),
     AdvanceRule(
+        name="merge_source_needs_manual_resolution",
+        matches=lambda ctx: ctx.merge_source_warning is not None,
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": f"SKIP: {ctx.merge_source_warning}",
+            },
+            reason="merge-source-needs-manual-resolution",
+        ),
+    ),
+    AdvanceRule(
         name="conflict_rebase_running",
         matches=lambda ctx: not ctx.can_merge and ctx.rebase_pending_or_running is not None,
         action=lambda ctx: {
@@ -776,7 +855,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="conflict_rebase_failed",
-        matches=lambda ctx: not ctx.can_merge and ctx.rebase_failed is not None,
+        matches=lambda ctx: not ctx.can_merge and _failed_rebase_still_blocks_advance(ctx),
         action=lambda ctx: with_needs_attention(
             {
                 "type": "needs_discussion",
@@ -812,6 +891,28 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="post_rebase_create_review",
         matches=lambda ctx: ctx.rebase_invalidates_review,
         action=lambda ctx: {"type": "create_review", "description": _rebase_create_review_description(ctx.review_invalidated_by_rebase)},
+    ),
+    AdvanceRule(
+        name="failed_rebase_without_successful_review",
+        matches=lambda ctx: _failed_rebase_still_blocks_advance(ctx),
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
+            },
+            reason="rebase-failed-needs-manual-resolution",
+        ),
+    ),
+    AdvanceRule(
+        name="failed_rebase_without_successful_review",
+        matches=lambda ctx: _failed_rebase_still_blocks_advance(ctx),
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
+            },
+            reason="rebase-failed-needs-manual-resolution",
+        ),
     ),
     AdvanceRule(
         name="closing_review_invariant",

@@ -34,6 +34,14 @@ class ResolvedGitRef:
     warning: str | None = None
 
 
+@dataclass(frozen=True)
+class ResolvedMergeSourceRef:
+    """Freshest merge-source selection for advance and merge workflows."""
+
+    ref: str | None
+    warning: str | None = None
+
+
 def _unquote_c_style_path(path: str) -> str:
     """Decode git C-style quoted paths from porcelain output."""
     if not (len(path) >= 2 and path[0] == '"' and path[-1] == '"'):
@@ -567,6 +575,56 @@ class Git:
 
         return None
 
+    def resolve_fresh_merge_source(self, branch: str, *, remote: str = "origin") -> ResolvedMergeSourceRef:
+        """Return the freshest safe ref for merge planning/execution.
+
+        Compare the local branch and remote-tracking ref when both exist. Prefer
+        ``<remote>/<branch>`` when it is equal to or ahead of the local branch,
+        prefer the local branch when it is strictly ahead, and fail closed with
+        a warning when the two refs have diverged.
+        """
+        remote_ref = f"{remote}/{branch}"
+        local_exists = self.branch_exists(branch)
+        remote_exists = self.ref_exists(remote_ref)
+
+        if remote_exists and not local_exists:
+            return ResolvedMergeSourceRef(remote_ref)
+        if local_exists and not remote_exists:
+            return ResolvedMergeSourceRef(branch)
+        if not local_exists and not remote_exists:
+            return ResolvedMergeSourceRef(None)
+
+        local_sha = self.rev_parse_if_exists(branch)
+        remote_sha = self.rev_parse_if_exists(remote_ref)
+        if local_sha and remote_sha and local_sha == remote_sha:
+            return ResolvedMergeSourceRef(remote_ref)
+
+        local_ahead = self.count_commits_ahead(branch, remote_ref)
+        remote_ahead = self.count_commits_ahead(remote_ref, branch)
+        if remote_ahead > 0 and local_ahead == 0:
+            return ResolvedMergeSourceRef(remote_ref)
+        if local_ahead > 0 and remote_ahead == 0:
+            return ResolvedMergeSourceRef(branch)
+        if local_ahead > 0 and remote_ahead > 0:
+            return ResolvedMergeSourceRef(
+                None,
+                (
+                    f"Local branch '{branch}' and remote-tracking ref '{remote_ref}' diverged. "
+                    "Push, fetch, or reconcile them before advancing or merging."
+                ),
+            )
+        return ResolvedMergeSourceRef(
+            None,
+            (
+                f"Unable to determine the freshest merge source between '{branch}' "
+                f"and '{remote_ref}'. Reconcile the refs before advancing or merging."
+            ),
+        )
+
+    def resolve_fresh_merge_source_ref(self, branch: str, *, remote: str = "origin") -> str | None:
+        """Return the freshest merge source ref when it is unambiguous."""
+        return self.resolve_fresh_merge_source(branch, remote=remote).ref
+
     def rev_parse(self, ref: str) -> str:
         """Resolve a ref to its commit SHA."""
         result = self._run("rev-parse", "--verify", f"{ref}^{{commit}}")
@@ -765,6 +823,9 @@ class Git:
         """Check if a branch can be merged cleanly (no conflicts).
 
         Uses git merge-tree to simulate a merge without touching the worktree.
+        Accepts either a local branch name or any other resolvable commit ref,
+        such as ``origin/<branch>`` when advance planning is reconciling across
+        worktrees.
 
         Args:
             branch: The branch to check
@@ -776,7 +837,7 @@ class Git:
         if into is None:
             into = self.default_branch()
 
-        if not self.branch_exists(branch):
+        if not self.branch_exists(branch) and not self.ref_exists(branch):
             return False
 
         # git merge-tree returns 0 for clean merge, 1 for conflicts

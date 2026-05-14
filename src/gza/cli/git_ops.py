@@ -28,6 +28,7 @@ from ..failure_reasons import mark_task_failed_from_cause
 from ..git import (
     Git,
     GitError,
+    ResolvedMergeSourceRef,
     active_worktree_path_for_branch,
     cleanup_worktree_for_branch,
     resolve_ref_if_possible,
@@ -108,6 +109,44 @@ class _ResolvedMergeSubject:
     merge_subject: DbTask
     merge_unit_id: str | None
     merge_branch: str | None
+    merge_source_ref: str | None
+    merge_source_warning: str | None
+
+
+def _resolve_fresh_merge_source(git: Git, branch: str | None) -> ResolvedMergeSourceRef:
+    """Return the freshest merge source ref supported by this git runtime."""
+    if not branch:
+        return ResolvedMergeSourceRef(None)
+
+    resolve_fresh = getattr(git, "resolve_fresh_merge_source", None)
+    if callable(resolve_fresh):
+        resolved = resolve_fresh(branch)
+        if isinstance(resolved, ResolvedMergeSourceRef):
+            return resolved
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            return ResolvedMergeSourceRef(resolved[0], resolved[1])
+        if isinstance(resolved, str):
+            return ResolvedMergeSourceRef(resolved)
+        if resolved is None:
+            return ResolvedMergeSourceRef(None)
+
+    resolve_fresh_ref = getattr(git, "resolve_fresh_merge_source_ref", None)
+    if callable(resolve_fresh_ref):
+        return ResolvedMergeSourceRef(resolve_fresh_ref(branch))
+
+    ref_exists = getattr(git, "ref_exists", None)
+    if callable(ref_exists):
+        remote_ref = f"origin/{branch}"
+        if ref_exists(remote_ref):
+            return ResolvedMergeSourceRef(remote_ref)
+
+    branch_exists = getattr(git, "branch_exists", None)
+    if callable(branch_exists):
+        if branch_exists(branch):
+            return ResolvedMergeSourceRef(branch)
+        return ResolvedMergeSourceRef(None)
+
+    return ResolvedMergeSourceRef(branch)
 
 
 def _task_is_already_merged(store: SqliteTaskStore, task: DbTask) -> bool:
@@ -439,13 +478,13 @@ def _require_default_branch(
 def _auto_squash_commit_count(
     config: Config,
     git: Git,
-    task: DbTask,
+    source_ref: str | None,
     target_branch: str,
 ) -> int | None:
     """Return commit count when task should auto-squash, otherwise None."""
-    if config.merge_squash_threshold <= 0 or not task.branch:
+    if config.merge_squash_threshold <= 0 or not source_ref:
         return None
-    commit_count = git.count_commits_ahead(task.branch, target_branch)
+    commit_count = git.count_commits_ahead(source_ref, target_branch)
     if commit_count < config.merge_squash_threshold:
         return None
     return commit_count
@@ -454,11 +493,11 @@ def _auto_squash_commit_count(
 def _build_auto_merge_args(
     config: Config,
     git: Git,
-    task: DbTask,
+    source_ref: str | None,
     target_branch: str,
 ) -> argparse.Namespace:
     """Build merge args with auto-squash behavior aligned across entrypoints."""
-    should_squash = _auto_squash_commit_count(config, git, task, target_branch) is not None
+    should_squash = _auto_squash_commit_count(config, git, source_ref, target_branch) is not None
     return argparse.Namespace(
         rebase=False,
         squash=should_squash,
@@ -519,6 +558,7 @@ def _resolve_merge_target_task(
 
 def _resolve_merge_subject(
     store: SqliteTaskStore,
+    git: Git,
     task_id: str,
     *,
     target_branch: str,
@@ -526,6 +566,7 @@ def _resolve_merge_subject(
     trigger_task = store.get(task_id)
     if trigger_task is None:
         return None
+    trigger_source = _resolve_fresh_merge_source(git, trigger_task.branch)
     if trigger_task.id is None:
         return _ResolvedMergeSubject(
             trigger_task=trigger_task,
@@ -533,6 +574,8 @@ def _resolve_merge_subject(
             merge_subject=trigger_task,
             merge_unit_id=None,
             merge_branch=trigger_task.branch,
+            merge_source_ref=trigger_source.ref,
+            merge_source_warning=trigger_source.warning,
         )
 
     unit = store.resolve_merge_unit_for_task(trigger_task.id)
@@ -545,6 +588,8 @@ def _resolve_merge_subject(
             merge_subject=trigger_task,
             merge_unit_id=None,
             merge_branch=trigger_task.branch,
+            merge_source_ref=trigger_source.ref,
+            merge_source_warning=trigger_source.warning,
         )
 
     merge_subject = store.resolve_merge_unit_owner_task(unit) or trigger_task
@@ -555,12 +600,15 @@ def _resolve_merge_subject(
     )
     if execution_task is None:
         execution_task = trigger_task if trigger_task.branch == unit.source_branch else merge_subject
+    merge_source = _resolve_fresh_merge_source(git, unit.source_branch)
     return _ResolvedMergeSubject(
         trigger_task=trigger_task,
         execution_task=execution_task,
         merge_subject=merge_subject,
         merge_unit_id=unit.id,
         merge_branch=unit.source_branch,
+        merge_source_ref=merge_source.ref,
+        merge_source_warning=merge_source.warning,
     )
 
 
@@ -574,7 +622,7 @@ def _merge_single_task(
 ) -> int:
     """Merge a single task's branch. Returns 0 on success, 1 on failure."""
     target_branch = git.default_branch()
-    resolved = _resolve_merge_subject(store, task_id, target_branch=target_branch)
+    resolved = _resolve_merge_subject(store, git, task_id, target_branch=target_branch)
     if resolved is None:
         print(f"Error: Task {task_id} not found")
         return 1
@@ -582,6 +630,7 @@ def _merge_single_task(
     merge_subject = resolved.merge_subject
     assert merge_subject.id is not None
     merge_branch = resolved.merge_branch or execution_task.branch
+    merge_source_ref = resolved.merge_source_ref
     merge_unit_id = resolved.merge_unit_id
 
     # Validate task state
@@ -592,8 +641,15 @@ def _merge_single_task(
         )
         return 1
 
-    if not merge_branch:
-        print(f"Error: Task {merge_subject.id} has no branch")
+    if resolved.merge_source_warning:
+        print(f"Error: {resolved.merge_source_warning}")
+        return 1
+
+    if not merge_branch or not merge_source_ref:
+        print(f"Error: Task {merge_subject.id} has no resolvable merge source")
+        return 1
+    if resolved.merge_source_warning:
+        print(f"Error: {resolved.merge_source_warning}")
         return 1
 
     # Handle --mark-only flag
@@ -611,15 +667,15 @@ def _merge_single_task(
         return 0
 
     # Check if branch already merged
-    if git.is_merged(merge_branch, current_branch):
+    if git.is_merged(merge_source_ref, current_branch):
         default_branch = git.default_branch()
-        if current_branch != default_branch and not git.is_merged(merge_branch, default_branch):
+        if current_branch != default_branch and not git.is_merged(merge_source_ref, default_branch):
             print(
-                f"Error: Branch '{merge_branch}' is already merged into current branch "
+                f"Error: Branch '{merge_source_ref}' is already merged into current branch "
                 f"'{current_branch}', but still unmerged from default branch '{default_branch}'"
             )
         else:
-            print(f"Error: Branch '{merge_branch}' is already merged into {current_branch}")
+            print(f"Error: Branch '{merge_source_ref}' is already merged into {current_branch}")
         return 1
 
     # Check for uncommitted changes (untracked files are OK, they won't conflict with merge)
@@ -642,9 +698,9 @@ def _merge_single_task(
         print("Error: --resolve requires --rebase")
         return 1
 
-    if not args.rebase and not git.can_merge(merge_branch, current_branch):
+    if not args.rebase and not git.can_merge(merge_source_ref, current_branch):
         print(
-            f"Error: Branch '{merge_branch}' has conflicts against '{current_branch}' "
+            f"Error: Branch '{merge_source_ref}' has conflicts against '{current_branch}' "
             "and cannot be merged cleanly."
         )
         print(f"Run: uv run gza rebase {merge_subject.id} --resolve")
@@ -675,7 +731,7 @@ def _merge_single_task(
             print(f"✓ Fast-forwarded {current_branch} to {merge_branch}")
         else:
             # Regular merge or squash merge
-            print(f"Merging '{merge_branch}' into '{current_branch}'...")
+            print(f"Merging '{merge_source_ref}' into '{current_branch}'...")
 
             # For squash merge, create a commit message from the task
             commit_message = None
@@ -688,12 +744,12 @@ def _merge_single_task(
                     subject_prefix="Squash merge: ",
                 )
 
-            git.merge(merge_branch, squash=args.squash, commit_message=commit_message)
+            git.merge(merge_source_ref, squash=args.squash, commit_message=commit_message)
 
             if args.squash:
-                print(f"✓ Successfully squash merged {merge_branch} and created commit")
+                print(f"✓ Successfully squash merged {merge_source_ref} and created commit")
             else:
-                print(f"✓ Successfully merged {merge_branch}")
+                print(f"✓ Successfully merged {merge_source_ref}")
 
         # Delete branch if requested
         if args.delete:
@@ -1926,7 +1982,7 @@ def _execute_merge_action(
     reused_followups: list[DbTask] = []
     execution_git = merge_git or git
     execution_branch = merge_current_branch or current_branch
-    resolved_subject = _resolve_merge_subject(store, task.id or "", target_branch=target_branch) if task.id else None
+    resolved_subject = _resolve_merge_subject(store, execution_git, task.id or "", target_branch=target_branch) if task.id else None
     merge_subject = resolved_subject.merge_subject if resolved_subject is not None else task
     assert merge_subject.id is not None
 
@@ -1935,6 +1991,14 @@ def _execute_merge_action(
             f"Error: Advance merge for task {merge_subject.id} targets '{target_branch}', "
             f"but the active checkout is '{execution_branch}'. Switch to '{target_branch}' and rerun."
         )
+        return _MergeActionResult(
+            rc=1,
+            created_followups=created_followups,
+            reused_followups=reused_followups,
+        )
+
+    if resolved_subject is not None and resolved_subject.merge_source_warning:
+        print(f"Error: {resolved_subject.merge_source_warning}")
         return _MergeActionResult(
             rc=1,
             created_followups=created_followups,
@@ -1956,9 +2020,8 @@ def _execute_merge_action(
     if (
         already_merged_behavior == "mark_merged"
         and resolved_subject is not None
-        and resolved_subject.merge_branch
-        and execution_git.branch_exists(resolved_subject.merge_branch)
-        and execution_git.is_merged(resolved_subject.merge_branch, execution_branch)
+        and resolved_subject.merge_source_ref
+        and execution_git.is_merged(resolved_subject.merge_source_ref, execution_branch)
     ):
         if resolved_subject.merge_unit_id is not None:
             store.set_merge_unit_state(
@@ -1975,7 +2038,12 @@ def _execute_merge_action(
             status="already_merged",
         )
 
-    merge_args = _build_auto_merge_args(config, execution_git, task, target_branch)
+    merge_args = _build_auto_merge_args(
+        config,
+        execution_git,
+        resolved_subject.merge_source_ref if resolved_subject is not None else task.branch,
+        target_branch,
+    )
     rc = _merge_single_task(
         task.id,
         config,
@@ -2344,7 +2412,17 @@ def cmd_advance(args: argparse.Namespace) -> int:
             continue
         description = action["description"]
         if action["type"] in {"merge", "merge_with_followups"} and dry_run:
-            commit_count = _auto_squash_commit_count(config, git, task, target_branch)
+            resolved_subject = (
+                _resolve_merge_subject(store, git, task.id, target_branch=target_branch)
+                if task.id is not None
+                else None
+            )
+            commit_count = _auto_squash_commit_count(
+                config,
+                git,
+                resolved_subject.merge_source_ref if resolved_subject is not None else task.branch,
+                target_branch,
+            )
             if commit_count is not None:
                 description = f"{description} (auto-squash, {commit_count} commits)"
         elif is_worker_consuming_advance_action(action["type"]):
@@ -2564,9 +2642,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 console.print(f"      [{_c_ok}]✓ Merged[/{_c_ok}]")
                 success_count += 1
             else:
-                task_branch = task.branch
+                resolved_subject = (
+                    _resolve_merge_subject(store, git, task.id, target_branch=target_branch)
+                    if task.id is not None
+                    else None
+                )
+                conflict_ref = resolved_subject.merge_source_ref if resolved_subject is not None else task.branch
                 conflict_detected = (
-                    task_branch is not None and not git.can_merge(task_branch, target_branch)
+                    conflict_ref is not None and not git.can_merge(conflict_ref, target_branch)
                 )
                 if conflict_detected:
                     console.print(f"      [{_c_warn}]! Merge had conflicts against '{target_branch}'[/{_c_warn}]")

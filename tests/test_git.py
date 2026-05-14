@@ -927,10 +927,26 @@ class TestMergeOperations:
         repo_dir.mkdir()
         git = Git(repo_dir)
 
-        with patch.object(git, 'branch_exists', return_value=False):
+        with patch.object(git, 'branch_exists', return_value=False), \
+             patch.object(git, 'ref_exists', return_value=False):
             result = git.can_merge("nonexistent")
 
             assert result is False
+
+    def test_can_merge_accepts_remote_tracking_ref(self, tmp_path: Path):
+        """Remote-tracking refs should be valid mergeability inputs."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "branch_exists", return_value=False), \
+             patch.object(git, "ref_exists", return_value=True), \
+             patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+            result = git.can_merge("origin/feature", "main")
+
+            assert result is True
 
     def test_can_merge_with_into_parameter(self, tmp_path: Path):
         """Test can_merge with into parameter specified."""
@@ -1510,6 +1526,54 @@ class TestExtractionGitHelpers:
             ]
 
             assert git.resolve_merge_source_ref("feature/demo") is None
+
+    def test_resolve_fresh_merge_source_prefers_local_when_origin_is_stale(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with (
+            patch.object(git, "branch_exists", return_value=True),
+            patch.object(git, "ref_exists", return_value=True),
+            patch.object(git, "rev_parse_if_exists", side_effect=["local-sha", "remote-sha"]),
+            patch.object(git, "count_commits_ahead", side_effect=[1, 0]),
+        ):
+            resolved = git.resolve_fresh_merge_source("feature/demo")
+
+        assert resolved.ref == "feature/demo"
+        assert resolved.warning is None
+
+    def test_resolve_fresh_merge_source_prefers_origin_when_refs_match(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with (
+            patch.object(git, "branch_exists", return_value=True),
+            patch.object(git, "ref_exists", return_value=True),
+            patch.object(git, "rev_parse_if_exists", side_effect=["same-sha", "same-sha"]),
+        ):
+            resolved = git.resolve_fresh_merge_source("feature/demo")
+
+        assert resolved.ref == "origin/feature/demo"
+        assert resolved.warning is None
+
+    def test_resolve_fresh_merge_source_returns_warning_for_diverged_refs(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with (
+            patch.object(git, "branch_exists", return_value=True),
+            patch.object(git, "ref_exists", return_value=True),
+            patch.object(git, "rev_parse_if_exists", side_effect=["local-sha", "remote-sha"]),
+            patch.object(git, "count_commits_ahead", side_effect=[1, 1]),
+        ):
+            resolved = git.resolve_fresh_merge_source("feature/demo")
+
+        assert resolved.ref is None
+        assert resolved.warning is not None
+        assert "diverged" in resolved.warning
 
     def test_get_diff_name_status_scoped_to_paths(self, tmp_path: Path):
         repo_dir = tmp_path / "repo"
