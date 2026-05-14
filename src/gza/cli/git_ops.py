@@ -55,6 +55,12 @@ from ..runner import (
     task_log_storage_path,
     write_log_entry,
 )
+from ..source_followup import (
+    SourceFollowupState,
+    collect_non_dropped_implement_source_ids,
+    resolve_source_followup_state,
+    source_task_needs_implementation_followup,
+)
 from ..sync_ops import (
     DEFAULT_SYNC_CACHE_SECONDS,
     build_branch_cohorts_for_task_ids,
@@ -311,7 +317,7 @@ def _collect_advance_completed_tasks(
     Returns completed unmerged tasks and also completed plan tasks without
     implement children (except when filtering to implement-only mode).
     """
-    impl_based_on_ids: set[str] = store.get_impl_based_on_ids()
+    impl_based_on_ids = collect_non_dropped_implement_source_ids(store.get_all())
     if store.supports_merge_units():
         tasks = []
         seen_unit_ids: set[str] = set()
@@ -1709,15 +1715,16 @@ def _resolve_unimplemented_source_targets(
     store: SqliteTaskStore,
     task: DbTask,
     *,
-    impl_source_ids: set[str],
     task_types: tuple[str, ...],
     task_cache: dict[str, DbTask],
     children_cache: dict[str, list[DbTask]],
-    frontier_cache: dict[str, tuple[list[DbTask], bool]],
+    frontier_cache: dict[str, list[DbTask]],
+    followup_state_cache: dict[str, SourceFollowupState],
+    non_dropped_implement_source_ids: set[str],
 ) -> list[DbTask]:
     """Resolve the newest unimplemented plan/explore source rows for each lineage branch."""
 
-    def _walk(current: DbTask) -> tuple[list[DbTask], bool]:
+    def _walk(current: DbTask) -> list[DbTask]:
         assert current.id is not None
         cached = frontier_cache.get(current.id)
         if cached is not None:
@@ -1733,32 +1740,30 @@ def _resolve_unimplemented_source_targets(
                 task_cache[child.id] = child
 
         child_targets: list[DbTask] = []
-        has_implement_in_subtree = current.task_type == "implement" or current.id in impl_source_ids
-
         for child in children:
             if child.id is None:
                 continue
-            branch_targets, branch_has_implement = _walk(child)
+            branch_targets = _walk(child)
             child_targets.extend(branch_targets)
-            has_implement_in_subtree = has_implement_in_subtree or branch_has_implement
 
         if child_targets:
             result = child_targets
-        elif (
-            current.task_type in task_types
-            and current.id not in impl_source_ids
-            and not has_implement_in_subtree
-            and current.status not in {"failed", "dropped"}
+        elif current.task_type in task_types and source_task_needs_implementation_followup(
+            current,
+            followup_state_cache.setdefault(
+                current.id,
+                resolve_source_followup_state(current, get_children=store.get_based_on_children),
+            ),
+            non_dropped_implement_source_ids=non_dropped_implement_source_ids,
         ):
             result = [current]
         else:
             result = []
 
-        frontier_cache[current.id] = (result, has_implement_in_subtree)
-        return frontier_cache[current.id]
+        frontier_cache[current.id] = result
+        return result
 
-    targets, _ = _walk(task)
-    return targets
+    return _walk(task)
 
 
 def _cmd_advance_unimplemented(
@@ -1779,10 +1784,11 @@ def _cmd_advance_unimplemented(
     # Find the current unimplemented source frontier for each lineage tree. A newer
     # descendant source row can replace its own ancestors, but sibling branches stay
     # independently eligible and implement tasks are never shown directly.
-    impl_source_ids: set[str] = store.get_impl_based_on_ids()
     task_cache = {task.id: task for task in all_completed if task.id is not None}
     children_cache: dict[str, list[DbTask]] = {}
-    frontier_cache: dict[str, tuple[list[DbTask], bool]] = {}
+    frontier_cache: dict[str, list[DbTask]] = {}
+    followup_state_cache: dict[str, SourceFollowupState] = {}
+    non_dropped_implement_source_ids = collect_non_dropped_implement_source_ids(store.get_all())
     covered_root_ids: set[str] = set()
     pending_tasks: list[DbTask] = []
 
@@ -1797,11 +1803,12 @@ def _cmd_advance_unimplemented(
             _resolve_unimplemented_source_targets(
                 store,
                 root,
-                impl_source_ids=impl_source_ids,
                 task_types=task_types,
                 task_cache=task_cache,
                 children_cache=children_cache,
                 frontier_cache=frontier_cache,
+                followup_state_cache=followup_state_cache,
+                non_dropped_implement_source_ids=non_dropped_implement_source_ids,
             )
         )
 
@@ -1828,7 +1835,7 @@ def _cmd_advance_unimplemented(
         if any(not _is_directly_implementable_plan(task) for task in pending_tasks):
             print(
                 "Use 'gza advance --unimplemented --create' to queue implement tasks "
-                "for listed explore rows or incomplete source descendants."
+                "for listed explore rows."
             )
         return 0
 

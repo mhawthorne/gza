@@ -121,7 +121,7 @@ class TestAdvanceUnimplementedCommand:
         assert rc == 0
         assert "No plan/explore lineages without implementation tasks." in capsys.readouterr().out
 
-    def test_advance_unimplemented_prefers_pending_plan_descendant_and_create_targets_it(
+    def test_advance_unimplemented_skips_explore_lineage_handed_off_to_pending_plan_descendant(
         self, tmp_path: Path, capsys
     ) -> None:
         setup_config(tmp_path)
@@ -143,22 +143,17 @@ class TestAdvanceUnimplementedCommand:
         output = capsys.readouterr().out
 
         assert rc == 0
-        assert str(plan.id) in output
-        assert "Plan the ingestion implementation" in output
-        assert "(pending)" in output
+        assert "No plan/explore lineages without implementation tasks." in output
+        assert str(plan.id) not in output
+        assert "Plan the ingestion implementation" not in output
         assert str(explore.id) not in output
         assert "Explore the ingestion approach" not in output
-        assert f"gza implement {plan.id}" not in output
-        assert "gza advance --unimplemented --create" in output
 
         create_rc = _run_unimplemented(tmp_path, store, create=True)
 
         assert create_rc == 0
         implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
-        assert len(implement_tasks) == 1
-        assert implement_tasks[0].depends_on == plan.id
-        assert implement_tasks[0].depends_on != explore.id
-        assert implement_tasks[0].prompt.startswith(f"Implement plan from task {plan.id}")
+        assert implement_tasks == []
 
     def test_advance_unimplemented_still_lists_completed_plan_without_descendants(self, tmp_path: Path, capsys) -> None:
         setup_config(tmp_path)
@@ -248,7 +243,7 @@ class TestAdvanceUnimplementedCommand:
         assert str(explore.id) not in output
         assert str(plan.id) not in output
 
-    def test_advance_unimplemented_prefers_newest_explore_descendant_deterministically(
+    def test_advance_unimplemented_prefers_newest_completed_explore_descendant_deterministically(
         self, tmp_path: Path, capsys
     ) -> None:
         setup_config(tmp_path)
@@ -287,14 +282,14 @@ class TestAdvanceUnimplementedCommand:
         output = capsys.readouterr().out
 
         assert rc == 0
-        assert str(latest_descendant.id) in output
-        assert "Explore reporting delivery tradeoffs" in output
-        assert "(pending)" in output
+        assert str(first_descendant.id) in output
+        assert "Explore reporting storage choices" in output
+        assert "(completed)" in output
         assert str(root.id) not in output
-        assert str(first_descendant.id) not in output
         assert "Explore reporting architecture" not in output
-        assert "Explore reporting storage choices" not in output
-        assert f"gza implement {latest_descendant.id}" not in output
+        assert str(latest_descendant.id) not in output
+        assert "Explore reporting delivery tradeoffs" not in output
+        assert f"gza implement {first_descendant.id}" not in output
         assert "gza advance --unimplemented --create" in output
 
         create_rc = _run_unimplemented(tmp_path, store, create=True)
@@ -302,8 +297,8 @@ class TestAdvanceUnimplementedCommand:
         assert create_rc == 0
         implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
         assert len(implement_tasks) == 1
-        assert implement_tasks[0].depends_on == latest_descendant.id
-        assert implement_tasks[0].prompt.startswith(f"Implement findings from task {latest_descendant.id}")
+        assert implement_tasks[0].depends_on == first_descendant.id
+        assert implement_tasks[0].prompt.startswith(f"Implement findings from task {first_descendant.id}")
 
     def test_advance_unimplemented_skips_failed_sibling_when_other_sibling_implemented(
         self, tmp_path: Path, capsys
@@ -420,14 +415,10 @@ class TestAdvanceUnimplementedCommand:
         assert str(dropped_retry.id) not in output
         assert "No plan/explore lineages without implementation tasks." in output
 
-    def test_advance_unimplemented_skips_dropped_leaf_with_no_implement_anywhere(
+    def test_advance_unimplemented_lists_completed_explore_with_only_dropped_plan_descendant(
         self, tmp_path: Path, capsys
     ) -> None:
-        """A dropped leaf is abandoned even when no sibling carried the work to implementation.
-
-        Dropped means the user explicitly walked away from this row. It should never surface
-        as "needs manual implementation" — surfacing a completed ancestor is fine if one exists.
-        """
+        """A dropped plan descendant does not suppress the completed explore frontier row."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -458,6 +449,17 @@ class TestAdvanceUnimplementedCommand:
         assert rc == 0
         assert str(dropped_descendant.id) not in output
         assert str(completed_ancestor.id) in output
+        assert "Explore the thing" in output
+
+        create_rc = _run_unimplemented(tmp_path, store, create=True)
+
+        assert create_rc == 0
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+        assert len(implement_tasks) == 1
+        assert (
+            implement_tasks[0].based_on == completed_ancestor.id
+            or implement_tasks[0].depends_on == completed_ancestor.id
+        )
 
     def test_advance_unimplemented_keeps_sibling_source_branches(self, tmp_path: Path, capsys) -> None:
         setup_config(tmp_path)
@@ -606,7 +608,7 @@ class TestAdvanceUnimplementedCommand:
         ) in output
         assert (
             "Use 'gza advance --unimplemented --create' to queue implement tasks "
-            "for listed explore rows or incomplete source descendants."
+            "for listed explore rows."
         ) in output
 
     def test_advance_unimplemented_create_queues_implement_tasks(self, tmp_path: Path, capsys) -> None:

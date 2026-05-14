@@ -116,21 +116,24 @@ def test_configuration_docs_cover_force_execution_flags_and_prerequisite_unmerge
 
 
 def test_configuration_docs_describe_unimplemented_lineage_guidance() -> None:
-    """advance docs should explain pending-descendant lineage selection and truthful follow-up actions."""
+    """advance docs should explain completed-source surfacing and truthful follow-up actions."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"
     config_content = (docs_root / "configuration.md").read_text()
 
     required_snippets = [
-        "| `--unimplemented` | List unimplemented plan/explore source rows, preferring newer descendants within each lineage branch |",
+        "| `--unimplemented` | List completed plan/explore source rows that still need an implementation path |",
         "| `--create` | With `--unimplemented`: queue implement tasks for the listed source rows |",
-        "It may surface a newer pending",
-        "keeping sibling branches as separate source rows",
+        "Completed `explore` roots with an active",
+        "queued follow-up work through `uv run gza next`, `uv run gza next --all`, or other queue surfaces.",
         "Only completed plan rows are directly runnable with `uv run gza implement <id>`;",
         "use `uv run gza advance --unimplemented --create` to queue implement tasks",
+        "for listed explore rows.",
     ]
 
     for snippet in required_snippets:
         assert snippet in config_content
+
+    assert "It may surface a newer pending" not in config_content
 
 
 def test_configuration_docs_describe_sync_as_broader_explicit_reconciliation_surface() -> None:
@@ -423,7 +426,7 @@ def test_internal_advance_workflow_failed_task_recovery_is_not_resume_only() -> 
     docs_root = Path(__file__).resolve().parents[1] / "docs"
     internal_content = (docs_root / "internal" / "advance-workflow.md").read_text()
 
-    failed_task_section = internal_content.split("### 8. Failed task recovery", 1)[1].split("## Improve chain semantics", 1)[0]
+    failed_task_section = internal_content.split("### 9. Failed task recovery", 1)[1].split("## Improve chain semantics", 1)[0]
     worker_actions_section = internal_content.split("### Worker-spawning actions", 1)[1].split("### Direct actions", 1)[0]
     output_section = internal_content.split("## Output", 1)[1].split("## Idempotency", 1)[0]
 

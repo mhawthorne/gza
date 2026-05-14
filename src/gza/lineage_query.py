@@ -9,6 +9,12 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from .db import MergeUnit, SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from .source_followup import (
+    SourceFollowupState,
+    collect_non_dropped_implement_source_ids,
+    resolve_source_followup_state,
+    source_task_needs_implementation_followup,
+)
 
 if TYPE_CHECKING:
     from .config import Config
@@ -92,6 +98,7 @@ class _LineageIndexes:
     skipped_same_branch_members_by_root_id: dict[str, list[DbTask]]
     merge_units_by_task_id: dict[str, MergeUnit]
     impl_based_on_ids: set[str]
+    non_dropped_impl_source_ids: set[str]
 
 
 def _normalize_dt(value: datetime | None) -> datetime:
@@ -362,6 +369,7 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
         skipped_same_branch_members_by_root_id=skipped_same_branch_members_by_root_id,
         merge_units_by_task_id=merge_units_by_task_id,
         impl_based_on_ids=store.get_impl_based_on_ids(),
+        non_dropped_impl_source_ids=collect_non_dropped_implement_source_ids(tasks),
     )
 
 
@@ -459,10 +467,9 @@ def _select_representative_completed_task(
     unresolved_tasks: Sequence[DbTask],
     *,
     include_dropped: bool,
-    impl_based_on_ids: set[str],
 ) -> DbTask | None:
     owner = snapshot.owner_task
-    if owner.id is not None and owner.task_type in {"plan", "explore"} and owner.id not in impl_based_on_ids:
+    if owner.task_type in {"plan", "explore"} and owner.status == "completed" and owner in unresolved_tasks:
         return owner
     actionable = _actionable_lifecycle_tasks(unresolved_tasks, include_dropped=include_dropped)
     if not actionable:
@@ -560,6 +567,24 @@ def _has_completed_same_type_descendant(indexes: _LineageIndexes, task: DbTask) 
     return False
 
 
+def _source_followup_state(
+    indexes: _LineageIndexes,
+    task: DbTask,
+    cache: dict[str, SourceFollowupState],
+) -> SourceFollowupState:
+    if task.id is None:
+        return resolve_source_followup_state(task, get_children=lambda _task_id: ())
+    cached = cache.get(task.id)
+    if cached is not None:
+        return cached
+    resolved = resolve_source_followup_state(
+        task,
+        get_children=lambda task_id: indexes.based_on_children.get(task_id, ()),
+    )
+    cache[task.id] = resolved
+    return resolved
+
+
 def _has_merged_descendant(
     indexes: _LineageIndexes,
     task: DbTask,
@@ -643,6 +668,7 @@ def query_lineage_owner_rows(
         for index, task in enumerate(visible_failed_tasks)
         if task.id is not None
     }
+    source_followup_cache: dict[str, SourceFollowupState] = {}
 
     rows: list[LineageOwnerRow] = []
     for owner_id, owner_members in indexes.members_by_owner_id.items():
@@ -687,7 +713,14 @@ def query_lineage_owner_rows(
                 tag_matcher=task_matches_tag_filters,
                 merge_unit=merge_unit,
             )
-            if task.task_type in {"plan", "explore"} and task.status == "completed" and task.id not in indexes.impl_based_on_ids:
+            if task.task_type in {"plan", "explore"} and task.status == "completed":
+                followup_state = _source_followup_state(indexes, task, source_followup_cache)
+                if not source_task_needs_implementation_followup(
+                    task,
+                    followup_state,
+                    non_dropped_implement_source_ids=indexes.non_dropped_impl_source_ids,
+                ):
+                    continue
                 if matches:
                     unresolved_tasks.append(task)
                 continue
@@ -761,7 +794,11 @@ def query_lineage_owner_rows(
             owner.id is not None
             and owner.task_type in {"plan", "explore"}
             and owner.status == "completed"
-            and owner.id not in indexes.impl_based_on_ids
+            and source_task_needs_implementation_followup(
+                owner,
+                _source_followup_state(indexes, owner, source_followup_cache),
+                non_dropped_implement_source_ids=indexes.non_dropped_impl_source_ids,
+            )
         )
         resolved_in_query = any(
             reason == "recovery_chain_completed"
@@ -782,7 +819,6 @@ def query_lineage_owner_rows(
             snapshot,
             unresolved_tasks,
             include_dropped=not query.exclude_dropped_from_planning,
-            impl_based_on_ids=indexes.impl_based_on_ids,
         )
         planning_task = lifecycle_action_task
         recovery_action_task: DbTask | None = None
@@ -853,7 +889,7 @@ def query_lineage_owner_rows(
                 git,
                 planning_task,
                 target_branch,
-                impl_based_on_ids=indexes.impl_based_on_ids,
+                impl_based_on_ids=indexes.non_dropped_impl_source_ids,
                 max_resume_attempts=query.max_recovery_attempts,
             )
         lineage_status = _classify_lineage_status(action) if action is not None else "actionable"

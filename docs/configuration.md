@@ -1390,7 +1390,7 @@ uv run gza advance [task_id] [options]
 | `--max N` | Limit the number of tasks to advance |
 | `--no-docker` | Run workers directly instead of in Docker |
 | `--force` | Skip dependency merge precondition checks when advance starts workers |
-| `--unimplemented` | List unimplemented plan/explore source rows, preferring newer descendants within each lineage branch |
+| `--unimplemented` | List completed plan/explore source rows that still need an implementation path |
 | `--create` | With `--unimplemented`: queue implement tasks for the listed source rows |
 | `--auto`, `-y` | Skip confirmation and execute immediately |
 | `--batch B` | Stop after spawning B background workers |
@@ -1401,11 +1401,13 @@ uv run gza advance [task_id] [options]
 | `--type TYPE` | Only advance tasks of this type (`plan` or `implement`) |
 | `--squash-threshold N` | Squash-merge branches with N or more commits (0 disables) |
 
-`--unimplemented` stays restricted to `plan` and `explore` lineages. It may surface a newer pending
-or completed `plan`/`explore` descendant instead of an older ancestor on the same branch, while
-keeping sibling branches as separate source rows. It never shows `implement` tasks directly.
+`--unimplemented` stays restricted to `plan` and `explore` lineages and only lists completed
+source rows that still need an implementation path. Completed `explore` roots with an active
+pending or in-progress `plan`/`implement` descendant are intentionally suppressed here; find that
+queued follow-up work through `uv run gza next`, `uv run gza next --all`, or other queue surfaces.
+It never shows `implement` tasks directly.
 Only completed plan rows are directly runnable with `uv run gza implement <id>`; use `uv run gza advance --unimplemented --create` to queue implement tasks
-for explore rows or incomplete source descendants.
+for listed explore rows.
 
 When the shared advance/recovery engine decides a task must be skipped for human intervention, `uv run gza advance` prints a dedicated `Needs attention` section. Each entry includes the task id, task type, short prompt, a stable `reason=...` policy slug, and the underlying skip text. This section is shown in the normal pre-confirmation preview and in `--dry-run` output, including when there is otherwise no actionable work to advance.
 

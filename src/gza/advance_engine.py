@@ -19,6 +19,11 @@ from gza.recovery_engine import (
 )
 from gza.resume_policy import is_resumable_failed_task as _is_resumable_failed_task
 from gza.review_verdict import ParsedReviewReport, ReviewFinding, get_review_report
+from gza.source_followup import (
+    collect_non_dropped_implement_source_ids,
+    resolve_source_followup_state,
+    source_task_has_implementation_followup,
+)
 
 NEEDS_ATTENTION_LABEL = "Needs attention"
 
@@ -49,7 +54,10 @@ class AdvanceContext:
     max_review_cycles: int
     max_resume_attempts: int
 
-    has_implement_child: bool = False
+    has_non_dropped_implement_descendant: bool = False
+    active_plan_child: DbTask | None = None
+    active_implement_child: DbTask | None = None
+    has_non_dropped_plan_or_implement_descendant: bool = False
 
     can_merge: bool = True
     rebase_pending_or_running: DbTask | None = None
@@ -132,6 +140,12 @@ def _rebase_pending_review_description(review_task: DbTask | None, rebase_task: 
 
 def _rebase_wait_review_description(review_task: DbTask | None, rebase_task: DbTask | None) -> str:
     return f"SKIP: review {_task_id(review_task)} in progress (rebase {_task_id(rebase_task)} {_rebase_change_reason(rebase_task)})"
+
+
+def _no_branch_description(ctx: AdvanceContext) -> str:
+    if ctx.task.status == "completed":
+        return f"SKIP: completed {ctx.task_type} task has no branch; no mergeable commits found"
+    return f"SKIP: {ctx.task.status} {ctx.task_type} task has no branch; no merge action available"
 
 
 def _merge_review_description(verdict: str, preserved_rebase: DbTask | None) -> str:
@@ -537,10 +551,32 @@ def resolve_advance_context(
     )
     has_resume_children = False
     resume_chain_depth = 0
+    active_plan_child: DbTask | None = None
+    active_implement_child: DbTask | None = None
+    has_non_dropped_plan_or_implement_descendant = False
+
+    if task.task_type in {"plan", "explore"}:
+        followup_state = resolve_source_followup_state(
+            task,
+            get_children=store.get_based_on_children,
+        )
+        active_plan_child = followup_state.active_plan_descendant
+        active_implement_child = followup_state.active_implement_descendant
+        has_non_dropped_plan_or_implement_descendant = (
+            followup_state.has_non_dropped_plan_or_implement_descendant
+        )
+        if impl_based_on_ids is None:
+            impl_based_on_ids = collect_non_dropped_implement_source_ids(store.get_all())
+    has_implementation_followup = (
+        task.task_type == "plan"
+        and source_task_has_implementation_followup(
+            task,
+            followup_state,
+            non_dropped_implement_source_ids=impl_based_on_ids,
+        )
+    )
 
     if task.task_type == "plan":
-        if impl_based_on_ids is None:
-            impl_based_on_ids = store.get_impl_based_on_ids()
         return AdvanceContext(
             task=task,
             task_type=task.task_type,
@@ -551,7 +587,10 @@ def resolve_advance_context(
             max_resume_attempts=effective_max_resume,
             failed_recovery_decision=failed_recovery_decision,
             failed_recovery_attention_reason=failed_recovery_attention_reason,
-            has_implement_child=task.id in impl_based_on_ids,
+            has_non_dropped_implement_descendant=has_implementation_followup,
+            active_plan_child=active_plan_child,
+            active_implement_child=active_implement_child,
+            has_non_dropped_plan_or_implement_descendant=has_non_dropped_plan_or_implement_descendant,
             is_resumable_failed_task=is_resumable_failed,
             has_resume_children=has_resume_children,
             resume_chain_depth=resume_chain_depth,
@@ -569,6 +608,10 @@ def resolve_advance_context(
             max_resume_attempts=effective_max_resume,
             failed_recovery_decision=failed_recovery_decision,
             failed_recovery_attention_reason=failed_recovery_attention_reason,
+            has_non_dropped_implement_descendant=has_implementation_followup,
+            active_plan_child=active_plan_child,
+            active_implement_child=active_implement_child,
+            has_non_dropped_plan_or_implement_descendant=has_non_dropped_plan_or_implement_descendant,
             is_resumable_failed_task=is_resumable_failed,
             has_resume_children=has_resume_children,
             resume_chain_depth=resume_chain_depth,
@@ -633,6 +676,10 @@ def resolve_advance_context(
         create_reviews=config.advance_create_reviews,
         max_review_cycles=config.max_review_cycles,
         max_resume_attempts=effective_max_resume,
+        has_non_dropped_implement_descendant=has_implementation_followup,
+        active_plan_child=active_plan_child,
+        active_implement_child=active_implement_child,
+        has_non_dropped_plan_or_implement_descendant=has_non_dropped_plan_or_implement_descendant,
         failed_recovery_decision=failed_recovery_decision,
         failed_recovery_attention_reason=failed_recovery_attention_reason,
         can_merge=can_merge,
@@ -680,18 +727,44 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="plan_needs_implement",
-        matches=lambda ctx: ctx.task_type == "plan" and not ctx.has_implement_child,
+        matches=lambda ctx: (
+            ctx.task_type == "plan"
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+        ),
         action=lambda ctx: {"type": "create_implement", "description": "Create and start implement task"},
     ),
     AdvanceRule(
         name="plan_has_implement",
-        matches=lambda ctx: ctx.task_type == "plan" and ctx.has_implement_child,
+        matches=lambda ctx: (
+            ctx.task_type == "plan"
+            and ctx.task.status == "completed"
+            and ctx.has_non_dropped_implement_descendant
+        ),
         action=lambda ctx: {"type": "skip", "description": "SKIP: implement task already exists for this plan"},
+    ),
+    AdvanceRule(
+        name="explore_needs_followup_decision",
+        matches=lambda ctx: (
+            ctx.task_type == "explore"
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_plan_or_implement_descendant
+        ),
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": (
+                    "SKIP: completed explore has no plan or implement follow-up; "
+                    "decide whether to drop it or spawn follow-up work"
+                ),
+            },
+            reason="explore-needs-follow-up-decision",
+        ),
     ),
     AdvanceRule(
         name="no_branch",
         matches=lambda ctx: not ctx.has_branch,
-        action=lambda ctx: {"type": "skip", "description": "SKIP: task has no branch (no commits)"},
+        action=lambda ctx: {"type": "skip", "description": _no_branch_description(ctx)},
     ),
     AdvanceRule(
         name="conflict_rebase_running",

@@ -63,13 +63,20 @@ For each task, `evaluate_advance_rules()` returns an action from `src/gza/advanc
 | Plan with no implement child | `create_implement` — create and run implement task |
 | Plan with existing implement child | `skip` |
 
-### 2. No branch
+### 2. Explore source follow-up
 
 | Condition | Action |
 |-----------|--------|
-| Task has no branch (no commits) | `skip` |
+| Completed `explore` with no non-dropped plan/implement descendant | `needs_discussion` — decide whether to drop it or spawn follow-up work |
 
-### 3. Merge conflicts
+### 3. No branch
+
+| Condition | Action |
+|-----------|--------|
+| Completed task has no branch | `skip` — completed `<type>` task has no branch; no mergeable commits found |
+| Non-completed task has no branch | `skip` — `<status>` `<type>` task has no branch; no merge action available |
+
+### 4. Merge conflicts
 
 Conflict detection uses the same target-branch resolution as task collection:
 
@@ -82,15 +89,15 @@ Conflict detection uses the same target-branch resolution as task collection:
 | Branch cannot merge into the resolved target branch AND rebase child is `failed` | `needs_discussion` — manual intervention required |
 | Branch cannot merge into the resolved target branch AND no active rebase child | `needs_rebase` — create rebase task |
 
-### 4. Post-rebase review invalidation
+### 5. Post-rebase review invalidation
 
 | Condition | Action |
 |-----------|--------|
 | A completed rebase on the implementation branch exists that is newer than the latest review | `create_review` — rebase may have introduced changes |
 
-### 5. Review state (when reviews exist)
+### 6. Review state (when reviews exist)
 
-#### 5a. Review was cleared (improve task ran after review)
+#### 6a. Review was cleared (improve task ran after review)
 
 | Condition | Action |
 |-----------|--------|
@@ -98,7 +105,7 @@ Conflict detection uses the same target-branch resolution as task collection:
 | Active review is `in_progress` | `wait_review` — skip |
 | Completed improve exists after latest review | `create_review` — code changed, need fresh review |
 
-#### 5b. Review is active (not cleared)
+#### 6b. Review is active (not cleared)
 
 | Condition | Action |
 |-----------|--------|
@@ -126,21 +133,21 @@ When the engine emits `improve`, the caller (iterate) delegates to `resolve_impr
 
 The improve flow now defers recovery edge selection to the shared recovery engine (`decide_failed_task_recovery`), and iterate also resolves fully recovered failed implement IDs through the same completed-descendant planner handoff used by advance/watch. That keeps iterate/advance/watch on one consistent resume/retry/manual-review boundary and avoids stale completed-recovery skip output on recovered ancestors.
 
-### 6. No reviews / all cleared
+### 7. No reviews / all cleared
 
 | Condition | Action |
 |-----------|--------|
 | Reviews exist but all cleared | `merge` — previous review addressed |
 | Non-implement task type (plan, explore, etc.) | `merge` — no review required |
 
-### 7. Implement with no review
+### 8. Implement with no review
 
 | Condition | Action |
 |-----------|--------|
 | `advance_requires_review=true` | `create_review` |
 | `advance_requires_review=false` | `merge` |
 
-### 8. Failed task recovery
+### 9. Failed task recovery
 
 Failed task recovery rules run in the same ordered rule engine.
 

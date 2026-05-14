@@ -93,6 +93,162 @@ def test_worker_action_taxonomy_covers_batch_accounting_actions() -> None:
     assert "create_implement" in WORKER_CONSUMING_ACTIONS
 
 
+def test_completed_explore_without_followup_needs_discussion(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    explore = store.add("Explore ingestion options", task_type="explore")
+    explore.status = "completed"
+    explore.completed_at = datetime.now(UTC)
+    store.update(explore)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), explore, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "explore-needs-follow-up-decision"
+    assert "completed explore has no plan or implement follow-up" in action["description"]
+
+
+def test_completed_explore_with_only_dropped_plan_descendant_still_needs_discussion(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    explore = store.add("Explore ingestion options", task_type="explore")
+    explore.status = "completed"
+    explore.completed_at = datetime.now(UTC)
+    store.update(explore)
+
+    dropped_plan = store.add("Plan ingestion options", task_type="plan", based_on=explore.id)
+    dropped_plan.status = "dropped"
+    dropped_plan.completed_at = datetime.now(UTC)
+    store.update(dropped_plan)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), explore, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "explore-needs-follow-up-decision"
+    assert "completed explore has no plan or implement follow-up" in action["description"]
+
+
+def test_branch_bearing_completed_explore_with_pending_plan_descendant_does_not_need_discussion(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    explore = store.add("Explore ingestion options", task_type="explore")
+    explore.status = "completed"
+    explore.completed_at = datetime.now(UTC)
+    explore.branch = "feat/explore-ingestion"
+    store.update(explore)
+
+    pending_plan = store.add("Plan ingestion options", task_type="plan", based_on=explore.id)
+    pending_plan.status = "pending"
+    store.update(pending_plan)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), explore, "main")
+
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge task (no review yet)"
+    assert action.get("needs_attention_reason") is None
+
+
+def test_branch_bearing_completed_explore_with_pending_implement_descendant_does_not_need_discussion(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    explore = store.add("Explore ingestion options", task_type="explore")
+    explore.status = "completed"
+    explore.completed_at = datetime.now(UTC)
+    explore.branch = "feat/explore-ingestion"
+    store.update(explore)
+
+    plan = store.add("Plan ingestion options", task_type="plan", based_on=explore.id)
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    pending_implement = store.add("Implement ingestion options", task_type="implement", based_on=plan.id)
+    pending_implement.status = "pending"
+    store.update(pending_implement)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), explore, "main")
+
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge task (no review yet)"
+    assert action.get("needs_attention_reason") is None
+
+
+def test_completed_plan_with_only_dropped_implement_descendant_still_needs_implement(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    dropped_implement = store.add("Implement ingestion options", task_type="implement", based_on=plan.id)
+    dropped_implement.status = "dropped"
+    dropped_implement.completed_at = datetime.now(UTC)
+    store.update(dropped_implement)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "create_implement"
+    assert action["description"] == "Create and start implement task"
+
+
+def test_pending_branchless_plan_without_implement_descendant_uses_no_branch_skip(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    plan.status = "pending"
+    store.update(plan)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: pending plan task has no branch; no merge action available"
+
+
+def test_pending_branchless_plan_with_implement_descendant_still_uses_no_branch_skip(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    plan.status = "pending"
+    store.update(plan)
+
+    implement = store.add("Implement ingestion options", task_type="implement", based_on=plan.id)
+    implement.status = "pending"
+    store.update(implement)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: pending plan task has no branch; no merge action available"
+    assert "implement task already exists" not in action["description"]
+
+
+def test_completed_no_branch_task_uses_shape_specific_skip_message(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    review = store.add("Review architecture notes", task_type="review")
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), review, "main")
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: completed review task has no branch; no mergeable commits found"
+
+
 def test_evaluate_prefers_in_progress_review_over_pending_sibling(tmp_path: Path):
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)

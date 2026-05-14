@@ -24,6 +24,7 @@ from ..recovery_engine import (
     decide_failed_task_recovery,
     should_hide_failed_recovery_decision,
 )
+from ..source_followup import collect_non_dropped_implement_source_ids
 from ..sync_ops import reconcile_task_branch_merge_truth
 from ..task_query import (
     TaskQueryPresets,
@@ -884,7 +885,7 @@ def _run_cycle(
     isolation_enabled = bool(getattr(config, "main_checkout_isolate", False))
     git = Git(config.project_dir)
     target_branch = git.default_branch()
-    impl_based_on_ids = store.get_impl_based_on_ids()
+    impl_based_on_ids = collect_non_dropped_implement_source_ids(store.get_all())
     owner_rows = _query_owner_rows(
         store=store,
         config=config,

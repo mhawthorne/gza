@@ -46,8 +46,8 @@ def _mock_git(*, current_branch: str = "main", can_merge: bool = True, commit_co
     return git
 
 
-def _create_completed_non_implement_task(store, prompt="Explore the codebase"):
-    task = store.add(prompt, task_type="explore")
+def _create_completed_non_implement_task(store, prompt="Document the codebase"):
+    task = store.add(prompt, task_type="task")
     task.status = "completed"
     task.completed_at = datetime.now(UTC)
     task.branch = f"feature/{task.id}"

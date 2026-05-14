@@ -229,6 +229,210 @@ def test_query_lineage_owner_rows_hides_failed_resume_resolved_by_completed_sibl
     assert failed_resume.id not in failed_leaf_ids
 
 
+def test_query_lineage_owner_rows_completed_explore_without_followup_needs_attention(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    explore = store.add("Explore auth provider options", task_type="explore")
+    assert explore.id is not None
+    _set_completed(
+        explore,
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        branch=None,
+        has_commits=False,
+    )
+    store.update(explore)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == explore.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "needs_discussion"
+    assert row.next_action["needs_attention_reason"] == "explore-needs-follow-up-decision"
+
+
+def test_query_lineage_owner_rows_keeps_completed_explore_with_only_dropped_plan_descendant(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    explore = store.add("Explore auth provider options", task_type="explore")
+    assert explore.id is not None
+    _set_completed(
+        explore,
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        branch=None,
+        has_commits=False,
+    )
+    store.update(explore)
+
+    dropped_plan = store.add("Plan auth provider options", task_type="plan", based_on=explore.id)
+    assert dropped_plan.id is not None
+    dropped_plan.status = "dropped"
+    dropped_plan.created_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    store.update(dropped_plan)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == explore.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "needs_discussion"
+    assert row.next_action["needs_attention_reason"] == "explore-needs-follow-up-decision"
+    assert {task.id for task in row.unresolved_tasks if task.id is not None} == {explore.id}
+
+
+def test_query_lineage_owner_rows_suppresses_completed_explore_with_pending_plan_even_when_tag_matches_only_root(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    tag = "v0.5.0"
+
+    explore = store.add("Explore scheduler rewrite", task_type="explore", tags=(tag,))
+    assert explore.id is not None
+    _set_completed(
+        explore,
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        branch=None,
+        has_commits=False,
+    )
+    store.update(explore)
+
+    plan = store.add("Plan scheduler rewrite", task_type="plan", based_on=explore.id)
+    assert plan.id is not None
+    plan.status = "pending"
+    store.update(plan)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, tags=(tag,), include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    assert not rows
+
+
+def test_query_lineage_owner_rows_suppresses_completed_explore_with_pending_implement_descendant(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    explore = store.add("Explore cache invalidation", task_type="explore")
+    assert explore.id is not None
+    _set_completed(
+        explore,
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        branch=None,
+        has_commits=False,
+    )
+    store.update(explore)
+
+    plan = store.add("Plan cache invalidation", task_type="plan", based_on=explore.id)
+    assert plan.id is not None
+    _set_completed(
+        plan,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        branch=None,
+        has_commits=False,
+    )
+    store.update(plan)
+
+    implement = store.add("Implement cache invalidation", task_type="implement", based_on=plan.id)
+    assert implement.id is not None
+    implement.status = "pending"
+    store.update(implement)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    assert not rows
+
+
+def test_query_lineage_owner_rows_promotes_completed_plan_descendant_over_explore_root(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    explore = store.add("Explore background jobs", task_type="explore")
+    assert explore.id is not None
+    _set_completed(
+        explore,
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        branch=None,
+        has_commits=False,
+    )
+    store.update(explore)
+
+    plan = store.add("Plan background jobs", task_type="plan", based_on=explore.id)
+    assert plan.id is not None
+    _set_completed(
+        plan,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        branch=None,
+        has_commits=False,
+    )
+    store.update(plan)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == plan.id
+    assert row.lifecycle_action_task is not None
+    assert row.lifecycle_action_task.id == plan.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "create_implement"
+
+
 def test_query_lineage_owner_rows_prefers_impl_branch_over_orphan_rebase_owner(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

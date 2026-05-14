@@ -272,9 +272,10 @@ class TestHelpOutput:
         assert "--unimplemented" in result.stdout
         assert "--force" in result.stdout
         assert (
-            "List plan/explore source rows without implementation, preferring newer descendants per branch"
+            "List completed plan/explore source rows that still need an implementation path"
             in normalized_output
         )
+        assert "preferring newer descendants per branch" not in normalized_output
         assert "With --unimplemented: queue implement tasks for the listed source rows" in normalized_output
         assert "--plans" not in result.stdout
 

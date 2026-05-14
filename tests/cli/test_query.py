@@ -11164,6 +11164,38 @@ class TestIncompleteCommand:
         ]
         assert result.stderr == ""
 
+    def test_incomplete_cli_json_reports_explore_followup_decision_without_legacy_no_branch_text(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        explore = store.add("cli completed explore", task_type="explore")
+        explore.status = "completed"
+        explore.completed_at = datetime.now(UTC)
+        store.update(explore)
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = run_gza(
+                "incomplete",
+                "--json",
+                "--fields",
+                "id,next_action,next_action_reason",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == [
+            {
+                "id": explore.id,
+                "next_action": "needs_discussion",
+                "next_action_reason": (
+                    "SKIP: completed explore has no plan or implement follow-up; "
+                    "decide whether to drop it or spawn follow-up work"
+                ),
+            }
+        ]
+        assert "task has no branch (no commits)" not in result.stdout
+        assert result.stderr == ""
+
     def test_incomplete_cli_unknown_fields_list_valid_choices(self, tmp_path: Path):
         setup_config(tmp_path)
         make_store(tmp_path).add("cli unknown incomplete field", task_type="implement")

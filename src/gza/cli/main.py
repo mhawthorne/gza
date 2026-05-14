@@ -609,7 +609,7 @@ def main() -> int:
     advance_parser.add_argument(
         "--unimplemented",
         action="store_true",
-        help="List plan/explore source rows without implementation, preferring newer descendants per branch",
+        help="List completed plan/explore source rows that still need an implementation path",
     )
     advance_parser.add_argument(
         "--plans",
