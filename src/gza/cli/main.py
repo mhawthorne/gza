@@ -2317,7 +2317,17 @@ def main() -> int:
     # set-status command
     set_status_parser = subparsers.add_parser(
         "set-status",
-        help="Manually force a task's status (pending, failed, dropped). To complete: `mark-completed`. To re-run a failed task: `retry`.",
+        help="Override a task's status for recovery or correction.",
+        description=(
+            "Override a task's status for recovery or correction.\n\n"
+            "Allowed targets: failed, dropped (any source), pending (only from\n"
+            "dropped, to revive an abandoned task).\n\n"
+            "For lifecycle transitions, use the dedicated commands instead:\n"
+            "  • complete a task      → gza mark-completed <id>\n"
+            "  • re-run a failed task → gza retry <id>\n"
+            "  • resume a partial run → gza resume <id>"
+        ),
+        formatter_class=SortingHelpFormatter,
     )
     set_status_parser.add_argument(
         "task_id",
@@ -2334,7 +2344,7 @@ def main() -> int:
     set_status_parser.add_argument(
         "--reason",
         default=None,
-        help="Failure reason for failed status",
+        help="Failure reason for failed status; ignored with a warning for pending/dropped",
     )
     add_common_args(set_status_parser)
 

@@ -1588,7 +1588,7 @@ When shared DB mode is active (explicit `db_path`) and a legacy local `.gza/gza.
 
 ### set-status
 
-Manually force a task's status.
+Override a task's status for recovery or correction.
 
 ```bash
 uv run gza set-status <task_id> <status> [--reason <text>]
@@ -1596,18 +1596,29 @@ uv run gza set-status <task_id> <status> [--reason <text>]
 
 `task_id` must be a full prefixed task ID (for example `gza-1234`).
 
-Valid statuses: `pending`, `failed`, `dropped`.
+Allowed targets:
 
-`completed` is rejected. To complete a task, use `uv run gza mark-completed
-<task_id>`, which also handles worker cleanup, provenance backfill, and optional
-`--reason`.
+- `failed`, from any source status that `set-status` already supports
+- `dropped`, from any source status that `set-status` already supports
+- `pending`, only from `dropped`, to revive an abandoned task
 
-`in_progress` is rejected. That state is set by a running worker, not by manual
-operator action. To start work on a task, use `gza work <task_id>`, `gza resume
-<task_id>`, `gza retry <task_id>`, or let `gza watch` pick up a pending task.
+Disallowed lifecycle transitions point operators at the canonical commands:
 
-`--reason` stores a failure reason for `failed` tasks. Other statuses ignore it
-and emit a warning.
+- `completed` is rejected as a target. To complete a task, use
+  `uv run gza mark-completed <task_id>`.
+- `failed -> pending` is rejected. Use `uv run gza retry <task_id>` to re-run
+  with the normal worker-registry reset and failure-reason cleanup.
+- `in_progress -> pending` is rejected. Use `uv run gza resume <task_id>` to
+  reattach to active work, or settle the task as `failed`/`dropped` if the
+  worker is gone.
+- `completed -> pending` is rejected. Create a new task with `uv run gza add`
+  for new work, or use `uv run gza set-status <task_id> failed --reason '...'`
+  to revert a falsely completed task.
+- `in_progress` is not a valid target. That state is set by a running worker,
+  not by manual operator action.
+
+`--reason` stores a failure reason for `failed` tasks. `dropped` and `pending`
+accept `--reason` but ignore it and emit a warning.
 
 ### sync-report
 

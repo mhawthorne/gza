@@ -12636,13 +12636,28 @@ class TestSetStatusCommand:
         assert "Invalid task ID" in result.stdout or "Invalid task ID" in result.stderr
         assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
 
-    @pytest.mark.parametrize("target_status,initial_status,completed_at_set", [
-        pytest.param("failed", "in_progress", True, id="in_progress-to-failed"),
-        pytest.param("dropped", "in_progress", True, id="in_progress-to-dropped"),
-        pytest.param("pending", "failed", False, id="failed-to-pending"),
-    ])
-    def test_set_status_transition(self, tmp_path: Path, target_status: str, initial_status: str, completed_at_set: bool):
-        """set-status transitions correctly and manages completed_at."""
+    @pytest.mark.parametrize(
+        ("initial_status", "target_status", "completed_at_set"),
+        [
+            pytest.param("pending", "failed", True, id="pending-to-failed"),
+            pytest.param("pending", "dropped", True, id="pending-to-dropped"),
+            pytest.param("failed", "dropped", True, id="failed-to-dropped"),
+            pytest.param("dropped", "pending", False, id="dropped-to-pending"),
+            pytest.param("dropped", "failed", True, id="dropped-to-failed"),
+            pytest.param("completed", "failed", True, id="completed-to-failed"),
+            pytest.param("completed", "dropped", True, id="completed-to-dropped"),
+            pytest.param("in_progress", "failed", True, id="in_progress-to-failed"),
+            pytest.param("in_progress", "dropped", True, id="in_progress-to-dropped"),
+        ],
+    )
+    def test_set_status_allowed_transition(
+        self,
+        tmp_path: Path,
+        initial_status: str,
+        target_status: str,
+        completed_at_set: bool,
+    ):
+        """set-status allows supported transitions and manages completed_at."""
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": initial_status},
         ])
@@ -12854,6 +12869,26 @@ class TestSetStatusCommand:
         assert updated.failure_reason is None
         assert updated.completion_reason is None
 
+    def test_set_status_reason_warns_for_pending_un_drop(self, tmp_path: Path) -> None:
+        """set-status warns and ignores --reason when reviving a dropped task."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "dropped"},
+        ])
+
+        task = make_store(tmp_path).get_all()[0]
+        result = run_gza(
+            "set-status", str(task.id), "pending", "--reason", "Ignored reason", "--project", str(tmp_path)
+        )
+
+        assert result.returncode == 0
+        assert "--reason is only meaningful for 'failed' status" in result.stdout
+
+        updated = make_store(tmp_path).get(task.id)
+        assert updated is not None
+        assert updated.status == "pending"
+        assert updated.failure_reason is None
+        assert updated.completion_reason is None
+
     def test_set_status_invalid_status_rejected(self, tmp_path: Path):
         """set-status rejects unknown status values."""
         setup_db_with_tasks(tmp_path, [
@@ -12868,13 +12903,17 @@ class TestSetStatusCommand:
         assert "Valid statuses: pending, failed, dropped." in result.stdout
 
     def test_set_status_help_omits_in_progress_and_execution_mode(self, tmp_path: Path):
-        """set-status subcommand help should only advertise operator-assertable statuses."""
+        """set-status subcommand help should explain the restricted transition model."""
         setup_db_with_tasks(tmp_path, [])
 
         result = run_gza("set-status", "--help", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "pending, failed, dropped" in result.stdout
+        assert "Override a task's status for recovery or correction." in result.stdout
+        assert "Allowed targets: failed, dropped (any source), pending (only from" in result.stdout
+        assert "gza mark-completed <id>" in result.stdout
+        assert "gza retry <id>" in result.stdout
+        assert "gza resume <id>" in result.stdout
         assert "in_progress" not in result.stdout
         assert "--execution-mode" not in result.stdout
 
@@ -12897,32 +12936,101 @@ class TestSetStatusCommand:
         assert result.returncode == 0
         assert "mark-completed        Mark a task as completed (defaults by task type;" in result.stdout
         assert "supports --verify-git, --force, --reason" in result.stdout
-        assert "set-status            Manually force a task's status (pending, failed," in result.stdout
-        assert "To complete: `mark-completed`" in result.stdout
+        assert "set-status            Override a task's status for recovery or correction." in result.stdout
 
-    @pytest.mark.parametrize("target_status", ["pending", "dropped"])
-    def test_set_status_clears_failure_reason(self, tmp_path: Path, target_status: str):
-        """set-status clears failure_reason when transitioning away from failed."""
+    @pytest.mark.parametrize(
+        ("initial_status", "target_status", "expected_message"),
+        [
+            pytest.param(
+                "failed",
+                "pending",
+                "use `gza retry <id>` to re-run",
+                id="failed-to-pending",
+            ),
+            pytest.param(
+                "completed",
+                "pending",
+                "create a new task with `gza add`",
+                id="completed-to-pending",
+            ),
+            pytest.param(
+                "in_progress",
+                "pending",
+                "use `gza resume <id>` to reattach to the running task",
+                id="in_progress-to-pending",
+            ),
+        ],
+    )
+    def test_set_status_rejects_disallowed_pending_transitions(
+        self,
+        tmp_path: Path,
+        initial_status: str,
+        target_status: str,
+        expected_message: str,
+    ) -> None:
+        """set-status rejects unsafe transitions to pending with specific guidance."""
         setup_db_with_tasks(tmp_path, [
-            {"prompt": "A task", "status": "failed"},
+            {"prompt": "A task", "status": initial_status},
         ])
         store = make_store(tmp_path)
-
-        # Set failure_reason on the existing failed task
-        all_tasks = store.get_all()
-        task = all_tasks[0]
-        assert task is not None
-        task.failure_reason = "Original error"
+        task = store.get_all()[0]
+        task.failure_reason = "Original failure"
+        task.completion_reason = "Original completion"
+        if initial_status == "completed":
+            task.completed_at = datetime.now(UTC)
+        elif initial_status == "in_progress":
+            task.completed_at = None
         store.update(task)
+        original_completed_at = task.completed_at
 
         result = run_gza("set-status", str(task.id), target_status, "--project", str(tmp_path))
 
-        assert result.returncode == 0
+        assert result.returncode == 1
+        assert expected_message in result.stdout.lower()
 
-        task = store.get(task.id)
-        assert task is not None
-        assert task.status == target_status
-        assert task.failure_reason is None
+        updated = make_store(tmp_path).get(task.id)
+        assert updated is not None
+        assert updated.status == initial_status
+        assert updated.failure_reason == "Original failure"
+        assert updated.completion_reason == "Original completion"
+        assert updated.completed_at == original_completed_at
+
+    @pytest.mark.parametrize("status", ["pending", "failed", "dropped"])
+    def test_set_status_self_transition_is_no_op(self, tmp_path: Path, status: str) -> None:
+        """set-status self-transitions should be friendly no-ops."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": status},
+        ])
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        task.failure_reason = "Original failure"
+        task.completion_reason = "Original completion"
+        if status in {"failed", "dropped"}:
+            task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza(
+            "set-status",
+            str(task.id),
+            status,
+            "--reason",
+            "ignored",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert f"Task {task.id} is already in status '{status}'; no change." in result.stdout
+
+        updated = make_store(tmp_path).get(task.id)
+        assert updated is not None
+        assert updated.status == status
+        assert updated.failure_reason == "Original failure"
+        assert updated.completion_reason == "Original completion"
+        if status in {"failed", "dropped"}:
+            assert updated.completed_at is not None
+        else:
+            assert updated.completed_at is None
 
     def test_advance_skips_dropped_tasks(self, tmp_path: Path):
         """gza advance does not act on dropped tasks."""

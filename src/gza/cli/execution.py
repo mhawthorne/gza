@@ -1730,11 +1730,6 @@ def cmd_set_status(args: argparse.Namespace) -> int:
             "Valid statuses: pending, failed, dropped."
         )
         return 1
-    if args.reason and args.status != "failed":
-        print(
-            "Warning: --reason is only meaningful for 'failed' status "
-            f"(current target: '{args.status}')"
-        )
 
     config = Config.load(args.project_dir)
     store = get_store(config)
@@ -1746,6 +1741,44 @@ def cmd_set_status(args: argparse.Namespace) -> int:
         return 1
 
     old_status = task.status
+    if args.status == old_status:
+        print(f"Task {task_id} is already in status '{args.status}'; no change.")
+        return 0
+
+    if args.status == "pending":
+        if old_status == "failed":
+            print(
+                "Error: Cannot reset a failed task to pending via set-status.\n"
+                "Use `gza retry <id>` to re-run (proper worker registry reset and\n"
+                "failure_reason clearing), or `gza set-status <id> dropped` to\n"
+                "abandon."
+            )
+            return 1
+        if old_status == "completed":
+            print(
+                "Error: Completed tasks cannot be reset to pending; the branch and\n"
+                "logs would be at risk of being clobbered by a new run.\n"
+                "To run similar work, create a new task with `gza add`.\n"
+                "To revert a falsely-completed task, use\n"
+                "`gza set-status <id> failed --reason '...'`."
+            )
+            return 1
+        if old_status != "dropped":
+            print(
+                f"Error: Tasks in status '{old_status}' cannot be reset to pending via set-status.\n"
+                "Pending is reserved for reviving a dropped task.\n"
+                "If work is still active, use `gza resume <id>` to reattach to the running task.\n"
+                "If the worker is gone, settle it with `gza set-status <id> failed --reason '...'`\n"
+                "or `gza set-status <id> dropped` instead."
+            )
+            return 1
+
+    if args.reason and args.status != "failed":
+        print(
+            "Warning: --reason is only meaningful for 'failed' status "
+            f"(current target: '{args.status}')"
+        )
+
     if args.status == "failed":
         mark_task_failed_from_cause(
             task=task,
