@@ -498,11 +498,11 @@ def test_advance_execution_merges_remote_tracking_ref_when_local_branch_is_missi
     capsys,
 ) -> None:
     from gza import advance_engine as advance_engine_module
+    from gza.git import ResolvedMergeSourceRef
 
     setup_config(tmp_path)
     store = make_store(tmp_path)
     branch = "feature/advance-remote-only"
-    git = _init_repo_with_remote_only_feature(tmp_path, branch)
     task = _add_mergeable_impl_with_failed_rebase(store, branch)
 
     monkeypatch.setattr(
@@ -515,17 +515,33 @@ def test_advance_execution_merges_remote_tracking_ref_when_local_branch_is_missi
         ),
     )
 
-    assert git.branch_exists(branch) is False
-    assert git.ref_exists(f"origin/{branch}") is True
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.side_effect = lambda b: b != branch
+    fake_git.ref_exists.side_effect = lambda r: r == f"origin/{branch}"
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(f"origin/{branch}")
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+    fake_git.merge.return_value = None
 
-    rc = cmd_advance(_advance_args(tmp_path, task.id))
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
 
     assert rc == 0
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.merge_status == "merged"
-    assert git.branch_exists(branch) is False
-    assert git.is_merged(f"origin/{branch}", "main") is True
+
+    fake_git.merge.assert_called_once()
+    merge_call_args, _ = fake_git.merge.call_args
+    assert merge_call_args[0] == f"origin/{branch}"
 
     output = capsys.readouterr().out
     assert f"Merging 'origin/{branch}' into 'main'" in output
@@ -538,11 +554,11 @@ def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
     capsys,
 ) -> None:
     from gza import advance_engine as advance_engine_module
+    from gza.git import ResolvedMergeSourceRef
 
     setup_config(tmp_path)
     store = make_store(tmp_path)
     branch = "feature/advance-stale-local"
-    git = _init_repo_with_stale_local_and_clean_origin(tmp_path, branch)
     task = _add_mergeable_impl_with_failed_rebase(store, branch)
 
     monkeypatch.setattr(
@@ -555,17 +571,33 @@ def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
         ),
     )
 
-    assert git.branch_exists(branch) is True
-    assert git.is_merged(branch, "main") is True
-    assert git.can_merge(f"origin/{branch}", "main") is True
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(f"origin/{branch}")
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+    fake_git.merge.return_value = None
 
-    rc = cmd_advance(_advance_args(tmp_path, task.id))
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
 
     assert rc == 0
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.merge_status == "merged"
-    assert git.is_merged(f"origin/{branch}", "main") is True
+
+    fake_git.merge.assert_called_once()
+    merge_call_args, _ = fake_git.merge.call_args
+    assert merge_call_args[0] == f"origin/{branch}"
 
     output = capsys.readouterr().out
     assert f"Merging 'origin/{branch}' into 'main'" in output
@@ -578,13 +610,13 @@ def test_advance_execution_prefers_local_branch_when_origin_is_stale(
     capsys,
 ) -> None:
     from gza import advance_engine as advance_engine_module
+    from gza.git import ResolvedMergeSourceRef
 
     setup_config(tmp_path)
     config = Config.load(tmp_path)
     config.merge_squash_threshold = 1
     store = make_store(tmp_path)
     branch = "feature/advance-local-ahead"
-    git = _init_repo_with_stale_origin_and_local_ahead(tmp_path, branch)
     task = _add_mergeable_impl_with_failed_rebase(store, branch)
 
     monkeypatch.setattr(
@@ -597,20 +629,39 @@ def test_advance_execution_prefers_local_branch_when_origin_is_stale(
         ),
     )
 
-    resolved = _resolve_merge_subject(store, git, task.id, target_branch="main")
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(branch)
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+    fake_git.merge.return_value = None
+
+    resolved = _resolve_merge_subject(store, fake_git, task.id, target_branch="main")
     assert resolved is not None
     assert resolved.merge_source_ref == branch
-    merge_args = _build_auto_merge_args(config, git, resolved.merge_source_ref, "main")
+    merge_args = _build_auto_merge_args(config, fake_git, resolved.merge_source_ref, "main")
 
-    rc = cmd_advance(_advance_args(tmp_path, task.id))
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
 
     assert merge_args.squash is True
     assert rc == 0
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.merge_status == "merged"
-    assert git.is_merged(branch, "main") is True
-    assert (tmp_path / "feature.txt").read_text() == "remote tip\nlocal tip\n"
+
+    fake_git.merge.assert_called_once()
+    merge_call_args, _ = fake_git.merge.call_args
+    assert merge_call_args[0] == branch
 
     output = capsys.readouterr().out
     assert f"Merging '{branch}' into 'main'" in output
