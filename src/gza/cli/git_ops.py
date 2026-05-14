@@ -1997,6 +1997,14 @@ def _execute_merge_action(
             reused_followups=reused_followups,
         )
 
+    if resolved_subject is not None and resolved_subject.merge_source_warning:
+        print(f"Error: {resolved_subject.merge_source_warning}")
+        return _MergeActionResult(
+            rc=1,
+            created_followups=created_followups,
+            reused_followups=reused_followups,
+        )
+
     if action.get("type") == "merge_with_followups":
         review_task = action.get("review_task")
         followup_findings = action.get("followup_findings")

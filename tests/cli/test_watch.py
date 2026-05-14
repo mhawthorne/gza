@@ -2850,6 +2850,91 @@ def test_execute_merge_action_marks_already_merged_task_without_error(tmp_path: 
     assert refreshed_task.merge_status == "merged"
 
 
+def test_execute_merge_action_with_followups_aborts_on_merge_source_warning_before_side_effects(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """merge_with_followups must fail closed on divergence before mutating task state."""
+    from gza.cli.git_ops import _ResolvedMergeSubject
+    from gza.review_verdict import ReviewFinding
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/diverged"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: APPROVED_WITH_FOLLOWUPS**"
+    store.update(review)
+
+    finding = ReviewFinding(
+        id="F1",
+        severity="FOLLOWUP",
+        title="Harden",
+        body="",
+        evidence=None,
+        impact=None,
+        fix_or_followup="add input guard",
+        tests=None,
+    )
+
+    resolved = _ResolvedMergeSubject(
+        trigger_task=impl,
+        execution_task=impl,
+        merge_subject=impl,
+        merge_unit_id=None,
+        merge_branch=impl.branch,
+        merge_source_ref=f"origin/{impl.branch}",
+        merge_source_warning=(
+            f"Branch '{impl.branch}' diverged between local and origin "
+            "(merge-source-needs-manual-resolution)"
+        ),
+    )
+
+    git = MagicMock()
+
+    with (
+        patch("gza.cli.git_ops._resolve_merge_subject", return_value=resolved),
+        patch("gza.cli.git_ops._create_or_reuse_followup_tasks") as create_followups,
+        patch("gza.cli.git_ops._merge_single_task") as merge_single,
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            git,
+            impl,
+            {
+                "type": "merge_with_followups",
+                "review_task": review,
+                "followup_findings": (finding,),
+            },
+            target_branch="main",
+            current_branch="main",
+        )
+
+    assert result.rc == 1
+    assert result.created_followups == []
+    assert result.reused_followups == []
+    create_followups.assert_not_called()
+    merge_single.assert_not_called()
+    output = capsys.readouterr().out
+    assert "merge-source-needs-manual-resolution" in output
+
+    refreshed = store.get(impl.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+
+
 def test_isolated_watch_merge_promotion_rollback_keeps_task_unmerged_when_attached_checkout_reset_fails(
     tmp_path: Path,
 ) -> None:
