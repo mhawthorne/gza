@@ -861,7 +861,8 @@ def test_failed_rebase_is_superseded_by_later_completed_same_branch_rebase(
     )
 
     assert action["type"] == "create_review"
-    assert action["description"] == "Create review (code changed by rebase since last review)"
+    assert action["description"].startswith("Create review (rebase ")
+    assert action["description"].endswith(" change unknown)")
 
 
 def test_failed_rebase_with_only_older_review_still_requires_manual_resolution(

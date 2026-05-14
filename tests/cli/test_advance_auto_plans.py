@@ -376,7 +376,8 @@ def test_advance_dry_run_uses_post_rebase_review_after_later_completed_rebase(
     assert rc == 0
     assert "Would advance 1 task(s):" in captured.out
     assert str(impl.id) in captured.out
-    assert "Create review (code changed by rebase since last review)" in captured.out
+    assert "Create review (rebase" in captured.out
+    assert "change unknown" in captured.out
     assert "reason=rebase-failed-needs-manual-resolution" not in captured.out
 
 
