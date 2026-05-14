@@ -9238,6 +9238,117 @@ class TestUnmergedUnifiedQueryOutput:
             }
         ]
 
+    def test_unmerged_default_refresh_ignores_historical_merged_unit_when_branch_is_reused(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        historical = store.add("Historical merged task", task_type="implement")
+        historical.status = "completed"
+        historical.completed_at = datetime.now(UTC)
+        historical.branch = "feature/reused"
+        historical.has_commits = True
+        historical.merge_status = "unmerged"
+        store.update(historical)
+        assert historical.id is not None
+        historical_unit = store.get_or_create_merge_unit_for_task(historical)
+        assert historical_unit is not None
+        store.set_merge_unit_state(historical_unit.id, "merged")
+
+        unrelated = store.add("Current reused branch task", task_type="implement")
+        unrelated.status = "completed"
+        unrelated.completed_at = datetime.now(UTC)
+        unrelated.branch = "feature/reused"
+        unrelated.has_commits = True
+        unrelated.merge_status = "unmerged"
+        store.update(unrelated)
+        assert unrelated.id is not None
+        unrelated_unit = store.get_or_create_merge_unit_for_task(unrelated)
+        assert unrelated_unit is not None
+        assert unrelated_unit.id != historical_unit.id
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=0,
+            json=True,
+            fields="id,prompt,merge_unit_id",
+        )
+
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert json.loads(captured.out) == [
+            {
+                "id": unrelated.id,
+                "prompt": "Current reused branch task",
+                "merge_unit_id": unrelated_unit.id,
+            }
+        ]
+
+        refreshed_historical = store.get(historical.id)
+        refreshed_unrelated = store.get(unrelated.id)
+        refreshed_historical_unit = store.resolve_merge_unit_for_task(historical.id)
+        refreshed_unrelated_unit = store.resolve_merge_unit_for_task(unrelated.id)
+        assert refreshed_historical is not None
+        assert refreshed_unrelated is not None
+        assert refreshed_historical_unit is not None
+        assert refreshed_unrelated_unit is not None
+        assert refreshed_historical_unit.state == "merged"
+        assert refreshed_historical.merge_status == "merged"
+        assert refreshed_unrelated_unit.state == "unmerged"
+        assert refreshed_unrelated.merge_status == "unmerged"
+
+    def test_unmerged_default_refresh_prefers_completed_retry_over_failed_owner(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.completed_at = datetime.now(UTC)
+        failed.branch = "feature/unmerged-retry"
+        failed.has_commits = True
+        failed.merge_status = "unmerged"
+        store.update(failed)
+
+        retry = store.add("Completed retry", task_type="implement", based_on=failed.id)
+        store.mark_completed(retry, has_commits=True, branch="feature/unmerged-retry")
+        assert retry.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=0,
+            json=True,
+            fields="id,prompt,merge_unit_id",
+        )
+
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+
+        captured = capsys.readouterr()
+        assert result == 0
+        payload = json.loads(captured.out)
+        assert payload == [
+            {
+                "id": retry.id,
+                "prompt": "Completed retry",
+                "merge_unit_id": store.resolve_merge_unit_for_task(retry.id).id,
+            }
+        ]
+
     def test_unmerged_live_target_json_fields_use_live_state_not_default_target_unit(
         self,
         tmp_path: Path,

@@ -2152,6 +2152,128 @@ class TestMergeStatus:
         assert representative is not None
         assert representative.id == recovery.id
 
+    def test_default_target_branch_apis_use_store_default_merge_target_not_main(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Store-level merge-unit writes and reads should honor the configured default target."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        monkeypatch.setattr(store, "default_merge_target", lambda *, strict=False: "trunk")
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(task, has_commits=True, branch="feature/trunk-target")
+
+        assert task.id is not None
+        trunk_unit = store.resolve_merge_unit_for_task(task.id)
+        assert trunk_unit is not None
+        assert trunk_unit.target_branch == "trunk"
+        assert [candidate.id for candidate in store.get_unmerged()] == [task.id]
+
+        store.set_merge_status(task.id, "merged")
+
+        refreshed_trunk_unit = store.resolve_merge_unit_for_task(task.id)
+        assert refreshed_trunk_unit is not None
+        assert refreshed_trunk_unit.state == "merged"
+        assert refreshed_trunk_unit.target_branch == "trunk"
+        assert store.get_unmerged() == []
+
+    def test_set_merge_status_without_target_updates_canonical_unit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Compatibility writes without a target must resolve through the canonical unit."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        monkeypatch.setattr(store, "default_merge_target", lambda *, strict=False: "main")
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(task, has_commits=True, branch="feature/multi-target")
+
+        assert task.id is not None
+        main_unit = store.resolve_merge_unit_for_task(task.id)
+        assert main_unit is not None
+
+        store.set_merge_unit_state(main_unit.id, "unmerged")
+
+        store.set_merge_status(task.id, "merged")
+
+        refreshed_main_unit = store.resolve_merge_unit_for_task(task.id)
+        refreshed_task = store.get(task.id)
+        assert refreshed_main_unit is not None
+        assert refreshed_task is not None
+        assert refreshed_main_unit.state == "merged"
+        assert refreshed_task.merge_status == "merged"
+
+    def test_mark_completed_without_explicit_target_raises_when_project_default_branch_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Project-backed write paths must not silently persist merge truth under main."""
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        store = SqliteTaskStore(tmp_path / "test.db", project_root=project_root)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        with patch("gza.git.Git.default_branch", side_effect=RuntimeError("git failure")):
+            with pytest.raises(MergeTargetResolutionError, match="Could not determine default merge target"):
+                store.mark_completed(task, has_commits=True, branch="feature/strict-default")
+
+        assert task.id is not None
+        assert store.resolve_merge_unit_for_task(task.id) is None
+        assert store.resolve_merge_unit_for_task(task.id) is None
+
+    def test_get_unmerged_backfills_legacy_actionable_row_when_merge_units_exist(self, tmp_path: Path) -> None:
+        """Legacy unmerged rows should remain visible until lazy merge-unit backfill attaches them."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        task = store.add(prompt="Legacy feature", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feature/legacy-unmerged"
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        assert task.id is not None
+        assert store.supports_merge_units() is True
+        assert store.resolve_merge_unit_for_task(task.id) is None
+
+        unmerged = store.get_unmerged()
+
+        assert [candidate.id for candidate in unmerged] == [task.id]
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == "unmerged"
+        assert {member.id for member in store.list_tasks_for_merge_unit(unit.id)} == {task.id}
+
+    def test_get_unmerged_prefers_actionable_merge_unit_member_over_failed_owner(self, tmp_path: Path) -> None:
+        """Unit-backed reads should surface the mergeable member, not a failed historical owner."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        failed = store.add(prompt="Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.completed_at = datetime.now(UTC)
+        failed.branch = "feature/recovered-work"
+        failed.has_commits = True
+        failed.merge_status = "unmerged"
+        store.update(failed)
+
+        recovery = store.add(prompt="Completed retry", task_type="implement", based_on=failed.id)
+        store.mark_completed(recovery, has_commits=True, branch="feature/recovered-work")
+        assert recovery.id is not None
+
+        unit = store.resolve_merge_unit_for_task(recovery.id)
+        assert unit is not None
+        assert unit.owner_task_id == failed.id
+        assert store._legacy_merge_status_owner_for_unit(unit).id == failed.id
+
+        assert [task.id for task in store.get_unmerged()] == [recovery.id]
+        representative = store.resolve_merge_unit_representative_task(unit, require_actionable=True)
+        assert representative is not None
+        assert representative.id == recovery.id
+
     def test_merge_unit_backfill_attaches_existing_branchless_reviews_with_review_role(self, tmp_path: Path) -> None:
         """Backfilling an implementation unit should attach existing branchless reviews."""
         db_path = tmp_path / "test.db"

@@ -7,6 +7,8 @@ import gza.recovery_engine as recovery_engine
 from gza.config import ConfigError
 from gza.db import MergeTargetResolutionError
 from gza.git import GitError
+from gza.db import MergeTargetResolutionError
+from gza.git import GitError
 from gza.recovery_engine import (
     _MergeContext,
     _is_resolved_by_landed_lineage,

@@ -3877,6 +3877,8 @@ class SqliteTaskStore:
             ).fetchone()
         return self._row_to_merge_unit(row)
 
+        return row is not None
+
     def task_is_attached_to_merge_unit_ids(self, task_id: str, merge_unit_ids: tuple[str, ...]) -> bool:
         """Return whether a task is attached to any active merge unit in ``merge_unit_ids``."""
         if not self.supports_merge_units() or not merge_unit_ids:

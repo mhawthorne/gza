@@ -407,6 +407,25 @@ def test_unmerged_lists_merge_unit_owner(tmp_path: Path) -> None:
     assert unit.state == "unmerged"
 
 
+def test_pr_blocks_when_task_merge_unit_is_merged_even_if_git_default_branch_differs(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement release-target branch", task_type="implement")
+    store.mark_completed(impl, has_commits=True, branch="feature/release-target")
+    assert impl.id is not None
+
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "merged")
+
+    fake_git = _MergeGit(tmp_path, default_branch="release")
+    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
+        result = run_gza("pr", str(impl.id), "--project", str(tmp_path), cwd=tmp_path)
+
+    assert "already marked as merged" in result.stdout
+
+
 def test_merge_missing_explicit_task_id_fails_closed(tmp_path: Path) -> None:
     setup_config(tmp_path)
     make_store(tmp_path)
