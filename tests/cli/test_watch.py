@@ -163,8 +163,10 @@ def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: P
     assert spawn_iterate.call_args.args[2].id == impl.id
     assert spawn_iterate.call_args.kwargs["prepared_task_id"] == impl.id
     assert spawn_iterate.call_args.kwargs["prepared_phase"] == "preloop"
+    assert spawn_iterate.call_args.kwargs["startup_quiet"] is True
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == plan.id
+    assert spawn_worker.call_args.kwargs["startup_quiet"] is True
 
 
 def test_watch_cycle_pending_implement_startup_failure_surfaces_without_spawning_iterate(
@@ -932,6 +934,7 @@ def test_watch_cycle_default_mode_does_not_treat_unrelated_in_progress_child_as_
     assert isinstance(prepared_child_id, str)
     assert spawn_iterate.call_args.kwargs["prepared_resume"] is True
     assert spawn_iterate.call_args.kwargs["prepared_phase"] == "preloop"
+    assert spawn_iterate.call_args.kwargs["startup_quiet"] is True
     assert [task.id for task in store.get_based_on_children(failed.id)] == [unrelated_child.id, prepared_child_id]
 
 
@@ -1241,6 +1244,7 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
     assert spawned_task.id == failed.id
     assert spawn_iterate.call_args.kwargs["prepared_resume"] is False
     assert spawn_iterate.call_args.kwargs["prepared_phase"] == "preloop"
+    assert spawn_iterate.call_args.kwargs["startup_quiet"] is True
     spawned_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
     assert isinstance(spawned_child_id, str)
     log_text = log_path.read_text()
@@ -7591,7 +7595,7 @@ def test_cmd_watch_quiet_suppresses_worker_stdout_and_still_logs_events(
         store.update(impl_task)
         return 0
 
-    def fake_spawn_worker(_args, _config, task_id=None, quiet=False):
+    def fake_spawn_worker(_args, _config, task_id=None, quiet=False, **_kwargs):
         if not quiet:
             print("Started worker noisy output")
         assert task_id is not None
@@ -7626,6 +7630,71 @@ def test_cmd_watch_quiet_suppresses_worker_stdout_and_still_logs_events(
         line.split(maxsplit=2)[1] == "START" and f"{plan.id} plan" in line
         for line in log_text.splitlines()
     )
+
+
+def test_cmd_watch_uses_startup_quiet_and_emits_sleep_for_productive_and_idle_cycles(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Watch should suppress helper startup blocks even when not quiet, and log SLEEP every pass."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    plan = store.add("Plan follow-up", task_type="plan")
+    assert impl.id is not None
+    assert plan.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=2,
+        poll=1,
+        max_idle=1,
+        max_iterations=10,
+        dry_run=False,
+        quiet=False,
+        yes=True,
+    )
+
+    def fake_spawn_iterate(_args, _config, impl_task, *, startup_quiet=False, **_kwargs):
+        if not startup_quiet:
+            print("Started iterate worker noisy output")
+        impl_task.status = "in_progress"
+        store.update(impl_task)
+        return 0
+
+    def fake_spawn_worker(_args, _config, task_id=None, *, startup_quiet=False, **_kwargs):
+        if not startup_quiet:
+            print("Started worker noisy output")
+        assert task_id is not None
+        task = store.get(task_id)
+        assert task is not None
+        task.status = "in_progress"
+        store.update(task)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=fake_spawn_iterate),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=fake_spawn_worker),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch._sleep_interruptibly"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert "Started worker noisy output" not in stdout
+    assert "Started iterate worker noisy output" not in stdout
+
+    log_lines = (tmp_path / ".gza" / "watch.log").read_text().splitlines()
+    sleep_lines = [
+        line
+        for line in log_lines
+        if line.strip() and line.split(maxsplit=2)[1] == "SLEEP"
+    ]
+    assert len(sleep_lines) == 2
+    assert all("sleeping 1s (0 pending, 0 running)" in line for line in sleep_lines)
 
 
 def test_watch_cycle_quiet_logs_start_failed_when_iterate_spawn_fails(
@@ -7759,6 +7828,42 @@ def test_watch_cycle_quiet_logs_start_failed_when_recovery_iterate_spawn_fails(
     log_text = log_path.read_text()
     assert "START_FAILED" in log_text
     assert f"{failed.id} -> {child_id}: iterate worker spawn failed" in log_text
+
+
+def test_watch_cycle_restart_failed_queue_events_use_queue_label(tmp_path: Path) -> None:
+    """Restart-failed queue transitions should use QUEUE, not PHASE."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    plan = store.add("Plan follow-up", task_type="plan")
+    assert plan.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    log_lines = log_path.read_text().splitlines()
+    queue_lines = [line for line in log_lines if line.split(maxsplit=2)[1] == "QUEUE"]
+    assert any("recovery queue enabled (--restart-failed)" in line for line in queue_lines)
+    assert any("recovery queue exhausted; switching to pending queue" in line for line in queue_lines)
+    assert any("pending queue active" in line for line in queue_lines)
+    assert not any(line.split(maxsplit=2)[1] == "PHASE" for line in log_lines)
 
 
 def test_cmd_watch_interrupts_sleep_promptly_on_signal(tmp_path: Path) -> None:

@@ -2455,6 +2455,78 @@ class TestBackgroundWorkerCommand:
         assert "Prompt:" not in output
         assert "Use 'gza log" not in output
 
+    def test_background_iterate_worker_startup_quiet_suppresses_entire_startup_block(self, tmp_path: Path):
+        """startup_quiet should suppress even the shared headline for watch-managed iterate launches."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli._common import _spawn_background_iterate_worker
+        from gza.config import Config
+        from gza.console import console
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl_task = store.add("Iterate quietly", task_type="implement")
+        assert impl_task.id is not None
+
+        config = Config.load(tmp_path)
+        mock_proc = MagicMock()
+        mock_proc.pid = 44444
+
+        def capture_spawn(_cmd, _config, worker_id):
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
+
+        args = argparse.Namespace(no_docker=True, force=False)
+
+        with (
+            patch("gza.cli._common._spawn_detached_worker_process", side_effect=capture_spawn),
+            console.capture() as capture,
+        ):
+            rc = _spawn_background_iterate_worker(
+                args,
+                config,
+                impl_task,
+                max_iterations=3,
+                startup_quiet=True,
+            )
+
+        assert rc == 0
+        assert capture.get() == ""
+
+    def test_background_iterate_worker_default_still_prints_startup_line(self, tmp_path: Path):
+        """Direct iterate background launches keep the existing startup block by default."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli._common import _spawn_background_iterate_worker
+        from gza.config import Config
+        from gza.console import console
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl_task = store.add("Iterate loudly", task_type="implement")
+        assert impl_task.id is not None
+
+        config = Config.load(tmp_path)
+        mock_proc = MagicMock()
+        mock_proc.pid = 45454
+
+        def capture_spawn(_cmd, _config, worker_id):
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
+
+        args = argparse.Namespace(no_docker=True, force=False)
+
+        with (
+            patch("gza.cli._common._spawn_detached_worker_process", side_effect=capture_spawn),
+            console.capture() as capture,
+        ):
+            rc = _spawn_background_iterate_worker(args, config, impl_task, max_iterations=3)
+
+        output = capture.get()
+        assert rc == 0
+        assert f"Started task {impl_task.id} in background (PID {mock_proc.pid})" in output
+        assert f"Use 'gza log {impl_task.id} -f' to follow progress" in output
+
     def test_background_resume_worker_verbose_output_matches_work_style(self, tmp_path: Path):
         """Resume startup output reuses the same themed shape as regular work."""
         import argparse

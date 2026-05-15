@@ -1027,6 +1027,7 @@ def _run_cycle(
                     task_id=task_id,
                     quiet=quiet,
                     prepared_task=task_obj,
+                    startup_quiet=True,
                 ),
             )
 
@@ -1044,6 +1045,7 @@ def _run_cycle(
                     new_task_id=task_id,
                     quiet=quiet,
                     prepared_task=task_obj,
+                    startup_quiet=True,
                 ),
             )
 
@@ -1060,7 +1062,12 @@ def _run_cycle(
                 log=log,
                 failure_message=f"{task_obj.id} {task_kind}: iterate worker spawn failed",
                 dedupe_key=f"spawn-iterate-failed:{task_obj.id}",
-                spawn_fn=lambda: _spawn_background_iterate(iterate_args, config, task_obj),
+                spawn_fn=lambda: _spawn_background_iterate(
+                    iterate_args,
+                    config,
+                    task_obj,
+                    startup_quiet=True,
+                ),
             )
 
         def _create_rebase_from_task(parent_task: DbTask) -> DbTask:
@@ -1113,6 +1120,7 @@ def _run_cycle(
                     prepared_task_id=str(prepared_task.id),
                     prepared_resume=mode == "resume",
                     prepared_phase="preloop",
+                    startup_quiet=True,
                 ),
             ),
             prefer_iterate_for_action=lambda task, action: _watch_iterate_impl_target(
@@ -1404,7 +1412,7 @@ def _run_cycle(
     # 2) Recovery queue for failed tasks.
     pending_recovery_task_ids: set[str] = set()
     if restart_failed:
-        log.emit("PHASE", "recovery queue enabled (--restart-failed)")
+        log.emit("QUEUE", "recovery queue enabled (--restart-failed)")
     failed_decisions: list[tuple[DbTask, FailedRecoveryDecision]] = []
     actionable_failed: list[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision]] = []
     for row in recovery_rows:
@@ -1494,6 +1502,7 @@ def _run_cycle(
                         recovered_task_id,
                         quiet=quiet,
                         prepared_task=prepared_recovered_task,
+                        startup_quiet=True,
                     ),
                 )
             else:
@@ -1530,6 +1539,7 @@ def _run_cycle(
                         prepared_task_id=recovered_task_id,
                         prepared_resume=True,
                         prepared_phase="preloop",
+                        startup_quiet=True,
                     ),
                 )
         else:
@@ -1579,6 +1589,7 @@ def _run_cycle(
                         task_id=recovered_task_id,
                         quiet=quiet,
                         prepared_task=prepared_recovered_task,
+                        startup_quiet=True,
                     ),
                 )
                 if decision.launch_mode == "worker"
@@ -1600,6 +1611,7 @@ def _run_cycle(
                         prepared_task_id=recovered_task_id,
                         prepared_resume=False,
                         prepared_phase="preloop",
+                        startup_quiet=True,
                     ),
                 )
             )
@@ -1629,11 +1641,11 @@ def _run_cycle(
         )
     )
     if restart_failed and not recovery_phase_active:
-        log.emit("PHASE", "recovery queue exhausted; switching to pending queue")
+        log.emit("QUEUE", "recovery queue exhausted; switching to pending queue")
 
     # 3) Start new queued tasks (consumes slots)
     if not recovery_phase_active:
-        log.emit("PHASE", "pending queue active")
+        log.emit("QUEUE", "pending queue active")
     if slots > 0 and not recovery_phase_active:
         for task in pending_tasks:
             if slots <= 0:
@@ -1688,6 +1700,7 @@ def _run_cycle(
                         task,
                         prepared_task_id=str(prepared_pending_task.id),
                         prepared_phase="preloop",
+                        startup_quiet=True,
                     ),
                 )
                 if rc != 0:
@@ -1720,7 +1733,13 @@ def _run_cycle(
                 log=log,
                 failure_message=f"{task.id} {task_type}: worker spawn failed",
                 dedupe_key=f"spawn-worker-failed:{task.id}",
-                spawn_fn=lambda: _spawn_background_worker(worker_args, config, task_id=task.id, quiet=quiet),
+                spawn_fn=lambda: _spawn_background_worker(
+                    worker_args,
+                    config,
+                    task_id=task.id,
+                    quiet=quiet,
+                    startup_quiet=True,
+                ),
             )
             if rc != 0:
                 continue
@@ -1957,12 +1976,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
             if cycle_result.work_done:
                 idle_seconds = 0
-            else:
+            log.emit(
+                "SLEEP",
+                f"sleeping {poll}s ({cycle_result.pending} pending, {cycle_result.running} running)",
+            )
+            if not cycle_result.work_done:
                 idle_seconds += poll
-                log.emit(
-                    "IDLE",
-                    f"sleeping {poll}s ({cycle_result.pending} pending, {cycle_result.running} running)",
-                )
                 if max_idle is not None and idle_seconds >= max_idle:
                     log.emit("INFO", f"max idle time reached ({max_idle}s), exiting")
                     break

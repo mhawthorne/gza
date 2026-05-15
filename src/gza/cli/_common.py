@@ -558,8 +558,11 @@ def _print_background_worker_started(
     pid: int,
     quiet: bool,
     resume: bool = False,
+    startup_quiet: bool = False,
 ) -> None:
     """Print shared themed startup output for background worker launches."""
+    if startup_quiet:
+        return
     wc = _colors.WORK_COLORS
     task_id_color = _colors.TASK_COLORS.task_id
     task_id = rich_escape(str(task.id) if task.id is not None else "<unknown>")
@@ -811,6 +814,7 @@ def _spawn_background_worker(
     task_id: str | None = None,
     quiet: bool = False,
     prepared_task: DbTask | None = None,
+    startup_quiet: bool = False,
 ) -> int:
     """Spawn a background worker process.
 
@@ -1034,7 +1038,13 @@ def _spawn_background_worker(
         )
         registry.ensure_running(worker_metadata)
 
-        _print_background_worker_started(selected_task, pid=pid, quiet=quiet, resume=resume_mode)
+        _print_background_worker_started(
+            selected_task,
+            pid=pid,
+            quiet=quiet,
+            resume=resume_mode,
+            startup_quiet=startup_quiet,
+        )
 
         return 0
 
@@ -1208,6 +1218,7 @@ def _spawn_background_resume_worker(
     new_task_id: str,
     quiet: bool = False,
     prepared_task: DbTask | None = None,
+    startup_quiet: bool = False,
 ) -> int:
     """Spawn a background worker to run a resume task.
 
@@ -1273,7 +1284,13 @@ def _spawn_background_resume_worker(
         )
         registry.ensure_running(worker)
 
-        _print_background_worker_started(task, pid=proc.pid, quiet=quiet, resume=True)
+        _print_background_worker_started(
+            task,
+            pid=proc.pid,
+            quiet=quiet,
+            resume=True,
+            startup_quiet=startup_quiet,
+        )
 
         return 0
 
@@ -1303,6 +1320,7 @@ def _spawn_background_iterate_worker(
     prepared_phase: str | None = None,
     prepared_action_type: str | None = None,
     prepared_review_task_id: str | None = None,
+    startup_quiet: bool = False,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     registry = WorkerRegistry(config.workers_path)
@@ -1358,7 +1376,12 @@ def _spawn_background_iterate_worker(
             startup_log_file=startup_log_rel,
         )
         registry.ensure_running(worker)
-        _print_background_worker_started(display_task, pid=proc.pid, quiet=quiet)
+        _print_background_worker_started(
+            display_task,
+            pid=proc.pid,
+            quiet=quiet,
+            startup_quiet=startup_quiet,
+        )
         return 0
     except Exception as e:
         _rollback_background_worker_launch(

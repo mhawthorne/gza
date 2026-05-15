@@ -2264,6 +2264,7 @@ def _spawn_background_iterate(
     prepared_phase: str | None = None,
     prepared_action_type: str | None = None,
     prepared_review_task_id: str | None = None,
+    startup_quiet: bool = False,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     effective_max_iterations = max_iterations
@@ -2285,6 +2286,7 @@ def _spawn_background_iterate(
         prepared_phase=prepared_phase,
         prepared_action_type=prepared_action_type,
         prepared_review_task_id=prepared_review_task_id,
+        startup_quiet=startup_quiet,
     )
 
 
