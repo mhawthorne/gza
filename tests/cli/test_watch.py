@@ -26,6 +26,7 @@ from gza.cli.watch import (
     _count_live_workers,
     _CycleResult,
     _emit_transition_events,
+    _format_elapsed,
     _format_wake_message,
     _query_owner_rows,
     _run_cycle,
@@ -140,6 +141,18 @@ def _setup_watch_plan_owned_branch_action_row(tmp_path: Path):
     store.attach_task_to_merge_unit(rebase.id, unit.id, "rebase")
 
     return store, plan, impl, rebase
+
+
+def test_format_elapsed_handles_mixed_naive_and_aware_timestamps() -> None:
+    """_format_elapsed must tolerate legacy naive DB timestamps mixed with newer UTC-aware ones."""
+    # Naive start, aware end — the exact shape that crashed in production.
+    assert _format_elapsed("2026-05-15T04:33:01", "2026-05-15T04:33:05+00:00") == "4s"
+    # Aware start, naive end — the reverse direction.
+    assert _format_elapsed("2026-05-15T04:33:01+00:00", "2026-05-15T04:33:05") == "4s"
+    # Both naive (legacy) — should still work.
+    assert _format_elapsed("2026-05-15T04:33:01", "2026-05-15T04:33:05") == "4s"
+    # Both aware — should still work.
+    assert _format_elapsed("2026-05-15T04:33:01+00:00", "2026-05-15T04:33:05+00:00") == "4s"
 
 
 def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: Path) -> None:
