@@ -671,6 +671,7 @@ def test_advance_execution_prefers_local_branch_when_origin_is_stale(
     assert f"Merging 'origin/{branch}' into 'main'" not in output
 
 
+@pytest.mark.functional
 def test_advance_dry_run_surfaces_diverged_merge_source_for_manual_resolution(
     tmp_path: Path,
     capsys,
