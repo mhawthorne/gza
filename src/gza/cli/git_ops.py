@@ -126,6 +126,12 @@ class SquashBranchReconcileResult:
     expected_remote_oid: str | None = None
 
 
+def _tracking_ref_refresh_command(*, remote: str, branch: str) -> str:
+    remote_branch_ref = f"refs/heads/{branch}"
+    tracking_ref = f"refs/remotes/{remote}/{branch}"
+    return f"git fetch {remote} +{remote_branch_ref}:{tracking_ref}"
+
+
 @dataclass(frozen=True)
 class _PendingSquashBranchReconcile:
     branch: str
@@ -459,6 +465,15 @@ def _print_squash_reconcile_result(result: SquashBranchReconcileResult) -> None:
         return
 
     reason = result.reason or "unknown error"
+    if result.status == "failed_remote_tracking_ref_update":
+        tracking_ref = f"refs/remotes/{result.remote}/{result.branch}"
+        print(
+            "Warning: Squash merge landed and the remote push succeeded, "
+            f"but the local tracking ref '{tracking_ref}' could not be updated: {reason}"
+        )
+        print(f"Refresh the local tracking ref with: {_tracking_ref_refresh_command(remote=result.remote, branch=result.branch)}")
+        return
+
     print(
         f"Warning: Squash merge landed, but {result.remote}/{result.branch} "
         f"could not be reconciled: {reason}"

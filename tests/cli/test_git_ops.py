@@ -18,6 +18,7 @@ from gza.cli.git_ops import (
     _reconcile_squash_merged_branch_with_origin,
     _resolve_merge_subject,
     _run_task_backed_rebase,
+    _tracking_ref_refresh_command,
     cmd_advance,
 )
 from gza.config import Config
@@ -1062,6 +1063,34 @@ def test_reconcile_squash_merge_lease_rejection_is_reported_without_updating_tra
     assert git.update_ref.call_args_list == []
 
 
+def test_reconcile_squash_merge_remote_tracking_ref_update_failure_reports_post_push_status() -> None:
+    git = MagicMock(spec=Git)
+    git.update_ref.side_effect = [
+        None,
+        GitError("cannot lock ref 'refs/remotes/origin/feature/demo'"),
+    ]
+
+    result = _reconcile_squash_merged_branch_with_origin(
+        git,
+        branch="feature/demo",
+        squash_oid="squash-oid",
+        pre_squash_local_oid="local-oid",
+        pre_squash_remote_oid="remote-oid",
+    )
+
+    assert result.status == "failed_remote_tracking_ref_update"
+    git.push_ref_force_with_lease.assert_called_once_with(
+        "refs/heads/feature/demo",
+        "feature/demo",
+        remote="origin",
+        expected_remote_oid="remote-oid",
+    )
+    assert git.update_ref.call_args_list == [
+        call("refs/heads/feature/demo", "squash-oid", "local-oid"),
+        call("refs/remotes/origin/feature/demo", "squash-oid"),
+    ]
+
+
 def test_classify_squash_reconcile_push_failure_keeps_policy_rejections_distinct() -> None:
     exc = GitError(
         "git push failed:\n"
@@ -1126,6 +1155,32 @@ def test_print_squash_reconcile_result_failed_local_ref_update_fails_closed(
     assert "known to point at the squash merge commit" in output
     assert "origin feature/demo:refs/heads/feature/demo" not in output
     assert "Manual repair:" not in output
+
+
+def test_tracking_ref_refresh_command_forces_non_fast_forward_tracking_update() -> None:
+    assert _tracking_ref_refresh_command(
+        remote="origin",
+        branch="feature/demo",
+    ) == "git fetch origin +refs/heads/feature/demo:refs/remotes/origin/feature/demo"
+
+
+def test_print_squash_reconcile_result_failed_remote_tracking_ref_update_reports_refresh_action(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _print_squash_reconcile_result(
+        SquashBranchReconcileResult(
+            status="failed_remote_tracking_ref_update",
+            branch="feature/demo",
+            reason="cannot lock ref 'refs/remotes/origin/feature/demo'",
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "remote push succeeded" in output
+    assert "could not be reconciled" not in output
+    assert "could not be updated" in output
+    assert "git push --force-with-lease" not in output
+    assert "git fetch origin +refs/heads/feature/demo:refs/remotes/origin/feature/demo" in output
 
 
 @pytest.mark.functional
