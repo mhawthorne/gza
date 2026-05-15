@@ -1324,6 +1324,7 @@ class TestCleanCommand:
         unmerged_task.has_commits = True
         unmerged_task.completed_at = datetime.now(UTC)
         store.update(unmerged_task)
+        assert unmerged_task.id is not None
 
         # Create branch for unmerged task
         git._run("checkout", "-b", "feature/unmerged")
@@ -1331,6 +1332,14 @@ class TestCleanCommand:
         git._run("add", "feature.txt")
         git._run("commit", "-m", "Add unmerged feature")
         git._run("checkout", "master")
+
+        unit = store.get_or_create_merge_unit_for_task(unmerged_task)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "unmerged")
+        stale_row = store.get(unmerged_task.id)
+        assert stale_row is not None
+        stale_row.merge_status = "merged"
+        store.update(stale_row)
 
         # Create logs for both tasks
         log_dir = config.log_path

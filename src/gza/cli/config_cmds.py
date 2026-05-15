@@ -24,6 +24,7 @@ from ..git import Git
 from ..importer import import_tasks, parse_import_file, validate_import
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..log_paths import paired_log_paths, slug_from_log_path
+from ..merge_state import resolve_task_merge_state_for_target
 from ..task_slug import get_slug_display_text
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import get_review_verdict, get_store, resolve_id
@@ -1670,7 +1671,16 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     for task in history:
                         if task.status == "completed" and task.branch and task.has_commits:
                             try:
-                                if task.merge_status != "merged" and not git.is_merged(task.branch, default_branch):
+                                if (
+                                    resolve_task_merge_state_for_target(
+                                        store=store,
+                                        task=task,
+                                        git=git,
+                                        target_branch=default_branch,
+                                    )
+                                    != "merged"
+                                    and not git.is_merged(task.branch, default_branch)
+                                ):
                                     if task.slug:
                                         unmerged_task_ids.add(task.slug)
                             except Exception:

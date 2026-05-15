@@ -8164,6 +8164,12 @@ class TestExtractedRunInnerHelpers:
         prior_review.status = "completed"
         prior_review.completed_at = datetime.now(UTC)
         store.update(prior_review)
+        assert prior_review.id is not None
+
+        impl_unit = store.get_or_create_merge_unit_for_task(impl_task)
+        assert impl_unit is not None
+        assert impl_unit.target_branch == "main"
+        store.set_merge_unit_state(impl_unit.id, "merged")
 
         fix_task = store.add(
             prompt="Fix the churn",
@@ -8220,6 +8226,10 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_impl is not None
         assert refreshed_impl.merge_status == "merged"
         assert refreshed_impl.review_cleared_at is None
+        refreshed_unit = store.get_merge_unit(impl_unit.id)
+        assert refreshed_unit is not None
+        assert refreshed_unit.state == "merged"
+        assert refreshed_unit.merged_by_task_id == impl_task.id
         reviews = [t for t in store.get_all() if t.task_type == "review" and t.depends_on == impl_task.id]
         assert len(reviews) == 1
 

@@ -741,9 +741,17 @@ def cmd_history(args: argparse.Namespace) -> int:
         return 0
 
     c = TASK_COLORS
+    default_merge_target = store.default_merge_target()
 
     # Fixed width for status labels to ensure alignment
     STATUS_WIDTH = 9  # "completed" is the longest at 9 chars
+
+    def _task_merge_unit_state(task: DbTask) -> str | None:
+        if task.id is not None:
+            unit = store.resolve_merge_unit_for_task(task.id)
+            if unit is not None and unit.target_branch == default_merge_target:
+                return unit.state
+        return task.merge_status
 
     def _task_shares_parent_branch(task: DbTask, parent_task: DbTask | None) -> bool:
         """Return True when a child task is anchored to the parent's branch."""
@@ -817,7 +825,8 @@ def cmd_history(args: argparse.Namespace) -> int:
     ) -> None:
         """Render a single task entry."""
         shares_parent_branch = _task_shares_parent_branch(task, parent_task)
-        use_merge_status = task.merge_status == "unmerged" and task_owns_merge_status(task)
+        merge_state = _task_merge_unit_state(task)
+        use_merge_status = merge_state == "unmerged" and task_owns_merge_status(task)
         if use_merge_status:
             status_label = "unmerged"
             status_color = c['unmerged']
@@ -869,7 +878,7 @@ def cmd_history(args: argparse.Namespace) -> int:
             )
 
         type_label = f"\\[{task.task_type}]"
-        merge_label = " \\[merged]" if task.merge_status == "merged" and task_owns_merge_status(task) else ""
+        merge_label = " \\[merged]" if merge_state == "merged" and task_owns_merge_status(task) else ""
         tid = c['task_id']
         if task.based_on and task.depends_on:
             parent_label = f" ← [{tid}]{task.based_on}[/{tid}] (dep [{tid}]{task.depends_on}[/{tid}])"

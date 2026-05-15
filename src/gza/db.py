@@ -4606,17 +4606,16 @@ class SqliteTaskStore:
                 unit = self.resolve_merge_unit_for_task(task_id)
                 if unit is None:
                     unit = self.get_or_create_merge_unit_for_task(task)
-                if unit is not None:
-                    if merge_status is not None:
-                        state = "merged" if merge_status == "merged" else "unmerged"
-                        owner = self.resolve_merge_unit_owner_task(unit)
-                        owner_task_id = owner.id if owner is not None else unit.owner_task_id
-                        self.set_merge_unit_state(
-                            unit.id,
-                            state,
-                            merged_by_task_id=owner_task_id if state == "merged" else None,
-                        )
-                        return
+                if unit is not None and merge_status is not None:
+                    state = "merged" if merge_status == "merged" else "unmerged"
+                    owner = self.resolve_merge_unit_owner_task(unit)
+                    owner_task_id = owner.id if owner is not None else unit.owner_task_id
+                    self.set_merge_unit_state(
+                        unit.id,
+                        state,
+                        merged_by_task_id=owner_task_id if state == "merged" else None,
+                    )
+                    return
         merged_at = _format_db_timestamp(datetime.now(UTC)) if merge_status == "merged" else None
         with self._connect() as conn:
             conn.execute(

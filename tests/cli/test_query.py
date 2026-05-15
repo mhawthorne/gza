@@ -14,6 +14,7 @@ import pytest
 from rich.console import Console
 
 from gza.cli import query as query_cli
+from gza.config import Config
 from gza.console import truncate
 from gza.db import Task
 from gza.git import GitError
@@ -868,6 +869,62 @@ class TestHistoryCommand:
         assert "[implement]" in result.stdout
         assert "Plan task" in result.stdout
         assert "[plan]" in result.stdout
+
+    def test_history_uses_default_target_merge_unit_state_for_status_label(self, tmp_path: Path):
+        """History should show unit-backed unmerged status even when the task row is stale."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = query_cli.get_store(config, open_mode="readwrite")
+
+        task = store.add("Stale merged row", task_type="implement")
+        store.mark_completed(task, has_commits=True, branch="feature/history-status")
+        assert task.id is not None
+
+        target_branch = store.default_merge_target()
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.target_branch == target_branch
+        store.set_merge_unit_state(unit.id, "unmerged")
+
+        stale_row = store.get(task.id)
+        assert stale_row is not None
+        stale_row.merge_status = "merged"
+        store.update(stale_row)
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "unmerged" in normalized
+        assert "[merged]" not in normalized
+
+    def test_history_uses_default_target_merge_unit_state_for_merge_label(self, tmp_path: Path):
+        """History should render the merged badge from the default-target merge unit."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = query_cli.get_store(config, open_mode="readwrite")
+
+        task = store.add("Unit merged row", task_type="implement")
+        store.mark_completed(task, has_commits=True, branch="feature/history-merged")
+        assert task.id is not None
+
+        target_branch = store.default_merge_target()
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.target_branch == target_branch
+        store.set_merge_unit_state(unit.id, "merged")
+
+        stale_row = store.get(task.id)
+        assert stale_row is not None
+        stale_row.merge_status = "unmerged"
+        store.update(stale_row)
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Unit merged row [implement] [merged]" in normalized
+        assert "unmerged" not in result.stdout
 
     def test_history_shows_orphaned_tasks_at_top(self, tmp_path: Path):
         """History command includes orphaned in-progress tasks at the top."""
