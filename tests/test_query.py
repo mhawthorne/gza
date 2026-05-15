@@ -643,6 +643,32 @@ class TestQueryIncomplete:
 
         assert query_incomplete(store, HistoryFilter(limit=None)) == []
 
+    def test_merged_merge_unit_owner_stays_hidden_with_orphan_same_branch_descendant(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("merged implement owner", task_type="implement")
+        store.mark_completed(root, has_commits=True, branch="feature/merged-owner")
+        assert root.id is not None
+
+        unit = store.resolve_merge_unit_for_task(root.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged")
+
+        orphan = store.add(
+            "orphan same-branch descendant on forked branch",
+            task_type="improve",
+            based_on=root.id,
+            same_branch=True,
+        )
+        orphan.status = "completed"
+        orphan.completed_at = datetime.now(UTC)
+        orphan.has_commits = True
+        orphan.branch = "feature/merged-owner-as-28"
+        orphan.merge_status = "unmerged"
+        store.update(orphan)
+
+        assert query_incomplete(store, HistoryFilter(limit=None)) == []
+
     def test_dropped_root_task_remains_visible(self, tmp_path: Path):
         store = self._store(tmp_path)
 

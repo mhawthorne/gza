@@ -11675,6 +11675,37 @@ class TestIncompleteCommand:
         assert json.loads(result.stdout) == [{"id": task.id, "status": "failed"}]
         assert result.stderr == ""
 
+    def test_incomplete_cli_json_hides_merged_owner_with_orphan_same_branch_descendant(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("merged implement owner", task_type="implement")
+        store.mark_completed(root, has_commits=True, branch="feature/cli-merged-owner")
+        assert root.id is not None
+
+        unit = store.resolve_merge_unit_for_task(root.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged")
+
+        orphan = store.add(
+            "orphan same-branch descendant on forked branch",
+            task_type="improve",
+            based_on=root.id,
+            same_branch=True,
+        )
+        orphan.status = "completed"
+        orphan.completed_at = datetime.now(UTC)
+        orphan.has_commits = True
+        orphan.branch = "feature/cli-merged-owner-as-28"
+        orphan.merge_status = "unmerged"
+        store.update(orphan)
+
+        result = run_gza("incomplete", "--json", "--last", "0", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == []
+        assert result.stderr == ""
+
     def test_incomplete_cli_json_uses_real_next_action_when_git_context_is_available(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)

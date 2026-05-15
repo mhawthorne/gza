@@ -784,6 +784,8 @@ def query_lineage_owner_rows(
             recovery_completed_by_failed_id=recovery_completed_by_failed_id,
         )
         owner_merge_unit = _resolve_owner_merge_unit(owner, merge_units_by_member=merge_units_by_member)
+        if owner_merge_unit is not None and owner_merge_unit.state == "merged":
+            continue
         if target_branch and owner_merge_unit is not None and owner_merge_unit.target_branch != target_branch:
             continue
         if not unresolved_tasks:
