@@ -43,7 +43,7 @@ from ..db import (
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git, GitError, active_worktree_path_for_branch
 from ..github import GitHub
-from ..lineage import walk_based_on_descendants
+from ..lineage import resolve_impl_task, walk_based_on_descendants
 from ..pr_ops import lookup_task_pr
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
@@ -1253,6 +1253,15 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             target_branch = None
 
     result = service.run(query, config=config, git=git, target_branch=target_branch)
+    if not blocked_by_dropped_only:
+        result = _normalize_incomplete_result_rows(
+            result,
+            service=service,
+            store=store,
+            config=config,
+            git=git,
+            target_branch=target_branch,
+        )
     if getattr(args, "json", False):
         _render_projection_result(result, use_json=True)
         return 0
@@ -1301,6 +1310,126 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             )
 
     return 0
+
+
+def _normalize_incomplete_result_rows(
+    result: _TaskQueryResult,
+    *,
+    service: _TaskQueryService,
+    store: SqliteTaskStore,
+    config: Config,
+    git: Git | None,
+    target_branch: str | None,
+) -> _TaskQueryResult:
+    """Re-root incomplete rows on the implementation that owns the merge unit."""
+    normalized_rows: list[_TaskRow | _LineageRow] = []
+    changed = False
+
+    for row in result.rows:
+        if not isinstance(row, _LineageRow):
+            normalized_rows.append(row)
+            continue
+
+        owner_task = _resolve_incomplete_owner_task(store, row)
+        tree = row.tree
+        members = row.members
+        if owner_task.task_type == "implement":
+            tree = _descendants_only_unmerged_lineage_tree(store, owner_task=owner_task)
+            members = tuple(_flatten_query_lineage_tree(tree)) if tree is not None else ()
+
+        owner_changed = owner_task.id != row.owner_task.id
+        tree_changed = tree is not row.tree
+        members_changed = tuple(task.id for task in members) != tuple(task.id for task in row.members)
+        if not owner_changed and not tree_changed and not members_changed:
+            normalized_rows.append(row)
+            continue
+
+        changed = True
+        normalized_rows.append(
+            service._project_lineage_row(  # noqa: SLF001
+                _LineageRow(
+                    owner_task=owner_task,
+                    members=members,
+                    tree=tree,
+                    unresolved_tasks=row.unresolved_tasks,
+                    lifecycle_action_task=row.lifecycle_action_task,
+                    recovery_action_task=row.recovery_action_task,
+                    recovery_leaf_task=row.recovery_leaf_task,
+                    lineage_status=row.lineage_status,
+                    next_action_data=row.next_action_data,
+                ),
+                result.query,
+                config=config,
+                git=git,
+                target_branch=target_branch,
+            )
+        )
+
+    if not changed:
+        return result
+    return _TaskQueryResult(query=result.query, rows=tuple(normalized_rows), total_count=result.total_count)
+
+
+def _resolve_incomplete_owner_task(store: SqliteTaskStore, row: _LineageRow) -> DbTask:
+    """Return the implementation that owns an incomplete row's branch when one exists."""
+
+    def _iter_candidates() -> list[DbTask]:
+        ordered: list[DbTask] = []
+        seen: set[str | None] = set()
+        for task in (
+            row.owner_task,
+            row.lifecycle_action_task,
+            row.recovery_action_task,
+            row.recovery_leaf_task,
+            *row.unresolved_tasks,
+            *row.members,
+        ):
+            if task is None or task.id in seen:
+                continue
+            seen.add(task.id)
+            ordered.append(task)
+        return ordered
+
+    def _resolve_impl(task: DbTask) -> DbTask | None:
+        if task.task_type == "implement":
+            return task
+        if task.id is None:
+            return None
+        if (unit := store.resolve_merge_unit_for_task(task.id)) is not None:
+            unit_owner = store.resolve_merge_unit_owner_task(unit)
+            if unit_owner is not None and unit_owner.task_type == "implement":
+                return unit_owner
+        if task.task_type in {"review", "improve", "fix"}:
+            impl_task, _error = resolve_impl_task(store, task.id)
+            return impl_task
+        if task.task_type != "rebase":
+            return None
+
+        current = task
+        seen_ids: set[str] = set()
+        while current.id is not None and current.id not in seen_ids and current.based_on:
+            seen_ids.add(current.id)
+            parent = store.get(current.based_on)
+            if parent is None:
+                return None
+            if parent.task_type == "implement":
+                return parent
+            if parent.task_type in {"review", "improve", "fix"} and parent.id is not None:
+                impl_task, _error = resolve_impl_task(store, parent.id)
+                return impl_task
+            current = parent
+        return None
+
+    candidates = _iter_candidates()
+    for candidate in candidates:
+        impl_task = _resolve_impl(candidate)
+        if impl_task is not None and impl_task.branch:
+            return impl_task
+    for candidate in candidates:
+        impl_task = _resolve_impl(candidate)
+        if impl_task is not None:
+            return impl_task
+    return row.owner_task
 
 
 def _format_review_verdict_label(review_verdict: str | None) -> str | None:

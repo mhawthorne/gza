@@ -11112,12 +11112,13 @@ class TestIncompleteCommand:
         *,
         fields: str | None,
         json: bool = False,
+        tree: bool = False,
     ) -> argparse.Namespace:
         return argparse.Namespace(
             project_dir=tmp_path,
             last=5,
             blocked_by_dropped=False,
-            tree=False,
+            tree=tree,
             type=None,
             days=None,
             date_field="effective",
@@ -11125,6 +11126,15 @@ class TestIncompleteCommand:
             verbose=False,
             fields=fields,
         )
+
+    @staticmethod
+    def _one_line_row_id(output: str) -> str:
+        return next(line.split(":", 1)[0] for line in output.splitlines() if line.strip())
+
+    @staticmethod
+    def _tree_root_id(output: str) -> str:
+        first_line = next(line for line in output.splitlines() if line.strip() and not set(line.strip()) == {"-"})
+        return first_line.split()[1]
 
     def test_incomplete_text_fields_multi_field_uses_generic_blocks(
         self,
@@ -11390,3 +11400,237 @@ class TestIncompleteCommand:
         assert "| context:" not in lines[0]
         assert "| unresolved:" not in lines[0]
         assert result.stderr == ""
+
+    def test_incomplete_roots_plan_impl_review_improve_lineage_at_impl_in_both_views(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan background job retries", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+        store.update(plan)
+        assert plan.id is not None
+
+        impl = store.add("Implement background job retries", task_type="implement", based_on=plan.id)
+        impl.status = "completed"
+        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+        impl.branch = "feature/retries"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        store.update(impl)
+        assert impl.id is not None
+
+        unit = store.create_merge_unit(
+            source_branch=impl.branch,
+            target_branch="main",
+            owner_task_id=impl.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(impl.id, unit.id, "owner")
+
+        review = store.add(
+            "Review background job retries",
+            task_type="review",
+            based_on=impl.id,
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        store.update(review)
+        assert review.id is not None
+        store.attach_task_to_merge_unit(review.id, unit.id, "review")
+
+        improve = store.add(
+            "Improve background job retries",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        improve.status = "in_progress"
+        improve.branch = impl.branch
+        improve.has_commits = True
+        store.update(improve)
+        assert improve.id is not None
+        store.attach_task_to_merge_unit(improve.id, unit.id, "improve")
+
+        git = _mock_unmerged_git()
+        with patch("gza.cli.query.Git", return_value=git):
+            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None))
+        captured = capsys.readouterr()
+
+        assert result == 0
+        one_line_output = captured.out
+        assert self._one_line_row_id(one_line_output) == impl.id
+        assert f"SKIP: improve task {improve.id} is in_progress" in one_line_output
+        assert plan.prompt not in one_line_output
+
+        with patch("gza.cli.query.Git", return_value=git):
+            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None, tree=True))
+        captured = capsys.readouterr()
+
+        assert result == 0
+        tree_output = captured.out
+        assert self._tree_root_id(tree_output) == impl.id
+        assert plan.id not in tree_output
+        assert plan.prompt not in tree_output
+        assert review.id in tree_output
+        assert improve.id in tree_output
+        assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
+
+    def test_incomplete_roots_failed_rebase_lineage_at_impl_and_reports_blocker(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement startup diagnostics", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+        impl.branch = "feature/startup-diagnostics"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        store.update(impl)
+        assert impl.id is not None
+
+        unit = store.create_merge_unit(
+            source_branch=impl.branch,
+            target_branch="main",
+            owner_task_id=impl.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(impl.id, unit.id, "owner")
+
+        rebase = store.add(
+            "Rebase startup diagnostics",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        rebase.status = "failed"
+        rebase.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        rebase.branch = impl.branch
+        rebase.has_commits = True
+        rebase.failure_reason = "MERGE_CONFLICT"
+        store.update(rebase)
+        assert rebase.id is not None
+        store.attach_task_to_merge_unit(rebase.id, unit.id, "rebase")
+
+        git = _mock_unmerged_git()
+        git.can_merge.return_value = False
+
+        with patch("gza.cli.query.Git", return_value=git):
+            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None))
+        captured = capsys.readouterr()
+
+        assert result == 0
+        one_line_output = captured.out
+        assert self._one_line_row_id(one_line_output) == impl.id
+        assert f"rebase {rebase.id} failed, needs manual resolution" in one_line_output
+
+        with patch("gza.cli.query.Git", return_value=git):
+            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None, tree=True))
+        captured = capsys.readouterr()
+
+        assert result == 0
+        tree_output = captured.out
+        assert self._tree_root_id(tree_output) == impl.id
+        assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
+
+    def test_incomplete_roots_dropped_rebase_chain_at_impl_in_both_views(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement background mode startup errors", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+        impl.branch = "feature/background-errors"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        store.update(impl)
+        assert impl.id is not None
+
+        unit = store.create_merge_unit(
+            source_branch=impl.branch,
+            target_branch="main",
+            owner_task_id=impl.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(impl.id, unit.id, "owner")
+
+        rebase_resolved = store.add(
+            "Resolved rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        rebase_resolved.status = "completed"
+        rebase_resolved.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        rebase_resolved.branch = impl.branch
+        rebase_resolved.has_commits = True
+        rebase_resolved.merge_status = "unmerged"
+        store.update(rebase_resolved)
+        assert rebase_resolved.id is not None
+        store.attach_task_to_merge_unit(rebase_resolved.id, unit.id, "rebase")
+
+        dropped_one = store.add(
+            "Dropped rebase one",
+            task_type="rebase",
+            based_on=rebase_resolved.id,
+            same_branch=True,
+        )
+        dropped_one.status = "dropped"
+        dropped_one.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+        dropped_one.branch = impl.branch
+        dropped_one.has_commits = True
+        store.update(dropped_one)
+        assert dropped_one.id is not None
+        store.attach_task_to_merge_unit(dropped_one.id, unit.id, "rebase")
+
+        dropped_two = store.add(
+            "Dropped rebase two",
+            task_type="rebase",
+            based_on=dropped_one.id,
+            same_branch=True,
+        )
+        dropped_two.status = "dropped"
+        dropped_two.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
+        dropped_two.branch = impl.branch
+        dropped_two.has_commits = True
+        store.update(dropped_two)
+        assert dropped_two.id is not None
+        store.attach_task_to_merge_unit(dropped_two.id, unit.id, "rebase")
+
+        git = _mock_unmerged_git()
+        git.can_merge.return_value = False
+
+        with patch("gza.cli.query.Git", return_value=git):
+            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None))
+        captured = capsys.readouterr()
+
+        assert result == 0
+        one_line_output = captured.out
+        assert self._one_line_row_id(one_line_output) == impl.id
+        assert "rebase --resolve (conflicts detected)" in one_line_output
+        assert f"{dropped_one.id} (dropped)" in one_line_output
+        assert f"{dropped_two.id} (dropped)" in one_line_output
+
+        with patch("gza.cli.query.Git", return_value=git):
+            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None, tree=True))
+        captured = capsys.readouterr()
+
+        assert result == 0
+        tree_output = captured.out
+        assert self._tree_root_id(tree_output) == impl.id
+        assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
