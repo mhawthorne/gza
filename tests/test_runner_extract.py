@@ -83,32 +83,16 @@ def _write_bundle(
     (bundle_dir / "prompt.md").write_text("seed prompt\n")
 
 
-def _init_repo_for_selected_subset_already_merged(tmp_path: Path) -> str:
-    repo_git = Git(tmp_path)
-    repo_git._run("init", "-b", "main")
-    repo_git._run("config", "user.email", "test@example.com")
-    repo_git._run("config", "user.name", "Test User")
-
-    source_file = tmp_path / "src" / "file.py"
-    source_file.parent.mkdir(parents=True, exist_ok=True)
-    source_file.write_text("print('anchor')\n")
-    repo_git._run("add", "src/file.py")
-    repo_git._run("commit", "-m", "base")
-
-    repo_git._run("checkout", "-b", "feature/source")
-    source_file.write_text("print('line a')\nprint('anchor')\n")
-    repo_git._run("add", "src/file.py")
-    repo_git._run("commit", "-m", "add line a")
-
-    patch_text = repo_git.get_diff_patch_for_paths("main...feature/source", ("src/file.py",), binary=True)
-
-    repo_git._run("checkout", "main")
-    source_file.parent.mkdir(parents=True, exist_ok=True)
-    source_file.write_text("print('line a')\nprint('anchor')\nprint('line b')\n")
-    repo_git._run("add", "src/file.py")
-    repo_git._run("commit", "-m", "add line a and line b later on main")
-
-    return patch_text
+def _selected_subset_patch_text() -> str:
+    return (
+        "diff --git a/src/file.py b/src/file.py\n"
+        "index 82db48f..145f4e6 100644\n"
+        "--- a/src/file.py\n"
+        "+++ b/src/file.py\n"
+        "@@ -1 +1,2 @@\n"
+        "+print('line a')\n"
+        " print('anchor')\n"
+    )
 
 
 def test_seed_extraction_bundle_applies_patch_and_returns_paths(tmp_path: Path) -> None:
@@ -898,7 +882,7 @@ def test_run_completes_without_provider_when_selected_source_changes_are_subset_
     task.slug = "20260508-already-merged-selected-subset"
     store.update(task)
 
-    patch_text = _init_repo_for_selected_subset_already_merged(tmp_path)
+    patch_text = _selected_subset_patch_text()
     assert "+print('line a')" in patch_text
     assert "+print('line b')" not in patch_text
     _write_bundle(
@@ -925,33 +909,42 @@ def test_run_completes_without_provider_when_selected_source_changes_are_subset_
     mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
 
     worktree_path = config.worktree_path / task.slug
-    repo_git = Git(tmp_path)
-    repo_git.worktree_add(worktree_path, "feature/already-merged-selected-subset", "main")
-    worktree_git = Git(worktree_path)
-    current_base_delta = worktree_git.get_diff_patch_for_paths(
-        "main..feature/source",
-        ("src/file.py",),
-        binary=True,
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    source_file = worktree_path / "src" / "file.py"
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    source_file.write_text("print('line a')\nprint('anchor')\nprint('line b')\n")
+    current_base_delta = (
+        "diff --git a/src/file.py b/src/file.py\n"
+        "index 2f3f377..145f4e6 100644\n"
+        "--- a/src/file.py\n"
+        "+++ b/src/file.py\n"
+        "@@ -1,3 +1,2 @@\n"
+        " print('line a')\n"
+        " print('anchor')\n"
+        "-print('line b')\n"
     )
-    reverse_check = patch.object(
-        worktree_git,
-        "reverse_check_patch_file_result",
-        wraps=worktree_git.reverse_check_patch_file_result,
+    worktree_git = Mock(spec=Git)
+    worktree_git.repo_dir = worktree_path
+    worktree_git.ref_exists.side_effect = lambda ref: ref in {"feature/source", "main"}
+    worktree_git.get_diff_patch_for_paths.side_effect = [patch_text, current_base_delta]
+    worktree_git.reverse_check_patch_file_result.return_value = GitApplyResult(
+        returncode=0,
+        stdout="",
+        stderr="",
     )
 
     assert current_base_delta.strip()
-    assert (worktree_path / "src" / "file.py").read_text() == (
+    assert source_file.read_text() == (
         "print('line a')\nprint('anchor')\nprint('line b')\n"
     )
 
-    with reverse_check as mock_reverse_check:
-        with (
-            patch("gza.runner.get_provider", return_value=mock_provider),
-            patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
-            patch("gza.runner.Git", side_effect=[mock_main_git, worktree_git]),
-            patch("gza.runner.load_dotenv"),
-        ):
-            rc = run(config, task_id=task.id)
+    with (
+        patch("gza.runner.get_provider", return_value=mock_provider),
+        patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
+        patch("gza.runner.Git", side_effect=[mock_main_git, worktree_git]),
+        patch("gza.runner.load_dotenv"),
+    ):
+        rc = run(config, task_id=task.id)
 
     assert rc == 0
     refreshed = store.get(task.id)
@@ -959,8 +952,8 @@ def test_run_completes_without_provider_when_selected_source_changes_are_subset_
     assert refreshed.status == "completed"
     assert refreshed.completion_reason == EXTRACTION_ALREADY_MERGED_COMPLETION_REASON
     assert mock_provider.run.call_count == 0
-    assert mock_reverse_check.call_count == 1
-    assert (worktree_path / "src" / "file.py").read_text() == (
+    worktree_git.reverse_check_patch_file_result.assert_called_once()
+    assert source_file.read_text() == (
         "print('line a')\nprint('anchor')\nprint('line b')\n"
     )
 
