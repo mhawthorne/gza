@@ -4667,6 +4667,45 @@ def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
     assert not any(" REBASE " in line for line in lines)
 
 
+def test_watch_cycle_skips_iterate_for_already_reachable_branch_with_stale_merge_state(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/already-reachable"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+    store.get_or_create_merge_unit_for_task(impl)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.is_merged.return_value = True
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate should not run")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    assert "implementation chain already merged; not starting iterate" in log_path.read_text()
+
+
 def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebase_task(tmp_path: Path) -> None:
     """Isolated conflict rebases should pass the prepared child into the worker spawn helper."""
     (tmp_path / "gza.yaml").write_text(
@@ -8032,9 +8071,11 @@ def test_watch_iterate_helper_skips_duplicate_impl_worker_for_pending_child(tmp_
 
     result = _watch_iterate_impl_target(
         store=store,
+        git=_make_watch_git(),
         task=impl,
         action={"type": "run_improve", "improve_task": improve},
         running_task_ids={impl.id},
+        target_branch="main",
     )
 
     assert result is not None

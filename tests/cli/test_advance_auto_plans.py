@@ -426,6 +426,82 @@ def test_advance_explicit_impl_uses_canonical_target_and_skips_orphan_rebase_bra
     assert outputs[0] == outputs[1]
 
 
+def test_advance_explicit_impl_reports_already_merged_when_branch_is_reachable_but_merge_state_is_stale(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = _create_completed_implement(store, "Implement feature")
+    assert impl.id is not None
+    _create_completed_review(store, impl, verdict="APPROVED")
+
+    rebase = store.add("Completed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert rebase.id is not None
+    rebase.status = "completed"
+    rebase.completed_at = datetime.now(UTC)
+    rebase.branch = impl.branch
+    rebase.has_commits = True
+    rebase.changed_diff = True
+    store.update(rebase)
+
+    git = _mock_git(can_merge=False)
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.ref_exists.return_value = False
+    git.is_merged.return_value = True
+
+    with patch("gza.cli.git_ops.Git", return_value=git):
+        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert f"Task {impl.id} is already merged" in captured.out
+    assert "Would advance" not in captured.out
+
+
+def test_advance_explicit_impl_prefers_fresh_remote_over_stale_legacy_local_ref(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    from gza.git import ResolvedMergeSourceRef
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = _create_completed_implement(store, "Implement feature")
+    assert impl.id is not None
+    _create_completed_review(store, impl, verdict="APPROVED")
+
+    rebase = store.add("Completed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert rebase.id is not None
+    rebase.status = "completed"
+    rebase.completed_at = datetime.now(UTC)
+    rebase.branch = impl.branch
+    rebase.has_commits = True
+    rebase.changed_diff = True
+    store.update(rebase)
+
+    git = _mock_git(can_merge=False)
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.ref_exists.return_value = True
+    git.resolve_merge_source_ref.return_value = impl.branch
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(f"origin/{impl.branch}")
+    git.is_merged.side_effect = lambda source_ref, target_branch: (
+        source_ref == f"origin/{impl.branch}" and target_branch == "main"
+    )
+
+    with patch("gza.cli.git_ops.Git", return_value=git):
+        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert f"Task {impl.id} is already merged" in captured.out
+    assert "Would advance" not in captured.out
+
+
 def test_advance_explicit_impl_conflict_plan_skips_orphan_rebase_branch_for_non_merge_action(
     tmp_path: Path,
     capsys,

@@ -18,6 +18,7 @@ from ..console import prompt_available_width, shorten_prompt
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..git import Git, GitError
 from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
+from ..merge_state import resolve_task_merge_state_for_target
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..recovery_engine import (
     FailedRecoveryDecision,
@@ -204,9 +205,11 @@ def _watch_iterate_result(
 def _watch_iterate_impl_target(
     *,
     store: SqliteTaskStore,
+    git: Git,
     task: DbTask,
     action: dict[str, object],
     running_task_ids: set[str],
+    target_branch: str,
 ) -> DbTask | AdvanceActionExecutionResult | None:
     action_type = str(action.get("type", "skip"))
     if action_type not in _WATCH_ITERATE_ROUTED_ACTIONS:
@@ -302,7 +305,15 @@ def _watch_iterate_impl_target(
             ),
             guarded_pending_task_id=guarded_pending_task_id,
         )
-    if impl_task.merge_status == "merged":
+    if (
+        resolve_task_merge_state_for_target(
+            store=store,
+            task=impl_task,
+            git=git,
+            target_branch=target_branch,
+        )
+        == "merged"
+    ):
         return _watch_iterate_result(
             action_type=action_type,
             status="skip",
@@ -1106,9 +1117,11 @@ def _run_cycle(
             ),
             prefer_iterate_for_action=lambda task, action: _watch_iterate_impl_target(
                 store=store,
+                git=git,
                 task=task,
                 action=action,
                 running_task_ids=running_task_id_set,
+                target_branch=target_branch,
             ),
         )
 

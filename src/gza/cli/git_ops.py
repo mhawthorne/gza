@@ -35,6 +35,7 @@ from ..git import (
 )
 from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
 from ..log_paths import resolve_ops_log_path
+from ..merge_state import resolve_task_merge_state_for_target
 from ..pickup import (
     count_worker_consuming_actions,
     get_runnable_pending_tasks,
@@ -2170,14 +2171,20 @@ def cmd_advance(args: argparse.Namespace) -> int:
         else:
             if task.status != 'completed':
                 return phase1_error(args, f"Task {task_id} is not completed (status: {task.status})")
-            if _task_is_already_merged(store, task):
-                print(f"Task {task_id} is already merged")
-                return 0
         try:
             target_branch = _resolve_advance_target_branch(store, git, task=task)
         except MergeTargetResolutionError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
+        if task.status != "failed" and target_branch is not None:
+            if resolve_task_merge_state_for_target(
+                store=store,
+                task=task,
+                git=git,
+                target_branch=target_branch,
+            ) == "merged":
+                print(f"Task {task_id} is already merged")
+                return 0
         owner_rows = list(
             query_lineage_owner_rows(
                 store,

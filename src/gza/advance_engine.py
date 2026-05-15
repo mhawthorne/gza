@@ -11,6 +11,7 @@ from typing import Any
 from gza.console import prompt_available_width, shorten_prompt
 from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from gza.git import ResolvedMergeSourceRef
+from gza.merge_state import resolve_task_merge_state_for_target
 from gza.query import get_code_changing_descendants_for_root, get_reviews_for_root
 from gza.recovery_engine import (
     FailedRecoveryDecision,
@@ -62,6 +63,7 @@ class AdvanceContext:
 
     merge_source_ref: str | None = None
     merge_source_warning: str | None = None
+    merge_state: str | None = None
     can_merge: bool = True
     rebase_pending_or_running: DbTask | None = None
     rebase_failed: DbTask | None = None
@@ -683,7 +685,13 @@ def resolve_advance_context(
         )
 
     merge_source = _resolve_current_merge_source(git, task.branch)
-    can_merge = bool(merge_source.ref) and git.can_merge(merge_source.ref, target_branch)
+    merge_state = resolve_task_merge_state_for_target(
+        store=store,
+        task=task,
+        git=git,
+        target_branch=target_branch,
+    )
+    can_merge = merge_state == "merged" or (bool(merge_source.ref) and git.can_merge(merge_source.ref, target_branch))
     rebase_children = [
         child
         for child in store.get_lineage_children(task.id)
@@ -750,6 +758,7 @@ def resolve_advance_context(
         failed_recovery_attention_reason=failed_recovery_attention_reason,
         merge_source_ref=merge_source.ref,
         merge_source_warning=merge_source.warning,
+        merge_state=merge_state,
         can_merge=can_merge,
         rebase_pending_or_running=rebase_pending_or_running,
         rebase_failed=rebase_failed,
@@ -844,6 +853,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
             },
             reason="merge-source-needs-manual-resolution",
         ),
+    ),
+    AdvanceRule(
+        name="already_merged",
+        matches=lambda ctx: ctx.merge_state == "merged",
+        action=lambda ctx: {"type": "skip", "description": "SKIP: already merged into target branch"},
     ),
     AdvanceRule(
         name="conflict_rebase_running",

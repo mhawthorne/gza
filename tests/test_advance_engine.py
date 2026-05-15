@@ -28,18 +28,25 @@ class _FakeGit:
         can_merge: bool = True,
         *,
         can_merge_by_ref: dict[tuple[str, str], bool] | None = None,
+        is_merged_by_ref: dict[tuple[str, str], bool] | None = None,
         existing_branches: set[str] | None = None,
         existing_refs: set[str] | None = None,
         merge_source_result: tuple[str | None, str | None] | None = None,
+        legacy_merge_source_ref: str | None = None,
     ):
         self._can_merge = can_merge
         self._can_merge_by_ref = can_merge_by_ref or {}
+        self._is_merged_by_ref = is_merged_by_ref or {}
         self._existing_branches = existing_branches or set()
         self._existing_refs = existing_refs or set()
         self._merge_source_result = merge_source_result
+        self._legacy_merge_source_ref = legacy_merge_source_ref
 
     def can_merge(self, source_branch: str, target_branch: str) -> bool:
         return self._can_merge_by_ref.get((source_branch, target_branch), self._can_merge)
+
+    def is_merged(self, source_branch: str, target_branch: str) -> bool:
+        return self._is_merged_by_ref.get((source_branch, target_branch), False)
 
     def branch_exists(self, branch: str) -> bool:
         return branch in self._existing_branches
@@ -59,6 +66,16 @@ class _FakeGit:
         if branch in self._existing_branches:
             return ResolvedMergeSourceRef(branch)
         return ResolvedMergeSourceRef(branch)
+
+    def resolve_merge_source_ref(self, branch: str) -> str | None:
+        if self._legacy_merge_source_ref is not None:
+            return self._legacy_merge_source_ref
+        if branch in self._existing_branches:
+            return branch
+        remote_ref = f"origin/{branch}"
+        if remote_ref in self._existing_refs:
+            return remote_ref
+        return None
 
 
 def _make_store(tmp_path: Path) -> SqliteTaskStore:
@@ -790,6 +807,130 @@ def test_failed_rebase_without_review_still_requires_manual_resolution(tmp_path:
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
     assert "failed, needs manual resolution" in action["description"]
+
+
+def test_already_merged_branch_skips_post_rebase_review_and_rebase_actions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 4, 0, tzinfo=UTC)
+    impl.branch = "feat/already-merged-after-rebase"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+    store.get_or_create_merge_unit_for_task(impl)
+
+    review = store.add("Initial review", task_type="review", depends_on=impl.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 5, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    rebase = store.add("Completed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    rebase.status = "completed"
+    rebase.completed_at = datetime(2026, 5, 14, 6, 0, tzinfo=UTC)
+    rebase.branch = impl.branch
+    rebase.has_commits = True
+    rebase.changed_diff = True
+    store.update(rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=False,
+            is_merged_by_ref={("origin/feat/already-merged-after-rebase", "main"): True},
+            existing_refs={"origin/feat/already-merged-after-rebase"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: already merged into target branch"
+
+
+def test_already_merged_branch_prefers_fresh_remote_over_stale_legacy_local_ref(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 4, 0, tzinfo=UTC)
+    impl.branch = "feat/stale-local-fresh-remote"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+    store.get_or_create_merge_unit_for_task(impl)
+
+    review = store.add("Initial review", task_type="review", depends_on=impl.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 5, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    rebase = store.add("Completed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    rebase.status = "completed"
+    rebase.completed_at = datetime(2026, 5, 14, 6, 0, tzinfo=UTC)
+    rebase.branch = impl.branch
+    rebase.has_commits = True
+    rebase.changed_diff = True
+    store.update(rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=False,
+            is_merged_by_ref={
+                ("origin/feat/stale-local-fresh-remote", "main"): True,
+                ("feat/stale-local-fresh-remote", "main"): False,
+            },
+            existing_branches={"feat/stale-local-fresh-remote"},
+            existing_refs={"origin/feat/stale-local-fresh-remote"},
+            merge_source_result=("origin/feat/stale-local-fresh-remote", None),
+            legacy_merge_source_ref="feat/stale-local-fresh-remote",
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: already merged into target branch"
 
 
 def test_failed_rebase_is_superseded_by_later_completed_same_branch_rebase(

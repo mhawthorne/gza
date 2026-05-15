@@ -41,6 +41,7 @@ from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git
 from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
+from ..merge_state import resolve_task_merge_state_for_target
 from ..prompts import PromptBuilder
 from ..query import (
     get_base_task_slug as _get_base_task_slug,
@@ -161,36 +162,12 @@ def _resolve_iterate_merge_state_for_current_target(
     iterate must suppress when current-target branch reachability proves the
     source ref is already merged elsewhere. Missing refs remain unproven.
     """
-    resolved_merge_unit = (
-        store.resolve_merge_unit_for_task(impl_task.id) if impl_task.id is not None else None
+    return resolve_task_merge_state_for_target(
+        store=store,
+        task=impl_task,
+        git=git_runtime,
+        target_branch=target_branch,
     )
-    source_merge_ref = (
-        git_runtime.resolve_merge_source_ref(impl_task.branch) if impl_task.branch else None
-    )
-    current_target_proves_merge = (
-        source_merge_ref is not None and git_runtime.is_merged(source_merge_ref, target_branch) is True
-    )
-
-    if resolved_merge_unit is not None:
-        if resolved_merge_unit.state == "merged" and resolved_merge_unit.target_branch == target_branch:
-            return "merged"
-        if resolved_merge_unit.state == "merged":
-            if current_target_proves_merge:
-                return "merged"
-            return None
-        if current_target_proves_merge:
-            return "merged"
-        return resolved_merge_unit.state
-
-    if current_target_proves_merge:
-        return "merged"
-
-    if impl_task.merge_status == "merged":
-        if not impl_task.branch:
-            return "merged"
-        return None
-
-    return impl_task.merge_status
 
 
 def _run_with_registered_worker(
