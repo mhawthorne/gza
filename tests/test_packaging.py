@@ -102,6 +102,7 @@ def test_unit_test_conftest_injects_unit_and_functional_watchdogs() -> None:
     assert explicit_timeout.markers == []
 
 
+@pytest.mark.functional
 def test_functional_subprocess_timeouts_within_watchdog() -> None:
     """subprocess.run(timeout=N) inside @pytest.mark.functional tests must not exceed the watchdog."""
     repo_root = Path(__file__).resolve().parents[1]
