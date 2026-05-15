@@ -5937,6 +5937,7 @@ class TestIterateCommand:
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
@@ -6054,6 +6055,7 @@ class TestIterateCommand:
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
@@ -6723,6 +6725,7 @@ class TestIterateCommand:
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
@@ -6883,6 +6886,7 @@ class TestIterateCommand:
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
@@ -7135,6 +7139,7 @@ class TestIterateCommand:
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
@@ -8532,6 +8537,7 @@ class TestIterateCommand:
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
         ):
             result = cmd_iterate(args)
         assert result == 0
@@ -8574,6 +8580,7 @@ class TestIterateCommand:
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
         ):
             result = cmd_iterate(args)
 
@@ -8621,6 +8628,7 @@ class TestIterateCommand:
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
         ):
             result = cmd_iterate(args)
 
@@ -8641,8 +8649,10 @@ class TestIterateCommand:
         setup_config(tmp_path)
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
+        store._default_merge_target_cache = "main"  # noqa: SLF001 - test fixture for merge-unit backfill
         assert impl.id is not None
         assert store.resolve_merge_unit_for_task(impl.id) is None
+        impl.has_commits = True
         impl.merge_status = "unmerged"
         store.update(impl)
 
@@ -8666,6 +8676,7 @@ class TestIterateCommand:
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
         ):
             result = cmd_iterate(args)
 
@@ -8674,6 +8685,139 @@ class TestIterateCommand:
         mock_git.is_merged.assert_called_once_with(f"origin/{impl.branch}", "release")
         assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
         assert f"[dry-run] Would iterate implementation {impl.id}" not in output
+
+    def test_iterate_reconciles_stale_legacy_impl_when_current_target_git_proves_merged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001 - test fixture for merge-unit backfill
+        impl = self._make_completed_impl(store)
+        assert impl.id is not None
+        assert store.resolve_merge_unit_for_task(impl.id) is None
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        store.update(impl)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.default_branch.return_value = "main"
+        mock_git.resolve_merge_source_ref.return_value = f"origin/{impl.branch}"
+        mock_git.branch_exists.return_value = False
+        mock_git.ref_exists.return_value = True
+        mock_git.is_merged.return_value = True
+        mock_git.can_merge.return_value = True
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        refreshed = store.get(impl.id)
+        unit = store.resolve_merge_unit_for_task(impl.id)
+
+        assert result == 0
+        assert refreshed is not None
+        assert refreshed.merge_status == "merged"
+        assert unit is not None
+        assert unit.target_branch == "main"
+        assert unit.state == "merged"
+        assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
+
+    def test_iterate_reconciles_resolved_completed_descendant_before_failed_ancestor_noop(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001 - test fixture for merge-unit backfill
+
+        failed_impl = store.add("Failed implementation", task_type="implement")
+        assert failed_impl.id is not None
+        failed_impl.status = "failed"
+        failed_impl.failure_reason = "TEST_FAILURE"
+        failed_impl.branch = "feature/failed-ancestor"
+        failed_impl.has_commits = True
+        failed_impl.completed_at = datetime.now(UTC)
+        store.update(failed_impl)
+
+        recovered_impl = store.add(
+            "Recovered implementation",
+            task_type="implement",
+            based_on=failed_impl.id,
+        )
+        assert recovered_impl.id is not None
+        recovered_impl.status = "completed"
+        recovered_impl.prompt = failed_impl.prompt
+        recovered_impl.branch = failed_impl.branch
+        recovered_impl.has_commits = True
+        recovered_impl.recovery_origin = "retry"
+        recovered_impl.completed_at = datetime.now(UTC)
+        recovered_impl.merge_status = "unmerged"
+        store.update(recovered_impl)
+
+        args = argparse.Namespace(
+            impl_task_id=failed_impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.default_branch.return_value = "main"
+        mock_git.resolve_merge_source_ref.return_value = f"origin/{recovered_impl.branch}"
+        mock_git.branch_exists.return_value = False
+        mock_git.ref_exists.return_value = True
+        mock_git.is_merged.return_value = True
+        mock_git.can_merge.return_value = True
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        refreshed = store.get(recovered_impl.id)
+        unit = store.resolve_merge_unit_for_task(recovered_impl.id)
+
+        assert result == 0
+        assert refreshed is not None
+        assert unit is not None
+        assert unit.state == "merged"
+        assert (
+            "No remaining iterate action: "
+            f"failed implementation {failed_impl.id} was fully recovered by merged descendant {recovered_impl.id}."
+        ) in output
 
     def test_iterate_suppresses_when_off_target_unmerged_merge_unit_is_merged(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -9467,6 +9611,74 @@ class TestIterateCommand:
         spawn_background.assert_not_called()
         assert "Next action: skip" in output
         assert "Iterate blocked: task has no branch (no commits)" in output
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+
+    def test_background_iterate_reconciles_already_merged_noop_before_spawn(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        store._default_merge_target_cache = "main"  # noqa: SLF001 - test fixture for merge-unit backfill
+        assert impl.id is not None
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        store.update(impl)
+
+        config = Config.load(tmp_path)
+        config.max_resume_attempts = 1
+        config.advance_requires_review = True
+        config.advance_create_reviews = True
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.default_branch.return_value = "main"
+        mock_git.resolve_merge_source_ref.return_value = f"origin/{impl.branch}"
+        mock_git.branch_exists.return_value = False
+        mock_git.ref_exists.return_value = True
+        mock_git.is_merged.return_value = True
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "merge", "description": "merge ready"},
+            ),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        refreshed = store.get(impl.id)
+        unit = store.resolve_merge_unit_for_task(impl.id)
+
+        assert result == 0
+        spawn_background.assert_not_called()
+        assert refreshed is not None
+        assert refreshed.merge_status == "merged"
+        assert unit is not None
+        assert unit.state == "merged"
+        assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
         assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 
     def test_background_iterate_merge_with_followups_spawns_worker_instead_of_noop(

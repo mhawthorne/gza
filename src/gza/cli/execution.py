@@ -170,6 +170,49 @@ def _resolve_iterate_merge_state_for_current_target(
     )
 
 
+def _reconcile_iterate_already_merged(
+    *,
+    store: SqliteTaskStore,
+    impl_task: DbTask,
+    git_runtime: Git,
+    target_branch: str,
+) -> None:
+    """Persist merged state when iterate proves the implementation is already landed.
+
+    Iterate may prove current-target reachability even when stored merge truth is stale.
+    Reconcile only when the canonical merge-state target matches the proven target, or
+    when a merge-unit-backed store would create the same target by default.
+    """
+    if impl_task.id is None:
+        return
+
+    merge_unit = store.resolve_merge_unit_for_task(impl_task.id)
+    if impl_task.merge_status == "merged" and merge_unit is None:
+        return
+    if merge_unit is not None:
+        if merge_unit.target_branch != target_branch or merge_unit.state == "merged":
+            return
+    elif store.supports_merge_units():
+        default_target = git_runtime.default_branch()
+        if default_target != target_branch:
+            return
+
+    store.set_merge_status(impl_task.id, "merged")
+
+    refreshed_unit = store.resolve_merge_unit_for_task(impl_task.id)
+    if refreshed_unit is not None:
+        if refreshed_unit.target_branch == target_branch and refreshed_unit.state == "merged":
+            return
+        raise RuntimeError(
+            f"stored merge unit remained {refreshed_unit.state!r} for target {refreshed_unit.target_branch!r}"
+        )
+
+    refreshed_task = store.get(impl_task.id)
+    if refreshed_task is not None and refreshed_task.merge_status == "merged":
+        return
+    raise RuntimeError("stored task merge status remained unmerged")
+
+
 def _run_with_registered_worker(
     *,
     config: Config,
@@ -2630,6 +2673,21 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             git_runtime=preflight_context.git_runtime,
             target_branch=preflight_context.target_branch,
         )
+        if resolved_merge_state == "merged":
+            try:
+                _reconcile_iterate_already_merged(
+                    store=store,
+                    impl_task=iterate_task,
+                    git_runtime=preflight_context.git_runtime,
+                    target_branch=preflight_context.target_branch,
+                )
+            except Exception as exc:
+                task_label = iterate_task.id or "<unknown>"
+                print_phase1_message(
+                    args,
+                    f"Error: failed to reconcile already-merged implementation {task_label}: {exc}",
+                )
+                return 1
         if resolved_from_failed_ancestor and resolved_merge_state == "merged":
             print(
                 "No remaining iterate action: "
@@ -3137,6 +3195,18 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         git_runtime=git_runtime,
         target_branch=target_branch,
     )
+    if resolved_merge_state == "merged":
+        try:
+            _reconcile_iterate_already_merged(
+                store=store,
+                impl_task=impl_task,
+                git_runtime=git_runtime,
+                target_branch=target_branch,
+            )
+        except Exception as exc:
+            task_label = impl_task.id or "<unknown>"
+            print(f"Error: failed to reconcile already-merged implementation {task_label}: {exc}")
+            return 1
     if resolved_from_failed_ancestor and resolved_merge_state == "merged":
         print(
             "No remaining iterate action: "

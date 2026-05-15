@@ -4710,6 +4710,93 @@ def test_watch_cycle_skips_iterate_for_already_reachable_branch_with_stale_merge
     assert "implementation chain already merged; not starting iterate" in log_path.read_text()
 
 
+def test_watch_cycle_next_pass_skips_iterate_after_child_reconciles_merged_state(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/watch-iterate-reconcile"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "unmerged")
+
+    queued = store.add("Queued follow-up plan", task_type="plan")
+    assert queued.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    def fake_spawn_iterate(_args, _config, impl_task, **_kwargs):
+        assert impl_task.id == impl.id
+        store.set_merge_status(impl_task.id, "merged")
+        return 0
+
+    def fake_spawn_worker(_args, _config, task_id=None, **_kwargs):
+        assert task_id == queued.id
+        task = store.get(task_id)
+        assert task is not None
+        task.status = "in_progress"
+        store.update(task)
+        return 0
+
+    def fake_determine_next_action(_config, _store, _git, task, _target_branch, **_kwargs):
+        if task.id == impl.id:
+            return {"type": "create_review"}
+        raise AssertionError(f"unexpected completed-task planning for {task.id}")
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.determine_next_action", side_effect=fake_determine_next_action),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=fake_spawn_iterate) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=fake_spawn_worker) as spawn_worker,
+    ):
+        first_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+        second_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
+    assert first_result.work_done is True
+    assert second_result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_worker.call_count == 1
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "merged"
+    log_lines = log_path.read_text().splitlines()
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and f"{impl.id} iterate" in line
+        for line in log_lines
+        if line.strip()
+    )
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and f"{queued.id} plan" in line
+        for line in log_lines
+        if line.strip()
+    )
+
+
 def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebase_task(tmp_path: Path) -> None:
     """Isolated conflict rebases should pass the prepared child into the worker spawn helper."""
     (tmp_path / "gza.yaml").write_text(
