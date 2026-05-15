@@ -352,15 +352,10 @@ def reconcile_branch_merge_truth(
                 remote_target_ref=remote_target_ref,
             )
             if reconcile_ref is None:
-                remote_merged = None
                 target_merged = None
             else:
-                remote_merged = (
-                    git.is_merged(reconcile_ref, into=remote_target_ref)
-                    if remote_target_ref is not None
-                    else None
-                )
-                target_merged = git.is_merged(reconcile_ref, into=target_branch)
+                proof_target_ref = remote_target_ref or target_branch
+                target_merged = git.is_merged(reconcile_ref, into=proof_target_ref)
         except GitError as exc:
             result.errors.append(str(exc))
             result.merge_status = desired_merge_status
@@ -387,7 +382,7 @@ def reconcile_branch_merge_truth(
                     "preserving any stored base_sha"
                 )
 
-        if remote_merged is True or target_merged is True:
+        if target_merged is True:
             desired_merge_status = "merged"
             _mark_merged(result)
         elif reconcile_ref is None:
@@ -692,6 +687,7 @@ def reconcile_task_branch_merge_truth(
     *,
     target_branch: str,
     include_diff_stats: bool,
+    remote_target_ref: str | None = None,
     persist: bool = True,
 ) -> BranchSyncResult:
     """Task-scoped wrapper that expands to a cohort and reconciles git merge truth."""
@@ -709,6 +705,7 @@ def reconcile_task_branch_merge_truth(
         [cohort],
         target_branch=target_branch,
         include_diff_stats=include_diff_stats,
+        remote_target_ref=remote_target_ref,
     )[0]
     if persist and result.skipped_reason is None:
         _persist_branch_updates(store, [cohort], [result], [_git_reconcile_update(result)], target_branch)

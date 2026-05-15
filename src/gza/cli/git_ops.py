@@ -67,6 +67,7 @@ from ..sync_ops import (
     DEFAULT_SYNC_CACHE_SECONDS,
     build_branch_cohorts_for_task_ids,
     build_default_branch_cohorts,
+    reconcile_task_branch_merge_truth,
     refresh_branch_diff_stats,
     sync_branch_cohorts,
 )
@@ -1278,6 +1279,28 @@ def _run_task_backed_rebase(
                 target_branch=rebase_target,
             ) == "merged":
                 store.set_merge_status(parent.id, "unmerged")
+
+        if target_parent_id:
+            reconciliation = reconcile_task_branch_merge_truth(
+                store,
+                worktree_git,
+                target_parent_id,
+                target_branch=target_branch,
+                include_diff_stats=True,
+                remote_target_ref=rebase_target if remote else None,
+            )
+            for warning in reconciliation.warnings:
+                logger.warning(warning)
+            if reconciliation.skipped_reason is not None:
+                logger.warning(
+                    "Skipped parent merge-status reconciliation for "
+                    f"{target_parent_id}: {reconciliation.skipped_reason}"
+                )
+            for error in reconciliation.errors:
+                logger.warning(
+                    "Parent merge-status reconciliation for "
+                    f"{target_parent_id} failed: {error}"
+                )
 
         logger.info(f"Changed Diff: {comparison.detail}")
 

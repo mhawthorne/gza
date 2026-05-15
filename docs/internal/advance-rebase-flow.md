@@ -57,7 +57,8 @@ Existing orphan recovery branches created before this behavior was fixed are lef
 5. Before treating that provider run as success, the host first rejects any still-active `rebase-merge` or `rebase-apply` state, then compares `ruff check --select F401,F821` diagnostics on the provider-touched Python files against the pre-resolve baseline. If unfinished rebase metadata or new undefined-name / unused-import errors appear, the rebase task fails instead of continuing silently.
 6. On success, the rebased branch is force-pushed from the worktree.
 7. The completed rebase row persists the same `changed_diff` signal used by runner-owned rebase tasks, and review invalidation only happens when that signal is not `False`.
-8. The worktree is removed on all exit paths (success, failure, exception) via a `try/finally` block.
+8. After a successful completion is recorded, the host reconciles the parent implementation merge unit through the shared task-scoped sync path using the same merge-proof ref as the rebase itself (`origin/<target>` for `--remote`, otherwise the local target branch). Remote rebase completion does not accept separate local-target reachability as proof, even though it still persists the merge unit against its canonical target branch. This lets empty-net-diff, squash-merged, or cherry-picked rebases flip the implementation back to authoritative `merged` state before the next `advance`, `watch`, or `iterate` pass reads the lineage.
+9. The worktree is removed on all exit paths (success, failure, exception) via a `try/finally` block.
 
 ## Review invalidation after rebase
 
