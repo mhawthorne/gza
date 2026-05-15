@@ -461,6 +461,23 @@ class Git:
         """
         self._run("push", "--force-with-lease", remote, branch)
 
+    def push_ref_force_with_lease(
+        self,
+        source_ref: str,
+        branch: str,
+        *,
+        remote: str = "origin",
+        expected_remote_oid: str,
+    ) -> None:
+        """Force-push ``source_ref`` to ``branch`` with an explicit lease."""
+        remote_branch_ref = f"refs/heads/{branch}"
+        self._run(
+            "push",
+            f"--force-with-lease={remote_branch_ref}:{expected_remote_oid}",
+            remote,
+            f"{source_ref}:{remote_branch_ref}",
+        )
+
     def get_log(self, revision_range: str, oneline: bool = True) -> str:
         """Get git log output for a revision range.
 

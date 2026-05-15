@@ -115,6 +115,36 @@ class _ResolvedMergeSubject:
     merge_source_warning: str | None
 
 
+@dataclass(frozen=True)
+class SquashBranchReconcileResult:
+    status: str
+    branch: str
+    remote: str = "origin"
+    reason: str | None = None
+    manual_source_ref: str | None = None
+    expected_remote_oid: str | None = None
+
+
+@dataclass(frozen=True)
+class _PendingSquashBranchReconcile:
+    branch: str
+    pre_squash_local_oid: str | None
+    pre_squash_remote_oid: str | None
+    remote: str = "origin"
+
+
+@dataclass(frozen=True)
+class _MergeSingleTaskResult:
+    rc: int
+    pending_squash_reconcile: _PendingSquashBranchReconcile | None = None
+
+
+def _coerce_merge_single_task_result(result: int | _MergeSingleTaskResult) -> _MergeSingleTaskResult:
+    if isinstance(result, _MergeSingleTaskResult):
+        return result
+    return _MergeSingleTaskResult(rc=result)
+
+
 def _resolve_fresh_merge_source(git: Git, branch: str | None) -> ResolvedMergeSourceRef:
     """Return the freshest merge source ref supported by this git runtime."""
     if not branch:
@@ -317,6 +347,138 @@ def _promote_isolated_merge_to_target_branch(
 def _advance_uses_iterate(config: Config) -> bool:
     """Whether advance should launch implement work through the iterate loop."""
     return getattr(config, "advance_mode", "default") == "iterate"
+
+
+def _classify_squash_reconcile_push_failure(exc: GitError) -> str:
+    message = str(exc).lower()
+    if "stale info" in message or "fetch first" in message:
+        return "failed_push_rejected"
+    return "failed_push_unavailable"
+
+
+def _rev_parse_if_exists_if_supported(git: Git, ref: str) -> str | None:
+    rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
+    if callable(rev_parse_if_exists):
+        return rev_parse_if_exists(ref)
+    return None
+
+
+def _rev_parse_if_supported(git: Git, ref: str) -> str | None:
+    rev_parse = getattr(git, "rev_parse", None)
+    if callable(rev_parse):
+        return rev_parse(ref)
+    return None
+
+
+def _capture_pre_squash_reconcile_state(
+    git: Git,
+    *,
+    branch: str,
+    remote: str = "origin",
+) -> _PendingSquashBranchReconcile:
+    return _PendingSquashBranchReconcile(
+        branch=branch,
+        pre_squash_local_oid=_rev_parse_if_exists_if_supported(git, f"refs/heads/{branch}"),
+        pre_squash_remote_oid=_rev_parse_if_exists_if_supported(git, f"refs/remotes/{remote}/{branch}"),
+        remote=remote,
+    )
+
+
+def _reconcile_squash_merged_branch_with_origin(
+    git: Git,
+    *,
+    branch: str,
+    squash_oid: str,
+    pre_squash_local_oid: str | None,
+    pre_squash_remote_oid: str | None,
+    remote: str = "origin",
+) -> SquashBranchReconcileResult:
+    if pre_squash_remote_oid is None:
+        return SquashBranchReconcileResult(
+            status="skipped_no_remote_tracking_ref",
+            branch=branch,
+            remote=remote,
+        )
+
+    source_ref = "HEAD"
+    if pre_squash_local_oid is not None:
+        try:
+            git.update_ref(f"refs/heads/{branch}", squash_oid, pre_squash_local_oid)
+        except GitError as exc:
+            return SquashBranchReconcileResult(
+                status="failed_local_ref_update",
+                branch=branch,
+                remote=remote,
+                reason=str(exc),
+                expected_remote_oid=pre_squash_remote_oid,
+            )
+        source_ref = f"refs/heads/{branch}"
+
+    try:
+        git.push_ref_force_with_lease(
+            source_ref,
+            branch,
+            remote=remote,
+            expected_remote_oid=pre_squash_remote_oid,
+        )
+    except GitError as exc:
+        return SquashBranchReconcileResult(
+            status=_classify_squash_reconcile_push_failure(exc),
+            branch=branch,
+            remote=remote,
+            reason=str(exc),
+            manual_source_ref=source_ref,
+            expected_remote_oid=pre_squash_remote_oid,
+        )
+
+    try:
+        git.update_ref(f"refs/remotes/{remote}/{branch}", squash_oid)
+    except GitError as exc:
+        return SquashBranchReconcileResult(
+            status="failed_remote_tracking_ref_update",
+            branch=branch,
+            remote=remote,
+            reason=str(exc),
+            manual_source_ref=source_ref,
+            expected_remote_oid=pre_squash_remote_oid,
+        )
+
+    return SquashBranchReconcileResult(
+        status="updated",
+        branch=branch,
+        remote=remote,
+    )
+
+
+def _print_squash_reconcile_result(result: SquashBranchReconcileResult) -> None:
+    if result.status == "skipped_no_remote_tracking_ref":
+        return
+    if result.status == "updated":
+        print(f"✓ Reconciled {result.remote}/{result.branch} to the squash merge commit")
+        return
+
+    reason = result.reason or "unknown error"
+    print(
+        f"Warning: Squash merge landed, but {result.remote}/{result.branch} "
+        f"could not be reconciled: {reason}"
+    )
+    if result.status == "failed_push_rejected":
+        print(
+            f"{result.remote}/{result.branch} changed since it was last observed; "
+            "reconcile it manually before relying on watch."
+        )
+    if result.status == "failed_local_ref_update":
+        print(
+            f"Reconcile the local branch '{result.branch}' first, or push a ref that is "
+            "known to point at the squash merge commit before repairing origin."
+        )
+    if result.manual_source_ref and result.expected_remote_oid:
+        remote_branch_ref = f"refs/heads/{result.branch}"
+        print(
+            "Manual repair: "
+            f"git push --force-with-lease={remote_branch_ref}:{result.expected_remote_oid} "
+            f"{result.remote} {result.manual_source_ref}:{remote_branch_ref}"
+        )
 
 
 def _spawn_prepared_background_iterate(
@@ -621,13 +783,13 @@ def _merge_single_task(
     git: Git,
     args: argparse.Namespace,
     current_branch: str,
-) -> int:
-    """Merge a single task's branch. Returns 0 on success, 1 on failure."""
+) -> _MergeSingleTaskResult:
+    """Merge a single task's branch."""
     target_branch = git.default_branch()
     resolved = _resolve_merge_subject(store, git, task_id, target_branch=target_branch)
     if resolved is None:
         print(f"Error: Task {task_id} not found")
-        return 1
+        return _MergeSingleTaskResult(rc=1)
     execution_task = resolved.execution_task
     merge_subject = resolved.merge_subject
     assert merge_subject.id is not None
@@ -641,32 +803,32 @@ def _merge_single_task(
             f"Error: Task {merge_subject.id} is not completed or unmerged "
             f"(execution status: {execution_task.status})"
         )
-        return 1
+        return _MergeSingleTaskResult(rc=1)
 
     if resolved.merge_source_warning:
         print(f"Error: {resolved.merge_source_warning}")
-        return 1
+        return _MergeSingleTaskResult(rc=1)
 
     if not merge_branch or not merge_source_ref:
         print(f"Error: Task {merge_subject.id} has no resolvable merge source")
-        return 1
+        return _MergeSingleTaskResult(rc=1)
     if resolved.merge_source_warning:
         print(f"Error: {resolved.merge_source_warning}")
-        return 1
+        return _MergeSingleTaskResult(rc=1)
 
     # Handle --mark-only flag
     if args.mark_only:
         # Check for conflicting flags
         if args.rebase or args.squash or args.delete:
             print("Error: --mark-only cannot be used with --rebase, --squash, or --delete")
-            return 1
+            return _MergeSingleTaskResult(rc=1)
 
         if merge_unit_id is not None:
             store.set_merge_unit_state(merge_unit_id, "merged", merged_by_task_id=merge_subject.id)
         else:
             store.set_merge_status(merge_subject.id, "merged")
         print(f"✓ Marked task {merge_subject.id} as merged (branch '{merge_branch}' preserved)")
-        return 0
+        return _MergeSingleTaskResult(rc=0)
 
     # Check if branch already merged
     if git.is_merged(merge_source_ref, current_branch):
@@ -678,27 +840,27 @@ def _merge_single_task(
             )
         else:
             print(f"Error: Branch '{merge_source_ref}' is already merged into {current_branch}")
-        return 1
+        return _MergeSingleTaskResult(rc=1)
 
     # Check for uncommitted changes (untracked files are OK, they won't conflict with merge)
     if git.has_changes(include_untracked=False):
         print("Error: You have uncommitted changes. Please commit or stash them first.")
-        return 1
+        return _MergeSingleTaskResult(rc=1)
 
     # Check for conflicting flags
     if args.rebase and args.squash:
         print("Error: Cannot use --rebase and --squash together")
-        return 1
+        return _MergeSingleTaskResult(rc=1)
 
     # Validate --remote flag
     if hasattr(args, 'remote') and args.remote and not args.rebase:
         print("Error: --remote requires --rebase")
-        return 1
+        return _MergeSingleTaskResult(rc=1)
 
     # Validate --resolve flag
     if getattr(args, 'resolve', False) and not args.rebase:
         print("Error: --resolve requires --rebase")
-        return 1
+        return _MergeSingleTaskResult(rc=1)
 
     if not args.rebase and not git.can_merge(merge_source_ref, current_branch):
         print(
@@ -707,10 +869,11 @@ def _merge_single_task(
         )
         print(f"Run: uv run gza rebase {merge_subject.id} --resolve")
         print(f"Or preview the lifecycle action with: uv run gza advance {merge_subject.id} --dry-run")
-        return 1
+        return _MergeSingleTaskResult(rc=1)
 
     # Perform the merge or rebase
     try:
+        pending_squash_reconcile: _PendingSquashBranchReconcile | None = None
         if args.rebase:
             # Determine the target branch to rebase onto
             rebase_target = current_branch
@@ -746,9 +909,32 @@ def _merge_single_task(
                     subject_prefix="Squash merge: ",
                 )
 
+            pre_squash_local_oid = None
+            pre_squash_remote_oid = None
+            if args.squash:
+                pre_squash_local_oid = _rev_parse_if_exists_if_supported(git, f"refs/heads/{merge_branch}")
+                pre_squash_remote_oid = _rev_parse_if_exists_if_supported(git, f"refs/remotes/origin/{merge_branch}")
+
             git.merge(merge_source_ref, squash=args.squash, commit_message=commit_message)
 
             if args.squash:
+                squash_oid = _rev_parse_if_supported(git, "HEAD")
+                if squash_oid is not None and git.repo_dir == config.project_dir:
+                    _print_squash_reconcile_result(
+                        _reconcile_squash_merged_branch_with_origin(
+                            git,
+                            branch=merge_branch,
+                            squash_oid=squash_oid,
+                            pre_squash_local_oid=pre_squash_local_oid,
+                            pre_squash_remote_oid=pre_squash_remote_oid,
+                        )
+                    )
+                elif squash_oid is not None:
+                    pending_squash_reconcile = _PendingSquashBranchReconcile(
+                        branch=merge_branch,
+                        pre_squash_local_oid=pre_squash_local_oid,
+                        pre_squash_remote_oid=pre_squash_remote_oid,
+                    )
                 print(f"✓ Successfully squash merged {merge_source_ref} and created commit")
             else:
                 print(f"✓ Successfully merged {merge_source_ref}")
@@ -766,7 +952,7 @@ def _merge_single_task(
                 store.set_merge_unit_state(merge_unit_id, "merged", merged_by_task_id=merge_subject.id)
             else:
                 store.set_merge_status(merge_subject.id, "merged")
-        return 0
+        return _MergeSingleTaskResult(rc=0, pending_squash_reconcile=pending_squash_reconcile)
 
     except GitError as e:
         operation = "rebase" if args.rebase else "merge"
@@ -794,7 +980,7 @@ def _merge_single_task(
                         pass
                 except GitError as abort_error:
                     print(f"Warning: Could not abort rebase: {abort_error}")
-                return 1
+                return _MergeSingleTaskResult(rc=1)
 
             # Switch back and fast-forward merge
             git.checkout(current_branch)
@@ -814,7 +1000,7 @@ def _merge_single_task(
                     store.set_merge_unit_state(merge_unit_id, "merged", merged_by_task_id=merge_subject.id)
                 else:
                     store.set_merge_status(merge_subject.id, "merged")
-            return 0
+            return _MergeSingleTaskResult(rc=0)
 
         print(f"Error during {operation}: {e}")
         print(f"\nAborting {operation} and restoring clean state...")
@@ -832,7 +1018,7 @@ def _merge_single_task(
                 print("✓ Merge aborted, working directory restored")
         except GitError as abort_error:
             print(f"Warning: Could not abort {operation}: {abort_error}")
-        return 1
+        return _MergeSingleTaskResult(rc=1)
 
 
 def cmd_merge(args: argparse.Namespace) -> int:
@@ -909,9 +1095,9 @@ def cmd_merge(args: argparse.Namespace) -> int:
     for task_id in task_ids:
         if use_all:
             print(f"Merging task {task_id}...")
-        result = _merge_single_task(task_id, config, store, git, args, current_branch)
+        result = _coerce_merge_single_task_result(_merge_single_task(task_id, config, store, git, args, current_branch))
 
-        if result != 0:
+        if result.rc != 0:
             # Merge failed, stop processing
             failed_task_id = task_id
             break
@@ -2068,17 +2254,44 @@ def _execute_merge_action(
         resolved_subject.merge_source_ref if resolved_subject is not None else task.branch,
         target_branch,
     )
-    rc = _merge_single_task(
-        task.id,
-        config,
-        store,
-        execution_git,
-        merge_args,
-        execution_branch,
+    real_pending_squash_reconcile: _PendingSquashBranchReconcile | None = None
+    if (
+        getattr(merge_args, "squash", False)
+        and merge_git is not None
+        and merge_git.repo_dir != git.repo_dir
+        and resolved_subject is not None
+        and resolved_subject.merge_branch
+    ):
+        real_pending_squash_reconcile = _capture_pre_squash_reconcile_state(
+            git,
+            branch=resolved_subject.merge_branch,
+        )
+    merge_result = _coerce_merge_single_task_result(
+        _merge_single_task(
+            task.id,
+            config,
+            store,
+            execution_git,
+            merge_args,
+            execution_branch,
+        )
     )
+    rc = merge_result.rc
     if rc == 0 and merge_git is not None and merge_git.repo_dir != git.repo_dir:
         try:
             _promote_isolated_merge_to_target_branch(git, execution_git, target_branch)
+            pending = real_pending_squash_reconcile or merge_result.pending_squash_reconcile
+            if pending is not None:
+                _print_squash_reconcile_result(
+                    _reconcile_squash_merged_branch_with_origin(
+                        git,
+                        branch=pending.branch,
+                        squash_oid=git.rev_parse(f"refs/heads/{target_branch}"),
+                        pre_squash_local_oid=pending.pre_squash_local_oid,
+                        pre_squash_remote_oid=pending.pre_squash_remote_oid,
+                        remote=pending.remote,
+                    )
+                )
             if resolved_subject is not None and resolved_subject.merge_unit_id is not None:
                 store.set_merge_unit_state(
                     resolved_subject.merge_unit_id,

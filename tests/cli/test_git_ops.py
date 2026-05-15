@@ -4,13 +4,18 @@ import argparse
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from gza.advance_engine import evaluate_advance_rules, resolve_advance_context
 from gza.cli.git_ops import (
+    SquashBranchReconcileResult,
     _build_auto_merge_args,
+    _classify_squash_reconcile_push_failure,
     _merge_single_task,
+    _print_squash_reconcile_result,
+    _reconcile_squash_merged_branch_with_origin,
     _resolve_merge_subject,
     _run_task_backed_rebase,
     cmd_advance,
@@ -98,9 +103,9 @@ def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -
     )
     config = SimpleNamespace(project_dir=tmp_path)
 
-    rc = _merge_single_task(task.id, config, store, git, args, "main")
+    result = _merge_single_task(task.id, config, store, git, args, "main")
 
-    assert rc == 1
+    assert result.rc == 1
     git.can_merge.assert_called_once_with("feature/conflicts", "main")
     git.merge.assert_not_called()
     output = capsys.readouterr().out
@@ -982,3 +987,262 @@ def test_rebase_background_reuses_prepared_child_without_second_startup_pass(tmp
     prepared_task = captured_spawn["prepared_task"]
     assert prepared_task is not None
     assert getattr(prepared_task, "id", None) == captured_spawn["task_id"]
+
+
+def test_reconcile_squash_merge_skips_when_no_remote_tracking_ref() -> None:
+    git = MagicMock(spec=Git)
+
+    result = _reconcile_squash_merged_branch_with_origin(
+        git,
+        branch="feature/demo",
+        squash_oid="squash-oid",
+        pre_squash_local_oid="local-oid",
+        pre_squash_remote_oid=None,
+    )
+
+    assert result.status == "skipped_no_remote_tracking_ref"
+    git.update_ref.assert_not_called()
+    git.push_ref_force_with_lease.assert_not_called()
+
+
+def test_reconcile_squash_merge_updates_local_and_remote_tracking_refs_before_and_after_push() -> None:
+    git = MagicMock(spec=Git)
+
+    result = _reconcile_squash_merged_branch_with_origin(
+        git,
+        branch="feature/demo",
+        squash_oid="squash-oid",
+        pre_squash_local_oid="local-oid",
+        pre_squash_remote_oid="remote-oid",
+    )
+
+    assert result.status == "updated"
+    assert git.update_ref.call_args_list == [
+        call("refs/heads/feature/demo", "squash-oid", "local-oid"),
+        call("refs/remotes/origin/feature/demo", "squash-oid"),
+    ]
+    git.push_ref_force_with_lease.assert_called_once_with(
+        "refs/heads/feature/demo",
+        "feature/demo",
+        remote="origin",
+        expected_remote_oid="remote-oid",
+    )
+
+
+def test_reconcile_squash_merge_local_ref_update_failure_prevents_push() -> None:
+    git = MagicMock(spec=Git)
+    git.update_ref.side_effect = GitError("branch is checked out elsewhere")
+
+    result = _reconcile_squash_merged_branch_with_origin(
+        git,
+        branch="feature/demo",
+        squash_oid="squash-oid",
+        pre_squash_local_oid="local-oid",
+        pre_squash_remote_oid="remote-oid",
+    )
+
+    assert result.status == "failed_local_ref_update"
+    assert result.manual_source_ref is None
+    git.push_ref_force_with_lease.assert_not_called()
+
+
+def test_reconcile_squash_merge_lease_rejection_is_reported_without_updating_tracking_ref() -> None:
+    git = MagicMock(spec=Git)
+    git.push_ref_force_with_lease.side_effect = GitError("git push failed:\n! [rejected] (stale info)")
+
+    result = _reconcile_squash_merged_branch_with_origin(
+        git,
+        branch="feature/demo",
+        squash_oid="squash-oid",
+        pre_squash_local_oid=None,
+        pre_squash_remote_oid="remote-oid",
+    )
+
+    assert result.status == "failed_push_rejected"
+    assert git.update_ref.call_args_list == []
+
+
+def test_classify_squash_reconcile_push_failure_keeps_policy_rejections_distinct() -> None:
+    exc = GitError(
+        "git push failed:\n"
+        "! [remote rejected] feature/demo -> feature/demo (protected branch hook declined)"
+    )
+
+    assert _classify_squash_reconcile_push_failure(exc) == "failed_push_unavailable"
+
+
+def test_print_squash_reconcile_result_does_not_emit_lease_guidance_for_policy_rejection(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _print_squash_reconcile_result(
+        SquashBranchReconcileResult(
+            status="failed_push_unavailable",
+            branch="feature/demo",
+            reason="git push failed: protected branch hook declined",
+            manual_source_ref="HEAD",
+            expected_remote_oid="remote-oid",
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "changed since it was last observed" not in output
+    assert "protected branch hook declined" in output
+    assert "git push --force-with-lease=refs/heads/feature/demo:remote-oid" in output
+
+
+def test_print_squash_reconcile_result_emits_lease_guidance_for_stale_info_rejection(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _print_squash_reconcile_result(
+        SquashBranchReconcileResult(
+            status="failed_push_rejected",
+            branch="feature/demo",
+            reason="git push failed: stale info",
+            manual_source_ref="HEAD",
+            expected_remote_oid="remote-oid",
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "changed since it was last observed" in output
+    assert "git push --force-with-lease=refs/heads/feature/demo:remote-oid" in output
+
+
+def test_print_squash_reconcile_result_failed_local_ref_update_fails_closed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _print_squash_reconcile_result(
+        SquashBranchReconcileResult(
+            status="failed_local_ref_update",
+            branch="feature/demo",
+            reason="branch is checked out elsewhere",
+            expected_remote_oid="remote-oid",
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "branch is checked out elsewhere" in output
+    assert "Reconcile the local branch 'feature/demo' first" in output
+    assert "known to point at the squash merge commit" in output
+    assert "origin feature/demo:refs/heads/feature/demo" not in output
+    assert "Manual repair:" not in output
+
+
+@pytest.mark.functional
+def test_squash_merge_reconciles_origin_branch_and_keeps_advance_planning_clean(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    git = Git(tmp_path)
+
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "file.txt").write_text("initial\n")
+    git._run("add", "file.txt")
+    git._run("commit", "-m", "Initial commit")
+
+    remote_dir = tmp_path / "origin.git"
+    git._run("init", "--bare", str(remote_dir))
+    git._run("remote", "add", "origin", str(remote_dir))
+    git._run("push", "-u", "origin", "main")
+
+    branch = "feature/squash-reconcile"
+    git._run("checkout", "-b", branch)
+    (tmp_path / "file.txt").write_text("initial\nfeature one\n")
+    git._run("add", "file.txt")
+    git._run("commit", "-m", "Feature one")
+    (tmp_path / "file.txt").write_text("initial\nfeature one\nfeature two\n")
+    git._run("add", "file.txt")
+    git._run("commit", "-m", "Feature two")
+    git._run("push", "-u", "origin", branch)
+    git._run("checkout", "main")
+    git.fetch("origin")
+
+    task = store.add("Implement squash reconcile", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = branch
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    args = argparse.Namespace(
+        rebase=False,
+        squash=True,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+    )
+
+    result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    squash_oid = git.rev_parse("HEAD")
+    assert git.rev_parse(f"refs/heads/{branch}") == squash_oid
+    assert git.rev_parse(f"refs/remotes/origin/{branch}") == squash_oid
+    assert git.rev_parse(f"refs/remotes/origin/{branch}") == git.rev_parse(f"refs/heads/{branch}")
+    assert git.resolve_fresh_merge_source(branch).warning is None
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    refreshed.merge_status = "unmerged"
+    store.update(refreshed)
+
+    ctx = resolve_advance_context(config, store, git, refreshed, "main")
+    assert ctx.merge_source_warning is None
+
+    action = evaluate_advance_rules(config, store, git, refreshed, "main")
+    assert action.get("needs_attention_reason") != "merge-source-needs-manual-resolution"
+
+
+@pytest.mark.functional
+def test_squash_merge_without_remote_tracking_ref_stays_local_only(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    git = Git(tmp_path)
+
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "file.txt").write_text("initial\n")
+    git._run("add", "file.txt")
+    git._run("commit", "-m", "Initial commit")
+
+    remote_dir = tmp_path / "origin.git"
+    git._run("init", "--bare", str(remote_dir))
+    git._run("remote", "add", "origin", str(remote_dir))
+    git._run("push", "-u", "origin", "main")
+
+    branch = "feature/local-only-squash"
+    git._run("checkout", "-b", branch)
+    (tmp_path / "feature.txt").write_text("feature\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Feature")
+    git._run("checkout", "main")
+
+    task = store.add("Implement local only squash", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = branch
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    args = argparse.Namespace(
+        rebase=False,
+        squash=True,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+    )
+
+    result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    assert git.rev_parse_if_exists(f"refs/remotes/origin/{branch}") is None

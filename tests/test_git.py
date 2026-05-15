@@ -891,6 +891,49 @@ class TestRemoteOperations:
 
             mock_run.assert_called_once_with("push", "--force-with-lease", "upstream", "feature")
 
+    def test_push_ref_force_with_lease_default_remote(self, tmp_path: Path):
+        """Test explicit lease push uses the expected source and remote ref."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            git.push_ref_force_with_lease(
+                "refs/heads/feature",
+                "feature",
+                expected_remote_oid="abc123",
+            )
+
+            mock_run.assert_called_once_with(
+                "push",
+                "--force-with-lease=refs/heads/feature:abc123",
+                "origin",
+                "refs/heads/feature:refs/heads/feature",
+            )
+
+    def test_push_ref_force_with_lease_custom_remote(self, tmp_path: Path):
+        """Test explicit lease push honors a custom remote."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            git.push_ref_force_with_lease(
+                "HEAD",
+                "feature",
+                remote="upstream",
+                expected_remote_oid="def456",
+            )
+
+            mock_run.assert_called_once_with(
+                "push",
+                "--force-with-lease=refs/heads/feature:def456",
+                "upstream",
+                "HEAD:refs/heads/feature",
+            )
+
 
 class TestMergeOperations:
     """Tests for merge operations."""

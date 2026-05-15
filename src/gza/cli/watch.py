@@ -91,7 +91,7 @@ def _merge_single_task(
     current_branch: str,
 ) -> int:
     """Compatibility shim for tests patching watch-local merge execution."""
-    return _git_ops_merge_single_task(task_id, config, store, git, args, current_branch)
+    return _git_ops_merge_single_task(task_id, config, store, git, args, current_branch).rc
 
 
 def _collect_advance_completed_tasks(

@@ -10,7 +10,13 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from gza.cli.git_ops import _execute_merge_action, ensure_watch_main_checkout
+from gza.cli.git_ops import (
+    _execute_merge_action,
+    _MergeSingleTaskResult,
+    _PendingSquashBranchReconcile,
+    _ResolvedMergeSubject,
+    ensure_watch_main_checkout,
+)
 from gza.cli.watch import (
     _collect_advance_completed_tasks,
     _collect_completed_transition_ids,
@@ -3066,6 +3072,327 @@ def test_isolated_watch_merge_promotion_rollback_keeps_task_unmerged_when_attach
     refreshed_task = store.get(task.id)
     assert refreshed_task is not None
     assert refreshed_task.merge_status == "unmerged"
+
+
+def test_execute_merge_action_reconciles_pending_squash_only_after_isolated_promotion(
+    tmp_path: Path,
+) -> None:
+    """Deferred squash reconciliation must run after isolated promotion succeeds."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Isolated squash promotion success", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-squash-success"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    resolved = _ResolvedMergeSubject(
+        trigger_task=task,
+        execution_task=task,
+        merge_subject=task,
+        merge_unit_id=None,
+        merge_branch=task.branch,
+        merge_source_ref=f"origin/{task.branch}",
+        merge_source_warning=None,
+    )
+    merge_result = _MergeSingleTaskResult(
+        rc=0,
+        pending_squash_reconcile=_PendingSquashBranchReconcile(
+            branch=task.branch,
+            pre_squash_local_oid="local-oid",
+            pre_squash_remote_oid="remote-oid",
+        ),
+    )
+
+    repo_git = MagicMock()
+    repo_git.repo_dir = tmp_path
+    repo_git.rev_parse.return_value = "promoted-target-oid"
+
+    merge_git = MagicMock()
+    merge_git.repo_dir = config.main_checkout_integration_path
+
+    promoted = False
+
+    def fake_promote(*_args, **_kwargs):
+        nonlocal promoted
+        promoted = True
+
+    reconcile_result = SimpleNamespace(status="updated")
+
+    def fake_reconcile(_git, **kwargs):
+        assert promoted is True
+        assert kwargs["branch"] == task.branch
+        assert kwargs["squash_oid"] == "promoted-target-oid"
+        assert kwargs["pre_squash_local_oid"] == "local-oid"
+        assert kwargs["pre_squash_remote_oid"] == "remote-oid"
+        return reconcile_result
+
+    with (
+        patch("gza.cli.git_ops._resolve_merge_subject", return_value=resolved),
+        patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
+        patch("gza.cli.git_ops._merge_single_task", return_value=merge_result),
+        patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch", side_effect=fake_promote) as promote,
+        patch(
+            "gza.cli.git_ops._reconcile_squash_merged_branch_with_origin",
+            side_effect=fake_reconcile,
+        ) as reconcile,
+        patch("gza.cli.git_ops._print_squash_reconcile_result") as print_reconcile,
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            repo_git,
+            task,
+            {"type": "merge"},
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch="main",
+        )
+
+    assert result.rc == 0
+    promote.assert_called_once_with(repo_git, merge_git, "main")
+    reconcile.assert_called_once()
+    print_reconcile.assert_called_once_with(reconcile_result)
+    refreshed_task = store.get(task.id)
+    assert refreshed_task is not None
+    assert refreshed_task.merge_status == "merged"
+
+
+def test_execute_merge_action_skips_pending_squash_reconcile_when_isolated_promotion_fails(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Deferred squash reconciliation must not run if isolated promotion fails."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Isolated squash promotion failure", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-squash-failure"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    resolved = _ResolvedMergeSubject(
+        trigger_task=task,
+        execution_task=task,
+        merge_subject=task,
+        merge_unit_id=None,
+        merge_branch=task.branch,
+        merge_source_ref=f"origin/{task.branch}",
+        merge_source_warning=None,
+    )
+    merge_result = _MergeSingleTaskResult(
+        rc=0,
+        pending_squash_reconcile=_PendingSquashBranchReconcile(
+            branch=task.branch,
+            pre_squash_local_oid="local-oid",
+            pre_squash_remote_oid="remote-oid",
+        ),
+    )
+
+    repo_git = MagicMock()
+    repo_git.repo_dir = tmp_path
+
+    merge_git = MagicMock()
+    merge_git.repo_dir = config.main_checkout_integration_path
+
+    with (
+        patch("gza.cli.git_ops._resolve_merge_subject", return_value=resolved),
+        patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
+        patch("gza.cli.git_ops._merge_single_task", return_value=merge_result),
+        patch(
+            "gza.cli.git_ops._promote_isolated_merge_to_target_branch",
+            side_effect=GitError("promotion failed"),
+        ) as promote,
+        patch("gza.cli.git_ops._reconcile_squash_merged_branch_with_origin") as reconcile,
+        patch("gza.cli.git_ops._print_squash_reconcile_result") as print_reconcile,
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            repo_git,
+            task,
+            {"type": "merge"},
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch="main",
+        )
+
+    assert result.rc == 1
+    promote.assert_called_once_with(repo_git, merge_git, "main")
+    reconcile.assert_not_called()
+    print_reconcile.assert_not_called()
+    assert "Error finalizing isolated merge success: promotion failed" in capsys.readouterr().out
+    refreshed_task = store.get(task.id)
+    assert refreshed_task is not None
+    assert refreshed_task.merge_status == "unmerged"
+
+
+def test_execute_merge_action_isolated_squash_uses_real_checkout_pre_squash_refs(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Isolated squash uses real checkout refs", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-real-refs"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    resolved = _ResolvedMergeSubject(
+        trigger_task=task,
+        execution_task=task,
+        merge_subject=task,
+        merge_unit_id=None,
+        merge_branch=task.branch,
+        merge_source_ref=f"origin/{task.branch}",
+        merge_source_warning=None,
+    )
+    merge_result = _MergeSingleTaskResult(
+        rc=0,
+        pending_squash_reconcile=_PendingSquashBranchReconcile(
+            branch=task.branch,
+            pre_squash_local_oid="isolated-local-oid",
+            pre_squash_remote_oid="isolated-remote-oid",
+        ),
+    )
+
+    repo_git = MagicMock()
+    repo_git.repo_dir = tmp_path
+    repo_git.rev_parse.return_value = "promoted-target-oid"
+    repo_git.rev_parse_if_exists.side_effect = lambda ref: {
+        f"refs/heads/{task.branch}": "real-local-oid",
+        f"refs/remotes/origin/{task.branch}": "real-remote-oid",
+    }.get(ref)
+
+    merge_git = MagicMock()
+    merge_git.repo_dir = config.main_checkout_integration_path
+
+    def fake_reconcile(_git, **kwargs):
+        assert kwargs["branch"] == task.branch
+        assert kwargs["squash_oid"] == "promoted-target-oid"
+        assert kwargs["pre_squash_local_oid"] == "real-local-oid"
+        assert kwargs["pre_squash_remote_oid"] == "real-remote-oid"
+        return SimpleNamespace(status="updated")
+
+    with (
+        patch("gza.cli.git_ops._resolve_merge_subject", return_value=resolved),
+        patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace(squash=True)),
+        patch("gza.cli.git_ops._merge_single_task", return_value=merge_result),
+        patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch"),
+        patch(
+            "gza.cli.git_ops._reconcile_squash_merged_branch_with_origin",
+            side_effect=fake_reconcile,
+        ) as reconcile,
+        patch("gza.cli.git_ops._print_squash_reconcile_result"),
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            repo_git,
+            task,
+            {"type": "merge"},
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch="main",
+        )
+
+    assert result.rc == 0
+    reconcile.assert_called_once()
+
+
+def test_execute_merge_action_isolated_squash_uses_real_checkout_missing_remote_tracking_ref(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Isolated squash preserves real missing remote ref", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-no-real-remote"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    resolved = _ResolvedMergeSubject(
+        trigger_task=task,
+        execution_task=task,
+        merge_subject=task,
+        merge_unit_id=None,
+        merge_branch=task.branch,
+        merge_source_ref=f"origin/{task.branch}",
+        merge_source_warning=None,
+    )
+    merge_result = _MergeSingleTaskResult(
+        rc=0,
+        pending_squash_reconcile=_PendingSquashBranchReconcile(
+            branch=task.branch,
+            pre_squash_local_oid="isolated-local-oid",
+            pre_squash_remote_oid="isolated-stale-remote-oid",
+        ),
+    )
+
+    repo_git = MagicMock()
+    repo_git.repo_dir = tmp_path
+    repo_git.rev_parse.return_value = "promoted-target-oid"
+    repo_git.rev_parse_if_exists.side_effect = lambda ref: {
+        f"refs/heads/{task.branch}": "real-local-oid",
+        f"refs/remotes/origin/{task.branch}": None,
+    }.get(ref)
+
+    merge_git = MagicMock()
+    merge_git.repo_dir = config.main_checkout_integration_path
+
+    def fake_reconcile(_git, **kwargs):
+        assert kwargs["pre_squash_local_oid"] == "real-local-oid"
+        assert kwargs["pre_squash_remote_oid"] is None
+        return SimpleNamespace(status="skipped_no_remote_tracking_ref")
+
+    with (
+        patch("gza.cli.git_ops._resolve_merge_subject", return_value=resolved),
+        patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace(squash=True)),
+        patch("gza.cli.git_ops._merge_single_task", return_value=merge_result),
+        patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch"),
+        patch(
+            "gza.cli.git_ops._reconcile_squash_merged_branch_with_origin",
+            side_effect=fake_reconcile,
+        ) as reconcile,
+        patch("gza.cli.git_ops._print_squash_reconcile_result"),
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            repo_git,
+            task,
+            {"type": "merge"},
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch="main",
+        )
+
+    assert result.rc == 0
+    reconcile.assert_called_once()
 
 
 def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_continues_merging(tmp_path: Path) -> None:
