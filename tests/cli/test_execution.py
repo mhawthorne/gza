@@ -12265,6 +12265,132 @@ class TestIterateCommand:
         create_rebase.assert_called_once()
         create_resume.assert_called_once()
 
+    def test_iterate_prepared_needs_rebase_skips_merged_target(self, tmp_path: Path):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.advance_engine import PostMergeRebaseState
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "needs_rebase", "description": "needs rebase"},
+            ),
+            patch(
+                "gza.cli.execution._resolve_and_persist_post_merge_rebase_state",
+                return_value=PostMergeRebaseState(
+                    merge_unit_state="unmerged",
+                    branch_tip_sha="same-sha",
+                    target_tip_sha="same-sha",
+                    target_is_ancestor_of_branch=True,
+                    branch_equals_target=True,
+                    already_merged=True,
+                    rebase_resolution_proved=True,
+                    reason="branch-tip-equals-target-tip",
+                ),
+            ),
+            patch("gza.cli.execution._create_rebase_task", side_effect=AssertionError("should not create rebase")),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+
+        assert result == 0
+        assert spawn_background.call_count == 1
+        assert spawn_background.call_args.kwargs.get("prepared_task_id") is None
+        assert [task for task in store.get_all() if task.task_type == "rebase"] == []
+
+    def test_iterate_needs_rebase_skips_merged_target_before_create(self, tmp_path: Path):
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.advance_engine import PostMergeRebaseState
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=2,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.resolve_closing_review_action", return_value=None),
+            patch(
+                "gza.cli.execution._resolve_and_persist_post_merge_rebase_state",
+                return_value=PostMergeRebaseState(
+                    merge_unit_state="unmerged",
+                    branch_tip_sha="same-sha",
+                    target_tip_sha="same-sha",
+                    target_is_ancestor_of_branch=True,
+                    branch_equals_target=True,
+                    already_merged=True,
+                    rebase_resolution_proved=True,
+                    reason="branch-tip-equals-target-tip",
+                ),
+            ),
+            patch(
+                "gza.cli.determine_next_action",
+                side_effect=[
+                    {"type": "needs_rebase", "description": "needs rebase"},
+                    {"type": "merge", "description": "done"},
+                ],
+            ),
+            patch("gza.cli._create_rebase_task", side_effect=AssertionError("should not create rebase")),
+        ):
+            result = cmd_iterate(args)
+
+        assert result == 0
+
     def test_iterate_real_engine_needs_rebase_transition(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """When git reports conflicts, the advance engine should request a rebase."""
         from unittest.mock import MagicMock

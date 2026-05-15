@@ -14,6 +14,7 @@ from typing import Any
 import gza.colors as _colors
 from gza.query import get_base_task_slug as _get_base_task_slug
 
+from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
 from ..colors import pink
 from ..commit_messages import build_task_commit_message
 from ..config import Config
@@ -2570,6 +2571,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
             spawn_resume_worker=lambda task_obj, _kind: _spawn_background_resume_worker(
                 _worker_args(), config, str(task_obj.id), quiet=True, prepared_task=task_obj
             ),
+            is_rebase_target_already_merged=lambda t: _resolve_and_persist_post_merge_rebase_state(
+                store,
+                git,
+                t,
+                target_branch,
+                merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
+            ).already_merged,
             spawn_iterate_worker=lambda task_obj, _kind, *, prepared_task=None, prepared_phase=None, prepared_action_type=None: _spawn_background_iterate_worker(
                 argparse.Namespace(
                     no_docker=getattr(args, 'no_docker', False),

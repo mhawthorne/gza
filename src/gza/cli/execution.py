@@ -13,7 +13,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ..advance_engine import count_completed_review_cycles
+from ..advance_engine import (
+    _resolve_and_persist_post_merge_rebase_state,
+    _resolve_current_merge_source,
+    count_completed_review_cycles,
+)
 from ..config import DEFAULT_MAX_RESUME_ATTEMPTS, Config
 from ..console import format_duration
 from ..db import (
@@ -211,6 +215,23 @@ def _reconcile_iterate_already_merged(
     if refreshed_task is not None and refreshed_task.merge_status == "merged":
         return
     raise RuntimeError("stored task merge status remained unmerged")
+
+
+def _iterate_rebase_target_already_merged(
+    *,
+    store: SqliteTaskStore,
+    git_runtime: Git,
+    task: DbTask,
+    target_branch: str,
+) -> bool:
+    """Return True when local state proves a scheduled rebase target is already merged."""
+    return _resolve_and_persist_post_merge_rebase_state(
+        store,
+        git_runtime,
+        task,
+        target_branch,
+        merge_source=_resolve_current_merge_source(git_runtime, task.branch) if task.branch else None,
+    ).already_merged
 
 
 def _run_with_registered_worker(
@@ -2944,6 +2965,13 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             if action_type == "needs_rebase":
                 if not iterate_task.branch:
                     return None, None
+                if _iterate_rebase_target_already_merged(
+                    store=store,
+                    git_runtime=preflight_context.git_runtime,
+                    task=iterate_task,
+                    target_branch=preflight_context.target_branch,
+                ):
+                    return None, None
                 assert iterate_task.id is not None
                 action_task = _create_rebase_task(
                     store,
@@ -3885,6 +3913,14 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 final_stop_reason = "needs_rebase"
                 _append_summary_row(summary_rows, iteration_index=iteration, task_type="rebase", task=None, status="failed")
                 break
+            elif _iterate_rebase_target_already_merged(
+                store=store,
+                git_runtime=git_runtime,
+                task=impl_task,
+                target_branch=target_branch,
+            ):
+                print("  Skipping rebase: target implementation already merged.")
+                continue
             else:
                 action_task = _create_rebase_task(store, impl_task.id, impl_task.branch, target_branch)
                 assert action_task.id is not None

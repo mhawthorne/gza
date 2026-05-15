@@ -654,6 +654,24 @@ class Git:
             return None
         return result.stdout.strip()
 
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """Return True when ``ancestor`` is reachable from ``descendant``."""
+        result = self._run(
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+            check=False,
+        )
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        error_output = result.stderr or result.stdout
+        raise GitError(
+            f"git merge-base --is-ancestor {ancestor} {descendant} failed:\n{error_output}"
+        )
+
     def get_commit_subject(self, commit_ref: str) -> str:
         """Get the subject line for a single committed revision."""
         result = self._run("show", "-s", "--format=%s", commit_ref, check=False)

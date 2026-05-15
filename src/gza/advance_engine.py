@@ -44,6 +44,21 @@ WORKER_CONSUMING_ACTIONS = frozenset(
 
 
 @dataclass(frozen=True)
+class PostMergeRebaseState:
+    """Local branch/target facts that can clear stale failed-rebase state."""
+
+    merge_unit_state: str | None
+    branch_tip_sha: str | None
+    target_tip_sha: str | None
+    target_is_ancestor_of_branch: bool | None
+    branch_equals_target: bool
+    already_merged: bool
+    rebase_resolution_proved: bool
+    reason: str | None
+    warning: str | None = None
+
+
+@dataclass(frozen=True)
 class AdvanceContext:
     """Resolved task state used by advance rules."""
 
@@ -63,6 +78,7 @@ class AdvanceContext:
 
     merge_source_ref: str | None = None
     merge_source_warning: str | None = None
+    post_merge_rebase_state: PostMergeRebaseState | None = None
     merge_state: str | None = None
     can_merge: bool = True
     rebase_pending_or_running: DbTask | None = None
@@ -130,6 +146,235 @@ def _resolve_current_merge_source(git: Any, branch: str) -> ResolvedMergeSourceR
     return ResolvedMergeSourceRef(branch)
 
 
+def resolve_post_merge_rebase_state(
+    store: SqliteTaskStore,
+    git: Any,
+    task: DbTask,
+    target_branch: str,
+    *,
+    merge_source: ResolvedMergeSourceRef | None = None,
+) -> PostMergeRebaseState:
+    """Resolve local proof that stale failed-rebase state is no longer authoritative."""
+    def _normalize_sha(value: object) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
+    merge_unit_state = merge_unit.state if merge_unit is not None else None
+    if merge_unit_state == "merged":
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=None,
+            target_tip_sha=None,
+            target_is_ancestor_of_branch=None,
+            branch_equals_target=False,
+            already_merged=True,
+            rebase_resolution_proved=True,
+            reason="merge-unit-merged",
+        )
+
+    branch_name = task.branch
+    if not branch_name:
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=None,
+            target_tip_sha=None,
+            target_is_ancestor_of_branch=None,
+            branch_equals_target=False,
+            already_merged=False,
+            rebase_resolution_proved=False,
+            reason=None,
+            warning="task branch is missing; cannot resolve post-merge rebase state",
+        )
+
+    proof_source = merge_source or _resolve_current_merge_source(git, branch_name)
+    proof_ref = proof_source.ref
+    if proof_source.warning:
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=None,
+            target_tip_sha=None,
+            target_is_ancestor_of_branch=None,
+            branch_equals_target=False,
+            already_merged=False,
+            rebase_resolution_proved=False,
+            reason=None,
+            warning=proof_source.warning,
+        )
+    if not proof_ref:
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=None,
+            target_tip_sha=None,
+            target_is_ancestor_of_branch=None,
+            branch_equals_target=False,
+            already_merged=False,
+            rebase_resolution_proved=False,
+            reason=None,
+            warning=(
+                f"fresh merge source for branch '{branch_name}' is unavailable; "
+                "cannot resolve post-merge rebase state"
+            ),
+        )
+
+    rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
+    if not callable(rev_parse_if_exists):
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=None,
+            target_tip_sha=None,
+            target_is_ancestor_of_branch=None,
+            branch_equals_target=False,
+            already_merged=False,
+            rebase_resolution_proved=False,
+            reason=None,
+            warning="git runtime cannot resolve local refs for post-merge rebase state",
+        )
+
+    try:
+        branch_tip_sha = _normalize_sha(rev_parse_if_exists(proof_ref))
+        target_tip_sha = _normalize_sha(rev_parse_if_exists(target_branch))
+    except Exception as exc:
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=None,
+            target_tip_sha=None,
+            target_is_ancestor_of_branch=None,
+            branch_equals_target=False,
+            already_merged=False,
+            rebase_resolution_proved=False,
+            reason=None,
+            warning=f"failed to resolve local refs for post-merge rebase state: {exc}",
+        )
+
+    branch_equals_target = (
+        branch_tip_sha is not None
+        and target_tip_sha is not None
+        and branch_tip_sha == target_tip_sha
+    )
+    if branch_equals_target:
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=branch_tip_sha,
+            target_tip_sha=target_tip_sha,
+            target_is_ancestor_of_branch=True,
+            branch_equals_target=True,
+            already_merged=True,
+            rebase_resolution_proved=True,
+            reason="branch-tip-equals-target-tip",
+        )
+
+    if branch_tip_sha is None or target_tip_sha is None:
+        missing_ref = proof_ref if branch_tip_sha is None else target_branch
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=branch_tip_sha,
+            target_tip_sha=target_tip_sha,
+            target_is_ancestor_of_branch=None,
+            branch_equals_target=False,
+            already_merged=False,
+            rebase_resolution_proved=False,
+            reason=None,
+            warning=f"missing local ref '{missing_ref}' for post-merge rebase state",
+        )
+
+    is_ancestor = getattr(git, "is_ancestor", None)
+    if not callable(is_ancestor):
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=branch_tip_sha,
+            target_tip_sha=target_tip_sha,
+            target_is_ancestor_of_branch=None,
+            branch_equals_target=False,
+            already_merged=False,
+            rebase_resolution_proved=False,
+            reason=None,
+            warning="git runtime cannot check ancestry for post-merge rebase state",
+        )
+
+    try:
+        target_is_ancestor_of_branch = is_ancestor(target_branch, proof_ref)
+    except Exception as exc:
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=branch_tip_sha,
+            target_tip_sha=target_tip_sha,
+            target_is_ancestor_of_branch=None,
+            branch_equals_target=False,
+            already_merged=False,
+            rebase_resolution_proved=False,
+            reason=None,
+            warning=f"failed to check post-merge ancestry for rebase state: {exc}",
+        )
+    if not isinstance(target_is_ancestor_of_branch, bool):
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=branch_tip_sha,
+            target_tip_sha=target_tip_sha,
+            target_is_ancestor_of_branch=None,
+            branch_equals_target=False,
+            already_merged=False,
+            rebase_resolution_proved=False,
+            reason=None,
+            warning="git runtime returned non-boolean ancestry result for post-merge rebase state",
+        )
+
+    if target_is_ancestor_of_branch:
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=branch_tip_sha,
+            target_tip_sha=target_tip_sha,
+            target_is_ancestor_of_branch=True,
+            branch_equals_target=False,
+            already_merged=False,
+            rebase_resolution_proved=True,
+            reason="branch-contains-target-tip",
+        )
+
+    return PostMergeRebaseState(
+        merge_unit_state=merge_unit_state,
+        branch_tip_sha=branch_tip_sha,
+        target_tip_sha=target_tip_sha,
+        target_is_ancestor_of_branch=False,
+        branch_equals_target=False,
+        already_merged=False,
+        rebase_resolution_proved=False,
+        reason=None,
+    )
+
+
+def _resolve_and_persist_post_merge_rebase_state(
+    store: SqliteTaskStore,
+    git: Any,
+    task: DbTask,
+    target_branch: str,
+    *,
+    merge_source: ResolvedMergeSourceRef | None = None,
+) -> PostMergeRebaseState:
+    """Resolve local stale-rebase cleanup state and persist proven merge truth."""
+    state = resolve_post_merge_rebase_state(
+        store,
+        git,
+        task,
+        target_branch,
+        merge_source=merge_source,
+    )
+    if (
+        state.reason == "branch-tip-equals-target-tip"
+        and state.already_merged
+        and task.id is not None
+    ):
+        merge_unit = store.resolve_merge_unit_for_task(task.id)
+        if merge_unit is not None:
+            store.set_merge_unit_state(
+                merge_unit.id,
+                "merged",
+                merged_by_task_id=task.id,
+            )
+        else:
+            store.set_merge_status(task.id, "merged")
+    return state
+
+
 def is_resumable_failure_reason(failure_reason: str | None) -> bool:
     """Return True when a failure reason is auto-resumable by advance."""
     return classify_failure_reason(failure_reason) == "timeout"
@@ -177,6 +422,12 @@ def _no_branch_description(ctx: AdvanceContext) -> str:
     if ctx.task.status == "completed":
         return f"SKIP: completed {ctx.task_type} task has no branch; no mergeable commits found"
     return f"SKIP: {ctx.task.status} {ctx.task_type} task has no branch; no merge action available"
+
+
+def _target_already_merged_description(ctx: AdvanceContext) -> str:
+    state = ctx.post_merge_rebase_state
+    reason = state.reason if state is not None else None
+    return f"SKIP: target implementation already merged ({reason or 'post-merge proof'})"
 
 
 def _merge_review_description(verdict: str, preserved_rebase: DbTask | None) -> str:
@@ -357,6 +608,11 @@ def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
     """
     failed_rebase = ctx.rebase_failed
     if failed_rebase is None:
+        return False
+    if (
+        ctx.post_merge_rebase_state is not None
+        and ctx.post_merge_rebase_state.rebase_resolution_proved
+    ):
         return False
 
     failed_rebase_time = _task_event_time(failed_rebase)
@@ -685,13 +941,24 @@ def resolve_advance_context(
         )
 
     merge_source = _resolve_current_merge_source(git, task.branch)
+    post_merge_rebase_state = _resolve_and_persist_post_merge_rebase_state(
+        store,
+        git,
+        task,
+        target_branch,
+        merge_source=merge_source,
+    )
     merge_state = resolve_task_merge_state_for_target(
         store=store,
         task=task,
         git=git,
         target_branch=target_branch,
     )
-    can_merge = merge_state == "merged" or (bool(merge_source.ref) and git.can_merge(merge_source.ref, target_branch))
+    can_merge = (
+        post_merge_rebase_state.already_merged
+        or merge_state == "merged"
+        or (bool(merge_source.ref) and git.can_merge(merge_source.ref, target_branch))
+    )
     rebase_children = [
         child
         for child in store.get_lineage_children(task.id)
@@ -758,6 +1025,7 @@ def resolve_advance_context(
         failed_recovery_attention_reason=failed_recovery_attention_reason,
         merge_source_ref=merge_source.ref,
         merge_source_warning=merge_source.warning,
+        post_merge_rebase_state=post_merge_rebase_state,
         merge_state=merge_state,
         can_merge=can_merge,
         rebase_pending_or_running=rebase_pending_or_running,
@@ -853,6 +1121,14 @@ ADVANCE_RULES: list[AdvanceRule] = [
             },
             reason="merge-source-needs-manual-resolution",
         ),
+    ),
+    AdvanceRule(
+        name="target_already_merged",
+        matches=lambda ctx: (
+            ctx.post_merge_rebase_state is not None
+            and ctx.post_merge_rebase_state.already_merged
+        ),
+        action=lambda ctx: {"type": "skip", "description": _target_already_merged_description(ctx)},
     ),
     AdvanceRule(
         name="already_merged",

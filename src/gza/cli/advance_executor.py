@@ -45,6 +45,7 @@ class AdvanceActionExecutionContext:
     # create_implement) omit the kwargs; the needs_rebase iterate path passes
     # prepared_task=<rebase child> so worker metadata points at the prepared row.
     spawn_iterate_worker: Callable[..., int]
+    is_rebase_target_already_merged: Callable[[DbTask], bool] | None = None
     prefer_iterate_for_action: Callable[
         [DbTask, dict[str, Any]],
         DbTask | AdvanceActionExecutionResult | None,
@@ -798,6 +799,17 @@ def execute_advance_action(
                 action_type=action_type,
                 status="error",
                 message=f"Cannot rebase: task {task.id} has no branch",
+            )
+        if (
+            context.is_rebase_target_already_merged is not None
+            and context.is_rebase_target_already_merged(task)
+        ):
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message="target implementation already merged",
+                worker_consuming=False,
+                work_done=False,
             )
         if context.dry_run:
             return AdvanceActionExecutionResult(

@@ -644,7 +644,7 @@ def _print_log_header(
     elif worker:
         console.print(f"[{_lc()}]Worker:[/{_lc()}] {rich_escape(worker.worker_id)}", soft_wrap=True)
         _w_status = worker.status if worker.status else "unknown"
-        if is_running and _w_status != "running":
+        if is_running and _w_status not in {"running", "failed", "completed", "stale"}:
             # Prefer live process state when worker metadata is stale.
             _w_status = "running"
         _w_color = PS_STATUS_COLORS.get(_w_status, "white")

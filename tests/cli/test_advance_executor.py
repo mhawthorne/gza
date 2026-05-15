@@ -702,6 +702,41 @@ def test_needs_rebase_dry_run_does_not_create_task(tmp_path: Path) -> None:
     assert len(store.get_all()) == before_count
 
 
+def test_advance_executor_skips_needs_rebase_if_target_already_merged_before_create(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    _mark_completed(task, branch="feature/rebase-skip")
+    store.update(task)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("should not create rebase task"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        is_rebase_target_already_merged=lambda _task: True,
+    )
+
+    result = execute_advance_action(task=task, action={"type": "needs_rebase"}, context=context)
+
+    assert result.status == "skip"
+    assert result.message == "target implementation already merged"
+    assert result.worker_consuming is False
+
+
 def test_needs_rebase_iterate_rolls_back_when_prepare_fails(tmp_path: Path) -> None:
     """advance_mode=iterate must create+prepare the rebase child in the parent and
     surface preparation failures without spawning iterate or leaving an orphan row."""

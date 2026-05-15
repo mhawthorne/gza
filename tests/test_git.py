@@ -1494,6 +1494,34 @@ class TestExtractionGitHelpers:
             assert git.rev_parse_if_exists("main") == "abc123"
             assert git.rev_parse_if_exists("missing") is None
 
+    def test_is_ancestor_returns_false_for_non_ancestor(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+            assert git.is_ancestor("main", "feature/demo") is False
+
+    def test_is_ancestor_with_real_repo(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+        git._run("init", "-b", "main")
+        git._run("config", "user.name", "Test User")
+        git._run("config", "user.email", "test@example.com")
+        (repo_dir / "file.txt").write_text("base\n")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "base")
+        base_sha = git.rev_parse("HEAD")
+        git._run("checkout", "-b", "feature/demo")
+        (repo_dir / "file.txt").write_text("base\nfeature\n")
+        git._run("add", "file.txt")
+        git._run("commit", "-m", "feature")
+
+        assert git.is_ancestor(base_sha, "feature/demo") is True
+        assert git.is_ancestor("feature/demo", "main") is False
+
     def test_resolve_ref_if_possible_uses_rev_parse_if_exists_when_available(self, tmp_path: Path):
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()

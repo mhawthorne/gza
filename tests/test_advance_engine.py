@@ -16,8 +16,9 @@ from gza.advance_engine import (
     resolve_closing_review_action,
 )
 from gza.config import Config
-from gza.db import SqliteTaskStore
+from gza.db import SqliteTaskStore, Task as DbTask
 from gza.git import Git
+from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.review_verdict import ParsedReviewReport
 
@@ -31,6 +32,8 @@ class _FakeGit:
         is_merged_by_ref: dict[tuple[str, str], bool] | None = None,
         existing_branches: set[str] | None = None,
         existing_refs: set[str] | None = None,
+        ref_shas: dict[str, str | None] | None = None,
+        ancestor_pairs: dict[tuple[str, str], bool] | None = None,
         merge_source_result: tuple[str | None, str | None] | None = None,
         legacy_merge_source_ref: str | None = None,
     ):
@@ -39,8 +42,12 @@ class _FakeGit:
         self._is_merged_by_ref = is_merged_by_ref or {}
         self._existing_branches = existing_branches or set()
         self._existing_refs = existing_refs or set()
+        self._ref_shas = ref_shas or {}
+        self._ancestor_pairs = ancestor_pairs or {}
         self._merge_source_result = merge_source_result
         self._legacy_merge_source_ref = legacy_merge_source_ref
+        self.rev_parse_calls: list[str] = []
+        self.is_ancestor_calls: list[tuple[str, str]] = []
 
     def can_merge(self, source_branch: str, target_branch: str) -> bool:
         return self._can_merge_by_ref.get((source_branch, target_branch), self._can_merge)
@@ -53,6 +60,14 @@ class _FakeGit:
 
     def ref_exists(self, ref: str) -> bool:
         return ref in self._existing_refs
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        self.rev_parse_calls.append(ref)
+        return self._ref_shas.get(ref)
+
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        self.is_ancestor_calls.append((ancestor, descendant))
+        return self._ancestor_pairs.get((ancestor, descendant), False)
 
     def resolve_fresh_merge_source(self, branch: str):
         from gza.git import ResolvedMergeSourceRef
@@ -105,6 +120,37 @@ def _init_repo_with_remote_tracking_only_feature(tmp_path: Path, branch: str) ->
     git._run("update-ref", f"refs/remotes/origin/{branch}", feature_sha)
     git._run("branch", "-D", branch)
     return git
+
+
+def _make_completed_impl_with_failed_rebase(
+    store: SqliteTaskStore,
+    *,
+    branch: str,
+    failure_reason: str = "MERGE_CONFLICT",
+) -> tuple[DbTask, DbTask]:
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = branch
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+    store.get_or_create_merge_unit_for_task(impl)
+
+    failed_rebase = store.add(
+        f"Failed rebase for {impl.id}",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.failure_reason = failure_reason
+    failed_rebase.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    failed_rebase.branch = branch
+    store.update(failed_rebase)
+    return impl, failed_rebase
 
 
 def test_resolve_context_excludes_resume_state_for_test_failure(tmp_path: Path):
@@ -809,6 +855,179 @@ def test_failed_rebase_without_review_still_requires_manual_resolution(tmp_path:
     assert "failed, needs manual resolution" in action["description"]
 
 
+def test_failed_rebase_clears_when_merge_unit_is_merged(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl, _failed_rebase = _make_completed_impl_with_failed_rebase(
+        store,
+        branch="feature/merge-unit-merged",
+    )
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "merged", merged_by_task_id=impl.id)
+
+    git = _FakeGit(
+        can_merge=False,
+        ref_shas={
+            impl.branch: "branch-sha",
+            "main": "target-sha",
+        },
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: target implementation already merged (merge-unit-merged)"
+    assert git.rev_parse_calls == []
+    assert git.is_ancestor_calls == []
+
+
+def test_failed_rebase_clears_and_marks_merged_when_branch_tip_equals_target_tip(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl, _failed_rebase = _make_completed_impl_with_failed_rebase(
+        store,
+        branch="feature/branch-equals-target",
+    )
+
+    git = _FakeGit(
+        can_merge=False,
+        ref_shas={
+            impl.branch: "same-sha",
+            "main": "same-sha",
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "skip"
+    assert action["description"] == (
+        "SKIP: target implementation already merged (branch-tip-equals-target-tip)"
+    )
+    refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "merged"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=False),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    assert all(row.owner_task.id != impl.id for row in rows)
+
+
+def test_failed_rebase_does_not_persist_merged_from_stale_local_tip_when_origin_is_fresher(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl, _failed_rebase = _make_completed_impl_with_failed_rebase(
+        store,
+        branch="feature/stale-local-tip",
+    )
+
+    git = _FakeGit(
+        can_merge=False,
+        can_merge_by_ref={("origin/feature/stale-local-tip", "main"): False},
+        ref_shas={
+            impl.branch: "target-sha",
+            "origin/feature/stale-local-tip": "remote-sha",
+            "main": "target-sha",
+        },
+        ancestor_pairs={("main", "origin/feature/stale-local-tip"): False},
+        merge_source_result=("origin/feature/stale-local-tip", None),
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+    assert "target implementation already merged" not in action["description"]
+
+    refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    assert ctx.merge_source_ref == "origin/feature/stale-local-tip"
+    assert ctx.post_merge_rebase_state is not None
+    assert ctx.post_merge_rebase_state.already_merged is False
+    assert ctx.post_merge_rebase_state.reason is None
+
+
+def test_failed_rebase_clears_when_branch_contains_current_target_tip(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl, _failed_rebase = _make_completed_impl_with_failed_rebase(
+        store,
+        branch="feature/contains-target",
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={
+            impl.branch: "branch-sha",
+            "main": "target-sha",
+        },
+        ancestor_pairs={("main", impl.branch): True},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_review"
+    refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+
+
+def test_failed_rebase_resolution_precedence_merge_unit_wins(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl, _failed_rebase = _make_completed_impl_with_failed_rebase(
+        store,
+        branch="feature/precedence-merge-unit",
+    )
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "merged", merged_by_task_id=impl.id)
+
+    git = _FakeGit(can_merge=False)
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: target implementation already merged (merge-unit-merged)"
+    assert git.rev_parse_calls == []
+    assert git.is_ancestor_calls == []
+
+
+def test_conflict_needs_rebase_not_emitted_when_target_already_merged(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feature/conflict-already-merged"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "merged", merged_by_task_id=impl.id)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=False), impl, "main")
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: target implementation already merged (merge-unit-merged)"
+
+
 def test_already_merged_branch_skips_post_rebase_review_and_rebase_actions(
     tmp_path: Path,
     monkeypatch,
@@ -1307,6 +1526,50 @@ def test_diverged_local_and_origin_need_manual_resolution(tmp_path: Path) -> Non
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
     assert "diverged" in action["description"]
+
+
+def test_diverged_local_and_origin_fail_closed_even_when_local_tip_matches_target(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl, _failed_rebase = _make_completed_impl_with_failed_rebase(
+        store,
+        branch="feature/diverged-equals-target-local",
+    )
+
+    git = _FakeGit(
+        can_merge=False,
+        ref_shas={
+            impl.branch: "target-sha",
+            "main": "target-sha",
+        },
+        merge_source_result=(
+            None,
+            (
+                "Local branch 'feature/diverged-equals-target-local' and remote-tracking ref "
+                "'origin/feature/diverged-equals-target-local' diverged. Push, fetch, or "
+                "reconcile them before advancing or merging."
+            ),
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert "diverged" in action["description"]
+    assert "target implementation already merged" not in action["description"]
+
+    refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    assert ctx.post_merge_rebase_state is not None
+    assert ctx.post_merge_rebase_state.already_merged is False
+    assert ctx.post_merge_rebase_state.warning is not None
+    assert "diverged" in ctx.post_merge_rebase_state.warning
 
 
 def test_real_git_remote_tracking_ref_unblocks_failed_rebase_after_later_approved_review(

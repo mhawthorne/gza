@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
 
 from .. import lineage
+from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
 from ..config import Config
 from ..console import prompt_available_width, shorten_prompt
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
@@ -1133,6 +1134,13 @@ def _run_cycle(
             spawn_worker=_watch_spawn_worker,
             spawn_resume_worker=_watch_spawn_resume_worker,
             spawn_iterate_worker=_watch_spawn_iterate,
+            is_rebase_target_already_merged=lambda t: _resolve_and_persist_post_merge_rebase_state(
+                store,
+                git,
+                t,
+                target_branch,
+                merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
+            ).already_merged,
             spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_worker_with_failure_log(
                 quiet=quiet,
                 log=log,
