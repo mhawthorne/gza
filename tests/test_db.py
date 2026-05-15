@@ -1586,6 +1586,278 @@ class TestGetReviewsForTask:
         assert reloaded.created_at == datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
         assert reloaded.completed_at == datetime(2026, 1, 1, 11, 0, 0, tzinfo=UTC)
 
+    def test_update_and_run_writers_normalize_naive_datetimes_to_canonical_utc(self, tmp_path: Path) -> None:
+        """Write paths should persist naive datetimes as UTC-aware ISO strings."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        task = store.add("Normalize naive timestamps")
+        assert task.id is not None
+        task.started_at = datetime(2026, 1, 2, 9, 0, 0)
+        task.completed_at = datetime(2026, 1, 2, 10, 0, 0)
+        task.pr_last_synced_at = datetime(2026, 1, 2, 11, 0, 0)
+        task.sync_last_synced_at = datetime(2026, 1, 2, 12, 0, 0)
+        task.merged_at = datetime(2026, 1, 2, 13, 0, 0)
+        task.review_cleared_at = datetime(2026, 1, 2, 14, 0, 0)
+        store.update(task)
+
+        step_ref = store.emit_step(
+            task.id,
+            "step",
+            provider="codex",
+            started_at=datetime(2026, 1, 2, 15, 0, 0),
+        )
+        store.emit_substep(
+            step_ref,
+            "tool_call",
+            {"ok": True},
+            source="assistant",
+            timestamp=datetime(2026, 1, 2, 15, 1, 0),
+        )
+        store.finalize_step(step_ref, "completed", completed_at=datetime(2026, 1, 2, 15, 2, 0))
+
+        unit = store.create_merge_unit(
+            source_branch="feature/timestamps",
+            target_branch="main",
+            owner_task_id=task.id,
+            state="merged",
+            merged_at=datetime(2026, 1, 2, 16, 0, 0),
+            pr_last_synced_at=datetime(2026, 1, 2, 16, 1, 0),
+            sync_last_synced_at=datetime(2026, 1, 2, 16, 2, 0),
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+
+        with sqlite3.connect(db_path) as conn:
+            task_row = conn.execute(
+                """
+                SELECT started_at, completed_at, pr_last_synced_at, sync_last_synced_at, merged_at, review_cleared_at
+                FROM tasks
+                WHERE id = ?
+                """,
+                (task.id,),
+            ).fetchone()
+            assert task_row == (
+                "2026-01-02T09:00:00+00:00",
+                "2026-01-02T10:00:00+00:00",
+                "2026-01-02T11:00:00+00:00",
+                "2026-01-02T12:00:00+00:00",
+                "2026-01-02T13:00:00+00:00",
+                "2026-01-02T14:00:00+00:00",
+            )
+            step_row = conn.execute(
+                "SELECT started_at, completed_at FROM run_steps WHERE run_id = ?",
+                (task.id,),
+            ).fetchone()
+            assert step_row == ("2026-01-02T15:00:00+00:00", "2026-01-02T15:02:00+00:00")
+            substep_row = conn.execute(
+                "SELECT timestamp FROM run_substeps WHERE run_id = ?",
+                (task.id,),
+            ).fetchone()
+            assert substep_row == ("2026-01-02T15:01:00+00:00",)
+            unit_row = conn.execute(
+                """
+                SELECT merged_at, pr_last_synced_at, sync_last_synced_at
+                FROM merge_units
+                WHERE id = ?
+                """,
+                (unit.id,),
+            ).fetchone()
+            assert unit_row == (
+                "2026-01-02T16:00:00+00:00",
+                "2026-01-02T16:01:00+00:00",
+                "2026-01-02T16:02:00+00:00",
+            )
+
+    def test_auto_migration_v43_to_v44_backfills_all_persisted_timestamp_tables(self, tmp_path: Path) -> None:
+        """Opening a v43 DB should rewrite legacy naive timestamp strings to canonical UTC-aware text."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        task = store.add("Backfill timestamp migration")
+        assert task.id is not None
+        step_ref = store.emit_step(
+            task.id,
+            "step",
+            provider="codex",
+            started_at=datetime(2026, 1, 3, 10, 0, tzinfo=UTC),
+        )
+        store.emit_substep(
+            step_ref,
+            "tool_call",
+            {"ok": True},
+            source="assistant",
+            timestamp=datetime(2026, 1, 3, 10, 1, tzinfo=UTC),
+        )
+        store.finalize_step(step_ref, "completed", completed_at=datetime(2026, 1, 3, 10, 2, tzinfo=UTC))
+        comment = store.add_comment(task.id, "comment")
+        unit = store.create_merge_unit(
+            source_branch="feature/backfill",
+            target_branch="main",
+            owner_task_id=task.id,
+            state="merged",
+            merged_at=datetime(2026, 1, 3, 11, 2, tzinfo=UTC),
+            pr_last_synced_at=datetime(2026, 1, 3, 11, 3, tzinfo=UTC),
+            sync_last_synced_at=datetime(2026, 1, 3, 11, 4, tzinfo=UTC),
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                UPDATE projects
+                SET created_at = ?, last_seen_at = ?
+                WHERE id = ?
+                """,
+                ("2026-01-03T08:00:00", "2026-01-03T08:01:00", "default"),
+            )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET created_at = ?,
+                    started_at = ?,
+                    completed_at = ?,
+                    pr_last_synced_at = ?,
+                    sync_last_synced_at = ?,
+                    urgent_bumped_at = ?,
+                    merged_at = ?,
+                    review_cleared_at = ?
+                WHERE id = ?
+                """,
+                (
+                    "2026-01-03T09:00:00",
+                    "2026-01-03T09:01:00",
+                    "2026-01-03T09:02:00",
+                    "2026-01-03T09:03:00",
+                    "2026-01-03T09:04:00",
+                    "2026-01-03T09:05:00",
+                    "2026-01-03T09:06:00",
+                    "2026-01-03T09:07:00",
+                    task.id,
+                ),
+            )
+            conn.execute(
+                "UPDATE run_steps SET started_at = ?, completed_at = ? WHERE run_id = ?",
+                ("2026-01-03T10:00:00", "2026-01-03T10:02:00", task.id),
+            )
+            conn.execute(
+                "UPDATE run_substeps SET timestamp = ? WHERE run_id = ?",
+                ("2026-01-03T10:01:00", task.id),
+            )
+            conn.execute(
+                "UPDATE task_comments SET created_at = ?, resolved_at = ? WHERE id = ?",
+                ("2026-01-03T10:03:00", "2026-01-03T10:04:00", comment.id),
+            )
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET created_at = ?,
+                    updated_at = ?,
+                    merged_at = ?,
+                    pr_last_synced_at = ?,
+                    sync_last_synced_at = ?
+                WHERE id = ?
+                """,
+                (
+                    "2026-01-03T11:00:00",
+                    "2026-01-03T11:01:00",
+                    "2026-01-03T11:02:00",
+                    "2026-01-03T11:03:00",
+                    "2026-01-03T11:04:00",
+                    unit.id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE merge_unit_tasks
+                SET attached_at = ?
+                WHERE merge_unit_id = ? AND task_id = ?
+                """,
+                ("2026-01-03T11:05:00", unit.id, task.id),
+            )
+            conn.execute("UPDATE schema_version SET version = 43")
+            conn.commit()
+
+        migrated = SqliteTaskStore(db_path, prefix="gza")
+        reloaded = migrated.get(task.id)
+        assert reloaded is not None
+        assert reloaded.created_at == datetime(2026, 1, 3, 9, 0, tzinfo=UTC)
+        assert reloaded.started_at == datetime(2026, 1, 3, 9, 1, tzinfo=UTC)
+        assert reloaded.completed_at == datetime(2026, 1, 3, 9, 2, tzinfo=UTC)
+        assert reloaded.pr_last_synced_at == datetime(2026, 1, 3, 9, 3, tzinfo=UTC)
+        assert reloaded.sync_last_synced_at == datetime(2026, 1, 3, 9, 4, tzinfo=UTC)
+        assert reloaded.merged_at == datetime(2026, 1, 3, 9, 6, tzinfo=UTC)
+        assert reloaded.review_cleared_at == datetime(2026, 1, 3, 9, 7, tzinfo=UTC)
+
+        with sqlite3.connect(db_path) as conn:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            project_row = conn.execute(
+                "SELECT created_at, last_seen_at FROM projects WHERE id = ?",
+                ("default",),
+            ).fetchone()
+            task_row = conn.execute(
+                """
+                SELECT created_at, started_at, completed_at, pr_last_synced_at, sync_last_synced_at,
+                       urgent_bumped_at, merged_at, review_cleared_at
+                FROM tasks
+                WHERE id = ?
+                """,
+                (task.id,),
+            ).fetchone()
+            step_row = conn.execute(
+                "SELECT started_at, completed_at FROM run_steps WHERE run_id = ?",
+                (task.id,),
+            ).fetchone()
+            substep_row = conn.execute(
+                "SELECT timestamp FROM run_substeps WHERE run_id = ?",
+                (task.id,),
+            ).fetchone()
+            comment_row = conn.execute(
+                "SELECT created_at, resolved_at FROM task_comments WHERE id = ?",
+                (comment.id,),
+            ).fetchone()
+            unit_row = conn.execute(
+                """
+                SELECT created_at, updated_at, merged_at, pr_last_synced_at, sync_last_synced_at
+                FROM merge_units
+                WHERE id = ?
+                """,
+                (unit.id,),
+            ).fetchone()
+            attachment_row = conn.execute(
+                """
+                SELECT attached_at
+                FROM merge_unit_tasks
+                WHERE merge_unit_id = ? AND task_id = ?
+                """,
+                (unit.id, task.id),
+            ).fetchone()
+
+        assert version == SCHEMA_VERSION
+        assert project_row is not None
+        assert project_row[0] == "2026-01-03T08:00:00+00:00"
+        assert project_row[1].endswith("+00:00")
+        assert task_row == (
+            "2026-01-03T09:00:00+00:00",
+            "2026-01-03T09:01:00+00:00",
+            "2026-01-03T09:02:00+00:00",
+            "2026-01-03T09:03:00+00:00",
+            "2026-01-03T09:04:00+00:00",
+            "2026-01-03T09:05:00+00:00",
+            "2026-01-03T09:06:00+00:00",
+            "2026-01-03T09:07:00+00:00",
+        )
+        assert step_row == ("2026-01-03T10:00:00+00:00", "2026-01-03T10:02:00+00:00")
+        assert substep_row == ("2026-01-03T10:01:00+00:00",)
+        assert comment_row == ("2026-01-03T10:03:00+00:00", "2026-01-03T10:04:00+00:00")
+        assert unit_row == (
+            "2026-01-03T11:00:00+00:00",
+            "2026-01-03T11:01:00+00:00",
+            "2026-01-03T11:02:00+00:00",
+            "2026-01-03T11:03:00+00:00",
+            "2026-01-03T11:04:00+00:00",
+        )
+        assert attachment_row == ("2026-01-03T11:05:00+00:00",)
+
     def test_get_reviews_for_task_returns_empty_when_no_reviews(self, tmp_path: Path):
         """Test that an empty list is returned when no reviews exist."""
         db_path = tmp_path / "test.db"
@@ -5882,7 +6154,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -5894,7 +6166,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -6854,6 +7126,134 @@ class TestSharedDbIsolationAndImportGating:
             ).fetchone()[0]
         assert mismatches == 0
         assert demo_links == 1
+
+    def test_import_local_db_normalizes_naive_timestamps_without_false_conflicts(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: demo\n"
+            "project_id: demoimporttimestamps01\n"
+            "project_prefix: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        config = Config.load(project_dir)
+        shared_store = SqliteTaskStore.from_config(config)
+        shared_task = shared_store.add("same task")
+        shared_step = shared_store.emit_step(shared_task.id, "same step", provider="codex")
+        shared_store.emit_substep(shared_step, "tool_call", {"ok": True}, source="assistant")
+        shared_store.finalize_step(shared_step, "completed", completed_at=datetime(2026, 1, 4, 10, 2, tzinfo=UTC))
+        shared_comment = shared_store.add_comment(shared_task.id, "same comment")
+
+        local_db = project_dir / ".gza" / "gza.db"
+        local_db.parent.mkdir(parents=True, exist_ok=True)
+        local_store = SqliteTaskStore(local_db, prefix="demo")
+        local_task = local_store.add("same task")
+        local_step = local_store.emit_step(local_task.id, "same step", provider="codex")
+        local_store.emit_substep(local_step, "tool_call", {"ok": True}, source="assistant")
+        local_store.finalize_step(local_step, "completed", completed_at=datetime(2026, 1, 4, 10, 2, tzinfo=UTC))
+        local_comment = local_store.add_comment(local_task.id, "same comment")
+
+        assert shared_task.id == local_task.id
+
+        with sqlite3.connect(shared_db) as conn:
+            conn.execute(
+                "UPDATE tasks SET created_at = ?, completed_at = ? WHERE project_id = ? AND id = ?",
+                (
+                    "2026-01-04T10:00:00+00:00",
+                    "2026-01-04T10:05:00+00:00",
+                    config.project_id,
+                    shared_task.id,
+                ),
+            )
+            conn.execute(
+                "UPDATE run_steps SET started_at = ?, completed_at = ? WHERE project_id = ? AND run_id = ?",
+                (
+                    "2026-01-04T10:01:00+00:00",
+                    "2026-01-04T10:02:00+00:00",
+                    config.project_id,
+                    shared_task.id,
+                ),
+            )
+            conn.execute(
+                "UPDATE run_substeps SET timestamp = ? WHERE project_id = ? AND run_id = ?",
+                ("2026-01-04T10:01:30+00:00", config.project_id, shared_task.id),
+            )
+            conn.execute(
+                "UPDATE task_comments SET created_at = ?, resolved_at = ? WHERE project_id = ? AND id = ?",
+                (
+                    "2026-01-04T10:03:00+00:00",
+                    "2026-01-04T10:04:00+00:00",
+                    config.project_id,
+                    shared_comment.id,
+                ),
+            )
+            conn.commit()
+
+        with sqlite3.connect(local_db) as conn:
+            conn.execute(
+                "UPDATE tasks SET created_at = ?, completed_at = ? WHERE id = ?",
+                ("2026-01-04T10:00:00", "2026-01-04T10:05:00", local_task.id),
+            )
+            conn.execute(
+                "UPDATE run_steps SET started_at = ?, completed_at = ? WHERE run_id = ?",
+                ("2026-01-04T10:01:00", "2026-01-04T10:02:00", local_task.id),
+            )
+            conn.execute(
+                "UPDATE run_substeps SET timestamp = ? WHERE run_id = ?",
+                ("2026-01-04T10:01:30", local_task.id),
+            )
+            conn.execute(
+                "UPDATE task_comments SET created_at = ?, resolved_at = ? WHERE id = ?",
+                ("2026-01-04T10:03:00", "2026-01-04T10:04:00", local_comment.id),
+            )
+            conn.commit()
+
+        result = import_legacy_local_db(config)
+        assert result["status"] == "imported"
+        assert result["tasks_imported"] == 0
+
+        refreshed = SqliteTaskStore.from_config(config)
+        comments = refreshed.get_comments(shared_task.id)
+        steps = refreshed.get_run_steps(shared_task.id)
+        assert len(comments) == 1
+        assert len(steps) == 1
+        substeps = refreshed.get_run_substeps(
+            StepRef(
+                id=steps[0].id,
+                run_id=steps[0].run_id,
+                step_index=steps[0].step_index,
+                step_id=steps[0].step_id,
+            )
+        )
+        assert len(substeps) == 1
+
+        with sqlite3.connect(shared_db) as conn:
+            task_row = conn.execute(
+                "SELECT created_at, completed_at FROM tasks WHERE project_id = ? AND id = ?",
+                (config.project_id, shared_task.id),
+            ).fetchone()
+            step_row = conn.execute(
+                "SELECT started_at, completed_at FROM run_steps WHERE project_id = ? AND run_id = ?",
+                (config.project_id, shared_task.id),
+            ).fetchone()
+            substep_row = conn.execute(
+                "SELECT timestamp FROM run_substeps WHERE project_id = ? AND run_id = ?",
+                (config.project_id, shared_task.id),
+            ).fetchone()
+            comment_row = conn.execute(
+                "SELECT created_at, resolved_at FROM task_comments WHERE project_id = ? AND id = ?",
+                (config.project_id, shared_comment.id),
+            ).fetchone()
+
+        assert task_row == ("2026-01-04T10:00:00+00:00", "2026-01-04T10:05:00+00:00")
+        assert step_row == ("2026-01-04T10:01:00+00:00", "2026-01-04T10:02:00+00:00")
+        assert substep_row == ("2026-01-04T10:01:30+00:00",)
+        assert comment_row == ("2026-01-04T10:03:00+00:00", "2026-01-04T10:04:00+00:00")
 
     def test_missing_project_id_is_persisted_once_via_migration_flow(self, tmp_path: Path) -> None:
         from gza.config import Config
@@ -8429,7 +8829,7 @@ class TestSharedDbIsolationAndImportGating:
         status = check_migration_status(db_path)
         assert status["current_version"] == 27
         assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
 
 
 class TestSyncCandidates:

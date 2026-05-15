@@ -233,6 +233,7 @@ def _backfill_task_tags_from_group(conn: sqlite3.Connection) -> None:
 
 def _next_monotonic_iso_timestamp(now: datetime, floor_iso: str | None) -> str:
     """Return an ISO timestamp that is strictly later than ``floor_iso`` when needed."""
+    now = _normalize_db_datetime(now)
     if floor_iso:
         try:
             floor = _parse_db_timestamp(floor_iso)
@@ -240,7 +241,9 @@ def _next_monotonic_iso_timestamp(now: datetime, floor_iso: str | None) -> str:
             floor = None
         if floor is not None and now <= floor:
             now = floor + timedelta(microseconds=1)
-    return now.isoformat()
+    formatted = _format_db_timestamp(now)
+    assert formatted is not None
+    return formatted
 
 
 def _parse_db_timestamp(value: str | None) -> datetime | None:
@@ -251,6 +254,33 @@ def _parse_db_timestamp(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _normalize_db_datetime(value: datetime) -> datetime:
+    """Normalize any datetime to the canonical UTC-aware DB representation."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _format_db_timestamp(value: datetime | None) -> str | None:
+    """Format a datetime for SQLite storage using the canonical UTC-aware ISO form."""
+    if value is None:
+        return None
+    return _normalize_db_datetime(value).isoformat()
+
+
+def _canonicalize_db_timestamp_text(value: str | None) -> str | None:
+    """Normalize persisted timestamp text into the canonical UTC-aware ISO form."""
+    parsed = _parse_db_timestamp(value)
+    return _format_db_timestamp(parsed)
+
+
+def _normalize_db_comparable_value(column: str, value: object) -> object:
+    """Normalize DB values before equality checks that include timestamp text."""
+    if column in _DB_TIMESTAMP_COLUMN_NAMES:
+        return _canonicalize_db_timestamp_text(cast("str | None", value))
+    return value
 
 
 def _coalesce_task_timestamp(*timestamps: datetime | None) -> datetime:
@@ -449,6 +479,35 @@ class TaskComment:
     created_at: datetime
     resolved_at: datetime | None
 
+
+_DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
+    "projects": ("created_at", "last_seen_at"),
+    "tasks": (
+        "created_at",
+        "started_at",
+        "completed_at",
+        "pr_last_synced_at",
+        "sync_last_synced_at",
+        "urgent_bumped_at",
+        "merged_at",
+        "review_cleared_at",
+    ),
+    "run_steps": ("started_at", "completed_at"),
+    "run_substeps": ("timestamp",),
+    "task_comments": ("created_at", "resolved_at"),
+    "merge_units": (
+        "created_at",
+        "updated_at",
+        "merged_at",
+        "pr_last_synced_at",
+        "sync_last_synced_at",
+    ),
+    "merge_unit_tasks": ("attached_at",),
+}
+_DB_TIMESTAMP_COLUMN_NAMES: frozenset[str] = frozenset(
+    column for columns in _DB_TIMESTAMP_COLUMNS.values() for column in columns
+)
+
 # Migration from v18 to v19
 MIGRATION_V18_TO_V19 = """
 CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on);
@@ -611,8 +670,13 @@ MIGRATION_V42_TO_V43 = """
 ALTER TABLE tasks ADD COLUMN changed_diff INTEGER;
 """
 
+# Migration from v43 to v44: canonical UTC-aware timestamp backfill
+MIGRATION_V43_TO_V44 = """
+-- v44 rewrites persisted timestamp text into canonical UTC-aware ISO strings.
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 43
+SCHEMA_VERSION = 44
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -662,6 +726,38 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     """Return the set of column names for an existing table."""
     return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _rewrite_persisted_timestamps_to_canonical_utc(conn: sqlite3.Connection) -> int:
+    """Rewrite persisted timestamp text in-place to canonical UTC-aware ISO strings."""
+    rewritten = 0
+    for table, configured_columns in _DB_TIMESTAMP_COLUMNS.items():
+        if not _table_exists(conn, table):
+            continue
+        present_columns = tuple(column for column in configured_columns if _table_has_column(conn, table, column))
+        if not present_columns:
+            continue
+        rows = conn.execute(f"SELECT rowid AS _rowid, {', '.join(present_columns)} FROM {table}").fetchall()
+        for row in rows:
+            assignments: list[str] = []
+            params: list[object] = []
+            for column in present_columns:
+                current_value = cast("str | None", row[column])
+                canonical_value = _canonicalize_db_timestamp_text(current_value)
+                if current_value != canonical_value:
+                    assignments.append(f"{column} = ?")
+                    params.append(canonical_value)
+            if not assignments:
+                continue
+            params.append(row["_rowid"])
+            conn.execute(f"UPDATE {table} SET {', '.join(assignments)} WHERE rowid = ?", params)
+            rewritten += 1
+    return rewritten
+
+
+def _run_v43_to_v44_migration(conn: sqlite3.Connection) -> None:
+    """Backfill all persisted timestamp text to canonical UTC-aware ISO strings."""
+    _rewrite_persisted_timestamps_to_canonical_utc(conn)
 
 
 def _drop_indexes_for_table(conn: sqlite3.Connection, table: str) -> None:
@@ -1257,7 +1353,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "base_branch",
 )
 
-_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset({40, 41, 42, 43})
+_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset({40, 41, 42, 43, 44})
 
 
 def _missing_required_columns(conn: sqlite3.Connection, table: str, required_columns: tuple[str, ...]) -> list[str]:
@@ -1968,6 +2064,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (41, MIGRATION_V40_TO_V41),
     (42, MIGRATION_V41_TO_V42),
     (43, MIGRATION_V42_TO_V43),
+    (44, MIGRATION_V43_TO_V44),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -2246,6 +2343,8 @@ class SqliteTaskStore:
                                         "Use a writable database to complete migration, then retry."
                                     ) from exc
                                 raise
+                        elif target_version == 44:
+                            _run_v43_to_v44_migration(conn)
                         elif migration_sql is not None:
                             for stmt in migration_sql.strip().split(";"):
                                 stmt = stmt.strip()
@@ -2508,7 +2607,8 @@ class SqliteTaskStore:
 
     def _ensure_project_row(self) -> None:
         """Ensure the current project is registered in the shared DB."""
-        now = datetime.now(UTC).isoformat()
+        now = _format_db_timestamp(datetime.now(UTC))
+        assert now is not None
         with self._connect() as conn:
             try:
                 conn.execute(
@@ -2814,7 +2914,8 @@ class SqliteTaskStore:
         skip_learnings: bool = False,
     ) -> Task:
         """Add a new task. Returns the created Task with its generated string ID."""
-        now = datetime.now(UTC).isoformat()
+        now = _format_db_timestamp(datetime.now(UTC))
+        assert now is not None
         normalized_tags = _normalize_tags(tags)
         if group is not None:
             normalized_tags = _normalize_tags((*normalized_tags, group))
@@ -3013,9 +3114,9 @@ class SqliteTaskStore:
                     task.cost_usd,
                     task.input_tokens,
                     task.output_tokens,
-                    task.started_at.isoformat() if task.started_at else None,
+                    _format_db_timestamp(task.started_at),
                     task.running_pid,
-                    task.completed_at.isoformat() if task.completed_at else None,
+                    _format_db_timestamp(task.completed_at),
                     persisted_group,
                     task.depends_on,
                     task.spec,
@@ -3029,15 +3130,15 @@ class SqliteTaskStore:
                     task.session_id,
                     task.pr_number,
                     task.pr_state,
-                    task.pr_last_synced_at.isoformat() if task.pr_last_synced_at else None,
-                    task.sync_last_synced_at.isoformat() if task.sync_last_synced_at else None,
+                    _format_db_timestamp(task.pr_last_synced_at),
+                    _format_db_timestamp(task.sync_last_synced_at),
                     task.model,
                     task.provider,
                     1 if task.provider_is_explicit else 0,
                     1 if task.urgent else 0,
                     task.queue_position,
                     task.merge_status,
-                    task.merged_at.isoformat() if task.merged_at else None,
+                    _format_db_timestamp(task.merged_at),
                     task.failure_reason,
                     task.completion_reason,
                     1 if task.skip_learnings else 0,
@@ -3045,7 +3146,7 @@ class SqliteTaskStore:
                     task.diff_lines_added,
                     task.diff_lines_removed,
                     1 if task.changed_diff else (0 if task.changed_diff is False else None),
-                    task.review_cleared_at.isoformat() if task.review_cleared_at else None,
+                    _format_db_timestamp(task.review_cleared_at),
                     task.review_score,
                     task.log_schema_version,
                     task.execution_mode,
@@ -3168,7 +3269,7 @@ class SqliteTaskStore:
                         running_pid = ?
                     WHERE project_id = ? AND id = ? AND status = 'pending'
                     """,
-                    (started_at.isoformat(), pid, self._project_id, task_id),
+                    (_format_db_timestamp(started_at), pid, self._project_id, task_id),
                 )
                 if cur.rowcount == 0:
                     return None
@@ -3230,7 +3331,7 @@ class SqliteTaskStore:
         Setting urgent=True records a bump timestamp so the task moves to the
         front of the urgent pickup lane.
         """
-        bumped_at = datetime.now(UTC).isoformat() if urgent else None
+        bumped_at = _format_db_timestamp(datetime.now(UTC)) if urgent else None
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE tasks SET urgent = ?, urgent_bumped_at = ? WHERE project_id = ? AND id = ?",
@@ -3486,14 +3587,16 @@ class SqliteTaskStore:
                 where_clauses.append("task_type != 'internal'")
 
             if since is not None:
-                since_str = since.isoformat()
+                since_str = _format_db_timestamp(since)
+                assert since_str is not None
                 where_clauses.append(
                     "(completed_at >= ? OR (completed_at IS NULL AND created_at >= ?))"
                 )
                 params.extend([since_str, since_str])
 
             if until is not None:
-                until_str = until.isoformat()
+                until_str = _format_db_timestamp(until)
+                assert until_str is not None
                 where_clauses.append(
                     "(completed_at <= ? OR (completed_at IS NULL AND created_at <= ?))"
                 )
@@ -3708,10 +3811,11 @@ class SqliteTaskStore:
         """Create and persist a merge unit."""
         if not self.supports_merge_units():
             raise RuntimeError("merge units are not available on this database")
-        now = datetime.now(UTC).isoformat()
-        merged_at_iso = merged_at.isoformat() if merged_at is not None else None
-        pr_last_synced_at_iso = pr_last_synced_at.isoformat() if pr_last_synced_at is not None else None
-        sync_last_synced_at_iso = sync_last_synced_at.isoformat() if sync_last_synced_at is not None else None
+        now = _format_db_timestamp(datetime.now(UTC))
+        assert now is not None
+        merged_at_iso = _format_db_timestamp(merged_at)
+        pr_last_synced_at_iso = _format_db_timestamp(pr_last_synced_at)
+        sync_last_synced_at_iso = _format_db_timestamp(sync_last_synced_at)
         with self._connect() as conn:
             unit_id = self._next_merge_unit_id(conn)
             conn.execute(
@@ -3840,7 +3944,8 @@ class SqliteTaskStore:
         """Attach a task row to a merge unit."""
         if not self.supports_merge_units():
             return
-        now = datetime.now(UTC).isoformat()
+        now = _format_db_timestamp(datetime.now(UTC))
+        assert now is not None
         with self._connect() as conn:
             conn.execute(
                 """
@@ -4147,7 +4252,7 @@ class SqliteTaskStore:
                     f"got {typed_merged_by_task_id!r}"
                 )
         updates: list[str] = ["state = ?", "updated_at = ?"]
-        params: list[object] = [state, now.isoformat()]
+        params: list[object] = [state, _format_db_timestamp(now)]
         merged_at_value: datetime | None | object = merged_at
         if state == "merged":
             if merged_at_value is DB_UNSET:
@@ -4164,7 +4269,7 @@ class SqliteTaskStore:
                 merged_by_task_id = None
         typed_merged_at_value = cast("datetime | None", merged_at_value)
         updates.append("merged_at = ?")
-        params.append(typed_merged_at_value.isoformat() if typed_merged_at_value is not None else None)
+        params.append(_format_db_timestamp(typed_merged_at_value))
         updates.append("merged_by_task_id = ?")
         params.append(cast("str | None", merged_by_task_id))
         if pr_number is not DB_UNSET:
@@ -4176,12 +4281,12 @@ class SqliteTaskStore:
         if pr_last_synced_at is not DB_UNSET:
             typed_pr_last_synced_at = cast("datetime | None", pr_last_synced_at)
             updates.append("pr_last_synced_at = ?")
-            params.append(typed_pr_last_synced_at.isoformat() if typed_pr_last_synced_at is not None else None)
+            params.append(_format_db_timestamp(typed_pr_last_synced_at))
         if sync_last_synced_at is not DB_UNSET:
             typed_sync_last_synced_at = cast("datetime | None", sync_last_synced_at)
             updates.append("sync_last_synced_at = ?")
             params.append(
-                typed_sync_last_synced_at.isoformat() if typed_sync_last_synced_at is not None else None
+                _format_db_timestamp(typed_sync_last_synced_at)
             )
         if diff_stats is not None:
             updates.extend(
@@ -4205,7 +4310,8 @@ class SqliteTaskStore:
         if not self.supports_merge_units():
             return 0
         affected_unit_ids: list[str] = []
-        now = datetime.now(UTC).isoformat()
+        now = _format_db_timestamp(datetime.now(UTC))
+        assert now is not None
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -4245,7 +4351,7 @@ class SqliteTaskStore:
         if not self.supports_merge_units():
             return
         updates = ["updated_at = ?"]
-        params: list[Any] = [datetime.now(UTC).isoformat()]
+        params: list[Any] = [_format_db_timestamp(datetime.now(UTC))]
         if head_sha is not DB_UNSET:
             normalized_head_sha = head_sha if isinstance(head_sha, str) and head_sha else None
             updates.append("head_sha = ?")
@@ -4256,7 +4362,8 @@ class SqliteTaskStore:
             params.append(normalized_base_sha)
         if len(updates) == 1:
             return
-        now = datetime.now(UTC).isoformat()
+        now = _format_db_timestamp(datetime.now(UTC))
+        assert now is not None
         params[0] = now
         params.extend([self._project_id, unit_id])
         with self._connect() as conn:
@@ -4448,8 +4555,10 @@ class SqliteTaskStore:
 
     def _legacy_sync_candidates(self, *, recent_days: int, cooldown_seconds: int) -> list[Task]:
         """Return legacy task-row sync candidates for migration fallback/union reads."""
-        recent_cutoff = (datetime.now(UTC) - timedelta(days=recent_days)).isoformat()
-        sync_cutoff = (datetime.now(UTC) - timedelta(seconds=max(cooldown_seconds, 0))).isoformat()
+        recent_cutoff = _format_db_timestamp(datetime.now(UTC) - timedelta(days=recent_days))
+        sync_cutoff = _format_db_timestamp(datetime.now(UTC) - timedelta(seconds=max(cooldown_seconds, 0)))
+        assert recent_cutoff is not None
+        assert sync_cutoff is not None
         cooldown_filter = ""
         params: list[object] = [self._project_id, recent_cutoff]
         if cooldown_seconds > 0:
@@ -4508,7 +4617,7 @@ class SqliteTaskStore:
                             merged_by_task_id=owner_task_id if state == "merged" else None,
                         )
                         return
-        merged_at = datetime.now(UTC).isoformat() if merge_status == "merged" else None
+        merged_at = _format_db_timestamp(datetime.now(UTC)) if merge_status == "merged" else None
         with self._connect() as conn:
             conn.execute(
                 "UPDATE tasks SET merge_status = ?, merged_at = ? WHERE project_id = ? AND id = ?",
@@ -4527,7 +4636,8 @@ class SqliteTaskStore:
 
         If task_id does not exist, this is a no-op (no error is raised).
         """
-        now = datetime.now(UTC).isoformat()
+        now = _format_db_timestamp(datetime.now(UTC))
+        assert now is not None
         with self._connect() as conn:
             conn.execute(
                 "UPDATE tasks SET review_cleared_at = ? WHERE project_id = ? AND id = ?",
@@ -4589,7 +4699,8 @@ class SqliteTaskStore:
         legacy_event_id: str | None = None,
     ) -> StepRef:
         """Create and persist a top-level message step for a run."""
-        timestamp = (started_at or datetime.now(UTC)).isoformat()
+        timestamp = _format_db_timestamp(started_at or datetime.now(UTC))
+        assert timestamp is not None
         with self._connect() as conn:
             cur = conn.execute(
                 "SELECT COALESCE(MAX(step_index), 0) + 1 AS next_step FROM run_steps WHERE project_id = ? AND run_id = ?",
@@ -4635,7 +4746,8 @@ class SqliteTaskStore:
         legacy_event_id: str | None = None,
     ) -> RunSubstep:
         """Append a substep/tool event under an existing step."""
-        ts = (timestamp or datetime.now(UTC)).isoformat()
+        ts = _format_db_timestamp(timestamp or datetime.now(UTC))
+        assert ts is not None
         payload_json = json.dumps(payload)
         with self._connect() as conn:
             cur = conn.execute(
@@ -4705,7 +4817,8 @@ class SqliteTaskStore:
         completed_at: datetime | None = None,
     ) -> None:
         """Mark a step complete and persist final outcome metadata."""
-        ts = (completed_at or datetime.now(UTC)).isoformat()
+        ts = _format_db_timestamp(completed_at or datetime.now(UTC))
+        assert ts is not None
         with self._connect() as conn:
             cur = conn.execute(
                 "SELECT run_id, step_index, step_id FROM run_steps WHERE project_id = ? AND id = ?",
@@ -5033,7 +5146,9 @@ class SqliteTaskStore:
             if cutoff.tzinfo is not None:
                 cutoff = cutoff.astimezone(UTC)
             query += " AND created_at <= ?"
-            params.append(cutoff.isoformat())
+            cutoff_value = _format_db_timestamp(cutoff)
+            assert cutoff_value is not None
+            params.append(cutoff_value)
         query += " ORDER BY created_at ASC, id ASC"
         with self._connect() as conn:
             cur = conn.execute(query, tuple(params))
@@ -5046,7 +5161,8 @@ class SqliteTaskStore:
         created_on_or_before: datetime | None = None,
     ) -> None:
         """Mark unresolved comments as resolved for a task."""
-        resolved_at = datetime.now(UTC).isoformat()
+        resolved_at = _format_db_timestamp(datetime.now(UTC))
+        assert resolved_at is not None
         query = (
             "UPDATE task_comments "
             "SET resolved_at = ? "
@@ -5058,7 +5174,9 @@ class SqliteTaskStore:
             if cutoff.tzinfo is not None:
                 cutoff = cutoff.astimezone(UTC)
             query += " AND created_at <= ?"
-            params.append(cutoff.isoformat())
+            cutoff_value = _format_db_timestamp(cutoff)
+            assert cutoff_value is not None
+            params.append(cutoff_value)
         with self._connect() as conn:
             conn.execute(query, tuple(params))
 
@@ -5965,7 +6083,11 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
             existing = existing_by_id.get(str(row["id"]))
             if existing is None:
                 continue
-            if any(existing[column] != row[column] for column in task_import_columns):
+            if any(
+                _normalize_db_comparable_value(column, existing[column])
+                != _normalize_db_comparable_value(column, row[column])
+                for column in task_import_columns
+            ):
                 conflicts.append(str(row["id"]))
         return conflicts
 
@@ -6011,7 +6133,11 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                 conflicts.append(identity)
                 continue
             shared_row = exact_matches[0]
-            if any(shared_row[column] != local_row[column] for column in run_step_payload_columns):
+            if any(
+                _normalize_db_comparable_value(column, shared_row[column])
+                != _normalize_db_comparable_value(column, local_row[column])
+                for column in run_step_payload_columns
+            ):
                 conflicts.append(identity)
         return conflicts
 
@@ -6079,7 +6205,11 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                 conflicts.append(identity)
                 continue
             shared_row = exact_matches[0]
-            if any(shared_row[column] != local_row[column] for column in run_substep_payload_columns):
+            if any(
+                _normalize_db_comparable_value(column, shared_row[column])
+                != _normalize_db_comparable_value(column, local_row[column])
+                for column in run_substep_payload_columns
+            ):
                 conflicts.append(identity)
         return conflicts
 
@@ -6335,24 +6465,56 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                             ),
                         )
                 if _table_exists(local_conn, "task_comments"):
-                    shared_conn.execute(
+                    comment_rows = shared_conn.execute(
                         """
-                        INSERT INTO task_comments(project_id, task_id, content, source, author, created_at, resolved_at)
-                        SELECT ?, c.task_id, c.content, c.source, c.author, c.created_at, c.resolved_at
-                        FROM legacy_local.task_comments c
-                        WHERE NOT EXISTS (
+                        SELECT task_id, content, source, author, created_at, resolved_at
+                        FROM legacy_local.task_comments
+                        ORDER BY id
+                        """
+                    ).fetchall()
+                    for row in comment_rows:
+                        created_at = _canonicalize_db_timestamp_text(cast("str | None", row["created_at"]))
+                        resolved_at = _canonicalize_db_timestamp_text(cast("str | None", row["resolved_at"]))
+                        existing = shared_conn.execute(
+                            """
                             SELECT 1
-                            FROM task_comments d
-                            WHERE d.project_id = ?
-                              AND d.task_id = c.task_id
-                              AND d.content = c.content
-                              AND d.source = c.source
-                              AND COALESCE(d.author, '') = COALESCE(c.author, '')
-                              AND d.created_at = c.created_at
+                            FROM task_comments
+                            WHERE project_id = ?
+                              AND task_id = ?
+                              AND content = ?
+                              AND source = ?
+                              AND COALESCE(author, '') = COALESCE(?, '')
+                              AND created_at = ?
+                            LIMIT 1
+                            """,
+                            (
+                                store._project_id,
+                                row["task_id"],
+                                row["content"],
+                                row["source"],
+                                row["author"],
+                                created_at,
+                            ),
+                        ).fetchone()
+                        if existing is not None:
+                            continue
+                        shared_conn.execute(
+                            """
+                            INSERT INTO task_comments(
+                                project_id, task_id, content, source, author, created_at, resolved_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                store._project_id,
+                                row["task_id"],
+                                row["content"],
+                                row["source"],
+                                row["author"],
+                                created_at,
+                                resolved_at,
+                            ),
                         )
-                        """,
-                        (store._project_id, store._project_id),
-                    )
                 if max_imported_suffix > 0:
                     shared_conn.execute(
                         """
@@ -6364,6 +6526,8 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                         """,
                         (store._project_id, store._prefix, max_imported_suffix),
                     )
+
+                _rewrite_persisted_timestamps_to_canonical_utc(shared_conn)
 
                 shared_conn.execute("COMMIT")
             except Exception:
@@ -6420,9 +6584,9 @@ def _task_to_dict(task: "Task") -> dict:
         "cost_usd": task.cost_usd,
         "input_tokens": task.input_tokens,
         "output_tokens": task.output_tokens,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-        "started_at": task.started_at.isoformat() if task.started_at else None,
-        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+        "created_at": _format_db_timestamp(task.created_at),
+        "started_at": _format_db_timestamp(task.started_at),
+        "completed_at": _format_db_timestamp(task.completed_at),
         "group": task.group,
         "tags": list(task.tags),
         "depends_on": task.depends_on,
@@ -6436,8 +6600,8 @@ def _task_to_dict(task: "Task") -> dict:
         "session_id": task.session_id,
         "pr_number": task.pr_number,
         "pr_state": task.pr_state,
-        "pr_last_synced_at": task.pr_last_synced_at.isoformat() if task.pr_last_synced_at else None,
-        "sync_last_synced_at": task.sync_last_synced_at.isoformat() if task.sync_last_synced_at else None,
+        "pr_last_synced_at": _format_db_timestamp(task.pr_last_synced_at),
+        "sync_last_synced_at": _format_db_timestamp(task.sync_last_synced_at),
         "model": task.model,
         "provider": task.provider,
         "provider_is_explicit": task.provider_is_explicit,
@@ -6450,7 +6614,7 @@ def _task_to_dict(task: "Task") -> dict:
         "diff_lines_added": task.diff_lines_added,
         "diff_lines_removed": task.diff_lines_removed,
         "changed_diff": task.changed_diff,
-        "review_cleared_at": task.review_cleared_at.isoformat() if task.review_cleared_at else None,
+        "review_cleared_at": _format_db_timestamp(task.review_cleared_at),
         "review_score": task.review_score,
         "log_schema_version": task.log_schema_version,
         "execution_mode": task.execution_mode,
