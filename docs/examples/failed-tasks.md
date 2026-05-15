@@ -41,7 +41,7 @@ You have two options for recovering:
 | Command | Behavior | Use when |
 |---------|----------|----------|
 | `uv run gza resume` | Continue from where it left off | Task was making progress, just needs more turns |
-| `uv run gza retry` | Start completely fresh | Task went down a wrong path, needs a fresh start |
+| `uv run gza retry` | Create a new retry attempt | Task needs another run; implement retries fork fresh, same-branch follow-ups stay on the shared branch |
 
 For bulk unattended recovery after fixing an environment issue, use watch recovery mode:
 

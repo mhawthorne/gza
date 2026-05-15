@@ -1811,7 +1811,7 @@ def main() -> int:
         start_action.add_argument(
             "--retry",
             action="store_true",
-            help="Retry a failed task before iterating (starts fresh)",
+            help="Retry a failed task before iterating (new attempt with a fresh conversation; implement retries may fork fresh, same-branch follow-ups stay on the shared branch)",
         )
         iterate_parser.add_argument(
             "--worker-id",

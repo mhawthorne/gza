@@ -9470,7 +9470,7 @@ class TestUnmergedUnifiedQueryOutput:
         assert refreshed_unrelated_unit.state == "unmerged"
         assert refreshed_unrelated.merge_status == "unmerged"
 
-    def test_unmerged_default_refresh_keeps_failed_owner_identity_with_completed_retry_member(
+    def test_unmerged_default_refresh_prefers_completed_retry_member_identity(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -9508,8 +9508,8 @@ class TestUnmergedUnifiedQueryOutput:
         payload = json.loads(captured.out)
         assert payload == [
             {
-                "id": failed.id,
-                "prompt": "Failed implementation",
+                "id": retry.id,
+                "prompt": "Completed retry",
                 "merge_unit_id": store.resolve_merge_unit_for_task(retry.id).id,
             }
         ]
@@ -9581,7 +9581,7 @@ class TestUnmergedUnifiedQueryOutput:
         assert refreshed_unrelated_unit.state == "unmerged"
         assert refreshed_unrelated.merge_status == "unmerged"
 
-    def test_unmerged_live_target_keeps_failed_owner_identity_with_completed_retry_member(
+    def test_unmerged_live_target_prefers_completed_retry_member_identity(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -9619,8 +9619,8 @@ class TestUnmergedUnifiedQueryOutput:
         payload = json.loads(captured.out)
         assert payload == [
             {
-                "id": failed.id,
-                "prompt": "Failed implementation",
+                "id": retry.id,
+                "prompt": "Completed retry",
                 "merge_unit_id": store.resolve_merge_unit_for_task(retry.id).id,
             }
         ]

@@ -253,7 +253,10 @@ def _recommend_next_steps(
 
     if _status_is_failure(status):
         return [
-            (f"gza retry {task.id}", "retry from scratch"),
+            (
+                f"gza retry {task.id}",
+                "create a new retry attempt (implement may fork fresh; same-branch follow-ups stay shared)",
+            ),
             (f"gza resume {task.id}", "resume from where it left off"),
         ]
 

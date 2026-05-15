@@ -11052,3 +11052,27 @@ class TestProviderPromptSanitization:
         assert len(captured_prompts) == 1
         assert "paused" in captured_prompts[0].lower()
         assert "interrupted" not in captured_prompts[0].lower()
+
+    def test_run_resume_without_session_id_uses_same_branch_retry_guidance(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Improve feature X", task_type="improve")
+        task.slug = "20260213-improve-feature-x"
+        task.status = "failed"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.db_path = db_path
+        config.workers_path = tmp_path / ".gza" / "workers"
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+
+        result = run(config, task_id=task.id, resume=True)
+
+        assert result == 1
+        output = capsys.readouterr().out
+        assert f"Error: Task {task.id} has no session ID (cannot resume)" in output
+        assert "create a new retry attempt with a fresh conversation" in output
+        assert "implement retries may fork fresh" in output
+        assert "same-branch follow-ups stay on the shared branch" in output

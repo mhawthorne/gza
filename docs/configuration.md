@@ -928,7 +928,7 @@ gza resume <task_id> [options]
 
 ### retry
 
-Retry a failed or completed task from scratch. Starts a fresh conversation.
+Retry a failed or completed task by creating a new attempt with a fresh conversation. Implement retries may fork a fresh branch; same-branch follow-up retries stay attached to the shared branch.
 
 ```bash
 gza retry <task_id> [options]
@@ -1724,7 +1724,7 @@ Any state can be manually set to `dropped` via `gza set-status`.
 **Recovering from failures:**
 
 - Use `uv run gza resume <task_id>` to continue from where the task left off (preserves conversation context)
-- Use `uv run gza retry <task_id>` to start completely fresh
+- Use `uv run gza retry <task_id>` to create a new retry attempt (`implement` retries fork fresh; same-branch follow-ups stay on the shared branch)
 - `PREREQUISITE_UNMERGED`: the resolved completed dependency is not yet marked merged to the default branch (`main` in most repos). Merge the dependency (`uv run gza merge <dependency_task_id>`); after that, `uv run gza watch --restart-failed` can pick the task up automatically, or you can retry it manually with `uv run gza retry <task_id>`. Use `--force` only when you intentionally want to bypass this guard.
 
 **Dependencies:**

@@ -4341,7 +4341,11 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     if not task.session_id:
         print_phase1_message(args, f"Error: Task {task_id} has no session ID (cannot resume)")
-        print_phase1_message(args, "Use 'gza retry' to start fresh instead")
+        print_phase1_message(
+            args,
+            "Use 'gza retry' to create a new retry attempt with a fresh conversation instead"
+            " (implement retries may fork fresh; same-branch follow-ups stay on the shared branch)",
+        )
         return 1
 
     # Create a new task (like retry) to track this resumed run.

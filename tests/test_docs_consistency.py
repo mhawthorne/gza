@@ -115,6 +115,22 @@ def test_configuration_docs_cover_force_execution_flags_and_prerequisite_unmerge
         assert snippet in config_content
 
 
+def test_retry_docs_and_examples_describe_same_branch_retry_split() -> None:
+    """Retry docs should describe fresh conversations without implying every retry forks fresh."""
+    repo_root = Path(__file__).resolve().parents[1]
+    config_content = (repo_root / "docs" / "configuration.md").read_text()
+    examples_readme = (repo_root / "docs" / "examples" / "README.md").read_text()
+
+    retry_section = config_content.split("### retry", 1)[1].split("### mark-completed", 1)[0]
+
+    assert "creating a new attempt with a fresh conversation" in retry_section
+    assert "Implement retries may fork a fresh branch; same-branch follow-up retries stay attached to the shared branch." in retry_section
+    assert "from scratch" not in retry_section
+    assert "Starts a fresh conversation." not in retry_section
+    assert "| Create a new retry attempt | `gza retry <task_id>` |" in examples_readme
+    assert "| Retry from scratch | `gza retry <task_id>` |" not in examples_readme
+
+
 def test_configuration_docs_describe_unimplemented_lineage_guidance() -> None:
     """advance docs should explain completed-source surfacing and truthful follow-up actions."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"
@@ -380,7 +396,11 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "Plain `gza watch` and `--restart-failed` both use the same bounded shared recovery policy" not in watch_section
 
     assert "| `uv run gza resume` | Continue from where it left off |" in failed_tasks_content
-    assert "| `uv run gza retry` | Start completely fresh |" in failed_tasks_content
+    assert (
+        "| `uv run gza retry` | Create a new retry attempt | Task needs another run; "
+        "implement retries fork fresh, same-branch follow-ups stay on the shared branch |"
+        in failed_tasks_content
+    )
     assert "| `uv run gza watch --restart-failed` | Drain actionable failed tasks before pending queue work, choosing `resume` or `retry` per task |" in failed_tasks_content
     assert "`uv run gza watch --restart-failed` adds an explicit recovery phase ahead of normal pending work." in failed_tasks_content
 

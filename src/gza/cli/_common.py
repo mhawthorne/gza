@@ -23,7 +23,7 @@ from rich.markup import escape as rich_escape
 from rich.pager import Pager
 from rich.panel import Panel
 
-from ..branch_resolution import resolve_rebase_target_branch
+from ..branch_resolution import resolve_rebase_target_branch, resolve_rebase_target_task
 from ..config import Config
 from ..console import (
     MAX_PROMPT_DISPLAY,
@@ -35,12 +35,14 @@ from ..db import (
     SqliteTaskStore,
     StoreOpenMode,
     Task as DbTask,
+    merge_unit_membership_role,
     resolve_task_id,
     task_id_numeric_key,
     task_owns_merge_status,
 )
 from ..failure_policy import is_resumable_failure_reason
 from ..failure_reasons import mark_task_failed_from_cause
+from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..prompts import PromptBuilder
 from ..recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
@@ -1966,22 +1968,19 @@ def _create_retry_task(
 ) -> DbTask:
     """Create a fresh retry task pointing to the original task.
 
-    For same-branch tasks that already ran on a branch, retries fork a fresh
-    branch from that prior branch via ``base_branch``.
-
-    Automatic rebase recoveries are the exception: they must keep targeting the
-    shared implementation branch across the entire recovery chain instead of
-    creating orphan sibling branches from the last failed attempt. Manual
-    ``gza retry`` keeps the historical fresh-branch retry contract.
+    Implement retries keep the historical fresh-branch semantics: when the
+    failed task was same-branch and already had a branch, retry from that prior
+    branch via ``base_branch``. All other task types preserve same-branch
+    targeting against the original merge-unit branch across both manual retry
+    and automatic recovery.
     """
     assert original_task.id is not None
     retry_same_branch = original_task.same_branch
     retry_base_branch: str | None = None
-    if (
-        original_task.same_branch
-        and original_task.branch
-        and not (automatic_recovery and original_task.task_type == "rebase")
-    ):
+    should_fork_retry_branch = (
+        original_task.task_type == "implement" and original_task.same_branch and original_task.branch
+    )
+    if should_fork_retry_branch:
         retry_same_branch = False
         retry_base_branch = original_task.branch
 
@@ -2002,16 +2001,70 @@ def _create_retry_task(
         base_branch=retry_base_branch,
         recovery_origin="retry",
     )
+    updates_needed = False
+    if retry_task.same_branch and original_task.branch and retry_task.branch != original_task.branch:
+        retry_task.branch = original_task.branch
+        updates_needed = True
+
     if (
-        automatic_recovery
-        and original_task.task_type == "rebase"
-        and retry_task.same_branch
+        original_task.task_type != "implement"
+        and store.supports_merge_units()
+        and retry_task.id is not None
     ):
-        target_branch = resolve_rebase_target_branch(store, original_task)
-        if target_branch:
-            retry_task.branch = target_branch
-            store.update(retry_task)
+        original_unit = _resolve_retry_merge_unit(store, original_task)
+        if original_unit is not None:
+            store.attach_task_to_merge_unit(retry_task.id, original_unit.id, merge_unit_membership_role(retry_task))
+            if retry_task.same_branch and original_unit.source_branch and retry_task.branch != original_unit.source_branch:
+                retry_task.branch = original_unit.source_branch
+                updates_needed = True
+        elif automatic_recovery and retry_task.same_branch and original_task.task_type == "rebase":
+            target_branch = resolve_rebase_target_branch(store, original_task)
+            if target_branch and retry_task.branch != target_branch:
+                retry_task.branch = target_branch
+                updates_needed = True
+
+    if updates_needed:
+        store.update(retry_task)
     return retry_task
+
+
+def _resolve_retry_merge_unit(store: SqliteTaskStore, original_task: DbTask):
+    """Resolve the canonical merge unit for a non-implement retry."""
+    assert original_task.id is not None
+    if original_task.task_type == "rebase":
+        canonical_task = resolve_rebase_target_task(store, original_task)
+        if canonical_task is not None:
+            canonical_unit = (
+                store.resolve_merge_unit_for_task(canonical_task.id)
+                if canonical_task.id is not None
+                else None
+            ) or (store.get_or_create_merge_unit_for_task(canonical_task) if canonical_task.branch else None)
+            if canonical_unit is not None:
+                return canonical_unit
+
+    attached_unit = store.resolve_merge_unit_for_task(original_task.id)
+    if attached_unit is not None:
+        return attached_unit
+
+    if original_task.task_type in {"improve", "fix", "review"}:
+        impl_task, err = resolve_impl_task(store, original_task.id)
+        if err is None and impl_task is not None:
+            return (
+                store.resolve_merge_unit_for_task(impl_task.id)
+                if impl_task.id is not None
+                else None
+            ) or store.get_or_create_merge_unit_for_task(impl_task)
+
+    if original_task.task_type == "rebase" and original_task.based_on:
+        parent = store.get(original_task.based_on)
+        if parent is not None:
+            return (
+                store.resolve_merge_unit_for_task(parent.id)
+                if parent.id is not None
+                else None
+            ) or (store.get_or_create_merge_unit_for_task(parent) if parent.branch else None)
+
+    return None
 
 
 def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
@@ -2041,7 +2094,7 @@ def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
         remote=False,
         parent_task_id=task.id,
         failure_hint_lines=[
-            "Use 'gza retry' to start fresh or run 'gza rebase' manually.",
+            "Use 'gza retry' to create a new retry attempt or run 'gza rebase' manually.",
         ],
     )
 

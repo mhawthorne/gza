@@ -323,6 +323,10 @@ class TestHelpOutput:
             "Maximum iterate iterations (each is a code-change task [implement/improve] plus its review)"
             in normalized_output
         )
+        assert "new attempt with a fresh conversation" in normalized_output
+        assert "implement retries may fork fresh" in normalized_output
+        assert "same-branch follow-ups stay on the shared branch" in normalized_output
+        assert "starts fresh" not in normalized_output
 
     def test_iterate_accepts_internal_worker_flags(self, tmp_path):
         """Background iterate workers pass hidden flags; parser must accept them."""

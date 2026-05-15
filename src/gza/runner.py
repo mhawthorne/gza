@@ -2937,7 +2937,10 @@ def run(
                 return 1
             if not task.session_id:
                 error_message(f"Error: Task {task_id} has no session ID (cannot resume)")
-                console.print("Use 'gza retry' to start fresh instead")
+                console.print(
+                    "Use 'gza retry' to create a new retry attempt with a fresh conversation instead"
+                    " (implement retries may fork fresh; same-branch follow-ups stay on the shared branch)"
+                )
                 return 1
             if task.status == "pending":
                 assert task.id is not None
@@ -3217,6 +3220,24 @@ def _resolve_code_task_branch_name(
                     f"Error: Rebase task {task.id} resolved target branch {rebase_branch} but it does not exist"
                 )
                 return None
+        merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
+        canonical_same_branch = merge_unit.source_branch if merge_unit is not None else task.branch
+        if canonical_same_branch:
+            if git.branch_exists(canonical_same_branch):
+                if merge_unit is not None:
+                    console.print(
+                        f"Using merge-unit source branch: [blue]{canonical_same_branch}[/blue]"
+                    )
+                else:
+                    console.print(
+                        f"Using existing branch from task {task.id}: [blue]{canonical_same_branch}[/blue]"
+                    )
+                return canonical_same_branch
+            error_message(
+                f"Error: Task {task.id} resolved canonical same-branch target "
+                f"{canonical_same_branch} but it does not exist"
+            )
+            return None
         # Use the branch from based_on task (for improve tasks) or depends_on task (fallback).
         # Walk the based_on chain until we find an ancestor with a valid, existing branch.
         source_task = None

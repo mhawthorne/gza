@@ -851,6 +851,15 @@ def resolve_lineage_owner_task(store: SqliteTaskStore, task: Task) -> Task:
     if task.id is not None and (unit := store.resolve_merge_unit_for_task(task.id)) is not None:
         owner = store.resolve_merge_unit_owner_task(unit)
         if owner is not None and owner.task_type == "implement":
+            if owner.status in {"completed", "unmerged"}:
+                return owner
+            representative = store.resolve_merge_unit_representative_task(
+                unit,
+                preferred_task_id=task.id,
+                require_actionable=True,
+            )
+            if representative is not None and representative.task_type == "implement":
+                return representative
             return owner
 
     if task.task_type in {"review", "improve", "fix"} and task.id is not None:

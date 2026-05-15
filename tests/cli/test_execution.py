@@ -969,8 +969,8 @@ class TestRetryCommand:
         assert new_task.based_on == task.id
         assert new_task.status == "pending"
 
-    def test_retry_same_branch_task_uses_base_branch_for_fresh_retry(self, tmp_path: Path):
-        """Retries of same-branch tasks fork a fresh branch from the failed branch."""
+    def test_retry_same_branch_improve_keeps_original_branch(self, tmp_path: Path):
+        """Retries of same-branch improves stay on the original shared branch."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -985,11 +985,12 @@ class TestRetryCommand:
 
         retry_task = get_latest_task(store, based_on=task.id, task_type="improve")
         assert retry_task is not None
-        assert retry_task.same_branch is False
-        assert retry_task.base_branch == "feature/impl-branch"
+        assert retry_task.same_branch is True
+        assert retry_task.base_branch is None
+        assert retry_task.branch == "feature/impl-branch"
 
-    def test_create_retry_task_shared_helper_preserves_retry_contract(self, tmp_path: Path):
-        """Shared retry creator keeps cmd_retry branch/base-branch semantics and metadata copy."""
+    def test_create_retry_task_shared_helper_keeps_same_branch_for_improves(self, tmp_path: Path):
+        """Shared retry creator preserves shared-branch semantics and metadata for improves."""
         from gza.cli._common import _create_retry_task
 
         setup_config(tmp_path)
@@ -1024,12 +1025,13 @@ class TestRetryCommand:
         assert retry_task.model == original.model
         assert retry_task.provider == original.provider
         assert retry_task.provider_is_explicit is True
-        assert retry_task.same_branch is False
-        assert retry_task.base_branch == "feature/old"
+        assert retry_task.same_branch is True
+        assert retry_task.base_branch is None
+        assert retry_task.branch == "feature/old"
         assert retry_task.recovery_origin == "retry"
 
-    def test_create_retry_task_manual_rebase_retry_keeps_fresh_branch_contract(self, tmp_path: Path):
-        """Manual rebase retry should still fork a fresh branch from the failed branch."""
+    def test_create_retry_task_manual_rebase_retry_keeps_same_branch(self, tmp_path: Path):
+        """Manual rebase retry should stay attached to the implementation branch."""
         from gza.cli._common import _create_retry_task
 
         setup_config(tmp_path)
@@ -1054,13 +1056,66 @@ class TestRetryCommand:
 
         retry_task = _create_retry_task(store, failed_rebase)
         assert retry_task.based_on == failed_rebase.id
-        assert retry_task.same_branch is False
-        assert retry_task.base_branch == impl.branch
-        assert retry_task.branch is None
+        assert retry_task.same_branch is True
+        assert retry_task.base_branch is None
+        assert retry_task.branch == impl.branch
         assert retry_task.recovery_origin == "retry"
 
-    def test_retry_cli_manual_rebase_retry_keeps_fresh_branch_contract(self, tmp_path: Path):
-        """`gza retry` should preserve the historical rebase retry branch contract."""
+    def test_create_retry_task_manual_rebase_retry_chain_prefers_impl_merge_unit(self, tmp_path: Path):
+        """Manual rebase retry chains should attach to the implementation merge unit."""
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/impl")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        orphan_parent = store.add(
+            "Failed rebase retry parent",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert orphan_parent.id is not None
+        orphan_parent.status = "failed"
+        orphan_parent.failure_reason = "WORKER_DIED"
+        orphan_parent.branch = "feature/impl-rebase-orphan"
+        orphan_parent.completed_at = datetime.now(UTC)
+        store.update(orphan_parent)
+        orphan_unit = store.get_or_create_merge_unit_for_task(orphan_parent)
+        assert orphan_unit is not None
+        assert orphan_unit.source_branch == "feature/impl-rebase-orphan"
+
+        failed_rebase = store.add(
+            "Failed rebase retry child",
+            task_type="rebase",
+            based_on=orphan_parent.id,
+            same_branch=True,
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.failure_reason = "TIMEOUT"
+        failed_rebase.branch = "feature/impl-rebase-orphan-2"
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        retry_task = _create_retry_task(store, failed_rebase)
+        assert retry_task.id is not None
+        assert retry_task.same_branch is True
+        assert retry_task.base_branch is None
+        assert retry_task.branch == "feature/impl"
+        retry_unit = store.resolve_merge_unit_for_task(retry_task.id)
+        assert retry_unit is not None
+        assert retry_unit.id == impl_unit.id
+        assert retry_unit.id != orphan_unit.id
+        assert retry_unit.source_branch == "feature/impl"
+
+    def test_retry_cli_manual_rebase_retry_keeps_same_branch(self, tmp_path: Path):
+        """`gza retry` keeps rebases on the original shared branch."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -1086,9 +1141,223 @@ class TestRetryCommand:
 
         retry_task = get_latest_task(store, based_on=failed_rebase.id, task_type="rebase")
         assert retry_task is not None
-        assert retry_task.same_branch is False
-        assert retry_task.base_branch == impl.branch
-        assert retry_task.branch is None
+        assert retry_task.same_branch is True
+        assert retry_task.base_branch is None
+        assert retry_task.branch == impl.branch
+
+    def test_create_retry_task_automatic_rebase_retry_chain_prefers_impl_merge_unit(self, tmp_path: Path):
+        """Automatic rebase recovery should ignore orphan retry merge units."""
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/impl")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        orphan_parent = store.add(
+            "Failed rebase retry parent",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert orphan_parent.id is not None
+        orphan_parent.status = "failed"
+        orphan_parent.failure_reason = "WORKER_DIED"
+        orphan_parent.branch = "feature/impl-rebase-orphan"
+        orphan_parent.completed_at = datetime.now(UTC)
+        store.update(orphan_parent)
+        orphan_unit = store.get_or_create_merge_unit_for_task(orphan_parent)
+        assert orphan_unit is not None
+
+        failed_rebase = store.add(
+            "Failed rebase retry child",
+            task_type="rebase",
+            based_on=orphan_parent.id,
+            same_branch=True,
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.failure_reason = "WORKER_DIED"
+        failed_rebase.branch = "feature/impl-rebase-orphan-2"
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        retry_task = _create_retry_task(store, failed_rebase, automatic_recovery=True)
+        assert retry_task.id is not None
+        assert retry_task.same_branch is True
+        assert retry_task.base_branch is None
+        assert retry_task.branch == "feature/impl"
+        retry_unit = store.resolve_merge_unit_for_task(retry_task.id)
+        assert retry_unit is not None
+        assert retry_unit.id == impl_unit.id
+        assert retry_unit.id != orphan_unit.id
+        assert retry_unit.source_branch == "feature/impl"
+
+    def test_create_retry_task_worker_died_unattached_improve_attaches_impl_merge_unit(self, tmp_path: Path):
+        """Automatic improve recovery reattaches unattached failures to the implementation merge unit."""
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/shared-impl")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        review = store.add("Review feature", task_type="review", based_on=impl.id, same_branch=True)
+        assert review.id is not None
+
+        failed_improve = store.add(
+            "Improve feature",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "WORKER_DIED"
+        failed_improve.branch = "feature/shared-impl"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+
+        assert store.resolve_merge_unit_for_task(failed_improve.id) is None
+
+        retry_task = _create_retry_task(store, failed_improve, automatic_recovery=True)
+        assert retry_task.id is not None
+        assert retry_task.same_branch is True
+        assert retry_task.base_branch is None
+        assert retry_task.branch == "feature/shared-impl"
+        retry_unit = store.resolve_merge_unit_for_task(retry_task.id)
+        assert retry_unit is not None
+        assert retry_unit.id == impl_unit.id
+
+    def test_create_retry_task_same_branch_improve_prefers_merge_unit_source_branch(self, tmp_path: Path):
+        """Same-branch improve retries use the merge-unit source branch over a drifted failed-row branch."""
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/shared")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        review = store.add("Review feature", task_type="review", based_on=impl.id, same_branch=True)
+        assert review.id is not None
+
+        failed_improve = store.add(
+            "Improve feature",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "WORKER_DIED"
+        failed_improve.branch = "feature/orphan"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+        store.attach_task_to_merge_unit(failed_improve.id, impl_unit.id, "improve")
+
+        retry_task = _create_retry_task(store, failed_improve, automatic_recovery=True)
+        assert retry_task.id is not None
+        assert retry_task.same_branch is True
+        assert retry_task.base_branch is None
+        assert retry_task.branch == "feature/shared"
+        retry_unit = store.resolve_merge_unit_for_task(retry_task.id)
+        assert retry_unit is not None
+        assert retry_unit.id == impl_unit.id
+
+    @pytest.mark.parametrize("creation_mode", ["automatic", "manual"])
+    def test_same_branch_improve_retry_execution_prefers_canonical_branch(self, tmp_path: Path, creation_mode: str):
+        """Execution should honor the retry's canonical branch instead of a drifted failed-parent branch."""
+        from gza.cli._common import _create_retry_task
+        from gza.runner import _resolve_code_task_branch_name
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/shared")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        review = store.add("Review feature", task_type="review", based_on=impl.id, same_branch=True)
+        assert review.id is not None
+
+        failed_improve = store.add(
+            "Improve feature",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "WORKER_DIED"
+        failed_improve.branch = "feature/orphan"
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+        store.attach_task_to_merge_unit(failed_improve.id, impl_unit.id, "improve")
+
+        if creation_mode == "automatic":
+            retry_task = _create_retry_task(store, failed_improve, automatic_recovery=True)
+        else:
+            result = run_gza("retry", str(failed_improve.id), "--queue", "--project", str(tmp_path))
+            assert result.returncode == 0
+            retry_task = get_latest_task(store, based_on=failed_improve.id, task_type="improve")
+            assert retry_task is not None
+
+        assert retry_task.id is not None
+        retry_unit = store.resolve_merge_unit_for_task(retry_task.id)
+        assert retry_unit is not None
+        assert retry_unit.id == impl_unit.id
+        assert retry_task.branch == "feature/shared"
+
+        mock_git = MagicMock()
+        mock_git.branch_exists.side_effect = lambda branch: branch in {"feature/shared", "feature/orphan"}
+
+        resolved_branch = _resolve_code_task_branch_name(
+            retry_task,
+            config,
+            store,
+            mock_git,
+            resume=False,
+        )
+
+        assert resolved_branch == "feature/shared"
+
+    def test_retry_cli_manual_improve_keeps_same_branch(self, tmp_path: Path):
+        """Manual improve retry keeps same_branch=True and reuses the original branch."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Improve with shared branch", task_type="improve", same_branch=True)
+        task.status = "failed"
+        task.branch = "feature/impl-branch"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
+        assert result.returncode == 0
+
+        retry_task = get_latest_task(store, based_on=task.id, task_type="improve")
+        assert retry_task is not None
+        assert retry_task.same_branch is True
+        assert retry_task.base_branch is None
+        assert retry_task.branch == "feature/impl-branch"
 
     def test_retry_does_not_copy_non_explicit_provider(self, tmp_path: Path):
         """Retry should not preserve provider that came from resolved default state."""
@@ -1421,6 +1690,8 @@ class TestResumeCommand:
         assert result.returncode == 1
         assert "has no session ID" in result.stdout
         assert "gza retry" in result.stdout
+        assert "fresh conversation" in result.stdout
+        assert "same-branch follow-ups stay on the shared branch" in result.stdout
 
     def test_resume_non_failed_task_fails(self, tmp_path: Path):
         """Resume command fails for non-failed, non-orphaned tasks."""
@@ -13799,6 +14070,35 @@ class TestRunForeground:
         assert "Rebased" in (rebase_task.output_content or "")
         assert rebase_task.log_file is not None
 
+    def test_auto_rebase_before_resume_uses_retry_hint_without_start_fresh_wording(self, tmp_path: Path):
+        """Failed preflight rebase guidance should not claim retry starts fresh."""
+        from gza.cli import _auto_rebase_before_resume
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Resume target", task_type="improve")
+        assert task.id is not None
+        task.status = "failed"
+        task.session_id = "resume-session"
+        task.branch = "feature/resume-target"
+        store.update(task)
+
+        mock_git = MagicMock()
+        mock_git.default_branch.return_value = "main"
+
+        with (
+            patch("gza.git.Git", return_value=mock_git),
+            patch("gza.cli.git_ops._run_task_backed_rebase", return_value=1) as mock_rebase,
+        ):
+            rc = _auto_rebase_before_resume(config, task.id)
+
+        assert rc == 1
+        assert mock_rebase.call_args.kwargs["failure_hint_lines"] == [
+            "Use 'gza retry' to create a new retry attempt or run 'gza rebase' manually.",
+        ]
+
     def test_run_foreground_marks_failed_on_keyboard_interrupt(self, tmp_path: Path):
         """_run_foreground marks worker as failed when interrupted."""
         setup_config(tmp_path)
@@ -14192,6 +14492,36 @@ class TestForegroundInvocationContextWiring:
         invocation = mock_run_foreground.call_args.kwargs["invocation"]
         assert invocation.command == "resume"
         assert invocation.execution_mode == "foreground_worker"
+
+    def test_cmd_resume_without_session_id_uses_same_branch_retry_guidance(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        from gza.cli.execution import cmd_resume
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed improve", task_type="improve")
+        failed.status = "failed"
+        failed.failure_reason = "WORKER_DIED"
+        store.update(failed)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=failed.id,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        rc = cmd_resume(args)
+
+        assert rc == 1
+        output = capsys.readouterr().out
+        assert f"Error: Task {failed.id} has no session ID (cannot resume)" in output
+        assert "create a new retry attempt with a fresh conversation" in output
+        assert "implement retries may fork fresh" in output
+        assert "same-branch follow-ups stay on the shared branch" in output
 
     def test_cmd_iterate_passes_iterate_invocation_to_run_foreground(self, tmp_path: Path):
         from unittest.mock import MagicMock

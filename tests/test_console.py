@@ -409,8 +409,10 @@ def test_recommend_failure_returns_retry_resume():
     task = _make_task(task_type="implement")
     steps = _recommend_next_steps(task, status="Failed: timed out")
     cmds = [cmd for cmd, _ in steps]
+    descriptions = [description for _, description in steps]
     assert any("gza retry 42" in c for c in cmds)
     assert any("gza resume 42" in c for c in cmds)
+    assert "create a new retry attempt (implement may fork fresh; same-branch follow-ups stay shared)" in descriptions
 
 
 def test_recommend_failure_for_non_code_task():

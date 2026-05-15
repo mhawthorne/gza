@@ -129,7 +129,7 @@ When the engine emits `improve`, the caller (iterate) delegates to `resolve_impr
 |-----------|-----------|
 | No prior failed improve for this (impl, review) | `new` — create a fresh improve |
 | Shared failed-task recovery policy returns `resume` | `resume` — continue from the latest failed improve |
-| Shared failed-task recovery policy returns `retry` | `retry` — fork a fresh improve attempt |
+| Shared failed-task recovery policy returns `retry` | `retry` — create a new improve attempt on the same shared branch |
 | `max_resume_attempts == 0` (automatic recovery disabled) | `give_up` — stop iterating; surface `automatic_recovery_disabled` as the stop reason |
 | Shared failed-task recovery policy returns `manual_review_required` (for example, failed resume descendants or a dropped recovery terminal) | `manual_review` — stop iterating and require operator intervention |
 
