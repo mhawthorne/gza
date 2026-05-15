@@ -57,6 +57,20 @@ def _make_watch_git() -> MagicMock:
     return git
 
 
+def _run_cycle_and_emit_transition_events(
+    *,
+    config: Config,
+    store,
+    log: _WatchLog,
+    **run_cycle_kwargs,
+) -> _CycleResult:
+    before = _task_snapshot(store)
+    result = _run_cycle(config=config, store=store, log=log, **run_cycle_kwargs)
+    after = _task_snapshot(store)
+    _emit_transition_events(before, after, store=store, config=config, log=log)
+    return result
+
+
 def _setup_watch_owner_with_failed_rebase(tmp_path: Path, *, failure_reason: str):
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -147,7 +161,7 @@ def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: P
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=2,
@@ -202,7 +216,7 @@ def test_watch_cycle_pending_implement_startup_failure_surfaces_without_spawning
             side_effect=AssertionError("iterate worker should not spawn"),
         ),
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -422,7 +436,7 @@ def test_watch_cycle_prefers_freshly_bumped_task_over_older_urgent(tmp_path: Pat
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -454,7 +468,7 @@ def test_watch_cycle_tag_filters_pending_pickup(tmp_path: Path) -> None:
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -488,7 +502,7 @@ def test_watch_cycle_tag_prefers_explicit_queue_order(tmp_path: Path) -> None:
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -528,7 +542,7 @@ def test_watch_cycle_recovery_mode_resumes_failed_task_before_starting_new_pendi
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -2452,7 +2466,7 @@ def test_watch_cycle_logs_tag_scoped_pending_count_in_wake_line(tmp_path: Path) 
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
     ):
-        _run_cycle(
+        _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -2686,10 +2700,13 @@ def test_watch_cycle_with_isolation_enabled_preflights_and_merges_in_isolated_ch
         patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
-            return_value=SimpleNamespace(rc=0, created_followups=[], reused_followups=[]),
+            side_effect=lambda *_args, **_kwargs: (
+                store.set_merge_status(task.id, "merged"),
+                SimpleNamespace(rc=0, created_followups=[], reused_followups=[]),
+            )[1],
         ) as execute_merge,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -2746,10 +2763,13 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_fa
         patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
-            return_value=SimpleNamespace(rc=0, created_followups=[], reused_followups=[]),
+            side_effect=lambda *_args, **_kwargs: (
+                store.set_merge_status(task.id, "merged"),
+                SimpleNamespace(rc=0, created_followups=[], reused_followups=[]),
+            )[1],
         ) as execute_merge,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -2770,7 +2790,7 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_fa
     log_text = log_path.read_text()
     assert "isolated merge checkout refresh failed; rebuilding: stale checkout" in log_text
     assert "isolated merge checkout rebuilt" in log_text
-    assert f"MERGE     {task.id} -> main" in log_text
+    assert log_text.count(f"MERGE     {task.id} -> main") == 1
 
 
 def test_watch_cycle_with_isolation_enabled_dry_run_does_not_mutate_checkout(tmp_path: Path) -> None:
@@ -3090,10 +3110,15 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_c
             return {"type": "merge"}
         return {"type": "skip"}
 
-    merge_results = [
-        SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
-        SimpleNamespace(rc=0, created_followups=[], reused_followups=[]),
-    ]
+    def merge_side_effect(*_args, **_kwargs):
+        if merge_side_effect.calls == 0:
+            merge_side_effect.calls += 1
+            return SimpleNamespace(rc=1, created_followups=[], reused_followups=[])
+        merge_side_effect.calls += 1
+        store.set_merge_status(task_b.id, "merged")
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    merge_side_effect.calls = 0  # type: ignore[attr-defined]
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -3101,13 +3126,13 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_c
         patch("gza.cli.watch.Git", return_value=repo_git),
         patch("gza.cli.watch.ensure_watch_main_checkout", side_effect=[isolated_git, rebuilt_git]) as ensure_isolated,
         patch("gza.cli.determine_next_action", side_effect=choose_action),
-        patch("gza.cli.watch._execute_merge_action", side_effect=merge_results) as execute_merge,
+        patch("gza.cli.watch._execute_merge_action", side_effect=merge_side_effect) as execute_merge,
         patch("gza.cli.watch.cleanup_failed_merge_checkout", side_effect=GitError("cleanup failed")),
         patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._create_rebase_task", return_value=rebase_task),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=2,
@@ -3126,7 +3151,7 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_c
     log_text = log_path.read_text()
     assert "isolated merge checkout rebuilt" in log_text
     assert "merge conflict routed to rebase" in log_text
-    assert " MERGE " in log_text
+    assert log_text.count(" MERGE ") == 1
 
 
 def test_watch_cycle_with_isolation_enabled_merge_conflict_preparation_failure_rolls_back_rebase(
@@ -3441,15 +3466,18 @@ def test_watch_cycle_logs_already_merged_reconciliation_as_info(tmp_path: Path) 
         patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
-            return_value=SimpleNamespace(
-                rc=0,
-                status="already_merged",
-                created_followups=[],
-                reused_followups=[],
-            ),
+            side_effect=lambda *_args, **_kwargs: (
+                store.set_merge_status(task.id, "merged"),
+                SimpleNamespace(
+                    rc=0,
+                    status="already_merged",
+                    created_followups=[],
+                    reused_followups=[],
+                ),
+            )[1],
         ) as execute_merge,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -3461,8 +3489,8 @@ def test_watch_cycle_logs_already_merged_reconciliation_as_info(tmp_path: Path) 
     assert result.work_done is True
     execute_merge.assert_called_once()
     log_text = log_path.read_text()
-    assert f"INFO      {task.id} already merged into main; marked merged" in log_text
-    assert f"MERGE     {task.id} -> main" not in log_text
+    assert f"INFO      {task.id} already merged into main; marked merged" not in log_text
+    assert log_text.count(f"MERGE     {task.id} -> main") == 1
 
 
 def test_watch_cycle_without_isolation_preserves_default_branch_merge_guard(tmp_path: Path) -> None:
@@ -3615,14 +3643,17 @@ def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(
         patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
-            side_effect=lambda *_args, **_kwargs: SimpleNamespace(
-                rc=noisy_merge(),
-                created_followups=[],
-                reused_followups=[],
-            ),
+            side_effect=lambda *_args, **_kwargs: (
+                store.set_merge_status(task.id, "merged"),
+                SimpleNamespace(
+                    rc=noisy_merge(),
+                    created_followups=[],
+                    reused_followups=[],
+                ),
+            )[1],
         ),
     ):
-        _run_cycle(
+        _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -3634,8 +3665,7 @@ def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(
 
     stdout = capsys.readouterr().out
     assert "Merging 'feature/watch-quiet-merge' into 'main'..." not in stdout
-    assert " MERGE " in log_path.read_text()
-    assert f"MERGE     {task.id} -> main" in log_path.read_text()
+    assert log_path.read_text().count(f"MERGE     {task.id} -> main") == 1
 
 
 def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_tasks(tmp_path: Path) -> None:
@@ -3680,14 +3710,17 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
         ),
         patch(
             "gza.cli.watch._execute_merge_action",
-            return_value=SimpleNamespace(
-                rc=0,
-                created_followups=[created_followup],
-                reused_followups=[],
-            ),
+            side_effect=lambda *_args, **_kwargs: (
+                store.set_merge_status(task.id, "merged"),
+                SimpleNamespace(
+                    rc=0,
+                    created_followups=[created_followup],
+                    reused_followups=[],
+                ),
+            )[1],
         ) as execute_merge,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -3710,7 +3743,7 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
     assert args[4]["followup_findings"] == (finding,)
     assert kwargs["target_branch"] == "main"
     assert kwargs["current_branch"] == "main"
-    assert f"MERGE     {task.id} -> main" in log_path.read_text()
+    assert log_path.read_text().count(f"MERGE     {task.id} -> main") == 1
     assert any(
         line.split(maxsplit=2)[1] == "FOLLOW" and "gza-999 created from" in line
         for line in log_path.read_text().splitlines()
@@ -3826,6 +3859,66 @@ def test_emit_transition_events_includes_followup_ids_for_review(tmp_path: Path)
     assert f"{review.id} for {impl.id}: APPROVED_WITH_FOLLOWUPS [follow-ups: F1]" in log_path.read_text()
 
 
+def test_emit_transition_events_logs_external_merge_status_flip(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    before = _task_snapshot(store)
+    store.set_merge_status(task.id, "merged")
+    after = _task_snapshot(store)
+
+    _emit_transition_events(before, after, store=store, config=config, log=log)
+
+    assert log_path.read_text().count(f"MERGE     {task.id} -> main") == 1
+
+
+def test_emit_transition_events_logs_merge_unit_target_branch_on_external_merge_flip(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed release task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-release-merge"
+    task.has_commits = True
+    store.update(task)
+
+    unit = store.create_merge_unit(
+        source_branch="feature/watch-release-merge",
+        target_branch="release",
+        owner_task_id=task.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+    store.dual_write_legacy_merge_status(unit.id)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    before = _task_snapshot(store)
+    store.set_merge_unit_state(unit.id, "merged")
+    after = _task_snapshot(store)
+
+    _emit_transition_events(before, after, store=store, config=config, log=log)
+
+    log_text = log_path.read_text()
+    assert log_text.count(f"MERGE     {task.id} -> release") == 1
+    assert f"MERGE     {task.id} -> main" not in log_text
+
+
 def test_cmd_watch_logs_completed_review_before_same_cycle_merge(tmp_path: Path) -> None:
     """Pre-pass transitions should land before merge logs from the same watch pass."""
     setup_config(tmp_path)
@@ -3845,11 +3938,66 @@ def test_cmd_watch_logs_completed_review_before_same_cycle_merge(tmp_path: Path)
     impl_id = impl_task.id
     review_id = review_task.id
     snapshots = [
-        {review_id: {"status": "in_progress", "task_type": "review", "started_at": None, "completed_at": None, "failure_reason": None, "depends_on": impl_id}},
-        {review_id: {"status": "completed", "task_type": "review", "started_at": None, "completed_at": datetime.now(UTC).isoformat(), "failure_reason": None, "depends_on": impl_id}},
-        {review_id: {"status": "completed", "task_type": "review", "started_at": None, "completed_at": datetime.now(UTC).isoformat(), "failure_reason": None, "depends_on": impl_id}},
-        {review_id: {"status": "completed", "task_type": "review", "started_at": None, "completed_at": datetime.now(UTC).isoformat(), "failure_reason": None, "depends_on": impl_id}},
-        {review_id: {"status": "completed", "task_type": "review", "started_at": None, "completed_at": datetime.now(UTC).isoformat(), "failure_reason": None, "depends_on": impl_id}},
+        {
+            impl_id: {"status": "completed", "task_type": "implement", "merge_status": "unmerged"},
+            review_id: {
+                "status": "in_progress",
+                "task_type": "review",
+                "started_at": None,
+                "completed_at": None,
+                "failure_reason": None,
+                "depends_on": impl_id,
+                "merge_status": None,
+            },
+        },
+        {
+            impl_id: {"status": "completed", "task_type": "implement", "merge_status": "unmerged"},
+            review_id: {
+                "status": "completed",
+                "task_type": "review",
+                "started_at": None,
+                "completed_at": datetime.now(UTC).isoformat(),
+                "failure_reason": None,
+                "depends_on": impl_id,
+                "merge_status": None,
+            },
+        },
+        {
+            impl_id: {"status": "completed", "task_type": "implement", "merge_status": "merged"},
+            review_id: {
+                "status": "completed",
+                "task_type": "review",
+                "started_at": None,
+                "completed_at": datetime.now(UTC).isoformat(),
+                "failure_reason": None,
+                "depends_on": impl_id,
+                "merge_status": None,
+            },
+        },
+        {
+            impl_id: {"status": "completed", "task_type": "implement", "merge_status": "merged"},
+            review_id: {
+                "status": "completed",
+                "task_type": "review",
+                "started_at": None,
+                "completed_at": datetime.now(UTC).isoformat(),
+                "failure_reason": None,
+                "depends_on": impl_id,
+                "merge_status": None,
+            },
+        },
+        {
+            impl_id: {"status": "completed", "task_type": "implement", "merge_status": "merged"},
+            review_id: {
+                "status": "completed",
+                "task_type": "review",
+                "started_at": None,
+                "completed_at": datetime.now(UTC).isoformat(),
+                "failure_reason": None,
+                "depends_on": impl_id,
+                "merge_status": None,
+            },
+        },
     ]
 
     args = argparse.Namespace(
@@ -3864,11 +4012,9 @@ def test_cmd_watch_logs_completed_review_before_same_cycle_merge(tmp_path: Path)
         yes=True,
     )
 
-    def fake_run_cycle(**kwargs):
-        log = kwargs["log"]
+    def fake_run_cycle(**_kwargs):
         if not hasattr(fake_run_cycle, "seen"):
             fake_run_cycle.seen = True  # type: ignore[attr-defined]
-            log.emit("MERGE", f"{impl_id} -> main")
             return _CycleResult(work_done=True, pending=0, running=0)
         return _CycleResult(work_done=False, pending=0, running=0)
 

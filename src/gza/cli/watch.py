@@ -425,7 +425,28 @@ def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
     with store._connect() as conn:  # noqa: SLF001 - CLI internal polling helper
         cur = conn.execute(
             """
-            SELECT id, status, task_type, started_at, completed_at, failure_reason, completion_reason, depends_on
+            SELECT
+                id,
+                status,
+                task_type,
+                started_at,
+                completed_at,
+                failure_reason,
+                completion_reason,
+                depends_on,
+                merge_status,
+                (
+                    SELECT mu.target_branch
+                    FROM merge_unit_tasks mut
+                    JOIN merge_units mu
+                      ON mu.project_id = mut.project_id
+                     AND mu.id = mut.merge_unit_id
+                    WHERE mut.project_id = tasks.project_id
+                      AND mut.task_id = tasks.id
+                      AND mu.superseded_by_unit_id IS NULL
+                    ORDER BY mu.updated_at DESC, mu.id DESC
+                    LIMIT 1
+                ) AS merge_target_branch
             FROM tasks
             """
         )
@@ -439,6 +460,8 @@ def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
                 "failure_reason": row["failure_reason"],
                 "completion_reason": row["completion_reason"],
                 "depends_on": row["depends_on"],
+                "merge_status": row["merge_status"],
+                "merge_target_branch": row["merge_target_branch"],
             }
     return snap
 
@@ -503,42 +526,50 @@ def _emit_transition_events(
     restart_failed_mode: bool = False,
     max_recovery_attempts: int = 1,
 ) -> None:
+    # Detector-owned event tags come from snapshot diffs, regardless of which
+    # process caused the state change: REVIEW, DONE, FAIL, and MERGE. Inline
+    # emits remain watch's own action/decision events such as START, SKIP,
+    # ATTENTION, INFO, PHASE, WAKE, and IDLE.
     for task_id in sorted(new.keys()):
-        old_status = (old.get(task_id) or {}).get("status")
+        old_row = old.get(task_id) or {}
+        old_status = old_row.get("status")
         new_row = new[task_id]
         new_status = new_row.get("status")
-        if old_status == new_status:
-            continue
 
         task_type = new_row.get("task_type") or "implement"
         elapsed = _format_elapsed(new_row.get("started_at"), new_row.get("completed_at"))
         elapsed_suffix = f" ({elapsed})" if elapsed else ""
-        if new_status == "completed":
-            completion_reason = new_row.get("completion_reason")
-            reason_suffix = f": {completion_reason}" if completion_reason else ""
-            if task_type == "review":
+        if old_status != new_status:
+            if new_status == "completed":
+                completion_reason = new_row.get("completion_reason")
+                reason_suffix = f": {completion_reason}" if completion_reason else ""
+                if task_type == "review":
+                    task = store.get(task_id)
+                    impl_id = new_row.get("depends_on") or "unknown"
+                    verdict = (
+                        format_review_outcome(config, task)
+                        if task is not None
+                        else "UNKNOWN"
+                    )
+                    log.emit("REVIEW", f"{task_id} for {impl_id}: {verdict}{reason_suffix}")
+                else:
+                    log.emit("DONE", f"{task_id} {task_type}{reason_suffix}{elapsed_suffix}")
+            elif new_status == "failed":
+                reason = new_row.get("failure_reason") or "UNKNOWN"
                 task = store.get(task_id)
-                impl_id = new_row.get("depends_on") or "unknown"
-                verdict = (
-                    format_review_outcome(config, task)
-                    if task is not None
-                    else "UNKNOWN"
-                )
-                log.emit("REVIEW", f"{task_id} for {impl_id}: {verdict}{reason_suffix}")
-            else:
-                log.emit("DONE", f"{task_id} {task_type}{reason_suffix}{elapsed_suffix}")
-        elif new_status == "failed":
-            reason = new_row.get("failure_reason") or "UNKNOWN"
-            task = store.get(task_id)
-            if restart_failed_mode and task is not None:
-                decision = decide_failed_task_recovery(
-                    store,
-                    task,
-                    max_recovery_attempts=max_recovery_attempts,
-                )
-                if should_hide_failed_recovery_decision(decision):
-                    continue
-            log.emit("FAIL", f"{task_id} {task_type}: {reason}{elapsed_suffix}")
+                if restart_failed_mode and task is not None:
+                    decision = decide_failed_task_recovery(
+                        store,
+                        task,
+                        max_recovery_attempts=max_recovery_attempts,
+                    )
+                    if should_hide_failed_recovery_decision(decision):
+                        continue
+                log.emit("FAIL", f"{task_id} {task_type}: {reason}{elapsed_suffix}")
+
+        if task_id in old and old_row.get("merge_status") != "merged" and new_row.get("merge_status") == "merged":
+            merge_target = new_row.get("merge_target_branch") or store.default_merge_target()
+            log.emit("MERGE", f"{task_id} -> {merge_target}")
 
 
 def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
@@ -1195,10 +1226,6 @@ def _run_cycle(
                 for followup_task in merge_result.reused_followups:
                     log.emit("FOLLOW", f"{followup_task.id} reused from {display_task.id}")
                 if rc == 0:
-                    if getattr(merge_result, "status", "merged") == "already_merged":
-                        log.emit("INFO", f"{display_task.id} already merged into {target_branch}; marked merged")
-                    else:
-                        log.emit("MERGE", f"{display_task.id} -> {target_branch}")
                     work_done = True
                 else:
                     conflict_handled = False
