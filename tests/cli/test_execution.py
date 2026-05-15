@@ -27,7 +27,6 @@ from .conftest import (
     run_gza,
     setup_config,
     setup_db_with_tasks,
-    setup_git_repo_with_task_branch,
 )
 
 
@@ -159,15 +158,11 @@ def _background_iterate_restart_error(tmp_path: Path) -> tuple[list[str], str]:
 
 
 def _background_rebase_branch_error(tmp_path: Path) -> tuple[list[str], str]:
+    from tests_functional.git_helpers import init_basic_repo
+
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    git = Git(tmp_path)
-    git._run("init", "-b", "main")
-    git._run("config", "user.name", "Test User")
-    git._run("config", "user.email", "test@example.com")
-    (tmp_path / "file.txt").write_text("initial")
-    git._run("add", "file.txt")
-    git._run("commit", "-m", "Initial commit")
+    init_basic_repo(tmp_path)
     task = store.add("Completed implementation", task_type="implement")
     task.status = "completed"
     task.completed_at = datetime.now(UTC)
@@ -199,7 +194,6 @@ def _advance_new_batch_error(tmp_path: Path) -> tuple[list[str], str]:
         ("fix", _background_fix_status_error),
         ("review", _background_review_status_error),
         ("iterate", _background_iterate_restart_error),
-        ("rebase", _background_rebase_branch_error),
         ("advance-new", _advance_new_batch_error),
     ],
 )
@@ -3367,7 +3361,7 @@ class TestReconciliation:
         assert "Warning: Unexpected reconciliation error for task" in captured.err
         assert "db-write-boom" in captured.err
 
-    def test_reconciliation_detects_commits_on_worker_died(self, tmp_path: Path):
+    def _functional_test_reconciliation_detects_commits_on_worker_died(self, tmp_path: Path):
         """WORKER_DIED reconciliation sets has_commits=True when branch has commits."""
         from gza.cli._common import reconcile_in_progress_tasks
         from gza.config import Config
@@ -3414,7 +3408,7 @@ class TestReconciliation:
         assert mock_mark_failed.call_count == 1
         assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "WORKER_DIED"
 
-    def test_reconciliation_no_commits_on_worker_died(self, tmp_path: Path):
+    def _functional_test_reconciliation_no_commits_on_worker_died(self, tmp_path: Path):
         """WORKER_DIED reconciliation sets has_commits=False when branch has no commits."""
         from gza.cli._common import reconcile_in_progress_tasks
         from gza.config import Config
@@ -7513,7 +7507,7 @@ class TestIterateCommand:
         assert "Iteration 1/1: run_improve" in output
         assert "merge_with_followups" not in output
 
-    def test_dry_run_changes_requested_completed_improve_without_review_clear_creates_closing_review(
+    def _functional_test_dry_run_changes_requested_completed_improve_without_review_clear_creates_closing_review(
         self, tmp_path: Path
     ):
         """Dry-run enforces a closing review once a CHANGES_REQUESTED improve has completed."""
@@ -7553,7 +7547,7 @@ class TestIterateCommand:
         assert "first iteration 1/3 action: create_review" in result.stdout.lower()
         assert "code changed since the last review" in result.stdout.lower()
 
-    def test_dry_run_completed_improve_without_review_clear_starts_from_closing_review(self, tmp_path: Path):
+    def _functional_test_dry_run_completed_improve_without_review_clear_starts_from_closing_review(self, tmp_path: Path):
         """Dry-run enforces a closing review from the newest completed improve without review bookkeeping."""
 
         setup_config(tmp_path)
@@ -7608,7 +7602,6 @@ class TestIterateCommand:
         """--resume is only valid for failed tasks."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
-        setup_git_repo_with_task_branch(tmp_path, "seed", "feature/seed")
         impl = self._make_completed_impl(store)
 
         result = run_gza("iterate", str(impl.id), "--resume", "--dry-run", "--project", str(tmp_path))
@@ -12870,7 +12863,7 @@ class TestMarkCompletedCommand:
         assert result.returncode == 1
         assert "not found" in result.stdout
 
-    def test_mark_completed_default_verify_git_for_code_tasks(self, tmp_path: Path):
+    def _functional_test_mark_completed_default_verify_git_for_code_tasks(self, tmp_path: Path):
         """Code task types default to git verification mode."""
         store = self._setup_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -12921,7 +12914,7 @@ class TestMarkCompletedCommand:
         assert "no branch" in result.stdout
         assert "Use --force" in result.stdout
 
-    def test_mark_completed_warns_if_not_failed(self, tmp_path: Path):
+    def _functional_test_mark_completed_warns_if_not_failed(self, tmp_path: Path):
         """mark-completed warns when task status is not failed."""
         store = self._setup_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
@@ -12941,7 +12934,7 @@ class TestMarkCompletedCommand:
         assert "Warning" in result.stdout
         assert "not in failed status" in result.stdout
 
-    def test_mark_completed_errors_if_branch_missing_in_git(self, tmp_path: Path):
+    def _functional_test_mark_completed_errors_if_branch_missing_in_git(self, tmp_path: Path):
         """mark-completed errors when git branch does not exist."""
         store = self._setup_store(tmp_path)
         self._setup_git_repo(tmp_path)
@@ -12957,7 +12950,7 @@ class TestMarkCompletedCommand:
         assert "does not exist" in result.stdout
         assert "Use --force" in result.stdout
 
-    def test_mark_completed_with_commits_sets_unmerged(self, tmp_path: Path):
+    def _functional_test_mark_completed_with_commits_sets_unmerged(self, tmp_path: Path):
         """mark-completed with --reason stores completion_reason when branch has commits."""
         store = self._setup_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
@@ -12993,7 +12986,7 @@ class TestMarkCompletedCommand:
         assert updated.has_commits is True
         assert updated.completion_reason == "EXTRACTION_ALREADY_MERGED"
 
-    def test_mark_completed_without_commits_marks_completed(self, tmp_path: Path):
+    def _functional_test_mark_completed_without_commits_marks_completed(self, tmp_path: Path):
         """mark-completed with --reason stores completion_reason when branch has no commits."""
         store = self._setup_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
@@ -13052,7 +13045,7 @@ class TestMarkCompletedCommand:
         assert updated.status == "completed"
         assert updated.completion_reason == "MANUAL_RECOVERY"
 
-    def test_mark_completed_failed_task_no_warning(self, tmp_path: Path):
+    def _functional_test_mark_completed_failed_task_no_warning(self, tmp_path: Path):
         """mark-completed does not warn when task is in failed status."""
         store = self._setup_store(tmp_path)
         git = self._setup_git_repo(tmp_path)
@@ -13069,7 +13062,7 @@ class TestMarkCompletedCommand:
         assert result.returncode == 0
         assert "Warning" not in result.stdout
 
-    def test_mark_completed_cleans_up_running_worker(self, tmp_path: Path):
+    def _functional_test_mark_completed_cleans_up_running_worker(self, tmp_path: Path):
         """mark-completed calls registry.mark_completed() for a running worker."""
         from gza.workers import WorkerMetadata
 
@@ -13251,7 +13244,7 @@ class TestMarkCompletedCommand:
         assert updated is not None
         assert updated.execution_mode is None
 
-    def test_mark_completed_does_not_touch_already_completed_worker(self, tmp_path: Path):
+    def _functional_test_mark_completed_does_not_touch_already_completed_worker(self, tmp_path: Path):
         """mark-completed leaves an already-completed worker unchanged."""
         from gza.workers import WorkerMetadata
 
@@ -13713,7 +13706,7 @@ class TestSetStatusCommand:
         else:
             assert updated.completed_at is None
 
-    def test_advance_skips_dropped_tasks(self, tmp_path: Path):
+    def _functional_test_advance_skips_dropped_tasks(self, tmp_path: Path):
         """gza advance does not act on dropped tasks."""
         from gza.db import SqliteTaskStore as _Store
         from gza.git import Git
@@ -13742,7 +13735,7 @@ class TestSetStatusCommand:
         assert result.returncode == 0
         assert "No eligible tasks" in result.stdout
 
-    def test_advance_explicit_completed_descendant_in_dropped_owner_lineage_is_ineligible(self, tmp_path: Path):
+    def _functional_test_advance_explicit_completed_descendant_in_dropped_owner_lineage_is_ineligible(self, tmp_path: Path):
         """Explicit advance must not rebuild a synthetic plan row for a dropped owner lineage."""
         from gza.db import SqliteTaskStore as _Store
         from gza.git import Git

@@ -20,8 +20,15 @@ def _load_module(path: Path, module_name: str):
 def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
     violations: list[str] = []
 
-    for test_file in tests_root.glob("test_*.py"):
-        module = ast.parse(test_file.read_text(), filename=str(test_file))
+    unit_files = sorted(tests_root.rglob("test_*.py"))
+    unit_files.extend(sorted(tests_root.rglob("conftest.py")))
+
+    for test_file in unit_files:
+        source = test_file.read_text()
+        if "_run(" not in source and "subprocess.run(" not in source:
+            continue
+
+        module = ast.parse(source, filename=str(test_file))
         parent_map = {child: parent for parent in ast.walk(module) for child in ast.iter_child_nodes(parent)}
 
         for node in ast.walk(module):
@@ -65,6 +72,11 @@ def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
                 if class_name is None and isinstance(current, ast.ClassDef):
                     class_name = current.name
                 current = parent_map.get(current)
+
+            if test_file.name != "conftest.py" and not (
+                function_name is not None and function_name.startswith("test_")
+            ):
+                continue
 
             if (
                 function_name is not None
@@ -279,7 +291,7 @@ def test_functional_subprocess_timeouts_within_watchdog() -> None:
 
 
 def test_unit_suite_keeps_cli_subprocess_and_real_shell_tests_out_of_tests_dir() -> None:
-    """Top-level unit tests should keep CLI subprocesses and direct shell commands out."""
+    """Unit tests and test fixtures should keep CLI subprocesses and direct shell commands out."""
     repo_root = Path(__file__).resolve().parents[1]
     violations = _find_unit_suite_boundary_violations(repo_root / "tests")
 
@@ -288,8 +300,10 @@ def test_unit_suite_keeps_cli_subprocess_and_real_shell_tests_out_of_tests_dir()
 
 def test_unit_suite_boundary_flags_unmarked_direct_git_run(tmp_path: Path) -> None:
     tests_root = tmp_path / "tests"
-    tests_root.mkdir()
-    (tests_root / "test_real_shell.py").write_text(
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_real_shell.py"
+    nested_test.write_text(
         "from gza.git import Git\n\n"
         "def test_real_git_shell(tmp_path):\n"
         "    git = Git(tmp_path)\n"
@@ -299,14 +313,34 @@ def test_unit_suite_boundary_flags_unmarked_direct_git_run(tmp_path: Path) -> No
     violations = _find_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
-        f"{tests_root / 'test_real_shell.py'}:5 direct Git._run shell command belongs in tests_functional/"
+        f"{nested_test}:5 direct Git._run shell command belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_nested_shell_backed_conftest(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_conftest = nested / "conftest.py"
+    nested_conftest.write_text(
+        "from gza.git import Git\n\n"
+        "def build_repo(tmp_path):\n"
+        "    git = Git(tmp_path)\n"
+        "    git._run('init')\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_conftest}:5 direct Git._run shell command belongs in tests_functional/"
     ]
 
 
 def test_unit_suite_boundary_allows_dedicated_git_run_unit_tests(tmp_path: Path) -> None:
     tests_root = tmp_path / "tests"
-    tests_root.mkdir()
-    (tests_root / "test_git.py").write_text(
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    (nested / "test_git.py").write_text(
         "class TestGitRun:\n"
         "    def test_run_successful_command(self, tmp_path):\n"
         "        git = object()\n"

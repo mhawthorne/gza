@@ -28,8 +28,6 @@ from .conftest import (
     run_gza,
     setup_config,
     setup_db_with_tasks,
-    setup_git_repo_with_task_branch,
-    setup_unmerged_env,
 )
 
 
@@ -129,6 +127,31 @@ def _setup_unmerged_env_fast(
     store.update(task)
 
     return store, task, _FastUnmergedGit()
+
+
+setup_unmerged_env = _setup_unmerged_env_fast
+
+
+def _setup_task_with_worktree_metadata(
+    tmp_path: Path,
+    *,
+    task_prompt: str,
+    branch_name: str,
+    worktree_name: str | None,
+) -> tuple[Task, Path | None]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add(task_prompt)
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = branch_name
+    store.update(task)
+    worktree_path = None
+    if worktree_name is not None:
+        worktree_path = tmp_path / "worktrees" / worktree_name
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    assert task.id is not None
+    return task, worktree_path
 
 
 def _first_nonempty_output_line(output: str) -> str:
@@ -3724,7 +3747,7 @@ class TestShowCommand:
 
     def test_show_displays_active_worktree_path_for_task_branch(self, tmp_path: Path):
         """Show command includes active worktree path when task branch is checked out in a worktree."""
-        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+        task, worktree_path = _setup_task_with_worktree_metadata(
             tmp_path,
             task_prompt="Task with worktree",
             branch_name="feature/show-worktree",
@@ -3733,7 +3756,14 @@ class TestShowCommand:
         assert task.id is not None
         assert worktree_path is not None
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        with patch("gza.cli.query.Git.worktree_list", return_value=[
+            {
+                "path": str(worktree_path),
+                "branch": f"refs/heads/{task.branch}",
+                "prunable": False,
+            }
+        ]):
+            result = run_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Branch: feature/show-worktree" in result.stdout
@@ -3742,7 +3772,7 @@ class TestShowCommand:
 
     def test_show_omits_worktree_path_when_branch_has_no_active_worktree(self, tmp_path: Path):
         """Show command omits worktree line when no active worktree is registered for the task branch."""
-        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+        task, worktree_path = _setup_task_with_worktree_metadata(
             tmp_path,
             task_prompt="Task without active worktree",
             branch_name="feature/no-worktree",
@@ -3751,7 +3781,8 @@ class TestShowCommand:
         assert task.id is not None
         assert worktree_path is None
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        with patch("gza.cli.query.Git.worktree_list", return_value=[]):
+            result = run_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Branch: feature/no-worktree" in result.stdout
@@ -3762,7 +3793,7 @@ class TestShowCommand:
         from gza.cli.query import cmd_show
         from gza.git import GitError
 
-        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+        task, worktree_path = _setup_task_with_worktree_metadata(
             tmp_path,
             task_prompt="Task with lookup failure",
             branch_name="feature/worktree-lookup-giterror",
@@ -3793,7 +3824,7 @@ class TestShowCommand:
         """Show command emits a warning when worktree lookup fails with OSError."""
         from gza.cli.query import cmd_show
 
-        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+        task, worktree_path = _setup_task_with_worktree_metadata(
             tmp_path,
             task_prompt="Task with lookup os error",
             branch_name="feature/worktree-lookup-oserror",
@@ -4786,7 +4817,7 @@ class TestShowCommand:
         """Show command should not treat prunable worktrees as active paths."""
         from gza.cli.query import cmd_show
 
-        _store, _git, task, worktree_path = setup_git_repo_with_task_branch(
+        task, worktree_path = _setup_task_with_worktree_metadata(
             tmp_path,
             task_prompt="Task with stale worktree registration",
             branch_name="feature/prunable-worktree",

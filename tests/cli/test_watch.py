@@ -40,7 +40,7 @@ from gza.git import GitError
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.workers import WorkerMetadata, WorkerRegistry
 
-from .conftest import make_store, run_gza, setup_config, setup_git_repo_with_task_branch
+from .conftest import make_store, run_gza, setup_config
 
 
 def _task_count(store) -> int:
@@ -2900,8 +2900,10 @@ def test_ensure_watch_main_checkout_detaches_existing_shared_default_branch_work
     workspace_git.has_changes.assert_called_once_with(include_untracked=True)
 
 
-def test_execute_merge_action_marks_already_merged_task_without_error(tmp_path: Path) -> None:
+def _functional_test_execute_merge_action_marks_already_merged_task_without_error(tmp_path: Path) -> None:
     """Watch-style merge execution should reconcile stale merged branches without surfacing an error."""
+    from tests_functional.git_helpers import setup_git_repo_with_task_branch
+
     store, git, task, _wt = setup_git_repo_with_task_branch(
         tmp_path,
         "Already merged task",

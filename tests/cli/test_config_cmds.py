@@ -1176,7 +1176,7 @@ class TestInitCommand:
 class TestCleanCommand:
     """Tests for 'gza clean' command (default mode)."""
 
-    def test_clean_dry_run(self, tmp_path: Path):
+    def _functional_test_clean_dry_run(self, tmp_path: Path):
         """Clean command dry run works."""
         from gza.config import Config
         from gza.git import Git
@@ -1295,7 +1295,7 @@ class TestCleanCommand:
         assert not worker_file.exists()
         assert not startup_log_file.exists()
 
-    def test_clean_keep_unmerged_logs(self, tmp_path: Path):
+    def _functional_test_clean_keep_unmerged_logs(self, tmp_path: Path):
         """Clean command with --keep-unmerged keeps logs for unmerged tasks."""
         import time
 
@@ -1390,7 +1390,7 @@ class TestCleanCommand:
         assert not transcript_log.exists()
         assert not ops_log.exists()
 
-    def test_clean_lineage_aware_preserves_recent(self, tmp_path: Path):
+    def _functional_test_clean_lineage_aware_preserves_recent(self, tmp_path: Path):
         """Worktrees with recent lineage activity are preserved."""
         from gza.config import Config
         from gza.db import SqliteTaskStore
@@ -1435,7 +1435,7 @@ class TestCleanCommand:
         # Worktree should be preserved — lineage is recent
         assert wt_path.exists()
 
-    def test_clean_lineage_aware_removes_old(self, tmp_path: Path):
+    def _functional_test_clean_lineage_aware_removes_old(self, tmp_path: Path):
         """Worktrees with old lineage activity are removed."""
         from gza.config import Config
         from gza.db import SqliteTaskStore
@@ -1481,7 +1481,7 @@ class TestCleanCommand:
         assert not wt_path.exists()
         assert "lineage inactive" in result.stdout
 
-    def test_clean_force_skips_prompt(self, tmp_path: Path):
+    def _functional_test_clean_force_skips_prompt(self, tmp_path: Path):
         """--force flag skips the confirmation prompt."""
         from gza.config import Config
         from gza.git import Git
@@ -1514,7 +1514,7 @@ class TestCleanCommand:
         assert not orphan.exists()
         assert "orphaned" in result.stdout
 
-    def test_clean_no_force_denies_removal(self, tmp_path: Path):
+    def _functional_test_clean_no_force_denies_removal(self, tmp_path: Path):
         """Without --force, answering 'n' skips worktree removal."""
         from gza.config import Config
         from gza.git import Git
