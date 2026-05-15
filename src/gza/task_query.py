@@ -739,7 +739,7 @@ class TaskQueryService:
 
     def _project_task_row(self, task: DbTask, query: TaskQuery, *, target_branch: str | None) -> TaskRow:
         root = _resolve_lineage_root(self._store, task)
-        branch_owner = self._resolve_branch_owner(task, query=query)
+        branch_owner = _resolve_lineage_owner_task(self._store, task)
         blocked, blocking_id, blocking_status = self._store.is_task_blocked(task)
         review_verdict = None
         comments_count = 0
@@ -888,7 +888,7 @@ class TaskQueryService:
         query: TaskQuery | None = None,
     ) -> DbTask:
         if query is not None and query.branch_owner_mode == "unmerged_same_branch":
-            return _resolve_unmerged_branch_owner(self._store, task)
+            return _resolve_lineage_owner_task(self._store, task)
         root = _resolve_lineage_root(self._store, task)
         if _is_shared_branch_descendant_query(task, root):
             return root
@@ -1151,6 +1151,12 @@ def _resolve_unmerged_branch_owner(store: SqliteTaskStore, task: DbTask) -> DbTa
     from gza.query import resolve_unmerged_branch_owner
 
     return resolve_unmerged_branch_owner(store, task)
+
+
+def _resolve_lineage_owner_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    from gza.query import resolve_lineage_owner_task
+
+    return resolve_lineage_owner_task(store, task)
 
 
 def _get_reviews_for_root(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:

@@ -13,6 +13,7 @@ from gza.query import (
     get_improves_for_root,
     get_reviews_for_root,
     get_task_slug,
+    resolve_lineage_owner_task,
     resolve_lineage_root,
     task_time_for_lineage,
 )
@@ -546,6 +547,66 @@ class TestResolveLineageRoot:
         result = resolve_lineage_root(store, child)
         assert result in (root_a, root_b)
         assert result.id is not None
+
+
+class TestResolveLineageOwnerTask:
+    def test_branchless_rebase_resolves_to_implement_owner_via_based_on_chain(self):
+        store = MagicMock()
+        impl = _make_task(id="gza-1", task_type="implement", branch="feature/owner")
+        rebase = _make_task(
+            id="gza-2",
+            task_type="rebase",
+            based_on="gza-1",
+            same_branch=True,
+            branch=None,
+        )
+
+        def mock_get(task_id):
+            return {"gza-1": impl, "gza-2": rebase}.get(task_id)
+
+        store.get.side_effect = mock_get
+        store.resolve_merge_unit_for_task.return_value = None
+
+        result = resolve_lineage_owner_task(store, rebase)
+
+        assert result == impl
+
+    def test_review_of_same_branch_retry_resolves_to_root_implement_owner(self):
+        store = MagicMock()
+        root = _make_task(id="gza-1", task_type="implement", branch="feature/root")
+        retry = _make_task(
+            id="gza-2",
+            task_type="implement",
+            based_on="gza-1",
+            same_branch=True,
+            branch="feature/root",
+        )
+        review = _make_task(
+            id="gza-3",
+            task_type="review",
+            based_on="gza-2",
+            depends_on="gza-2",
+        )
+
+        def mock_get(task_id):
+            return {"gza-1": root, "gza-2": retry, "gza-3": review}.get(task_id)
+
+        store.get.side_effect = mock_get
+        store.resolve_merge_unit_for_task.return_value = None
+
+        result = resolve_lineage_owner_task(store, review)
+
+        assert result == root
+
+    def test_branchless_plan_or_explore_remains_task_scoped(self):
+        store = MagicMock()
+        for task_type in ("plan", "explore"):
+            ancestor = _make_task(id="gza-1", task_type=task_type, branch=None)
+            store.resolve_merge_unit_for_task.return_value = None
+
+            result = resolve_lineage_owner_task(store, ancestor)
+
+            assert result == ancestor
 
 
 # ---------------------------------------------------------------------------

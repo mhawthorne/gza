@@ -43,7 +43,7 @@ from ..db import (
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git, GitError, active_worktree_path_for_branch
 from ..github import GitHub
-from ..lineage import resolve_impl_task, walk_based_on_descendants
+from ..lineage import walk_based_on_descendants
 from ..pr_ops import lookup_task_pr
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
@@ -1390,45 +1390,15 @@ def _resolve_incomplete_owner_task(store: SqliteTaskStore, row: _LineageRow) -> 
             ordered.append(task)
         return ordered
 
-    def _resolve_impl(task: DbTask) -> DbTask | None:
-        if task.task_type == "implement":
-            return task
-        if task.id is None:
-            return None
-        if (unit := store.resolve_merge_unit_for_task(task.id)) is not None:
-            unit_owner = store.resolve_merge_unit_owner_task(unit)
-            if unit_owner is not None and unit_owner.task_type == "implement":
-                return unit_owner
-        if task.task_type in {"review", "improve", "fix"}:
-            impl_task, _error = resolve_impl_task(store, task.id)
-            return impl_task
-        if task.task_type != "rebase":
-            return None
-
-        current = task
-        seen_ids: set[str] = set()
-        while current.id is not None and current.id not in seen_ids and current.based_on:
-            seen_ids.add(current.id)
-            parent = store.get(current.based_on)
-            if parent is None:
-                return None
-            if parent.task_type == "implement":
-                return parent
-            if parent.task_type in {"review", "improve", "fix"} and parent.id is not None:
-                impl_task, _error = resolve_impl_task(store, parent.id)
-                return impl_task
-            current = parent
-        return None
-
     candidates = _iter_candidates()
     for candidate in candidates:
-        impl_task = _resolve_impl(candidate)
-        if impl_task is not None and impl_task.branch:
-            return impl_task
+        owner_task = _resolve_lineage_owner_task(store, candidate)
+        if owner_task.task_type == "implement" and owner_task.branch:
+            return owner_task
     for candidate in candidates:
-        impl_task = _resolve_impl(candidate)
-        if impl_task is not None:
-            return impl_task
+        owner_task = _resolve_lineage_owner_task(store, candidate)
+        if owner_task.task_type == "implement":
+            return owner_task
     return row.owner_task
 
 
@@ -1482,6 +1452,12 @@ def _resolve_unmerged_branch_owner(store: SqliteTaskStore, task: DbTask) -> DbTa
     from gza.query import resolve_unmerged_branch_owner
 
     return resolve_unmerged_branch_owner(store, task)
+
+
+def _resolve_lineage_owner_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    from gza.query import resolve_lineage_owner_task
+
+    return resolve_lineage_owner_task(store, task)
 
 
 def _descendants_only_unmerged_lineage_tree(
@@ -1685,7 +1661,7 @@ def _enrich_unmerged_result(
             rows.append(row)
             continue
 
-        owner_task = row.owner_task
+        owner_task = _resolve_lineage_owner_task(store, row.owner_task)
         merge_unit = (
             store.resolve_merge_unit_for_task(owner_task.id)
             if owner_task.id is not None
@@ -1883,7 +1859,7 @@ def _enrich_unmerged_result(
             if gh_available is None:
                 gh_available = gh.is_available()
             pr_lookup = lookup_task_pr(
-                representative_task,
+                owner_task,
                 gh=gh,
                 available=gh_available,
                 include_number=False,
@@ -1930,29 +1906,29 @@ def _enrich_unmerged_result(
                 "deletions": deletions,
                 "has_conflicts": has_conflicts,
                 "pr_url": pr_url,
-                "id": representative_task.id,
-                "prompt": representative_task.prompt,
-                "status": representative_task.status,
-                "task_type": representative_task.task_type,
-                "completed_at": representative_task.completed_at,
+                "id": owner_task.id,
+                "prompt": owner_task.prompt,
+                "status": owner_task.status,
+                "task_type": owner_task.task_type,
+                "completed_at": owner_task.completed_at,
                 "review_status": review_classification,
                 "review_detail": review_detail,
                 "review_verdict": verdict_label or review_verdict,
                 "review_score": review_score,
-                "report_file": representative_task.report_file,
-                "stats": format_stats(representative_task),
-                "completion_reason": representative_task.completion_reason,
+                "report_file": owner_task.report_file,
+                "stats": format_stats(owner_task),
+                "completion_reason": owner_task.completion_reason,
                 "failure_reason": (
-                    representative_task.failure_reason
-                    if representative_task.failure_reason
-                    and representative_task.failure_reason != "UNKNOWN"
+                    owner_task.failure_reason
+                    if owner_task.failure_reason
+                    and owner_task.failure_reason != "UNKNOWN"
                     else None
                 ),
             }
         )
         rows.append(
             _LineageRow(
-                owner_task=representative_task,
+                owner_task=owner_task,
                 members=members,
                 tree=pruned_tree,
                 unresolved_tasks=row.unresolved_tasks,
@@ -2127,7 +2103,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     owner_ids = tuple(
         dict.fromkeys(
             owner.id
-            for owner in (_resolve_unmerged_branch_owner(store, task) for task in selected_tasks)
+            for owner in (_resolve_lineage_owner_task(store, task) for task in selected_tasks)
             if owner.id is not None
         )
     )
@@ -2873,6 +2849,14 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         console.print(f"[red]Error: unable to build lineage for {task_id}[/red]")
         return 1
     lineage_tree = cast(TaskLineageNode, lineage_tree)
+    owner_task = _resolve_lineage_owner_task(store, task)
+    if (
+        owner_task.task_type == "implement"
+        and owner_task.branch
+        and owner_task.id is not None
+        and owner_task.id != lineage_tree.task.id
+    ):
+        lineage_tree = _build_lineage_tree_for_root(store, owner_task, max_depth=None)
 
     def _format_utc_timestamp(value: datetime) -> str:
         ts = value.astimezone(UTC) if value.tzinfo is not None else value

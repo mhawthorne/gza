@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from gza.db import SqliteTaskStore, Task, task_id_numeric_key
-from gza.lineage import walk_ancestors
+from gza.lineage import resolve_impl_task, walk_ancestors
 from gza.task_query import (
     DateFilter,
     TaskQuery,
@@ -806,4 +806,49 @@ def resolve_unmerged_branch_owner(store: SqliteTaskStore, task: Task) -> Task:
     lineage_root = resolve_same_branch_lineage_root(store, task)
     if _is_shared_branch_descendant(task, lineage_root):
         return lineage_root
+    return task
+
+
+def _resolve_branchless_rebase_owner(store: SqliteTaskStore, task: Task) -> Task | None:
+    """Resolve a branchless rebase row back to its implementation owner."""
+    if task.task_type != "rebase" or task.branch or not task.based_on:
+        return None
+
+    current = task
+    visited: set[str] = {task.id} if task.id is not None else set()
+    while current.based_on:
+        parent = store.get(current.based_on)
+        if parent is None or parent.id is None or parent.id in visited:
+            return None
+        visited.add(parent.id)
+        if parent.task_type == "rebase":
+            current = parent
+            continue
+        if parent.task_type in {"implement", "review", "improve", "fix"}:
+            impl_task, _error = resolve_impl_task(store, parent.id)
+            if impl_task is None:
+                return None
+            return resolve_lineage_owner_task(store, impl_task)
+        return None
+    return None
+
+
+def resolve_lineage_owner_task(store: SqliteTaskStore, task: Task) -> Task:
+    """Resolve the implementation row that owns a task's shared branch when one exists."""
+    if task.id is not None and (unit := store.resolve_merge_unit_for_task(task.id)) is not None:
+        owner = store.resolve_merge_unit_owner_task(unit)
+        if owner is not None and owner.task_type == "implement":
+            return owner
+
+    if task.task_type in {"review", "improve", "fix"} and task.id is not None:
+        impl_task, _error = resolve_impl_task(store, task.id)
+        if impl_task is not None:
+            return resolve_lineage_owner_task(store, impl_task)
+
+    if task.task_type == "rebase" and (owner := _resolve_branchless_rebase_owner(store, task)) is not None:
+        return owner
+
+    if task.branch:
+        return resolve_unmerged_branch_owner(store, task)
+
     return task

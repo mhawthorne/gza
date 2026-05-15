@@ -130,6 +130,225 @@ def _setup_unmerged_env_fast(
     return store, task, _FastUnmergedGit()
 
 
+def _first_nonempty_output_line(output: str) -> str:
+    return next(line for line in output.splitlines() if line.strip())
+
+
+def _lineage_root_id(output: str) -> str:
+    match = re.search(r"\b[a-z0-9]{1,12}-\d+\b", _first_nonempty_output_line(output))
+    assert match is not None
+    return match.group(0)
+
+
+def _setup_lineage_owner_parity_fixture(tmp_path: Path) -> dict[str, Task]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Parity plan context", task_type="plan")
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    store.update(plan)
+    assert plan.id is not None
+
+    impl = store.add("Parity implement owner", task_type="implement", based_on=plan.id)
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    impl.branch = "feature/parity-owner"
+    impl.has_commits = True
+    impl.merge_status = "unmerged"
+    store.update(impl)
+    assert impl.id is not None
+
+    unit = store.create_merge_unit(
+        source_branch=impl.branch,
+        target_branch="main",
+        owner_task_id=impl.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(impl.id, unit.id, "owner")
+
+    review = store.add(
+        "Parity review context",
+        task_type="review",
+        based_on=impl.id,
+        depends_on=impl.id,
+    )
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 11, 0, tzinfo=UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+    assert review.id is not None
+    store.attach_task_to_merge_unit(review.id, unit.id, "review")
+
+    improve = store.add(
+        "Parity improve follow-up",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    improve.status = "in_progress"
+    improve.branch = impl.branch
+    improve.has_commits = True
+    store.update(improve)
+    assert improve.id is not None
+    store.attach_task_to_merge_unit(improve.id, unit.id, "improve")
+
+    dropped_one = store.add(
+        "Parity dropped rebase one",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    dropped_one.status = "dropped"
+    dropped_one.completed_at = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    dropped_one.branch = impl.branch
+    dropped_one.has_commits = True
+    store.update(dropped_one)
+    assert dropped_one.id is not None
+    store.attach_task_to_merge_unit(dropped_one.id, unit.id, "rebase")
+
+    dropped_two = store.add(
+        "Parity dropped rebase two",
+        task_type="rebase",
+        based_on=dropped_one.id,
+        same_branch=True,
+    )
+    dropped_two.status = "dropped"
+    dropped_two.completed_at = datetime(2026, 5, 14, 13, 0, tzinfo=UTC)
+    dropped_two.branch = impl.branch
+    dropped_two.has_commits = True
+    store.update(dropped_two)
+    assert dropped_two.id is not None
+    store.attach_task_to_merge_unit(dropped_two.id, unit.id, "rebase")
+
+    return {
+        "plan": plan,
+        "impl": impl,
+        "review": review,
+        "improve": improve,
+        "dropped_one": dropped_one,
+        "dropped_two": dropped_two,
+    }
+
+
+def _setup_branchless_rebase_owner_fixture(tmp_path: Path) -> dict[str, Task]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Branch owner implementation", task_type="implement")
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    impl.branch = "feature/branchless-rebase-owner"
+    impl.has_commits = True
+    impl.merge_status = "unmerged"
+    store.update(impl)
+    assert impl.id is not None
+
+    rebase = store.add(
+        "Branchless rebase child",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    rebase.status = "completed"
+    rebase.completed_at = datetime(2026, 5, 14, 11, 0, tzinfo=UTC)
+    rebase.has_commits = True
+    store.update(rebase)
+    assert rebase.id is not None
+
+    return {"impl": impl, "rebase": rebase}
+
+
+def _setup_retry_review_owner_fixture(tmp_path: Path) -> dict[str, Task]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Retry owner root implementation", task_type="implement")
+    root.status = "completed"
+    root.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    root.branch = "feature/retry-owner"
+    root.has_commits = True
+    root.merge_status = "unmerged"
+    store.update(root)
+    assert root.id is not None
+
+    retry = store.add(
+        "Retry implementation on same branch",
+        task_type="implement",
+        based_on=root.id,
+        same_branch=True,
+    )
+    retry.status = "completed"
+    retry.completed_at = datetime(2026, 5, 14, 11, 0, tzinfo=UTC)
+    retry.branch = root.branch
+    retry.has_commits = True
+    retry.merge_status = "unmerged"
+    store.update(retry)
+    assert retry.id is not None
+
+    review = store.add(
+        "Review of same-branch retry",
+        task_type="review",
+        based_on=retry.id,
+        depends_on=retry.id,
+    )
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+    assert review.id is not None
+
+    return {"root": root, "retry": retry, "review": review}
+
+
+def _setup_plan_fanout_fixture(tmp_path: Path) -> dict[str, Task]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Fanout plan root", task_type="plan")
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    store.update(plan)
+    assert plan.id is not None
+
+    impl_a = store.add("Fanout implement alpha", task_type="implement", based_on=plan.id)
+    impl_a.status = "completed"
+    impl_a.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    impl_a.branch = "feature/fanout-alpha"
+    impl_a.has_commits = True
+    impl_a.merge_status = "unmerged"
+    store.update(impl_a)
+    assert impl_a.id is not None
+
+    unit_a = store.create_merge_unit(
+        source_branch=impl_a.branch,
+        target_branch="main",
+        owner_task_id=impl_a.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(impl_a.id, unit_a.id, "owner")
+
+    impl_b = store.add("Fanout implement beta", task_type="implement", based_on=plan.id)
+    impl_b.status = "completed"
+    impl_b.completed_at = datetime(2026, 5, 14, 11, 0, tzinfo=UTC)
+    impl_b.branch = "feature/fanout-beta"
+    impl_b.has_commits = True
+    impl_b.merge_status = "unmerged"
+    store.update(impl_b)
+    assert impl_b.id is not None
+
+    unit_b = store.create_merge_unit(
+        source_branch=impl_b.branch,
+        target_branch="main",
+        owner_task_id=impl_b.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(impl_b.id, unit_b.id, "owner")
+
+    return {"plan": plan, "impl_a": impl_a, "impl_b": impl_b}
+
+
 def _unmerged_branch_block(output: str, branch: str) -> str:
     """Return the rendered unmerged output block for a specific branch."""
     for block in output.split("-" * 32):
@@ -7402,8 +7621,8 @@ class TestUnmergedReviewStatus:
         # The "← latest" annotation may wrap across lines at narrow terminal widths
         assert "latest" in " ".join(result.stdout.split())
 
-    def test_unmerged_uses_latest_branch_implementation_for_summary_and_review(self, tmp_path: Path):
-        """Unmerged summarizes the latest implementation on a shared branch, not an older retry."""
+    def test_unmerged_keeps_owner_identity_while_using_latest_branch_review_summary(self, tmp_path: Path):
+        """Unmerged keeps the branch owner row while summarizing the latest branch review state."""
         store, root_impl, git = setup_unmerged_env(tmp_path)
 
         retry_impl = store.add("Retry implementation", task_type="implement")
@@ -7453,7 +7672,7 @@ class TestUnmergedReviewStatus:
         assert unmerged_result.returncode == 0
 
         unmerged_output = " ".join(unmerged_result.stdout.split())
-        assert f"⚡ {sibling_impl.id}" in unmerged_output
+        assert f"⚡ {root_impl.id}" in unmerged_output
         assert "review: reviewed [✓ approved]" in unmerged_output
         assert root_impl.id in unmerged_output
         assert retry_impl.id in unmerged_output
@@ -7513,8 +7732,8 @@ class TestUnmergedReviewStatus:
         assert sibling_impl.id in lineage_output
         assert sibling_impl.id in unmerged_output
 
-    def test_unmerged_uses_latest_retry_resume_implementation_as_representative(self, tmp_path: Path):
-        """Shared-branch retry/resume chains summarize the newest implementation attempt."""
+    def test_unmerged_keeps_owner_identity_for_retry_resume_branch_summary(self, tmp_path: Path):
+        """Shared-branch retry/resume chains keep the owner row while summarizing the newest review."""
         store, root_impl, git = setup_unmerged_env(tmp_path)
 
         retry_impl = store.add("Retry implementation", task_type="implement")
@@ -7557,7 +7776,7 @@ class TestUnmergedReviewStatus:
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
-        assert f"⚡ {resumed_impl.id}" in normalized
+        assert f"⚡ {root_impl.id}" in normalized
         assert "review: reviewed [✓ approved]" in normalized
         assert root_impl.id in normalized
         assert retry_impl.id in normalized
@@ -7592,7 +7811,7 @@ class TestUnmergedReviewStatus:
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
-        assert f"⚡ {impl_retry.id}" in normalized
+        assert f"⚡ {root_impl.id}" in normalized
         assert "review: review stale" in normalized
         assert f"latest implement {impl_retry.id}" in normalized
         assert "review: reviewed [✓ approved]" not in normalized
@@ -7677,7 +7896,7 @@ class TestUnmergedReviewStatus:
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
-        assert f"⚡ {resumed_impl.id}" in normalized
+        assert f"⚡ {root_impl.id}" in normalized
         assert "review: review stale" in normalized
         assert f"review state cleared after last review {retry_review.id}" in normalized
         assert "review: no review" not in normalized
@@ -9194,7 +9413,7 @@ class TestUnmergedUnifiedQueryOutput:
         assert refreshed_unrelated_unit.state == "unmerged"
         assert refreshed_unrelated.merge_status == "unmerged"
 
-    def test_unmerged_default_refresh_prefers_completed_retry_over_failed_owner(
+    def test_unmerged_default_refresh_keeps_failed_owner_identity_with_completed_retry_member(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -9232,8 +9451,8 @@ class TestUnmergedUnifiedQueryOutput:
         payload = json.loads(captured.out)
         assert payload == [
             {
-                "id": retry.id,
-                "prompt": "Completed retry",
+                "id": failed.id,
+                "prompt": "Failed implementation",
                 "merge_unit_id": store.resolve_merge_unit_for_task(retry.id).id,
             }
         ]
@@ -9305,7 +9524,7 @@ class TestUnmergedUnifiedQueryOutput:
         assert refreshed_unrelated_unit.state == "unmerged"
         assert refreshed_unrelated.merge_status == "unmerged"
 
-    def test_unmerged_default_refresh_prefers_completed_retry_over_failed_owner(
+    def test_unmerged_live_target_keeps_failed_owner_identity_with_completed_retry_member(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -9343,8 +9562,8 @@ class TestUnmergedUnifiedQueryOutput:
         payload = json.loads(captured.out)
         assert payload == [
             {
-                "id": retry.id,
-                "prompt": "Completed retry",
+                "id": failed.id,
+                "prompt": "Failed implementation",
                 "merge_unit_id": store.resolve_merge_unit_for_task(retry.id).id,
             }
         ]
@@ -11543,6 +11762,347 @@ class TestIncompleteCommand:
         tree_output = captured.out
         assert self._tree_root_id(tree_output) == impl.id
         assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
+
+
+class TestLineageOwnerParity:
+    @staticmethod
+    def _incomplete_args(tmp_path: Path, *, fields: str | None, json: bool = False, tree: bool = False):
+        return argparse.Namespace(
+            project_dir=tmp_path,
+            last=0,
+            list_fields=False,
+            blocked_by_dropped=False,
+            tree=tree,
+            type=None,
+            days=None,
+            date_field="effective",
+            json=json,
+            verbose=False,
+            fields=fields,
+        )
+
+    @staticmethod
+    def _one_line_row_id(output: str) -> str:
+        return next(line.split(":", 1)[0] for line in output.splitlines() if line.strip())
+
+    @staticmethod
+    def _tree_root_id(output: str) -> str:
+        first_line = next(line for line in output.splitlines() if line.strip() and not set(line.strip()) == {"-"})
+        return first_line.split()[1]
+
+    def test_unmerged_keeps_impl_owner_identity_for_mixed_followup_lineage(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        tasks = _setup_lineage_owner_parity_fixture(tmp_path)
+        impl = tasks["impl"]
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=True,
+            fields="id,prompt",
+        )
+
+        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
+        captured = capsys.readouterr()
+
+        assert result == 0
+        assert json.loads(captured.out) == [{"id": impl.id, "prompt": impl.prompt}]
+
+    @pytest.mark.parametrize("focus_key", ["review", "improve", "dropped_two"])
+    def test_lineage_re_roots_branch_owned_descendants_at_implement_owner(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        focus_key: str,
+    ) -> None:
+        tasks = _setup_lineage_owner_parity_fixture(tmp_path)
+        impl = tasks["impl"]
+        focus_task = tasks[focus_key]
+
+        result = query_cli.cmd_lineage(
+            argparse.Namespace(project_dir=tmp_path, task_id=str(focus_task.id))
+        )
+        captured = capsys.readouterr()
+
+        assert result == 0
+        assert _lineage_root_id(captured.out) == impl.id
+        assert tasks["plan"].id not in captured.out
+
+    def test_branchless_rebase_owner_identity_parity_across_lineage_history_and_search(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        tasks = _setup_branchless_rebase_owner_fixture(tmp_path)
+        impl = tasks["impl"]
+        rebase = tasks["rebase"]
+
+        lineage_result = query_cli.cmd_lineage(
+            argparse.Namespace(project_dir=tmp_path, task_id=str(rebase.id))
+        )
+        lineage_captured = capsys.readouterr()
+        assert lineage_result == 0
+        assert _lineage_root_id(lineage_captured.out) == impl.id
+
+        history_result = run_gza(
+            "history",
+            "--status",
+            "completed",
+            "--json",
+            "--fields",
+            "id,branch_owner_id",
+            "--project",
+            str(tmp_path),
+        )
+        assert history_result.returncode == 0
+        history_rows = {row["id"]: row["branch_owner_id"] for row in json.loads(history_result.stdout)}
+        assert history_rows[rebase.id] == impl.id
+
+        search_result = run_gza(
+            "search",
+            "Branchless rebase",
+            "--json",
+            "--fields",
+            "id,branch_owner_id",
+            "--project",
+            str(tmp_path),
+        )
+        assert search_result.returncode == 0
+        search_rows = {row["id"]: row["branch_owner_id"] for row in json.loads(search_result.stdout)}
+        assert search_rows[rebase.id] == impl.id
+
+    def test_unattached_retry_review_owner_identity_parity_across_lineage_history_and_search(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        tasks = _setup_retry_review_owner_fixture(tmp_path)
+        root = tasks["root"]
+        review = tasks["review"]
+
+        lineage_result = query_cli.cmd_lineage(
+            argparse.Namespace(project_dir=tmp_path, task_id=str(review.id))
+        )
+        lineage_captured = capsys.readouterr()
+        assert lineage_result == 0
+        assert _lineage_root_id(lineage_captured.out) == root.id
+
+        history_result = run_gza(
+            "history",
+            "--status",
+            "completed",
+            "--json",
+            "--fields",
+            "id,branch_owner_id",
+            "--project",
+            str(tmp_path),
+        )
+        assert history_result.returncode == 0
+        history_rows = {row["id"]: row["branch_owner_id"] for row in json.loads(history_result.stdout)}
+        assert history_rows[review.id] == root.id
+
+        search_result = run_gza(
+            "search",
+            "same-branch retry",
+            "--json",
+            "--fields",
+            "id,branch_owner_id",
+            "--project",
+            str(tmp_path),
+        )
+        assert search_result.returncode == 0
+        search_rows = {row["id"]: row["branch_owner_id"] for row in json.loads(search_result.stdout)}
+        assert search_rows[review.id] == root.id
+
+    def test_lineage_keeps_requested_plan_root_for_fanout_implementations(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        tasks = _setup_plan_fanout_fixture(tmp_path)
+        plan = tasks["plan"]
+        impl_a = tasks["impl_a"]
+        impl_b = tasks["impl_b"]
+
+        lineage_result = query_cli.cmd_lineage(
+            argparse.Namespace(project_dir=tmp_path, task_id=str(plan.id))
+        )
+        captured = capsys.readouterr()
+
+        assert lineage_result == 0
+        assert _lineage_root_id(captured.out) == plan.id
+        assert impl_a.id in captured.out
+        assert impl_b.id in captured.out
+
+    def test_plan_fanout_history_and_search_keep_task_scoped_branch_owner_id(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        tasks = _setup_plan_fanout_fixture(tmp_path)
+        plan = tasks["plan"]
+        impl_a = tasks["impl_a"]
+        impl_b = tasks["impl_b"]
+
+        history_result = run_gza(
+            "history",
+            "--status",
+            "completed",
+            "--json",
+            "--fields",
+            "id,branch_owner_id",
+            "--project",
+            str(tmp_path),
+        )
+        assert history_result.returncode == 0
+        history_rows = {
+            row["id"]: row["branch_owner_id"]
+            for row in json.loads(history_result.stdout)
+            if row["id"] in {plan.id, impl_a.id, impl_b.id}
+        }
+        assert history_rows == {
+            plan.id: plan.id,
+            impl_a.id: impl_a.id,
+            impl_b.id: impl_b.id,
+        }
+
+        search_result = run_gza(
+            "search",
+            "Fanout",
+            "--json",
+            "--fields",
+            "id,branch_owner_id",
+            "--project",
+            str(tmp_path),
+        )
+        assert search_result.returncode == 0
+        search_rows = {
+            row["id"]: row["branch_owner_id"]
+            for row in json.loads(search_result.stdout)
+            if row["id"] in {plan.id, impl_a.id, impl_b.id}
+        }
+        assert search_rows == {
+            plan.id: plan.id,
+            impl_a.id: impl_a.id,
+            impl_b.id: impl_b.id,
+        }
+
+    def test_owner_identity_parity_across_incomplete_unmerged_lineage_history_and_search(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        tasks = _setup_lineage_owner_parity_fixture(tmp_path)
+        plan = tasks["plan"]
+        impl = tasks["impl"]
+        review = tasks["review"]
+        improve = tasks["improve"]
+        dropped_one = tasks["dropped_one"]
+        dropped_two = tasks["dropped_two"]
+
+        git = _mock_unmerged_git()
+        with patch("gza.cli.query.Git", return_value=git):
+            incomplete_result = query_cli.cmd_incomplete(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    last=0,
+                    list_fields=False,
+                    blocked_by_dropped=False,
+                    tree=False,
+                    type=None,
+                    days=None,
+                    date_field="effective",
+                    json=True,
+                    verbose=False,
+                    fields="id",
+                )
+            )
+        incomplete_captured = capsys.readouterr()
+        assert incomplete_result == 0
+        assert json.loads(incomplete_captured.out) == [{"id": impl.id}]
+
+        unmerged_result = query_cli.cmd_unmerged(
+            argparse.Namespace(
+                project_dir=tmp_path,
+                into_current=False,
+                target=None,
+                fetch=False,
+                limit=5,
+                json=True,
+                fields="id",
+            ),
+            git=_FastUnmergedGit(),
+        )
+        unmerged_captured = capsys.readouterr()
+        assert unmerged_result == 0
+        assert json.loads(unmerged_captured.out) == [{"id": impl.id}]
+
+        lineage_result = query_cli.cmd_lineage(
+            argparse.Namespace(project_dir=tmp_path, task_id=str(dropped_two.id))
+        )
+        lineage_captured = capsys.readouterr()
+        assert lineage_result == 0
+        assert _lineage_root_id(lineage_captured.out) == impl.id
+
+        history_result = run_gza(
+            "history",
+            "--json",
+            "--fields",
+            "id,branch_owner_id",
+            "--project",
+            str(tmp_path),
+        )
+        assert history_result.returncode == 0
+        history_rows = {
+            row["id"]: row["branch_owner_id"]
+            for row in json.loads(history_result.stdout)
+            if row["id"] in {plan.id, review.id, dropped_one.id, dropped_two.id}
+        }
+        assert history_rows == {
+            plan.id: plan.id,
+            review.id: impl.id,
+            dropped_one.id: impl.id,
+            dropped_two.id: impl.id,
+        }
+
+        search_result = run_gza(
+            "search",
+            "Parity",
+            "--json",
+            "--fields",
+            "id,branch_owner_id",
+            "--project",
+            str(tmp_path),
+        )
+        assert search_result.returncode == 0
+        search_rows = {
+            row["id"]: row["branch_owner_id"]
+            for row in json.loads(search_result.stdout)
+            if row["id"] in {plan.id, review.id, improve.id, dropped_one.id, dropped_two.id}
+        }
+        assert search_rows == {
+            plan.id: plan.id,
+            review.id: impl.id,
+            improve.id: impl.id,
+            dropped_one.id: impl.id,
+            dropped_two.id: impl.id,
+        }
+
+    def test_ps_remains_task_scoped_in_a_lineage_owner_fixture(self, tmp_path: Path) -> None:
+        tasks = _setup_lineage_owner_parity_fixture(tmp_path)
+        improve = tasks["improve"]
+
+        result = run_gza("ps", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == improve.id
 
     def test_incomplete_roots_dropped_rebase_chain_at_impl_in_both_views(
         self,

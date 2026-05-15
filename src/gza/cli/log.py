@@ -699,11 +699,12 @@ def cmd_log(args: argparse.Namespace) -> int:
         if not worker:
             print(f"Error: Worker '{query}' not found")
             return 1
-        is_running = registry.is_running(query)
+        is_running = registry.is_running(worker.worker_id)
+        if is_running:
+            worker_id_for_follow = worker.worker_id
         if worker.task_id:
             task = store.get(worker.task_id)
         log_path, using_startup_log = _resolve_worker_log_path(config, worker, task)
-        worker_id_for_follow = worker.worker_id
 
     elif args.slug:
         # Look up by slug (exact or partial match)
@@ -721,7 +722,7 @@ def cmd_log(args: argparse.Namespace) -> int:
 
         log_path, using_startup_log = _resolve_task_log_path(config, registry, task)
 
-        if task.id is not None:
+        if task.id:
             worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
             is_running = worker_id_for_follow is not None
 
@@ -735,7 +736,7 @@ def cmd_log(args: argparse.Namespace) -> int:
 
         log_path, using_startup_log = _resolve_task_log_path(config, registry, task)
 
-        if task.id is not None:
+        if task.id:
             worker_id_for_follow = _running_worker_id_for_task(registry, task.id)
             is_running = worker_id_for_follow is not None
 

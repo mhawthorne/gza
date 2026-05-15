@@ -359,6 +359,47 @@ def test_incomplete_date_field_created_vs_effective_affects_lineage_selection(tm
     assert len(effective_result.rows) == 0
 
 
+def test_task_row_plan_fanout_keeps_branch_owner_task_scoped(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    plan = store.add("fanout plan", task_type="plan")
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    store.update(plan)
+    assert plan.id is not None
+
+    implement_a = store.add("fanout implement a", task_type="implement", based_on=plan.id)
+    implement_a.status = "completed"
+    implement_a.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    implement_a.branch = "feature/fanout-a"
+    implement_a.has_commits = True
+    implement_a.merge_status = "unmerged"
+    store.update(implement_a)
+    assert implement_a.id is not None
+
+    implement_b = store.add("fanout implement b", task_type="implement", based_on=plan.id)
+    implement_b.status = "completed"
+    implement_b.completed_at = datetime(2026, 5, 14, 11, 0, tzinfo=UTC)
+    implement_b.branch = "feature/fanout-b"
+    implement_b.has_commits = True
+    implement_b.merge_status = "unmerged"
+    store.update(implement_b)
+    assert implement_b.id is not None
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQueryPresets.search(
+            "fanout",
+            limit=None,
+        )
+    )
+
+    rows = {row.task.id: row.values["branch_owner_id"] for row in result.rows if hasattr(row, "task")}
+    assert rows[plan.id] == plan.id
+    assert rows[implement_a.id] == implement_a.id
+    assert rows[implement_b.id] == implement_b.id
+
+
 def test_incomplete_date_field_completed_excludes_missing_completed_at(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
