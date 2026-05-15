@@ -4,7 +4,6 @@ import json
 import os
 import sqlite3
 import stat
-import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -8204,41 +8203,6 @@ class TestSharedDbIsolationAndImportGating:
 
         assert version == 27
         assert row == (3, 12.5)
-
-    def test_v24_to_v27_chains_via_gza_migrate(self, tmp_path: Path) -> None:
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: gza\n"
-            f"db_path: {db_path}\n",
-            encoding="utf-8",
-        )
-        _make_v24_db(db_path)
-
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        conn.execute(
-            "INSERT INTO tasks (id, prompt, created_at) VALUES (1, 'parent', '2024-01-01T00:00:00+00:00')"
-        )
-        conn.execute(
-            "INSERT INTO tasks (id, prompt, based_on, depends_on, created_at) VALUES (2, 'child', 1, 1, '2024-01-01T00:00:00+00:00')"
-        )
-        conn.commit()
-        conn.close()
-
-        result = subprocess.run(
-            ["uv", "run", "gza", "migrate", "--yes", "--project", str(tmp_path)],
-            capture_output=True,
-            text=True,
-            cwd=tmp_path,
-        )
-        assert result.returncode == 0, result.stderr
-
-        status = check_migration_status(db_path)
-        assert status["current_version"] == 27
-        assert status["pending_manual"] == []
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
-
 
 class TestSyncCandidates:
     """Tests for bounded sync candidate selection."""

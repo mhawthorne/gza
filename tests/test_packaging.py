@@ -213,6 +213,65 @@ def test_functional_subprocess_timeouts_within_watchdog() -> None:
     )
 
 
+def test_unit_suite_keeps_cli_subprocess_and_real_shell_tests_out_of_tests_dir() -> None:
+    """Unit tests should not reintroduce CLI subprocess or timeout-budget shell-command cases."""
+    repo_root = Path(__file__).resolve().parents[1]
+    violations: list[str] = []
+
+    for test_file in (repo_root / "tests").rglob("test_*.py"):
+        module = ast.parse(test_file.read_text(), filename=str(test_file))
+
+        for node in ast.walk(module):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "run"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "subprocess"
+                and node.args
+                and isinstance(node.args[0], ast.List)
+            ):
+                continue
+
+            parts: list[str | None] = []
+            for elt in node.args[0].elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    parts.append(elt.value)
+                elif isinstance(elt, ast.Attribute) and isinstance(elt.value, ast.Name) and elt.value.id == "sys":
+                    parts.append(f"sys.{elt.attr}")
+                else:
+                    parts.append(None)
+
+            if parts[:3] == ["uv", "run", "gza"] or parts[:3] == ["sys.executable", "-m", "gza"]:
+                violations.append(f"{test_file}:{node.lineno} CLI subprocess invocation belongs in tests_functional/")
+
+        for node in module.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            has_timeout = any(
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Attribute)
+                and decorator.func.attr == "timeout"
+                and isinstance(decorator.func.value, ast.Attribute)
+                and decorator.func.value.attr == "mark"
+                and isinstance(decorator.func.value.value, ast.Name)
+                and decorator.func.value.value.id == "pytest"
+                for decorator in node.decorator_list
+            )
+            if not has_timeout:
+                continue
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr == "_run"
+                ):
+                    violations.append(f"{test_file}:{inner.lineno} timeout-marked real shell command belongs in tests_functional/")
+
+    assert not violations, "Unit suite boundary violations found:\n  " + "\n  ".join(violations)
+
+
 def test_github_test_workflow_uses_shared_test_script() -> None:
     workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "test.yml"
     workflow_text = workflow.read_text()

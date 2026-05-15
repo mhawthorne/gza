@@ -1455,48 +1455,6 @@ def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: 
     assert ctx_with_stale_local_branch.can_merge is True
 
 
-@pytest.mark.timeout(4, method="signal")
-def test_resolve_context_prefers_local_branch_when_origin_is_stale(tmp_path: Path) -> None:
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    git = Git(tmp_path)
-    branch = "feat/local-ahead"
-
-    git._run("init", "-b", "main")
-    git._run("config", "user.name", "Test User")
-    git._run("config", "user.email", "test@example.com")
-    (tmp_path / "base.txt").write_text("base\n")
-    git._run("add", "base.txt")
-    git._run("commit", "-m", "Initial commit")
-
-    git._run("checkout", "-b", branch)
-    (tmp_path / "feature.txt").write_text("remote tip\n")
-    git._run("add", "feature.txt")
-    git._run("commit", "-m", "Remote tip")
-    remote_sha = git.rev_parse("HEAD")
-
-    (tmp_path / "feature.txt").write_text("remote tip\nlocal tip\n")
-    git._run("add", "feature.txt")
-    git._run("commit", "-m", "Local tip")
-    git._run("update-ref", f"refs/remotes/origin/{branch}", remote_sha)
-    git._run("checkout", "main")
-
-    impl = store.add("Implement feature", task_type="implement")
-    assert impl.id is not None
-    impl.status = "completed"
-    impl.completed_at = datetime.now(UTC)
-    impl.branch = branch
-    impl.merge_status = "unmerged"
-    impl.has_commits = True
-    store.update(impl)
-
-    ctx = resolve_advance_context(config, store, git, impl, "main")
-
-    assert ctx.merge_source_ref == branch
-    assert ctx.merge_source_warning is None
-    assert ctx.can_merge is True
-
-
 def test_diverged_local_and_origin_need_manual_resolution(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -1571,60 +1529,6 @@ def test_diverged_local_and_origin_fail_closed_even_when_local_tip_matches_targe
     assert ctx.post_merge_rebase_state.already_merged is False
     assert ctx.post_merge_rebase_state.warning is not None
     assert "diverged" in ctx.post_merge_rebase_state.warning
-
-
-@pytest.mark.timeout(4, method="signal")
-def test_real_git_remote_tracking_ref_unblocks_failed_rebase_after_later_approved_review(
-    tmp_path: Path, monkeypatch
-) -> None:
-    from gza import advance_engine as advance_engine_module
-
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    branch = "feat/remote-only-mergeable"
-    git = _init_repo_with_remote_tracking_only_feature(tmp_path, branch)
-
-    impl = store.add("Implement feature", task_type="implement")
-    assert impl.id is not None
-    impl.status = "completed"
-    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
-    impl.branch = branch
-    impl.merge_status = "unmerged"
-    impl.has_commits = True
-    store.update(impl)
-
-    review = store.add("Review", task_type="review", depends_on=impl.id)
-    review.status = "completed"
-    review.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
-    review.report_file = "reviews/fake.md"
-    store.update(review)
-
-    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
-    failed_rebase.status = "failed"
-    failed_rebase.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
-    failed_rebase.branch = branch
-    failed_rebase.failure_reason = "MERGE_CONFLICT"
-    store.update(failed_rebase)
-
-    monkeypatch.setattr(
-        advance_engine_module,
-        "get_review_report",
-        lambda project_dir, r: ParsedReviewReport(
-            verdict="APPROVED",
-            findings=(),
-            format_version="legacy",
-        ),
-    )
-
-    assert git.branch_exists(branch) is False
-    assert git.ref_exists(f"origin/{branch}") is True
-
-    ctx = resolve_advance_context(config, store, git, impl, "main")
-    action = evaluate_advance_rules(config, store, git, impl, "main")
-
-    assert ctx.can_merge is True
-    assert action["type"] == "merge"
-    assert action["description"] == "Merge (review APPROVED)"
 
 
 @pytest.mark.parametrize(
