@@ -29,13 +29,13 @@ from .log_rendering import (
     configured_model_from_gza_info,
     error_lines,
     generic_log_summary,
-    generic_tv_summary,
     model_parity_lines,
     normalize_model_name,
     pretty_json_lines,
     strip_shell_wrapper,
     text_to_lines,
     truncated_json_lines,
+    tv_error_lines,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
 
@@ -130,7 +130,7 @@ class CodexLogRenderer:
             return RenderedLines()
         if event_type == "error":
             if tv:
-                return RenderedLines(tv_lines=[generic_tv_summary(entry)])
+                return RenderedLines(tv_lines=tv_error_lines(entry.get("message", "")))
             return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in error_lines(entry.get("message", ""))])
         if event_type == "thread.started":
             thread_id = entry.get("thread_id")

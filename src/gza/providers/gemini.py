@@ -30,13 +30,13 @@ from .log_rendering import (
     configured_model_from_gza_info,
     error_lines,
     generic_log_summary,
-    generic_tv_summary,
     model_parity_lines,
     normalize_model_name,
     pretty_json_lines,
     text_to_lines,
     tool_one_liner,
     truncated_json_lines,
+    tv_error_lines,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
 
@@ -106,7 +106,7 @@ class GeminiLogRenderer:
             return RenderedLines()
         if event_type == "error":
             if tv:
-                return RenderedLines(tv_lines=[generic_tv_summary(entry)])
+                return RenderedLines(tv_lines=tv_error_lines(entry.get("message", "")))
             return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in error_lines(entry.get("message", ""))])
         if event_type == "init":
             self._provider_model = normalize_model_name(entry.get("model"))

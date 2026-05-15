@@ -109,6 +109,36 @@ def test_gemini_renderer_keeps_user_content_visible_and_only_suppresses_empty_bo
     assert renderer.suppressed_count == 1
 
 
+def test_codex_renderer_shows_error_message_in_tv_mode() -> None:
+    renderer = get_log_renderer("codex")
+    entry = {"type": "error", "message": "FAILED tests/test_cli.py::test_case - AssertionError"}
+
+    tv_rendered = renderer.handle_tv(entry)
+
+    assert any("FAILED tests/test_cli.py::test_case - AssertionError" in line for line in tv_rendered.tv_lines)
+    assert all("event:error" not in line for line in tv_rendered.tv_lines)
+
+
+def test_claude_renderer_shows_error_message_in_tv_mode() -> None:
+    renderer = get_log_renderer("claude")
+    entry = {"type": "error", "message": '{"error":{"message":"provider crashed"}}'}
+
+    tv_rendered = renderer.handle_tv(entry)
+
+    assert any("provider crashed" in line for line in tv_rendered.tv_lines)
+    assert all("event:error" not in line for line in tv_rendered.tv_lines)
+
+
+def test_gemini_renderer_shows_error_message_in_tv_mode() -> None:
+    renderer = get_log_renderer("gemini")
+    entry = {"type": "error", "message": "permission denied"}
+
+    tv_rendered = renderer.handle_tv(entry)
+
+    assert any("permission denied" in line for line in tv_rendered.tv_lines)
+    assert all("event:error" not in line for line in tv_rendered.tv_lines)
+
+
 def test_claude_renderer_falls_back_for_unknown_assistant_blocks() -> None:
     renderer = get_log_renderer("claude")
     entry = {

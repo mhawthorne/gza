@@ -125,6 +125,21 @@ def error_lines(message: object) -> list[str]:
     return [f"[error] {rendered}" if rendered else "[error]"]
 
 
+def tv_error_lines(message: object, *, max_lines: int = 6) -> list[str]:
+    """Format provider error payloads for TV panels without rich markup."""
+    lines: list[str] = []
+    for line in error_lines(message):
+        plain = line.removeprefix("[error] ").removeprefix("[error]").strip() or "error"
+        lines.append(plain)
+    if len(lines) <= max_lines:
+        return lines
+    visible_lines = max(max_lines - 1, 0)
+    truncated_count = len(lines) - visible_lines
+    if visible_lines == 0:
+        return [f"... (+{len(lines)} more)"]
+    return [*lines[:visible_lines], f"... (+{truncated_count} more)"]
+
+
 def strip_shell_wrapper(cmd: str) -> str:
     """Strip common shell wrappers to show the inner command."""
     for prefix in ('/bin/bash -lc "', "/bin/bash -lc '", '/bin/sh -c "', "/bin/sh -c '"):
