@@ -84,6 +84,44 @@ def _setup_watch_owner_with_failed_rebase(tmp_path: Path, *, failure_reason: str
     return store, impl, failed_rebase
 
 
+def _setup_watch_plan_owned_branch_action_row(tmp_path: Path):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Watch branch owner plan", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    impl = store.add("Watch branch owner implement", task_type="implement", depends_on=plan.id)
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/watch-plan-owned-attention"
+    impl.has_commits = True
+    store.update(impl)
+
+    rebase = store.add("Watch branch owner rebase", task_type="rebase", based_on=impl.id)
+    assert rebase.id is not None
+    rebase.status = "completed"
+    rebase.completed_at = datetime.now(UTC)
+    rebase.branch = "feature/watch-plan-owned-attention"
+    rebase.has_commits = True
+    store.update(rebase)
+
+    unit = store.create_merge_unit(
+        source_branch="feature/watch-plan-owned-attention",
+        target_branch="main",
+        owner_task_id=plan.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(impl.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(rebase.id, unit.id, "rebase")
+
+    return store, plan, impl, rebase
+
+
 def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: Path) -> None:
     """Pending implement tasks use iterate workers, while plan tasks use plain workers."""
     setup_config(tmp_path)
@@ -5052,6 +5090,169 @@ def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(
     assert text.count("ATTENTION") == 2
     assert str(impl.id) in text
     assert "SKIP" not in text
+
+
+def test_watch_cycle_attention_uses_impl_owner_for_plan_owned_rebase_row(tmp_path: Path) -> None:
+    """Plan-owned branch rows should reroot ATTENTION output to the implementation owner."""
+    store, plan, impl, rebase = _setup_watch_plan_owned_branch_action_row(tmp_path)
+
+    config = Config.load(tmp_path)
+    rows = _query_owner_rows(
+        store=store,
+        config=config,
+        git=_make_watch_git(),
+        target_branch="main",
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+    action_rows = [
+        row
+        for row in rows
+        if row.lifecycle_action_task is not None and row.lifecycle_action_task.id == rebase.id
+    ]
+    assert len(action_rows) == 1
+    assert action_rows[0].owner_task.id == plan.id
+    assert any(member.id == impl.id for member in action_rows[0].members)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.determine_next_action",
+            return_value={
+                "type": "needs_discussion",
+                "description": "SKIP: review verdict is NEEDS_DISCUSSION, needs manual attention",
+            },
+        ),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    attention_lines = [line for line in log_path.read_text().splitlines() if "ATTENTION" in line]
+    assert len(attention_lines) == 1
+    assert str(impl.id) in attention_lines[0]
+    assert str(plan.id) not in attention_lines[0]
+
+
+def test_watch_cycle_attention_keeps_plan_when_no_impl_exists(tmp_path: Path) -> None:
+    """Plan-only manual ATTENTION rows should keep the plan identity."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Design unresolved branch ownership", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.determine_next_action",
+            return_value={
+                "type": "needs_discussion",
+                "description": "SKIP: plan needs manual attention",
+            },
+        ),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    attention_lines = [line for line in log_path.read_text().splitlines() if "ATTENTION" in line]
+    assert len(attention_lines) == 1
+    assert str(plan.id) in attention_lines[0]
+
+
+def test_watch_cycle_execution_attention_uses_impl_owner_for_plan_owned_rebase_row(tmp_path: Path) -> None:
+    """Execution-time ATTENTION rows should reroot plan-owned branch rows the same way."""
+    store, plan, impl, rebase = _setup_watch_plan_owned_branch_action_row(tmp_path)
+
+    config = Config.load(tmp_path)
+    rows = _query_owner_rows(
+        store=store,
+        config=config,
+        git=_make_watch_git(),
+        target_branch="main",
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+    action_rows = [
+        row
+        for row in rows
+        if row.lifecycle_action_task is not None and row.lifecycle_action_task.id == rebase.id
+    ]
+    assert len(action_rows) == 1
+    assert action_rows[0].owner_task.id == plan.id
+    assert any(member.id == impl.id for member in action_rows[0].members)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    exec_result = SimpleNamespace(
+        status="skip",
+        message="worker needs manual review",
+        attempted_spawn=True,
+        handled_task_id=None,
+        guarded_pending_task_id=None,
+    )
+    attention = SimpleNamespace(
+        action={
+            "type": "manual_review_required",
+            "description": "SKIP: worker needs manual review",
+            "needs_attention_reason": "manual-review-required",
+        }
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.determine_next_action",
+            return_value={"type": "create_review", "description": "Create review (required before merge)"},
+        ),
+        patch("gza.cli.watch.execute_advance_action", return_value=exec_result),
+        patch("gza.cli.watch.resolve_execution_needs_attention", return_value=attention),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    attention_lines = [line for line in log_path.read_text().splitlines() if "ATTENTION" in line]
+    assert len(attention_lines) == 1
+    assert str(impl.id) in attention_lines[0]
+    assert str(plan.id) not in attention_lines[0]
 
 
 def test_watch_cycle_dedupes_non_human_execution_skip_across_cycles(tmp_path: Path) -> None:

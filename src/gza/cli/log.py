@@ -807,8 +807,9 @@ def cmd_log(args: argparse.Namespace) -> int:
             args,
             registry,
             worker_id_for_follow if is_running else None,
-            task.id if task else None,
-            store if task else None,
+            follow=follow,
+            task_id=task.id if task else None,
+            store=store if task else None,
         )
 
     use_page = getattr(args, 'page', False)
@@ -947,12 +948,13 @@ def _tail_log_file(
     args: argparse.Namespace,
     registry: WorkerRegistry,
     worker_id: str | None,
+    *,
+    follow: bool,
     task_id: str | None = None,
     store: SqliteTaskStore | None = None,
 ) -> int:
     """Tail a log file with optional follow mode."""
     raw_mode = hasattr(args, 'raw') and args.raw
-    follow = hasattr(args, 'follow') and args.follow
     conversation_only = bool(getattr(args, "conversation_only", False))
     ops_only = bool(getattr(args, "ops_only", False))
     ops_log_path: Path | None = getattr(args, "_ops_log_path", None)

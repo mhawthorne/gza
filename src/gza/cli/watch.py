@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 from .. import lineage
 from ..config import Config
@@ -73,6 +73,7 @@ from .git_ops import (
     cleanup_failed_merge_checkout,
     ensure_watch_main_checkout,
 )
+from .query import _resolve_incomplete_owner_task
 
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
@@ -119,6 +120,11 @@ def _watch_skip_message(task: DbTask, action: dict) -> str:
 
 def _watch_needs_attention_message(task: DbTask, action: dict) -> str:
     return format_needs_attention_entry_for_display(task, action=action)
+
+
+def _resolve_watch_attention_display_task(store: SqliteTaskStore, row: LineageOwnerRow) -> DbTask:
+    """Match watch ATTENTION row identity to the same row-level owner selection as incomplete."""
+    return _resolve_incomplete_owner_task(store, cast(Any, row))
 
 
 def _failed_recovery_attention_action(
@@ -1110,6 +1116,7 @@ def _run_cycle(
             display_task = row.owner_task
             action_type = action.get("type")
             if classify_advance_action(action) == "needs_attention":
+                display_task = _resolve_watch_attention_display_task(store, row)
                 # Lineage-progress attention comes from the advance action plan only.
                 log.emit_attention(
                     attention_key=f"advance-attention:{display_task.id}:{action_type}",
@@ -1292,6 +1299,7 @@ def _run_cycle(
                     message = f"{display_task.id}: {message}"
                 attention = resolve_execution_needs_attention(task, exec_result)
                 if attention is not None and display_task.id is not None:
+                    display_task = _resolve_watch_attention_display_task(store, row)
                     # Orthogonal to advance-plan classification: the action tried to run
                     # and the execution layer reported a worker/startup attention state.
                     log.emit_attention(

@@ -888,10 +888,11 @@ class TestLogCommand:
             json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "live"}]}})
         ]))
 
-        captured: dict[str, str | None] = {}
+        captured: dict[str, str | bool | None] = {}
 
-        def fake_tail(log_path, args, reg, worker_id, task_id, store_obj):
+        def fake_tail(log_path, args, reg, worker_id, *, follow, task_id, store):
             captured["worker_id"] = worker_id
+            captured["follow"] = follow
             captured["task_id"] = str(task_id) if task_id is not None else None
             return 0
 
@@ -911,6 +912,7 @@ class TestLogCommand:
         rc = cmd_log(args)
         assert rc == 0
         assert captured["worker_id"] == "w-20260227-010101"
+        assert captured["follow"] is True
         assert captured["task_id"] == str(task.id)
         output = capsys.readouterr().out
         assert "Task: Running task for follow" in output
@@ -983,6 +985,7 @@ class TestLogCommand:
             args,
             FakeRegistry(),
             worker_id="w-follow",
+            follow=True,
         )
 
         assert rc == 0
@@ -1112,6 +1115,7 @@ class TestLogCommand:
             args,
             FakeRegistry(),
             worker_id=None,
+            follow=True,
             task_id=task.id,
             store=store,
         )
@@ -1212,6 +1216,36 @@ class TestLogCommand:
         assert "persisted output" in result.stdout
         assert "Task: Completed task with persisted log" in result.stdout
         assert "ID:" in result.stdout
+
+    @pytest.mark.functional
+    def test_log_follow_raw_by_task_not_running_falls_back_to_static_output(self, tmp_path: Path):
+        """-t -f --raw should print persisted logs and exit when task is not actively running."""
+        import json
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Completed task with persisted raw log")
+        task.status = "completed"
+        task.log_file = ".gza/logs/static-raw.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "static-raw.log").write_text("\n".join([
+            json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "persisted raw output"}]}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "done", "num_steps": 1, "duration_ms": 1000, "total_cost_usd": 0.01}),
+        ]))
+
+        result = subprocess.run(
+            ["uv", "run", "gza", "log", str(task.id), "--follow", "--raw", "--project", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+
+        assert result.returncode == 0
+        assert "persisted raw output" in result.stdout
+        assert "Task: Completed task with persisted raw log" not in result.stdout
 
     def test_log_steps_compact_renders_step_labels(self, tmp_path: Path):
         """--steps renders compact step-first timeline anchors."""
