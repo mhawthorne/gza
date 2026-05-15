@@ -1006,6 +1006,82 @@ def test_conflict_needs_rebase_not_emitted_when_target_already_merged(tmp_path: 
     assert action["description"] == "SKIP: target implementation already merged (merge-unit-merged)"
 
 
+def test_orphan_rebase_descendant_skips_when_canonical_target_merge_unit_is_merged(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feature/canonical-merged"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "merged", merged_by_task_id=impl.id)
+
+    orphan_rebase = store.add(
+        "Retry orphan rebase",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert orphan_rebase.id is not None
+    orphan_rebase.status = "completed"
+    orphan_rebase.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    orphan_rebase.branch = "feature/canonical-merged-orphan"
+    orphan_rebase.merge_status = "unmerged"
+    orphan_rebase.has_commits = True
+    store.update(orphan_rebase)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=False), orphan_rebase, "main")
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: target implementation already merged (merge-unit-merged)"
+
+
+def test_orphan_rebase_descendant_skips_when_canonical_target_has_no_merge_unit(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feature/no-merge-unit"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+    assert store.resolve_merge_unit_for_task(impl.id) is None
+
+    orphan_rebase = store.add(
+        "Retry orphan rebase",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert orphan_rebase.id is not None
+    orphan_rebase.status = "completed"
+    orphan_rebase.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    orphan_rebase.branch = "feature/no-merge-unit-orphan"
+    orphan_rebase.merge_status = "unmerged"
+    orphan_rebase.has_commits = True
+    store.update(orphan_rebase)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=False), orphan_rebase, "main")
+
+    assert action["type"] == "skip"
+    assert action["description"] == (
+        "SKIP: rebase target has no merge unit (rebase-target-missing-merge-unit)"
+    )
+
+
 def test_already_merged_branch_skips_post_rebase_review_and_rebase_actions(
     tmp_path: Path,
     monkeypatch,

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from gza.branch_resolution import resolve_rebase_target_task
 from gza.console import prompt_available_width, shorten_prompt
 from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from gza.git import ResolvedMergeSourceRef
@@ -56,6 +57,7 @@ class PostMergeRebaseState:
     rebase_resolution_proved: bool
     reason: str | None
     warning: str | None = None
+    rebase_target_missing_merge_unit: bool = False
 
 
 @dataclass(frozen=True)
@@ -158,7 +160,17 @@ def resolve_post_merge_rebase_state(
     def _normalize_sha(value: object) -> str | None:
         return value if isinstance(value, str) and value else None
 
-    merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
+    merge_target_task = task
+    if task.task_type == "rebase":
+        resolved_target = resolve_rebase_target_task(store, task)
+        if resolved_target is not None:
+            merge_target_task = resolved_target
+
+    merge_unit = (
+        store.resolve_merge_unit_for_task(merge_target_task.id)
+        if merge_target_task.id is not None
+        else None
+    )
     merge_unit_state = merge_unit.state if merge_unit is not None else None
     if merge_unit_state == "merged":
         return PostMergeRebaseState(
@@ -170,6 +182,26 @@ def resolve_post_merge_rebase_state(
             already_merged=True,
             rebase_resolution_proved=True,
             reason="merge-unit-merged",
+        )
+
+    if (
+        task.task_type == "rebase"
+        and merge_target_task.id is not None
+        and merge_unit is None
+        and bool(task.branch)
+        and bool(merge_target_task.branch)
+        and task.branch != merge_target_task.branch
+    ):
+        return PostMergeRebaseState(
+            merge_unit_state=None,
+            branch_tip_sha=None,
+            target_tip_sha=None,
+            target_is_ancestor_of_branch=None,
+            branch_equals_target=False,
+            already_merged=False,
+            rebase_resolution_proved=False,
+            reason="rebase-target-missing-merge-unit",
+            rebase_target_missing_merge_unit=True,
         )
 
     branch_name = task.branch
@@ -428,6 +460,12 @@ def _target_already_merged_description(ctx: AdvanceContext) -> str:
     state = ctx.post_merge_rebase_state
     reason = state.reason if state is not None else None
     return f"SKIP: target implementation already merged ({reason or 'post-merge proof'})"
+
+
+def _rebase_target_missing_merge_unit_description(ctx: AdvanceContext) -> str:
+    state = ctx.post_merge_rebase_state
+    reason = state.reason if state is not None else None
+    return f"SKIP: rebase target has no merge unit ({reason or 'missing-merge-unit'})"
 
 
 def _merge_review_description(verdict: str, preserved_rebase: DbTask | None) -> str:
@@ -1129,6 +1167,15 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.post_merge_rebase_state.already_merged
         ),
         action=lambda ctx: {"type": "skip", "description": _target_already_merged_description(ctx)},
+    ),
+    AdvanceRule(
+        name="rebase_target_missing_merge_unit",
+        matches=lambda ctx: (
+            ctx.task_type == "rebase"
+            and ctx.post_merge_rebase_state is not None
+            and ctx.post_merge_rebase_state.rebase_target_missing_merge_unit
+        ),
+        action=lambda ctx: {"type": "skip", "description": _rebase_target_missing_merge_unit_description(ctx)},
     ),
     AdvanceRule(
         name="already_merged",
