@@ -38,3 +38,21 @@ either the diagnosis was wrong, or unrelated concerns are being smuggled in.
 A specific failure mode: pairing an infrastructure refactor with a policy
 change in one PR. ("Refactor tests that assert X, and while we're here,
 change X.") Different decisions; separate them.
+
+## A subprocess makes it a functional test
+
+If a test spawns a subprocess, it's a functional test — not a unit test —
+and must be marked `@pytest.mark.functional`. The unit suite has tight
+latency requirements, enforced by a short per-test watchdog, so the inner
+dev loop stays fast and regressions surface quickly. Subprocess startup
+routinely blows that budget; treating these as functional tests gives them
+the headroom they actually need.
+
+## Skip `uv run` inside the test suite
+
+When a test must spawn the CLI as a subprocess, use `sys.executable -m gza`
+rather than `uv run gza`. Pytest already runs inside the project venv (the
+suite is invoked via `uv run pytest`), so `sys.executable` points at the
+same interpreter `uv run` would launch — but without the per-invocation
+lockfile revalidation that `uv run` performs. Skipping that step removes a
+real chunk of the per-test budget and a common source of flakes.
