@@ -14,6 +14,14 @@ import pytest
 from .conftest import make_store, run_gza, setup_config
 
 
+def write_user_config(home_dir: Path, content: str) -> Path:
+    """Write ~/.gza/config.yaml for tests."""
+    user_config_path = home_dir / ".gza" / "config.yaml"
+    user_config_path.parent.mkdir(parents=True, exist_ok=True)
+    user_config_path.write_text(content, encoding="utf-8")
+    return user_config_path
+
+
 class TestConfigRequirements:
     """Tests for gza.yaml configuration requirements."""
 
@@ -662,11 +670,289 @@ class TestLocalConfigOverrides:
             re.MULTILINE,
         )
 
+    def test_user_config_db_path_applies_when_project_omits_it(self, tmp_path: Path):
+        """User config should provide db_path defaults when the project omits them."""
+        from gza.config import Config
+
+        home_dir = Path(os.environ["HOME"])
+        shared_db = home_dir / ".gza" / "shared.db"
+        write_user_config(home_dir, f"db_path: {shared_db}\nuse_docker: false\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+
+        config = Config.load(tmp_path)
+
+        assert config.db_path == shared_db.resolve()
+        assert config.use_docker is False
+        assert config.user_config_active is True
+        assert config.source_map["db_path"] == "user"
+        assert config.source_map["use_docker"] == "user"
+
+    def test_project_config_overrides_user_config(self, tmp_path: Path):
+        """Project gza.yaml should win over user defaults."""
+        from gza.config import Config
+
+        home_dir = Path(os.environ["HOME"])
+        shared_db = home_dir / ".gza" / "shared.db"
+        write_user_config(home_dir, f"db_path: {shared_db}\ntimeout_minutes: 30\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "db_path: .gza/project.db\n"
+            "timeout_minutes: 10\n"
+        )
+
+        config = Config.load(tmp_path)
+
+        assert config.db_path == (tmp_path / ".gza" / "project.db").resolve()
+        assert config.timeout_minutes == 10
+        assert config.source_map["db_path"] == "base"
+        assert config.source_map["timeout_minutes"] == "base"
+
+    def test_local_config_overrides_user_and_project_config(self, tmp_path: Path):
+        """Local overrides should win over both project config and user defaults."""
+        from gza.config import Config
+
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "use_docker: false\nwatch:\n  poll: 15\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "use_docker: true\n"
+            "watch:\n"
+            "  poll: 30\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "use_docker: false\n"
+            "watch:\n"
+            "  poll: 5\n"
+        )
+
+        config = Config.load(tmp_path)
+
+        assert config.use_docker is False
+        assert config.watch.poll == 5
+        assert config.source_map["use_docker"] == "local"
+        assert config.source_map["watch.poll"] == "local"
+
+    def test_gza_db_path_env_override_beats_user_project_and_local(self, tmp_path: Path):
+        """GZA_DB_PATH should override db_path from every config file layer."""
+        shared_db = tmp_path / "env-shared" / "gza.db"
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, f"db_path: {home_dir / '.gza' / 'user.db'}\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "db_path: .gza/project.db\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text("db_path: .gza/local.db\n")
+
+        result = run_gza(
+            "config",
+            "--json",
+            "--project",
+            str(tmp_path),
+            env={"GZA_DB_PATH": str(shared_db)},
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["db_path"] == str(shared_db.resolve())
+        assert payload["sources"]["db_path"] == "env"
+
+    def test_config_command_json_reports_user_sources_and_metadata(self, tmp_path: Path):
+        """gza config --json should expose user-source attribution and metadata."""
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "use_docker: false\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+
+        result = run_gza("config", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["use_docker"] is False
+        assert payload["sources"]["use_docker"] == "user"
+        assert payload["user_config_active"] is True
+        assert payload["user_config_file"] == "~/.gza/config.yaml"
+
+    def test_config_command_json_project_top_level_aliases_override_user_defaults(self, tmp_path: Path):
+        """Project top-level compatibility aliases should beat lower-priority user defaults.* values."""
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(
+            home_dir,
+            "provider: codex\n"
+            "defaults:\n"
+            "  max_steps: 10\n"
+            "  model: gpt-5.3-codex\n"
+            "  reasoning_effort: high\n",
+        )
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "max_steps: 5\n"
+            "model: gpt-5.2-codex\n"
+            "reasoning_effort: medium\n"
+        )
+
+        result = run_gza("config", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["max_steps"] == 5
+        assert payload["sources"]["max_steps"] == "base"
+        assert payload["effective"]["model"] == "gpt-5.2-codex"
+        assert payload["sources"]["model"] == "base"
+        assert payload["effective"]["reasoning_effort"] == "medium"
+        assert payload["sources"]["reasoning_effort"] == "base"
+
+    def test_config_command_json_project_top_level_max_turns_overrides_user_defaults_fallback(
+        self, tmp_path: Path
+    ):
+        """Legacy max_turns fallback should still respect config layer precedence."""
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "defaults:\n  max_turns: 10\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "max_turns: 5\n"
+        )
+
+        with pytest.warns(DeprecationWarning, match="max_turns"):
+            result = run_gza("config", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["max_steps"] == 5
+        assert payload["sources"]["max_steps"] == "base"
+        assert payload["effective"]["max_turns"] == 5
+        assert payload["sources"]["max_turns"] == "base"
+
+    def test_config_command_text_renders_user_source_and_status(self, tmp_path: Path):
+        """gza config text output should render user config status and [user] rows."""
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "use_docker: false\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+
+        result = run_gza("config", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "User config: active (~/.gza/config.yaml)" in result.stdout
+        assert re.search(r"^use_docker\s+false\s+\[user\]$", result.stdout, re.MULTILINE)
+
+    def test_config_command_text_reports_base_source_for_project_top_level_alias(self, tmp_path: Path):
+        """Text output should reflect project precedence over lower-priority user defaults.* values."""
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "defaults:\n  max_steps: 10\n")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "max_steps: 5\n"
+        )
+
+        result = run_gza("config", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert re.search(r"^max_steps\s+5\s+\[base\]$", result.stdout, re.MULTILINE)
+
+    def test_config_command_json_local_top_level_aliases_override_project_defaults(self, tmp_path: Path):
+        """Local top-level compatibility aliases should beat lower-priority project defaults.* values."""
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "defaults:\n"
+            "  max_steps: 10\n"
+            "  model: gpt-5.3-codex\n"
+            "  reasoning_effort: high\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "max_steps: 5\n"
+            "model: gpt-5.2-codex\n"
+            "reasoning_effort: medium\n"
+        )
+
+        result = run_gza("config", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["max_steps"] == 5
+        assert payload["sources"]["max_steps"] == "local"
+        assert payload["effective"]["model"] == "gpt-5.2-codex"
+        assert payload["sources"]["model"] == "local"
+        assert payload["effective"]["reasoning_effort"] == "medium"
+        assert payload["sources"]["reasoning_effort"] == "local"
+
+    def test_config_command_text_reports_local_source_for_top_level_alias(self, tmp_path: Path):
+        """Text output should reflect local precedence over lower-priority project defaults.* values."""
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "defaults:\n"
+            "  max_steps: 10\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text("max_steps: 5\n")
+
+        result = run_gza("config", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert re.search(r"^max_steps\s+5\s+\[local\]$", result.stdout, re.MULTILINE)
+
+    @pytest.mark.parametrize(
+        "key,content",
+        [
+            ("project_name", "project_name: nope\n"),
+            ("project_id", "project_id: nope\n"),
+            ("project_prefix", "project_prefix: nope\n"),
+            ("tasks_file", "tasks_file: nope\n"),
+            ("log_dir", "log_dir: nope\n"),
+            ("branch_strategy", "branch_strategy: simple\n"),
+            ("branch_mode", "branch_mode: single\n"),
+            ("verify_command", "verify_command: uv run pytest\n"),
+            ("unknown_key", "unknown_key: value\n"),
+        ],
+    )
+    def test_user_config_rejects_disallowed_and_unknown_keys(self, tmp_path: Path, key: str, content: str):
+        """User config should hard-fail on disallowed project-specific or unknown keys."""
+        from gza.config import Config, ConfigError
+
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, content)
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+
+        with pytest.raises(
+            ConfigError,
+            match=rf"Invalid user config key '{re.escape(key)}' in ~/.gza/config.yaml",
+        ):
+            Config.load(tmp_path)
+
+    def test_validate_fails_for_invalid_user_config(self, tmp_path: Path):
+        """gza validate should fail when the user config contains disallowed keys."""
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "project_id: nope\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+
+        result = run_gza("validate", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Invalid user config key 'project_id' in ~/.gza/config.yaml" in result.stdout
+
+    def test_config_validate_method_fails_on_invalid_user_config(self, tmp_path: Path):
+        """Config.validate should fail fast on invalid user config."""
+        from gza.config import Config
+
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "branch_mode: single\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+
+        is_valid, errors, warnings = Config.validate(tmp_path)
+
+        assert is_valid is False
+        assert errors == [
+            "Invalid user config key 'branch_mode' in ~/.gza/config.yaml. Put project-specific settings in gza.yaml."
+        ]
+        assert warnings == []
+
     def test_docs_configuration_mentions_gza_db_path_override(self):
         """Operator docs should document GZA_DB_PATH override and precedence."""
         docs_text = Path("docs/configuration.md").read_text()
         assert "GZA_DB_PATH" in docs_text
-        assert "gza.yaml` < `gza.local.yaml` < `GZA_DB_PATH`" in docs_text
+        assert "`~/.gza/config.yaml` < `gza.yaml` < `gza.local.yaml` < `GZA_DB_PATH`" in docs_text
 
     def test_config_keys_table_lists_all_registered_keys_and_columns(self, tmp_path: Path):
         """`gza config keys` should render a tabular registry with stable columns."""
@@ -810,6 +1096,51 @@ class TestInitCommand:
                 "SELECT DISTINCT project_id FROM tasks WHERE prompt LIKE 'task in %' ORDER BY project_id"
             ).fetchall()
         assert ids == [(project_id,)]
+
+    def test_init_with_user_db_path_keeps_project_id_and_initializes_shared_db(self, tmp_path: Path):
+        """Init should honor user-level shared DB defaults without writing an active project db_path."""
+        from gza.config import Config
+
+        home_dir = Path(os.environ["HOME"])
+        shared_db = home_dir / ".gza" / "gza.db"
+        write_user_config(home_dir, f"db_path: {shared_db}\n")
+
+        result = run_gza("init", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
+        assert re.search(r"^project_id:\s*([a-z0-9]{1,64})\s*$", content, re.MULTILINE)
+        assert re.search(r"^db_path:\s*", content, re.MULTILINE) is None
+        assert "# db_path: .gza/gza.db" in content
+
+        config = Config.load(tmp_path)
+        assert config.db_path == shared_db.resolve()
+        assert shared_db.exists()
+
+    def test_init_rejects_semantically_invalid_user_config_before_writing_project_file(self, tmp_path: Path):
+        """Init should fail before writing gza.yaml when user config passes schema but fails runtime validation."""
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "db_path: 123\n")
+
+        result = run_gza("init", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Invalid user config in ~/.gza/config.yaml" in result.stdout
+        assert "'db_path' must be a string" in result.stdout
+        assert (tmp_path / "gza.yaml").exists() is False
+        assert (tmp_path / "gza.local.yaml.example").exists() is False
+
+    def test_init_rejects_malformed_user_config_before_writing_project_file(self, tmp_path: Path):
+        """Init should report malformed user config cleanly and avoid partial project files."""
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "defaults:\n  model: [\n")
+
+        result = run_gza("init", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Invalid YAML syntax in ~/.gza/config.yaml" in result.stdout
+        assert (tmp_path / "gza.yaml").exists() is False
+        assert (tmp_path / "gza.local.yaml.example").exists() is False
 
     def test_init_does_not_overwrite(self, tmp_path: Path):
         """Init command does not overwrite existing config without --force."""

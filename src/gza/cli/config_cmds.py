@@ -16,7 +16,7 @@ from typing import Any
 from rich.table import Table
 
 from .. import colors as _colors
-from ..config import Config, _generate_project_id
+from ..config import Config, ConfigError, _generate_project_id
 from ..config_schema import CONFIG_KEY_REGISTRY
 from ..console import console
 from ..db import SqliteTaskStore, Task, task_id_numeric_key
@@ -1385,6 +1385,10 @@ def cmd_config(args: argparse.Namespace) -> int:
             "effective": effective,
             "sources": effective_sources,
             "model_resolution": model_resolution,
+            "user_config_active": config.user_config_active,
+            "user_config_file": (
+                Config.user_config_display_path() if config.user_config_file else None
+            ),
             "local_overrides_active": config.local_overrides_active,
             "local_override_file": (
                 config.local_override_path.name if config.local_override_path else None
@@ -1406,6 +1410,11 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(f"Config: {base_path.name} -> {os.readlink(base_path)}")
     else:
         print(f"Config: {base_path.name}")
+
+    if config.user_config_active and config.user_config_file:
+        print(f"User config: active ({Config.user_config_display_path()})")
+    else:
+        print("User config: inactive")
 
     if config.local_overrides_active and config.local_override_path:
         local_path = Config.local_config_path(Path(args.project_dir))
@@ -2019,6 +2028,16 @@ def cmd_init(args: argparse.Namespace) -> int:
         choice = "1"
 
     project_id = _generate_project_id(args.project_dir, default_project_name)
+
+    try:
+        Config.preflight_init_user_config(
+            args.project_dir,
+            project_name=default_project_name,
+            project_id=project_id,
+        )
+    except ConfigError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     # Replace project metadata placeholders
     config_content = template.replace("project_name: my-project", f"project_name: {default_project_name}")

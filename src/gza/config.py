@@ -15,6 +15,7 @@ import yaml
 APP_NAME = "gza"
 CONFIG_FILENAME = f"{APP_NAME}.yaml"
 LOCAL_CONFIG_FILENAME = f"{APP_NAME}.local.yaml"
+USER_CONFIG_FILENAME = "config.yaml"
 logger = logging.getLogger(__name__)
 
 # Compiled regex for validating project_prefix values.
@@ -83,6 +84,18 @@ DEFAULT_REVIEW_CONTEXT_FILE_LIMIT = 12
 DEFAULT_LEARNINGS_WINDOW = 25
 DEFAULT_LEARNINGS_INTERVAL = 5
 DEFAULT_LEARNINGS_MAX_ITEMS = 50
+VALID_CONFIG_FIELDS = {
+    "project_name", "project_id", "project_prefix", "tasks_file", "log_dir", "db_path", "use_docker",
+    "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps",
+    "max_turns", "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
+    "reasoning_effort", "defaults", "task_types", "providers", "branch_strategy", "chat_text_display_length",
+    "verify_command",
+    "advance_create_reviews", "advance_requires_review", "advance_mode", "max_resume_attempts",
+    "max_review_cycles", "iterate_max_iterations", "watch", "interactive_worktree_dir",
+    "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
+    "review_diff_medium_threshold", "review_context_file_limit", "tmux", "learnings_window",
+    "learnings_interval", "learnings_max_items", "theme", "colors",
+}
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "db_path": None,
     "use_docker": None,
@@ -162,6 +175,92 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
+    "theme": None,
+    "colors": {
+        "*": None,
+    },
+}
+USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
+    "db_path": None,
+    "use_docker": None,
+    "docker_image": None,
+    "docker_volumes": None,
+    "docker_setup_command": None,
+    "timeout_minutes": None,
+    "max_steps": None,
+    "max_turns": None,
+    "worktree_dir": None,
+    "work_count": None,
+    "provider": None,
+    "task_providers": {
+        "*": None,
+    },
+    "model": None,
+    "reasoning_effort": None,
+    "defaults": {
+        "model": None,
+        "reasoning_effort": None,
+        "max_steps": None,
+        "max_turns": None,
+    },
+    "task_types": {
+        "*": {
+            "model": None,
+            "reasoning_effort": None,
+            "max_steps": None,
+            "max_turns": None,
+        },
+    },
+    "providers": {
+        "*": {
+            "model": None,
+            "reasoning_effort": None,
+            "task_types": {
+                "*": {
+                    "model": None,
+                    "reasoning_effort": None,
+                    "max_steps": None,
+                    "max_turns": None,
+                },
+            },
+        },
+    },
+    "claude": {
+        "fetch_auth_token_from_keychain": None,
+        "args": None,
+    },
+    "tmux": {
+        "enabled": None,
+        "auto_accept_timeout": None,
+        "max_idle_timeout": None,
+        "detach_grace": None,
+        "terminal_size": None,
+    },
+    "chat_text_display_length": None,
+    "watch": {
+        "batch": None,
+        "poll": None,
+        "no_activity_timeout": None,
+        "max_idle": None,
+        "max_iterations": None,
+        "restart_failed_batch": None,
+        "failure_backoff_initial": None,
+        "failure_backoff_max": None,
+        "failure_halt_after": None,
+    },
+    "iterate_max_iterations": None,
+    "max_resume_attempts": None,
+    "max_review_cycles": None,
+    "interactive_worktree_dir": None,
+    "merge_squash_threshold": None,
+    "main_checkout_isolate": None,
+    "cleanup_days": None,
+    "review_diff_small_threshold": None,
+    "review_diff_medium_threshold": None,
+    "review_context_file_limit": None,
+    "learnings_window": None,
+    "learnings_interval": None,
+    "learnings_max_items": None,
     "theme": None,
     "colors": {
         "*": None,
@@ -290,23 +389,72 @@ def _record_leaf_sources(data: dict, source: str, source_map: dict[str, str], pa
             source_map[path] = source
 
 
-def _deep_merge_dicts(base: dict, override: dict, source_map: dict[str, str], path_prefix: str = "") -> dict:
+def _deep_merge_dicts(
+    base: dict,
+    override: dict,
+    source_map: dict[str, str],
+    *,
+    source: str,
+    path_prefix: str = "",
+) -> dict:
     merged = copy.deepcopy(base)
     for key, value in override.items():
         path = f"{path_prefix}.{key}" if path_prefix else key
         if value is None and isinstance(merged.get(key), dict):
             continue
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dicts(merged[key], value, source_map, path)
+            merged[key] = _deep_merge_dicts(merged[key], value, source_map, source=source, path_prefix=path)
             continue
 
         merged[key] = copy.deepcopy(value)
         _remove_source_subtree(source_map, path)
         if isinstance(value, dict):
-            _record_leaf_sources(value, "local", source_map, path)
+            _record_leaf_sources(value, source, source_map, path)
         else:
-            source_map[path] = "local"
+            source_map[path] = source
     return merged
+
+
+_CONFIG_LAYER_PRIORITY = {
+    "default": 0,
+    "derived": 0,
+    "user": 1,
+    "base": 2,
+    "local": 3,
+    "env": 4,
+}
+
+
+def _get_nested_config_value(data: dict, path: str) -> tuple[bool, object]:
+    current: object = data
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return False, None
+        current = current[part]
+    return True, current
+
+
+def _resolve_compat_value(
+    data: dict,
+    source_map: dict[str, str],
+    candidates: list[str],
+) -> tuple[object | None, str | None]:
+    """Resolve compatibility aliases by config layer first, then by path priority."""
+    winner: tuple[int, int, object, str] | None = None
+    total_candidates = len(candidates)
+    for idx, path in enumerate(candidates):
+        exists, value = _get_nested_config_value(data, path)
+        if not exists or value is None:
+            continue
+        source = source_map.get(path, "default")
+        layer_priority = _CONFIG_LAYER_PRIORITY.get(source, 0)
+        shape_priority = total_candidates - idx
+        candidate = (layer_priority, shape_priority, value, path)
+        if winner is None or candidate[:2] > winner[:2]:
+            winner = candidate
+    if winner is None:
+        return None, None
+    return winner[2], winner[3]
 
 
 def _validate_local_override_data(data: dict, schema: dict, path_prefix: str = "") -> None:
@@ -330,6 +478,32 @@ def _validate_local_override_data(data: dict, schema: dict, path_prefix: str = "
         elif isinstance(value, dict):
             raise ConfigError(
                 f"Invalid local override value for '{path}' in {LOCAL_CONFIG_FILENAME}: "
+                "nested object is not allowed here."
+            )
+
+
+def _validate_user_config_data(data: dict, schema: dict, path_prefix: str = "") -> None:
+    user_config_display = Config.user_config_display_path()
+    for key, value in data.items():
+        path = f"{path_prefix}.{key}" if path_prefix else key
+        allowed = schema.get(key, schema.get("*"))
+        if allowed is None and key not in schema and "*" not in schema:
+            raise ConfigError(
+                f"Invalid user config key '{path}' in {user_config_display}. "
+                "Put project-specific settings in gza.yaml."
+            )
+        if isinstance(allowed, dict):
+            if value is None:
+                continue
+            if not isinstance(value, dict):
+                raise ConfigError(
+                    f"Invalid user config value for '{path}' in {user_config_display}: "
+                    "expected a dictionary."
+                )
+            _validate_user_config_data(value, allowed, path)
+        elif isinstance(value, dict):
+            raise ConfigError(
+                f"Invalid user config value for '{path}' in {user_config_display}: "
                 "nested object is not allowed here."
             )
 
@@ -465,7 +639,9 @@ class Config:
     tmux: TmuxConfig = field(default_factory=TmuxConfig)  # Tmux session configuration
     theme: str | None = "minimal"  # Named color theme (default: 'minimal')
     colors: dict[str, str] = field(default_factory=dict)  # Ad-hoc per-field color overrides
-    source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/local/env)
+    source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/user/local/env)
+    user_config_file: Path | None = None
+    user_config_active: bool = False
     local_override_path: Path | None = None
     local_overrides_active: bool = False
 
@@ -663,8 +839,37 @@ class Config:
         return project_dir / LOCAL_CONFIG_FILENAME
 
     @classmethod
-    def _load_merged_config_data(cls, project_dir: Path) -> tuple[dict, dict[str, str], Path | None, bool]:
-        """Load base/local config layers with deep-merge and source attribution."""
+    def user_config_path(cls) -> Path:
+        """Get the path to the user-level config file."""
+        return Path.home() / f".{APP_NAME}" / USER_CONFIG_FILENAME
+
+    @classmethod
+    def user_config_display_path(cls) -> str:
+        """Return the canonical user config path for display."""
+        return f"~/.{APP_NAME}/{USER_CONFIG_FILENAME}"
+
+    @classmethod
+    def _load_user_config_data(cls) -> tuple[dict, Path | None, bool]:
+        """Load and validate user-level config data if present."""
+        user_path = cls.user_config_path()
+        if not user_path.exists():
+            return {}, None, False
+
+        try:
+            user_data = _read_yaml_dict(user_path)
+        except yaml.YAMLError as exc:
+            raise ConfigError(
+                f"Invalid YAML syntax in {cls.user_config_display_path()}: {exc}"
+            ) from exc
+        if user_data:
+            _validate_user_config_data(user_data, USER_CONFIG_ALLOWED_SCHEMA)
+        return user_data, user_path, bool(user_data)
+
+    @classmethod
+    def _load_merged_config_data(
+        cls, project_dir: Path
+    ) -> tuple[dict, dict[str, str], Path | None, bool, Path | None, bool]:
+        """Load user/base/local config layers with deep-merge and source attribution."""
         config_path = cls.config_path(project_dir)
 
         if not config_path.exists():
@@ -673,21 +878,36 @@ class Config:
                 f"Run 'gza init' to create one."
             )
 
-        base_data = _read_yaml_dict(config_path)
+        user_data, user_path, user_active = cls._load_user_config_data()
         source_map: dict[str, str] = {}
-        _record_leaf_sources(base_data, "base", source_map)
+        merged_data = copy.deepcopy(user_data)
+        if user_data:
+            _record_leaf_sources(user_data, "user", source_map)
+
+        base_data = _read_yaml_dict(config_path)
+        if merged_data:
+            merged_data = _deep_merge_dicts(merged_data, base_data, source_map, source="base")
+        else:
+            merged_data = copy.deepcopy(base_data)
+            _record_leaf_sources(base_data, "base", source_map)
 
         local_path = cls.local_config_path(project_dir)
         local_active = False
-        merged_data = copy.deepcopy(base_data)
         if local_path.exists():
             local_data = _read_yaml_dict(local_path)
             if local_data:
                 _validate_local_override_data(local_data, LOCAL_OVERRIDE_ALLOWED_SCHEMA)
-                merged_data = _deep_merge_dicts(merged_data, local_data, source_map)
+                merged_data = _deep_merge_dicts(merged_data, local_data, source_map, source="local")
                 local_active = True
 
-        return merged_data, source_map, (local_path if local_path.exists() else None), local_active
+        return (
+            merged_data,
+            source_map,
+            user_path,
+            user_active,
+            (local_path if local_path.exists() else None),
+            local_active,
+        )
 
     @classmethod
     def load(cls, project_dir: Path, *, discover: bool = False) -> "Config":
@@ -698,8 +918,38 @@ class Config:
         if discover:
             project_dir = discover_project_dir(project_dir)
 
+        (
+            data,
+            source_map,
+            user_config_path,
+            user_config_active,
+            local_override_path,
+            local_overrides_active,
+        ) = cls._load_merged_config_data(project_dir)
+        return cls._build_config_from_merged_data(
+            project_dir,
+            data,
+            source_map,
+            user_config_path=user_config_path,
+            user_config_active=user_config_active,
+            local_override_path=local_override_path,
+            local_overrides_active=local_overrides_active,
+        )
+
+    @classmethod
+    def _build_config_from_merged_data(
+        cls,
+        project_dir: Path,
+        data: dict,
+        source_map: dict[str, str],
+        *,
+        user_config_path: Path | None,
+        user_config_active: bool,
+        local_override_path: Path | None,
+        local_overrides_active: bool,
+    ) -> "Config":
+        """Build a Config from already-merged config data."""
         config_path = cls.config_path(project_dir)
-        data, source_map, local_override_path, local_overrides_active = cls._load_merged_config_data(project_dir)
 
         # if local_overrides_active and local_override_path:
         #     project_key = str(project_dir.resolve())
@@ -711,25 +961,8 @@ class Config:
         #         _LOCAL_OVERRIDE_NOTICE_SHOWN.add(project_key)
 
         # Validate and warn about unknown keys
-        valid_fields = {
-            "project_name", "project_id", "project_prefix", "tasks_file", "log_dir", "db_path", "use_docker",
-            "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
-            "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model", "reasoning_effort",
-            "defaults", "task_types", "providers", "branch_strategy", "verify_command",
-            "advance_create_reviews", "advance_requires_review", "advance_mode",
-            "max_resume_attempts", "max_review_cycles", "iterate_max_iterations",
-            "watch",
-            "interactive_worktree_dir",
-            "merge_squash_threshold",
-            "main_checkout_isolate",
-            "cleanup_days",
-            "review_diff_small_threshold", "review_diff_medium_threshold", "review_context_file_limit",
-            "tmux",
-            "learnings_window", "learnings_interval", "learnings_max_items",
-            "theme", "colors",
-        }
         for key in data.keys():
-            if key not in valid_fields:
+            if key not in VALID_CONFIG_FIELDS:
                 print(f"Warning: Unknown configuration field '{key}' in {config_path}", file=sys.stderr)
 
         # Require project_name
@@ -801,31 +1034,41 @@ class Config:
         timeout_minutes = data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES)
         branch_mode = data.get("branch_mode", DEFAULT_BRANCH_MODE)
 
-        # max_steps (canonical): check defaults section first, then top-level
-        max_steps = defaults.get("max_steps")
-        if max_steps is None:
-            max_steps = data.get("max_steps")
-
-        # max_turns (legacy fallback): check defaults section first, then top-level
-        max_turns = defaults.get("max_turns")
-        if max_turns is None:
-            max_turns = data.get("max_turns")
+        # Compatibility aliases resolve by layer first; defaults.* only wins within the same layer.
+        max_steps, max_steps_source_key = _resolve_compat_value(
+            data,
+            source_map,
+            ["defaults.max_steps", "max_steps"],
+        )
+        max_turns, max_turns_source_key = _resolve_compat_value(
+            data,
+            source_map,
+            ["defaults.max_turns", "max_turns"],
+        )
 
         # Migration behavior: if max_steps isn't set, fall back to max_turns with warning.
         if max_steps is None:
             if max_turns is not None:
+                if not isinstance(max_turns, int):
+                    raise ConfigError("'max_turns' must be an integer")
                 warnings.warn(
                     "'max_turns' is deprecated; use 'max_steps'.",
                     DeprecationWarning,
                     stacklevel=2,
                 )
                 max_steps = max_turns
+                max_steps_source_key = max_turns_source_key
             else:
                 max_steps = DEFAULT_MAX_STEPS
+        elif not isinstance(max_steps, int):
+            raise ConfigError("'max_steps' must be an integer")
 
         # Keep max_turns populated for backward-compatible call sites.
         if max_turns is None:
             max_turns = max_steps
+            max_turns_source_key = max_steps_source_key
+        elif not isinstance(max_turns, int):
+            raise ConfigError("'max_turns' must be an integer")
 
         worktree_dir = data.get("worktree_dir", DEFAULT_WORKTREE_DIR)
         work_count = data.get("work_count", DEFAULT_WORK_COUNT)
@@ -847,10 +1090,24 @@ class Config:
                     )
                 task_providers[task_type] = provider_name
 
-        # model: check defaults section first, then top-level
-        model = defaults.get("model") or data.get("model", "")
-        # reasoning_effort: check defaults section first, then top-level
-        reasoning_effort = defaults.get("reasoning_effort") or data.get("reasoning_effort", "")
+        model, model_source_key = _resolve_compat_value(
+            data,
+            source_map,
+            ["defaults.model", "model"],
+        )
+        if model is None:
+            model = ""
+        elif not isinstance(model, str):
+            raise ConfigError("'model' must be a string")
+        reasoning_effort, reasoning_effort_source_key = _resolve_compat_value(
+            data,
+            source_map,
+            ["defaults.reasoning_effort", "reasoning_effort"],
+        )
+        if reasoning_effort is None:
+            reasoning_effort = ""
+        elif not isinstance(reasoning_effort, str):
+            raise ConfigError("'reasoning_effort' must be a string")
 
         docker_volumes = data.get("docker_volumes", [])
 
@@ -1156,34 +1413,15 @@ class Config:
                 claude_config.args = data["claude_args"]
                 source_map["claude.args"] = source_map.get("claude_args", "base")
 
-        # Resolve source for fields that may come from defaults.* fallback.
-        if "max_steps" not in source_map:
-            if defaults.get("max_steps") is not None:
-                source_map["max_steps"] = source_map.get("defaults.max_steps", "base")
-            elif data.get("max_steps") is not None:
-                source_map["max_steps"] = source_map.get("max_steps", "base")
-            elif max_turns is not None:
-                if defaults.get("max_turns") is not None:
-                    source_map["max_steps"] = source_map.get("defaults.max_turns", "base")
-                elif data.get("max_turns") is not None:
-                    source_map["max_steps"] = source_map.get("max_turns", "base")
-
-        if "max_turns" not in source_map:
-            if defaults.get("max_turns") is not None:
-                source_map["max_turns"] = source_map.get("defaults.max_turns", "base")
-            elif data.get("max_turns") is not None:
-                source_map["max_turns"] = source_map.get("max_turns", "base")
-
-        if "model" not in source_map and model:
-            if defaults.get("model"):
-                source_map["model"] = source_map.get("defaults.model", "base")
-            elif data.get("model"):
-                source_map["model"] = source_map.get("model", "base")
-        if "reasoning_effort" not in source_map and reasoning_effort:
-            if defaults.get("reasoning_effort"):
-                source_map["reasoning_effort"] = source_map.get("defaults.reasoning_effort", "base")
-            elif data.get("reasoning_effort"):
-                source_map["reasoning_effort"] = source_map.get("reasoning_effort", "base")
+        # Resolve sources for semantic fields whose winning value may come from defaults.*.
+        if max_steps_source_key is not None:
+            source_map["max_steps"] = source_map.get(max_steps_source_key, "base")
+        if max_turns_source_key is not None:
+            source_map["max_turns"] = source_map.get(max_turns_source_key, "base")
+        if model_source_key is not None:
+            source_map["model"] = source_map.get(model_source_key, "base")
+        if reasoning_effort_source_key is not None:
+            source_map["reasoning_effort"] = source_map.get(reasoning_effort_source_key, "base")
 
         advance_create_reviews = bool(data.get("advance_create_reviews", DEFAULT_ADVANCE_CREATE_REVIEWS))
         advance_requires_review = bool(data.get("advance_requires_review", DEFAULT_ADVANCE_REQUIRES_REVIEW))
@@ -1487,9 +1725,41 @@ class Config:
             theme=theme_name,
             colors=colors,
             source_map=source_map,
+            user_config_file=user_config_path,
+            user_config_active=user_config_active,
             local_override_path=local_override_path,
             local_overrides_active=local_overrides_active,
         )
+
+    @classmethod
+    def preflight_init_user_config(cls, project_dir: Path, *, project_name: str, project_id: str) -> None:
+        """Validate user config semantics for `gza init` before writing project files."""
+        user_data, user_path, user_active = cls._load_user_config_data()
+        if not user_data:
+            return
+
+        source_map: dict[str, str] = {}
+        _record_leaf_sources(user_data, "user", source_map)
+        candidate_data = copy.deepcopy(user_data)
+        candidate_data["project_name"] = project_name
+        candidate_data["project_id"] = project_id
+        source_map["project_name"] = "base"
+        source_map["project_id"] = "base"
+
+        try:
+            cls._build_config_from_merged_data(
+                project_dir,
+                candidate_data,
+                source_map,
+                user_config_path=user_path,
+                user_config_active=user_active,
+                local_override_path=None,
+                local_overrides_active=False,
+            )
+        except ConfigError as exc:
+            raise ConfigError(
+                f"Invalid user config in {cls.user_config_display_path()}: {exc}"
+            ) from exc
 
     @classmethod
     def validate(cls, project_dir: Path) -> tuple[bool, list[str], list[str]]:
@@ -1509,7 +1779,14 @@ class Config:
 
         # Try to parse and merge YAML config layers
         try:
-            data, _source_map, local_override_path, local_overrides_active = cls._load_merged_config_data(project_dir)
+            (
+                data,
+                _source_map,
+                user_config_path,
+                user_config_active,
+                local_override_path,
+                local_overrides_active,
+            ) = cls._load_merged_config_data(project_dir)
         except yaml.YAMLError as e:
             errors.append(f"Invalid YAML syntax: {e}")
             return False, errors, warnings
@@ -1525,30 +1802,13 @@ class Config:
             errors.append(f"Error reading file: {e}")
             return False, errors, warnings
 
+        if user_config_active and user_config_path:
+            warnings.append(f"User config active: {cls.user_config_display_path()}")
         if local_overrides_active and local_override_path:
             warnings.append(f"Local overrides active: {local_override_path.name}")
 
-        # Validate known fields - unknown keys are warnings, not errors
-        valid_fields = {
-            "project_name", "project_id", "project_prefix", "tasks_file", "log_dir", "db_path", "use_docker",
-            "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps", "max_turns",
-            "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model", "reasoning_effort",
-            "defaults", "task_types", "providers", "branch_strategy", "verify_command",
-            "advance_create_reviews", "advance_requires_review", "advance_mode",
-            "max_resume_attempts", "max_review_cycles", "iterate_max_iterations",
-            "watch",
-            "interactive_worktree_dir",
-            "merge_squash_threshold",
-            "main_checkout_isolate",
-            "cleanup_days",
-            "review_diff_small_threshold", "review_diff_medium_threshold", "review_context_file_limit",
-            "tmux",
-            "learnings_window", "learnings_interval", "learnings_max_items",
-            "theme", "colors",
-        }
-
         for key in data.keys():
-            if key not in valid_fields:
+            if key not in VALID_CONFIG_FIELDS:
                 warnings.append(f"Unknown configuration field: '{key}'")
 
         # Require project_name

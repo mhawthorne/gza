@@ -1,6 +1,7 @@
 """Shared test fixtures."""
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +34,14 @@ def _disable_git_signing(tmp_path, monkeypatch):
     global_config = tmp_path / ".gitconfig-empty"
     global_config.write_text("")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home_dir(tmp_path: Path, monkeypatch):
+    """Isolate HOME so user-level config tests do not read developer-machine state."""
+    home_dir = tmp_path / ".isolated-home"
+    home_dir.mkdir()
+    monkeypatch.setenv("HOME", str(home_dir))
 
 
 @pytest.fixture(autouse=True)

@@ -2,10 +2,15 @@
 
 This document provides a comprehensive reference for all configuration options available in Gza.
 
-## Configuration File (gza.yaml)
+## Configuration Files
 
-The main configuration file is `gza.yaml` in your project root directory.
-You can optionally add `gza.local.yaml` for machine-local overrides.
+Gza reads configuration from three YAML layers:
+
+1. `~/.gza/config.yaml` for per-user defaults across all projects on the machine
+2. `gza.yaml` in the project root for committed project configuration
+3. `gza.local.yaml` for machine-local project overrides
+
+`gza.yaml` is still required for project discovery and must define `project_name`.
 
 ### Required Configuration
 
@@ -57,8 +62,30 @@ You can optionally add `gza.local.yaml` for machine-local overrides.
 Use `gza.local.yaml` for machine-specific settings that should not be committed.
 
 - Merge behavior: deep merge for dictionaries, replace for scalars/lists
-- Precedence: `gza.yaml` < `gza.local.yaml` < `GZA_DB_PATH` (for `db_path`) < other env vars
+- Precedence: `~/.gza/config.yaml` < `gza.yaml` < `gza.local.yaml` < `GZA_DB_PATH` (for `db_path`) < other env vars
 - Guardrails: only approved keys can be overridden in `gza.local.yaml`
+
+### User Defaults (`~/.gza/config.yaml`)
+
+Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza project on the machine.
+
+- Merge behavior: deep merge for dictionaries, replace for scalars/lists
+- Purpose: machine-wide defaults such as shared DB location, provider/model defaults, Docker settings, watch/tmux defaults, and UI preferences
+- Project discovery: unsupported. `~/.gza/config.yaml` does not replace `gza.yaml`, and it cannot supply `project_name`.
+- Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
+
+Allowed keys:
+`db_path`, `use_docker`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `watch`, `iterate_max_iterations`, `max_resume_attempts`, `max_review_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `colors`
+
+Disallowed keys:
+`project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`, `verify_command`
+
+Shared DB example:
+
+```yaml
+# ~/.gza/config.yaml
+db_path: ~/.gza/gza.db
+```
 
 `GZA_DB_PATH` is the supported environment override for the task database path. This is useful for one-off runs against a shared DB:
 
@@ -1711,9 +1738,11 @@ Tasks with `depends_on` set will remain pending until their dependency completes
 Configuration is resolved in the following order (highest to lowest priority):
 
 1. **Command-line arguments**
-2. **`gza.local.yaml` file** (if present)
-3. **`gza.yaml` file**
-4. **Hardcoded defaults**
+2. **Environment variables** (`GZA_DB_PATH` for `db_path`, then other env-specific overrides)
+3. **`gza.local.yaml` file** (if present)
+4. **`gza.yaml` file**
+5. **`~/.gza/config.yaml` file** (if present)
+6. **Hardcoded defaults**
 
 Provider credentials (API keys) have their own precedence — see [Dotenv Files](#dotenv-files-env) above.
 
@@ -1744,6 +1773,7 @@ Provider credentials (API keys) have their own precedence — see [Dotenv Files]
 
 | Path | Purpose |
 |------|---------|
+| `~/.gza/config.yaml` | User-level Gza defaults shared across projects |
 | `~/.gza/.env` | User-level environment variables |
 | `~/.claude/` | Claude OAuth credentials |
 | `~/.codex/` | Codex OAuth credentials |

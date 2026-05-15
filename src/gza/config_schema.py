@@ -19,6 +19,8 @@ RUNTIME_ONLY_CONFIG_FIELDS = {
     "project_dir",
     "db_path_value",
     "source_map",
+    "user_config_file",
+    "user_config_active",
     "local_override_path",
     "local_overrides_active",
 }
