@@ -43,6 +43,7 @@ from .log_rendering import (
     pretty_json_lines,
     summarize_tool_detail,
     tool_one_liner,
+    truncated_json_lines,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
 
@@ -373,10 +374,9 @@ class ClaudeLogRenderer:
 
     def _render_unknown(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         if tv:
-            return RenderedLines(tv_lines=[generic_tv_summary(entry)])
+            return RenderedLines(tv_lines=truncated_json_lines(entry))
         lines = [generic_log_summary(entry)]
-        if self.verbose:
-            lines.extend(rich_escape(line) for line in pretty_json_lines(entry))
+        lines.extend(rich_escape(line) for line in pretty_json_lines(entry))
         return RenderedLines(log_lines=lines)
 
     def _render_unknown_assistant(
@@ -388,7 +388,12 @@ class ClaudeLogRenderer:
     ) -> RenderedLines:
         if tv and unknown_block_types:
             block_types = ",".join(dict.fromkeys(unknown_block_types))
-            return RenderedLines(tv_lines=[f"event:assistant block={block_types}"])
+            return RenderedLines(
+                tv_lines=[
+                    f"event:assistant block={block_types}",
+                    *truncated_json_lines(entry, max_lines=7),
+                ]
+            )
         return self._render_unknown(entry, tv=tv)
 
 def sync_keychain_credentials() -> bool:

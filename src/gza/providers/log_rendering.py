@@ -248,3 +248,15 @@ def generic_tv_summary(entry: dict[str, Any], *, max_value_chars: int = 80) -> s
 def pretty_json_lines(entry: dict[str, Any]) -> list[str]:
     """Pretty JSON lines for verbose fallback rendering."""
     return json.dumps(entry, ensure_ascii=True, indent=2, sort_keys=True).splitlines()
+
+
+def truncated_json_lines(entry: dict[str, Any], *, max_lines: int = 8) -> list[str]:
+    """Pretty JSON lines truncated for panel-constrained TV rendering."""
+    lines = pretty_json_lines(entry)
+    if len(lines) <= max_lines:
+        return lines
+    visible_lines = max(max_lines - 1, 0)
+    truncated_count = len(lines) - visible_lines
+    if visible_lines == 0:
+        return [f"... (+{len(lines)} lines)"]
+    return [*lines[:visible_lines], f"... (+{truncated_count} lines)"]

@@ -50,7 +50,7 @@ def test_codex_renderer_accumulates_tv_tokens_from_usage_fixture() -> None:
     assert stats.output_tokens == 8
     assert "Session started (thread: thread_123)" in joined
     assert "I found the root cause." in joined
-    assert "event:weird.codex" in joined
+    assert '"type": "weird.codex"' in joined
 
 
 def test_codex_renderer_counts_distinct_usage_events_with_identical_token_values() -> None:
@@ -89,7 +89,8 @@ def test_gemini_renderer_suppresses_routine_events_and_keeps_unknowns_visible() 
     assert renderer.stats.output_tokens == 12
     assert renderer.suppressed_count == 2
     assert "Planning changes now." in joined
-    assert "event:oddity message=unknown event" in joined
+    assert '"type": "oddity"' in joined
+    assert '"message": "unknown event"' in joined
 
 
 def test_gemini_renderer_keeps_user_content_visible_and_only_suppresses_empty_boundaries() -> None:
@@ -126,6 +127,9 @@ def test_claude_renderer_falls_back_for_unknown_assistant_blocks() -> None:
     assert log_rendered.log_lines[0].startswith("[event:assistant]")
     assert "new_block" in log_rendered.log_lines[0]
     assert tv_rendered.tv_lines[0].startswith("event:assistant")
+    assert tv_rendered.tv_lines[1] == "{"
+    assert any('"new_block"' in line for line in tv_rendered.tv_lines[1:])
+    assert tv_rendered.tv_lines[-1].startswith("... (+")
     assert renderer.suppressed_count == 0
 
 
@@ -158,7 +162,9 @@ def test_claude_renderer_falls_back_for_unknown_user_blocks() -> None:
 
     assert log_rendered.log_lines[0].startswith("[event:user]")
     assert "new_block" in log_rendered.log_lines[0]
-    assert tv_rendered.tv_lines[0].startswith("event:user")
+    assert tv_rendered.tv_lines[0] == "{"
+    assert any('"new_block"' in line for line in tv_rendered.tv_lines)
+    assert tv_rendered.tv_lines[-1].startswith("... (+")
     assert renderer.suppressed_count == 0
 
 
@@ -183,8 +189,9 @@ def test_claude_renderer_keeps_unknown_blocks_when_mixed_with_text() -> None:
     assert any(line.startswith("[event:assistant]") for line in log_rendered.log_lines[1:])
     assert any("new_block" in line for line in log_rendered.log_lines[1:])
     assert tv_rendered.tv_lines[0] == "Known text"
-    assert any(line.startswith("event:assistant") for line in tv_rendered.tv_lines[1:])
-    assert any("new_block" in line for line in tv_rendered.tv_lines[1:])
+    assert any(line == "event:assistant block=new_block" for line in tv_rendered.tv_lines[1:])
+    assert tv_rendered.tv_lines[2] == "{"
+    assert tv_rendered.tv_lines[-1].startswith("... (+")
 
 
 def test_claude_renderer_keeps_non_init_system_errors_visible() -> None:
@@ -202,7 +209,9 @@ def test_claude_renderer_keeps_non_init_system_errors_visible() -> None:
     assert "[event:system]" in log_rendered.log_lines[0]
     assert "subtype=session" in log_rendered.log_lines[0]
     assert "error={\"message\": \"visible failure\"}" in log_rendered.log_lines[0]
-    assert tv_rendered.tv_lines == ["event:system message=error from provider metadata sync"]
+    assert tv_rendered.tv_lines[0] == "{"
+    assert any('"type": "system"' in line for line in tv_rendered.tv_lines)
+    assert any('"message": "error from provider metadata sync"' in line for line in tv_rendered.tv_lines)
     assert renderer.suppressed_count == 0
 
 
@@ -247,8 +256,8 @@ def test_claude_renderer_routine_system_metadata_does_not_clear_provider_model()
     assert not any("Warning: provider did not echo model" in line for line in rendered.log_lines)
 
 
-def test_unknown_event_verbose_mode_expands_json_payload() -> None:
-    renderer = get_log_renderer("codex", verbose=True)
+def test_unknown_event_log_mode_always_expands_json_payload() -> None:
+    renderer = get_log_renderer("codex", verbose=False)
     rendered = renderer.handle_log(
         {"type": "mystery", "message": "hello", "nested": {"x": 1}},
         live=False,
@@ -281,7 +290,9 @@ def test_codex_renderer_falls_back_for_empty_agent_message() -> None:
     assert log_rendered.log_lines[0].startswith("[event:item.completed]")
     assert "item.type=agent_message" in log_rendered.log_lines[0]
     assert tv_rendered.starts_step is False
-    assert tv_rendered.tv_lines[0].startswith("event:item.completed")
+    assert tv_rendered.tv_lines[0] == "{"
+    assert any('"type": "item.completed"' in line for line in tv_rendered.tv_lines)
+    assert any('"item": {' in line for line in tv_rendered.tv_lines)
     assert log_renderer.stats.step_count == 0
     assert tv_renderer.stats.step_count == 0
     assert log_renderer.suppressed_count == 0
@@ -302,9 +313,52 @@ def test_codex_renderer_falls_back_for_command_execution_without_command_or_outp
     assert log_rendered.log_lines[0].startswith("[event:item.completed]")
     assert "item.type=command_execution" in log_rendered.log_lines[0]
     assert "item.id=cmd1" in log_rendered.log_lines[0]
-    assert tv_rendered.tv_lines[0].startswith("event:item.completed")
+    assert tv_rendered.tv_lines[0] == "{"
+    assert any('"command_execution"' in line for line in tv_rendered.tv_lines)
+    assert tv_rendered.tv_lines[-1].startswith("... (+")
     assert log_renderer.suppressed_count == 0
     assert tv_renderer.suppressed_count == 0
+
+
+def test_unknown_event_tv_mode_renders_pretty_json() -> None:
+    renderer = get_log_renderer("codex")
+
+    rendered = renderer.handle_tv({"type": "mystery", "foo": "bar"})
+
+    assert rendered.tv_lines == [
+        "{",
+        '  "foo": "bar",',
+        '  "type": "mystery"',
+        "}",
+    ]
+
+
+def test_unknown_event_tv_mode_truncates_long_json_payload() -> None:
+    renderer = get_log_renderer("codex")
+    entry = {
+        "type": "mystery",
+        "outer": {
+            "alpha": 1,
+            "beta": 2,
+            "gamma": 3,
+            "delta": 4,
+            "epsilon": 5,
+            "zeta": 6,
+        },
+    }
+
+    rendered = renderer.handle_tv(entry)
+
+    assert rendered.tv_lines == [
+        "{",
+        '  "outer": {',
+        '    "alpha": 1,',
+        '    "beta": 2,',
+        '    "delta": 4,',
+        '    "epsilon": 5,',
+        '    "gamma": 3,',
+        "... (+4 lines)",
+    ]
 
 
 def test_live_log_printer_does_not_emit_blank_header_for_suppressed_empty_claude_assistant() -> None:

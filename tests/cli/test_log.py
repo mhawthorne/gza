@@ -1983,9 +1983,11 @@ class TestBuildStepTimeline:
 
         assert len(steps) == 1
         assert steps[0]["message_text"] == "Known text"
-        assert len(steps[0]["substeps"]) == 1
         assert steps[0]["substeps"][0]["detail"].startswith("[event:assistant]")
         assert "new_block" in steps[0]["substeps"][0]["detail"]
+        assert any(substep["detail"] == "{" for substep in steps[0]["substeps"][1:])
+        assert any('"payload": "SHOULD_SHOW"' in substep["detail"] for substep in steps[0]["substeps"][1:])
+        assert any('"type": "assistant"' in substep["detail"] for substep in steps[0]["substeps"][1:])
 
     def test_claude_timeline_skips_suppressed_empty_assistant_steps(self) -> None:
         """Suppressed empty assistant events should not create blank timeline steps."""

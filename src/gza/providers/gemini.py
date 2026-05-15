@@ -36,6 +36,7 @@ from .log_rendering import (
     pretty_json_lines,
     text_to_lines,
     tool_one_liner,
+    truncated_json_lines,
 )
 from .output_formatter import StreamOutputFormatter, truncate_text
 
@@ -240,10 +241,9 @@ class GeminiLogRenderer:
 
     def _render_unknown(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         if tv:
-            return RenderedLines(tv_lines=[generic_tv_summary(entry)])
+            return RenderedLines(tv_lines=truncated_json_lines(entry))
         lines = [generic_log_summary(entry)]
-        if self.verbose:
-            lines.extend(rich_escape(line) for line in pretty_json_lines(entry))
+        lines.extend(rich_escape(line) for line in pretty_json_lines(entry))
         return RenderedLines(log_lines=lines)
 
 
