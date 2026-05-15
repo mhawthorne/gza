@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from gza.cli.git_ops import (
     _build_auto_merge_args,
     _merge_single_task,
@@ -407,6 +409,7 @@ def test_run_task_backed_rebase_invalidates_review_state_when_diff_changes(tmp_p
     assert refreshed_rebase.changed_diff is True
 
 
+@pytest.mark.functional
 def test_advance_explicit_merge_refuses_when_checkout_does_not_match_canonical_target(
     tmp_path: Path,
     capsys,
