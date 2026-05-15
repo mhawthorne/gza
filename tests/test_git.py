@@ -1503,25 +1503,6 @@ class TestExtractionGitHelpers:
             mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
             assert git.is_ancestor("main", "feature/demo") is False
 
-    def test_is_ancestor_with_real_repo(self, tmp_path: Path):
-        repo_dir = tmp_path / "repo"
-        repo_dir.mkdir()
-        git = Git(repo_dir)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (repo_dir / "file.txt").write_text("base\n")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "base")
-        base_sha = git.rev_parse("HEAD")
-        git._run("checkout", "-b", "feature/demo")
-        (repo_dir / "file.txt").write_text("base\nfeature\n")
-        git._run("add", "file.txt")
-        git._run("commit", "-m", "feature")
-
-        assert git.is_ancestor(base_sha, "feature/demo") is True
-        assert git.is_ancestor("feature/demo", "main") is False
-
     def test_resolve_ref_if_possible_uses_rev_parse_if_exists_when_available(self, tmp_path: Path):
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
@@ -1798,41 +1779,3 @@ class TestExtractionGitHelpers:
         assert result.stdout == "stdout"
         assert result.stderr == "stderr"
         mock_run.assert_called_once_with("apply", "--check", "--reverse", str(patch_file), check=False)
-
-    def test_reverse_check_patch_file_result_accepts_selected_subset_already_on_base(self, tmp_path: Path):
-        repo_dir = tmp_path / "repo"
-        repo_dir.mkdir()
-        git = Git(repo_dir)
-
-        git._run("init", "-b", "main")
-        git._run("config", "user.email", "test@example.com")
-        git._run("config", "user.name", "Test User")
-
-        source_file = repo_dir / "src" / "file.py"
-        source_file.parent.mkdir(parents=True, exist_ok=True)
-        source_file.write_text("print('anchor')\n")
-        git._run("add", "src/file.py")
-        git._run("commit", "-m", "base")
-
-        git._run("checkout", "-b", "feature/source")
-        source_file.write_text("print('line a')\nprint('anchor')\n")
-        git._run("add", "src/file.py")
-        git._run("commit", "-m", "add line a")
-
-        patch_text = git.get_diff_patch_for_paths("main...feature/source", ("src/file.py",), binary=True)
-        patch_file = repo_dir / "selected.patch"
-        patch_file.write_text(patch_text)
-        assert "+print('line a')" in patch_text
-        assert "+print('line b')" not in patch_text
-
-        git._run("checkout", "main")
-        source_file.write_text("print('line a')\nprint('anchor')\nprint('line b')\n")
-        git._run("add", "src/file.py")
-        git._run("commit", "-m", "add line a and later line b on main")
-        current_base_delta = git.get_diff_patch_for_paths("main..feature/source", ("src/file.py",), binary=True)
-
-        result = git.reverse_check_patch_file_result(patch_file)
-
-        assert current_base_delta.strip()
-        assert result.returncode == 0
-        assert source_file.read_text() == "print('line a')\nprint('anchor')\nprint('line b')\n"

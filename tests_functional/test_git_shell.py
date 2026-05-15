@@ -3,18 +3,21 @@
 import argparse
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import Mock
 
 from gza import advance_engine as advance_engine_module
 from gza.advance_engine import evaluate_advance_rules, resolve_advance_context
 from gza.cli.git_ops import _merge_single_task
 from gza.config import Config
-from gza.db import check_migration_status
+from gza.db import SqliteTaskStore, check_migration_status
 from gza.git import Git
 from gza.review_verdict import ParsedReviewReport
-from tests.cli.conftest import make_store, setup_config
+from gza.runner import WIP_DIR, _restore_wip_changes, _save_wip_changes, _squash_wip_commits
+from tests.cli.conftest import setup_config
 from tests.helpers.cli import run_gza_subprocess
-from tests.test_advance_engine import _init_repo_with_remote_tracking_only_feature, _make_store
+from tests.test_advance_engine import _make_store
 from tests.test_db import _make_v24_db
+from tests_functional.git_helpers import init_repo_with_remote_tracking_only_feature
 
 
 def test_v24_to_v27_chains_via_gza_migrate(tmp_path: Path) -> None:
@@ -50,7 +53,7 @@ def test_v24_to_v27_chains_via_gza_migrate(tmp_path: Path) -> None:
 def test_squash_merge_reconciles_origin_branch_and_keeps_advance_planning_clean(tmp_path: Path) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
-    store = make_store(tmp_path)
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
     git = Git(tmp_path)
 
     git._run("init", "-b", "main")
@@ -119,7 +122,7 @@ def test_squash_merge_reconciles_origin_branch_and_keeps_advance_planning_clean(
 def test_squash_merge_without_remote_tracking_ref_stays_local_only(tmp_path: Path) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
-    store = make_store(tmp_path)
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
     git = Git(tmp_path)
 
     git._run("init", "-b", "main")
@@ -212,7 +215,7 @@ def test_real_git_remote_tracking_ref_unblocks_failed_rebase_after_later_approve
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     branch = "feat/remote-only-mergeable"
-    git = _init_repo_with_remote_tracking_only_feature(tmp_path, branch)
+    git = init_repo_with_remote_tracking_only_feature(tmp_path, branch)
 
     impl = store.add("Implement feature", task_type="implement")
     assert impl.id is not None
@@ -255,3 +258,266 @@ def test_real_git_remote_tracking_ref_unblocks_failed_rebase_after_later_approve
     assert ctx.can_merge is True
     assert action["type"] == "merge"
     assert action["description"] == "Merge (review APPROVED)"
+
+
+def test_is_ancestor_with_real_repo(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    git = Git(repo_dir)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (repo_dir / "file.txt").write_text("base\n")
+    git._run("add", "file.txt")
+    git._run("commit", "-m", "base")
+    base_sha = git.rev_parse("HEAD")
+    git._run("checkout", "-b", "feature/demo")
+    (repo_dir / "file.txt").write_text("base\nfeature\n")
+    git._run("add", "file.txt")
+    git._run("commit", "-m", "feature")
+
+    assert git.is_ancestor(base_sha, "feature/demo") is True
+    assert git.is_ancestor("feature/demo", "main") is False
+
+
+def test_reverse_check_patch_file_result_accepts_selected_subset_already_on_base(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    git = Git(repo_dir)
+
+    git._run("init", "-b", "main")
+    git._run("config", "user.email", "test@example.com")
+    git._run("config", "user.name", "Test User")
+
+    source_file = repo_dir / "src" / "file.py"
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    source_file.write_text("print('anchor')\n")
+    git._run("add", "src/file.py")
+    git._run("commit", "-m", "base")
+
+    git._run("checkout", "-b", "feature/source")
+    source_file.write_text("print('line a')\nprint('anchor')\n")
+    git._run("add", "src/file.py")
+    git._run("commit", "-m", "add line a")
+
+    patch_text = git.get_diff_patch_for_paths("main...feature/source", ("src/file.py",), binary=True)
+    patch_file = repo_dir / "selected.patch"
+    patch_file.write_text(patch_text)
+    assert "+print('line a')" in patch_text
+    assert "+print('line b')" not in patch_text
+
+    git._run("checkout", "main")
+    source_file.write_text("print('line a')\nprint('anchor')\nprint('line b')\n")
+    git._run("add", "src/file.py")
+    git._run("commit", "-m", "add line a and later line b on main")
+    current_base_delta = git.get_diff_patch_for_paths("main..feature/source", ("src/file.py",), binary=True)
+
+    result = git.reverse_check_patch_file_result(patch_file)
+
+    assert current_base_delta.strip()
+    assert result.returncode == 0
+    assert source_file.read_text() == "print('line a')\nprint('anchor')\nprint('line b')\n"
+
+
+def test_plan_extraction_commit_source_uses_commit_subject_and_provenance(tmp_path: Path) -> None:
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src" / "agent_sessions.py").write_text("persisted = False\n")
+    git._run("add", "src/agent_sessions.py")
+    git._run("commit", "-m", "Improve agent session persistence")
+
+    from gza.extractions import normalize_selected_paths, plan_extraction, resolve_source_selection
+
+    source = resolve_source_selection(
+        store,
+        git,
+        source_task_id=None,
+        source_branch=None,
+        source_commits=("HEAD",),
+        base_branch_override=None,
+    )
+    draft = plan_extraction(
+        git,
+        source,
+        normalize_selected_paths(["src/agent_sessions.py"]),
+        operator_prompt=None,
+    )
+
+    assert draft.prompt.startswith("Carry over: Improve agent session persistence\n")
+    assert "Source: commit " in draft.prompt
+    assert "Source commit subjects:" in draft.prompt
+
+
+def test_save_wip_changes_creates_commit_and_diff(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+    task = store.add(prompt="Test task", task_type="implement")
+    task.slug = "20260212-test-task"
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    (worktree_path / "test.txt").write_text("test content")
+
+    git = Git(worktree_path)
+    git._run("init")
+    git._run("config", "user.email", "test@example.com")
+    git._run("config", "user.name", "Test User")
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+
+    _save_wip_changes(task, git, config, "test-branch")
+
+    log = git._run("log", "-1", "--pretty=%s").stdout.strip()
+    assert log == "WIP: gza task interrupted"
+
+    wip_file = tmp_path / WIP_DIR / "20260212-test-task.diff"
+    assert wip_file.exists()
+    assert "test.txt" in wip_file.read_text()
+
+
+def test_save_wip_changes_with_no_changes(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+    task = store.add(prompt="Test task", task_type="implement")
+    task.slug = "20260212-test-task"
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    git = Git(worktree_path)
+    git._run("init")
+    git._run("config", "user.email", "test@example.com")
+    git._run("config", "user.name", "Test User")
+    (worktree_path / "initial.txt").write_text("initial")
+    git.add(".")
+    git.commit("Initial commit")
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+
+    _save_wip_changes(task, git, config, "test-branch")
+
+    log = git._run("log", "-1", "--pretty=%s").stdout.strip()
+    assert log == "Initial commit"
+    assert not (tmp_path / WIP_DIR / "20260212-test-task.diff").exists()
+
+
+def test_restore_wip_changes_finds_wip_commit(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+    task = store.add(prompt="Test task", task_type="implement")
+    task.slug = "20260212-test-task"
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    git = Git(worktree_path)
+    git._run("init")
+    git._run("config", "user.email", "test@example.com")
+    git._run("config", "user.name", "Test User")
+    (worktree_path / "test.txt").write_text("test")
+    git.add(".")
+    git.commit("WIP: gza task interrupted\n\nTask ID: 20260212-test-task")
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+
+    _restore_wip_changes(task, git, config, "test-branch")
+
+    log = git._run("log", "-1", "--pretty=%s").stdout.strip()
+    assert log == "WIP: gza task interrupted"
+
+
+def test_restore_wip_changes_applies_diff_backup(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+    task = store.add(prompt="Test task", task_type="implement")
+    task.slug = "20260212-test-task"
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    git = Git(worktree_path)
+    git._run("init")
+    git._run("config", "user.email", "test@example.com")
+    git._run("config", "user.name", "Test User")
+    (worktree_path / "initial.txt").write_text("initial")
+    git.add(".")
+    git.commit("Initial commit")
+
+    wip_dir = tmp_path / WIP_DIR
+    wip_dir.mkdir(parents=True)
+    wip_file = wip_dir / "20260212-test-task.diff"
+    wip_file.write_text(
+        "diff --git a/test.txt b/test.txt\n"
+        "new file mode 100644\n"
+        "index 0000000..9daeafb\n"
+        "--- /dev/null\n"
+        "+++ b/test.txt\n"
+        "@@ -0,0 +1 @@\n"
+        "+test\n"
+    )
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+
+    _restore_wip_changes(task, git, config, "test-branch")
+
+    log = git._run("log", "-1", "--pretty=%s").stdout.strip()
+    assert log == "WIP: restored from diff"
+
+
+def test_squash_wip_commits(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+    task = store.add(prompt="Test task", task_type="implement")
+    task.slug = "20260212-test-task"
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    git = Git(worktree_path)
+    git._run("init")
+    git._run("config", "user.email", "test@example.com")
+    git._run("config", "user.name", "Test User")
+
+    (worktree_path / "initial.txt").write_text("initial")
+    git.add(".")
+    git.commit("Initial commit")
+
+    (worktree_path / "wip1.txt").write_text("wip1")
+    git.add(".")
+    git.commit("WIP: first attempt")
+
+    (worktree_path / "wip2.txt").write_text("wip2")
+    git.add(".")
+    git.commit("WIP: second attempt")
+
+    log_before = git._run("log", "--oneline").stdout.strip().split("\n")
+    assert len(log_before) == 3
+
+    _squash_wip_commits(git, task)
+
+    log_after = git._run("log", "--oneline").stdout.strip().split("\n")
+    assert len(log_after) == 1
+    assert log_after[0].endswith("Initial commit")
+    assert git.has_changes(".", include_untracked=False)
+
+
+def test_squash_wip_commits_with_no_wip_commits(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+    task = store.add(prompt="Test task", task_type="implement")
+    task.slug = "20260212-test-task"
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    git = Git(worktree_path)
+    git._run("init")
+    git._run("config", "user.email", "test@example.com")
+    git._run("config", "user.name", "Test User")
+
+    (worktree_path / "test.txt").write_text("test")
+    git.add(".")
+    git.commit("Normal commit")
+
+    _squash_wip_commits(git, task)
+
+    log = git._run("log", "-1", "--pretty=%s").stdout.strip()
+    assert log == "Normal commit"

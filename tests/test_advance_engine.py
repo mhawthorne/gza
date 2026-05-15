@@ -17,7 +17,6 @@ from gza.advance_engine import (
 )
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task as DbTask
-from gza.git import Git
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.review_verdict import ParsedReviewReport
@@ -99,27 +98,6 @@ def _make_store(tmp_path: Path) -> SqliteTaskStore:
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return SqliteTaskStore(db_path, prefix=config.project_prefix)
-
-
-def _init_repo_with_remote_tracking_only_feature(tmp_path: Path, branch: str) -> Git:
-    git = Git(tmp_path)
-    git._run("init", "-b", "main")
-    git._run("config", "user.name", "Test User")
-    git._run("config", "user.email", "test@example.com")
-    (tmp_path / "base.txt").write_text("base\n")
-    git._run("add", "base.txt")
-    git._run("commit", "-m", "Initial commit")
-
-    git._run("checkout", "-b", branch)
-    feature_file = Path(branch.replace("/", "_") + ".txt")
-    (tmp_path / feature_file).write_text("feature\n")
-    git._run("add", str(feature_file))
-    git._run("commit", "-m", "Feature commit")
-    feature_sha = git.rev_parse("HEAD")
-    git._run("checkout", "main")
-    git._run("update-ref", f"refs/remotes/origin/{branch}", feature_sha)
-    git._run("branch", "-D", branch)
-    return git
 
 
 def _make_completed_impl_with_failed_rebase(

@@ -184,38 +184,6 @@ def test_write_extraction_bundle_and_bundle_roundtrip(tmp_path: Path) -> None:
     assert (copied / "manifest.json").exists()
 
 
-def test_plan_extraction_commit_source_uses_commit_subject_and_provenance(tmp_path: Path) -> None:
-    git = Git(tmp_path)
-    git._run("init", "-b", "main")
-    git._run("config", "user.name", "Test User")
-    git._run("config", "user.email", "test@example.com")
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-
-    (tmp_path / "src").mkdir(exist_ok=True)
-    (tmp_path / "src" / "agent_sessions.py").write_text("persisted = False\n")
-    git._run("add", "src/agent_sessions.py")
-    git._run("commit", "-m", "Improve agent session persistence")
-
-    source = resolve_source_selection(
-        store,
-        git,
-        source_task_id=None,
-        source_branch=None,
-        source_commits=("HEAD",),
-        base_branch_override=None,
-    )
-    draft = plan_extraction(
-        git,
-        source,
-        normalize_selected_paths(["src/agent_sessions.py"]),
-        operator_prompt=None,
-    )
-
-    assert draft.prompt.startswith("Carry over: Improve agent session persistence\n")
-    assert "Source: commit " in draft.prompt
-    assert "Source commit subjects:" in draft.prompt
-
-
 def test_plan_extraction_branch_source_uses_branch_name_in_prompt() -> None:
     git = MagicMock(spec=Git)
     source = SourceSelection(

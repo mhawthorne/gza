@@ -17,6 +17,71 @@ def _load_module(path: Path, module_name: str):
     return module
 
 
+def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
+    violations: list[str] = []
+
+    for test_file in tests_root.glob("test_*.py"):
+        module = ast.parse(test_file.read_text(), filename=str(test_file))
+        parent_map = {child: parent for parent in ast.walk(module) for child in ast.iter_child_nodes(parent)}
+
+        for node in ast.walk(module):
+            if not isinstance(node, ast.Call):
+                continue
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "run"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "subprocess"
+                and node.args
+                and isinstance(node.args[0], ast.List)
+            ):
+                parts: list[str | None] = []
+                for elt in node.args[0].elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        parts.append(elt.value)
+                    elif isinstance(elt, ast.Attribute) and isinstance(elt.value, ast.Name) and elt.value.id == "sys":
+                        parts.append(f"sys.{elt.attr}")
+                    else:
+                        parts.append(None)
+
+                if parts[:3] == ["uv", "run", "gza"] or parts[:3] == ["sys.executable", "-m", "gza"]:
+                    violations.append(
+                        f"{test_file}:{node.lineno} CLI subprocess invocation belongs in tests_functional/"
+                    )
+                continue
+
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_run"
+            ):
+                continue
+
+            current = parent_map.get(node)
+            function_name: str | None = None
+            class_name: str | None = None
+            while current is not None:
+                if function_name is None and isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    function_name = current.name
+                if class_name is None and isinstance(current, ast.ClassDef):
+                    class_name = current.name
+                current = parent_map.get(current)
+
+            if (
+                function_name is not None
+                and (
+                    (test_file.name == "test_git.py" and class_name == "TestGitRun")
+                    or (test_file.name == "test_github.py" and class_name == "TestGitHubRun")
+                )
+            ):
+                continue
+
+            violations.append(
+                f"{test_file}:{node.lineno} direct Git._run shell command belongs in tests_functional/"
+            )
+
+    return violations
+
+
 def test_hatch_vcs_does_not_write_source_version_file() -> None:
     """Editable installs must not require writing src/gza/_version.py."""
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
@@ -214,62 +279,41 @@ def test_functional_subprocess_timeouts_within_watchdog() -> None:
 
 
 def test_unit_suite_keeps_cli_subprocess_and_real_shell_tests_out_of_tests_dir() -> None:
-    """Unit tests should not reintroduce CLI subprocess or timeout-budget shell-command cases."""
+    """Top-level unit tests should keep CLI subprocesses and direct shell commands out."""
     repo_root = Path(__file__).resolve().parents[1]
-    violations: list[str] = []
-
-    for test_file in (repo_root / "tests").rglob("test_*.py"):
-        module = ast.parse(test_file.read_text(), filename=str(test_file))
-
-        for node in ast.walk(module):
-            if not isinstance(node, ast.Call):
-                continue
-            if not (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "run"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "subprocess"
-                and node.args
-                and isinstance(node.args[0], ast.List)
-            ):
-                continue
-
-            parts: list[str | None] = []
-            for elt in node.args[0].elts:
-                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                    parts.append(elt.value)
-                elif isinstance(elt, ast.Attribute) and isinstance(elt.value, ast.Name) and elt.value.id == "sys":
-                    parts.append(f"sys.{elt.attr}")
-                else:
-                    parts.append(None)
-
-            if parts[:3] == ["uv", "run", "gza"] or parts[:3] == ["sys.executable", "-m", "gza"]:
-                violations.append(f"{test_file}:{node.lineno} CLI subprocess invocation belongs in tests_functional/")
-
-        for node in module.body:
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            has_timeout = any(
-                isinstance(decorator, ast.Call)
-                and isinstance(decorator.func, ast.Attribute)
-                and decorator.func.attr == "timeout"
-                and isinstance(decorator.func.value, ast.Attribute)
-                and decorator.func.value.attr == "mark"
-                and isinstance(decorator.func.value.value, ast.Name)
-                and decorator.func.value.value.id == "pytest"
-                for decorator in node.decorator_list
-            )
-            if not has_timeout:
-                continue
-            for inner in ast.walk(node):
-                if (
-                    isinstance(inner, ast.Call)
-                    and isinstance(inner.func, ast.Attribute)
-                    and inner.func.attr == "_run"
-                ):
-                    violations.append(f"{test_file}:{inner.lineno} timeout-marked real shell command belongs in tests_functional/")
+    violations = _find_unit_suite_boundary_violations(repo_root / "tests")
 
     assert not violations, "Unit suite boundary violations found:\n  " + "\n  ".join(violations)
+
+
+def test_unit_suite_boundary_flags_unmarked_direct_git_run(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    tests_root.mkdir()
+    (tests_root / "test_real_shell.py").write_text(
+        "from gza.git import Git\n\n"
+        "def test_real_git_shell(tmp_path):\n"
+        "    git = Git(tmp_path)\n"
+        "    git._run('init', '-b', 'main')\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{tests_root / 'test_real_shell.py'}:5 direct Git._run shell command belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_allows_dedicated_git_run_unit_tests(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    tests_root.mkdir()
+    (tests_root / "test_git.py").write_text(
+        "class TestGitRun:\n"
+        "    def test_run_successful_command(self, tmp_path):\n"
+        "        git = object()\n"
+        "        git._run('status')\n"
+    )
+
+    assert _find_unit_suite_boundary_violations(tests_root) == []
 
 
 def test_github_test_workflow_uses_shared_test_script() -> None:
