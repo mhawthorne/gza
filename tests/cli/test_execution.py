@@ -157,22 +157,6 @@ def _background_iterate_restart_error(tmp_path: Path) -> tuple[list[str], str]:
     )
 
 
-def _background_rebase_branch_error(tmp_path: Path) -> tuple[list[str], str]:
-    from tests_functional.git_helpers import init_basic_repo
-
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    init_basic_repo(tmp_path)
-    task = store.add("Completed implementation", task_type="implement")
-    task.status = "completed"
-    task.completed_at = datetime.now(UTC)
-    store.update(task)
-    return (
-        ["rebase", str(task.id), "--background", "--project", str(tmp_path)],
-        f"Error: Task {task.id} has no branch",
-    )
-
-
 def _advance_new_batch_error(tmp_path: Path) -> tuple[list[str], str]:
     setup_config(tmp_path)
     return (
@@ -3361,88 +3345,6 @@ class TestReconciliation:
         assert "Warning: Unexpected reconciliation error for task" in captured.err
         assert "db-write-boom" in captured.err
 
-    def _functional_test_reconciliation_detects_commits_on_worker_died(self, tmp_path: Path):
-        """WORKER_DIED reconciliation sets has_commits=True when branch has commits."""
-        from gza.cli._common import reconcile_in_progress_tasks
-        from gza.config import Config
-        from gza.failure_reasons import mark_task_failed_from_cause
-        from gza.git import Git
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        # Set up a git repo with a branch that has commits
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "README.md").write_text("initial")
-        git._run("add", "README.md")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create a branch with a commit
-        git._run("checkout", "-b", "task-branch")
-        (tmp_path / "work.py").write_text("print('hello')")
-        git._run("add", "work.py")
-        git._run("commit", "-m", "Task work")
-        git._run("checkout", "main")
-
-        # Create task that looks like worker died (dead PID, has branch)
-        task = store.add("Task with commits")
-        store.mark_in_progress(task)
-        task = store.get(task.id)
-        assert task is not None
-        task.running_pid = -1  # guaranteed dead PID
-        task.branch = "task-branch"
-        store.update(task)
-
-        config = Config.load(tmp_path)
-        with patch("gza.cli._common.mark_task_failed_from_cause", wraps=mark_task_failed_from_cause) as mock_mark_failed:
-            reconcile_in_progress_tasks(config)
-
-        refreshed = store.get(task.id)
-        assert refreshed is not None
-        assert refreshed.status == "failed"
-        assert refreshed.failure_reason == "WORKER_DIED"
-        assert refreshed.has_commits is True
-        assert mock_mark_failed.call_count == 1
-        assert mock_mark_failed.call_args.kwargs["explicit_reason"] == "WORKER_DIED"
-
-    def _functional_test_reconciliation_no_commits_on_worker_died(self, tmp_path: Path):
-        """WORKER_DIED reconciliation sets has_commits=False when branch has no commits."""
-        from gza.cli._common import reconcile_in_progress_tasks
-        from gza.config import Config
-        from gza.git import Git
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        # Set up a git repo — no extra branch
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "README.md").write_text("initial")
-        git._run("add", "README.md")
-        git._run("commit", "-m", "Initial commit")
-
-        # Create task with no branch (worker died before branch creation)
-        task = store.add("Task without branch")
-        store.mark_in_progress(task)
-        task = store.get(task.id)
-        assert task is not None
-        task.running_pid = -1
-        store.update(task)
-
-        config = Config.load(tmp_path)
-        reconcile_in_progress_tasks(config)
-
-        refreshed = store.get(task.id)
-        assert refreshed is not None
-        assert refreshed.status == "failed"
-        assert refreshed.failure_reason == "WORKER_DIED"
-        assert refreshed.has_commits is not True
-
     def test_reconciliation_marks_silent_live_task_no_activity(self, tmp_path: Path):
         """An alive-but-silent task (no log writes for > threshold) is marked NO_ACTIVITY."""
         from datetime import UTC, datetime, timedelta
@@ -6137,44 +6039,6 @@ class TestIterateCommand:
             _format_needs_attention_line(iterate_attention.task, iterate_attention.action),
         )
 
-    def _init_git_repo(self, tmp_path: Path) -> None:
-        from gza.git import Git
-
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "README.md").write_text("initial")
-        git._run("add", "README.md")
-        git._run("commit", "-m", "Initial commit")
-
-    def test_cycle_dry_run(self, tmp_path: Path):
-        """gza iterate --dry-run prints preview and exits 0."""
-
-        setup_config(tmp_path)
-        self._init_git_repo(tmp_path)
-        store = make_store(tmp_path)
-        impl = self._make_completed_impl(store)
-
-        result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "dry-run" in result.stdout.lower()
-
-    def test_cycle_uses_default_iterations_when_flag_omitted(self, tmp_path: Path):
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
-            "db_path: .gza/gza.db\n"
-        )
-        self._init_git_repo(tmp_path)
-        store = make_store(tmp_path)
-        impl = self._make_completed_impl(store)
-
-        result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "max 3 iterations" in result.stdout
-
     def test_iterate_live_progress_labels_non_cycle_merge_as_next_action(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
@@ -7506,84 +7370,6 @@ class TestIterateCommand:
         assert run_foreground.call_args.kwargs["task_id"] == pending_improve.id
         assert "Iteration 1/1: run_improve" in output
         assert "merge_with_followups" not in output
-
-    def _functional_test_dry_run_changes_requested_completed_improve_without_review_clear_creates_closing_review(
-        self, tmp_path: Path
-    ):
-        """Dry-run enforces a closing review once a CHANGES_REQUESTED improve has completed."""
-
-        setup_config(tmp_path)
-        self._init_git_repo(tmp_path)
-        store = make_store(tmp_path)
-        impl = self._make_completed_impl(store)
-        git = Git(tmp_path)
-        git._run("checkout", "-b", impl.branch)
-        (tmp_path / "impl.txt").write_text("impl work")
-        git._run("add", "impl.txt")
-        git._run("commit", "-m", "Add impl work")
-        git._run("checkout", "main")
-
-        review = store.add("Review", task_type="review", depends_on=impl.id)
-        review.status = "completed"
-        review.output_content = "**Verdict: CHANGES_REQUESTED**"
-        review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
-        store.update(review)
-
-        improve = store.add(
-            "Completed improve",
-            task_type="improve",
-            based_on=impl.id,
-            depends_on=review.id,
-            same_branch=True,
-        )
-        improve.status = "completed"
-        improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
-        store.update(improve)
-
-        result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "would iterate implementation" in result.stdout.lower()
-        assert "first iteration 1/3 action: create_review" in result.stdout.lower()
-        assert "code changed since the last review" in result.stdout.lower()
-
-    def _functional_test_dry_run_completed_improve_without_review_clear_starts_from_closing_review(self, tmp_path: Path):
-        """Dry-run enforces a closing review from the newest completed improve without review bookkeeping."""
-
-        setup_config(tmp_path)
-        self._init_git_repo(tmp_path)
-        store = make_store(tmp_path)
-        impl = self._make_completed_impl(store)
-        git = Git(tmp_path)
-        git._run("checkout", "-b", impl.branch)
-        (tmp_path / "impl.txt").write_text("impl work")
-        git._run("add", "impl.txt")
-        git._run("commit", "-m", "Add impl work")
-        git._run("checkout", "main")
-
-        stale_review = store.add("Old review", task_type="review", depends_on=impl.id)
-        stale_review.status = "completed"
-        stale_review.output_content = "**Verdict: APPROVED**"
-        stale_review.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
-        store.update(stale_review)
-
-        improve = store.add(
-            "Current write",
-            task_type="improve",
-            based_on=impl.id,
-            depends_on=stale_review.id,
-            same_branch=True,
-        )
-        improve.status = "completed"
-        improve.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
-        store.update(improve)
-
-        result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "would iterate implementation" in result.stdout.lower()
-        assert "first iteration 1/3 action: create_review" in result.stdout.lower()
-        assert "code changed since the last review" in result.stdout.lower()
 
     def test_failed_task_requires_resume_or_retry(self, tmp_path: Path):
         """gza iterate on a failed task without --resume or --retry errors."""
@@ -12842,18 +12628,6 @@ class TestMarkCompletedCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return make_store(tmp_path)
 
-    def _setup_git_repo(self, tmp_path: Path):
-        """Initialize a minimal git repo in tmp_path."""
-        from gza.git import Git
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "README.md").write_text("initial")
-        git._run("add", "README.md")
-        git._run("commit", "-m", "Initial commit")
-        return git
-
     def test_mark_completed_nonexistent_task(self, tmp_path: Path):
         """mark-completed errors on a nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
@@ -12862,22 +12636,6 @@ class TestMarkCompletedCommand:
 
         assert result.returncode == 1
         assert "not found" in result.stdout
-
-    def _functional_test_mark_completed_default_verify_git_for_code_tasks(self, tmp_path: Path):
-        """Code task types default to git verification mode."""
-        store = self._setup_store(tmp_path)
-        self._setup_git_repo(tmp_path)
-
-        task = store.add("Code task with no branch", task_type="implement")
-        task.status = "failed"
-        store.update(task)
-
-        store = make_store(tmp_path)
-        task = store.get_all()[0]
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert "no branch" in result.stdout
 
     def test_mark_completed_default_force_for_non_code_tasks(self, tmp_path: Path):
         """Non-code task types default to status-only completion."""
@@ -12914,111 +12672,6 @@ class TestMarkCompletedCommand:
         assert "no branch" in result.stdout
         assert "Use --force" in result.stdout
 
-    def _functional_test_mark_completed_warns_if_not_failed(self, tmp_path: Path):
-        """mark-completed warns when task status is not failed."""
-        store = self._setup_store(tmp_path)
-        git = self._setup_git_repo(tmp_path)
-
-        # Create a branch for the task
-        git._run("checkout", "-b", "gza/1-test-task")
-        git._run("checkout", "main")
-
-        task = store.add("Pending task")
-        task.status = "pending"
-        task.branch = "gza/1-test-task"
-        store.update(task)
-
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Warning" in result.stdout
-        assert "not in failed status" in result.stdout
-
-    def _functional_test_mark_completed_errors_if_branch_missing_in_git(self, tmp_path: Path):
-        """mark-completed errors when git branch does not exist."""
-        store = self._setup_store(tmp_path)
-        self._setup_git_repo(tmp_path)
-
-        task = store.add("Failed task")
-        task.status = "failed"
-        task.branch = "gza/1-nonexistent-branch"
-        store.update(task)
-
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert "does not exist" in result.stdout
-        assert "Use --force" in result.stdout
-
-    def _functional_test_mark_completed_with_commits_sets_unmerged(self, tmp_path: Path):
-        """mark-completed with --reason stores completion_reason when branch has commits."""
-        store = self._setup_store(tmp_path)
-        git = self._setup_git_repo(tmp_path)
-
-        # Create branch with a commit
-        git._run("checkout", "-b", "gza/1-task-with-commits")
-        (tmp_path / "feature.txt").write_text("feature")
-        git._run("add", "feature.txt")
-        git._run("commit", "-m", "Add feature")
-        git._run("checkout", "main")
-
-        task = store.add("Failed task with commits")
-        task.status = "failed"
-        task.branch = "gza/1-task-with-commits"
-        store.update(task)
-
-        result = run_gza(
-            "mark-completed",
-            str(task.id),
-            "--reason",
-            "EXTRACTION_ALREADY_MERGED",
-            "--project",
-            str(tmp_path),
-        )
-
-        assert result.returncode == 0
-        assert "unmerged" in result.stdout
-
-        updated = store.get(task.id)
-        assert updated is not None
-        assert updated.status == "completed"
-        assert updated.merge_status == "unmerged"
-        assert updated.has_commits is True
-        assert updated.completion_reason == "EXTRACTION_ALREADY_MERGED"
-
-    def _functional_test_mark_completed_without_commits_marks_completed(self, tmp_path: Path):
-        """mark-completed with --reason stores completion_reason when branch has no commits."""
-        store = self._setup_store(tmp_path)
-        git = self._setup_git_repo(tmp_path)
-
-        # Create branch with NO commits beyond main
-        git._run("checkout", "-b", "gza/1-empty-branch")
-        git._run("checkout", "main")
-
-        task = store.add("Failed task no commits")
-        task.status = "failed"
-        task.branch = "gza/1-empty-branch"
-        store.update(task)
-
-        result = run_gza(
-            "mark-completed",
-            str(task.id),
-            "--reason",
-            "EXTRACTION_ALREADY_MERGED",
-            "--project",
-            str(tmp_path),
-        )
-
-        assert result.returncode == 0
-        assert "No commits found" in result.stdout
-        assert "completed" in result.stdout
-
-        updated = store.get(task.id)
-        assert updated is not None
-        assert updated.status == "completed"
-        assert updated.has_commits is False
-        assert updated.completion_reason == "EXTRACTION_ALREADY_MERGED"
-
     def test_mark_completed_force_stale_in_progress_recovery(self, tmp_path: Path):
         """--force with --reason stores completion_reason without git validation."""
         store = self._setup_store(tmp_path)
@@ -13044,69 +12697,6 @@ class TestMarkCompletedCommand:
         assert updated is not None
         assert updated.status == "completed"
         assert updated.completion_reason == "MANUAL_RECOVERY"
-
-    def _functional_test_mark_completed_failed_task_no_warning(self, tmp_path: Path):
-        """mark-completed does not warn when task is in failed status."""
-        store = self._setup_store(tmp_path)
-        git = self._setup_git_repo(tmp_path)
-        git._run("checkout", "-b", "gza/1-failed-branch")
-        git._run("checkout", "main")
-
-        task = store.add("Failed task")
-        task.status = "failed"
-        task.branch = "gza/1-failed-branch"
-        store.update(task)
-
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Warning" not in result.stdout
-
-    def _functional_test_mark_completed_cleans_up_running_worker(self, tmp_path: Path):
-        """mark-completed calls registry.mark_completed() for a running worker."""
-        from gza.workers import WorkerMetadata
-
-        store = self._setup_store(tmp_path)
-
-        git = self._setup_git_repo(tmp_path)
-        git._run("checkout", "-b", "gza/1-worker-task")
-        git._run("checkout", "main")
-
-        task = store.add("Failed task with worker")
-        task.status = "failed"
-        task.branch = "gza/1-worker-task"
-        store.update(task)
-
-        # Register a running worker for this task
-        workers_path = tmp_path / ".gza" / "workers"
-        workers_path.mkdir(parents=True, exist_ok=True)
-        registry = WorkerRegistry(workers_path)
-        worker = WorkerMetadata(
-            worker_id="w-20260301-120000",
-            pid=99999,  # non-existent PID
-            task_id=task.id,
-            task_slug=task.slug,
-            started_at="2026-03-01T12:00:00+00:00",
-            status="running",
-            log_file=None,
-            worktree=None,
-            is_background=True,
-        )
-        registry.register(worker)
-
-        # Verify PID file exists before
-        pid_path = workers_path / "w-20260301-120000.pid"
-        assert pid_path.exists()
-
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-
-        # Worker metadata should be updated to completed and PID file removed
-        updated_worker = registry.get("w-20260301-120000")
-        assert updated_worker is not None
-        assert updated_worker.status == "completed"
-        assert not pid_path.exists()
 
     def test_mark_completed_no_worker_is_graceful(self, tmp_path: Path):
         """mark-completed succeeds when no worker exists for the task."""
@@ -13243,49 +12833,6 @@ class TestMarkCompletedCommand:
         updated = store.get(task.id)
         assert updated is not None
         assert updated.execution_mode is None
-
-    def _functional_test_mark_completed_does_not_touch_already_completed_worker(self, tmp_path: Path):
-        """mark-completed leaves an already-completed worker unchanged."""
-        from gza.workers import WorkerMetadata
-
-        store = self._setup_store(tmp_path)
-
-        git = self._setup_git_repo(tmp_path)
-        git._run("checkout", "-b", "gza/1-already-done-branch")
-        git._run("checkout", "main")
-
-        task = store.add("Failed task with done worker")
-        task.status = "failed"
-        task.branch = "gza/1-already-done-branch"
-        store.update(task)
-
-        workers_path = tmp_path / ".gza" / "workers"
-        workers_path.mkdir(parents=True, exist_ok=True)
-        registry = WorkerRegistry(workers_path)
-        worker = WorkerMetadata(
-            worker_id="w-20260301-130000",
-            pid=99998,
-            task_id=task.id,
-            task_slug=task.slug,
-            started_at="2026-03-01T13:00:00+00:00",
-            status="failed",
-            log_file=None,
-            worktree=None,
-            is_background=True,
-            exit_code=1,
-            completed_at="2026-03-01T13:05:00+00:00",
-        )
-        registry.register(worker)
-
-        store = make_store(tmp_path)
-        task = store.get_all()[0]
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        # Worker that was already failed should remain failed (not touched)
-        updated_worker = registry.get("w-20260301-130000")
-        assert updated_worker is not None
-        assert updated_worker.status == "failed"
 
 
 class TestSetStatusCommand:
@@ -13705,75 +13252,6 @@ class TestSetStatusCommand:
             assert updated.completed_at is not None
         else:
             assert updated.completed_at is None
-
-    def _functional_test_advance_skips_dropped_tasks(self, tmp_path: Path):
-        """gza advance does not act on dropped tasks."""
-        from gza.db import SqliteTaskStore as _Store
-        from gza.git import Git
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = _Store(db_path)
-
-        # Set up a minimal git repo so advance can run
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "README.md").write_text("initial")
-        git._run("add", "README.md")
-        git._run("commit", "-m", "Initial commit")
-
-        # Add a dropped task (it has no branch, no unmerged state)
-        task = store.add("Dropped task", task_type="implement")
-        task.status = "dropped"
-        task.completed_at = datetime.now(UTC)
-        store.update(task)
-
-        # gza advance should report no eligible tasks — the dropped task is not actionable
-        result = run_gza("advance", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "No eligible tasks" in result.stdout
-
-    def _functional_test_advance_explicit_completed_descendant_in_dropped_owner_lineage_is_ineligible(self, tmp_path: Path):
-        """Explicit advance must not rebuild a synthetic plan row for a dropped owner lineage."""
-        from gza.db import SqliteTaskStore as _Store
-        from gza.git import Git
-
-        setup_config(tmp_path)
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = _Store(db_path)
-
-        git = Git(tmp_path)
-        git._run("init", "-b", "main")
-        git._run("config", "user.name", "Test User")
-        git._run("config", "user.email", "test@example.com")
-        (tmp_path / "README.md").write_text("initial")
-        git._run("add", "README.md")
-        git._run("commit", "-m", "Initial commit")
-
-        owner = store.add("Dropped implement owner", task_type="implement")
-        owner.status = "dropped"
-        owner.completed_at = datetime.now(UTC)
-        owner.branch = "feature/dropped-owner"
-        owner.has_commits = True
-        owner.merge_status = "unmerged"
-        store.update(owner)
-        assert owner.id is not None
-
-        descendant = store.add("Completed rebase descendant", task_type="rebase", based_on=owner.id, same_branch=True)
-        descendant.status = "completed"
-        descendant.completed_at = datetime.now(UTC)
-        descendant.branch = owner.branch
-        descendant.has_commits = True
-        descendant.merge_status = "unmerged"
-        store.update(descendant)
-        assert descendant.id is not None
-
-        result = run_gza("advance", str(descendant.id), "--dry-run", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "No eligible tasks to advance" in result.stdout
 
     def test_dropped_task_blocks_dependent(self, tmp_path: Path):
         """A task that depends_on a dropped task is reported as blocked."""

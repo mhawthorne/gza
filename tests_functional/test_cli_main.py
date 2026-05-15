@@ -1,6 +1,6 @@
 """Subprocess CLI help regression tests."""
 
-from tests.helpers.cli import run_gza_subprocess
+from tests_functional.helpers.cli import run_gza_subprocess
 
 
 class TestHelpOutputSubprocess:

@@ -14,7 +14,7 @@ from gza.git import Git
 from gza.review_verdict import ParsedReviewReport
 from gza.runner import WIP_DIR, _restore_wip_changes, _save_wip_changes, _squash_wip_commits
 from tests.cli.conftest import setup_config
-from tests.helpers.cli import run_gza_subprocess
+from tests_functional.helpers.cli import run_gza_subprocess
 from tests.test_advance_engine import _make_store
 from tests.test_db import _make_v24_db
 from tests_functional.git_helpers import init_repo_with_remote_tracking_only_feature

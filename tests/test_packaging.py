@@ -20,12 +20,12 @@ def _load_module(path: Path, module_name: str):
 def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
     violations: list[str] = []
 
-    unit_files = sorted(tests_root.rglob("test_*.py"))
-    unit_files.extend(sorted(tests_root.rglob("conftest.py")))
+    suspicious_patterns = ("_run(", "subprocess.run(", "run_gza_subprocess", "tests_functional")
+    unit_files = sorted(tests_root.rglob("*.py"))
 
     for test_file in unit_files:
         source = test_file.read_text()
-        if "_run(" not in source and "subprocess.run(" not in source:
+        if not any(pattern in source for pattern in suspicious_patterns):
             continue
 
         module = ast.parse(source, filename=str(test_file))
@@ -57,6 +57,12 @@ def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
                     )
                 continue
 
+            if isinstance(node.func, ast.Name) and node.func.id == "run_gza_subprocess":
+                violations.append(
+                    f"{test_file}:{node.lineno} CLI subprocess helper belongs in tests_functional/"
+                )
+                continue
+
             if not (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "_run"
@@ -73,11 +79,6 @@ def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
                     class_name = current.name
                 current = parent_map.get(current)
 
-            if test_file.name != "conftest.py" and not (
-                function_name is not None and function_name.startswith("test_")
-            ):
-                continue
-
             if (
                 function_name is not None
                 and (
@@ -90,6 +91,14 @@ def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
             violations.append(
                 f"{test_file}:{node.lineno} direct Git._run shell command belongs in tests_functional/"
             )
+
+        for node in ast.walk(module):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.module == "tests_functional" or (node.module and node.module.startswith("tests_functional.")):
+                violations.append(
+                    f"{test_file}:{node.lineno} unit tests must not import tests_functional modules"
+                )
 
     return violations
 
@@ -333,6 +342,82 @@ def test_unit_suite_boundary_flags_nested_shell_backed_conftest(tmp_path: Path) 
 
     assert violations == [
         f"{nested_conftest}:5 direct Git._run shell command belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_non_collected_helper_shell_body(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_hidden_helper.py"
+    nested_test.write_text(
+        "from gza.git import Git\n\n"
+        "def _functional_test_hidden(tmp_path):\n"
+        "    git = Git(tmp_path)\n"
+        "    git._run('status')\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:5 direct Git._run shell command belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_subprocess_helper_definition(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    helpers = tests_root / "helpers"
+    helpers.mkdir(parents=True)
+    helper = helpers / "cli.py"
+    helper.write_text(
+        "import subprocess\nimport sys\n\n"
+        "def run_gza_subprocess(*args):\n"
+        "    return subprocess.run([sys.executable, '-m', 'gza', *args])\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{helper}:5 CLI subprocess invocation belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_subprocess_helper_call_and_import(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    helpers = tests_root / "helpers"
+    helpers.mkdir(parents=True)
+    (helpers / "cli.py").write_text("def run_gza_subprocess(*args):\n    return args\n")
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_cli.py"
+    nested_test.write_text(
+        "from tests.helpers.cli import run_gza_subprocess\n\n"
+        "def test_cli_roundtrip():\n"
+        "    run_gza_subprocess('next')\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:4 CLI subprocess helper belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_tests_functional_imports(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_imports.py"
+    nested_test.write_text(
+        "from tests_functional.git_helpers import init_basic_repo\n\n"
+        "def test_x(tmp_path):\n"
+        "    assert init_basic_repo is not None\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:1 unit tests must not import tests_functional modules"
     ]
 
 

@@ -2900,39 +2900,6 @@ def test_ensure_watch_main_checkout_detaches_existing_shared_default_branch_work
     workspace_git.has_changes.assert_called_once_with(include_untracked=True)
 
 
-def _functional_test_execute_merge_action_marks_already_merged_task_without_error(tmp_path: Path) -> None:
-    """Watch-style merge execution should reconcile stale merged branches without surfacing an error."""
-    from tests_functional.git_helpers import setup_git_repo_with_task_branch
-
-    store, git, task, _wt = setup_git_repo_with_task_branch(
-        tmp_path,
-        "Already merged task",
-        "feature/watch-already-merged-success",
-    )
-    config = Config.load(tmp_path)
-
-    assert task.id is not None
-    git._run("merge", "--no-ff", task.branch)
-    store.set_merge_status(task.id, "unmerged")
-
-    merge_result = _execute_merge_action(
-        config,
-        store,
-        git,
-        task,
-        {"type": "merge"},
-        target_branch="main",
-        current_branch="main",
-        already_merged_behavior="mark_merged",
-    )
-
-    assert merge_result.rc == 0
-    assert merge_result.status == "already_merged"
-    refreshed_task = store.get(task.id)
-    assert refreshed_task is not None
-    assert refreshed_task.merge_status == "merged"
-
-
 def test_execute_merge_action_with_followups_aborts_on_merge_source_warning_before_side_effects(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

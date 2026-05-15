@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from tests.helpers.cli import run_gza_subprocess
+from tests_functional.helpers.cli import run_gza_subprocess
 
 
 def _setup_config(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from tests.cli.conftest import make_store, setup_config
-from tests.helpers.cli import run_gza_subprocess
+from tests_functional.helpers.cli import run_gza_subprocess
 
 
 class TestLogFollowSubprocess:
