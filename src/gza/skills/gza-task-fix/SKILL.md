@@ -148,16 +148,15 @@ Persist the fix task (mirrors how `/gza-task-improve` persists its row):
 
 ```bash
 uv run python -c "
-import json, subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.git import Git
-from gza.runner import _compute_slug_override, generate_slug
+from gza.runner import _compute_slug_override, generate_slug, get_task_output_paths
 
 config = Config.load(Path.cwd())
-store = SqliteTaskStore(config.db_path)
+store = SqliteTaskStore.from_config(config)
 
 ledger_body = '''<LEDGER_YAML_FROM_ABOVE>'''
 origin = datetime.now(timezone.utc).strftime('%Y-%m-%d')
@@ -173,34 +172,37 @@ created = store.add(
 )
 assert created.id is not None
 
-if created.slug is None:
-    slug_override = _compute_slug_override(created, store)
-    created.slug = generate_slug(
-        created.prompt, existing_id=None,
-        log_path=config.log_path,
-        git=Git(config.project_dir),
-        store=store,
-        exclude_task_id=created.id,
-        project_name=config.project_name,
-        project_prefix=config.project_prefix,
-        slug_override=slug_override,
-        branch_strategy=config.branch_strategy,
-        explicit_type=created.task_type_hint,
-    )
+try:
+    if created.slug is None:
+        slug_override = _compute_slug_override(created, store)
+        created.slug = generate_slug(
+            created.prompt, existing_id=None,
+            log_path=config.log_path,
+            git=Git(config.project_dir),
+            store=store,
+            exclude_task_id=created.id,
+            project_name=config.project_name,
+            project_prefix=config.project_prefix,
+            slug_override=slug_override,
+            branch_strategy=config.branch_strategy,
+            explicit_type=created.task_type_hint,
+        )
+        store.update(created)
+
+    _report_path, summary_path = get_task_output_paths(created, config.project_dir)
+    assert summary_path is not None
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(summary_with_origin)
+
+    created.report_file = str(summary_path.relative_to(config.project_dir))
+    created.status = 'completed'
+    created.completed_at = datetime.now(timezone.utc)
+    created.output_content = ledger_body
     store.update(created)
-
-prompt_data = json.loads(subprocess.check_output(
-    ['uv', 'run', 'gza', 'show', '--prompt', created.id], text=True,
-))
-summary_path = Path(prompt_data['summary_path'])
-summary_path.parent.mkdir(parents=True, exist_ok=True)
-summary_path.write_text(summary_with_origin)
-
-created.report_file = str(summary_path.relative_to(config.project_dir))
-created.status = 'completed'
-created.completed_at = datetime.now(timezone.utc)
-created.output_content = ledger_body
-store.update(created)
+except Exception:
+    created.status = 'dropped'
+    store.update(created)
+    raise
 
 if <CHANGES_WERE_COMMITTED>:
     store.clear_review_state('<IMPL_ID>')

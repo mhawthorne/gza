@@ -225,20 +225,18 @@ Pass the branch name, authoritative diff context, the `## verify_command result`
 
 After the review agent returns markdown, always persist it as a canonical review artifact and completed review task row.
 
-Use `gza show --prompt` on the newly created review task ID to get the canonical `report_path` (same source of truth as `get_task_output_paths()`), write the file there, and persist `report_file` + `output_content`:
+Compute the canonical `report_path` via `get_task_output_paths(created, config.project_dir)`, write the file there, and persist `report_file` + `output_content`. If any persistence step after `store.add(...)` fails, mark the created review task as `dropped` before re-raising so no runnable orphan stays `pending`:
 
 ```bash
 uv run python -c "
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.runner import _compute_slug_override, generate_slug
-import subprocess
+from gza.runner import _compute_slug_override, generate_slug, get_task_output_paths
 
 config = Config.load(Path.cwd())
-store = SqliteTaskStore(config.db_path)
+store = SqliteTaskStore.from_config(config)
 
 review_markdown = '''<REVIEW_CONTENT>'''
 origin_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
@@ -253,37 +251,38 @@ created = store.add(
 )
 assert created.id is not None
 
-if created.slug is None:
-    slug_override = _compute_slug_override(created, store)
-    created.slug = generate_slug(
-        created.prompt,
-        existing_id=None,
-        log_path=config.log_path,
-        git=None,
-        store=store,
-        exclude_task_id=created.id,
-        project_name=config.project_name,
-        project_prefix=config.project_prefix,
-        slug_override=slug_override,
-        branch_strategy=config.branch_strategy,
-        explicit_type=created.task_type_hint,
-    )
+try:
+    if created.slug is None:
+        slug_override = _compute_slug_override(created, store)
+        created.slug = generate_slug(
+            created.prompt,
+            existing_id=None,
+            log_path=config.log_path,
+            git=None,
+            store=store,
+            exclude_task_id=created.id,
+            project_name=config.project_name,
+            project_prefix=config.project_prefix,
+            slug_override=slug_override,
+            branch_strategy=config.branch_strategy,
+            explicit_type=created.task_type_hint,
+        )
+        store.update(created)
+
+    report_path, _summary_path = get_task_output_paths(created, config.project_dir)
+    assert report_path is not None
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(file_content)
+
+    created.report_file = str(report_path.relative_to(config.project_dir))
+    created.status = 'completed'
+    created.completed_at = datetime.now(timezone.utc)
+    created.output_content = review_markdown
     store.update(created)
-
-prompt_json = subprocess.check_output(
-    ['uv', 'run', 'gza', 'show', '--prompt', created.id],
-    text=True,
-)
-prompt_data = json.loads(prompt_json)
-report_path = Path(prompt_data['report_path'])
-report_path.parent.mkdir(parents=True, exist_ok=True)
-report_path.write_text(file_content)
-
-created.report_file = str(report_path.relative_to(config.project_dir))
-created.status = 'completed'
-created.completed_at = datetime.now(timezone.utc)
-created.output_content = review_markdown
-store.update(created)
+except Exception:
+    created.status = 'dropped'
+    store.update(created)
+    raise
 print(f'Review saved as task #{created.id} ({created.report_file})')
 "
 ```

@@ -154,21 +154,19 @@ If the branch already has an upstream, a plain `git push` is fine. If the push f
 
 After a successful commit and push, always create a completed improve task row and summary artifact, then clear review state for the implementation task.
 
-Use the `review_task_id` already resolved in Step 1 (pass `None` for `depends_on` when this was a comments-only improve), then call `gza show --prompt` on the newly created improve task ID to get the canonical `summary_path` (same source of truth as `get_task_output_paths()`), write the summary there with an origin header, persist `report_file` + `output_content`, and call `store.clear_review_state(<IMPL_TASK_ID>)`. Also call `store.resolve_comments(<IMPL_TASK_ID>)` so the unresolved comments you addressed are marked resolved.
+Use the `review_task_id` already resolved in Step 1 (pass `None` for `depends_on` when this was a comments-only improve), then compute the canonical `summary_path` via `get_task_output_paths(created, config.project_dir)`, write the summary there with an origin header, persist `report_file` + `output_content`, and call `store.clear_review_state(<IMPL_TASK_ID>)`. Also call `store.resolve_comments(<IMPL_TASK_ID>)` so the unresolved comments you addressed are marked resolved. If any persistence step after `store.add(...)` fails, mark the created improve task as `dropped` before re-raising so no runnable orphan stays `pending`.
 
 ```bash
 uv run python -c "
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.git import Git
-from gza.runner import _compute_slug_override, generate_slug
-import subprocess
+from gza.runner import _compute_slug_override, generate_slug, get_task_output_paths
 
 config = Config.load(Path.cwd())
-store = SqliteTaskStore(config.db_path)
+store = SqliteTaskStore.from_config(config)
 
 origin_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 summary_body = '''Addressed <B_COUNT> blocker items: <B_ITEMS_SUMMARY>
@@ -185,38 +183,41 @@ created = store.add(
 )
 assert created.id is not None
 
-if created.slug is None:
-    slug_override = _compute_slug_override(created, store)
-    created.slug = generate_slug(
-        created.prompt,
-        existing_id=None,
-        log_path=config.log_path,
-        git=Git(config.project_dir),
-        store=store,
-        exclude_task_id=created.id,
-        project_name=config.project_name,
-        project_prefix=config.project_prefix,
-        slug_override=slug_override,
-        branch_strategy=config.branch_strategy,
-        explicit_type=created.task_type_hint,
-    )
+try:
+    if created.slug is None:
+        slug_override = _compute_slug_override(created, store)
+        created.slug = generate_slug(
+            created.prompt,
+            existing_id=None,
+            log_path=config.log_path,
+            git=Git(config.project_dir),
+            store=store,
+            exclude_task_id=created.id,
+            project_name=config.project_name,
+            project_prefix=config.project_prefix,
+            slug_override=slug_override,
+            branch_strategy=config.branch_strategy,
+            explicit_type=created.task_type_hint,
+        )
+        store.update(created)
+
+    _report_path, summary_path = get_task_output_paths(created, config.project_dir)
+    assert summary_path is not None
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(summary_with_origin)
+
+    created.report_file = str(summary_path.relative_to(config.project_dir))
+    created.status = 'completed'
+    created.completed_at = datetime.now(timezone.utc)
+    created.output_content = summary_body
     store.update(created)
+except Exception:
+    created.status = 'dropped'
+    store.update(created)
+    raise
 
-prompt_json = subprocess.check_output(
-    ['uv', 'run', 'gza', 'show', '--prompt', created.id],
-    text=True,
-)
-prompt_data = json.loads(prompt_json)
-summary_path = Path(prompt_data['summary_path'])
-summary_path.parent.mkdir(parents=True, exist_ok=True)
-summary_path.write_text(summary_with_origin)
-
-created.report_file = str(summary_path.relative_to(config.project_dir))
-created.status = 'completed'
-created.completed_at = datetime.now(timezone.utc)
-created.output_content = summary_body
-store.update(created)
 store.clear_review_state('<IMPL_TASK_ID>')
+store.resolve_comments('<IMPL_TASK_ID>')
 print(f'Improve saved as task #{created.id} ({created.report_file}); review state cleared')
 "
 ```

@@ -24,7 +24,7 @@ def _create_store_for_project(tmp_path: Path):
     from gza.db import SqliteTaskStore
 
     config = Config.load(tmp_path)
-    store = SqliteTaskStore(config.db_path, prefix=config.project_prefix)
+    store = SqliteTaskStore.from_config(config)
     return config, store
 
 
@@ -51,6 +51,98 @@ def _assign_slug_like_runner(task, store, config, *, git=None) -> None:
         explicit_type=task.task_type_hint,
     )
     store.update(task)
+
+
+def _persist_manual_skill_output(
+    created,
+    store,
+    config,
+    *,
+    content_with_origin: str,
+    output_body: str,
+    path_kind: str,
+    clear_review_task_id: str | None = None,
+    resolve_comments_task_id: str | None = None,
+):
+    from gza.runner import get_task_output_paths
+
+    try:
+        report_path, summary_path = get_task_output_paths(created, config.project_dir)
+        output_path = summary_path if path_kind == "summary" else report_path
+        assert output_path is not None
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(content_with_origin)
+
+        created.report_file = str(output_path.relative_to(config.project_dir))
+        created.status = "completed"
+        created.completed_at = datetime.now(UTC)
+        created.output_content = output_body
+        store.update(created)
+    except Exception:
+        created.status = "dropped"
+        store.update(created)
+        raise
+
+    if clear_review_task_id is not None:
+        store.clear_review_state(clear_review_task_id)
+    if resolve_comments_task_id is not None:
+        store.resolve_comments(resolve_comments_task_id)
+
+
+def _finalize_manual_skill_output_like_snippet(
+    created,
+    store,
+    config,
+    *,
+    content_with_origin: str,
+    output_body: str,
+    path_kind: str,
+    git=None,
+    clear_review_task_id: str | None = None,
+    resolve_comments_task_id: str | None = None,
+):
+    from gza.git import Git
+    import gza.runner as runner
+
+    try:
+        if created.slug is None:
+            slug_override = runner._compute_slug_override(created, store)
+            slug_git = None if created.task_type == "review" else (git if git is not None else Git(config.project_dir))
+            created.slug = runner.generate_slug(
+                created.prompt,
+                existing_id=None,
+                log_path=config.log_path,
+                git=slug_git,
+                store=store,
+                exclude_task_id=created.id,
+                project_name=config.project_name,
+                project_prefix=config.project_prefix,
+                slug_override=slug_override,
+                branch_strategy=config.branch_strategy,
+                explicit_type=created.task_type_hint,
+            )
+            store.update(created)
+
+        report_path, summary_path = runner.get_task_output_paths(created, config.project_dir)
+        output_path = summary_path if path_kind == "summary" else report_path
+        assert output_path is not None
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(content_with_origin)
+
+        created.report_file = str(output_path.relative_to(config.project_dir))
+        created.status = "completed"
+        created.completed_at = datetime.now(UTC)
+        created.output_content = output_body
+        store.update(created)
+    except Exception:
+        created.status = "dropped"
+        store.update(created)
+        raise
+
+    if clear_review_task_id is not None:
+        store.clear_review_state(clear_review_task_id)
+    if resolve_comments_task_id is not None:
+        store.resolve_comments(resolve_comments_task_id)
 
 
 def _extract_generate_slug_calls(snippet: str) -> list[str]:
@@ -497,11 +589,11 @@ class TestSkillContentValidation:
         assert "Config.load()" not in content
         assert content.count("Config.load(Path.cwd())") >= 2
 
-    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve"])
-    def test_manual_review_improve_persistence_snippets_use_valid_store_api(
+    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve", "gza-task-fix"])
+    def test_manual_persistence_snippets_use_project_bound_store_api(
         self, skill_name: str
     ):
-        """Manual persistence snippets should use SqliteTaskStore.add/update, not nonexistent create()."""
+        """Manual persistence snippets should use project-bound SqliteTaskStore.from_config()."""
         from gza.skills_utils import get_skills_source_path
 
         skill_file = get_skills_source_path() / skill_name / "SKILL.md"
@@ -510,34 +602,56 @@ class TestSkillContentValidation:
         assert "from gza.db import SqliteTaskStore" in content
         assert "from gza.models import Task" not in content
         assert "config = Config.load(Path.cwd())" in content
+        assert "SqliteTaskStore.from_config(config)" in content
         assert "store.add(" in content
         assert "store.update(created)" in content
         assert "store.create(" not in content
 
     @pytest.mark.parametrize(
-        ("skill_name", "expects_git_import"),
-        [("gza-task-review", False), ("gza-task-improve", True)],
+        ("skill_name", "expects_git_import", "path_var"),
+        [
+            ("gza-task-review", False, "report_path"),
+            ("gza-task-improve", True, "summary_path"),
+            ("gza-task-fix", True, "summary_path"),
+        ],
     )
-    def test_manual_review_improve_persistence_snippets_assign_slug_before_show_prompt(
-        self, skill_name: str, expects_git_import: bool
+    def test_manual_persistence_snippets_assign_slug_before_output_path_lookup(
+        self, skill_name: str, expects_git_import: bool, path_var: str
     ):
-        """Manual persistence snippets should assign/persist slug before calling gza show --prompt."""
+        """Manual persistence snippets should assign/persist slug before calling get_task_output_paths()."""
         from gza.skills_utils import get_skills_source_path
 
         skill_file = get_skills_source_path() / skill_name / "SKILL.md"
         content = skill_file.read_text()
 
-        assert "from gza.runner import _compute_slug_override, generate_slug" in content
+        assert "from gza.runner import _compute_slug_override, generate_slug, get_task_output_paths" in content
         assert "if created.slug is None:" in content
         assert "store.update(created)" in content
-        assert "['uv', 'run', 'gza', 'show', '--prompt', created.id]" in content
-        assert content.find("if created.slug is None:") < content.find(
-            "['uv', 'run', 'gza', 'show', '--prompt', created.id]"
+        assert "get_task_output_paths(created, config.project_dir)" in content
+        assert f"assert {path_var} is not None" in content
+        assert content.rfind("try:\n    if created.slug is None:") != -1
+        assert content.rfind("if created.slug is None:") < content.rfind(
+            "get_task_output_paths(created, config.project_dir)"
         )
         if expects_git_import:
             assert "from gza.git import Git" in content
         else:
             assert "from gza.git import Git" not in content
+
+    @pytest.mark.parametrize("skill_name", ["gza-task-review", "gza-task-improve", "gza-task-fix"])
+    def test_manual_persistence_snippets_drop_task_on_post_add_failure(self, skill_name: str):
+        """Manual persistence snippets should mark the created row dropped before re-raising."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / skill_name / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "except Exception:" in content
+        assert "created.status = 'dropped'" in content
+        assert "store.update(created)" in content
+        assert "raise" in content
+        assert content.rfind("assert created.id is not None") < content.rfind("try:")
+        assert content.rfind("try:") < content.rfind("if created.slug is None:")
 
     def test_manual_review_skill_persistence_snippet_stays_checkout_neutral(self):
         """gza-task-review persistence should avoid Git-backed slug collision checks."""
@@ -613,9 +727,6 @@ class TestSkillContentValidation:
         )
         assert created.id is not None
 
-        prompt_before = run_gza("show", "--prompt", created.id, "--project", str(tmp_path))
-        assert prompt_before.returncode == 0
-        assert "Manual review via /gza-task-review" in prompt_before.stdout
         report_path_before, _summary_path_before = get_task_output_paths(created, config.project_dir)
         assert report_path_before is None
 
@@ -625,27 +736,24 @@ class TestSkillContentValidation:
         refreshed = store.get(created.id)
         assert refreshed is not None
 
-        prompt_after = run_gza("show", "--prompt", created.id, "--project", str(tmp_path))
-        assert prompt_after.returncode == 0
-        assert "Manual review via /gza-task-review" in prompt_after.stdout
         report_path_value, _summary_path_after = get_task_output_paths(refreshed, config.project_dir)
         assert report_path_value is not None
 
-        report_path = Path(report_path_value)
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(file_content)
-
-        created.report_file = str(report_path.relative_to(config.project_dir))
-        created.status = "completed"
-        created.completed_at = datetime.now(UTC)
-        created.output_content = review_markdown
-        store.update(created)
+        _persist_manual_skill_output(
+            created,
+            store,
+            config,
+            content_with_origin=file_content,
+            output_body=review_markdown,
+            path_kind="report",
+        )
 
         persisted = store.get(created.id)
         assert persisted is not None
         assert persisted.report_file == created.report_file
         assert isinstance(persisted.completed_at, datetime)
         assert persisted.output_content == review_markdown
+        report_path = Path(report_path_value)
         assert report_path.read_text() == file_content
 
     def test_manual_improve_persistence_flow_works_for_fresh_task(self, tmp_path: Path):
@@ -678,9 +786,6 @@ class TestSkillContentValidation:
         )
         assert created.id is not None
 
-        prompt_before = run_gza("show", "--prompt", created.id, "--project", str(tmp_path))
-        assert prompt_before.returncode == 0
-        assert "Manual improve via /gza-task-improve" in prompt_before.stdout
         _report_path_before, summary_path_before = get_task_output_paths(created, config.project_dir)
         assert summary_path_before is None
 
@@ -690,22 +795,19 @@ class TestSkillContentValidation:
         refreshed = store.get(created.id)
         assert refreshed is not None
 
-        prompt_after = run_gza("show", "--prompt", created.id, "--project", str(tmp_path))
-        assert prompt_after.returncode == 0
-        assert "Manual improve via /gza-task-improve" in prompt_after.stdout
         _report_path_after, summary_path_value = get_task_output_paths(refreshed, config.project_dir)
         assert summary_path_value is not None
 
-        summary_path = Path(summary_path_value)
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(summary_with_origin)
-
-        created.report_file = str(summary_path.relative_to(config.project_dir))
-        created.status = "completed"
-        created.completed_at = datetime.now(UTC)
-        created.output_content = summary_body
-        store.update(created)
-        store.clear_review_state(impl_task.id)
+        _persist_manual_skill_output(
+            created,
+            store,
+            config,
+            content_with_origin=summary_with_origin,
+            output_body=summary_body,
+            path_kind="summary",
+            clear_review_task_id=impl_task.id,
+            resolve_comments_task_id=impl_task.id,
+        )
 
         persisted = store.get(created.id)
         assert persisted is not None
@@ -713,12 +815,178 @@ class TestSkillContentValidation:
         assert persisted.depends_on == review_task.id
         assert isinstance(persisted.completed_at, datetime)
         assert persisted.output_content == summary_body
+        summary_path = Path(summary_path_value)
         assert summary_path.read_text() == summary_with_origin
         assert store.get_improve_tasks_for(impl_task.id, review_task.id) == [persisted]
 
         impl_refreshed = store.get(impl_task.id)
         assert impl_refreshed is not None
         assert impl_refreshed.review_cleared_at is not None
+
+    @pytest.mark.parametrize(
+        ("task_type", "prompt", "path_kind"),
+        [
+            ("review", "Manual review via /gza-task-review", "report"),
+            ("improve", "Manual improve via /gza-task-improve", "summary"),
+            ("fix", "Manual rescue via /gza-task-fix", "summary"),
+        ],
+    )
+    def test_manual_persistence_flow_marks_task_dropped_when_output_path_resolution_fails(
+        self, tmp_path: Path, task_type: str, prompt: str, path_kind: str, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Post-add failures must not leave manual review/improve/fix rows pending."""
+        setup_config(tmp_path)
+        config, store = _create_store_for_project(tmp_path)
+
+        depends_on = None
+        based_on = None
+        if task_type in {"review", "improve", "fix"}:
+            impl_task = store.add("Implementation task for persistence failure", task_type="implement")
+            assert impl_task.id is not None
+            if task_type == "review":
+                depends_on = impl_task.id
+            else:
+                review_task = store.add(
+                    "Review task for persistence failure",
+                    task_type="review",
+                    depends_on=impl_task.id,
+                )
+                assert review_task.id is not None
+                depends_on = review_task.id
+                based_on = impl_task.id
+
+        created = store.add(
+            prompt=prompt,
+            task_type=task_type,
+            depends_on=depends_on,
+            based_on=based_on,
+        )
+        assert created.id is not None
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated persistence failure")
+
+        import gza.runner as runner
+
+        monkeypatch.setattr(runner, "get_task_output_paths", _boom)
+
+        mock_git = Mock()
+        mock_git.branch_exists.return_value = False
+
+        with pytest.raises(RuntimeError, match="simulated persistence failure"):
+            _finalize_manual_skill_output_like_snippet(
+                created,
+                store,
+                config,
+                content_with_origin="ignored",
+                output_body="ignored",
+                path_kind=path_kind,
+                git=mock_git,
+            )
+
+        persisted = store.get(created.id)
+        assert persisted is not None
+        assert persisted.status == "dropped"
+        assert persisted.report_file is None
+        assert persisted.completed_at is None
+        assert persisted.output_content is None
+
+    @pytest.mark.parametrize(
+        ("task_type", "prompt", "path_kind", "failure_stage"),
+        [
+            ("review", "Manual review via /gza-task-review", "report", "slug_override"),
+            ("improve", "Manual improve via /gza-task-improve", "summary", "slug_override"),
+            ("fix", "Manual rescue via /gza-task-fix", "summary", "slug_override"),
+            ("review", "Manual review via /gza-task-review", "report", "slug_update"),
+            ("improve", "Manual improve via /gza-task-improve", "summary", "slug_update"),
+            ("fix", "Manual rescue via /gza-task-fix", "summary", "slug_update"),
+        ],
+    )
+    def test_manual_persistence_flow_marks_task_dropped_when_slug_stage_fails(
+        self,
+        tmp_path: Path,
+        task_type: str,
+        prompt: str,
+        path_kind: str,
+        failure_stage: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Failures before output-path lookup must still drop the created manual task."""
+        import gza.runner as runner
+
+        setup_config(tmp_path)
+        config, store = _create_store_for_project(tmp_path)
+
+        depends_on = None
+        based_on = None
+        if task_type in {"review", "improve", "fix"}:
+            impl_task = store.add("Implementation task for slug failure", task_type="implement")
+            assert impl_task.id is not None
+            if task_type == "review":
+                depends_on = impl_task.id
+            else:
+                review_task = store.add(
+                    "Review task for slug failure",
+                    task_type="review",
+                    depends_on=impl_task.id,
+                )
+                assert review_task.id is not None
+                depends_on = review_task.id
+                based_on = impl_task.id
+
+        created = store.add(
+            prompt=prompt,
+            task_type=task_type,
+            depends_on=depends_on,
+            based_on=based_on,
+        )
+        assert created.id is not None
+
+        if failure_stage == "slug_override":
+            def _slug_override_boom(*args, **kwargs):
+                raise RuntimeError("simulated slug override failure")
+
+            monkeypatch.setattr(runner, "_compute_slug_override", _slug_override_boom)
+        else:
+            monkeypatch.setattr(runner, "_compute_slug_override", lambda *args, **kwargs: None)
+            monkeypatch.setattr(runner, "generate_slug", lambda *args, **kwargs: "20260514-test-slug")
+            original_update = store.update
+            update_calls = 0
+
+            def _update_then_boom(task):
+                nonlocal update_calls
+                update_calls += 1
+                if update_calls == 1:
+                    raise RuntimeError("simulated slug update failure")
+                return original_update(task)
+
+            monkeypatch.setattr(store, "update", _update_then_boom)
+
+        mock_git = Mock()
+        mock_git.branch_exists.return_value = False
+
+        expected_error = (
+            "simulated slug override failure"
+            if failure_stage == "slug_override"
+            else "simulated slug update failure"
+        )
+        with pytest.raises(RuntimeError, match=expected_error):
+            _finalize_manual_skill_output_like_snippet(
+                created,
+                store,
+                config,
+                content_with_origin="ignored",
+                output_body="ignored",
+                path_kind=path_kind,
+                git=mock_git,
+            )
+
+        persisted = store.get(created.id)
+        assert persisted is not None
+        assert persisted.status == "dropped"
+        assert persisted.report_file is None
+        assert persisted.completed_at is None
+        assert persisted.output_content is None
 
     @pytest.mark.parametrize(
         ("prompt", "task_type", "path_kind"),
