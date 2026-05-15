@@ -620,6 +620,25 @@ class TestReviewContextFromChain:
         assert "partial pytest output" in result
         assert "still running" in result
 
+    def test_run_review_verify_command_reports_custom_timeout(self, tmp_path: Path):
+        """Timeout wording should reflect the configured autonomous review timeout."""
+        with patch(
+            "gza.runner.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd=["bash", "-lc", "uv run pytest tests/ -q"],
+                timeout=240,
+                output="partial pytest output\n",
+                stderr="still running\n",
+            ),
+        ):
+            result = _run_review_verify_command(
+                "uv run pytest tests/ -q",
+                cwd=tmp_path,
+                timeout_seconds=240,
+            )
+
+        assert "verify_command timed out after 240s" in result
+
     def test_review_context_includes_changed_files_diffstat_and_diff(self, tmp_path: Path):
         """Review context should include changed files, diffstat, and inline diff."""
         db_path = tmp_path / "test.db"
@@ -10433,6 +10452,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = "printf 'lint failed\\n' && exit 7"
+        config.review_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
@@ -10498,6 +10518,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = "uv run pytest tests/ -q"
+        config.review_verify_timeout_seconds = 240
 
         captured_prompts: list[str] = []
 
@@ -10530,7 +10551,7 @@ class TestProviderPromptSanitization:
             "gza.runner.subprocess.run",
             side_effect=subprocess.TimeoutExpired(
                 cmd=["bash", "-lc", config.verify_command],
-                timeout=120,
+                timeout=240,
                 output="partial pytest output\n",
                 stderr="still running\n",
             ),
@@ -10543,7 +10564,7 @@ class TestProviderPromptSanitization:
         assert "## verify_command result" in prompt
         assert "- Status: failed" in prompt
         assert "- Exit status: timed out" in prompt
-        assert "verify_command timed out after 120s" in prompt
+        assert "verify_command timed out after 240s" in prompt
         assert "partial pytest output" in prompt
         assert "still running" in prompt
         assert "## Original request:" in prompt

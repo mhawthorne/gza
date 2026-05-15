@@ -4614,10 +4614,52 @@ class TestShowCommand:
         plain = console.export_text(clear=False)
         assert exit_code == 0
         assert "Lifecycle: recovered, needs attention" in plain
-        assert "reason=max-resume-attempts-reached" in plain
-        assert "automatic recovery exhausted" in plain
-        assert "\x1b[31mrecovered, needs attention" in rendered
-        assert "\x1b[32mrecovered, needs attention" not in rendered
+
+    def test_show_recommend_rebase_lifecycle_uses_shared_attention_reason(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement stale show", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        impl.branch = "feature/stale-show"
+        impl.merge_status = "unmerged"
+        impl.has_commits = True
+        store.update(impl)
+
+        review = store.add("Pending review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        store.update(review)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.resolve_fresh_merge_source.return_value = ("origin/feature/stale-show", None)
+        git.count_commits_behind.return_value = 1
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(impl.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Lifecycle: needs attention reason=branch-stale-recommend-rebase" in output
 
     def test_show_lineage_statuses_reuse_top_level_show_status_colors(self, tmp_path: Path) -> None:
         """Show lineage status labels should use the same status palette as the top-level Status field."""

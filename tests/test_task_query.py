@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.query import TaskLineageNode
 from gza.task_query import (
@@ -162,6 +163,75 @@ def test_lifecycle_complete_excludes_pending_review_attached_to_merged_unit(tmp_
     prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
     assert "merged implement" in prompts
     assert "pending review" not in prompts
+
+
+def test_incomplete_projection_includes_recommend_rebase_reason(tmp_path: Path) -> None:
+    from tests.cli.conftest import make_store, setup_config
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement stale projection", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/stale-projection"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQueryPresets.incomplete(limit=None),
+        config=Config.load(tmp_path),
+        git=SimpleNamespace(
+            can_merge=lambda source, target: True,
+            is_merged=lambda source, target: False,
+            resolve_fresh_merge_source=lambda branch: ("origin/feature/stale-projection", None),
+            count_commits_behind=lambda source, target: 1,
+        ),
+        target_branch="main",
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert row.values["next_action"] == "recommend_rebase"
+    assert "branch is stale" in str(row.values["next_action_reason"])
+
+
+def test_incomplete_projection_surfaces_behind_count_warning(tmp_path: Path) -> None:
+    from tests.cli.conftest import make_store, setup_config
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement behind warning projection", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/behind-warning"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQueryPresets.incomplete(limit=None),
+        config=Config.load(tmp_path),
+        git=SimpleNamespace(
+            can_merge=lambda source, target: True,
+            is_merged=lambda source, target: False,
+            resolve_fresh_merge_source=lambda branch: ("origin/feature/behind-warning", None),
+            count_commits_behind=lambda source, target: (_ for _ in ()).throw(RuntimeError("boom")),
+        ),
+        target_branch="main",
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert row.values["next_action"] == "create_review"
+    assert "Warning:" in str(row.values["next_action_reason"])
+    assert "behind count unavailable" in str(row.values["next_action_reason"])
 
 
 def test_merge_chain_unmerged_matches_legacy_unmerged_status(tmp_path: Path) -> None:

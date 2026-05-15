@@ -2892,6 +2892,54 @@ class TestWatchConfigValidation:
         with pytest.raises(ConfigError, match="watch.failure_backoff_max must be >= watch.failure_backoff_initial"):
             Config.load(tmp_path)
 
+    def test_review_verify_timeout_and_recommend_rebase_defaults_load(self, tmp_path: Path) -> None:
+        """Config.load should expose the stale-branch and review-timeout defaults."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "")
+        config = Config.load(tmp_path)
+        assert config.review_verify_timeout_seconds == 120
+        assert config.recommend_rebase_behind_commits == 1
+
+    def test_review_verify_timeout_and_recommend_rebase_custom_values_load(self, tmp_path: Path) -> None:
+        """Config.load should preserve custom stale-branch config values."""
+        from gza.config import Config
+
+        self._write_config(
+            tmp_path,
+            "review_verify_timeout_seconds: 240\nrecommend_rebase_behind_commits: 0\n",
+        )
+        config = Config.load(tmp_path)
+        assert config.review_verify_timeout_seconds == 240
+        assert config.recommend_rebase_behind_commits == 0
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("review_verify_timeout_seconds", "nope", "'review_verify_timeout_seconds' must be an integer"),
+            ("review_verify_timeout_seconds", "0", "'review_verify_timeout_seconds' must be positive"),
+            ("review_verify_timeout_seconds", "-1", "'review_verify_timeout_seconds' must be positive"),
+            ("recommend_rebase_behind_commits", "nope", "'recommend_rebase_behind_commits' must be an integer"),
+            ("recommend_rebase_behind_commits", "-1", "'recommend_rebase_behind_commits' must be non-negative"),
+        ],
+    )
+    def test_review_verify_timeout_and_recommend_rebase_invalid_values_fail(
+        self,
+        tmp_path: Path,
+        field: str,
+        value: str,
+        message: str,
+    ) -> None:
+        """Config.load/validate should reject invalid stale-branch config values."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, f"{field}: {value}\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert message in errors
+        with pytest.raises(ConfigError, match=re.escape(message)):
+            Config.load(tmp_path)
+
     @pytest.mark.parametrize(
         ("field", "value"),
         [

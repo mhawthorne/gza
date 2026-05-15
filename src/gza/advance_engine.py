@@ -27,6 +27,7 @@ from gza.source_followup import (
     resolve_source_followup_state,
     source_task_has_implementation_followup,
 )
+from gza.stale_branch import BranchStaleness, resolve_branch_staleness
 
 NEEDS_ATTENTION_LABEL = "Needs attention"
 
@@ -80,6 +81,7 @@ class AdvanceContext:
 
     merge_source_ref: str | None = None
     merge_source_warning: str | None = None
+    stale_branch: BranchStaleness | None = None
     post_merge_rebase_state: PostMergeRebaseState | None = None
     merge_state: str | None = None
     can_merge: bool = True
@@ -499,6 +501,22 @@ def with_needs_attention(
     return annotated
 
 
+def _with_warning(action: Mapping[str, Any], warning: str | None) -> dict[str, Any]:
+    """Attach a visible warning to an action description without changing its type."""
+    annotated = dict(action)
+    if not warning:
+        return annotated
+    description = str(annotated.get("description", "")).strip()
+    warning_text = f"Warning: {warning}"
+    if not description:
+        annotated["description"] = warning_text
+        return annotated
+    if warning_text in description:
+        return annotated
+    annotated["description"] = f"{description} [{warning_text}]"
+    return annotated
+
+
 def failed_recovery_decision_to_action(
     task: DbTask,
     decision: FailedRecoveryDecision,
@@ -613,6 +631,47 @@ def format_needs_attention_lifecycle(action: Mapping[str, Any]) -> str:
     if description:
         return f"needs attention reason={reason} {description}"
     return f"needs attention reason={reason}"
+
+
+def _recommend_rebase_description(stale_branch: BranchStaleness) -> str:
+    if stale_branch.reason == "verify_duration":
+        reason_text = "local verify passed but exceeded the review verify timeout"
+    elif stale_branch.reason == "behind_target":
+        reason_text = "branch is behind the target branch"
+    elif stale_branch.reason == "both":
+        reason_text = (
+            "local verify exceeded the review verify timeout and branch is behind the target branch"
+        )
+    else:
+        reason_text = "branch is stale"
+    return f"SKIP: branch is stale; {reason_text}; rebase recommended"
+
+
+def _recommend_rebase_action(ctx: AdvanceContext) -> dict[str, Any]:
+    assert ctx.stale_branch is not None
+    operator_action = (
+        "branch is stale; run `uv run gza rebase --background "
+        f"{ctx.task.id}` or the existing project-supported rebase command for this implementation branch"
+    )
+    return with_needs_attention(
+        {
+            "type": "recommend_rebase",
+            "description": _recommend_rebase_description(ctx.stale_branch),
+            "recommend_rebase": {
+                "recommended": True,
+                "reason": ctx.stale_branch.reason,
+                "target_branch": ctx.stale_branch.target_branch,
+                "source_ref": ctx.stale_branch.source_ref,
+                "behind_count": ctx.stale_branch.behind_count,
+                "behind_threshold": ctx.stale_branch.behind_threshold,
+                "verify_duration_seconds": ctx.stale_branch.verify_duration_seconds,
+                "review_verify_timeout_seconds": ctx.stale_branch.review_verify_timeout_seconds,
+                "evidence_task_id": ctx.stale_branch.evidence_task_id,
+                "operator_action": operator_action,
+            },
+        },
+        reason="branch-stale-recommend-rebase",
+    )
 
 
 def _review_priority_sort_key(task: DbTask) -> tuple[datetime, int]:
@@ -979,6 +1038,14 @@ def resolve_advance_context(
         )
 
     merge_source = _resolve_current_merge_source(git, task.branch)
+    stale_branch = resolve_branch_staleness(
+        config=config,
+        store=store,
+        git=git,
+        task=task,
+        target_branch=target_branch,
+        source_ref=merge_source.ref,
+    )
     post_merge_rebase_state = _resolve_and_persist_post_merge_rebase_state(
         store,
         git,
@@ -1063,6 +1130,7 @@ def resolve_advance_context(
         failed_recovery_attention_reason=failed_recovery_attention_reason,
         merge_source_ref=merge_source.ref,
         merge_source_warning=merge_source.warning,
+        stale_branch=stale_branch,
         post_merge_rebase_state=post_merge_rebase_state,
         merge_state=merge_state,
         can_merge=can_merge,
@@ -1205,6 +1273,15 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="conflict_needs_rebase",
         matches=lambda ctx: not ctx.can_merge,
         action=lambda ctx: {"type": "needs_rebase", "description": "rebase --resolve (conflicts detected)"},
+    ),
+    AdvanceRule(
+        name="branch_stale_recommend_rebase",
+        matches=lambda ctx: (
+            ctx.stale_branch is not None
+            and ctx.stale_branch.recommend_rebase
+            and not _failed_rebase_still_blocks_advance(ctx)
+        ),
+        action=_recommend_rebase_action,
     ),
     AdvanceRule(
         name="post_rebase_run_pending_review",
@@ -1456,6 +1533,12 @@ def evaluate_advance_rules(
 
     for rule in ADVANCE_RULES:
         if rule.matches(context):
-            return rule.action(context)
+            return _with_warning(
+                rule.action(context),
+                context.stale_branch.warning if context.stale_branch is not None else None,
+            )
 
-    return {"type": "skip", "description": "SKIP: no matching rule (unexpected)"}
+    return _with_warning(
+        {"type": "skip", "description": "SKIP: no matching rule (unexpected)"},
+        context.stale_branch.warning if context.stale_branch is not None else None,
+    )

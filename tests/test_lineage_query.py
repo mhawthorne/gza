@@ -827,3 +827,41 @@ def test_query_lineage_owner_rows_planning_keeps_completed_and_failed_live_tasks
     assert rows_by_owner[failed_impl.id].recovery_action_task.id == failed_impl.id
     assert rows_by_owner[failed_impl.id].next_action is not None
     assert rows_by_owner[failed_impl.id].next_action["type"] == "resume"
+
+
+def test_query_lineage_owner_rows_projects_recommend_rebase_action(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement stale lineage", task_type="implement")
+    assert impl.id is not None
+    _set_completed(
+        impl,
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+        branch="feature/stale-lineage",
+        has_commits=True,
+    )
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+    git.resolve_fresh_merge_source.return_value = ("origin/feature/stale-lineage", None)
+    git.count_commits_behind.return_value = 1
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.lifecycle_action_task is not None
+    assert row.lifecycle_action_task.id == impl.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "recommend_rebase"
+    assert row.lineage_status == "needs_attention"

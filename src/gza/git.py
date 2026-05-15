@@ -982,6 +982,16 @@ class Git:
             return 0
         return int(result.stdout.strip())
 
+    def count_commits_behind(self, source_ref: str, target_ref: str) -> int | None:
+        """Count commits reachable from ``target_ref`` and not ``source_ref``."""
+        result = self._run("rev-list", "--count", f"{source_ref}..{target_ref}", check=False)
+        if result.returncode != 0:
+            return None
+        try:
+            return int(result.stdout.strip())
+        except ValueError:
+            return None
+
 
 def cleanup_worktree_for_branch(git: "Git", branch: str, force: bool = False) -> Path | None:
     """Clean up worktree if branch is checked out in one.

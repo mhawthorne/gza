@@ -1240,6 +1240,31 @@ index abc123..def456 100644
 
             assert result == 0
 
+    def test_count_commits_behind(self, tmp_path: Path):
+        """Test counting commits behind."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="3\n", stderr="")
+            result = git.count_commits_behind("feature", "main")
+
+            mock_run.assert_called_once_with("rev-list", "--count", "feature..main", check=False)
+            assert result == 3
+
+    def test_count_commits_behind_error(self, tmp_path: Path):
+        """Test count_commits_behind returns None on error."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+            result = git.count_commits_behind("feature", "main")
+
+            assert result is None
+
 
 class TestParseDiffNumstat:
     """Tests for parse_diff_numstat module-level function."""

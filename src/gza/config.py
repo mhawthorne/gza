@@ -81,6 +81,8 @@ DEFAULT_CLEANUP_DAYS = 30
 DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD = 500
 DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
 DEFAULT_REVIEW_CONTEXT_FILE_LIMIT = 12
+DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS = 120
+DEFAULT_RECOMMEND_REBASE_BEHIND_COMMITS = 1
 DEFAULT_LEARNINGS_WINDOW = 25
 DEFAULT_LEARNINGS_INTERVAL = 5
 DEFAULT_LEARNINGS_MAX_ITEMS = 50
@@ -93,7 +95,8 @@ VALID_CONFIG_FIELDS = {
     "advance_create_reviews", "advance_requires_review", "advance_mode", "max_resume_attempts",
     "max_review_cycles", "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
-    "review_diff_medium_threshold", "review_context_file_limit", "tmux", "learnings_window",
+    "review_diff_medium_threshold", "review_context_file_limit", "review_verify_timeout_seconds",
+    "recommend_rebase_behind_commits", "tmux", "learnings_window",
     "learnings_interval", "learnings_max_items", "theme", "colors",
 }
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
@@ -175,6 +178,8 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
+    "review_verify_timeout_seconds": None,
+    "recommend_rebase_behind_commits": None,
     "theme": None,
     "colors": {
         "*": None,
@@ -258,6 +263,8 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
+    "review_verify_timeout_seconds": None,
+    "recommend_rebase_behind_commits": None,
     "learnings_window": None,
     "learnings_interval": None,
     "learnings_max_items": None,
@@ -633,6 +640,8 @@ class Config:
     review_diff_small_threshold: int = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
+    review_verify_timeout_seconds: int = DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS
+    recommend_rebase_behind_commits: int = DEFAULT_RECOMMEND_REBASE_BEHIND_COMMITS
     learnings_window: int = DEFAULT_LEARNINGS_WINDOW
     learnings_interval: int = DEFAULT_LEARNINGS_INTERVAL
     learnings_max_items: int = DEFAULT_LEARNINGS_MAX_ITEMS
@@ -1580,6 +1589,22 @@ class Config:
         if review_context_file_limit < 1:
             raise ConfigError("review_context_file_limit must be a positive integer")
 
+        review_verify_timeout_seconds = _load_strict_int_field(
+            data,
+            "review_verify_timeout_seconds",
+            DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS,
+        )
+        if review_verify_timeout_seconds < 1:
+            raise ConfigError("'review_verify_timeout_seconds' must be positive")
+
+        recommend_rebase_behind_commits = _load_strict_int_field(
+            data,
+            "recommend_rebase_behind_commits",
+            DEFAULT_RECOMMEND_REBASE_BEHIND_COMMITS,
+        )
+        if recommend_rebase_behind_commits < 0:
+            raise ConfigError("'recommend_rebase_behind_commits' must be non-negative")
+
         try:
             learnings_window = int(data.get("learnings_window", DEFAULT_LEARNINGS_WINDOW))
         except (TypeError, ValueError):
@@ -1718,6 +1743,8 @@ class Config:
             review_diff_small_threshold=review_diff_small_threshold,
             review_diff_medium_threshold=review_diff_medium_threshold,
             review_context_file_limit=review_context_file_limit,
+            review_verify_timeout_seconds=review_verify_timeout_seconds,
+            recommend_rebase_behind_commits=recommend_rebase_behind_commits,
             learnings_window=learnings_window,
             learnings_interval=learnings_interval,
             learnings_max_items=learnings_max_items,
@@ -2077,6 +2104,18 @@ class Config:
                 errors.append("'review_context_file_limit' must be an integer")
             elif data["review_context_file_limit"] <= 0:
                 errors.append("'review_context_file_limit' must be positive")
+
+        if "review_verify_timeout_seconds" in data:
+            if not isinstance(data["review_verify_timeout_seconds"], int):
+                errors.append("'review_verify_timeout_seconds' must be an integer")
+            elif data["review_verify_timeout_seconds"] <= 0:
+                errors.append("'review_verify_timeout_seconds' must be positive")
+
+        if "recommend_rebase_behind_commits" in data:
+            if not isinstance(data["recommend_rebase_behind_commits"], int):
+                errors.append("'recommend_rebase_behind_commits' must be an integer")
+            elif data["recommend_rebase_behind_commits"] < 0:
+                errors.append("'recommend_rebase_behind_commits' must be non-negative")
 
         if (
             isinstance(data.get("review_diff_small_threshold"), int)

@@ -334,7 +334,10 @@ def main() -> int:
     incomplete_parser = subparsers.add_parser(
         "incomplete",
         help="Show unresolved task lineages that still need attention",
-        description="Show unresolved task lineages that still need attention",
+        description=(
+            "Show unresolved task lineages that still need attention. "
+            "Projected next_action values can include manual-attention states such as recommend_rebase."
+        ),
     )
     add_common_args(incomplete_parser)
     incomplete_parser.set_defaults(last=5)

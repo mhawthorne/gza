@@ -5618,16 +5618,26 @@ def test_watch_cycle_logs_skip_events_for_non_actionable_advance_outcomes(
 
 
 @pytest.mark.parametrize(
-    ("action_type", "description"),
+    "action",
     [
-        ("needs_discussion", "SKIP: review verdict is NEEDS_DISCUSSION, needs manual attention"),
-        ("max_cycles_reached", "SKIP: max review cycles (2) reached, needs manual intervention"),
+        {
+            "type": "needs_discussion",
+            "description": "SKIP: review verdict is NEEDS_DISCUSSION, needs manual attention",
+        },
+        {
+            "type": "max_cycles_reached",
+            "description": "SKIP: max review cycles (2) reached, needs manual intervention",
+        },
+        {
+            "type": "recommend_rebase",
+            "description": "SKIP: branch is stale; branch is behind the target branch; rebase recommended",
+            "needs_attention_reason": "branch-stale-recommend-rebase",
+        },
     ],
 )
 def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(
     tmp_path: Path,
-    action_type: str,
-    description: str,
+    action: dict[str, str],
 ) -> None:
     """Pre-execution manual-attention advance outcomes should use ATTENTION instead of deduped SKIP."""
     setup_config(tmp_path)
@@ -5652,7 +5662,7 @@ def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": action_type, "description": description}),
+        patch("gza.cli.determine_next_action", return_value=action),
     ):
         _run_cycle(
             config=config,

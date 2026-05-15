@@ -105,7 +105,7 @@ If every blocker classifies as `already_addressed`, **do not make changes**. Ski
 
 ### Step 5: Run verify
 
-If `verify_command` is configured, run it. Fix verification fallout only in files you already touched in Step 4 — do not broaden scope. Retry up to 3 iterations. If still failing, stop and report to the user with `fix_result: needs_user`.
+If `verify_command` is configured, run it and time the full wall-clock duration with a monotonic clock. Record `verify.duration_seconds` whenever the command actually runs. Fix verification fallout only in files you already touched in Step 4 — do not broaden scope. Retry up to 3 iterations. If still failing, stop and report to the user with `fix_result: needs_user`.
 
 ### Step 6: Commit and push (only if changes were made)
 
@@ -129,6 +129,23 @@ Ledger format (preserve this schema — downstream tooling reads it):
 
 ```yaml
 fix_result: repaired_pending_review | diagnosed_no_change | needs_user | blocked_external
+verify:
+  command: <configured verify command or "">
+  passed: true | false | null
+  duration_seconds: <float or null>
+  review_verify_timeout_seconds: <int>
+recommend_rebase:
+  recommended: true | false
+  reasons:
+    - verify_duration_exceeds_review_gate
+    - branch_behind_target
+  target_branch: <branch or null>
+  source_ref: <branch/ref or null>
+  behind_count: <int or null>
+  behind_threshold: <int>
+  verify_duration_seconds: <float or null>
+  review_verify_timeout_seconds: <int>
+  operator_action: <short text, no automatic rebase>
 blockers:
   - source_review_id: <review_task_id>
     blocker_key: <short_key>
@@ -140,6 +157,9 @@ blockers:
 ```
 
 **Ledger integrity rules:**
+- `verify.duration_seconds` is required whenever `verify_command` ran.
+- `recommend_rebase.recommended=true` whenever either trigger fires: local verify passed but met/exceeded the review verify timeout, or the implementation branch is behind the target by at least the configured threshold.
+- `recommend_rebase.operator_action` must remain advisory. Do not run a rebase from this skill.
 - `status: addressed` requires a commit in this pass. Cite the commit sha in `closure_evidence`.
 - `status: already_addressed` requires a file:line citation to current code that satisfies the review. No commit.
 - `follow_up_review_required: true` is permitted **only** when `fix_result: repaired_pending_review` and commits were made. Never request a review for a no-op pass.
@@ -227,5 +247,6 @@ If the restore fails, stop and tell the user exactly what checkout you left them
 - **Bounded scope.** Only touch files and tests named by the current review's Must-Fix items. No opportunistic cleanup, no drive-by refactors, no renames.
 - **Ask the user before** broadening scope, deciding an `ambiguous` blocker, or committing to a `stale_review` / `scope_creep` diagnosis.
 - **No review request without a commit.** `follow_up_review_required: true` is only valid when code changed in this pass. A no-op pass is an operational finding, not work for a reviewer.
+- **No automatic rebase.** If the stale-branch recommendation fires, report it in the ledger and final handoff, but leave rebasing to the operator’s normal `gza rebase` workflow.
 - **Restore the user's checkout before exit.** Final state returns to `<START_CHECKOUT>`; closing message should name both checkouts explicitly.
 - **Role separation.** `review` is the independent approval boundary. `improve` is the normal response to one review. `fix` is escalation for churn.

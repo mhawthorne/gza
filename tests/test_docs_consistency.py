@@ -229,6 +229,31 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
         assert snippet in config_content
 
 
+def test_recommend_rebase_docs_and_fix_skill_schema_stay_in_sync() -> None:
+    """Operator docs and fix-skill ledger schema should describe recommend_rebase consistently."""
+    repo_root = Path(__file__).resolve().parents[1]
+    config_content = (repo_root / "docs" / "configuration.md").read_text()
+    advance_workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+    fix_skill = (repo_root / "src" / "gza" / "skills" / "gza-task-fix" / "SKILL.md").read_text()
+
+    required_snippets = [
+        "review_verify_timeout_seconds",
+        "recommend_rebase_behind_commits",
+        "Projected `next_action` values can include `recommend_rebase`",
+        "`recommend_rebase` — manual attention; branch is stale",
+        "recommend_rebase:",
+        "review_verify_timeout_seconds: <int>",
+        "operator_action: <short text, no automatic rebase>",
+        "No automatic rebase.",
+    ]
+    for snippet in required_snippets:
+        assert (
+            snippet in config_content
+            or snippet in advance_workflow
+            or snippet in fix_skill
+        )
+
+
 def test_summary_docs_and_skill_use_dedicated_triage_surfaces() -> None:
     """`/gza-summary` docs should synthesize dedicated surfaces instead of reviving `gza incomplete`."""
     repo_root = Path(__file__).resolve().parents[1]

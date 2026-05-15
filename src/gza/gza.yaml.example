@@ -52,6 +52,13 @@ project_name: my-project
 # Example: 'uv run mypy src/ && uv run pytest tests/ -x -q'
 # verify_command: ""
 
+# Timeout in seconds for autonomous review verify_command runs (default: 120)
+# review_verify_timeout_seconds: 120
+
+# Advisory stale-branch threshold for recommend_rebase. Set 0 to disable
+# behind-target detection while keeping verify-duration stale detection active.
+# recommend_rebase_behind_commits: 1
+
 # --- Branching ---
 
 # Branch mode: "single" (reuse one branch) or "multi" (create branch per task)

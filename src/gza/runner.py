@@ -26,6 +26,7 @@ from .config import (
     DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
     DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD,
     DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD,
+    DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS,
     BranchStrategy,
     Config,
 )
@@ -899,7 +900,7 @@ REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
 REVIEW_IMPROVE_LINEAGE_LIMIT = 5
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 REVIEW_VERIFY_OUTPUT_MAX_CHARS = 4000
-REVIEW_VERIFY_TIMEOUT_SECONDS = 120
+REVIEW_VERIFY_TIMEOUT_SECONDS = DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS
 COMMIT_SUBJECT_MAX_CHARS = 72
 
 
@@ -4560,9 +4561,17 @@ def _run_non_code_task(
                 else None
             )
             if task.task_type == "review" and verify_command is not None:
+                review_verify_timeout_seconds = getattr(
+                    config,
+                    "review_verify_timeout_seconds",
+                    REVIEW_VERIFY_TIMEOUT_SECONDS,
+                )
+                if not isinstance(review_verify_timeout_seconds, int) or review_verify_timeout_seconds < 1:
+                    review_verify_timeout_seconds = REVIEW_VERIFY_TIMEOUT_SECONDS
                 review_verify_result = _run_review_verify_command(
                     verify_command,
                     cwd=worktree_path,
+                    timeout_seconds=review_verify_timeout_seconds,
                 )
             prompt = build_prompt(
                 task,

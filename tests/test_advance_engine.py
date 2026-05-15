@@ -35,6 +35,8 @@ class _FakeGit:
         ancestor_pairs: dict[tuple[str, str], bool] | None = None,
         merge_source_result: tuple[str | None, str | None] | None = None,
         legacy_merge_source_ref: str | None = None,
+        behind_count: int | None = None,
+        behind_count_error: Exception | None = None,
     ):
         self._can_merge = can_merge
         self._can_merge_by_ref = can_merge_by_ref or {}
@@ -45,8 +47,11 @@ class _FakeGit:
         self._ancestor_pairs = ancestor_pairs or {}
         self._merge_source_result = merge_source_result
         self._legacy_merge_source_ref = legacy_merge_source_ref
+        self._behind_count = behind_count
+        self._behind_count_error = behind_count_error
         self.rev_parse_calls: list[str] = []
         self.is_ancestor_calls: list[tuple[str, str]] = []
+        self.behind_calls: list[tuple[str, str]] = []
 
     def can_merge(self, source_branch: str, target_branch: str) -> bool:
         return self._can_merge_by_ref.get((source_branch, target_branch), self._can_merge)
@@ -90,6 +95,12 @@ class _FakeGit:
         if remote_ref in self._existing_refs:
             return remote_ref
         return None
+
+    def count_commits_behind(self, source_ref: str, target_ref: str) -> int | None:
+        self.behind_calls.append((source_ref, target_ref))
+        if self._behind_count_error is not None:
+            raise self._behind_count_error
+        return self._behind_count
 
 
 def _make_store(tmp_path: Path) -> SqliteTaskStore:
@@ -1906,3 +1917,165 @@ def test_approved_with_followups_and_newer_unresolved_comment_creates_improve(tm
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
     assert action["type"] == "improve"
     assert action["review_task"].id == review.id
+
+
+def test_stale_branch_returns_recommend_rebase_attention_action(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement stale branch", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/stale-branch"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_refs={"origin/feature/stale-branch"},
+        behind_count=2,
+    )
+
+    action = evaluate_advance_rules(config, store, git, task, "main")
+
+    assert action["type"] == "recommend_rebase"
+    assert action["needs_attention_reason"] == "branch-stale-recommend-rebase"
+    assert action["recommend_rebase"]["behind_count"] == 2
+    assert classify_advance_action(action) == "needs_attention"
+    assert "recommend_rebase" not in WORKER_CONSUMING_ACTIONS
+
+
+def test_merge_conflict_still_wins_over_recommend_rebase(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement conflict branch", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/conflict-branch"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    git = _FakeGit(
+        can_merge=False,
+        existing_refs={"origin/feature/conflict-branch"},
+        behind_count=3,
+    )
+
+    action = evaluate_advance_rules(config, store, git, task, "main")
+    assert action["type"] == "needs_rebase"
+
+
+def test_failed_rebase_manual_resolution_still_wins_over_recommend_rebase(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl, failed_rebase = _make_completed_impl_with_failed_rebase(
+        store,
+        branch="feature/failed-rebase-stale",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_refs={"origin/feature/failed-rebase-stale"},
+        behind_count=2,
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+    assert failed_rebase.id in action["description"]
+
+
+def test_non_stale_branch_keeps_existing_review_action(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/review-needed"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_refs={"origin/feature/review-needed"},
+        behind_count=0,
+    )
+
+    action = evaluate_advance_rules(config, store, git, task, "main")
+    assert action["type"] == "create_review"
+
+
+def test_approved_but_behind_branch_is_held_for_recommend_rebase(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement approved but behind", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/approved-behind"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    review = store.add("Approved review", task_type="review", depends_on=task.id, based_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: APPROVED**"
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_refs={"origin/feature/approved-behind"},
+        behind_count=1,
+    )
+    action = evaluate_advance_rules(config, store, git, task, "main")
+
+    assert action["type"] == "recommend_rebase"
+
+
+def test_behind_count_error_is_visible_without_false_recommend_rebase(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement behind-count warning", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/behind-warning"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_refs={"origin/feature/behind-warning"},
+        behind_count_error=RuntimeError("boom"),
+    )
+
+    action = evaluate_advance_rules(config, store, git, task, "main")
+
+    assert action["type"] == "create_review"
+    assert "Warning:" in action["description"]
+    assert "behind count unavailable" in action["description"]

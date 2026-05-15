@@ -96,7 +96,7 @@ Use `/gza-task-fix` when an implementation is stuck after repeated `CHANGES_REQU
 - Starts from a full prefixed task ID (for example, `gza-1234`) and resolves to the root implementation lineage
 - Uses `uv run gza fix <task_id>` instead of ad hoc manual repair steps
 - Enforces bounded blocker-driven scope with explicit rescue guardrails
-- Requires machine-readable closure ledger output (`fix_result` plus blocker entries)
+- Requires machine-readable closure ledger output (`fix_result`, `verify`, `recommend_rebase`, plus blocker entries)
 - Requires a fresh independent review after code-changing rescue runs
 
 ---
