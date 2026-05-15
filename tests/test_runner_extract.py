@@ -872,7 +872,7 @@ def test_run_completes_without_provider_when_selected_extraction_scope_is_alread
     assert mock_provider.run.call_count == 0
 
 
-@pytest.mark.functional
+@pytest.mark.timeout(4, method="signal")
 def test_run_completes_without_provider_when_selected_source_changes_are_subset_of_current_base(
     tmp_path: Path,
 ) -> None:

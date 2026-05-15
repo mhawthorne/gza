@@ -3,7 +3,6 @@
 
 import importlib
 import re
-import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -26,58 +25,6 @@ def _normalized_markdown_section(path: Path, heading: str) -> str:
 
 class TestHelpOutput:
     """Tests for CLI help output."""
-
-    @pytest.mark.functional
-    def test_commands_displayed_alphabetically(self):
-        """Help output should display commands in alphabetical order."""
-        result = subprocess.run(
-            ["uv", "run", "gza", "--help"],
-            capture_output=True,
-            text=True,
-        )
-
-        assert result.returncode == 0
-
-        # Extract the commands section from help output
-        help_text = result.stdout
-
-        # Find where the commands list starts (after "positional arguments:" or "{")
-        # Commands are typically shown as "{command1,command2,...}"
-        import re
-
-        # Look for the commands in the help output
-        # They appear in a format like: {add,delete,edit,...}
-        commands_match = re.search(r'\{([^}]+)\}', help_text)
-        if not commands_match:
-            # Alternative: commands listed line by line
-            # Extract command names from lines that look like "  command_name  description"
-            command_lines = []
-            in_commands_section = False
-            for line in help_text.split('\n'):
-                if 'positional arguments:' in line or '{' in line:
-                    in_commands_section = True
-                    continue
-                if in_commands_section and line.strip() and not line.startswith(' ' * 10):
-                    # Extract command name (first word after leading spaces)
-                    parts = line.strip().split()
-                    if parts and not parts[0].startswith('-'):
-                        command_lines.append(parts[0])
-                if in_commands_section and line and not line.startswith(' '):
-                    # End of commands section
-                    break
-
-            # Check if commands are sorted
-            if command_lines:
-                sorted_commands = sorted(command_lines)
-                assert command_lines == sorted_commands, f"Commands not in alphabetical order. Got: {command_lines}, Expected: {sorted_commands}"
-        else:
-            # Commands are in {cmd1,cmd2,...} format
-            commands_str = commands_match.group(1)
-            commands = [cmd.strip() for cmd in commands_str.split(',')]
-
-            # Verify commands are in alphabetical order
-            sorted_commands = sorted(commands)
-            assert commands == sorted_commands, f"Commands not in alphabetical order. Got: {commands}, Expected: {sorted_commands}"
 
     def test_history_lineage_depth_help_mentions_root_deduplicated_trees(self, tmp_path):
         """history --help should describe tree/root lineage semantics."""
@@ -257,27 +204,6 @@ class TestHelpOutput:
             "fields": "id",
             "project_dir": tmp_path.resolve(),
         }
-
-    @pytest.mark.functional
-    def test_advance_help_shows_unimplemented_and_hides_plans_alias(self):
-        """advance --help should show --unimplemented/--force and keep --plans hidden."""
-        result = subprocess.run(
-            ["uv", "run", "gza", "advance", "--help"],
-            capture_output=True,
-            text=True,
-        )
-        normalized_output = " ".join(result.stdout.split())
-
-        assert result.returncode == 0
-        assert "--unimplemented" in result.stdout
-        assert "--force" in result.stdout
-        assert (
-            "List completed plan/explore source rows that still need an implementation path"
-            in normalized_output
-        )
-        assert "preferring newer descendants per branch" not in normalized_output
-        assert "With --unimplemented: queue implement tasks for the listed source rows" in normalized_output
-        assert "--plans" not in result.stdout
 
     def test_advance_help_and_docs_describe_shared_failed_task_recovery_scope(self, tmp_path):
         """advance help/docs/config-key surfaces should describe shared failed-task recovery, not resume-only."""

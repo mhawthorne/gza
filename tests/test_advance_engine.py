@@ -1455,7 +1455,7 @@ def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: 
     assert ctx_with_stale_local_branch.can_merge is True
 
 
-@pytest.mark.functional
+@pytest.mark.timeout(4, method="signal")
 def test_resolve_context_prefers_local_branch_when_origin_is_stale(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -1573,7 +1573,7 @@ def test_diverged_local_and_origin_fail_closed_even_when_local_tip_matches_targe
     assert "diverged" in ctx.post_merge_rebase_state.warning
 
 
-@pytest.mark.functional
+@pytest.mark.timeout(4, method="signal")
 def test_real_git_remote_tracking_ref_unblocks_failed_rebase_after_later_approved_review(
     tmp_path: Path, monkeypatch
 ) -> None:

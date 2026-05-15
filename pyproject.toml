@@ -57,13 +57,12 @@ source = "vcs"
 fallback-version = "0.1.0.dev0"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "tests_functional"]
 addopts = "-x"
 pythonpath = ["."]
 timeout_method = "signal"
 markers = [
     "integration: mark test as integration test (requires credentials and Docker)",
-    "functional: mark test as a functional test that crosses process boundaries",
 ]
 
 [tool.mypy]

@@ -1,6 +1,5 @@
 """Tests for --page flag on gza show and gza log commands."""
 
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -81,64 +80,3 @@ class TestPagerContext:
 
         # If we got here without exception, pager_context worked correctly
         assert True
-
-
-# ---------------------------------------------------------------------------
-# CLI argument parser tests (via subprocess)
-# ---------------------------------------------------------------------------
-
-def _run_gza(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["uv", "run", "gza", *args],
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-    )
-
-
-def _setup_config(tmp_path: Path) -> None:
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
-
-
-@pytest.mark.functional
-class TestCliPageFlag:
-    """Ensure --page flag is accepted by gza show and gza log."""
-
-    def test_show_page_flag_is_recognized(self, tmp_path: Path) -> None:
-        """gza show --page should not error with 'unrecognized argument'."""
-        _setup_config(tmp_path)
-        result = _run_gza("show", "testproject-99999", "--page", "--project", str(tmp_path))
-        # Flag is known, so argparse won't complain; we get a task lookup failure instead.
-        assert "unrecognized" not in result.stderr.lower()
-        assert result.returncode != 0
-
-    def test_show_page_not_active_without_flag(self, tmp_path: Path) -> None:
-        """gza show without --page should not produce argparse errors."""
-        _setup_config(tmp_path)
-        result = _run_gza("show", "testproject-99999", "--project", str(tmp_path))
-        assert "unrecognized" not in result.stderr.lower()
-
-    def test_log_page_flag_is_recognized(self, tmp_path: Path) -> None:
-        """gza log --page should not error with 'unrecognized argument'."""
-        _setup_config(tmp_path)
-        result = _run_gza("log", "testproject-99999", "--page", "--project", str(tmp_path))
-        assert "unrecognized" not in result.stderr.lower()
-        assert result.returncode != 0
-
-    def test_log_page_not_active_without_flag(self, tmp_path: Path) -> None:
-        """gza log without --page should not produce argparse errors."""
-        _setup_config(tmp_path)
-        result = _run_gza("log", "testproject-99999", "--project", str(tmp_path))
-        assert "unrecognized" not in result.stderr.lower()
-
-    def test_show_help_mentions_page(self, tmp_path: Path) -> None:
-        """gza show --help should mention the --page flag."""
-        result = _run_gza("show", "--help")
-        assert result.returncode == 0
-        assert "--page" in result.stdout
-
-    def test_log_help_mentions_page(self, tmp_path: Path) -> None:
-        """gza log --help should mention the --page flag."""
-        result = _run_gza("log", "--help")
-        assert result.returncode == 0
-        assert "--page" in result.stdout

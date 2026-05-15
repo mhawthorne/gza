@@ -39,14 +39,14 @@ A specific failure mode: pairing an infrastructure refactor with a policy
 change in one PR. ("Refactor tests that assert X, and while we're here,
 change X.") Different decisions; separate them.
 
-## A subprocess makes it a functional test
+## A subprocess belongs in `tests_functional/`
 
 If a test spawns a subprocess, it's a functional test — not a unit test —
-and must be marked `@pytest.mark.functional`. The unit suite has tight
-latency requirements, enforced by a short per-test watchdog, so the inner
-dev loop stays fast and regressions surface quickly. Subprocess startup
-routinely blows that budget; treating these as functional tests gives them
-the headroom they actually need.
+and belongs under `tests_functional/`. The unit suite has tight latency
+requirements, enforced by a short per-test watchdog, so the inner dev loop
+stays fast and regressions surface quickly. Subprocess startup routinely
+blows that budget; the dedicated functional suite gives those tests the
+headroom they actually need without stretching the unit watchdog.
 
 ## Skip `uv run` inside the test suite
 

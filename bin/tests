@@ -26,6 +26,7 @@ uv run ty check src/gza/
 uv run mypy src/gza/
 uv run python -m checks
 uv run pytest tests/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x -o faulthandler_timeout=$PYTEST_FAULTHANDLER_TIMEOUT
+uv run pytest tests_functional/ -x -o faulthandler_timeout=$PYTEST_FAULTHANDLER_TIMEOUT
 
 if [ "$RUN_INTEGRATION" -eq 1 ]; then
     uv run pytest tests_integration -xv

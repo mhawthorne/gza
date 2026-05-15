@@ -19,17 +19,7 @@ def run_gza(
 ) -> subprocess.CompletedProcess:
     """Run gza CLI in-process and capture stdout/stderr like subprocess.run."""
     if args and args[0] in {"diff"}:
-        run_env = os.environ.copy()
-        if env:
-            run_env.update(env)
-        return subprocess.run(
-            ["uv", "run", "gza", *args],
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            input=stdin_input,
-            env=run_env,
-        )
+        return run_gza_subprocess(*args, cwd=cwd, stdin_input=stdin_input, env=env)
 
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -61,6 +51,31 @@ def run_gza(
         returncode=returncode,
         stdout=stdout.getvalue(),
         stderr=stderr.getvalue(),
+    )
+
+
+def run_gza_subprocess(
+    *args: str,
+    cwd: Path | None = None,
+    stdin_input: str | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run gza in a subprocess using the active test interpreter."""
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+    for name in ("FORCE_COLOR", "TTY_COMPATIBLE", "CLICOLOR_FORCE"):
+        run_env.pop(name, None)
+    run_env.setdefault("NO_COLOR", "1")
+    return subprocess.run(
+        [sys.executable, "-m", "gza", *args],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+        input=stdin_input,
+        env=run_env,
+        timeout=timeout,
     )
 
 

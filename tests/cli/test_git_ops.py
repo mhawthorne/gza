@@ -591,7 +591,7 @@ def test_run_task_backed_rebase_failure_does_not_reconcile_parent_merge_status(t
     reconcile_task_branch_merge_truth.assert_not_called()
 
 
-@pytest.mark.functional
+@pytest.mark.timeout(4, method="signal")
 def test_advance_explicit_merge_refuses_when_checkout_does_not_match_canonical_target(
     tmp_path: Path,
     capsys,
@@ -851,7 +851,7 @@ def test_advance_execution_prefers_local_branch_when_origin_is_stale(
     assert f"Merging 'origin/{branch}' into 'main'" not in output
 
 
-@pytest.mark.functional
+@pytest.mark.timeout(4, method="signal")
 def test_advance_dry_run_surfaces_diverged_merge_source_for_manual_resolution(
     tmp_path: Path,
     capsys,
@@ -1183,7 +1183,7 @@ def test_print_squash_reconcile_result_failed_remote_tracking_ref_update_reports
     assert "git fetch origin +refs/heads/feature/demo:refs/remotes/origin/feature/demo" in output
 
 
-@pytest.mark.functional
+@pytest.mark.timeout(4, method="signal")
 def test_squash_merge_reconciles_origin_branch_and_keeps_advance_planning_clean(tmp_path: Path) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
@@ -1253,7 +1253,7 @@ def test_squash_merge_reconciles_origin_branch_and_keeps_advance_planning_clean(
     assert action.get("needs_attention_reason") != "merge-source-needs-manual-resolution"
 
 
-@pytest.mark.functional
+@pytest.mark.timeout(4, method="signal")
 def test_squash_merge_without_remote_tracking_ref_stays_local_only(tmp_path: Path) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
