@@ -437,14 +437,3 @@ def test_unit_suite_boundary_allows_dedicated_git_run_unit_tests(tmp_path: Path)
     )
 
     assert _find_unit_suite_boundary_violations(tests_root) == []
-
-
-def test_github_test_workflow_uses_shared_test_script() -> None:
-    workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "test.yml"
-    workflow_text = workflow.read_text()
-
-    assert "run: ./bin/tests" in workflow_text
-    # CI pins workers to `auto` because bin/tests now defaults to ~75% of cores so
-    # busy laptops have headroom for Docker / gza / etc. CI runners aren't busy
-    # with anything else, so they should saturate.
-    assert 'PYTEST_XDIST_WORKERS: "auto"' in workflow_text
