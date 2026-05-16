@@ -1771,15 +1771,20 @@ def _create_improve_task(
     """
     assert impl_task.id is not None
     has_comments = bool(store.get_comments(impl_task.id, unresolved_only=True))
+    based_on_id = impl_task.id
     if review_task is not None:
         assert review_task.id is not None
         existing = store.get_improve_tasks_for(impl_task.id, review_task.id)
         if existing:
-            existing_task = existing[0]
-            raise ValueError(
-                f"An improve task already exists for implementation {impl_task.id} "
-                f"and review {review_task.id}: {existing_task.id} (status: {existing_task.status})"
-            )
+            latest_existing = existing[0]
+            if latest_existing.status == "completed" and latest_existing.changed_diff is False:
+                assert latest_existing.id is not None
+                based_on_id = latest_existing.id
+            else:
+                raise ValueError(
+                    f"An improve task already exists for implementation {impl_task.id} "
+                    f"and review {review_task.id}: {latest_existing.id} (status: {latest_existing.status})"
+                )
 
     prompt = PromptBuilder().improve_task_prompt(
         impl_task.id,
@@ -1790,7 +1795,7 @@ def _create_improve_task(
         prompt=prompt,
         task_type="improve",
         depends_on=review_task.id if review_task is not None else None,
-        based_on=impl_task.id,
+        based_on=based_on_id,
         same_branch=True,
         tags=impl_task.tags,
         create_review=create_review,

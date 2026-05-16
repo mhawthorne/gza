@@ -2363,6 +2363,7 @@ class _AdvanceEngineConfigAdapter:
     advance_create_reviews: bool
     max_review_cycles: int
     max_resume_attempts: int
+    max_noop_improve_cycles: int = 2
 
 
 def _iterate_action_description(action: dict[str, Any]) -> str:
@@ -2581,6 +2582,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         advance_requires_review=bool(getattr(config, "advance_requires_review", True)),
         advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
+        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 2),
         max_resume_attempts=effective_max_resume_attempts,
     )
 
@@ -3418,6 +3420,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         advance_requires_review=bool(getattr(config, "advance_requires_review", True)),
         advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
+        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 2),
         max_resume_attempts=max_resume_attempts,
     )
     if prepared_iteration_start is not None:
@@ -3587,6 +3590,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         advance_requires_review=bool(getattr(config, "advance_requires_review", True)),
         advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
+        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 2),
         max_resume_attempts=max_resume_attempts,
     )
 

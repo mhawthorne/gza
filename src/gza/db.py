@@ -403,7 +403,7 @@ class Task:
     diff_files_changed: int | None = None  # Files changed vs. main (v13)
     diff_lines_added: int | None = None    # Lines added vs. main (v13)
     diff_lines_removed: int | None = None  # Lines removed vs. main (v13)
-    changed_diff: bool | None = None  # Rebase-only: whether rebasing changed the reviewed implementation diff
+    changed_diff: bool | None = None  # Same-branch lifecycle diff-change signal for rebase/improve; NULL = legacy/unknown
     review_cleared_at: datetime | None = None  # When review state was cleared by an improve task (v14)
     review_score: int | None = None  # Derived deterministic score for completed review tasks (v33)
     log_schema_version: int = 1  # 1=legacy logs, 2=message-step logs
@@ -4658,13 +4658,17 @@ class SqliteTaskStore:
                 (self._project_id, task_id),
             )
 
-    def set_rebase_changed_diff(self, task_id: str, changed_diff: bool) -> None:
-        """Persist the completed rebase diff-change signal."""
+    def set_task_changed_diff(self, task_id: str, changed_diff: bool) -> None:
+        """Persist the completed same-branch diff-change signal."""
         with self._connect() as conn:
             conn.execute(
                 "UPDATE tasks SET changed_diff = ? WHERE project_id = ? AND id = ?",
                 (1 if changed_diff else 0, self._project_id, task_id),
             )
+
+    def set_rebase_changed_diff(self, task_id: str, changed_diff: bool) -> None:
+        """Compatibility wrapper for persisting the completed rebase diff-change signal."""
+        self.set_task_changed_diff(task_id, changed_diff)
 
     def set_log_schema_version(self, task_id: str, version: int) -> None:
         """Set the persisted log schema marker for a task/run."""

@@ -50,6 +50,7 @@ Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
 | `advance_create_reviews` | `true` | Auto-create review tasks for implements. The invariant-closing review after a completed write is always enforced. |
 | `max_resume_attempts` | `1` | Shared automatic failed-task recovery toggle (`0` disables; any positive value enables the fixed bounded resume/retry policy) |
 | `max_review_cycles` | `3` | Max review→improve cycles before flagging for manual intervention |
+| `max_noop_improve_cycles` | `2` | Max consecutive no-op improves before lifecycle automation stops for discussion |
 | `review_verify_timeout_seconds` | `120` | Timeout for autonomous review `verify_command` runs; stale-branch slow-verify evidence compares against this |
 | `recommend_rebase_behind_commits` | `1` | Advisory stale-branch threshold; `0` disables behind-target `recommend_rebase` detection |
 | `merge_squash_threshold` | `0` | Auto-squash branches with >= N commits (0 = disabled) |
@@ -129,9 +130,10 @@ If the live behind-count probe fails, lifecycle planning does not silently downg
 | Verdict = `APPROVED` | `merge` |
 | Verdict = `APPROVED_WITH_FOLLOWUPS` with at least one parsed `FOLLOWUP` finding | `merge_with_followups` — create/reuse follow-up implement tasks, then merge |
 | Verdict = `APPROVED_WITH_FOLLOWUPS` with zero parsed `FOLLOWUP` findings | `needs_discussion` — fail closed; review output is inconsistent |
-| Verdict = `CHANGES_REQUESTED` AND cycles >= `max_review_cycles` | `max_cycles_reached` — manual intervention |
 | Verdict = `CHANGES_REQUESTED` AND improve is `in_progress` | `wait_improve` — skip |
 | Verdict = `CHANGES_REQUESTED` AND improve is `pending` | `run_improve` — spawn worker |
+| Consecutive completed no-op improves for the latest `(impl, review)` pair >= `max_noop_improve_cycles` and lineage is not tagged `allow-noop-improve` | `needs_discussion` — stop repeated no-op improve loops |
+| Verdict = `CHANGES_REQUESTED` AND cycles >= `max_review_cycles` | `max_cycles_reached` — manual intervention |
 | Verdict = `CHANGES_REQUESTED` AND no improve exists | `improve` — create improve task |
 | Verdict = unknown | `needs_discussion` — manual intervention |
 
@@ -184,6 +186,8 @@ A single (impl, review) pair can produce a **chain** of improve tasks — the or
 Implication for queries: **to find all improves for an (impl, review) pair, filter by `depends_on = review.id`, not by `based_on = impl.id`.** Filtering by `based_on = impl.id` only finds first-generation improves and misses every retry/resume. This has been the root cause of multiple bugs where iterate or the engine couldn't "see" chained work (e.g. keeping the review state dirty because a completed retry wasn't counted as addressing the review).
 
 Likewise, post-completion side effects that logically target "the impl this improve belongs to" must walk up the `based_on` chain until a non-improve ancestor is found, because `task.based_on` on a retry/resume points at the previous improve, not the impl. The helper `runner._resolve_impl_ancestor()` encapsulates this walk.
+
+Completed improve tasks persist `changed_diff` to record whether the task changed the tracked aggregate review diff compared with the branch state captured immediately before the improve started. `changed_diff = 0` means the improve completed but made no tracked reviewable change, so the runner does not clear review state, resolve comments, or create a closing review. Advance counts consecutive no-op improves for the latest `(implementation, review)` pair and returns `needs_discussion` with reason `improve-no-op` once `max_noop_improve_cycles` is reached, unless the implementation/review/improve lineage is tagged `allow-noop-improve`. `NULL` is legacy/unknown and is treated as changed.
 
 ## Action Types
 

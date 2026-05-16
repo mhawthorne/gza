@@ -11652,6 +11652,84 @@ class TestIterateCommand:
         assert target.id == first.id
         assert decision is not None
 
+    def test_iterate_creates_followup_after_completed_noop_improve(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        noop_improve = store.add("Improve 1", task_type="improve", based_on=impl.id, depends_on=review.id)
+        noop_improve.status = "completed"
+        noop_improve.changed_diff = False
+        noop_improve.completed_at = datetime.now(UTC)
+        store.update(noop_improve)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=3,
+            max_review_cycles=3,
+            max_noop_improve_cycles=2,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        def fake_run_foreground(config, task_id, **kwargs):
+            del config, kwargs
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+            patch("gza.cli.time.monotonic", side_effect=[300.0, 340.0]),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        created = next(
+            task
+            for task in store.get_improve_tasks_for(impl.id, review.id)
+            if task.id not in {noop_improve.id}
+        )
+        assert created.based_on == noop_improve.id
+        assert created.status == "completed"
+        assert any(call.kwargs["task_id"] == created.id for call in run_foreground.call_args_list)
+        assert f"Running improve {created.id}..." in output
+        assert "Iterate blocked:" in output
+
     def test_changes_requested_with_dropped_improve_blocks_and_does_not_run_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):

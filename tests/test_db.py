@@ -56,6 +56,25 @@ def test_is_readonly_snapshot_operational_error_accepts_snapshot_variants() -> N
     assert not _is_readonly_snapshot_operational_error(sqlite3.OperationalError("database is locked"))
 
 
+def test_set_task_changed_diff_persists_and_rebase_wrapper_still_works(tmp_path: Path) -> None:
+    db_path = tmp_path / "test.db"
+    store = SqliteTaskStore(db_path)
+
+    improve = store.add("Improve feature", task_type="improve")
+    assert improve.id is not None
+    store.set_task_changed_diff(improve.id, False)
+    refreshed_improve = store.get(improve.id)
+    assert refreshed_improve is not None
+    assert refreshed_improve.changed_diff is False
+
+    rebase = store.add("Rebase feature", task_type="rebase")
+    assert rebase.id is not None
+    store.set_rebase_changed_diff(rebase.id, True)
+    refreshed_rebase = store.get(rebase.id)
+    assert refreshed_rebase is not None
+    assert refreshed_rebase.changed_diff is True
+
+
 class TestTaskChaining:
     """Tests for task chaining functionality."""
 

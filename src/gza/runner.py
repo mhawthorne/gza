@@ -55,6 +55,11 @@ from .failure_reasons import (
 )
 from .git import Git, GitApplyResult, GitError, cleanup_worktree_for_branch, parse_diff_numstat
 from .github import GitHub, GitHubError
+from .improve_diff import (
+    ImproveDiffBaseline,
+    capture_improve_diff_baseline,
+    compute_improve_changed_diff,
+)
 from .learnings import maybe_auto_regenerate_learnings
 from .lineage import get_plan_for_task
 from .log_paths import TaskLogPaths, ops_log_path_for, resolve_ops_log_path, resolve_task_log_paths
@@ -338,6 +343,7 @@ def _finalize_rebase_completion(
     fix_commits_ahead_before_run: int | None = None,
     fix_default_branch: str | None = None,
     fix_was_merged_before_run: bool = False,
+    improve_diff_baseline: ImproveDiffBaseline | None = None,
     rebase_diff_baseline: RebaseDiffBaseline | None = None,
 ) -> int:
     """Publish a completed rebase before persisting completed task state."""
@@ -353,6 +359,7 @@ def _finalize_rebase_completion(
         fix_commits_ahead_before_run=fix_commits_ahead_before_run,
         fix_default_branch=fix_default_branch,
         fix_was_merged_before_run=fix_was_merged_before_run,
+        improve_diff_baseline=improve_diff_baseline,
         rebase_diff_baseline=rebase_diff_baseline,
     )
     if post_complete_rc != 0:
@@ -2133,9 +2140,41 @@ def _resolve_impl_ancestor(store: SqliteTaskStore, task: Task) -> Task | None:
     return None
 
 
+def _task_has_tag(task: Task | None, tag: str) -> bool:
+    """Return whether a task carries the given tag."""
+    return task is not None and tag in task.tags
+
+
+def _noop_improve_warning_text(
+    store: SqliteTaskStore,
+    task: Task,
+    impl_ancestor: Task | None,
+) -> str:
+    """Build explicit operator-facing warning text for a no-op improve."""
+    review_task = store.get(task.depends_on) if task.depends_on is not None else None
+    opt_out = (
+        _task_has_tag(impl_ancestor, "allow-noop-improve")
+        or _task_has_tag(review_task, "allow-noop-improve")
+        or _task_has_tag(task, "allow-noop-improve")
+    )
+    warning = "Improve completed with no tracked diff change."
+    if opt_out:
+        warning += " Tag `allow-noop-improve` is present, so continuation is explicitly allowed."
+    return warning
+
+
 def _is_recovered_rebase_lineage(task: Task, *, resume: bool) -> bool:
     """Return whether rebase diff classification must fail closed for this run."""
     if task.task_type != "rebase":
+        return False
+    if resume:
+        return True
+    return task.recovery_origin in {"resume", "retry"}
+
+
+def _is_recovered_improve_lineage(task: Task, *, resume: bool) -> bool:
+    """Return whether improve diff classification must fail open for this run."""
+    if task.task_type != "improve":
         return False
     if resume:
         return True
@@ -3626,6 +3665,7 @@ def _complete_code_task(
     fix_commits_ahead_before_run: int | None = None,
     fix_default_branch: str | None = None,
     seeded_paths: set[str] | None = None,
+    improve_diff_baseline: ImproveDiffBaseline | None = None,
     rebase_diff_baseline: RebaseDiffBaseline | None = None,
 ) -> int:
     """Handle successful code-task completion (staging, commit, completion state, output).
@@ -3827,6 +3867,7 @@ def _complete_code_task(
             fix_commits_ahead_before_run=fix_commits_ahead_before_run,
             fix_default_branch=fix_default_branch,
             fix_was_merged_before_run=fix_was_merged_before_run,
+            improve_diff_baseline=improve_diff_baseline,
             rebase_diff_baseline=rebase_diff_baseline,
         )
 
@@ -3856,6 +3897,7 @@ def _complete_code_task(
         fix_commits_ahead_before_run=fix_commits_ahead_before_run,
         fix_default_branch=fix_default_branch,
         fix_was_merged_before_run=fix_was_merged_before_run,
+        improve_diff_baseline=improve_diff_baseline,
         rebase_diff_baseline=rebase_diff_baseline,
     )
 
@@ -3873,44 +3915,62 @@ def _post_complete_code_task(
     fix_commits_ahead_before_run: int | None = None,
     fix_default_branch: str | None = None,
     fix_was_merged_before_run: bool = False,
+    improve_diff_baseline: ImproveDiffBaseline | None = None,
     rebase_diff_baseline: RebaseDiffBaseline | None = None,
 ) -> int:
     """Run shared post-completion side effects for completed code tasks."""
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
     improve_follow_up_ready = True
+    improve_changed_diff: bool | None = None
     fix_code_changed = False
     fix_auto_review_ready = True
     impl_ancestor: Task | None = None
 
-    # Clear review state on the root implementation task after improve completes.
     # Improve retries/resumes may chain based_on through previous improves, so
-    # resolve the implementation ancestor first. Hold the review-clear handoff
-    # until live-PR publication is known safe so later lifecycle automation does
-    # not recreate PR-facing review work for unpublished code.
+    # resolve the implementation ancestor first. Only clear review state,
+    # resolve comments, and create a follow-up review when the improve changed
+    # the tracked review diff or comparison could not be proven.
     if task.task_type == "improve":
         impl_ancestor = _resolve_impl_ancestor(store, task)
-        if impl_ancestor and impl_ancestor.id is not None:
-            # If the implementation was already merged, flip it back to unmerged:
-            # improve writes add commits on the shared implementation branch even
-            # when publishing those commits still needs operator intervention.
-            refreshed_impl = store.get(impl_ancestor.id)
-            refreshed_unit = (
-                store.resolve_merge_unit_for_task(refreshed_impl.id)
-                if refreshed_impl and refreshed_impl.id is not None
-                else None
-            )
-            if refreshed_impl and refreshed_impl.id is not None and (
-                refreshed_unit.state if refreshed_unit is not None else refreshed_impl.merge_status
-            ) == "merged":
-                store.set_merge_status(refreshed_impl.id, "unmerged")
-        if task.create_review:
-            improve_follow_up_ready = _sync_completed_code_task_branch_for_live_pr(task, store, worktree_git)
-        if improve_follow_up_ready and impl_ancestor and impl_ancestor.id is not None:
-            store.clear_review_state(impl_ancestor.id)
-            store.resolve_comments(
-                impl_ancestor.id,
-                created_on_or_before=task.created_at,
-            )
+        improve_comparison = compute_improve_changed_diff(
+            worktree_git,
+            baseline=(
+                improve_diff_baseline
+                if improve_diff_baseline is not None
+                else ImproveDiffBaseline(branch_tip_before=None, target_at_start=None, recovered=True)
+            ),
+            branch=branch_name,
+        )
+        improve_changed_diff = improve_comparison.changed_diff
+        assert task.id is not None
+        store.set_task_changed_diff(task.id, improve_comparison.changed_diff)
+        task.changed_diff = improve_comparison.changed_diff
+        if improve_comparison.warning:
+            logger.warning(improve_comparison.warning)
+            console.print(f"[yellow]Warning: {improve_comparison.warning}[/yellow]")
+        if improve_comparison.changed_diff:
+            if impl_ancestor and impl_ancestor.id is not None:
+                # If the implementation was already merged, flip it back to unmerged:
+                # improve writes add commits on the shared implementation branch even
+                # when publishing those commits still needs operator intervention.
+                refreshed_impl = store.get(impl_ancestor.id)
+                refreshed_unit = (
+                    store.resolve_merge_unit_for_task(refreshed_impl.id)
+                    if refreshed_impl and refreshed_impl.id is not None
+                    else None
+                )
+                if refreshed_impl and refreshed_impl.id is not None and (
+                    refreshed_unit.state if refreshed_unit is not None else refreshed_impl.merge_status
+                ) == "merged":
+                    store.set_merge_status(refreshed_impl.id, "unmerged")
+            if task.create_review:
+                improve_follow_up_ready = _sync_completed_code_task_branch_for_live_pr(task, store, worktree_git)
+            if improve_follow_up_ready and impl_ancestor and impl_ancestor.id is not None:
+                store.clear_review_state(impl_ancestor.id)
+                store.resolve_comments(
+                    impl_ancestor.id,
+                    created_on_or_before=task.created_at,
+                )
 
     # Rebase tasks run provider-side conflict resolution in the worktree.
     # Force-push from the host runner so SSH/auth follows host environment.
@@ -3927,7 +3987,7 @@ def _post_complete_code_task(
     # or equivalence could not be proven, but only after publication succeeds.
     if task.task_type == "rebase" and task.based_on:
         impl_ancestor = _resolve_impl_ancestor(store, task)
-        comparison = compute_rebase_changed_diff(
+        rebase_comparison = compute_rebase_changed_diff(
             worktree_git,
             baseline=(
                 rebase_diff_baseline
@@ -3937,17 +3997,17 @@ def _post_complete_code_task(
             branch=branch_name,
             target=target_branch if target_branch is not None else worktree_git.default_branch(),
         )
-        rebase_changed_diff = comparison.changed_diff
+        rebase_changed_diff = rebase_comparison.changed_diff
         assert task.id is not None
-        store.set_rebase_changed_diff(task.id, comparison.changed_diff)
-        task.changed_diff = comparison.changed_diff
-        if comparison.warning:
-            logger.warning(comparison.warning)
-            console.print(f"[yellow]Warning: {comparison.warning}[/yellow]")
+        store.set_rebase_changed_diff(task.id, rebase_comparison.changed_diff)
+        task.changed_diff = rebase_comparison.changed_diff
+        if rebase_comparison.warning:
+            logger.warning(rebase_comparison.warning)
+            console.print(f"[yellow]Warning: {rebase_comparison.warning}[/yellow]")
         rebase_review_target_id = (
             impl_ancestor.id if impl_ancestor and impl_ancestor.id is not None else task.based_on
         )
-        if comparison.changed_diff:
+        if rebase_comparison.changed_diff:
             store.invalidate_review_state(rebase_review_target_id)
         parent = store.get(rebase_review_target_id)
         parent_unit = (
@@ -3975,6 +4035,15 @@ def _post_complete_code_task(
                 _create_fix_follow_up_review_task(task, store)
 
     console.print("")
+    if task.task_type == "improve" and improve_changed_diff is not None:
+        if improve_changed_diff is False:
+            console.print(f"[yellow]Warning: {_noop_improve_warning_text(store, task, impl_ancestor)}[/yellow]")
+        changed_diff_text = (
+            "yes (tracked improve diff changed or comparison unavailable)"
+            if improve_changed_diff
+            else "no (no tracked improve changes)"
+        )
+        console.print(f"Changed Diff: {changed_diff_text}")
     if task.task_type == "rebase" and rebase_changed_diff is not None:
         changed_diff_text = "yes (review must be refreshed)" if rebase_changed_diff else "no (review can be preserved)"
         console.print(f"Changed Diff: {changed_diff_text}")
@@ -3989,6 +4058,8 @@ def _post_complete_code_task(
 
     # Auto-create and run review task if requested
     if task.create_review:
+        if task.task_type == "improve" and improve_changed_diff is False:
+            return 0
         if task.task_type == "improve" and not improve_follow_up_ready:
             review_target = _resolve_impl_ancestor(store, task)
             if review_target and review_target.id is not None:
@@ -4526,6 +4597,7 @@ def _run_inner(
     pre_run_status = worktree_git.status_porcelain()
     task_logger = TaskExecutionLogger(resolve_ops_log_path(config, log_file), echo=True)
     rebase_validation_state: tuple[str, set[RuffDiagnostic]] | None = None
+    improve_diff_baseline: ImproveDiffBaseline | None = None
     rebase_diff_baseline: RebaseDiffBaseline | None = None
     if task.task_type == "rebase":
         try:
@@ -4550,6 +4622,13 @@ def _run_inner(
                 branch=branch_name,
             )
             return 0
+    if task.task_type == "improve":
+        improve_diff_baseline = capture_improve_diff_baseline(
+            worktree_git,
+            branch=branch_name,
+            target=default_branch,
+            recovered=_is_recovered_improve_lineage(task, resume=resume),
+        )
     fix_commits_ahead_before_run: int | None = None
     fix_default_branch: str | None = None
     if task.task_type == "fix":
@@ -4672,6 +4751,7 @@ def _run_inner(
             fix_commits_ahead_before_run=fix_commits_ahead_before_run,
             fix_default_branch=fix_default_branch,
             seeded_paths=seeded_paths,
+            improve_diff_baseline=improve_diff_baseline,
             rebase_diff_baseline=rebase_diff_baseline,
         )
 

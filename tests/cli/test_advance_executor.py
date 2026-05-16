@@ -191,6 +191,52 @@ def test_improve_manual_review_returns_skip_without_mutation(tmp_path: Path) -> 
     assert len(store.get_all()) == before_count
 
 
+def test_improve_dry_run_preserves_noop_warning_description(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/improve-noop-warning")
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=True,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={
+            "type": "improve",
+            "review_task": review,
+            "description": "Create improve task (review CHANGES_REQUESTED); previous no-op improve gza-9 made no tracked diff change",
+        },
+        context=context,
+    )
+
+    assert result.status == "dry_run"
+    assert result.message is not None
+    assert "previous no-op improve gza-9" in result.message
+
+
 @pytest.mark.parametrize(
     ("reason_code", "reason_text"),
     [
@@ -423,6 +469,67 @@ def test_improve_retry_preserves_review_backed_execution_settings(tmp_path: Path
     assert result.created_task.model == "gpt-5.4"
     assert result.created_task.provider == "codex"
     assert result.created_task.provider_is_explicit is True
+    assert spawned == [(result.created_task.id, "improve")]
+
+
+def test_improve_executor_allows_followup_after_completed_noop_improve(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/improve-noop-followup")
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    noop_improve = store.add(
+        "Improve attempt",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert noop_improve.id is not None
+    noop_improve.status = "completed"
+    noop_improve.changed_diff = False
+    noop_improve.completed_at = datetime.now(UTC)
+    store.update(noop_improve)
+
+    spawned: list[tuple[str, str]] = []
+    context = AdvanceActionExecutionContext(
+        store=store,
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda task_obj, kind: spawned.append((str(task_obj.id), kind)) or 0,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={"type": "improve", "review_task": review},
+        context=context,
+    )
+
+    assert result.status == "success"
+    assert result.improve_mode == "new"
+    assert result.created_task is not None
+    assert result.created_task.id is not None
+    assert result.created_task.based_on == noop_improve.id
+    assert result.created_task.depends_on == review.id
     assert spawned == [(result.created_task.id, "improve")]
 
 

@@ -64,6 +64,7 @@ DEFAULT_ADVANCE_REQUIRES_REVIEW = True
 DEFAULT_ADVANCE_MODE = "default"
 DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
+DEFAULT_MAX_NOOP_IMPROVE_CYCLES = 2
 DEFAULT_WATCH_BATCH = 5
 DEFAULT_WATCH_POLL = 300
 DEFAULT_WATCH_NO_ACTIVITY_TIMEOUT = 60
@@ -93,7 +94,7 @@ VALID_CONFIG_FIELDS = {
     "reasoning_effort", "defaults", "task_types", "providers", "branch_strategy", "chat_text_display_length",
     "verify_command",
     "advance_create_reviews", "advance_requires_review", "advance_mode", "max_resume_attempts",
-    "max_review_cycles", "iterate_max_iterations", "watch", "interactive_worktree_dir",
+    "max_review_cycles", "max_noop_improve_cycles", "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
     "review_diff_medium_threshold", "review_context_file_limit", "review_verify_timeout_seconds",
     "recommend_rebase_behind_commits", "tmux", "learnings_window",
@@ -159,6 +160,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "verify_command": None,
     "max_resume_attempts": None,
     "max_review_cycles": None,
+    "max_noop_improve_cycles": None,
     "watch": {
         "batch": None,
         "poll": None,
@@ -256,6 +258,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "iterate_max_iterations": None,
     "max_resume_attempts": None,
     "max_review_cycles": None,
+    "max_noop_improve_cycles": None,
     "interactive_worktree_dir": None,
     "merge_squash_threshold": None,
     "main_checkout_isolate": None,
@@ -631,6 +634,7 @@ class Config:
     advance_mode: str = DEFAULT_ADVANCE_MODE
     max_resume_attempts: int = DEFAULT_MAX_RESUME_ATTEMPTS
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
+    max_noop_improve_cycles: int = DEFAULT_MAX_NOOP_IMPROVE_CYCLES
     interactive_worktree_dir: str = DEFAULT_INTERACTIVE_WORKTREE_DIR
     merge_squash_threshold: int = DEFAULT_MERGE_SQUASH_THRESHOLD
     main_checkout_isolate: bool = DEFAULT_MAIN_CHECKOUT_ISOLATE
@@ -1443,6 +1447,11 @@ class Config:
         max_review_cycles = _load_strict_int_field(data, "max_review_cycles", DEFAULT_MAX_REVIEW_CYCLES)
         if max_review_cycles <= 0:
             raise ConfigError("'max_review_cycles' must be positive")
+        max_noop_improve_cycles = _load_strict_int_field(
+            data, "max_noop_improve_cycles", DEFAULT_MAX_NOOP_IMPROVE_CYCLES
+        )
+        if max_noop_improve_cycles <= 0:
+            raise ConfigError("'max_noop_improve_cycles' must be positive")
 
         iterate_max_iterations = _load_strict_int_field(
             data, "iterate_max_iterations", DEFAULT_ITERATE_MAX_ITERATIONS
@@ -1734,6 +1743,7 @@ class Config:
             advance_mode=advance_mode,
             max_resume_attempts=max_resume_attempts,
             max_review_cycles=max_review_cycles,
+            max_noop_improve_cycles=max_noop_improve_cycles,
             watch=watch_config,
             iterate_max_iterations=iterate_max_iterations,
             interactive_worktree_dir=interactive_worktree_dir,
@@ -2141,6 +2151,11 @@ class Config:
                 errors.append("'max_review_cycles' must be an integer")
             elif data["max_review_cycles"] <= 0:
                 errors.append("'max_review_cycles' must be positive")
+        if "max_noop_improve_cycles" in data:
+            if not _is_strict_int(data["max_noop_improve_cycles"]):
+                errors.append("'max_noop_improve_cycles' must be an integer")
+            elif data["max_noop_improve_cycles"] <= 0:
+                errors.append("'max_noop_improve_cycles' must be positive")
         if "iterate_max_iterations" in data:
             if not _is_strict_int(data["iterate_max_iterations"]):
                 errors.append("'iterate_max_iterations' must be an integer")

@@ -765,3 +765,48 @@ def test_advance_creates_exactly_one_closing_review_after_completed_improve(
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == closing_review.id
     assert f"Created review task {closing_review.id}" in output
+
+
+def test_advance_dry_run_surfaces_improve_noop_attention_reason(tmp_path: Path, capsys, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.review_verdict import ParsedReviewReport
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = _create_completed_implement(store)
+    review = _create_completed_review(store, impl, verdict="CHANGES_REQUESTED")
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    for hour in (11, 12):
+        improve = store.add(
+            f"Improve {hour}",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 1, 3, hour, 0, tzinfo=UTC)
+        improve.branch = impl.branch
+        improve.changed_diff = False
+        store.update(improve)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
+        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "reason=improve-no-op" in output
+    assert "consecutive no-op improves" in output

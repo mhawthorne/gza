@@ -15,6 +15,7 @@ from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError
 from gza.github import GitHubError, PullRequestDetails
+from gza.improve_diff import ImproveDiffResult
 from gza.lineage import get_plan_for_task
 from gza.log_paths import ops_log_path_for
 from gza.providers import ClaudeProvider, RunResult
@@ -7613,6 +7614,202 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_impl.review_cleared_at is not None
         unresolved_impl_comments = store.get_comments(impl.id, unresolved_only=True)
         assert unresolved_impl_comments == []
+
+    def test_post_complete_noop_improve_persists_changed_diff_and_skips_follow_up_review(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with review", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/noop-improve"
+        store.update(impl)
+        assert impl.id is not None
+        old_comment = store.add_comment(impl.id, "Older comment already handled.", source="direct")
+        old_cleared_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+        impl.review_cleared_at = old_cleared_at
+        store.update(impl)
+        store.resolve_comments(impl.id, created_on_or_before=old_comment.created_at)
+        store.add_comment(impl.id, "Comment should remain unresolved after no-op improve.", source="direct")
+
+        review = store.add(
+            prompt="Review before improve",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        improve = store.add(
+            prompt="Improve without tracked diff change",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+
+        with (
+            patch(
+                "gza.runner.compute_improve_changed_diff",
+                return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
+            ),
+            patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 0
+        sync_branch.assert_not_called()
+        run_review.assert_not_called()
+
+        refreshed_improve = store.get(improve.id)
+        assert refreshed_improve is not None
+        assert refreshed_improve.changed_diff is False
+
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.review_cleared_at == old_cleared_at
+        unresolved_impl_comments = store.get_comments(impl.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved_impl_comments] == [
+            "Comment should remain unresolved after no-op improve."
+        ]
+        output = capsys.readouterr().out
+        assert "Warning: Improve completed with no tracked diff change." in output
+        assert "Changed Diff: no (no tracked improve changes)" in output
+
+    def test_post_complete_noop_improve_preserves_impl_review_state_timestamp(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with review", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/noop-preserve-clear"
+        impl.review_cleared_at = datetime(2026, 5, 11, 9, 30, tzinfo=UTC)
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(prompt="Review before improve", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        improve = store.add(
+            prompt="Improve without tracked diff change",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+
+        with (
+            patch(
+                "gza.runner.compute_improve_changed_diff",
+                return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
+            ),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 0
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.review_cleared_at == datetime(2026, 5, 11, 9, 30, tzinfo=UTC)
+
+    def test_post_complete_noop_improve_warning_mentions_allow_noop_opt_out(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(
+            prompt="Implement with review",
+            task_type="implement",
+            tags=("allow-noop-improve",),
+        )
+        impl.status = "completed"
+        impl.branch = "feature/noop-opt-out"
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(prompt="Review before improve", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        improve = store.add(
+            prompt="Improve without tracked diff change",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+
+        with (
+            patch(
+                "gza.runner.compute_improve_changed_diff",
+                return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
+            ),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "Warning: Improve completed with no tracked diff change." in output
+        assert "allow-noop-improve" in output
 
     def test_post_complete_improve_gh_unavailable_still_runs_auto_review_without_noise(
         self,

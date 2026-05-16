@@ -30,6 +30,7 @@ from gza.source_followup import (
 from gza.stale_branch import BranchStaleness, resolve_branch_staleness
 
 NEEDS_ATTENTION_LABEL = "Needs attention"
+ALLOW_NOOP_IMPROVE_TAG = "allow-noop-improve"
 
 WORKER_CONSUMING_ACTIONS = frozenset(
     {
@@ -72,6 +73,7 @@ class AdvanceContext:
     requires_review: bool
     create_reviews: bool
     max_review_cycles: int
+    max_noop_improve_cycles: int
     max_resume_attempts: int
 
     has_non_dropped_implement_descendant: bool = False
@@ -103,6 +105,10 @@ class AdvanceContext:
     completed_review_cycles: int = 0
     active_improve_running: DbTask | None = None
     active_improve_pending: DbTask | None = None
+    latest_noop_improve: DbTask | None = None
+    consecutive_noop_improves: int = 0
+    noop_improve_allowed: bool = False
+    noop_improve_trigger: str | None = None
     has_improve_after_review: bool = False
     has_fresh_unresolved_comments_since_latest_review: bool = False
     closing_review_action: dict[str, Any] | None = None
@@ -424,6 +430,26 @@ def count_completed_review_cycles(store: SqliteTaskStore, impl_task_id: str) -> 
     return sum(1 for t in improve_tasks if t.status == "completed")
 
 
+def _has_tag(task: DbTask | None, tag: str) -> bool:
+    return task is not None and tag in task.tags
+
+
+def _count_consecutive_noop_improves(improve_tasks: list[DbTask]) -> tuple[DbTask | None, int]:
+    latest_noop_improve: DbTask | None = None
+    consecutive_noops = 0
+    for improve in improve_tasks:
+        if improve.status == "completed":
+            if improve.changed_diff is False:
+                if latest_noop_improve is None:
+                    latest_noop_improve = improve
+                consecutive_noops += 1
+                continue
+            break
+        if improve.status in {"failed", "dropped", "unmerged"}:
+            break
+    return latest_noop_improve, consecutive_noops
+
+
 def _task_id(task: DbTask | None) -> str:
     """Render a task id for user-facing action descriptions."""
     if task is None or task.id is None:
@@ -474,6 +500,31 @@ def _merge_review_description(verdict: str, preserved_rebase: DbTask | None) -> 
     if preserved_rebase is None:
         return f"Merge (review {verdict})"
     return f"Merge (review {verdict}, preserved across rebase {_task_id(preserved_rebase)})"
+
+
+def _noop_improve_followup_suffix(ctx: AdvanceContext) -> str:
+    if ctx.latest_noop_improve is None or ctx.consecutive_noop_improves <= 0:
+        return ""
+    suffix = f"; previous no-op improve {_task_id(ctx.latest_noop_improve)} made no tracked diff change"
+    if ctx.noop_improve_allowed:
+        suffix += f" and `{ALLOW_NOOP_IMPROVE_TAG}` allows continuing"
+    return suffix
+
+
+def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]:
+    latest_noop_id = _task_id(ctx.latest_noop_improve)
+    source = "unresolved comments remain open after" if ctx.noop_improve_trigger == "comments" else "review feedback remains unresolved after"
+    opt_out_note = f" Tag `{ALLOW_NOOP_IMPROVE_TAG}` to continue automation anyway." if not ctx.noop_improve_allowed else ""
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                f"SKIP: {ctx.consecutive_noop_improves} consecutive no-op improves reached "
+                f"(latest {latest_noop_id}); {source} no tracked diff change.{opt_out_note}"
+            ),
+        },
+        reason="improve-no-op",
+    )
 
 
 def _failed_task_skip_action(ctx: AdvanceContext) -> dict[str, Any]:
@@ -846,6 +897,10 @@ def _resolve_review_state(
     int,
     DbTask | None,
     DbTask | None,
+    DbTask | None,
+    int,
+    bool,
+    str | None,
     bool,
     bool,
     dict[str, Any] | None,
@@ -869,6 +924,10 @@ def _resolve_review_state(
     completed_review_cycles = 0
     active_improve_running: DbTask | None = None
     active_improve_pending: DbTask | None = None
+    latest_noop_improve: DbTask | None = None
+    consecutive_noop_improves = 0
+    noop_improve_allowed = False
+    noop_improve_trigger: str | None = None
     has_improve_after_review = False
     has_fresh_unresolved_comments_since_latest_review = False
     latest_completed_code_change: DbTask | None = None
@@ -876,6 +935,7 @@ def _resolve_review_state(
         t
         for t in get_code_changing_descendants_for_root(store, task)
         if t.status == "completed"
+        and not (t.task_type == "improve" and t.changed_diff is False)
     ]
     if completed_descendant_code_changes:
         latest_completed_code_change = max(completed_descendant_code_changes, key=_task_event_time)
@@ -901,12 +961,28 @@ def _resolve_review_state(
         improve_tasks = store.get_improve_tasks_for(task.id, latest_completed_review.id)
         active_improve_running = next((t for t in improve_tasks if t.status == "in_progress"), None)
         active_improve_pending = next((t for t in improve_tasks if t.status == "pending"), None)
+        latest_noop_improve, consecutive_noop_improves = _count_consecutive_noop_improves(improve_tasks)
+        latest_completed_improve = next((t for t in improve_tasks if t.status == "completed"), None)
+        noop_improve_allowed = (
+            _has_tag(task, ALLOW_NOOP_IMPROVE_TAG)
+            or _has_tag(latest_completed_review, ALLOW_NOOP_IMPROVE_TAG)
+            or _has_tag(latest_completed_improve, ALLOW_NOOP_IMPROVE_TAG)
+        )
 
         if latest_completed_review.completed_at is not None and latest_completed_code_change is not None:
             has_improve_after_review = (
                 _task_event_time(latest_completed_code_change)
                 > _normalize_time(latest_completed_review.completed_at)
             )
+
+        if (
+            task.task_type == "implement"
+            and has_fresh_unresolved_comments_since_latest_review
+            and (review_cleared or review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"})
+        ):
+            noop_improve_trigger = "comments"
+        elif review_verdict == "CHANGES_REQUESTED":
+            noop_improve_trigger = "review"
 
         if review_verdict == "CHANGES_REQUESTED":
             completed_review_cycles = count_completed_review_cycles(store, task.id)
@@ -929,6 +1005,10 @@ def _resolve_review_state(
         completed_review_cycles,
         active_improve_running,
         active_improve_pending,
+        latest_noop_improve,
+        consecutive_noop_improves,
+        noop_improve_allowed,
+        noop_improve_trigger,
         has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review,
         closing_review_action,
@@ -949,6 +1029,7 @@ def resolve_advance_context(
     assert task.id is not None
 
     effective_max_resume = max_resume_attempts if max_resume_attempts is not None else config.max_resume_attempts
+    effective_max_noop_improves = int(getattr(config, "max_noop_improve_cycles", 2))
 
     failed_recovery_decision: FailedRecoveryDecision | None = None
     failed_recovery_attention_reason: str | None = None
@@ -999,11 +1080,12 @@ def resolve_advance_context(
         return AdvanceContext(
             task=task,
             task_type=task.task_type,
-            has_branch=bool(task.branch),
-            requires_review=config.advance_requires_review,
-            create_reviews=config.advance_create_reviews,
-            max_review_cycles=config.max_review_cycles,
-            max_resume_attempts=effective_max_resume,
+                has_branch=bool(task.branch),
+                requires_review=config.advance_requires_review,
+                create_reviews=config.advance_create_reviews,
+                max_review_cycles=config.max_review_cycles,
+                max_noop_improve_cycles=effective_max_noop_improves,
+                max_resume_attempts=effective_max_resume,
             failed_recovery_decision=failed_recovery_decision,
             failed_recovery_attention_reason=failed_recovery_attention_reason,
             has_non_dropped_implement_descendant=has_implementation_followup,
@@ -1020,11 +1102,12 @@ def resolve_advance_context(
         return AdvanceContext(
             task=task,
             task_type=task.task_type,
-            has_branch=False,
-            requires_review=config.advance_requires_review,
-            create_reviews=config.advance_create_reviews,
-            max_review_cycles=config.max_review_cycles,
-            max_resume_attempts=effective_max_resume,
+                has_branch=False,
+                requires_review=config.advance_requires_review,
+                create_reviews=config.advance_create_reviews,
+                max_review_cycles=config.max_review_cycles,
+                max_noop_improve_cycles=effective_max_noop_improves,
+                max_resume_attempts=effective_max_resume,
             failed_recovery_decision=failed_recovery_decision,
             failed_recovery_attention_reason=failed_recovery_attention_reason,
             has_non_dropped_implement_descendant=has_implementation_followup,
@@ -1093,6 +1176,10 @@ def resolve_advance_context(
         completed_review_cycles,
         active_improve_running,
         active_improve_pending,
+        latest_noop_improve,
+        consecutive_noop_improves,
+        noop_improve_allowed,
+        noop_improve_trigger,
         has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review,
         closing_review_action,
@@ -1121,6 +1208,7 @@ def resolve_advance_context(
         requires_review=config.advance_requires_review,
         create_reviews=config.advance_create_reviews,
         max_review_cycles=config.max_review_cycles,
+        max_noop_improve_cycles=effective_max_noop_improves,
         max_resume_attempts=effective_max_resume,
         has_non_dropped_implement_descendant=has_implementation_followup,
         active_plan_child=active_plan_child,
@@ -1150,6 +1238,10 @@ def resolve_advance_context(
         completed_review_cycles=completed_review_cycles,
         active_improve_running=active_improve_running,
         active_improve_pending=active_improve_pending,
+        latest_noop_improve=latest_noop_improve,
+        consecutive_noop_improves=consecutive_noop_improves,
+        noop_improve_allowed=noop_improve_allowed,
+        noop_improve_trigger=noop_improve_trigger,
         has_improve_after_review=has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review=has_fresh_unresolved_comments_since_latest_review,
         closing_review_action=closing_review_action,
@@ -1388,6 +1480,14 @@ ADVANCE_RULES: list[AdvanceRule] = [
         },
     ),
     AdvanceRule(
+        name="fresh_comments_noop_improve_limit",
+        matches=lambda ctx: ctx.task_type == "implement"
+        and ctx.noop_improve_trigger == "comments"
+        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
+        and not ctx.noop_improve_allowed,
+        action=_noop_improve_needs_discussion_action,
+    ),
+    AdvanceRule(
         name="fresh_comments_create_improve",
         matches=lambda ctx: ctx.task_type == "implement"
         and ctx.latest_completed_review is not None
@@ -1395,7 +1495,10 @@ ADVANCE_RULES: list[AdvanceRule] = [
         and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}),
         action=lambda ctx: {
             "type": "improve",
-            "description": "Create improve task (unresolved comments newer than latest review)",
+            "description": (
+                "Create improve task (unresolved comments newer than latest review)"
+                f"{_noop_improve_followup_suffix(ctx)}"
+            ),
             "review_task": ctx.latest_completed_review,
         },
     ),
@@ -1422,21 +1525,6 @@ ADVANCE_RULES: list[AdvanceRule] = [
         },
     ),
     AdvanceRule(
-        name="review_max_cycles",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.completed_review_cycles >= ctx.max_review_cycles,
-        action=lambda ctx: with_needs_attention(
-            {
-                "type": "max_cycles_reached",
-                "description": (
-                    f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"
-                ),
-            },
-            reason="review-max-cycles-reached",
-        ),
-    ),
-    AdvanceRule(
         name="review_wait_improve",
         matches=lambda ctx: (not ctx.review_cleared)
         and ctx.review_verdict == "CHANGES_REQUESTED"
@@ -1459,11 +1547,34 @@ ADVANCE_RULES: list[AdvanceRule] = [
         },
     ),
     AdvanceRule(
+        name="review_noop_improve_limit",
+        matches=lambda ctx: (not ctx.review_cleared)
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
+        and not ctx.noop_improve_allowed,
+        action=_noop_improve_needs_discussion_action,
+    ),
+    AdvanceRule(
+        name="review_max_cycles",
+        matches=lambda ctx: (not ctx.review_cleared)
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and ctx.completed_review_cycles >= ctx.max_review_cycles,
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "max_cycles_reached",
+                "description": (
+                    f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"
+                ),
+            },
+            reason="review-max-cycles-reached",
+        ),
+    ),
+    AdvanceRule(
         name="review_create_improve",
         matches=lambda ctx: (not ctx.review_cleared) and ctx.review_verdict == "CHANGES_REQUESTED",
         action=lambda ctx: {
             "type": "improve",
-            "description": "Create improve task (review CHANGES_REQUESTED)",
+            "description": f"Create improve task (review CHANGES_REQUESTED){_noop_improve_followup_suffix(ctx)}",
             "review_task": ctx.latest_completed_review,
         },
     ),

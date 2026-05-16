@@ -670,6 +670,404 @@ def test_completed_improve_without_review_clear_creates_closing_review(
     assert action["description"] == "Create closing review (code changed since the last review)"
 
 
+def test_one_noop_improve_permits_another_improve_with_warning_description(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/noop-warning"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    improve = store.add("Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 5, 14, 11, 0, tzinfo=UTC)
+    improve.branch = impl.branch
+    improve.changed_diff = False
+    store.update(improve)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "improve"
+    assert improve.id in action["description"]
+    assert "no tracked diff change" in action["description"]
+
+
+def test_two_consecutive_noop_improves_return_needs_discussion(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/noop-stop"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    for hour in (11, 12):
+        improve = store.add("Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
+        improve.branch = impl.branch
+        improve.changed_diff = False
+        store.update(improve)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert "2 consecutive no-op improves" in action["description"]
+
+
+def test_noop_improve_limit_preempts_max_review_cycles_when_thresholds_match(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nmax_review_cycles: 2\nmax_noop_improve_cycles: 2\n"
+    )
+    config = Config.load(tmp_path)
+    db_path = tmp_path / ".gza" / "gza.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteTaskStore(db_path, prefix=config.project_prefix)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/noop-preempts-max-cycles"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    for hour in (11, 12):
+        improve = store.add("Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
+        improve.branch = impl.branch
+        improve.changed_diff = False
+        store.update(improve)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action.get("needs_attention_reason") != "review-max-cycles-reached"
+
+
+def test_threshold_reached_with_in_progress_improve_still_waits(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/noop-wait"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    for hour in (11, 12):
+        improve = store.add("No-op improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
+        improve.branch = impl.branch
+        improve.changed_diff = False
+        store.update(improve)
+
+    active_improve = store.add("Active improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+    assert active_improve.id is not None
+    active_improve.status = "in_progress"
+    active_improve.started_at = datetime(2026, 5, 14, 13, 0, tzinfo=UTC)
+    active_improve.branch = impl.branch
+    store.update(active_improve)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "wait_improve"
+    assert action["improve_task"].id == active_improve.id
+    assert active_improve.id in action["description"]
+
+
+def test_threshold_reached_with_pending_improve_still_runs(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/noop-run"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    for hour in (11, 12):
+        improve = store.add("No-op improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
+        improve.branch = impl.branch
+        improve.changed_diff = False
+        store.update(improve)
+
+    pending_improve = store.add("Pending improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+    assert pending_improve.id is not None
+    pending_improve.status = "pending"
+    pending_improve.branch = impl.branch
+    store.update(pending_improve)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "run_improve"
+    assert action["improve_task"].id == pending_improve.id
+    assert pending_improve.id in action["description"]
+
+
+def test_allow_noop_improve_tag_bypasses_stop_rule(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement", tags=("allow-noop-improve",))
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/noop-tag"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    for hour in (11, 12):
+        improve = store.add("Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
+        improve.branch = impl.branch
+        improve.changed_diff = False
+        store.update(improve)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "improve"
+    assert "allow-noop-improve" in action["description"]
+
+
+def test_legacy_unknown_changed_diff_does_not_trigger_noop_stop_rule(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/noop-legacy"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    legacy_improve = store.add("Legacy improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+    legacy_improve.status = "completed"
+    legacy_improve.completed_at = datetime(2026, 5, 14, 11, 0, tzinfo=UTC)
+    legacy_improve.branch = impl.branch
+    legacy_improve.changed_diff = None
+    store.update(legacy_improve)
+
+    latest_improve = store.add("Latest improve", task_type="improve", based_on=legacy_improve.id, depends_on=review.id, same_branch=True)
+    latest_improve.status = "completed"
+    latest_improve.completed_at = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    latest_improve.branch = impl.branch
+    latest_improve.changed_diff = False
+    store.update(latest_improve)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "create_review"
+    assert action.get("needs_attention_reason") is None
+
+
+def test_comments_triggered_noop_improves_use_same_stop_rule(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/noop-comments"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+    store.add_comment(impl.id, "Unresolved comments still remain", source="direct")
+
+    for hour in (11, 12):
+        improve = store.add("Comments improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
+        improve.branch = impl.branch
+        improve.changed_diff = False
+        store.update(improve)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert "unresolved comments" in action["description"]
+
+
 def test_completed_orphan_rebase_does_not_invalidate_review_on_impl_branch(tmp_path: Path, monkeypatch) -> None:
     from gza import advance_engine as advance_engine_module
 

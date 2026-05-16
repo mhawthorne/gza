@@ -3116,7 +3116,7 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Failure Reason:[/{c['label']}] [{c['value']}]{task.failure_reason}[/{c['value']}]")
     if task.completion_reason:
         console.print(f"[{c['label']}]Completion Reason:[/{c['label']}] [{c['value']}]{task.completion_reason}[/{c['value']}]")
-    if task.task_type == "rebase":
+    if task.task_type in {"rebase", "improve"}:
         console.print(
             f"[{c['label']}]Changed Diff:[/{c['label']}] "
             f"[{c['value']}]{_format_changed_diff_label(task.changed_diff)}[/{c['value']}]"
