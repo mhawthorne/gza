@@ -226,6 +226,54 @@ def test_incomplete_projection_uses_review_flow_for_mergeable_behind_branch(tmp_
     assert "stale" not in str(row.values["next_action_reason"]).lower()
 
 
+def test_incomplete_projection_uses_merge_flow_for_approved_behind_branch(tmp_path: Path) -> None:
+    from tests.cli.conftest import make_store, setup_config
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement approved stale projection", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/approved-stale-projection"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add(
+        "Approved review",
+        task_type="review",
+        depends_on=impl.id,
+        based_on=impl.id,
+    )
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: APPROVED**"
+    store.update(review)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQueryPresets.incomplete(limit=None),
+        config=Config.load(tmp_path),
+        git=SimpleNamespace(
+            can_merge=lambda source, target: True,
+            is_merged=lambda source, target: False,
+            resolve_fresh_merge_source=lambda branch: (
+                "origin/feature/approved-stale-projection",
+                None,
+            ),
+            count_commits_behind=lambda source, target: 1,
+        ),
+        target_branch="main",
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert row.values["next_action"] == "merge"
+    assert "stale" not in str(row.values["next_action_reason"]).lower()
+
+
 def test_merge_chain_unmerged_matches_legacy_unmerged_status(tmp_path: Path) -> None:
     store = _store(tmp_path)
     legacy = store.add("legacy unmerged", task_type="implement")

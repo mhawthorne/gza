@@ -899,3 +899,56 @@ def test_query_lineage_owner_rows_mergeable_behind_branch_projects_normal_action
     assert row.next_action is not None
     assert row.next_action["type"] == "create_review"
     assert row.lineage_status == "actionable"
+
+
+def test_query_lineage_owner_rows_projects_merge_for_approved_behind_branch(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement approved stale lineage", task_type="implement")
+    assert impl.id is not None
+    _set_completed(
+        impl,
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+        branch="feature/approved-stale-lineage",
+        has_commits=True,
+    )
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    review = store.add(
+        "Approved review",
+        task_type="review",
+        depends_on=impl.id,
+        based_on=impl.id,
+    )
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 15, 10, 0, tzinfo=UTC)
+    review.output_content = "**Verdict: APPROVED**"
+    store.update(review)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+    git.resolve_fresh_merge_source.return_value = (
+        "origin/feature/approved-stale-lineage",
+        None,
+    )
+    git.count_commits_behind.return_value = 1
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.lifecycle_action_task is not None
+    assert row.lifecycle_action_task.id == impl.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "merge"
+    assert row.lineage_status == "actionable"
