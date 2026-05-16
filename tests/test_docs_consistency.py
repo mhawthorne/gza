@@ -3,6 +3,42 @@
 from pathlib import Path
 
 
+def test_importer_cleanup_has_no_stale_references_in_operator_surfaces() -> None:
+    """Tracked operator-facing surfaces should not refer to the removed importer module."""
+    repo_root = Path(__file__).resolve().parents[1]
+    stale_module_name = "importer" ".py"
+    roots = [
+        repo_root / "src",
+        repo_root / "tests",
+        repo_root / "docs",
+        repo_root / "src" / "gza" / "skills",
+        # Exclude .claude/skills: it is gitignored, per-worktree install state rather than
+        # tracked repo source, so scanning it would make this regression depend on stale local
+        # artifacts that cannot be fixed in a commit.
+        repo_root / "scripts",
+        repo_root / "specs",
+        repo_root / "etc",
+    ]
+
+    assert repo_root / ".claude" not in roots
+
+    stale_references: list[str] = []
+    for root in roots:
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            if "__pycache__" in path.parts or path.suffix == ".pyc":
+                continue
+            content = path.read_text(errors="ignore")
+            if stale_module_name in content:
+                stale_references.append(str(path.relative_to(repo_root)))
+
+    assert not stale_references, (
+        f"Found stale {stale_module_name} references in tracked operator-facing surfaces: "
+        + ", ".join(stale_references)
+    )
+
+
 def test_docs_task_type_use_internal_not_learn() -> None:
     """Docs should reflect internal task type in authoritative task-type lists."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"

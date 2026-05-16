@@ -464,7 +464,7 @@ Reviewer: Claude
 ### Issues Found
 | Resource Type | Location | Issue |
 |---------------|----------|-------|
-| file | importer.py:89 | open() without context manager |
+| file | skills_utils.py:89 | open() without context manager |
 
 ## Type Safety
 
