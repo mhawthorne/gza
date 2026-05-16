@@ -30,7 +30,7 @@ Rebase tasks go through the **code task path** in `runner.py:_run_inner` (not th
 - Run the provider (Claude) which invokes `/gza-rebase --auto`
 - Reject provider `exit_code=0` if git still reports `rebase-merge` or `rebase-apply`, then validate the Python files changed by the provider-backed resolution against the pre-resolve `ruff` baseline before accepting success
 - On completion, `skip_commit=True` is set (rebase tasks don't need runner commits)
-- After completion, the host runner force-pushes the rebased branch (`git push --force-with-lease`)
+- Before recording successful completion, the host runner routes rebase publication through the shared post-rebase helper, which verifies the rewritten tip, rejects known no-op/non-advancing rebases, fails closed on local/remote ref lookup uncertainty, and force-pushes the rebased branch (`git push --force-with-lease`)
 - On successful completion, the runner also computes and persists `changed_diff` on the rebase task:
   - `0` means the normalized implementation patch before and after the rebase is identical, so prior review evidence may be preserved
   - `1` means the patch changed or equivalence could not be proven, so prior review evidence must be refreshed
@@ -46,6 +46,8 @@ The worktree may have uncommitted changes (e.g., from provider initialization). 
 
 If a rebase task fails and gza creates a follow-up retry attempt, that retry must keep `same_branch=True` semantics against the original implementation branch so the completed rebase force-pushes back to the implementation branch instead of creating a sibling `*-rebase-branch-*` orphan. Recovery branch resolution must walk past any failed orphan recovery descendants and re-anchor on the original implementation branch (or the oldest recorded rebase branch if the implementation row no longer has one recorded).
 
+If a rebase already published successfully and only PR creation/reuse failed (`PR_REQUIRED`), the retry treats that run as a PR-only completion retry: it re-verifies or refresh-publishes the current rebased tip idempotently, but it does not replay rebase-only review invalidation or diff-baseline logic against the already-rebased head.
+
 Existing orphan recovery branches created before this behavior was fixed are left in place intentionally. Per project policy, branch cleanup is an operator concern rather than an automatic migration; future automatic recoveries simply stop targeting those orphan branches, and advance planning ignores divergent `same_branch=True` fork owners instead of treating them as merge candidates.
 
 ## Relationship to `gza rebase` CLI command
@@ -57,9 +59,9 @@ Existing orphan recovery branches created before this behavior was fixed are lef
 3. A mechanical `git rebase` is attempted inside that worktree.
 4. If conflicts arise, the rebase is aborted and `invoke_provider_resolve` runs the provider (Claude) inside the same worktree via `/gza-rebase --auto`.
 5. Before treating that provider run as success, the host first rejects any still-active `rebase-merge` or `rebase-apply` state, then compares `ruff check --select F401,F821` diagnostics on the provider-touched Python files against the pre-resolve baseline. If unfinished rebase metadata or new undefined-name / unused-import errors appear, the rebase task fails instead of continuing silently.
-6. On success, the rebased branch is force-pushed from the worktree.
+6. On success, the rebased branch is published through the shared post-rebase helper, which verifies the rewritten tip, rejects known no-op/non-advancing rebases, fails closed on local/remote ref lookup uncertainty, and force-pushes from the worktree.
 7. The completed rebase row persists the same `changed_diff` signal used by runner-owned rebase tasks, and review invalidation only happens when that signal is not `False`.
-8. After a successful completion is recorded, the host reconciles the parent implementation merge unit through the shared task-scoped sync path using the same merge-proof ref as the rebase itself (`origin/<target>` for `--remote`, otherwise the local target branch). Remote rebase completion does not accept separate local-target reachability as proof, even though it still persists the merge unit against its canonical target branch. This lets empty-net-diff, squash-merged, or cherry-picked rebases flip the implementation back to authoritative `merged` state before the next `advance`, `watch`, or `iterate` pass reads the lineage.
+8. After rebase publication succeeds and the task is ready to be recorded as completed, the host reconciles the parent implementation merge unit through the shared task-scoped sync path using the same merge-proof ref as the rebase itself (`origin/<target>` for `--remote`, otherwise the local target branch). Remote rebase completion does not accept separate local-target reachability as proof, even though it still persists the merge unit against its canonical target branch. This lets empty-net-diff, squash-merged, or cherry-picked rebases flip the implementation back to authoritative `merged` state before the next `advance`, `watch`, or `iterate` pass reads the lineage.
 9. The worktree is removed on all exit paths (success, failure, exception) via a `try/finally` block.
 
 ## Review invalidation after rebase

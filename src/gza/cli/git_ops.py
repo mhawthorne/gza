@@ -44,6 +44,7 @@ from ..pickup import (
 )
 from ..pr_ops import build_task_pr_content, ensure_task_pr
 from ..rebase_diff import capture_rebase_diff_baseline, compute_rebase_changed_diff
+from ..rebase_publish import publish_rebased_branch
 from ..rebase_validation import (
     capture_rebase_validation_baseline,
     is_rebase_in_progress as _shared_is_rebase_in_progress,
@@ -1405,7 +1406,6 @@ def _run_task_backed_rebase(
         resolved_by_provider = False
         try:
             worktree_git.rebase(rebase_target)
-            output_content = f"Rebased '{branch}' onto '{rebase_target}'."
         except GitError as e:
             logger.warning(f"Conflicts detected: {e}")
             try:
@@ -1441,10 +1441,29 @@ def _run_task_backed_rebase(
                 return 1
 
             resolved_by_provider = True
-            logger.command(f"Pushing {branch}...")
-            worktree_git.push_force_with_lease(branch)
-            logger.info(f"✓ Pushed {branch}")
-            output_content = f"Resolved conflicts and rebased '{branch}' onto '{rebase_target}'."
+        try:
+            publish_rebased_branch(
+                worktree_git,
+                branch=branch,
+                baseline=rebase_diff_baseline,
+                logger=logger,
+            )
+        except GitError:
+            mark_task_failed_from_cause(
+                task=rebase_task,
+                config=config,
+                store=store,
+                log_file=log_file,
+                branch=branch,
+                explicit_reason="GIT_ERROR",
+            )
+            print()
+            return 1
+        output_content = (
+            f"Resolved conflicts and rebased '{branch}' onto '{rebase_target}'."
+            if resolved_by_provider
+            else f"Rebased '{branch}' onto '{rebase_target}'."
+        )
 
         has_commits = _branch_has_commits(config, branch)
         head_ref = resolve_ref_if_possible(worktree_git, branch)

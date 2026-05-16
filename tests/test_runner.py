@@ -7,7 +7,7 @@ import stat
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
 
@@ -6973,7 +6973,7 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
-        worktree_git.push_force_with_lease.assert_called_once_with(impl.branch)
+        worktree_git.push_force_with_lease.assert_called_once_with(impl.branch, remote="origin")
 
     def test_select_worktree_base_ref_prefers_origin_when_origin_ahead(self):
         """Base ref selection should choose origin/main when origin is strictly ahead."""
@@ -8651,8 +8651,8 @@ class TestExtractedRunInnerHelpers:
         unresolved_improve1 = store.get_comments(improve1.id, unresolved_only=True)
         assert [comment.content for comment in unresolved_improve1] == ["Intermediate improve comment"]
 
-    def test_run_pr_required_retry_for_rebase_preserves_rebase_completion_side_effects(self, tmp_path: Path):
-        """PR retry completion for rebases should invalidate review state and force-push."""
+    def test_run_pr_required_retry_for_rebase_treats_published_head_as_pr_only_retry(self, tmp_path: Path):
+        """A published rebase PR retry should skip the stale non-advancing baseline path."""
         (tmp_path / "gza.yaml").write_text(
             "project_name: testproject\n"
             "project_id: default\n"
@@ -8671,40 +8671,157 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            create_pr=True,
         )
-        task.slug = "20260414-retry-rebase-pr-required"
-        task.status = "failed"
-        task.failure_reason = "PR_REQUIRED"
-        task.branch = "feature/retry-rebase-pr-required"
-        task.log_file = "logs/retry-rebase.log"
-        task.output_content = "summary"
-        task.has_commits = True
-        store.update(task)
+        task.slug = "20260516-retry-rebase-pr-required"
+        store.mark_in_progress(task)
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text("")
+
+        initial_git = Mock(spec=Git)
+        initial_git.default_branch.return_value = "main"
+        initial_git.get_diff_numstat.return_value = ""
+        initial_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "feat/parent": "rebased-head",
+            "main": "base-before-pr",
+        }.get(ref)
+
+        with (
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner.publish_rebased_branch"),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=False),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                initial_git,
+                log_file,
+                "feat/parent",
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "missing-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+                skip_commit=True,
+                create_pr=True,
+            )
+
+        assert rc == 1
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "PR_REQUIRED"
 
         git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.rev_parse_if_exists.side_effect = lambda ref: {
+            task.branch: "rebased-head",
+            "main": "base-after-pr-retry",
+            f"origin/{task.branch}": "rebased-head",
+        }.get(ref)
 
         with (
             patch("gza.runner.Git", return_value=git),
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
-            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch("gza.runner.publish_rebased_branch") as publish_rebased_branch,
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True) as ensure_work_pr,
             patch("gza.runner.task_footer"),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
         ):
             rc = run(config, task_id=task.id, create_pr=True)
 
         assert rc == 0
-        git.push_force_with_lease.assert_called_once_with(task.branch)
+        publish_rebased_branch.assert_called_once_with(
+            git,
+            branch=task.branch,
+            baseline=None,
+            logger=ANY,
+        )
+        ensure_work_pr.assert_called_once()
 
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.status == "completed"
         assert refreshed.failure_reason is None
+        updated_unit = store.resolve_merge_unit_for_task(task.id)
+        assert updated_unit is not None
+        assert updated_unit.head_sha == "rebased-head"
+        assert updated_unit.base_sha == "base-after-pr-retry"
 
         updated_parent = store.get(parent.id)
         assert updated_parent is not None
         assert updated_parent.review_cleared_at is None
         assert updated_parent.merge_status == "unmerged"
+
+    def test_complete_code_task_rebase_pr_required_failure_persists_retry_baseline_refs(self, tmp_path: Path):
+        """Rebase PR-required failures must persist head/base refs for publish retry verification."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        rebase_task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            create_pr=True,
+        )
+        rebase_task.slug = "20260515-rebase-pr-required-baseline"
+        store.mark_in_progress(rebase_task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{rebase_task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = ""
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "feat/parent": "head-before-pr",
+            "main": "base-before-pr",
+        }.get(ref)
+
+        with (
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner.publish_rebased_branch"),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=False),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = _complete_code_task(
+                rebase_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feat/parent",
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "missing-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{rebase_task.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+                skip_commit=True,
+                create_pr=True,
+            )
+
+        assert rc == 1
+        refreshed = store.get(rebase_task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "PR_REQUIRED"
+        rebase_unit = store.resolve_merge_unit_for_task(rebase_task.id)
+        assert rebase_unit is not None
+        assert rebase_unit.head_sha == "head-before-pr"
+        assert rebase_unit.base_sha == "base-before-pr"
 
     @pytest.mark.parametrize(
         ("initial_text", "broken_text", "expected_diagnostic"),
@@ -8827,7 +8944,7 @@ class TestExtractedRunInnerHelpers:
         assert '"failure_reason": "REBASE_VALIDATION_FAILED"' in log_text
 
     def test_complete_code_task_rebase_force_pushes_from_runner(self, tmp_path: Path):
-        """Rebase completion should force-push from the host runner."""
+        """Rebase completion should publish through the shared helper."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -8851,7 +8968,10 @@ class TestExtractedRunInnerHelpers:
         worktree_git.default_branch.return_value = "main"
         worktree_git.get_diff_numstat.return_value = ""
 
-        with patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+        with (
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner.publish_rebased_branch") as publish_rebased_branch,
+        ):
             rc = _complete_code_task(
                 rebase_task,
                 config,
@@ -8869,10 +8989,573 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
-        worktree_git.push_force_with_lease.assert_called_once_with("feat/parent")
+        publish_rebased_branch.assert_called_once_with(
+            worktree_git,
+            branch="feat/parent",
+            baseline=None,
+            logger=ANY,
+        )
         refreshed = store.get(rebase_task.id)
         assert refreshed is not None
         assert refreshed.status == "completed"
+
+    def test_complete_code_task_rebase_publishes_before_pr_ensure(self, tmp_path: Path) -> None:
+        """Rebase completion with create_pr should publish before PR setup runs."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        rebase_task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            create_pr=True,
+        )
+        rebase_task.slug = "20260516-rebase-pr-order"
+        store.mark_in_progress(rebase_task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{rebase_task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = ""
+
+        call_order: list[str] = []
+
+        def _publish(*_args, **_kwargs):
+            call_order.append("publish")
+
+        def _ensure(*_args, **_kwargs):
+            call_order.append("pr")
+            return True
+
+        with (
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner.publish_rebased_branch", side_effect=_publish) as publish_rebased_branch,
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", side_effect=_ensure) as ensure_work_pr,
+        ):
+            rc = _complete_code_task(
+                rebase_task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feat/parent",
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "missing-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{rebase_task.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+                skip_commit=True,
+                create_pr=True,
+            )
+
+        assert rc == 0
+        assert call_order == ["publish", "pr"]
+        publish_rebased_branch.assert_called_once()
+        ensure_work_pr.assert_called_once()
+        worktree_git.push_branch.assert_not_called()
+        refreshed = store.get(rebase_task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+
+    def test_run_rebase_task_publication_failure_logs_failed_terminal_outcome(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.slug = "20260515-parent-impl"
+        parent.branch = "feature/rebase-parent"
+        store.mark_in_progress(parent)
+        store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
+        parent.merge_status = "merged"
+        store.update(parent)
+        review = store.add(prompt="Review parent", task_type="review", depends_on=parent.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        store.clear_review_state(parent.id)
+        parent_before_failure = store.get(parent.id)
+        assert parent_before_failure is not None
+        assert parent_before_failure.review_cleared_at is not None
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        assert task.id is not None
+        task.slug = "20260515-runner-rebase-publish-failure"
+        store.update(task)
+
+        worktree_path = config.worktree_path / task.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.check_credentials.return_value = True
+        mock_provider.verify_credentials.return_value = True
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=2.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.worktree_list.return_value = []
+
+        mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.status_porcelain.return_value = set()
+        mock_worktree_git.has_changes.return_value = False
+        mock_worktree_git.rev_parse.return_value = "same-head"
+        mock_worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            parent.branch: "head-new",
+            "main": "base-new",
+        }.get(ref)
+        mock_worktree_git.get_diff_numstat.return_value = ""
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner.capture_rebase_validation_baseline", return_value=("same-head", set())),
+            patch("gza.runner.is_rebase_in_progress", return_value=False),
+            patch("gza.runner.validate_rebase_resolution_output", return_value=True),
+            patch("gza.runner.publish_rebased_branch", side_effect=GitError("push boom")),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = run(config, task_id=task.id)
+
+        assert rc == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.changed_diff is None
+
+        refreshed_parent = store.get(parent.id)
+        assert refreshed_parent is not None
+        assert refreshed_parent.review_cleared_at == parent_before_failure.review_cleared_at
+        assert refreshed_parent.merge_status == "merged"
+
+        surfaced = capsys.readouterr()
+        assert "Git error: push boom" in surfaced.out
+
+        assert refreshed.log_file is not None
+        log_file = config.project_dir / refreshed.log_file
+        log_text = ops_log_path_for(log_file).read_text()
+        assert "Outcome: failed (GIT_ERROR)" in log_text
+        assert "Outcome: completed" not in log_text
+
+    def test_run_rebase_task_remote_ref_lookup_failure_logs_failed_terminal_outcome(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.slug = "20260515-parent-impl"
+        parent.branch = "feature/rebase-parent"
+        store.mark_in_progress(parent)
+        store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
+        parent.merge_status = "merged"
+        store.update(parent)
+        review = store.add(prompt="Review parent", task_type="review", depends_on=parent.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        store.clear_review_state(parent.id)
+        parent_before_failure = store.get(parent.id)
+        assert parent_before_failure is not None
+        assert parent_before_failure.review_cleared_at is not None
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        assert task.id is not None
+        task.slug = "20260515-runner-rebase-lookup-failure"
+        store.update(task)
+
+        worktree_path = config.worktree_path / task.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.check_credentials.return_value = True
+        mock_provider.verify_credentials.return_value = True
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=2.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.worktree_list.return_value = []
+
+        mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.status_porcelain.return_value = set()
+        mock_worktree_git.has_changes.return_value = False
+        mock_worktree_git.rev_parse.return_value = "head-new"
+        def rev_parse_if_exists(ref: str) -> str | None:
+            if ref == parent.branch:
+                return "head-new"
+            if ref == "main":
+                return "base-new"
+            if ref == f"origin/{parent.branch}":
+                raise RuntimeError("remote lookup boom")
+            return None
+
+        mock_worktree_git.rev_parse_if_exists.side_effect = rev_parse_if_exists
+        mock_worktree_git.get_diff_numstat.return_value = ""
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner.capture_rebase_validation_baseline", return_value=("same-head", set())),
+            patch("gza.runner.is_rebase_in_progress", return_value=False),
+            patch("gza.runner.validate_rebase_resolution_output", return_value=True),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = run(config, task_id=task.id)
+
+        assert rc == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.changed_diff is None
+
+        refreshed_parent = store.get(parent.id)
+        assert refreshed_parent is not None
+        assert refreshed_parent.review_cleared_at == parent_before_failure.review_cleared_at
+        assert refreshed_parent.merge_status == "merged"
+
+        surfaced = capsys.readouterr()
+        assert "Git error: Failed to resolve rebased branch publication refs for feature/rebase-parent: remote lookup boom" in surfaced.out
+
+        assert refreshed.log_file is not None
+        log_file = config.project_dir / refreshed.log_file
+        log_text = ops_log_path_for(log_file).read_text()
+        assert "Outcome: failed (GIT_ERROR)" in log_text
+        assert "Outcome: completed" not in log_text
+
+    def test_run_pr_required_retry_for_rebase_publish_failure_keeps_state_unpublished(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Rebase PR retries must fail before completion-side state if publication fails."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        parent.merge_status = "merged"
+        store.update(parent)
+        review = store.add(prompt="Review parent", task_type="review", depends_on=parent.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        store.clear_review_state(parent.id)
+        parent_before_retry = store.get(parent.id)
+        assert parent_before_retry is not None
+        assert parent_before_retry.review_cleared_at is not None
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        task.slug = "20260515-retry-rebase-publish-failure"
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        task.branch = "feature/retry-rebase-publish-failure"
+        task.log_file = "logs/retry-rebase-publish-failure.log"
+        task.output_content = "summary"
+        task.diff_files_changed = 3
+        task.diff_lines_added = 10
+        task.diff_lines_removed = 4
+        store.mark_failed(
+            task,
+            log_file=task.log_file,
+            has_commits=True,
+            branch=task.branch,
+            failure_reason="PR_REQUIRED",
+            head_sha="old-tip",
+            base_sha="start-target",
+        )
+        task.output_content = "summary"
+        store.update(task)
+
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.rev_parse_if_exists.side_effect = lambda ref: {
+            task.branch: "head-new",
+            "main": "base-new",
+        }.get(ref)
+
+        with (
+            patch("gza.runner.Git", return_value=git),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch("gza.runner.publish_rebased_branch", side_effect=GitError("push boom")),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = run(config, task_id=task.id, create_pr=True)
+
+        assert rc == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.changed_diff is None
+
+        refreshed_parent = store.get(parent.id)
+        assert refreshed_parent is not None
+        assert refreshed_parent.review_cleared_at == parent_before_retry.review_cleared_at
+        assert refreshed_parent.merge_status == "merged"
+
+        surfaced = capsys.readouterr()
+        assert "Git error: push boom" in surfaced.out
+
+        assert refreshed.log_file is not None
+        log_file = config.project_dir / refreshed.log_file
+        log_text = ops_log_path_for(log_file).read_text()
+        assert "Outcome: failed (GIT_ERROR)" in log_text
+        assert "Outcome: completed" not in log_text
+
+    def test_run_pr_required_retry_for_rebase_publishes_before_pr_ensure(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """PR-required rebase retries should publish before re-running PR setup."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            create_pr=True,
+        )
+        task.slug = "20260516-retry-rebase-pr-order"
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        task.branch = "feature/retry-rebase-pr-order"
+        task.log_file = "logs/retry-rebase-pr-order.log"
+        task.output_content = "summary"
+        task.diff_files_changed = 1
+        task.diff_lines_added = 2
+        task.diff_lines_removed = 3
+        store.mark_failed(
+            task,
+            log_file=task.log_file,
+            has_commits=True,
+            branch=task.branch,
+            failure_reason="PR_REQUIRED",
+            head_sha="old-tip",
+            base_sha="start-target",
+        )
+        task.output_content = "summary"
+        store.update(task)
+
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.rev_parse_if_exists.side_effect = lambda ref: {
+            task.branch: "head-new",
+            "main": "base-new",
+        }.get(ref)
+
+        call_order: list[str] = []
+
+        def _publish(*_args, **_kwargs):
+            call_order.append("publish")
+
+        def _ensure(*_args, **_kwargs):
+            call_order.append("pr")
+            return True
+
+        with (
+            patch("gza.runner.Git", return_value=git),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.publish_rebased_branch", side_effect=_publish) as publish_rebased_branch,
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", side_effect=_ensure) as ensure_work_pr,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = run(config, task_id=task.id, create_pr=True)
+
+        assert rc == 0
+        assert call_order == ["publish", "pr"]
+        publish_rebased_branch.assert_called_once()
+        ensure_work_pr.assert_called_once()
+        git.push_branch.assert_not_called()
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+
+    def test_run_pr_required_retry_for_rebase_remote_ref_lookup_failure_keeps_state_unpublished(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Rebase PR retries must fail before completion-side state if publication lookup fails."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        parent.merge_status = "merged"
+        store.update(parent)
+        review = store.add(prompt="Review parent", task_type="review", depends_on=parent.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        store.clear_review_state(parent.id)
+        parent_before_retry = store.get(parent.id)
+        assert parent_before_retry is not None
+        assert parent_before_retry.review_cleared_at is not None
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        task.slug = "20260515-retry-rebase-lookup-failure"
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        task.branch = "feature/retry-rebase-publish-failure"
+        task.log_file = "logs/retry-rebase-publish-failure.log"
+        task.output_content = "summary"
+        task.diff_files_changed = 3
+        task.diff_lines_added = 10
+        task.diff_lines_removed = 4
+        store.mark_failed(
+            task,
+            log_file=task.log_file,
+            has_commits=True,
+            branch=task.branch,
+            failure_reason="PR_REQUIRED",
+            head_sha="old-tip",
+            base_sha="start-target",
+        )
+        task.output_content = "summary"
+        store.update(task)
+
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.rev_parse.return_value = "head-new"
+        def retry_rev_parse_if_exists(ref: str) -> str | None:
+            if ref == task.branch:
+                return "head-new"
+            if ref == "main":
+                return "base-new"
+            if ref == f"origin/{task.branch}":
+                raise RuntimeError("remote lookup boom")
+            return None
+
+        git.rev_parse_if_exists.side_effect = retry_rev_parse_if_exists
+
+        with (
+            patch("gza.runner.Git", return_value=git),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = run(config, task_id=task.id, create_pr=True)
+
+        assert rc == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.changed_diff is None
+
+        refreshed_parent = store.get(parent.id)
+        assert refreshed_parent is not None
+        assert refreshed_parent.review_cleared_at == parent_before_retry.review_cleared_at
+        assert refreshed_parent.merge_status == "merged"
+
+        surfaced = capsys.readouterr()
+        assert (
+            "Git error: Failed to resolve rebased branch publication refs for "
+            "feature/retry-rebase-publish-failure: remote lookup boom"
+        ) in surfaced.out
+
+        assert refreshed.log_file is not None
+        log_file = config.project_dir / refreshed.log_file
+        log_text = ops_log_path_for(log_file).read_text()
+        assert "Outcome: failed (GIT_ERROR)" in log_text
+        assert "Outcome: completed" not in log_text
 
     def test_run_inner_marks_resumed_rebase_baseline_as_recovered(
         self,
@@ -9122,7 +9805,7 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
-        mock_worktree_git.push_force_with_lease.assert_called_once_with(parent.branch)
+        mock_worktree_git.push_force_with_lease.assert_called_once_with(parent.branch, remote="origin")
 
         refreshed_rebase = store.get(task.id)
         assert refreshed_rebase is not None
@@ -9214,7 +9897,7 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
-        mock_worktree_git.push_force_with_lease.assert_called_once_with(parent.branch)
+        mock_worktree_git.push_force_with_lease.assert_called_once_with(parent.branch, remote="origin")
 
         refreshed_rebase = store.get(task.id)
         assert refreshed_rebase is not None

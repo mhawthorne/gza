@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from .config import Config
-from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason
+from .db import DB_UNSET, SqliteTaskStore, Task, TaskStats, extract_failure_reason
 
 TERMINATED_FAILURE_REASON = "TERMINATED"
 _RUNNER_OWNED_LOG_FALLBACK_REASONS = frozenset(
@@ -114,6 +114,8 @@ def mark_task_failed_from_cause(
     step_limit: int | None = None,
     turn_limit: int | None = None,
     fallback_to_log: bool = False,
+    head_sha: str | None | object = DB_UNSET,
+    base_sha: str | None | object = DB_UNSET,
 ) -> str:
     """Persist a failed task using the shared failure-reason owner."""
     resolved_reason = resolve_failure_reason(
@@ -136,5 +138,7 @@ def mark_task_failed_from_cause(
         branch=branch,
         has_commits=bool(has_commits),
         failure_reason=resolved_reason,
+        head_sha=head_sha,
+        base_sha=base_sha,
     )
     return resolved_reason

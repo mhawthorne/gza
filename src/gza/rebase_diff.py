@@ -47,6 +47,25 @@ def capture_rebase_diff_baseline(
     )
 
 
+def restore_rebase_diff_baseline(
+    git: Git,
+    *,
+    old_tip: str | None,
+    target_at_start: str | None,
+    recovered: bool = False,
+) -> RebaseDiffBaseline:
+    """Rebuild a diff baseline from previously persisted refs."""
+    merge_base_at_start: str | None = None
+    if old_tip and target_at_start:
+        merge_base_at_start = _merge_base(git, old_tip, target_at_start)
+    return RebaseDiffBaseline(
+        old_tip=old_tip,
+        target_at_start=target_at_start,
+        merge_base_at_start=merge_base_at_start,
+        recovered=recovered,
+    )
+
+
 def compute_rebase_changed_diff(
     git: Git,
     *,

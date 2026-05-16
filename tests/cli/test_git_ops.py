@@ -21,8 +21,8 @@ from gza.cli.git_ops import (
     cmd_advance,
 )
 from gza.config import Config
-from gza.git import Git, GitError
-from gza.rebase_diff import RebaseDiffResult
+from gza.git import Git, GitError, ResolvedGitRef
+from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult
 
 from .conftest import make_store, run_gza, setup_config
 
@@ -145,6 +145,14 @@ def test_run_task_backed_rebase_refreshes_merge_unit_provenance(tmp_path) -> Non
         patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
         patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
         patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline(
+                old_tip="head-old",
+                target_at_start="base-old",
+                merge_base_at_start="merge-base",
+            ),
+        ),
     ):
         rc = _run_task_backed_rebase(
             config=config,
@@ -186,12 +194,32 @@ def test_run_task_backed_rebase_surfaces_resolution_warnings_and_preserves_exist
     worktree_git = MagicMock()
     worktree_git.current_branch.return_value = "feature/rebased"
     worktree_git.rebase.return_value = None
-    worktree_git.rev_parse_if_exists.side_effect = RuntimeError("boom")
+    worktree_git.rev_parse.return_value = "head-new"
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/rebased": "head-new",
+        "main": "base-new",
+        "origin/feature/rebased": "head-new",
+    }.get(ref)
 
     with (
         patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
         patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
         patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline(
+                old_tip="head-old",
+                target_at_start="base-old",
+                merge_base_at_start="merge-base",
+            ),
+        ),
+        patch(
+            "gza.cli.git_ops.resolve_ref_if_possible",
+            side_effect=[
+                ResolvedGitRef(None, "unexpected error resolving ref 'feature/rebased': boom"),
+                ResolvedGitRef(None, "unexpected error resolving ref 'main': boom"),
+            ],
+        ),
     ):
         rc = _run_task_backed_rebase(
             config=config,
@@ -204,8 +232,9 @@ def test_run_task_backed_rebase_surfaces_resolution_warnings_and_preserves_exist
     assert rc == 0
     refreshed_unit = store.get_merge_unit(unit.id)
     assert refreshed_unit is not None
-    assert refreshed_unit.head_sha == "head-old"
-    assert refreshed_unit.base_sha == "base-old"
+    assert refreshed_unit.head_sha == "head-new"
+    assert refreshed_unit.base_sha == "base-new"
+    worktree_git.push_force_with_lease.assert_not_called()
     output = capsys.readouterr()
     assert "unexpected error resolving ref 'feature/rebased': boom" in output.err
     assert "unexpected error resolving ref 'main': boom" in output.err
@@ -242,6 +271,14 @@ def test_run_task_backed_rebase_preserves_review_state_when_diff_is_unchanged(tm
         patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
         patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
         patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline(
+                old_tip="head-old",
+                target_at_start="base-old",
+                merge_base_at_start="merge-base",
+            ),
+        ),
         patch(
             "gza.cli.git_ops.compute_rebase_changed_diff",
             return_value=RebaseDiffResult(changed_diff=False, detail="no (review can be preserved)"),
@@ -295,6 +332,14 @@ def test_run_task_backed_rebase_invalidates_review_state_when_diff_changes(tmp_p
         patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
         patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
         patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline(
+                old_tip="head-old",
+                target_at_start="base-old",
+                merge_base_at_start="merge-base",
+            ),
+        ),
         patch(
             "gza.cli.git_ops.compute_rebase_changed_diff",
             return_value=RebaseDiffResult(changed_diff=True, detail="yes (review must be refreshed)"),
@@ -588,6 +633,199 @@ def test_run_task_backed_rebase_failure_does_not_reconcile_parent_merge_status(t
     assert refreshed_parent.merge_status == "unmerged"
     mark_failed.assert_called_once()
     reconcile_task_branch_merge_truth.assert_not_called()
+
+
+def test_run_task_backed_rebase_provider_resolve_publishes_via_shared_helper(tmp_path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
+    assert parent.id is not None
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.side_effect = GitError("rebase boom")
+    worktree_git.rebase_abort.return_value = None
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/rebased": "head-new",
+        "main": "base-new",
+    }.get(ref)
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch("gza.cli.git_ops.invoke_provider_resolve", return_value=True),
+        patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+        patch("gza.cli.git_ops.publish_rebased_branch") as publish_rebased_branch,
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 0
+    publish_rebased_branch.assert_called_once()
+
+
+def test_run_task_backed_rebase_clean_publish_failure_does_not_fall_back_to_provider(tmp_path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
+    assert parent.id is not None
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.return_value = None
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch("gza.cli.git_ops.publish_rebased_branch", side_effect=GitError("push boom")),
+        patch("gza.cli.git_ops.invoke_provider_resolve") as invoke_provider_resolve,
+        patch("gza.cli.git_ops.mark_task_failed_from_cause", return_value=None) as mark_failed,
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 1
+    invoke_provider_resolve.assert_not_called()
+    worktree_git.rebase_abort.assert_not_called()
+    mark_failed.assert_called_once()
+    assert mark_failed.call_args.kwargs["explicit_reason"] == "GIT_ERROR"
+
+
+def test_run_task_backed_rebase_remote_ref_lookup_failure_marks_task_failed(tmp_path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
+    assert parent.id is not None
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.return_value = None
+    worktree_git.rev_parse.return_value = "head-new"
+    worktree_git.rev_parse_if_exists.side_effect = RuntimeError("remote lookup boom")
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch("gza.cli.git_ops.invoke_provider_resolve") as invoke_provider_resolve,
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 1
+    invoke_provider_resolve.assert_not_called()
+    worktree_git.push_force_with_lease.assert_not_called()
+
+    refreshed = store.get(rebase_task.id)
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert refreshed.failure_reason == "GIT_ERROR"
+
+
+def test_run_task_backed_rebase_non_advancing_publish_rejection_marks_task_failed(tmp_path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
+    assert parent.id is not None
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    store.update(rebase_task)
+    assert rebase_task.id is not None
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.return_value = None
+    worktree_git.rev_parse.return_value = "same-head"
+    worktree_git.rev_parse_if_exists.return_value = "remote-stale"
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline(
+                old_tip="same-head",
+                target_at_start="base-old",
+                merge_base_at_start="merge-base",
+            ),
+        ),
+        patch("gza.cli.git_ops.invoke_provider_resolve") as invoke_provider_resolve,
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 1
+    invoke_provider_resolve.assert_not_called()
+    worktree_git.push_force_with_lease.assert_not_called()
+
+    refreshed = store.get(rebase_task.id)
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert refreshed.failure_reason == "GIT_ERROR"
 
 
 @pytest.mark.timeout(4, method="signal")

@@ -68,6 +68,7 @@ from .rebase_diff import (
     capture_rebase_diff_baseline,
     compute_rebase_changed_diff,
 )
+from .rebase_publish import publish_rebased_branch
 from .rebase_validation import (
     RuffDiagnostic,
     capture_rebase_validation_baseline,
@@ -133,6 +134,14 @@ def _rebase_validation_failure() -> ResolvedRunFailure:
         reason=REBASE_VALIDATION_FAILURE_REASON,
         status="failed",
         outcome_message=f"Outcome: failed ({REBASE_VALIDATION_FAILURE_REASON})",
+    )
+
+
+def _git_error_failure() -> ResolvedRunFailure:
+    return ResolvedRunFailure(
+        reason="GIT_ERROR",
+        status="Failed: git error",
+        outcome_message="Outcome: failed (GIT_ERROR)",
     )
 
 
@@ -267,6 +276,216 @@ def _write_stats_entry(log_file: Path, stats: TaskStats) -> None:
             "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
         },
     )
+
+
+def _finalize_completed_code_task(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    log_file: Path,
+    branch_name: str,
+    output_content: str | None,
+    stats: TaskStats,
+    diff_files: int,
+    diff_added: int,
+    diff_removed: int,
+    head_sha: str | None,
+    base_sha: str | None,
+) -> None:
+    """Write terminal success logs and persist completed state for a code task."""
+    # Write final log entries before marking completed in DB, so that
+    # `gza log -f` (which checks task status) doesn't break out of the
+    # follow loop before the log file is fully written.
+    write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
+    _write_stats_entry(log_file, stats)
+
+    # Mark completed — after log entries are flushed so readers see the
+    # full log before the status transitions away from in_progress.
+    store.mark_completed(
+        task,
+        branch=branch_name,
+        log_file=str(log_file.relative_to(config.project_dir)),
+        output_content=output_content,
+        has_commits=True,
+        stats=stats,
+        diff_files_changed=diff_files,
+        diff_lines_added=diff_added,
+        diff_lines_removed=diff_removed,
+        head_sha=head_sha,
+        base_sha=base_sha,
+    )
+
+
+def _finalize_rebase_completion(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    worktree_git: Git,
+    branch_name: str,
+    stats: TaskStats,
+    log_file: Path,
+    output_content: str | None,
+    diff_files: int,
+    diff_added: int,
+    diff_removed: int,
+    head_sha: str | None,
+    base_sha: str | None,
+    task_logger: "TaskExecutionLogger",
+    target_branch: str,
+    create_pr: bool = False,
+    fix_commits_ahead_before_run: int | None = None,
+    fix_default_branch: str | None = None,
+    fix_was_merged_before_run: bool = False,
+    rebase_diff_baseline: RebaseDiffBaseline | None = None,
+) -> int:
+    """Publish a completed rebase before persisting completed task state."""
+    post_complete_rc = _post_complete_code_task(
+        task,
+        config,
+        store,
+        worktree_git,
+        branch_name,
+        stats,
+        task_logger=task_logger,
+        target_branch=target_branch,
+        fix_commits_ahead_before_run=fix_commits_ahead_before_run,
+        fix_default_branch=fix_default_branch,
+        fix_was_merged_before_run=fix_was_merged_before_run,
+        rebase_diff_baseline=rebase_diff_baseline,
+    )
+    if post_complete_rc != 0:
+        return post_complete_rc
+    if create_pr:
+        pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
+        if not pr_ready:
+            print("Error: Task requested PR creation/reuse, aborting before rebase completion")
+            task.output_content = output_content
+            task.diff_files_changed = diff_files
+            task.diff_lines_added = diff_added
+            task.diff_lines_removed = diff_removed
+            _mark_task_failed(
+                task=task,
+                config=config,
+                store=store,
+                log_file=log_file,
+                has_commits=True,
+                stats=stats,
+                branch=branch_name,
+                explicit_reason=PR_REQUIRED_FAILURE_REASON,
+                error_type=None,
+                exit_code=1,
+                head_sha=head_sha,
+                base_sha=base_sha,
+            )
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "outcome",
+                    "message": "Outcome: failed (PR_REQUIRED)",
+                    "exit_code": 1,
+                },
+            )
+            _write_stats_entry(log_file, stats)
+            return 1
+    _finalize_completed_code_task(
+        task=task,
+        config=config,
+        store=store,
+        log_file=log_file,
+        branch_name=branch_name,
+        output_content=output_content,
+        stats=stats,
+        diff_files=diff_files,
+        diff_added=diff_added,
+        diff_removed=diff_removed,
+        head_sha=head_sha,
+        base_sha=base_sha,
+    )
+    return 0
+
+
+def _finalize_already_published_rebase_pr_retry(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    branch_name: str,
+    stats: TaskStats,
+    log_file: Path,
+    output_content: str | None,
+    diff_files: int,
+    diff_added: int,
+    diff_removed: int,
+    head_sha: str | None,
+    base_sha: str | None,
+    task_logger: "TaskExecutionLogger",
+) -> int:
+    """Complete a rebase PR retry after the rebase-side effects already ran.
+
+    A rebase task only reaches ``PR_REQUIRED`` after ``_post_complete_code_task``
+    has already published the rebased branch and recorded the rebase-only
+    review/merge-state side effects. Retrying PR creation must therefore verify
+    the current branch tip is still published without replaying those rebase
+    completion effects against a post-rebase baseline.
+    """
+
+    publish_rebased_branch(
+        git,
+        branch=branch_name,
+        baseline=None,
+        logger=task_logger,
+    )
+    pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+    if not pr_ready:
+        print("Error: Task requested PR creation/reuse, aborting before rebase completion")
+        task.output_content = output_content
+        task.diff_files_changed = diff_files
+        task.diff_lines_added = diff_added
+        task.diff_lines_removed = diff_removed
+        _mark_task_failed(
+            task=task,
+            config=config,
+            store=store,
+            log_file=log_file,
+            has_commits=True,
+            stats=stats,
+            branch=branch_name,
+            explicit_reason=PR_REQUIRED_FAILURE_REASON,
+            error_type=None,
+            exit_code=1,
+            head_sha=head_sha,
+            base_sha=base_sha,
+        )
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "outcome",
+                "message": "Outcome: failed (PR_REQUIRED)",
+                "exit_code": 1,
+            },
+        )
+        _write_stats_entry(log_file, stats)
+        return 1
+    _finalize_completed_code_task(
+        task=task,
+        config=config,
+        store=store,
+        log_file=log_file,
+        branch_name=branch_name,
+        output_content=output_content,
+        stats=stats,
+        diff_files=diff_files,
+        diff_added=diff_added,
+        diff_removed=diff_removed,
+        head_sha=head_sha,
+        base_sha=base_sha,
+    )
+    return 0
 
 
 def _record_run_failure(
@@ -3543,7 +3762,7 @@ def _complete_code_task(
     # Keep branch context on the in-memory task so PR ensure can run before
     # the final completed-state DB transition.
     task.branch = branch_name
-    if create_pr:
+    if create_pr and task.task_type != "rebase":
         pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
         if not pr_ready:
             print("Error: Task requested PR creation/reuse, aborting before auto-review")
@@ -3562,6 +3781,8 @@ def _complete_code_task(
                 explicit_reason=PR_REQUIRED_FAILURE_REASON,
                 error_type=None,
                 exit_code=1,
+                head_sha=head_sha,
+                base_sha=base_sha,
             )
             write_log_entry(
                 log_file,
@@ -3575,22 +3796,6 @@ def _complete_code_task(
             _write_stats_entry(log_file, stats)
             return 1
 
-    # Write final log entries before marking completed in DB, so that
-    # `gza log -f` (which checks task status) doesn't break out of the
-    # follow loop before the log file is fully written.
-    write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
-    write_log_entry(
-        log_file,
-        {
-            "type": "gza",
-            "subtype": "stats",
-            "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
-            "duration_seconds": stats.duration_seconds,
-            "cost_usd": stats.cost_usd,
-            "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
-        },
-    )
-
     fix_was_merged_before_run = False
     if task.task_type == "fix":
         root_impl = _resolve_root_implementation_for_fix(task, store)
@@ -3600,18 +3805,42 @@ def _complete_code_task(
                 (root_impl_unit.state if root_impl_unit is not None else root_impl.merge_status) == "merged"
             )
 
-    # Mark completed — after log entries are flushed so readers see the
-    # full log before the status transitions away from in_progress.
-    store.mark_completed(
-        task,
-        branch=branch_name,
-        log_file=str(log_file.relative_to(config.project_dir)),
+    task_logger = TaskExecutionLogger(resolve_ops_log_path(config, log_file), echo=True)
+    if task.task_type == "rebase":
+        return _finalize_rebase_completion(
+            task=task,
+            config=config,
+            store=store,
+            worktree_git=worktree_git,
+            branch_name=branch_name,
+            stats=stats,
+            log_file=log_file,
+            output_content=output_content,
+            diff_files=diff_files,
+            diff_added=diff_added,
+            diff_removed=diff_removed,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            task_logger=task_logger,
+            target_branch=default_branch,
+            create_pr=create_pr,
+            fix_commits_ahead_before_run=fix_commits_ahead_before_run,
+            fix_default_branch=fix_default_branch,
+            fix_was_merged_before_run=fix_was_merged_before_run,
+            rebase_diff_baseline=rebase_diff_baseline,
+        )
+
+    _finalize_completed_code_task(
+        task=task,
+        config=config,
+        store=store,
+        log_file=log_file,
+        branch_name=branch_name,
         output_content=output_content,
-        has_commits=True,
         stats=stats,
-        diff_files_changed=diff_files,
-        diff_lines_added=diff_added,
-        diff_lines_removed=diff_removed,
+        diff_files=diff_files,
+        diff_added=diff_added,
+        diff_removed=diff_removed,
         head_sha=head_sha,
         base_sha=base_sha,
     )
@@ -3622,6 +3851,7 @@ def _complete_code_task(
         worktree_git,
         branch_name,
         stats,
+        task_logger=task_logger,
         target_branch=default_branch,
         fix_commits_ahead_before_run=fix_commits_ahead_before_run,
         fix_default_branch=fix_default_branch,
@@ -3638,6 +3868,7 @@ def _post_complete_code_task(
     branch_name: str,
     stats: TaskStats,
     *,
+    task_logger: TaskExecutionLogger | None = None,
     target_branch: str | None = None,
     fix_commits_ahead_before_run: int | None = None,
     fix_default_branch: str | None = None,
@@ -3681,9 +3912,19 @@ def _post_complete_code_task(
                 created_on_or_before=task.created_at,
             )
 
+    # Rebase tasks run provider-side conflict resolution in the worktree.
+    # Force-push from the host runner so SSH/auth follows host environment.
+    if task.task_type == "rebase":
+        publish_rebased_branch(
+            worktree_git,
+            branch=branch_name,
+            baseline=rebase_diff_baseline,
+            logger=task_logger,
+        )
+
     rebase_changed_diff: bool | None = None
     # Invalidate review state after rebase completes only when the patch changed
-    # or equivalence could not be proven.
+    # or equivalence could not be proven, but only after publication succeeds.
     if task.task_type == "rebase" and task.based_on:
         impl_ancestor = _resolve_impl_ancestor(store, task)
         comparison = compute_rebase_changed_diff(
@@ -3716,11 +3957,6 @@ def _post_complete_code_task(
             parent_unit.state if parent_unit is not None else parent.merge_status
         ) == "merged":
             store.set_merge_status(parent.id, "unmerged")
-
-    # Rebase tasks run provider-side conflict resolution in the worktree.
-    # Force-push from the host runner so SSH/auth follows host environment.
-    if task.task_type == "rebase":
-        worktree_git.push_force_with_lease(branch_name)
 
     if task.task_type == "fix":
         fix_code_changed = _prepare_fix_follow_up_review(
@@ -3896,22 +4132,6 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
         return 1
 
     git = Git(config.project_dir)
-    pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, git)
-    if not pr_ready:
-        print("Error: PR-required retry still could not create/reuse PR")
-        _mark_task_failed(
-            task=task,
-            config=config,
-            store=store,
-            log_file=task.log_file,
-            branch=task.branch,
-            has_commits=bool(task.has_commits),
-            explicit_reason=PR_REQUIRED_FAILURE_REASON,
-            error_type=None,
-            exit_code=1,
-        )
-        return 1
-
     stats = TaskStats(
         duration_seconds=task.duration_seconds,
         num_steps_reported=task.num_steps_reported,
@@ -3928,6 +4148,80 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
     target_branch: str | None = git.default_branch() if task.branch and task.has_commits else None
     head_sha = git.rev_parse_if_exists(task.branch) if task.branch and task.has_commits else None
     base_sha = git.rev_parse_if_exists(target_branch) if target_branch and task.has_commits else None
+    retry_logger = None
+    retry_log_path: Path | None = None
+    if task.log_file:
+        retry_log_path = config.project_dir / Path(task.log_file)
+        retry_log_path.parent.mkdir(parents=True, exist_ok=True)
+        retry_logger = TaskExecutionLogger(
+            resolve_ops_log_path(config, retry_log_path),
+            echo=True,
+        )
+    if task.task_type == "rebase":
+        try:
+            return _finalize_already_published_rebase_pr_retry(
+                task=task,
+                config=config,
+                store=store,
+                git=git,
+                branch_name=task.branch,
+                stats=stats,
+                log_file=retry_log_path if retry_log_path is not None else config.project_dir / "retry.log",
+                output_content=task.output_content,
+                diff_files=task.diff_files_changed or 0,
+                diff_added=task.diff_lines_added or 0,
+                diff_removed=task.diff_lines_removed or 0,
+                head_sha=head_sha,
+                base_sha=base_sha,
+                task_logger=retry_logger
+                or TaskExecutionLogger(resolve_ops_log_path(config, config.project_dir / "retry.log"), echo=True),
+            )
+        except GitError as e:
+            error_message(f"Git error: {e}")
+            if retry_log_path is not None:
+                write_log_entry(
+                    retry_log_path,
+                    {
+                        "type": "gza",
+                        "subtype": "outcome",
+                        "message": "Outcome: failed (GIT_ERROR)",
+                        "exit_code": 1,
+                        "failure_reason": "GIT_ERROR",
+                    },
+                )
+                _write_stats_entry(retry_log_path, stats)
+            _mark_task_failed(
+                task=task,
+                config=config,
+                store=store,
+                log_file=task.log_file,
+                stats=stats,
+                branch=task.branch,
+                has_commits=bool(task.has_commits),
+                explicit_reason="GIT_ERROR",
+                error_type=None,
+                exit_code=1,
+                head_sha=head_sha,
+                base_sha=base_sha,
+            )
+            return 1
+
+    pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+    if not pr_ready:
+        print("Error: PR-required retry still could not create/reuse PR")
+        _mark_task_failed(
+            task=task,
+            config=config,
+            store=store,
+            log_file=task.log_file,
+            branch=task.branch,
+            has_commits=bool(task.has_commits),
+            explicit_reason=PR_REQUIRED_FAILURE_REASON,
+            error_type=None,
+            exit_code=1,
+        )
+        return 1
+
     store.mark_completed(
         task,
         branch=task.branch,
@@ -3948,6 +4242,7 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
         git,
         task.branch,
         stats,
+        task_logger=retry_logger,
         target_branch=target_branch,
     )
 
@@ -4382,14 +4677,14 @@ def _run_inner(
 
     except GitError as e:
         error_message(f"Git error: {e}")
-        _mark_task_failed(
+        _record_run_failure(
             task=task,
             config=config,
             store=store,
             log_file=log_file,
+            stats=stats,
             branch=branch_name,
-            explicit_reason="GIT_ERROR",
-            error_type=None,
+            failure=_git_error_failure(),
             exit_code=1,
         )
         return 1

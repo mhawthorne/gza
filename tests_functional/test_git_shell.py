@@ -7,13 +7,13 @@ from unittest.mock import Mock
 
 from gza import advance_engine as advance_engine_module
 from gza.advance_engine import evaluate_advance_rules, resolve_advance_context
-from gza.cli.git_ops import _merge_single_task
+from gza.cli.git_ops import _merge_single_task, _run_task_backed_rebase
 from gza.config import Config
 from gza.db import SqliteTaskStore, check_migration_status
 from gza.git import Git
 from gza.review_verdict import ParsedReviewReport
 from gza.runner import WIP_DIR, _restore_wip_changes, _save_wip_changes, _squash_wip_commits
-from tests.cli.conftest import setup_config
+from tests.cli.conftest import make_store, setup_config
 from tests_functional.helpers.cli import run_gza_subprocess
 from tests.test_advance_engine import _make_store
 from tests.test_db import _make_v24_db
@@ -117,6 +117,69 @@ def test_squash_merge_reconciles_origin_branch_and_keeps_advance_planning_clean(
 
     action = evaluate_advance_rules(config, store, git, refreshed, "main")
     assert action.get("needs_attention_reason") != "merge-source-needs-manual-resolution"
+
+
+def test_run_task_backed_rebase_clean_rebase_updates_origin_and_clears_merge_source_divergence(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    git = Git(tmp_path)
+
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "base.txt").write_text("base\n")
+    git._run("add", "base.txt")
+    git._run("commit", "-m", "Initial commit")
+
+    remote_dir = tmp_path / "origin.git"
+    git._run("init", "--bare", str(remote_dir))
+    git._run("remote", "add", "origin", str(remote_dir))
+    git._run("push", "-u", "origin", "main")
+
+    branch = "feature/rebase-publish"
+    git._run("checkout", "-b", branch)
+    (tmp_path / "feature.txt").write_text("feature\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Feature commit")
+    git._run("push", "-u", "origin", branch)
+    original_remote_sha = git.rev_parse("HEAD")
+
+    git._run("checkout", "main")
+    (tmp_path / "base.txt").write_text("base\nmain update\n")
+    git._run("add", "base.txt")
+    git._run("commit", "-m", "Main update")
+
+    parent = store.add("Implement feature", task_type="implement")
+    assert parent.id is not None
+    parent.status = "completed"
+    parent.completed_at = datetime.now(UTC)
+    parent.branch = branch
+    parent.merge_status = "unmerged"
+    parent.has_commits = True
+    store.update(parent)
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    assert rebase_task.id is not None
+    rebase_task.branch = branch
+    store.update(rebase_task)
+
+    rc = _run_task_backed_rebase(
+        config=config,
+        store=store,
+        rebase_task=rebase_task,
+        branch=branch,
+        target_branch="main",
+    )
+
+    assert rc == 0
+    rebased_sha = git.rev_parse(branch)
+    assert rebased_sha != original_remote_sha
+    git.fetch("origin")
+    assert git.rev_parse(f"origin/{branch}") == rebased_sha
+    assert git.resolve_fresh_merge_source(branch).warning is None
 
 
 def test_squash_merge_without_remote_tracking_ref_stays_local_only(tmp_path: Path) -> None:
