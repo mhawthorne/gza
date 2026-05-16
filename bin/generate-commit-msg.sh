@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-DEFAULT_PROVIDER="codex"
+DEFAULT_PROVIDER="claude"
 CLAUDE_MODEL="haiku"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

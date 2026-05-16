@@ -101,6 +101,16 @@ For each Must-Fix item in the latest review:
 3. **For `open` items only, make the change** strictly as described in the review's "Required fix." Do not rename, refactor, or reorganize anything outside the blocker.
 4. **Add or update the targeted regression test** the review names. Do not add extra tests.
 
+**Known recipe — installed skill out of sync after `src/gza/skills/` edit.**
+If the blocker is a test failure where `.claude/skills/<name>/SKILL.md` differs from `src/gza/skills/<name>/SKILL.md` (e.g. `test_merge_first_docs_and_fix_skill_schema_stay_in_sync` or any `*sync*` test comparing the two paths), the fix is **not** a code edit. The bundled source has changed but the installed copy in the worktree is stale because the runner only installs missing skills at task start, not on source changes. Recipe:
+
+```bash
+uv run gza skills-install --update --project .
+git add .claude/skills/
+```
+
+Then re-run verify. Do **not** edit `.claude/skills/` by hand — it's an installed artifact, not source. If `git status` shows no `.claude/skills/` delta after the install, the installed copy was already current and the failure is something else; reclassify and continue.
+
 If every blocker classifies as `already_addressed`, **do not make changes**. Skip to Step 7 with `fix_result: diagnosed_no_change`.
 
 ### Step 5: Run verify
