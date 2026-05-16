@@ -156,10 +156,12 @@ Use `/gza-summary` when you want a synthesized "what should I do next?" view tha
 Use `/gza-rebase` when your branch has fallen behind main and needs rebasing before merge. Handles conflict resolution interactively, explaining each conflict and asking for approval before editing.
 
 **Key behaviors:**
-- Checks for uncommitted changes before starting (stops if any exist)
-- Lets you choose between `origin/main` (default) or local `main` as the rebase target
-- For each conflict: explains what both sides are doing, proposes a resolution, asks for approval, edits the file, verifies Python syntax, and stages the file
-- Supports `--auto` mode for automation: resolves conflicts using best judgment, aborts on low-confidence conflicts
+- In default mode, checks for uncommitted changes before starting and stops if any exist
+- Uses local `main` by default; `origin/main` is only for explicit remote rebases
+- In `--auto` mode, stashes uncommitted changes before rebasing, restores them before final verification, and relies only on local refs already present unless the caller explicitly requested a remote rebase outside auto mode
+- For each conflict: explains what both sides are doing, proposes a resolution, asks for approval, edits the file, and stages the file
+- Runs the configured project `verify_command` on the final rebased checkout, after any stash restoration, before declaring success
+- Supports `--auto` mode for automation: resolves conflicts using best judgment, aborts on low-confidence conflicts, and avoids remote creativity when the local target ref is missing
 - Never force-pushes automatically — shows the push command for you to run
 
 **After rebase:**

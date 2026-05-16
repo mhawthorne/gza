@@ -245,9 +245,10 @@ When advance detects merge conflicts:
 3. Worker runs through the standard runner as a code task (with `skip_commit=True`)
 4. The agent invokes `/gza-rebase --auto` which:
    - Stashes any uncommitted changes
-   - Fetches and rebases onto the target branch
+   - Rebases onto the already-present local target branch without fetching or other remote operations
    - Resolves conflicts autonomously
-   - Restores stashed changes
+   - Restores stashed changes before final verification
+   - Runs the configured project `verify_command` on the final checkout before reporting success
 5. On completion, the host runner force-pushes the rebased branch (`git push --force-with-lease`)
 6. Advance sees no more conflicts on next run
 7. If a completed rebase is newer than the latest review → advance creates a fresh review before merging

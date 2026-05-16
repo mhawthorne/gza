@@ -139,6 +139,24 @@ def parse_diff_numstat(numstat_output: str) -> tuple[int, int, int]:
     return files, added, removed
 
 
+def is_rebase_in_progress(worktree_path: Path) -> bool:
+    """Check whether git still reports an in-progress rebase for this checkout."""
+    git_file = worktree_path / ".git"
+    if git_file.is_file():
+        try:
+            git_dir_text = git_file.read_text().strip()
+            if git_dir_text.startswith("gitdir: "):
+                raw = git_dir_text[len("gitdir: "):]
+                git_dir = Path(raw) if Path(raw).is_absolute() else (worktree_path / raw).resolve()
+            else:
+                git_dir = git_file
+        except OSError:
+            git_dir = worktree_path / ".git"
+    else:
+        git_dir = worktree_path / ".git"
+    return (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
+
+
 def resolve_ref_if_possible(git: "Git", ref: str | None) -> ResolvedGitRef:
     """Resolve ``ref`` when available without forcing a caller-wide failure."""
     if not ref:

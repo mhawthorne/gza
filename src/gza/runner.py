@@ -53,7 +53,7 @@ from .failure_reasons import (
     mark_task_failed_from_cause as _mark_task_failed,
     resolve_failure_reason as _resolve_failure_reason,
 )
-from .git import Git, GitApplyResult, GitError, cleanup_worktree_for_branch, parse_diff_numstat
+from .git import Git, GitApplyResult, GitError, cleanup_worktree_for_branch, is_rebase_in_progress, parse_diff_numstat
 from .github import GitHub, GitHubError
 from .improve_diff import (
     ImproveDiffBaseline,
@@ -74,12 +74,6 @@ from .rebase_diff import (
     compute_rebase_changed_diff,
 )
 from .rebase_publish import publish_rebased_branch
-from .rebase_validation import (
-    RuffDiagnostic,
-    capture_rebase_validation_baseline,
-    is_rebase_in_progress,
-    validate_rebase_resolution_output,
-)
 from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
 from .review_verdict import (
     compute_review_score,
@@ -105,7 +99,6 @@ EXTRACTION_PRECHECK_FAILURE_REASON = "EXTRACTION_PRECHECK_FAILED"
 EXTRACTION_ALREADY_MERGED_COMPLETION_REASON = "EXTRACTION_ALREADY_MERGED"
 
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
-REBASE_VALIDATION_FAILURE_REASON = "REBASE_VALIDATION_FAILED"
 
 
 @dataclass(frozen=True)
@@ -132,16 +125,6 @@ class ResolvedRunFailure:
     reason: str
     status: str
     outcome_message: str
-
-
-def _rebase_validation_failure() -> ResolvedRunFailure:
-    return ResolvedRunFailure(
-        reason=REBASE_VALIDATION_FAILURE_REASON,
-        status="failed",
-        outcome_message=f"Outcome: failed ({REBASE_VALIDATION_FAILURE_REASON})",
-    )
-
-
 def _git_error_failure() -> ResolvedRunFailure:
     return ResolvedRunFailure(
         reason="GIT_ERROR",
@@ -2559,6 +2542,15 @@ def _create_and_run_review_task(
             )
             return 0
         review_target = resolved_impl
+    elif completed_task.task_type == "rebase":
+        resolved_impl = _resolve_impl_ancestor(store, completed_task)
+        if resolved_impl is None:
+            console.print(
+                f"\n[yellow]Could not resolve the implementation ancestor for rebase task {completed_task.id}; "
+                "skipping auto-review.[/yellow]"
+            )
+            return 0
+        review_target = resolved_impl
 
     try:
         review_task = create_review_task(
@@ -4596,32 +4588,15 @@ def _run_inner(
     # Snapshot worktree state before provider runs so we can selectively stage only new changes
     pre_run_status = worktree_git.status_porcelain()
     task_logger = TaskExecutionLogger(resolve_ops_log_path(config, log_file), echo=True)
-    rebase_validation_state: tuple[str, set[RuffDiagnostic]] | None = None
     improve_diff_baseline: ImproveDiffBaseline | None = None
     rebase_diff_baseline: RebaseDiffBaseline | None = None
     if task.task_type == "rebase":
-        try:
-            rebase_validation_state = capture_rebase_validation_baseline(worktree_git)
-            rebase_diff_baseline = capture_rebase_diff_baseline(
-                worktree_git,
-                branch=branch_name,
-                target=default_branch,
-                recovered=_is_recovered_rebase_lineage(task, resume=resume),
-            )
-        except RuntimeError as exc:
-            task_logger.error(f"Pre-rebase ruff validation failed to run: {exc}")
-            _save_wip_changes(task, worktree_git, config, branch_name)
-            _record_run_failure(
-                task=task,
-                config=config,
-                store=store,
-                log_file=log_file,
-                stats=TaskStats(duration_seconds=0.0, num_steps_reported=0, cost_usd=0.0),
-                failure=_rebase_validation_failure(),
-                exit_code=1,
-                branch=branch_name,
-            )
-            return 0
+        rebase_diff_baseline = capture_rebase_diff_baseline(
+            worktree_git,
+            branch=branch_name,
+            target=default_branch,
+            recovered=_is_recovered_rebase_lineage(task, resume=resume),
+        )
     if task.task_type == "improve":
         improve_diff_baseline = capture_improve_diff_baseline(
             worktree_git,
@@ -4697,8 +4672,6 @@ def _run_inner(
             return 0
 
         if task.task_type == "rebase":
-            assert rebase_validation_state is not None
-            before_head, pre_existing_diagnostics = rebase_validation_state
             if is_rebase_in_progress(worktree_git.repo_dir):
                 task_logger.error("Rebase still in progress after provider success.")
                 _save_wip_changes(task, worktree_git, config, branch_name)
@@ -4708,25 +4681,7 @@ def _run_inner(
                     store=store,
                     log_file=log_file,
                     stats=stats,
-                    failure=_rebase_validation_failure(),
-                    exit_code=1,
-                    branch=branch_name,
-                )
-                return 0
-            if not validate_rebase_resolution_output(
-                git=worktree_git,
-                before_head=before_head,
-                pre_existing_diagnostics=pre_existing_diagnostics,
-                task_logger=task_logger,
-            ):
-                _save_wip_changes(task, worktree_git, config, branch_name)
-                _record_run_failure(
-                    task=task,
-                    config=config,
-                    store=store,
-                    log_file=log_file,
-                    stats=stats,
-                    failure=_rebase_validation_failure(),
+                    failure=_git_error_failure(),
                     exit_code=1,
                     branch=branch_name,
                 )

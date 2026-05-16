@@ -318,6 +318,36 @@ def test_summary_docs_and_skill_use_dedicated_triage_surfaces() -> None:
     assert "Keep failed history, unmerged work, unimplemented follow-up, and queue state on their dedicated surfaces." in skill_content
 
 
+def test_gza_rebase_docs_match_final_verify_contract() -> None:
+    """Operator docs should describe the rebase skill's final verify_command contract."""
+    repo_root = Path(__file__).resolve().parents[1]
+    skills_doc_content = (repo_root / "docs" / "skills.md").read_text()
+    skill_content = (repo_root / "src" / "gza" / "skills" / "gza-rebase" / "SKILL.md").read_text()
+    advance_workflow_content = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+
+    assert "configured project `verify_command`" in skills_doc_content
+    assert "after any stash restoration" in skills_doc_content
+    assert "before declaring success" in skills_doc_content
+    assert "default mode, checks for uncommitted changes before starting and stops if any exist" in skills_doc_content
+    assert "In `--auto` mode, stashes uncommitted changes before rebasing" in skills_doc_content
+    assert "relies only on local refs already present" in skills_doc_content
+
+    assert "project `verify_command`" in skill_content
+    assert "after any stashed changes have been restored" in skill_content
+    assert "Do not report success yet." in skill_content
+    assert "Do NOT use remote git operations." in skill_content
+    assert "In default mode: if any exist, stop and ask the user to commit or stash them" in skill_content
+    assert "In `--auto` mode: if any exist, run `git stash` to save them." in skill_content
+
+    assert "Rebases onto the already-present local target branch without fetching or other remote operations" in advance_workflow_content
+    assert "Restores stashed changes before final verification" in advance_workflow_content
+
+    assert "verifies Python syntax" not in skills_doc_content
+    assert "origin/main` (default)" not in skills_doc_content
+    assert "Checks for uncommitted changes before starting (stops if any exist)" not in skills_doc_content
+    assert "Fetches and rebases onto the target branch" not in advance_workflow_content
+
+
 def test_bulk_import_examples_use_tags_not_retired_group_aliases() -> None:
     """Operator import examples should teach canonical tags syntax only."""
     docs_root = Path(__file__).resolve().parents[1] / "docs" / "examples"

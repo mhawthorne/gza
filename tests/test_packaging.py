@@ -29,7 +29,11 @@ def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
             continue
 
         module = ast.parse(source, filename=str(test_file))
-        parent_map = {child: parent for parent in ast.walk(module) for child in ast.iter_child_nodes(parent)}
+        parent_map = (
+            {child: parent for parent in ast.walk(module) for child in ast.iter_child_nodes(parent)}
+            if "_run(" in source
+            else {}
+        )
 
         for node in ast.walk(module):
             if not isinstance(node, ast.Call):

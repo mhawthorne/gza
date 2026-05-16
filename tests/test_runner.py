@@ -2150,6 +2150,57 @@ class TestReviewTaskSlugGeneration:
         finally:
             gza.runner.run = original_run
 
+    def test_auto_review_rebase_targets_implementation_ancestor(self, tmp_path: Path):
+        """Completed rebases should auto-review the implementation ancestor, not the rebase row."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(
+            prompt="Add user authentication",
+            task_type="implement",
+        )
+        impl_task.status = "completed"
+        impl_task.slug = "20260211-add-user-authentication"
+        store.update(impl_task)
+
+        rebase_task = store.add(
+            prompt="Rebase implementation branch",
+            task_type="rebase",
+            based_on=impl_task.id,
+            same_branch=True,
+        )
+        rebase_task.status = "completed"
+        rebase_task.slug = "20260212-rebase-auth"
+        store.update(rebase_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.project_prefix = None
+
+        run_calls: list[str] = []
+
+        def mock_run(_config, task_id):
+            run_calls.append(task_id)
+            return 0
+
+        import gza.runner
+        original_run = gza.runner.run
+        gza.runner.run = mock_run
+
+        try:
+            exit_code = _create_and_run_review_task(rebase_task, config, store)
+            assert exit_code == 0
+
+            all_tasks = store.get_all()
+            review_task = [t for t in all_tasks if t.task_type == "review"][0]
+            assert review_task.depends_on == impl_task.id
+            assert review_task.based_on == impl_task.id
+            assert review_task.prompt == "review add-user-authentication"
+            assert run_calls == [review_task.id]
+        finally:
+            gza.runner.run = original_run
+
     def test_duplicate_in_progress_review_does_not_call_run(self, tmp_path: Path):
         """Test that _create_and_run_review_task does not call run() for in_progress reviews."""
         db_path = tmp_path / "test.db"
@@ -9020,126 +9071,6 @@ class TestExtractedRunInnerHelpers:
         assert rebase_unit.head_sha == "head-before-pr"
         assert rebase_unit.base_sha == "base-before-pr"
 
-    @pytest.mark.parametrize(
-        ("initial_text", "broken_text", "expected_diagnostic"),
-        [
-            (
-                "from math import ceil\n\n\ndef compute() -> int:\n    value = ceil(1.2)\n    return value\n",
-                "from math import ceil\n\n\ndef compute() -> int:\n    return 1\n",
-                "src/rebase_target.py:1:18: F401",
-            ),
-            (
-                "from math import ceil\n\n\ndef compute() -> int:\n    value = ceil(1.2)\n    return value\n",
-                "def compute() -> int:\n    value = ceil(1.2)\n    return value\n",
-                "src/rebase_target.py:2:13: F821",
-            ),
-        ],
-    )
-    def test_run_rebase_task_fails_validation_before_completion_and_push(
-        self,
-        tmp_path: Path,
-        initial_text: str,
-        broken_text: str,
-        expected_diagnostic: str,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """Runner-backed rebases must fail before completion when auto-resolve introduces F401/F821."""
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
-            "project_id: default\n"
-            "db_path: .gza/gza.db\n"
-            "use_docker: false\n"
-        )
-        config = Config.load(tmp_path)
-        store = SqliteTaskStore(config.db_path)
-
-        parent = store.add(prompt="Implement parent", task_type="implement")
-        assert parent.id is not None
-        parent.slug = "20260512-parent-impl"
-        parent.branch = "feature/rebase-parent"
-        store.mark_in_progress(parent)
-        store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
-
-        task = store.add(
-            prompt="Rebase parent branch",
-            task_type="rebase",
-            based_on=parent.id,
-            same_branch=True,
-        )
-        assert task.id is not None
-        task.slug = "20260512-runner-rebase-validation"
-        store.update(task)
-
-        worktree_path = config.worktree_path / task.slug
-        target_file = worktree_path / "src" / "rebase_target.py"
-        target_file.parent.mkdir(parents=True, exist_ok=True)
-        target_file.write_text(initial_text)
-
-        def provider_run(_config, _prompt, log_file, work_dir, **_kwargs):
-            broken_file = work_dir / "src" / "rebase_target.py"
-            broken_file.write_text(broken_text)
-            log_file.write_text("provider output\n")
-            return RunResult(
-                exit_code=0,
-                duration_seconds=3.0,
-                num_turns_reported=1,
-                cost_usd=0.01,
-                error_type=None,
-            )
-
-        mock_provider = Mock()
-        mock_provider.name = "TestProvider"
-        mock_provider.check_credentials.return_value = True
-        mock_provider.verify_credentials.return_value = True
-        mock_provider.run.side_effect = provider_run
-
-        mock_main_git = Mock(spec=Git)
-        mock_main_git.default_branch.return_value = "main"
-        mock_main_git.worktree_list.return_value = []
-
-        mock_worktree_git = Mock(spec=Git)
-        mock_worktree_git.repo_dir = worktree_path
-        mock_worktree_git.status_porcelain.side_effect = [set(), {("M", "src/rebase_target.py")}]
-        mock_worktree_git.has_changes.return_value = False
-        mock_worktree_git.rev_parse.return_value = "same-head"
-
-        def worktree_run(*args, **kwargs):
-            if args[:3] == ("ls-files", "--", "*.py"):
-                return Mock(stdout="src/rebase_target.py\n", returncode=0, stderr="")
-            return Mock(stdout="", returncode=0, stderr="")
-
-        mock_worktree_git._run.side_effect = worktree_run
-
-        with (
-            patch("gza.runner.backup_database"),
-            patch("gza.runner.load_dotenv"),
-            patch("gza.runner.get_provider", return_value=mock_provider),
-            patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
-            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
-            patch("gza.runner._setup_code_task_worktree", return_value=True),
-            patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._complete_code_task", side_effect=AssertionError("rebase should fail before completion")),
-            patch("gza.runner.task_footer"),
-        ):
-            rc = run(config, task_id=task.id)
-
-        assert rc == 0
-        mock_worktree_git.push_force_with_lease.assert_not_called()
-
-        refreshed = store.get(task.id)
-        assert refreshed is not None
-        assert refreshed.status == "failed"
-        assert refreshed.failure_reason == "REBASE_VALIDATION_FAILED"
-
-        surfaced = capsys.readouterr()
-        assert "Post-rebase ruff validation found new F401/F821 diagnostics" in surfaced.err
-        assert expected_diagnostic in surfaced.err
-
-        assert refreshed.log_file is not None
-        log_file = config.project_dir / refreshed.log_file
-        log_text = ops_log_path_for(log_file).read_text()
-        assert '"failure_reason": "REBASE_VALIDATION_FAILED"' in log_text
-
     def test_complete_code_task_rebase_force_pushes_from_runner(self, tmp_path: Path):
         """Rebase completion should publish through the shared helper."""
         db_path = tmp_path / "test.db"
@@ -9341,9 +9272,7 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
             patch("gza.runner._setup_code_task_worktree", return_value=True),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner.capture_rebase_validation_baseline", return_value=("same-head", set())),
             patch("gza.runner.is_rebase_in_progress", return_value=False),
-            patch("gza.runner.validate_rebase_resolution_output", return_value=True),
             patch("gza.runner.publish_rebased_branch", side_effect=GitError("push boom")),
             patch("gza.runner.task_footer"),
         ):
@@ -9455,9 +9384,7 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
             patch("gza.runner._setup_code_task_worktree", return_value=True),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner.capture_rebase_validation_baseline", return_value=("same-head", set())),
             patch("gza.runner.is_rebase_in_progress", return_value=False),
-            patch("gza.runner.validate_rebase_resolution_output", return_value=True),
             patch("gza.runner.task_footer"),
         ):
             rc = run(config, task_id=task.id)
@@ -9826,9 +9753,7 @@ class TestExtractedRunInnerHelpers:
             patch("gza.skills_utils.ensure_all_skills", return_value=0),
             patch("gza.runner._snapshot_task_db_to_worktree"),
             patch("gza.runner._copy_learnings_to_worktree"),
-            patch("gza.runner.capture_rebase_validation_baseline", return_value=("same-head", set())),
             patch("gza.runner.capture_rebase_diff_baseline", side_effect=capture_baseline),
-            patch("gza.runner.validate_rebase_resolution_output", return_value=True),
             patch("gza.runner._complete_code_task", return_value=0) as mock_complete,
         ):
             rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=True)
@@ -9923,9 +9848,7 @@ class TestExtractedRunInnerHelpers:
             patch("gza.skills_utils.ensure_all_skills", return_value=0),
             patch("gza.runner._snapshot_task_db_to_worktree"),
             patch("gza.runner._copy_learnings_to_worktree"),
-            patch("gza.runner.capture_rebase_validation_baseline", return_value=("same-head", set())),
             patch("gza.runner.capture_rebase_diff_baseline", side_effect=capture_baseline),
-            patch("gza.runner.validate_rebase_resolution_output", return_value=True),
             patch("gza.runner._complete_code_task", return_value=0) as mock_complete,
         ):
             rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
@@ -10171,9 +10094,7 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
             patch("gza.runner._setup_code_task_worktree", return_value=True),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner.capture_rebase_validation_baseline", return_value=("same-head", set())),
             patch("gza.runner.is_rebase_in_progress", return_value=True),
-            patch("gza.runner.validate_rebase_resolution_output", side_effect=AssertionError("should fail before validation")),
             patch("gza.runner._complete_code_task", side_effect=AssertionError("should fail before completion")),
             patch("gza.runner.task_footer"),
         ):
@@ -10185,7 +10106,7 @@ class TestExtractedRunInnerHelpers:
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.status == "failed"
-        assert refreshed.failure_reason == "REBASE_VALIDATION_FAILED"
+        assert refreshed.failure_reason == "GIT_ERROR"
 
         surfaced = capsys.readouterr()
         assert "Rebase still in progress after provider success." in surfaced.err
@@ -10194,7 +10115,7 @@ class TestExtractedRunInnerHelpers:
         log_file = config.project_dir / refreshed.log_file
         log_text = ops_log_path_for(log_file).read_text()
         assert "Rebase still in progress after provider success." in log_text
-        assert '"failure_reason": "REBASE_VALIDATION_FAILED"' in log_text
+        assert '"failure_reason": "GIT_ERROR"' in log_text
 
     def test_complete_code_task_uses_summary_for_commit_subject(self, tmp_path: Path):
         """Commit subject should come from worktree summary when present."""

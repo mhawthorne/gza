@@ -28,7 +28,7 @@ Rebase tasks go through the **code task path** in `runner.py:_run_inner` (not th
 - Resolve the branch via `_resolve_code_task_branch_name` (follows `based_on` chain to find parent's branch)
 - Set up a worktree on that branch
 - Run the provider (Claude) which invokes `/gza-rebase --auto`
-- Reject provider `exit_code=0` if git still reports `rebase-merge` or `rebase-apply`, then validate the Python files changed by the provider-backed resolution against the pre-resolve `ruff` baseline before accepting success
+- Reject provider `exit_code=0` if git still reports `rebase-merge` or `rebase-apply` before accepting success
 - On completion, `skip_commit=True` is set (rebase tasks don't need runner commits)
 - Before recording successful completion, the host runner routes rebase publication through the shared post-rebase helper, which verifies the rewritten tip, rejects known no-op/non-advancing rebases, fails closed on local/remote ref lookup uncertainty, and force-pushes the rebased branch (`git push --force-with-lease`)
 - On successful completion, the runner also computes and persists `changed_diff` on the rebase task:
@@ -40,7 +40,7 @@ Rebase tasks go through the **code task path** in `runner.py:_run_inner` (not th
 
 Rebase tasks need git identity to create commits during `git rebase --continue`. The Docker container gets `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL` env vars injected from the host's git config (see `build_docker_cmd` in `providers/base.py`).
 
-The worktree may have uncommitted changes (e.g., from provider initialization). The `/gza-rebase --auto` skill handles this by stashing changes before rebasing and popping them after.
+The worktree may have uncommitted changes (e.g., from provider initialization). The `/gza-rebase --auto` skill handles this by stashing changes before rebasing, restoring them with `git stash pop` after the rebase, and only then running the final project `verify_command`.
 
 ## Failure handling
 
@@ -58,7 +58,7 @@ Existing orphan recovery branches created before this behavior was fixed are lef
 2. A fresh worktree is created at `config.worktree_path / task.id`.
 3. A mechanical `git rebase` is attempted inside that worktree.
 4. If conflicts arise, the rebase is aborted and `invoke_provider_resolve` runs the provider (Claude) inside the same worktree via `/gza-rebase --auto`.
-5. Before treating that provider run as success, the host first rejects any still-active `rebase-merge` or `rebase-apply` state, then compares `ruff check --select F401,F821` diagnostics on the provider-touched Python files against the pre-resolve baseline. If unfinished rebase metadata or new undefined-name / unused-import errors appear, the rebase task fails instead of continuing silently.
+5. Before treating that provider run as success, the host rejects any still-active `rebase-merge` or `rebase-apply` state. The agent-side `/gza-rebase --auto` skill is responsible for reading and running the configured project `verify_command` only after the rebase is complete and after any stashed changes have been restored, before declaring success.
 6. On success, the rebased branch is published through the shared post-rebase helper, which verifies the rewritten tip, rejects known no-op/non-advancing rebases, fails closed on local/remote ref lookup uncertainty, and force-pushes from the worktree.
 7. The completed rebase row persists the same `changed_diff` signal used by runner-owned rebase tasks, and review invalidation only happens when that signal is not `False`.
 8. After rebase publication succeeds and the task is ready to be recorded as completed, the host reconciles the parent implementation merge unit through the shared task-scoped sync path using the same merge-proof ref as the rebase itself (`origin/<target>` for `--remote`, otherwise the local target branch). Remote rebase completion does not accept separate local-target reachability as proof, even though it still persists the merge unit against its canonical target branch. This lets empty-net-diff, squash-merged, or cherry-picked rebases flip the implementation back to authoritative `merged` state before the next `advance`, `watch`, or `iterate` pass reads the lineage.
@@ -84,4 +84,4 @@ With `--background`, `gza rebase` creates a rebase task via `_create_rebase_task
 `/gza-rebase --auto` is allowed to resolve straightforward additive conflicts without operator input, but it must not silently choose deletion when symbol liveness is uncertain. Two guardrails now apply:
 
 1. The skill instructions explicitly treat edit-vs-delete and ambiguous two-sided modifications as stop conditions unless the resolver can preserve all still-referenced symbols confidently.
-2. The host-side validation gate rejects any provider result that either leaves git rebase metadata behind or introduces new `F401` or `F821` diagnostics in the Python files changed by the rebase attempt, whether the rebase runs through `invoke_provider_resolve()` or through a standard runner-owned `task_type="rebase"` task.
+2. The host rejects any provider result that leaves git rebase metadata behind, whether the rebase runs through `invoke_provider_resolve()` or through a standard runner-owned `task_type="rebase"` task. Project verification is agent-side: `/gza-rebase --auto` must run the configured `verify_command` on the final checkout, after any stash restoration, before it reports success.

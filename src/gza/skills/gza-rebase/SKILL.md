@@ -1,7 +1,7 @@
 ---
 name: gza-rebase
 description: Rebase current branch on main, with interactive conflict resolution. Use when rebasing, merging, or resolving git conflicts.
-allowed-tools: Read, Edit, Glob, Grep, Bash(git:*), Bash(uv run python -m py_compile:*), Bash(python -m ruff check:*)
+allowed-tools: Read, Edit, Glob, Grep, Bash(git:*), Bash(uv run:*), Bash(./*), Bash(make:*), Bash(npm:*), Bash(pytest:*), Bash(python:*), Bash(awk:*), Bash(sed:*)
 version: 1.0.0
 public: true
 ---
@@ -43,7 +43,7 @@ Rebase the current branch onto a local target branch, resolving any merge confli
 
 1. If and only if the caller explicitly requested a remote rebase in non-`--auto` mode, run `git fetch origin main`
 2. Run `git rebase <chosen-target>`
-3. If rebase succeeds with no conflicts, report success and show the push command
+3. If rebase succeeds with no conflicts, continue to Step 6. Do not report success yet.
 4. If the chosen local target does not exist, stop and report the missing ref. Do not try remote probes or alternate transports.
 
 ### Step 4: Resolve conflicts (if any)
@@ -58,8 +58,7 @@ For each conflicted file:
 4. **Propose a resolution** - Suggest how to combine the changes (usually keeping both)
 5. **Ask for approval** - Use AskUserQuestion to confirm the resolution approach before editing
 6. **Apply the fix** - Edit the file to resolve the conflict, removing all conflict markers
-7. **Verify Python safety** - For Python files, run both `uv run python -m py_compile <file>` and a targeted undefined-name/import check such as `python -m ruff check --select F401,F821 <file>`
-8. **Stage the file** - Run `git add <file>`
+7. **Stage the file** - Run `git add <file>`
 
 Repeat for each conflicted file.
 
@@ -69,14 +68,21 @@ After all conflicts are resolved:
 
 1. Run `git rebase --continue`
 2. If more conflicts appear (from subsequent commits), repeat Step 4
-3. Before declaring success, run a targeted `ruff` pass covering the Python files changed by the resolution and stop if it introduces new `F401` or `F821` diagnostics
-4. Continue until rebase completes
+3. Continue until rebase completes, then proceed to Step 6
 
 ### Step 6: Restore stashed changes
 
-If changes were stashed in Step 1, run `git stash pop` to restore them.
+If changes were stashed in Step 1, run `git stash pop` to restore them before final verification. If `git stash pop` introduces conflicts, resolve them before proceeding and do not report success until the current checkout is clean enough to verify.
 
-### Step 7: Final summary
+### Step 7: Final verification
+
+Before declaring success, determine the project `verify_command` by running `uv run gza config` and reading the `verify_command` value. If config loading fails, fall back to reading `verify_command` directly from `gza.yaml`.
+
+- Run the configured `verify_command` from the project root or worktree root after the rebase is fully complete and after any stashed changes have been restored.
+- Fix any failures you surface in your own context and do not declare success until verification passes.
+- If no `verify_command` is configured, say so explicitly before finishing.
+
+### Step 8: Final summary
 
 Show:
 - "Rebase completed successfully!"
@@ -88,5 +94,5 @@ Show:
 - **Never force-push automatically** - always let the caller/user do this manually
 - **Always ask before resolving ambiguous conflicts** (unless in `--auto` mode) - if the intent isn't clear, ask
 - **Preserve both changes when possible** - most conflicts in this project are additive (both sides adding new code)
-- **Check Python semantics, not just syntax** - `py_compile` alone misses dropped-symbol failures like undefined names and import deletions
+- **Verification is project-specific** - rely on the configured `verify_command`, not language-specific hardcoded checks
 - **No remote creativity** - if remote access is unavailable or the local target ref is missing, stop and report instead of trying SSH workarounds, HTTPS fallbacks, or git-config changes

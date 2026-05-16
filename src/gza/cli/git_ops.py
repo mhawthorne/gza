@@ -32,6 +32,7 @@ from ..git import (
     ResolvedMergeSourceRef,
     active_worktree_path_for_branch,
     cleanup_worktree_for_branch,
+    is_rebase_in_progress,
     resolve_ref_if_possible,
 )
 from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
@@ -45,11 +46,6 @@ from ..pickup import (
 from ..pr_ops import build_task_pr_content, ensure_task_pr
 from ..rebase_diff import capture_rebase_diff_baseline, compute_rebase_changed_diff
 from ..rebase_publish import publish_rebased_branch
-from ..rebase_validation import (
-    capture_rebase_validation_baseline,
-    is_rebase_in_progress as _shared_is_rebase_in_progress,
-    validate_rebase_resolution_output as _validate_provider_resolve_output,
-)
 from ..recovery_engine import list_failed_tasks_for_recovery, resolve_recovery_planning_task
 from ..runner import (
     TaskExecutionLogger,
@@ -1180,7 +1176,7 @@ def ensure_skill(skill_name: str, provider: str, project_dir: Path) -> bool:
 
 def _is_rebase_in_progress(worktree_path: Path) -> bool:
     """Backward-compatible wrapper for shared rebase-state detection."""
-    return _shared_is_rebase_in_progress(worktree_path)
+    return is_rebase_in_progress(worktree_path)
 
 
 def _branch_has_commits(config: Config, branch: str | None) -> bool:
@@ -1262,12 +1258,6 @@ def invoke_provider_resolve(
     load_dotenv(config.project_dir)
     provider = get_provider(resolve_config)
     work_dir = worktree_path if worktree_path is not None else config.project_dir
-    worktree_git = Git(work_dir)
-    try:
-        before_head, pre_existing_diagnostics = capture_rebase_validation_baseline(worktree_git)
-    except RuntimeError as exc:
-        task_logger.error(f"Pre-rebase ruff validation failed to run: {exc}")
-        return False
 
     if worktree_path is not None:
         skill_cmd = "/gza-rebase --auto"
@@ -1301,13 +1291,6 @@ def invoke_provider_resolve(
     rebase_in_progress = _is_rebase_in_progress(worktree_path or config.project_dir)
     if rebase_in_progress:
         task_logger.error(f"Rebase still in progress after {skill_cmd}.")
-        return False
-    if not _validate_provider_resolve_output(
-        git=worktree_git,
-        before_head=before_head,
-        pre_existing_diagnostics=pre_existing_diagnostics,
-        task_logger=task_logger,
-    ):
         return False
 
     task_logger.info("Provider resolve completed successfully.")
