@@ -23,6 +23,7 @@ from gza.cli.git_ops import (
 from gza.config import Config
 from gza.git import Git, GitError, ResolvedGitRef
 from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult
+from gza.worktree_roots import managed_worktree_root_paths
 
 from .conftest import make_store, run_gza, setup_config
 
@@ -360,6 +361,90 @@ def test_run_task_backed_rebase_invalidates_review_state_when_diff_changes(tmp_p
     refreshed_rebase = store.get(rebase_task.id)
     assert refreshed_rebase is not None
     assert refreshed_rebase.changed_diff is True
+
+def test_run_task_backed_rebase_passes_managed_roots_to_cleanup(tmp_path: Path) -> None:
+    """Foreground rebase setup should constrain branch cleanup to managed roots."""
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(
+        config_path.read_text() + "interactive_worktree_dir: interactive-worktrees\n"
+    )
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    parent.status = "completed"
+    parent.completed_at = datetime.now(UTC)
+    parent.branch = "feature/rebased"
+    store.update(parent)
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = parent.branch
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git._run.return_value = None
+    repo_git.worktree_remove.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.rebase.return_value = None
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/rebased": "head-new",
+        "main": "base-new",
+    }.get(ref)
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None) as mock_cleanup,
+        patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 0
+    mock_cleanup.assert_called_once_with(
+        repo_git,
+        "feature/rebased",
+        force=True,
+        permitted_root_paths=managed_worktree_root_paths(config),
+    )
+
+
+def test_checkout_passes_managed_roots_to_cleanup(tmp_path: Path) -> None:
+    """Checkout should pass both task and configured interactive roots to cleanup."""
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(
+        config_path.read_text() + "interactive_worktree_dir: interactive-worktrees\n"
+    )
+    store = make_store(tmp_path)
+    task = store.add("Checkout feature", task_type="implement")
+    task.branch = "feature/checkout-roots"
+    store.update(task)
+
+    git = MagicMock()
+    git.branch_exists.return_value = True
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=git),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None) as mock_cleanup,
+    ):
+        result = run_gza("checkout", str(task.id), "--project", str(tmp_path))
+
+    assert result.returncode == 0
+    config = Config.load(tmp_path)
+    mock_cleanup.assert_called_once_with(
+        git,
+        "feature/checkout-roots",
+        force=False,
+        permitted_root_paths=managed_worktree_root_paths(config),
+    )
 
 
 def test_run_task_backed_rebase_reconciles_parent_merge_status_when_rebased_branch_is_already_in_target(

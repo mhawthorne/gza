@@ -5,12 +5,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
+
 from gza import advance_engine as advance_engine_module
 from gza.advance_engine import evaluate_advance_rules, resolve_advance_context
 from gza.cli.git_ops import _merge_single_task, _run_task_backed_rebase
 from gza.config import Config
 from gza.db import SqliteTaskStore, check_migration_status
-from gza.git import Git
+from gza.git import Git, GitError, active_worktree_path_for_branch, cleanup_worktree_for_branch
 from gza.review_verdict import ParsedReviewReport
 from gza.runner import WIP_DIR, _restore_wip_changes, _save_wip_changes, _squash_wip_commits
 from tests.cli.conftest import make_store, setup_config
@@ -321,6 +323,47 @@ def test_real_git_remote_tracking_ref_unblocks_failed_rebase_after_later_approve
     assert ctx.can_merge is True
     assert action["type"] == "merge"
     assert action["description"] == "Merge (review APPROVED)"
+
+
+def test_cleanup_worktree_for_branch_refuses_foreign_live_worktree_in_real_repo(tmp_path: Path) -> None:
+    """Real git worktrees outside managed roots must remain untouched."""
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "README.md").write_text("initial\n")
+    git._run("add", "README.md")
+    git._run("commit", "-m", "Initial commit")
+
+    branch = "feature/foreign-worktree"
+    git._run("checkout", "-b", branch)
+    (tmp_path / "feature.txt").write_text("feature\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Add feature")
+    git._run("checkout", "main")
+
+    managed_root = tmp_path / ".gza-managed"
+    foreign_path = tmp_path / "user-worktrees" / "foreign-feature"
+    foreign_path.parent.mkdir(parents=True, exist_ok=True)
+    git._run("worktree", "add", str(foreign_path), branch)
+    sentinel = foreign_path / "sentinel.txt"
+    sentinel.write_text("leave me alone\n")
+    registrations_before = {p.name for p in (tmp_path / ".git" / "worktrees").iterdir() if p.is_dir()}
+
+    with pytest.raises(GitError, match="Refusing to remove worktree for branch 'feature/foreign-worktree'"):
+        cleanup_worktree_for_branch(
+            git,
+            branch,
+            force=True,
+            permitted_root_paths=[managed_root],
+        )
+
+    assert sentinel.exists()
+    registrations_after = {p.name for p in (tmp_path / ".git" / "worktrees").iterdir() if p.is_dir()}
+    assert registrations_after == registrations_before
+    active_path = active_worktree_path_for_branch(git, branch)
+    assert active_path == foreign_path.resolve(strict=False)
+    assert Git(foreign_path).current_branch() == branch
 
 
 def test_is_ancestor_with_real_repo(tmp_path: Path) -> None:

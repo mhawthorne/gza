@@ -88,6 +88,7 @@ from .task_slug import (
     get_base_task_slug,
     strip_derived_implement_prefixes,
 )
+from .worktree_roots import managed_worktree_root_paths
 
 logger = logging.getLogger(__name__)
 
@@ -3601,7 +3602,12 @@ def _setup_code_task_worktree(
         try:
             # Remove any existing worktree for this branch (may be at a different path
             # from a previous task run), then also remove worktree at target path if present
-            cleanup_worktree_for_branch(git, branch_name, force=True)
+            cleanup_worktree_for_branch(
+                git,
+                branch_name,
+                force=True,
+                permitted_root_paths=managed_worktree_root_paths(config),
+            )
             if worktree_path.exists():
                 git.worktree_remove(worktree_path, force=True)
 

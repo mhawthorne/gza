@@ -69,6 +69,7 @@ from ..sync_ops import (
     refresh_branch_diff_stats,
     sync_branch_cohorts,
 )
+from ..worktree_roots import managed_worktree_root_paths
 from ._common import (
     DuplicateReviewError,
     _create_or_reuse_followup_tasks,
@@ -1353,7 +1354,12 @@ def _run_task_backed_rebase(
 
     worktree_path = config.worktree_path / str(rebase_task.id)
     try:
-        stale_path = cleanup_worktree_for_branch(git, branch, force=True)
+        stale_path = cleanup_worktree_for_branch(
+            git,
+            branch,
+            force=True,
+            permitted_root_paths=managed_worktree_root_paths(config),
+        )
         if stale_path:
             logger.phase(f"Removing stale worktree at {stale_path}...")
             logger.info("✓ Removed worktree")
@@ -1660,7 +1666,12 @@ def cmd_checkout(args: argparse.Namespace) -> int:
 
     # Clean up worktree if branch is checked out in one
     try:
-        worktree_path = cleanup_worktree_for_branch(git, branch, force=args.force)
+        worktree_path = cleanup_worktree_for_branch(
+            git,
+            branch,
+            force=args.force,
+            permitted_root_paths=managed_worktree_root_paths(config),
+        )
         if worktree_path:
             print(f"Removing stale worktree at {worktree_path}...")
             print("✓ Removed worktree")

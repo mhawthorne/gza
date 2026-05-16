@@ -7,7 +7,7 @@ import pytest
 
 from gza.cli.git_ops import _execute_merge_action, ensure_watch_main_checkout
 from gza.config import Config
-from tests.cli.conftest import setup_git_repo_with_task_branch
+from tests_functional.git_helpers import setup_git_repo_with_task_branch
 
 pytestmark = [pytest.mark.integration, pytest.mark.timeout(10)]
 

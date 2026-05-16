@@ -33,11 +33,12 @@ class TestCleanupWorktreeForBranch:
     def test_raises_when_live_worktree_remove_fails_without_deleting_registration(self, tmp_path: Path):
         """A failed live remove must preserve the branch registration."""
         git = Git(tmp_path)
+        worktree_path = tmp_path / "worktrees" / "branch"
         registration_dir = tmp_path / ".git" / "worktrees" / "feature-test"
         registration_dir.mkdir(parents=True)
 
         with patch.object(git, "worktree_list", return_value=[
-            {"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}
+            {"path": str(worktree_path), "branch": "refs/heads/feature/test"}
         ]), \
              patch.object(
                  git,
@@ -45,16 +46,17 @@ class TestCleanupWorktreeForBranch:
                  return_value=MagicMock(returncode=1, stdout="", stderr="worktree is locked"),
              ) as mock_remove, \
              patch("gza.git._worktree_registration_dir_for_branch", return_value=registration_dir), \
-             patch("gza.git.Git.has_changes", return_value=False):
+            patch("gza.git.Git.has_changes", return_value=False):
             with pytest.raises(GitError, match="git worktree remove failed"):
                 cleanup_worktree_for_branch(git, "feature/test", force=True)
 
-            mock_remove.assert_called_once_with(Path("/tmp/gza/branch"), force=True)
+            mock_remove.assert_called_once_with(worktree_path.resolve(strict=False), force=True)
             assert registration_dir.exists()
 
     def test_raises_when_worktree_still_registered_after_remove(self, tmp_path: Path):
         """A failed remove should not be reported as successful."""
         git = Git(tmp_path)
+        worktree_path = tmp_path / "worktrees" / "branch"
 
         with patch.object(git, "worktree_list") as mock_list, \
              patch.object(git, "worktree_remove") as mock_remove, \
@@ -62,18 +64,19 @@ class TestCleanupWorktreeForBranch:
              patch("gza.git.Git.has_changes", return_value=False):
             mock_remove.return_value = MagicMock(returncode=0, stdout="", stderr="")
             mock_list.side_effect = [
-                [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
-                [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
+                [{"path": str(worktree_path), "branch": "refs/heads/feature/test"}],
+                [{"path": str(worktree_path), "branch": "refs/heads/feature/test"}],
             ]
 
             with pytest.raises(GitError, match="still registered"):
                 cleanup_worktree_for_branch(git, "feature/test", force=True)
 
-            mock_remove.assert_called_once_with(Path("/tmp/gza/branch"), force=True)
+            mock_remove.assert_called_once_with(worktree_path.resolve(strict=False), force=True)
 
     def test_removes_targeted_registration_after_remove(self, tmp_path: Path):
         """A stale registration for the same branch is removed directly."""
         git = Git(tmp_path)
+        worktree_path = tmp_path / "worktrees" / "branch"
         registration_dir = tmp_path / ".git" / "worktrees" / "feature-test"
         registration_dir.mkdir(parents=True)
 
@@ -83,14 +86,14 @@ class TestCleanupWorktreeForBranch:
              patch("gza.git.Git.has_changes", return_value=False):
             mock_remove.return_value = MagicMock(returncode=0, stdout="", stderr="")
             mock_list.side_effect = [
-                [{"path": "/tmp/gza/branch", "branch": "refs/heads/feature/test"}],
+                [{"path": str(worktree_path), "branch": "refs/heads/feature/test"}],
                 [],
             ]
 
             result = cleanup_worktree_for_branch(git, "feature/test", force=True)
 
-            assert result == Path("/tmp/gza/branch")
-            mock_remove.assert_called_once_with(Path("/tmp/gza/branch"), force=True)
+            assert result == worktree_path.resolve(strict=False)
+            mock_remove.assert_called_once_with(worktree_path.resolve(strict=False), force=True)
             assert not registration_dir.exists()
 
     def test_removes_prunable_only_target_registration(self, tmp_path: Path):
@@ -113,7 +116,96 @@ class TestCleanupWorktreeForBranch:
             mock_remove.assert_not_called()
             assert not registration_dir.exists()
 
+    def test_refuses_to_remove_live_worktree_outside_permitted_roots(self, tmp_path: Path):
+        """Foreign live worktrees must fail closed and preserve registration."""
+        git = Git(tmp_path)
+        managed_root = tmp_path / "managed"
+        foreign_path = tmp_path / "foreign" / "feature-test"
+        registration_dir = tmp_path / ".git" / "worktrees" / "feature-test"
+        registration_dir.mkdir(parents=True)
 
+        with (
+            patch.object(git, "worktree_list", side_effect=[
+                [{"path": str(foreign_path), "branch": "refs/heads/feature/test"}],
+                [{"path": str(foreign_path), "branch": "refs/heads/feature/test"}],
+            ]),
+            patch.object(git, "worktree_remove") as mock_remove,
+            patch("gza.git._worktree_registration_dir_for_branch", return_value=registration_dir),
+        ):
+            with pytest.raises(GitError, match="Refusing to remove worktree for branch 'feature/test'") as exc_info:
+                cleanup_worktree_for_branch(
+                    git,
+                    "feature/test",
+                    force=True,
+                    permitted_root_paths=[managed_root],
+                )
+
+            assert str(foreign_path.resolve(strict=False)) in str(exc_info.value)
+            assert "git worktree remove --force" in str(exc_info.value)
+            mock_remove.assert_not_called()
+            assert registration_dir.exists()
+
+    def test_removes_live_worktree_within_permitted_roots(self, tmp_path: Path):
+        """Managed live worktrees should still be removed normally."""
+        git = Git(tmp_path)
+        managed_root = tmp_path / "managed"
+        worktree_path = managed_root / "feature-test"
+        registration_dir = tmp_path / ".git" / "worktrees" / "feature-test"
+        registration_dir.mkdir(parents=True)
+
+        with (
+            patch.object(git, "worktree_list") as mock_list,
+            patch.object(git, "worktree_remove") as mock_remove,
+            patch("gza.git._worktree_registration_dir_for_branch", return_value=registration_dir),
+            patch("gza.git.Git.has_changes", return_value=False),
+        ):
+            mock_remove.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            mock_list.side_effect = [
+                [{"path": str(worktree_path), "branch": "refs/heads/feature/test"}],
+                [],
+            ]
+
+            result = cleanup_worktree_for_branch(
+                git,
+                "feature/test",
+                force=True,
+                permitted_root_paths=[managed_root],
+            )
+
+            assert result == worktree_path.resolve(strict=False)
+            mock_remove.assert_called_once_with(worktree_path.resolve(strict=False), force=True)
+            assert not registration_dir.exists()
+
+    def test_removes_live_worktree_within_permitted_roots(self, tmp_path: Path):
+        """Managed live worktrees should still be removed normally."""
+        git = Git(tmp_path)
+        managed_root = tmp_path / "managed"
+        worktree_path = managed_root / "feature-test"
+        registration_dir = tmp_path / ".git" / "worktrees" / "feature-test"
+        registration_dir.mkdir(parents=True)
+
+        with (
+            patch.object(git, "worktree_list") as mock_list,
+            patch.object(git, "worktree_remove") as mock_remove,
+            patch("gza.git._worktree_registration_dir_for_branch", return_value=registration_dir),
+            patch("gza.git.Git.has_changes", return_value=False),
+        ):
+            mock_remove.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            mock_list.side_effect = [
+                [{"path": str(worktree_path), "branch": "refs/heads/feature/test"}],
+                [],
+            ]
+
+            result = cleanup_worktree_for_branch(
+                git,
+                "feature/test",
+                force=True,
+                permitted_root_paths=[managed_root],
+            )
+
+            assert result == worktree_path.resolve(strict=False)
+            mock_remove.assert_called_once_with(worktree_path.resolve(strict=False), force=True)
+            assert not registration_dir.exists()
 class TestGitRun:
     """Tests for the _run helper method."""
 

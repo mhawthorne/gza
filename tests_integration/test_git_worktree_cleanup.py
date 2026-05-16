@@ -7,8 +7,9 @@ from unittest.mock import patch
 import pytest
 
 from gza.git import Git, GitError, cleanup_worktree_for_branch
-from tests.cli.conftest import make_store, setup_git_repo_with_task_branch
+from tests.cli.conftest import make_store
 from tests.helpers.cli import run_gza
+from tests_functional.git_helpers import setup_git_repo_with_task_branch
 
 pytestmark = pytest.mark.integration
 

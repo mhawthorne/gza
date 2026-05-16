@@ -64,6 +64,7 @@ from gza.runner import (
     write_log_entry,
     write_worker_start_event,
 )
+from gza.worktree_roots import managed_worktree_root_paths
 
 
 class TestGetTaskOutputPaths:
@@ -7062,6 +7063,37 @@ class TestExtractedRunInnerHelpers:
         )
 
         assert ok is False
+
+    def test_setup_code_task_worktree_resume_passes_managed_roots_to_cleanup(self, tmp_path: Path):
+        """Resume/same-branch setup should guard cleanup with configured roots."""
+        config = self._make_config(tmp_path)
+        config.interactive_worktree_dir = "interactive-worktrees"
+        task = Task(id=1, prompt="resume task", task_type="implement", slug="20260317-task")
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = True
+        git._run.return_value = None
+        git.worktree_remove.return_value = None
+
+        worktree_path = tmp_path / "worktrees" / "20260317-task"
+
+        with patch("gza.runner.cleanup_worktree_for_branch", return_value=None) as mock_cleanup:
+            ok = _setup_code_task_worktree(
+                task,
+                config,
+                git,
+                branch_name="feature/existing",
+                worktree_path=worktree_path,
+                default_branch="main",
+                resume=True,
+            )
+
+        assert ok is True
+        mock_cleanup.assert_called_once_with(
+            git,
+            "feature/existing",
+            force=True,
+            permitted_root_paths=managed_worktree_root_paths(config),
+        )
 
     def test_complete_code_task_marks_failed_when_no_changes_and_no_commits(self, tmp_path: Path):
         """Completion helper should fail task when provider produced neither changes nor commits."""

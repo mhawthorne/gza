@@ -3,6 +3,7 @@
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1011,42 +1012,88 @@ class Git:
             return None
 
 
-def cleanup_worktree_for_branch(git: "Git", branch: str, force: bool = False) -> Path | None:
+def _resolve_permitted_worktree_roots(permitted_root_paths: Sequence[Path] | None) -> tuple[Path, ...] | None:
+    """Resolve configured worktree roots for containment checks."""
+    if permitted_root_paths is None:
+        return None
+    return tuple(path.resolve(strict=False) for path in permitted_root_paths)
+
+
+def _path_is_under_any_root(path: Path, roots: Sequence[Path]) -> bool:
+    """Return whether ``path`` is equal to or contained by any root."""
+    resolved_path = path.resolve(strict=False)
+    for root in roots:
+        try:
+            resolved_path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _format_foreign_worktree_error(branch: str, worktree_path: Path, roots: Sequence[Path]) -> str:
+    """Build the refusal message for non-managed live worktrees."""
+    roots_block = "\n".join(f"  {root}" for root in roots) or "  (none)"
+    return (
+        f"Refusing to remove worktree for branch '{branch}' at '{worktree_path}'\n"
+        "because it is outside Gza-managed worktree roots:\n"
+        f"{roots_block}\n\n"
+        "Remove it manually if this is intentional:\n"
+        f"  git worktree remove {worktree_path}\n"
+        f"  git worktree remove --force {worktree_path}"
+    )
+
+
+def cleanup_worktree_for_branch(
+    git: "Git",
+    branch: str,
+    force: bool = False,
+    *,
+    permitted_root_paths: Sequence[Path] | None = None,
+) -> Path | None:
     """Clean up worktree if branch is checked out in one.
 
     Args:
         git: Git instance for the main repository
         branch: Branch name to check for worktree
         force: If True, remove worktree even with uncommitted changes
+        permitted_root_paths: Allowed root directories for live worktree removal.
 
     Returns:
         Path to cleaned worktree, or None if no worktree found
 
     Raises:
         ValueError: If worktree has uncommitted changes and force=False
+        GitError: If a live worktree is outside the permitted roots
     """
     worktree_path = active_worktree_path_for_branch(git, branch)
+    permitted_roots = _resolve_permitted_worktree_roots(permitted_root_paths)
 
     remove_succeeded = False
     if worktree_path:
+        resolved_worktree_path = worktree_path.resolve(strict=False)
+        if permitted_roots is not None and not _path_is_under_any_root(resolved_worktree_path, permitted_roots):
+            raise GitError(_format_foreign_worktree_error(branch, resolved_worktree_path, permitted_roots))
+
         # Check if worktree has uncommitted changes
-        worktree_git = Git(worktree_path)
+        worktree_git = Git(resolved_worktree_path)
         if worktree_git.has_changes(include_untracked=True) and not force:
             raise ValueError(
-                f"Worktree at {worktree_path} has uncommitted changes.\n"
+                f"Worktree at {resolved_worktree_path} has uncommitted changes.\n"
                 f"\nOptions:\n"
-                f"  1. cd {worktree_path} and commit or discard changes\n"
+                f"  1. cd {resolved_worktree_path} and commit or discard changes\n"
                 f"  2. Use --force to remove the worktree anyway (loses changes)"
             )
 
         # Remove the worktree
-        remove_result = git.worktree_remove(worktree_path, force=force)
+        remove_result = git.worktree_remove(resolved_worktree_path, force=force)
         if remove_result.returncode != 0:
             error_output = remove_result.stderr or remove_result.stdout
             raise GitError(
-                f"git worktree remove failed for branch '{branch}' at '{worktree_path}':\n{error_output}"
+                f"git worktree remove failed for branch '{branch}' at '{resolved_worktree_path}':\n{error_output}"
             )
         remove_succeeded = True
+        worktree_path = resolved_worktree_path
 
     registration_dir = _worktree_registration_dir_for_branch(git, branch)
     should_remove_registration = worktree_path is None or remove_succeeded

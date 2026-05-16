@@ -6,6 +6,8 @@ from pathlib import Path
 from gza.db import SqliteTaskStore, Task, task_id_numeric_key
 from tests.helpers.cli import run_gza
 
+__all__ = ["run_gza"]
+
 LOG_FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "logs"
 
 
