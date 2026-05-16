@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from gza.advance_engine import (
+    _resolve_and_persist_post_merge_rebase_state,
     WORKER_CONSUMING_ACTIONS,
     classify_advance_action,
     evaluate_advance_rules,
@@ -1306,6 +1307,37 @@ def test_failed_rebase_clears_and_marks_merged_when_branch_tip_equals_target_tip
         target_branch="main",
     )
     assert all(row.owner_task.id != impl.id for row in rows)
+
+
+def test_post_merge_rebase_state_does_not_persist_merged_for_in_progress_implement(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "in_progress"
+    impl.branch = "feature/in-progress-equals-target"
+    impl.merge_status = "unmerged"
+    impl.has_commits = False
+    store.update(impl)
+
+    git = _FakeGit(
+        can_merge=False,
+        ref_shas={
+            impl.branch: "same-sha",
+            "main": "same-sha",
+        },
+    )
+
+    state = _resolve_and_persist_post_merge_rebase_state(store, git, impl, "main")
+
+    assert state.already_merged is True
+    assert state.reason == "branch-tip-equals-target-tip"
+    assert store.resolve_merge_unit_for_task(impl.id) is None
+    refreshed = store.get(impl.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
 
 
 def test_failed_rebase_does_not_persist_merged_from_stale_local_tip_when_origin_is_fresher(

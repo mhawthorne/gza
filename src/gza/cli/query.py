@@ -210,7 +210,14 @@ def _implementation_review_rebase_detail(
     try:
         git = Git(config.project_dir)
         target_branch = git.default_branch()
-        ctx = resolve_advance_context(config, store, git, task, target_branch)
+        ctx = resolve_advance_context(
+            config,
+            store,
+            git,
+            task,
+            target_branch,
+            persist_post_merge_rebase_state=False,
+        )
     except (GitError, OSError, ValueError):
         return None
 
@@ -272,7 +279,14 @@ def _summarize_lifecycle(
         return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="failed")
 
     try:
-        action = determine_next_action(config, store, git, planning_task, target_branch)
+        action = determine_next_action(
+            config,
+            store,
+            git,
+            planning_task,
+            target_branch,
+            persist_post_merge_rebase_state=False,
+        )
     except (GitError, OSError, ValueError) as exc:
         detail = f"lifecycle unavailable - failed to classify lifecycle: {' '.join(str(exc).split())}"
         return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="failed")

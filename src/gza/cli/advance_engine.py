@@ -36,6 +36,7 @@ def determine_next_action(
     *,
     impl_based_on_ids: set[str] | None = None,
     max_resume_attempts: int | None = None,
+    persist_post_merge_rebase_state: bool = True,
 ) -> dict[str, Any]:
     """Backward-compatible entrypoint for advance action selection."""
     return evaluate_advance_rules(
@@ -46,6 +47,7 @@ def determine_next_action(
         target_branch,
         impl_based_on_ids=impl_based_on_ids,
         max_resume_attempts=max_resume_attempts,
+        persist_post_merge_rebase_state=persist_post_merge_rebase_state,
     )
 
 

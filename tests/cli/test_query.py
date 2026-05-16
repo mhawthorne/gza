@@ -93,7 +93,7 @@ class _FastUnmergedGit:
             raise self._fetch_error
         return None
 
-    def _run(self, *args: str) -> None:
+    def run_forbidden_subprocess(self, *args: str) -> None:
         raise AssertionError("fast unmerged git double does not run subprocesses")
 
 
@@ -4181,6 +4181,147 @@ class TestShowCommand:
 
         output = capsys.readouterr().out
         assert exit_code == 0
+        assert f"Review: APPROVED (carried across rebase {rebase.id})" in output
+
+    def test_show_in_progress_implement_does_not_invoke_db_write_paths(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gza import advance_engine as advance_engine_module
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement feature", task_type="implement")
+        assert task.id is not None
+        task.status = "in_progress"
+        task.branch = "feature/show-readonly"
+        task.merge_status = "unmerged"
+        task.has_commits = False
+        store.update(task)
+
+        review = store.add(f"Review {task.id}", task_type="review", based_on=task.id, depends_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        store.update(review)
+
+        rebase = store.add(f"Rebase {task.id}", task_type="rebase", based_on=task.id, same_branch=True)
+        rebase.status = "completed"
+        rebase.completed_at = datetime(2026, 5, 4, 10, 20, 0, tzinfo=UTC)
+        rebase.branch = task.branch
+        rebase.changed_diff = False
+        store.update(rebase)
+
+        monkeypatch.setattr(
+            advance_engine_module,
+            "get_review_report",
+            lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+        )
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+        git.resolve_fresh_merge_source.return_value = advance_engine_module.ResolvedMergeSourceRef(task.branch)
+        git.rev_parse_if_exists.side_effect = lambda ref: "same-sha" if ref in {task.branch, "main"} else None
+        git.is_ancestor.return_value = True
+
+        with (
+            patch.object(
+                query_cli.SqliteTaskStore,
+                "set_merge_status",
+                side_effect=AssertionError("show must not set merge_status"),
+            ),
+            patch.object(
+                query_cli.SqliteTaskStore,
+                "set_merge_unit_state",
+                side_effect=AssertionError("show must not set merge unit state"),
+            ),
+            patch.object(
+                query_cli.SqliteTaskStore,
+                "create_merge_unit",
+                side_effect=AssertionError("show must not create merge units"),
+            ),
+            patch("gza.cli.query.Git", return_value=git),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(task.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert f"Review: APPROVED (carried across rebase {rebase.id})" in output
+
+    def test_show_merged_implement_still_renders_review_carried_across_rebase(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gza import advance_engine as advance_engine_module
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement feature", task_type="implement")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        task.branch = "feature/review-preserved-merged-show"
+        task.has_commits = True
+        task.merge_status = "merged"
+        store.update(task)
+        unit = store.get_or_create_merge_unit_for_task(task)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged", merged_by_task_id=task.id)
+
+        review = store.add(f"Review {task.id}", task_type="review", based_on=task.id, depends_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        store.update(review)
+
+        rebase = store.add(f"Rebase {task.id}", task_type="rebase", based_on=task.id, same_branch=True)
+        rebase.status = "completed"
+        rebase.completed_at = datetime(2026, 5, 4, 10, 20, 0, tzinfo=UTC)
+        rebase.branch = task.branch
+        rebase.changed_diff = False
+        store.update(rebase)
+
+        monkeypatch.setattr(
+            advance_engine_module,
+            "get_review_report",
+            lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+        )
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(task.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Merge Status: merged" in output
         assert f"Review: APPROVED (carried across rebase {rebase.id})" in output
 
     def test_show_implement_renders_review_invalidated_by_rebase(

@@ -10,7 +10,7 @@ from typing import Any
 
 from gza.branch_resolution import resolve_rebase_target_task
 from gza.console import prompt_available_width, shorten_prompt
-from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key, task_owns_merge_status
 from gza.git import ResolvedMergeSourceRef
 from gza.merge_state import resolve_task_merge_state_for_target
 from gza.query import get_code_changing_descendants_for_root, get_reviews_for_root
@@ -402,6 +402,9 @@ def _resolve_and_persist_post_merge_rebase_state(
         state.reason == "branch-tip-equals-target-tip"
         and state.already_merged
         and task.id is not None
+        and task.status == "completed"
+        and task.has_commits
+        and task_owns_merge_status(task)
     ):
         merge_unit = store.resolve_merge_unit_for_task(task.id)
         if merge_unit is not None:
@@ -1024,6 +1027,7 @@ def resolve_advance_context(
     *,
     impl_based_on_ids: set[str] | None = None,
     max_resume_attempts: int | None = None,
+    persist_post_merge_rebase_state: bool = True,
 ) -> AdvanceContext:
     """Resolve state once, then let rules evaluate pure context."""
     assert task.id is not None
@@ -1129,13 +1133,22 @@ def resolve_advance_context(
         target_branch=target_branch,
         source_ref=merge_source.ref,
     )
-    post_merge_rebase_state = _resolve_and_persist_post_merge_rebase_state(
-        store,
-        git,
-        task,
-        target_branch,
-        merge_source=merge_source,
-    )
+    if persist_post_merge_rebase_state:
+        post_merge_rebase_state = _resolve_and_persist_post_merge_rebase_state(
+            store,
+            git,
+            task,
+            target_branch,
+            merge_source=merge_source,
+        )
+    else:
+        post_merge_rebase_state = resolve_post_merge_rebase_state(
+            store,
+            git,
+            task,
+            target_branch,
+            merge_source=merge_source,
+        )
     merge_state = resolve_task_merge_state_for_target(
         store=store,
         task=task,
@@ -1630,6 +1643,7 @@ def evaluate_advance_rules(
     *,
     impl_based_on_ids: set[str] | None = None,
     max_resume_attempts: int | None = None,
+    persist_post_merge_rebase_state: bool = True,
 ) -> dict[str, Any]:
     """Evaluate ordered advance rules for a task and return an action dict."""
     context = resolve_advance_context(
@@ -1640,6 +1654,7 @@ def evaluate_advance_rules(
         target_branch,
         impl_based_on_ids=impl_based_on_ids,
         max_resume_attempts=max_resume_attempts,
+        persist_post_merge_rebase_state=persist_post_merge_rebase_state,
     )
 
     for rule in ADVANCE_RULES:
