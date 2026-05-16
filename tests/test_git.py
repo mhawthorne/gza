@@ -145,11 +145,11 @@ class TestCleanupWorktreeForBranch:
             mock_remove.assert_not_called()
             assert registration_dir.exists()
 
-    def test_removes_live_worktree_within_permitted_roots(self, tmp_path: Path):
-        """Managed live worktrees should still be removed normally."""
+    def test_removes_live_worktree_equal_to_permitted_root(self, tmp_path: Path):
+        """A worktree exactly at the permitted root should still be removable."""
         git = Git(tmp_path)
         managed_root = tmp_path / "managed"
-        worktree_path = managed_root / "feature-test"
+        worktree_path = managed_root
         registration_dir = tmp_path / ".git" / "worktrees" / "feature-test"
         registration_dir.mkdir(parents=True)
 
