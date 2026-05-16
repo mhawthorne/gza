@@ -540,6 +540,7 @@ gza add [prompt] [options]
 | `--based-on ID` | Base on previous task by full prefixed task ID (e.g. `gza-1234`) |
 | `--depends-on ID` | Set dependency on another task by full prefixed task ID (e.g. `gza-1234`) |
 | `--review` | Auto-create review task on completion |
+| `--hold-for-review` | For `--type plan`, require manual review before any automatic implementation follow-up |
 | `--pr` | Auto-create/reuse a GitHub PR after successful code-task completion |
 | `--same-branch` | Continue on depends_on task's branch |
 | `--spec FILE` | Path to spec file for context |
@@ -569,6 +570,7 @@ gza edit <task_id> [options]
 | `--explore` | Convert to explore task |
 | `--task` | Convert to regular task |
 | `--review` | Enable automatic review task creation on completion |
+| `--auto-implement` | For plan tasks, enable automatic implementation follow-up |
 | `--pr` | Enable automatic PR creation on successful code-task completion |
 | `--prompt TEXT` | Set new prompt directly (use `-` for stdin) |
 | `--prompt-file FILE` | Read new prompt from file |
@@ -577,6 +579,7 @@ gza edit <task_id> [options]
 | `--no-learnings` | Skip injecting learnings context |
 
 Pending tasks may use any supported edit flag. Non-pending tasks may only use tag mutation flags (`--add-tag`, `--remove-tag`, `--clear-tags`, or `--set-tags`).
+Completed plan tasks may also use `--auto-implement` to release a hold-for-review plan without rerunning it.
 All other edit flags (`--based-on`, `--depends-on`, `--explore`, `--task`, `--review`, `--pr`, `--prompt`, `--prompt-file`, `--model`, `--provider`, and `--no-learnings`) remain pending-only.
 
 Non-conflicting edit mutations can be combined in one invocation. Tag mutation flags remain mutually exclusive with each other.
@@ -1089,7 +1092,7 @@ gza incomplete [options]
 
 Use `gza incomplete` for unresolved lineage triage. Use the more specific command surfaces when you want one domain only:
 
-Projected `next_action` values can include `recommend_rebase` when a branch is behind its target or when the latest `/gza-task-fix` ledger proves local verify passed but exceeded the autonomous review verify timeout.
+Projected `next_action` values can include `recommend_rebase` when a branch is behind its target or when the latest `/gza-task-fix` ledger proves local verify passed but exceeded the autonomous review verify timeout. Completed held plan tasks surface `awaiting_human` until you run `uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --auto-implement`.
 
 `uv run gza incomplete --list-fields` prints the unresolved-lineage projection set. `uv run gza incomplete --blocked-by-dropped --list-fields` prints the blocked-dropped task projection set.
 
@@ -1369,6 +1372,8 @@ gza implement <plan_task_id> [prompt] [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when running the implement task |
 
+When `uv run gza implement <plan-id>` is used to approve a held completed plan, it also clears that plan's hold so the completed plan no longer remains in `uv run gza incomplete`.
+
 ### extract
 
 Create a new implementation task from a selected subset of file changes on a source task branch or explicit branch.
@@ -1445,6 +1450,7 @@ Only completed plan rows are directly runnable with `uv run gza implement <id>`;
 for listed explore rows.
 
 When the shared advance/recovery engine decides a task must be skipped for human intervention, `uv run gza advance` prints a dedicated `Needs attention` section. Each entry includes the task id, task type, short prompt, a stable `reason=...` policy slug, and the underlying skip text. This section is shown in the normal pre-confirmation preview and in `--dry-run` output, including when there is otherwise no actionable work to advance.
+Held completed plans use `next_action = awaiting_human` with guidance to review the plan and then either run `uv run gza implement <plan-id>` for a one-off approval or `uv run gza edit <plan-id> --auto-implement` to restore the normal automatic follow-up path.
 
 ### iterate
 

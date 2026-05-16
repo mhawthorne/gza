@@ -307,6 +307,25 @@ def test_completed_plan_with_only_dropped_implement_descendant_still_needs_imple
     assert action["description"] == "Create and start implement task"
 
 
+def test_completed_held_plan_awaits_human_review(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan", auto_implement=False)
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "awaiting_human"
+    assert action["description"] == (
+        f"Awaiting human review: review the plan, then run 'uv run gza implement {plan.id}' "
+        "to create implementation, or drop it if you decided not to implement."
+    )
+    assert classify_advance_action(action) == "needs_attention"
+
+
 def test_pending_branchless_plan_without_implement_descendant_uses_no_branch_skip(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)

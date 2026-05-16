@@ -2346,6 +2346,7 @@ def _advance_action_color(action_type: str) -> str:
         return ac.merge
     if action_type in (
         'needs_rebase',
+        'awaiting_human',
         'needs_discussion',
         'max_cycles_reached',
         'max_improve_attempts',

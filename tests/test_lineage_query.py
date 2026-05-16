@@ -433,6 +433,40 @@ def test_query_lineage_owner_rows_promotes_completed_plan_descendant_over_explor
     assert row.next_action["type"] == "create_implement"
 
 
+def test_query_lineage_owner_rows_surfaces_held_completed_plan_as_awaiting_human(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan background jobs", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    _set_completed(
+        plan,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        branch=None,
+        has_commits=False,
+    )
+    store.update(plan)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == plan.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "awaiting_human"
+    assert f"uv run gza implement {plan.id}" in row.next_action["description"]
+
+
 def test_query_lineage_owner_rows_prefers_impl_branch_over_orphan_rebase_owner(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

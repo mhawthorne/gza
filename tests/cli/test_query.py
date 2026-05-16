@@ -4073,6 +4073,43 @@ class TestShowCommand:
         assert "implement task already exists for this plan" not in output
         assert "lifecycle unavailable" not in output
 
+    def test_show_held_plan_displays_auto_implement_hold_guidance(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan held feature", task_type="plan", auto_implement=False)
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        store.update(plan)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(plan.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Auto Implement: no (hold for review; run uv run gza implement" in output
+
     @pytest.mark.parametrize(
         ("changed_diff", "expected"),
         [
@@ -11714,6 +11751,37 @@ class TestIncompleteCommand:
                 "id": plan.id,
                 "next_action": "create_implement",
                 "next_action_reason": "Create and start implement task",
+            }
+        ]
+        assert result.stderr == ""
+
+    def test_incomplete_cli_json_reports_held_plan_as_awaiting_human(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        plan = store.add("cli completed held plan", task_type="plan", auto_implement=False)
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = run_gza(
+                "incomplete",
+                "--json",
+                "--fields",
+                "id,next_action,next_action_reason",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == [
+            {
+                "id": plan.id,
+                "next_action": "awaiting_human",
+                "next_action_reason": (
+                    f"Awaiting human review: review the plan, then run 'uv run gza implement {plan.id}' "
+                    "to create implementation, or drop it if you decided not to implement."
+                ),
             }
         ]
         assert result.stderr == ""

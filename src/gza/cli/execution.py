@@ -827,6 +827,9 @@ def cmd_implement(args: argparse.Namespace) -> int:
         return 1
     impl_task = prepared_impl_task
 
+    plan_task.auto_implement = True
+    store.update(plan_task)
+
     # Handle queue mode - add to queue without executing
     if hasattr(args, 'queue') and args.queue:
         return 0
@@ -1139,6 +1142,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     depends_on = resolve_id(config, args.depends_on) if hasattr(args, 'depends_on') and args.depends_on else None
     based_on = resolve_id(config, args.based_on) if hasattr(args, 'based_on') and args.based_on else None
     create_review = args.review if hasattr(args, 'review') and args.review else False
+    hold_for_review = bool(getattr(args, "hold_for_review", False))
     create_pr = bool(getattr(args, "create_pr", False))
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
     spec = args.spec if hasattr(args, 'spec') and args.spec else None
@@ -1159,6 +1163,10 @@ def cmd_add(args: argparse.Namespace) -> int:
     # Validation: --same-branch requires --based-on or --depends-on
     if same_branch and not based_on and not depends_on:
         print("Error: --same-branch requires --based-on or --depends-on")
+        return 1
+
+    if hold_for_review and task_type != "plan":
+        print("Error: --hold-for-review is only valid with --type plan")
         return 1
 
     # Validation: --based-on must reference an existing task
@@ -1201,6 +1209,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             tags=tags,
             depends_on=depends_on,
             create_review=create_review,
+            auto_implement=not hold_for_review,
             create_pr=create_pr,
             same_branch=same_branch,
             spec=spec,
@@ -1226,6 +1235,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             tags=tags,
             depends_on=depends_on,
             create_review=create_review,
+            auto_implement=not hold_for_review,
             create_pr=create_pr,
             same_branch=same_branch,
             task_type_hint=branch_type,
@@ -1250,6 +1260,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             tags=tags,
             depends_on=depends_on,
             create_review=create_review,
+            auto_implement=not hold_for_review,
             create_pr=create_pr,
             same_branch=same_branch,
             spec=spec,
@@ -1319,11 +1330,25 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if getattr(args, "skip_learnings", False):
         pending_only_flags.append("--no-learnings")
 
-    if task.status != "pending" and (pending_only_flags or not tag_mutation_flags):
+    auto_implement_requested = bool(getattr(args, "auto_implement", False))
+
+    if auto_implement_requested and task.task_type != "plan":
+        print("Error: --auto-implement is only valid for plan tasks.")
+        return 1
+
+    non_pending_auto_implement_allowed = (
+        auto_implement_requested
+        and task.task_type == "plan"
+        and task.status == "completed"
+    )
+
+    if task.status != "pending" and (pending_only_flags or (not tag_mutation_flags and not non_pending_auto_implement_allowed)):
         print(
             f"Error: Task {task_id} is {task.status}; non-pending tasks only allow "
             "tag edits via --set-tags, --add-tag, --remove-tag, or --clear-tags.",
         )
+        if auto_implement_requested and not non_pending_auto_implement_allowed:
+            print("Error: --auto-implement is only allowed for completed plan tasks.")
         if pending_only_flags:
             print(f"Error: Pending-only edit flags requested: {', '.join(pending_only_flags)}")
         return 1
@@ -1426,6 +1451,11 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if getattr(args, "create_pr", False):
         task.create_pr = True
         update_messages.append(f"✓ Enabled automatic PR creation for task {task.id}")
+        changed = True
+
+    if auto_implement_requested:
+        task.auto_implement = True
+        update_messages.append(f"✓ Enabled automatic implementation follow-up for plan task {task.id}")
         changed = True
 
     # Handle --model flag

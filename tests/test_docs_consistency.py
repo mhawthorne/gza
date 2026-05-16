@@ -180,6 +180,8 @@ def test_configuration_docs_describe_unimplemented_lineage_guidance() -> None:
         "Only completed plan rows are directly runnable with `uv run gza implement <id>`;",
         "use `uv run gza advance --unimplemented --create` to queue implement tasks",
         "for listed explore rows.",
+        "Completed held plan tasks surface `awaiting_human` until you run `uv run gza implement <plan-id>`",
+        "Held completed plans use `next_action = awaiting_human`",
     ]
 
     for snippet in required_snippets:
@@ -552,6 +554,7 @@ def test_internal_advance_workflow_failed_task_recovery_is_not_resume_only() -> 
 
     assert "`create_review`, `create_implement`, `resume`, `retry`, `needs_rebase`" in output_section
     assert "created/reused task ID" in output_section
+    assert "`awaiting_human` — review the plan, then run `uv run gza implement <id>`" in internal_content
 
 
 def test_docker_setup_command_docs_describe_prewarm_hook_and_race_avoidance() -> None:

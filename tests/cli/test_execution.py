@@ -505,6 +505,39 @@ class TestEditCommand:
         assert updated.create_review is False
         assert updated.tags == ("backend",)
 
+    def test_edit_auto_implement_allowed_for_completed_plan(self, tmp_path: Path):
+        """Completed held plans may release the hold via --auto-implement."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Held plan", task_type="plan", auto_implement=False)
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("edit", str(task.id), "--auto-implement", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "automatic implementation follow-up" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.auto_implement is True
+
+    def test_edit_auto_implement_rejects_non_plan_task(self, tmp_path: Path):
+        """The auto-implement release valve is plan-only."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Regular task", task_type="implement")
+
+        result = run_gza("edit", str(task.id), "--auto-implement", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "--auto-implement is only valid for plan tasks" in result.stdout
+
     def test_edit_review_flag(self, tmp_path: Path):
         """Edit command can enable automatic review task creation."""
 
@@ -3778,6 +3811,24 @@ class TestImplementCommand:
         assert impl_task.prompt == f"Implement plan from task {plan_task.id}: plan-auth-migration"
         assert impl_task.based_on is None
         assert impl_task.depends_on == plan_task.id
+
+    def test_implement_clears_hold_for_review_after_creating_child(self, tmp_path: Path):
+        """Manual implementation approval should release the plan hold once the child exists."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan", auto_implement=False)
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        refreshed = store.get(plan_task.id)
+        assert refreshed is not None
+        assert refreshed.auto_implement is True
 
     def test_implement_rejects_depends_on_flag(self, tmp_path: Path):
         """Implement command should fail fast for removed --depends-on flag."""
@@ -14766,6 +14817,41 @@ class TestAddCommandWithChaining:
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
+
+    def test_add_plan_with_hold_for_review_persists_auto_implement_false(self, tmp_path: Path):
+        """Add command stores held plan tasks as auto_implement=false."""
+
+        setup_config(tmp_path)
+        result = run_gza(
+            "add",
+            "--type",
+            "plan",
+            "--hold-for-review",
+            "Create a held plan",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        store = make_store(tmp_path)
+        task = next((t for t in store.get_pending() if t.prompt == "Create a held plan"), None)
+        assert task is not None
+        assert task.auto_implement is False
+
+    def test_add_hold_for_review_rejects_non_plan_task(self, tmp_path: Path):
+        """Hold-for-review is plan-only at creation time."""
+
+        setup_config(tmp_path)
+        result = run_gza(
+            "add",
+            "--hold-for-review",
+            "Implement feature",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "--hold-for-review is only valid with --type plan" in result.stdout
 
     def test_add_with_type_implement(self, tmp_path: Path):
         """Add command can create implement tasks."""

@@ -379,6 +379,7 @@ class Task:
     depends_on: str | None = None  # Task ID this task depends on (string)
     spec: str | None = None  # Path to spec file for context
     create_review: bool = False  # Auto-create review task on completion
+    auto_implement: bool | None = None  # Plan-only lifecycle flag; None/NULL means enabled for legacy rows
     create_pr: bool = False  # Auto-create/reuse PR on successful code-task completion
     same_branch: bool = False  # Continue on depends_on task's branch instead of creating new
     base_branch: str | None = None  # Optional branch ref used when creating a fresh retry branch
@@ -675,8 +676,10 @@ MIGRATION_V43_TO_V44 = """
 -- v44 rewrites persisted timestamp text into canonical UTC-aware ISO strings.
 """
 
+MIGRATION_V44_TO_V45 = "ALTER TABLE tasks ADD COLUMN auto_implement INTEGER DEFAULT 1;"
+
 # Schema version for migrations
-SCHEMA_VERSION = 44
+SCHEMA_VERSION = 45
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -936,6 +939,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 depends_on TEXT,
                 spec TEXT,
                 create_review INTEGER DEFAULT 0,
+                auto_implement INTEGER DEFAULT 1,
                 create_pr INTEGER DEFAULT 0,
                 same_branch INTEGER DEFAULT 0,
                 task_type_hint TEXT,
@@ -1053,7 +1057,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "id", "prompt", "status", "task_type", "slug", "branch", "log_file", "report_file", "based_on", "has_commits",
             "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns", "num_turns_reported", "num_turns_computed",
             "attach_count", "attach_duration_seconds", "cost_usd", "created_at", "started_at", "running_pid", "completed_at",
-            "group", "depends_on", "spec", "create_review", "create_pr", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
+            "group", "depends_on", "spec", "create_review", "auto_implement", "create_pr", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
             "pr_state", "pr_last_synced_at", "sync_last_synced_at", "model", "provider", "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
             "merge_status", "merged_at", "failure_reason", "completion_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
             "changed_diff",
@@ -1064,6 +1068,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "status": "'pending'",
             "task_type": "'implement'",
             "create_review": "0",
+            "auto_implement": "1",
             "create_pr": "0",
             "same_branch": "0",
             "provider_is_explicit": "0",
@@ -1094,7 +1099,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 project_id, id, prompt, status, task_type, slug, branch, log_file, report_file, based_on, has_commits,
                 duration_seconds, num_steps_reported, num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                 attach_count, attach_duration_seconds, cost_usd, created_at, started_at, running_pid, completed_at,
-                "group", depends_on, spec, create_review, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
+                "group", depends_on, spec, create_review, auto_implement, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
                 pr_state, pr_last_synced_at, sync_last_synced_at, model, provider, provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
                 merge_status, merged_at, failure_reason, completion_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
                 changed_diff, review_cleared_at, review_score, log_schema_version, execution_mode, base_branch, recovery_origin
@@ -1353,7 +1358,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "base_branch",
 )
 
-_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset({40, 41, 42, 43, 44})
+_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset({40, 41, 42, 43, 44, 45})
 
 
 def _missing_required_columns(conn: sqlite3.Connection, table: str, required_columns: tuple[str, ...]) -> list[str]:
@@ -1439,6 +1444,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         34: ("tasks", "queue_position"),
         37: ("tasks", "create_pr"),
         41: ("tasks", "recovery_origin"),
+        45: ("tasks", "auto_implement"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -1513,6 +1519,7 @@ def _ensure_required_auto_migration_artifacts(
         (39, "tasks", "sync_last_synced_at", "ALTER TABLE tasks ADD COLUMN sync_last_synced_at TEXT"),
         (41, "tasks", "recovery_origin", "ALTER TABLE tasks ADD COLUMN recovery_origin TEXT"),
         (43, "tasks", "changed_diff", "ALTER TABLE tasks ADD COLUMN changed_diff INTEGER"),
+        (45, "tasks", "auto_implement", "ALTER TABLE tasks ADD COLUMN auto_implement INTEGER DEFAULT 1"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -1621,6 +1628,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     depends_on TEXT,
     spec TEXT,
     create_review INTEGER DEFAULT 0,
+    auto_implement INTEGER DEFAULT 1,
     create_pr INTEGER DEFAULT 0,
     same_branch INTEGER DEFAULT 0,
     task_type_hint TEXT,
@@ -2065,6 +2073,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (42, MIGRATION_V41_TO_V42),
     (43, MIGRATION_V42_TO_V43),
     (44, MIGRATION_V43_TO_V44),
+    (45, MIGRATION_V44_TO_V45),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -2490,6 +2499,11 @@ class SqliteTaskStore:
                 "Query-only DB open detected missing optional column tasks.recovery_origin; "
                 "recovery provenance will fall back to legacy edge heuristics."
             )
+        if not self._query_only_has_column("tasks", "auto_implement"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing optional column tasks.auto_implement; "
+                "plan tasks will default to automatic implementation follow-up."
+            )
         if not self.supports_merge_units():
             self._startup_warnings.append(
                 "Query-only DB open detected missing optional merge-unit tables; "
@@ -2718,6 +2732,7 @@ class SqliteTaskStore:
             depends_on=row["depends_on"],
             spec=row["spec"],
             create_review=bool(row["create_review"]) if row["create_review"] is not None else False,
+            auto_implement=bool(row["auto_implement"]) if "auto_implement" in keys and row["auto_implement"] is not None else None,
             create_pr=bool(row["create_pr"]) if "create_pr" in keys and row["create_pr"] is not None else False,
             same_branch=bool(row["same_branch"]) if row["same_branch"] is not None else False,
             base_branch=row["base_branch"] if "base_branch" in keys else None,
@@ -2902,6 +2917,7 @@ class SqliteTaskStore:
         depends_on: str | None = None,
         spec: str | None = None,
         create_review: bool = False,
+        auto_implement: bool = True,
         create_pr: bool = False,
         same_branch: bool = False,
         base_branch: str | None = None,
@@ -2926,8 +2942,8 @@ class SqliteTaskStore:
             new_id = self._next_id(conn)
             conn.execute(
                 """
-                INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, create_pr, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, recovery_origin, urgent, skip_learnings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, auto_implement, create_pr, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, recovery_origin, urgent, skip_learnings)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._project_id,
@@ -2940,6 +2956,7 @@ class SqliteTaskStore:
                     depends_on,
                     spec,
                     1 if create_review else 0,
+                    1 if auto_implement else 0,
                     1 if create_pr else 0,
                     1 if same_branch else 0,
                     base_branch,
@@ -3063,6 +3080,7 @@ class SqliteTaskStore:
                     depends_on = ?,
                     spec = ?,
                     create_review = ?,
+                    auto_implement = ?,
                     create_pr = ?,
                     same_branch = ?,
                     base_branch = ?,
@@ -3121,6 +3139,7 @@ class SqliteTaskStore:
                     task.depends_on,
                     task.spec,
                     1 if task.create_review else 0,
+                    None if task.auto_implement is None else (1 if task.auto_implement else 0),
                     1 if task.create_pr else 0,
                     1 if task.same_branch else 0,
                     task.base_branch,
@@ -5881,6 +5900,7 @@ def add_task_interactive(
     tags: Iterable[str] | None = None,
     depends_on: str | None = None,
     create_review: bool = False,
+    auto_implement: bool = True,
     create_pr: bool = False,
     same_branch: bool = False,
     task_type_hint: str | None = None,
@@ -5933,6 +5953,7 @@ def add_task_interactive(
                 depends_on=depends_on,
                 spec=spec,
                 create_review=create_review,
+                auto_implement=auto_implement,
                 create_pr=create_pr,
                 same_branch=same_branch,
                 task_type_hint=task_type_hint,
@@ -6028,6 +6049,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "has_commits", "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns",
         "num_turns_reported", "num_turns_computed", "attach_count", "attach_duration_seconds", "cost_usd",
         "created_at", "started_at", "running_pid", "completed_at", "group", "depends_on", "spec", "create_review",
+        "auto_implement",
         "create_pr",
         "same_branch", "task_type_hint", "output_content", "session_id", "pr_number", "pr_state",
         "pr_last_synced_at", "sync_last_synced_at", "model", "provider",
@@ -6039,6 +6061,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
     task_import_columns_sql = ", ".join(f'"{c}"' if c == "group" else c for c in task_import_columns)
     legacy_task_fallbacks = {
         "create_pr": "0",
+        "auto_implement": "1",
         "pr_state": "NULL",
         "pr_last_synced_at": "NULL",
         "sync_last_synced_at": "NULL",
@@ -6598,6 +6621,7 @@ def _task_to_dict(task: "Task") -> dict:
         "depends_on": task.depends_on,
         "spec": task.spec,
         "create_review": task.create_review,
+        "auto_implement": task.auto_implement,
         "create_pr": task.create_pr,
         "same_branch": task.same_branch,
         "recovery_origin": task.recovery_origin,
@@ -6886,6 +6910,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                 depends_on TEXT REFERENCES tasks_v25(id),
                 spec TEXT,
                 create_review INTEGER DEFAULT 0,
+                auto_implement INTEGER DEFAULT 1,
                 create_pr INTEGER DEFAULT 0,
                 same_branch INTEGER DEFAULT 0,
                 task_type_hint TEXT,
@@ -6931,14 +6956,14 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                     num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                     attach_count, attach_duration_seconds, cost_usd,
                     created_at, started_at, running_pid, completed_at,
-                    "group", depends_on, spec, create_review, create_pr, same_branch, task_type_hint,
+                    "group", depends_on, spec, create_review, auto_implement, create_pr, same_branch, task_type_hint,
                     output_content, session_id, pr_number, model, provider, provider_is_explicit, recovery_origin,
                     input_tokens, output_tokens, merge_status, merged_at, failure_reason, completion_reason,
                     skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed, changed_diff,
                     review_cleared_at, log_schema_version, cycle_id, cycle_iteration_index,
                     cycle_role
                 ) VALUES (
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
                 )
                 """,
                 (
@@ -6959,6 +6984,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                     depends_on_new,
                     row["spec"],
                     row["create_review"] if "create_review" in row.keys() else 0,
+                    row["auto_implement"] if "auto_implement" in row.keys() else 1,
                     row["create_pr"] if "create_pr" in row.keys() else 0,
                     row["same_branch"] if "same_branch" in row.keys() else 0,
                     row["task_type_hint"] if "task_type_hint" in row.keys() else None,
@@ -7466,6 +7492,7 @@ def run_v27_migration(db_path: Path) -> None:
                 depends_on TEXT REFERENCES tasks(id),
                 spec TEXT,
                 create_review INTEGER DEFAULT 0,
+                auto_implement INTEGER DEFAULT 1,
                 create_pr INTEGER DEFAULT 0,
                 same_branch INTEGER DEFAULT 0,
                 task_type_hint TEXT,
@@ -7492,6 +7519,11 @@ def run_v27_migration(db_path: Path) -> None:
             )
         """)
 
+        legacy_auto_implement_expr = (
+            "auto_implement"
+            if _table_has_column(conn, "tasks", "auto_implement")
+            else "1 AS auto_implement"
+        )
         legacy_create_pr_expr = "create_pr" if _table_has_column(conn, "tasks", "create_pr") else "0 AS create_pr"
         legacy_attach_count_expr = (
             "attach_count"
@@ -7511,7 +7543,7 @@ def run_v27_migration(db_path: Path) -> None:
                 num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                 attach_count, attach_duration_seconds,
                 cost_usd, created_at, started_at, running_pid, completed_at, "group",
-                depends_on, spec, create_review, create_pr, same_branch, task_type_hint,
+                depends_on, spec, create_review, auto_implement, create_pr, same_branch, task_type_hint,
                 output_content, session_id, pr_number, model, provider,
                 provider_is_explicit, recovery_origin, input_tokens, output_tokens, merge_status,
                 merged_at, failure_reason, completion_reason, skip_learnings, diff_files_changed,
@@ -7523,7 +7555,7 @@ def run_v27_migration(db_path: Path) -> None:
                 num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                 {legacy_attach_count_expr}, {legacy_attach_duration_seconds_expr},
                 cost_usd, created_at, started_at, running_pid, completed_at, "group",
-                depends_on, spec, create_review, {legacy_create_pr_expr}, same_branch, task_type_hint,
+                depends_on, spec, create_review, {legacy_auto_implement_expr}, {legacy_create_pr_expr}, same_branch, task_type_hint,
                 output_content, session_id, pr_number, model, provider,
                 provider_is_explicit, NULL AS recovery_origin, input_tokens, output_tokens, merge_status,
                 merged_at, failure_reason, NULL AS completion_reason, skip_learnings, diff_files_changed,

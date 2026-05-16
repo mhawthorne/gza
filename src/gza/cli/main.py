@@ -1378,6 +1378,11 @@ def main() -> int:
         help="Auto-create review task on completion (for implement tasks)",
     )
     add_parser.add_argument(
+        "--hold-for-review",
+        action="store_true",
+        help="For plan tasks, require manual review before automatic implementation follow-up",
+    )
+    add_parser.add_argument(
         "--pr",
         action="store_true",
         dest="create_pr",
@@ -1425,11 +1430,12 @@ def main() -> int:
     # edit command
     edit_parser = subparsers.add_parser(
         "edit",
-        help="Edit a task; non-pending tasks only support tag edits",
+        help="Edit a task; non-pending tasks only support tag edits except completed plan --auto-implement",
         description="Edit an existing task. Pending tasks may use any supported edit flag.",
         epilog=(
             "Non-pending tasks may only use tag mutation flags "
             "(`--add-tag`, `--remove-tag`, `--clear-tags`, or `--set-tags`). "
+            "Completed plan tasks may also use `--auto-implement` to release a hold-for-review plan. "
             "All other edit flags (`--based-on`, `--depends-on`, `--explore`, `--task`, "
             "`--review`, `--pr`, `--prompt`, `--prompt-file`, `--model`, `--provider`, "
             "and `--no-learnings`) remain pending-only."
@@ -1494,6 +1500,11 @@ def main() -> int:
         "--review",
         action="store_true",
         help="Enable automatic review task creation on completion",
+    )
+    edit_parser.add_argument(
+        "--auto-implement",
+        action="store_true",
+        help="For plan tasks, enable automatic implementation follow-up",
     )
     edit_parser.add_argument(
         "--pr",

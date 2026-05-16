@@ -6172,7 +6172,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -6184,7 +6184,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -7878,6 +7878,40 @@ class TestSharedDbIsolationAndImportGating:
         assert [row.id for row in history] == [task.id]
         assert history[0].changed_diff is None
         assert any("tasks.changed_diff" in warning for warning in query_store.startup_warnings())
+
+    def test_query_only_open_pre_v45_db_missing_auto_implement_defaults_enabled(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should read v44 snapshots without forcing the v45 auto_implement migration."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Plan before v45 auto_implement", task_type="plan")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        _drop_tasks_column(db_path, "auto_implement")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 44")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            reloaded = query_store.get(task.id)
+            history = query_store.get_history(limit=None)
+        finally:
+            db_path.chmod(0o644)
+
+        assert reloaded is not None
+        assert reloaded.prompt == "Plan before v45 auto_implement"
+        assert reloaded.auto_implement is None
+        assert [row.id for row in history] == [task.id]
+        assert history[0].auto_implement is None
+        assert any("tasks.auto_implement" in warning for warning in query_store.startup_warnings())
 
     def test_query_only_open_current_db_missing_create_pr_fails_closed(
         self, tmp_path: Path

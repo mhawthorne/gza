@@ -109,6 +109,33 @@ def test_incomplete_preset_projects_real_next_action_when_context_available(tmp_
     assert row.values["next_action_reason"] == "Create and start implement task"
 
 
+def test_incomplete_preset_projects_held_plan_as_awaiting_human_when_context_available(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    plan = store.add("completed held plan", task_type="plan", auto_implement=False)
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQueryPresets.incomplete(limit=None),
+        config=SimpleNamespace(
+            max_resume_attempts=1,
+            advance_requires_review=True,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+        ),
+        git=SimpleNamespace(),
+        target_branch="main",
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert hasattr(row, "owner_task")
+    assert row.values["next_action"] == "awaiting_human"
+    assert f"uv run gza implement {plan.id}" in str(row.values["next_action_reason"])
+
+
 def test_lifecycle_incomplete_prefers_merged_unit_state_over_stale_task_row(tmp_path: Path) -> None:
     store = _store(tmp_path)
     task = store.add("stale task-row merge status", task_type="implement")

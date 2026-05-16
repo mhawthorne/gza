@@ -63,6 +63,7 @@ For each task, `evaluate_advance_rules()` returns an action from `src/gza/advanc
 
 | Condition | Action |
 |-----------|--------|
+| Completed held plan with no implement child (`auto_implement = false`) | `awaiting_human` — review the plan, then run `uv run gza implement <id>` or re-enable automatic follow-up |
 | Plan with no implement child | `create_implement` — create and run implement task |
 | Plan with existing implement child | `skip` |
 
@@ -220,6 +221,7 @@ These actions create background workers and count toward the batch limit. The so
 | `skip` | No action needed or possible |
 | `wait_review` | Review in progress, wait for it |
 | `wait_improve` | Improve in progress, wait for it |
+| `awaiting_human` | Plan is intentionally held for manual review before implementation follow-up |
 | `needs_discussion` | Requires manual intervention (shown in attention summary) |
 | `max_cycles_reached` | Review iteration limit exceeded (shown in attention summary) |
 

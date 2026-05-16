@@ -155,6 +155,29 @@ def test_advance_skips_plan_with_existing_implement(tmp_path: Path, capsys) -> N
     assert "implement task already exists" in capsys.readouterr().out
 
 
+def test_advance_does_not_create_implement_for_held_plan(tmp_path: Path, capsys) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    plan = _create_completed_plan(store, "Design auth system")
+    plan.auto_implement = False
+    store.update(plan)
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch(
+            "gza.cli.git_ops._spawn_background_worker",
+            side_effect=AssertionError("held plan should not spawn an implement worker"),
+        ),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task_id=plan.id, dry_run=True))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "Awaiting human review" in output
+    assert f"uv run gza implement {plan.id}" in output
+    assert [task for task in store.get_all() if task.task_type == "implement"] == []
+
+
 def test_advance_type_plan_filters_to_plans_only(tmp_path: Path, capsys) -> None:
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"

@@ -76,6 +76,7 @@ class AdvanceContext:
     max_noop_improve_cycles: int
     max_resume_attempts: int
 
+    auto_implement_enabled: bool = True
     has_non_dropped_implement_descendant: bool = False
     active_plan_child: DbTask | None = None
     active_implement_child: DbTask | None = None
@@ -627,6 +628,7 @@ def get_needs_attention_reason(action: Mapping[str, Any]) -> str | None:
         return value
     action_type = str(action.get("type", ""))
     legacy_reasons = {
+        "awaiting_human": "awaiting-human-review",
         "needs_discussion": "needs-discussion",
         "max_cycles_reached": "review-max-cycles-reached",
         "max_improve_attempts": "max-improve-attempts-reached",
@@ -1079,17 +1081,19 @@ def resolve_advance_context(
             non_dropped_implement_source_ids=impl_based_on_ids,
         )
     )
+    auto_implement_enabled = task.auto_implement is not False
 
     if task.task_type == "plan":
         return AdvanceContext(
             task=task,
             task_type=task.task_type,
-                has_branch=bool(task.branch),
-                requires_review=config.advance_requires_review,
-                create_reviews=config.advance_create_reviews,
-                max_review_cycles=config.max_review_cycles,
-                max_noop_improve_cycles=effective_max_noop_improves,
-                max_resume_attempts=effective_max_resume,
+            has_branch=bool(task.branch),
+            requires_review=config.advance_requires_review,
+            create_reviews=config.advance_create_reviews,
+            max_review_cycles=config.max_review_cycles,
+            max_noop_improve_cycles=effective_max_noop_improves,
+            max_resume_attempts=effective_max_resume,
+            auto_implement_enabled=auto_implement_enabled,
             failed_recovery_decision=failed_recovery_decision,
             failed_recovery_attention_reason=failed_recovery_attention_reason,
             has_non_dropped_implement_descendant=has_implementation_followup,
@@ -1106,12 +1110,13 @@ def resolve_advance_context(
         return AdvanceContext(
             task=task,
             task_type=task.task_type,
-                has_branch=False,
-                requires_review=config.advance_requires_review,
-                create_reviews=config.advance_create_reviews,
-                max_review_cycles=config.max_review_cycles,
-                max_noop_improve_cycles=effective_max_noop_improves,
-                max_resume_attempts=effective_max_resume,
+            has_branch=False,
+            requires_review=config.advance_requires_review,
+            create_reviews=config.advance_create_reviews,
+            max_review_cycles=config.max_review_cycles,
+            max_noop_improve_cycles=effective_max_noop_improves,
+            max_resume_attempts=effective_max_resume,
+            auto_implement_enabled=auto_implement_enabled,
             failed_recovery_decision=failed_recovery_decision,
             failed_recovery_attention_reason=failed_recovery_attention_reason,
             has_non_dropped_implement_descendant=has_implementation_followup,
@@ -1223,6 +1228,7 @@ def resolve_advance_context(
         max_review_cycles=config.max_review_cycles,
         max_noop_improve_cycles=effective_max_noop_improves,
         max_resume_attempts=effective_max_resume,
+        auto_implement_enabled=auto_implement_enabled,
         has_non_dropped_implement_descendant=has_implementation_followup,
         active_plan_child=active_plan_child,
         active_implement_child=active_implement_child,
@@ -1282,11 +1288,28 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=_failed_task_skip_action,
     ),
     AdvanceRule(
+        name="awaiting_human_plan_review",
+        matches=lambda ctx: (
+            ctx.task_type == "plan"
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and not ctx.auto_implement_enabled
+        ),
+        action=lambda ctx: {
+            "type": "awaiting_human",
+            "description": (
+                f"Awaiting human review: review the plan, then run 'uv run gza implement {ctx.task.id}' "
+                "to create implementation, or drop it if you decided not to implement."
+            ),
+        },
+    ),
+    AdvanceRule(
         name="plan_needs_implement",
         matches=lambda ctx: (
             ctx.task_type == "plan"
             and ctx.task.status == "completed"
             and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
         ),
         action=lambda ctx: {"type": "create_implement", "description": "Create and start implement task"},
     ),

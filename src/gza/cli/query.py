@@ -3138,6 +3138,18 @@ def _cmd_show_output(
     if task.merge_status and task_owns_merge_status(task):
         console.print(f"[{c['label']}]Merge Status:[/{c['label']}] [{c['value']}]{task.merge_status}[/{c['value']}]")
     console.print(f"[{c['label']}]Type:[/{c['label']}] [{c['value']}]{task.task_type}[/{c['value']}]")
+    if task.task_type == "plan":
+        auto_implement_detail = "yes"
+        if task.auto_implement is False:
+            auto_implement_detail = (
+                f"no (hold for review; run uv run gza implement {task.id})"
+                if task.id is not None
+                else "no (hold for review)"
+            )
+        console.print(
+            f"[{c['label']}]Auto Implement:[/{c['label']}] "
+            f"[{c['value']}]{auto_implement_detail}[/{c['value']}]"
+        )
     if task.execution_mode:
         console.print(f"[{c['label']}]Execution Mode:[/{c['label']}] [{c['value']}]{task.execution_mode}[/{c['value']}]")
     if task.slug:
