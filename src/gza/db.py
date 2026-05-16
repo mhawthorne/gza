@@ -4626,12 +4626,15 @@ class SqliteTaskStore:
     def clear_review_state(self, task_id: str) -> None:
         """Clear the review state on an implementation task.
 
-        Called when an improve task completes, to indicate that the previous
-        review's feedback has been addressed. Sets review_cleared_at to now.
+        Called when a caller decides a completed improve changed the tracked
+        review diff, to indicate that the previous review's feedback has been
+        addressed. Sets review_cleared_at to now.
 
-        Note: This is called whenever an improve task completes with commits.
-        It cannot verify whether the improve task actually addressed the review
-        feedback in a meaningful way — it only records that an improve task ran.
+        Callers are responsible for deciding whether the completed improve
+        changed the tracked review diff. No-op improve detection suppresses
+        this call when the tracked diff did not change. This method does not
+        verify whether the improve addressed review feedback in a meaningful
+        way; it only records that the caller cleared the prior review state.
 
         If task_id does not exist, this is a no-op (no error is raised).
         """
