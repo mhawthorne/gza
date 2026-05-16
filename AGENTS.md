@@ -67,6 +67,13 @@ Key modules: `src/gza/db.py` (storage), `src/gza/cli/` (CLI), `src/gza/runner.py
 
 **Tests scale with risk.** Write tests for behavior changes in project code. Do not add unit tests for repo scripts, generated/internal metadata, one-off config wording, prompt-only edits, or documentation-only changes unless fixing a concrete regression or guarding a stable user-facing contract. Validate scripts and config syntax ad hoc instead.
 
+**No config-value pinning.** Tests that read a config file and assert a literal value (env var, flag default, workflow setting, version string) have near-zero defect-prevention value — when the config legitimately changes, the test must change in lockstep, with no actual bug ever caught. Don't write them.
+
+❌ `assert 'PYTEST_XDIST_WORKERS: "auto"' in workflow_text`
+❌ `assert "timeout = 30" in pyproject_text`
+
+If you need to guard the *behavior* the config enables ("unit tests have a timeout"), assert the behavior — run a slow test, observe the timeout. Not the string.
+
 **Use Explore subagents** for multi-file research (3+ files) instead of sequential reads.
 
 **Use offset/limit** when reading large files (>1000 lines).
