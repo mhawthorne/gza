@@ -863,7 +863,7 @@ def test_query_lineage_owner_rows_planning_keeps_completed_and_failed_live_tasks
     assert rows_by_owner[failed_impl.id].next_action["type"] == "resume"
 
 
-def test_query_lineage_owner_rows_projects_recommend_rebase_action(tmp_path: Path) -> None:
+def test_query_lineage_owner_rows_mergeable_behind_branch_projects_normal_action(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -897,5 +897,5 @@ def test_query_lineage_owner_rows_projects_recommend_rebase_action(tmp_path: Pat
     assert row.lifecycle_action_task is not None
     assert row.lifecycle_action_task.id == impl.id
     assert row.next_action is not None
-    assert row.next_action["type"] == "recommend_rebase"
-    assert row.lineage_status == "needs_attention"
+    assert row.next_action["type"] == "create_review"
+    assert row.lineage_status == "actionable"

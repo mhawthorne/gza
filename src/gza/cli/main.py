@@ -336,7 +336,7 @@ def main() -> int:
         help="Show unresolved task lineages that still need attention",
         description=(
             "Show unresolved task lineages that still need attention. "
-            "Projected next_action values can include manual-attention states such as recommend_rebase."
+            "Projected next_action values reflect the live shared lifecycle planner."
         ),
     )
     add_common_args(incomplete_parser)

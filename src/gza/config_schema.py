@@ -102,7 +102,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("providers.*.task_types.*.reasoning_effort", "str", None, "Provider/task-type reasoning effort override (Codex)."),
     ConfigKeySpec("review_context_file_limit", "int", 12, "Max changed files included in large review context excerpts."),
     ConfigKeySpec("review_verify_timeout_seconds", "int", 120, "Timeout in seconds for autonomous review verify_command runs."),
-    ConfigKeySpec("recommend_rebase_behind_commits", "int", 1, "Advisory stale-branch threshold; 0 disables behind-target recommend_rebase detection."),
+    ConfigKeySpec("recommend_rebase_behind_commits", "int", 1, "Deprecated compatibility key; accepted but ignored."),
     ConfigKeySpec("review_diff_medium_threshold", "int", 2000, "Medium diff threshold for review prompt shaping."),
     ConfigKeySpec("review_diff_small_threshold", "int", 500, "Small diff threshold for full inline review diffs."),
     ConfigKeySpec("task_providers.*", "str", None, "Task-type to provider routing override."),

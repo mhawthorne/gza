@@ -365,6 +365,52 @@ class TestSkillsInstallClaudeTarget:
         assert "verify_command" in refreshed
         assert "Bash(uv run:*)" in refreshed
 
+    def test_update_flag_refreshes_gza_task_fix_retired_recommend_rebase_schema(self, tmp_path: Path):
+        """--update should remove retired recommend_rebase guidance from installed gza-task-fix."""
+        from gza.skills_utils import get_skills_source_path
+
+        setup_config(tmp_path)
+
+        result1 = run_gza("skills-install", "--target", "claude", "gza-task-fix", "--project", str(tmp_path))
+        assert result1.returncode == 0
+
+        skill_file = tmp_path / ".claude" / "skills" / "gza-task-fix" / "SKILL.md"
+        skill_file.write_text(
+            "---\n"
+            "name: gza-task-fix\n"
+            "description: stale\n"
+            "public: true\n"
+            "---\n\n"
+            "recommend_rebase:\n"
+            "  recommended: true\n"
+            "  reasons:\n"
+            "    - branch_behind_target\n"
+            "- `recommend_rebase.recommended=true` whenever either trigger fires.\n"
+            "- `recommend_rebase.operator_action` must remain advisory. Do not run a rebase from this skill.\n"
+            "- No automatic rebase. If the stale-branch recommendation fires, report it in the ledger and final handoff.\n"
+        )
+
+        result2 = run_gza(
+            "skills-install",
+            "--target",
+            "claude",
+            "--update",
+            "gza-task-fix",
+            "--project",
+            str(tmp_path),
+        )
+        assert result2.returncode == 0
+        assert "updated 1" in result2.stdout
+        assert "(updated)" in result2.stdout
+
+        refreshed = skill_file.read_text()
+        bundled = (get_skills_source_path() / "gza-task-fix" / "SKILL.md").read_text()
+        assert refreshed == bundled
+        assert "recommend_rebase:" not in refreshed
+        assert "branch_behind_target" not in refreshed
+        assert "recommend_rebase.recommended=true" not in refreshed
+        assert "stale-branch recommendation" not in refreshed
+
     def test_update_flag_refreshes_manual_skill_generate_slug_collision_guards(self, tmp_path: Path):
         """--update should restore collision-aware generate_slug() kwargs in installed manual skills."""
         from gza.skills_utils import get_skills_source_path

@@ -5628,11 +5628,6 @@ def test_watch_cycle_logs_skip_events_for_non_actionable_advance_outcomes(
             "type": "max_cycles_reached",
             "description": "SKIP: max review cycles (2) reached, needs manual intervention",
         },
-        {
-            "type": "recommend_rebase",
-            "description": "SKIP: branch is stale; branch is behind the target branch; rebase recommended",
-            "needs_attention_reason": "branch-stale-recommend-rebase",
-        },
     ],
 )
 def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(

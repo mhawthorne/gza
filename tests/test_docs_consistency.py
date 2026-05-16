@@ -74,6 +74,23 @@ def test_agents_document_pytest_hang_triage_rules() -> None:
         assert snippet in agents_content
 
 
+def test_practices_document_gitignored_derived_artifacts_as_non_blockers() -> None:
+    """Internal practices should forbid review blockers on gitignored installed artifacts."""
+    repo_root = Path(__file__).resolve().parents[1]
+    practices_content = (repo_root / "docs" / "internal" / "practices.md").read_text()
+
+    required_snippets = [
+        "## Gitignored derived artifacts are not review blockers",
+        "`.claude/skills/` is installed per-worktree by `gza skills-install`",
+        "Reviewers must not",
+        "flag drift between an installed copy and its bundled source as",
+        "property of the installed copy genuinely matters",
+        "installer into `tmp_path`",
+    ]
+    for snippet in required_snippets:
+        assert snippet in practices_content
+
+
 def test_tests_integration_module_guidance_avoids_stale_test_paths() -> None:
     """Integration test module docstrings should not point at the removed tests/test_integration.py path."""
     repo_root = Path(__file__).resolve().parents[1]
@@ -267,8 +284,8 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
         assert snippet in config_content
 
 
-def test_recommend_rebase_docs_and_fix_skill_schema_stay_in_sync() -> None:
-    """Operator docs and fix-skill ledger schema should describe recommend_rebase consistently."""
+def test_merge_first_docs_and_fix_skill_schema_stay_in_sync() -> None:
+    """Tracked operator docs and bundled fix-skill source should stay aligned."""
     repo_root = Path(__file__).resolve().parents[1]
     config_content = (repo_root / "docs" / "configuration.md").read_text()
     advance_workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
@@ -277,12 +294,12 @@ def test_recommend_rebase_docs_and_fix_skill_schema_stay_in_sync() -> None:
     required_snippets = [
         "review_verify_timeout_seconds",
         "recommend_rebase_behind_commits",
-        "Projected `next_action` values can include `recommend_rebase`",
-        "`recommend_rebase` — manual attention; branch is stale",
-        "recommend_rebase:",
+        "Deprecated compatibility key; accepted but ignored",
+        "Projected `next_action` values come from the shared live lifecycle planner",
+        "Cleanly mergeable branches continue to the normal review or merge actions",
+        "verify:",
         "review_verify_timeout_seconds: <int>",
-        "operator_action: <short text, no automatic rebase>",
-        "No automatic rebase.",
+        "blockers:",
     ]
     for snippet in required_snippets:
         assert (
@@ -290,6 +307,15 @@ def test_recommend_rebase_docs_and_fix_skill_schema_stay_in_sync() -> None:
             or snippet in advance_workflow
             or snippet in fix_skill
         )
+
+    retired_snippets = [
+        "recommend_rebase:",
+        "branch_behind_target",
+        "recommend_rebase.recommended=true",
+        "stale-branch recommendation",
+    ]
+    for snippet in retired_snippets:
+        assert snippet not in fix_skill
 
 
 def test_summary_docs_and_skill_use_dedicated_triage_surfaces() -> None:
@@ -380,6 +406,22 @@ def test_source_skills_use_impl_tags_not_retired_group_placeholders() -> None:
         assert "group='" not in content
         assert "impl_tags" in content
         assert "tags=<" in content
+
+
+def test_fix_skill_treats_installed_claude_skills_as_local_install_state() -> None:
+    """The bundled fix skill should not treat `.claude/skills/` as committable blocker state."""
+    skill_content = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "gza"
+        / "skills"
+        / "gza-task-fix"
+        / "SKILL.md"
+    ).read_text()
+
+    assert "git add .claude/skills/" not in skill_content
+    assert "bundled source under `src/gza/skills/` is the only committable source of truth" in skill_content
+    assert "classify it as an environment/refresh issue rather than a review blocker" in skill_content
 
 
 def test_operator_facing_unmerged_examples_use_uv_run_prefix() -> None:

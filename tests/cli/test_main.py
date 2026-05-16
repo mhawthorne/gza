@@ -175,7 +175,7 @@ class TestHelpOutput:
         assert "--list-fields" in result.stdout
         assert "--json" in result.stdout
         assert "--blocked-by-dropped" in result.stdout
-        assert "recommend_rebase" in result.stdout
+        assert "live shared lifecycle planner" in result.stdout
         assert "deprecated and no longer supported" not in result.stdout
         assert "incomplete --blocked-by-dropped --list-fields" in Path("docs/configuration.md").read_text()
         assert result.stderr == ""

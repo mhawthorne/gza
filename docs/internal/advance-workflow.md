@@ -51,8 +51,8 @@ Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
 | `max_resume_attempts` | `1` | Shared automatic failed-task recovery toggle (`0` disables; any positive value enables the fixed bounded resume/retry policy) |
 | `max_review_cycles` | `3` | Max review→improve cycles before flagging for manual intervention |
 | `max_noop_improve_cycles` | `2` | Max consecutive no-op improves before lifecycle automation stops for discussion |
-| `review_verify_timeout_seconds` | `120` | Timeout for autonomous review `verify_command` runs; stale-branch slow-verify evidence compares against this |
-| `recommend_rebase_behind_commits` | `1` | Advisory stale-branch threshold; `0` disables behind-target `recommend_rebase` detection |
+| `review_verify_timeout_seconds` | `120` | Timeout for autonomous review `verify_command` runs |
+| `recommend_rebase_behind_commits` | `1` | Deprecated compatibility key; accepted but ignored by lifecycle planning |
 | `merge_squash_threshold` | `0` | Auto-squash branches with >= N commits (0 = disabled) |
 
 ## Decision Tree
@@ -101,17 +101,7 @@ A failed rebase is not cleared just because the latest implementation tip become
 |-----------|--------|
 | A completed rebase on the implementation branch exists that is newer than the latest review | `create_review` — rebase may have introduced changes |
 
-### 6. Branch stale advisory
-
-| Condition | Action |
-|-----------|--------|
-| Branch is at least `recommend_rebase_behind_commits` commits behind the target branch, or the latest completed `/gza-task-fix` ledger proves local verify passed but took at least `review_verify_timeout_seconds` | `recommend_rebase` — manual attention; branch is stale and should be rebased before another review/improve/merge pass |
-
-`recommend_rebase` is advisory only. It is surfaced as needs-attention in `gza incomplete`, `gza show`, `gza advance --dry-run`, and sticky `ATTENTION` watch output. It does not run a rebase automatically; operators must use the normal `uv run gza rebase --background <task-id>` or other project-supported rebase flow.
-
-If the live behind-count probe fails, lifecycle planning does not silently downgrade the branch back to normal flow. The shared action stays on the non-stale path (`create_review`, `improve`, `merge`, and so on), but the projected lifecycle description carries a visible warning that the behind-count diagnostic was unavailable for that run.
-
-### 7. Review state (when reviews exist)
+### 6. Review state (when reviews exist)
 
 #### 6a. Review was cleared (improve task ran after review)
 

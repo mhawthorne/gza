@@ -102,14 +102,13 @@ For each Must-Fix item in the latest review:
 4. **Add or update the targeted regression test** the review names. Do not add extra tests.
 
 **Known recipe — installed skill out of sync after `src/gza/skills/` edit.**
-If the blocker is a test failure where `.claude/skills/<name>/SKILL.md` differs from `src/gza/skills/<name>/SKILL.md` (e.g. `test_merge_first_docs_and_fix_skill_schema_stay_in_sync` or any `*sync*` test comparing the two paths), the fix is **not** a code edit. The bundled source has changed but the installed copy in the worktree is stale because the runner only installs missing skills at task start, not on source changes. Recipe:
+If the blocker is a test failure where `.claude/skills/<name>/SKILL.md` differs from `src/gza/skills/<name>/SKILL.md` (e.g. `test_merge_first_docs_and_fix_skill_schema_stay_in_sync` or any `*sync*` test comparing the two paths), treat it as a **source-vs-install-state diagnosis**, not an automatic code edit. The bundled source under `src/gza/skills/` is the only committable source of truth; `.claude/skills/` is a gitignored install artifact. First verify whether the bundled source already satisfies the requested behavior. If it does, refresh the local installed copy only as verification/setup:
 
 ```bash
 uv run gza skills-install --update --project .
-git add .claude/skills/
 ```
 
-Then re-run verify. Do **not** edit `.claude/skills/` by hand — it's an installed artifact, not source. If `git status` shows no `.claude/skills/` delta after the install, the installed copy was already current and the failure is something else; reclassify and continue.
+Then re-run verify. Do **not** edit or stage `.claude/skills/` by hand — it is local install state, not source. If the only remaining mismatch is the installed copy, classify it as an environment/refresh issue rather than a review blocker. Only change code when the bundled source, installer behavior, or a test asserting the supported refresh path is actually wrong.
 
 If every blocker classifies as `already_addressed`, **do not make changes**. Skip to Step 7 with `fix_result: diagnosed_no_change`.
 
@@ -144,18 +143,6 @@ verify:
   passed: true | false | null
   duration_seconds: <float or null>
   review_verify_timeout_seconds: <int>
-recommend_rebase:
-  recommended: true | false
-  reasons:
-    - verify_duration_exceeds_review_gate
-    - branch_behind_target
-  target_branch: <branch or null>
-  source_ref: <branch/ref or null>
-  behind_count: <int or null>
-  behind_threshold: <int>
-  verify_duration_seconds: <float or null>
-  review_verify_timeout_seconds: <int>
-  operator_action: <short text, no automatic rebase>
 blockers:
   - source_review_id: <review_task_id>
     blocker_key: <short_key>
@@ -168,8 +155,6 @@ blockers:
 
 **Ledger integrity rules:**
 - `verify.duration_seconds` is required whenever `verify_command` ran.
-- `recommend_rebase.recommended=true` whenever either trigger fires: local verify passed but met/exceeded the review verify timeout, or the implementation branch is behind the target by at least the configured threshold.
-- `recommend_rebase.operator_action` must remain advisory. Do not run a rebase from this skill.
 - `status: addressed` requires a commit in this pass. Cite the commit sha in `closure_evidence`.
 - `status: already_addressed` requires a file:line citation to current code that satisfies the review. No commit.
 - `follow_up_review_required: true` is permitted **only** when `fix_result: repaired_pending_review` and commits were made. Never request a review for a no-op pass.
@@ -257,6 +242,5 @@ If the restore fails, stop and tell the user exactly what checkout you left them
 - **Bounded scope.** Only touch files and tests named by the current review's Must-Fix items. No opportunistic cleanup, no drive-by refactors, no renames.
 - **Ask the user before** broadening scope, deciding an `ambiguous` blocker, or committing to a `stale_review` / `scope_creep` diagnosis.
 - **No review request without a commit.** `follow_up_review_required: true` is only valid when code changed in this pass. A no-op pass is an operational finding, not work for a reviewer.
-- **No automatic rebase.** If the stale-branch recommendation fires, report it in the ledger and final handoff, but leave rebasing to the operator’s normal `gza rebase` workflow.
 - **Restore the user's checkout before exit.** Final state returns to `<START_CHECKOUT>`; closing message should name both checkouts explicitly.
 - **Role separation.** `review` is the independent approval boundary. `improve` is the normal response to one review. `fix` is escalation for churn.

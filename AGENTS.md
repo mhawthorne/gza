@@ -82,6 +82,8 @@ If you need to guard the *behavior* the config enables ("unit tests have a timeo
 
 Edit skills in `src/gza/skills/`, never in `.claude/skills/` (installed artifacts). Install with `gza skills-install`. New skill = new directory with `SKILL.md`. See [docs/skills.md](docs/skills.md).
 
+**Reviewers**: do NOT flag drift between `.claude/skills/` and `src/gza/skills/` as a blocker. The installed copy is gitignored, so no commit can change it — see [docs/internal/practices.md](docs/internal/practices.md).
+
 ## Config Fields (new/notable)
 
 - `project_prefix` — prefix for generated task IDs (1–12 chars, lowercase alphanumeric only — no hyphens, since hyphen is the separator in task IDs). Defaults to `project_name`. Task IDs take the form `{prefix}-{decimal_seq}` (e.g. `gza-1234`). Also affects `task.slug`: `YYYYMMDD-{prefix}-{slug}`. See [docs/configuration.md](docs/configuration.md).

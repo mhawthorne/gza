@@ -50,7 +50,7 @@ Gza reads configuration from three YAML layers:
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
 | `review_verify_timeout_seconds` | Integer | `120` | Timeout for autonomous review `verify_command` runs |
-| `recommend_rebase_behind_commits` | Integer | `1` | Advisory stale-branch threshold; `0` disables behind-target `recommend_rebase` detection |
+| `recommend_rebase_behind_commits` | Integer | `1` | Deprecated compatibility key; accepted but ignored by current lifecycle planning |
 | `max_noop_improve_cycles` | Integer | `2` | Cap for consecutive no-op improves before lifecycle automation stops for discussion |
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
 | `main_checkout_isolate` | Boolean | `false` | When true, `gza watch` stages merges in a dedicated detached checkout, then fast-forwards the real default branch only after the isolated merge lands cleanly |
@@ -78,7 +78,7 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `watch`, `iterate_max_iterations`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `recommend_rebase_behind_commits`, `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `colors`
+`db_path`, `use_docker`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `watch`, `iterate_max_iterations`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `colors`
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`, `verify_command`
@@ -1092,7 +1092,7 @@ gza incomplete [options]
 
 Use `gza incomplete` for unresolved lineage triage. Use the more specific command surfaces when you want one domain only:
 
-Projected `next_action` values can include `recommend_rebase` when a branch is behind its target or when the latest `/gza-task-fix` ledger proves local verify passed but exceeded the autonomous review verify timeout. Completed held plan tasks surface `awaiting_human` until you run `uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --auto-implement`.
+Projected `next_action` values come from the shared live lifecycle planner. Cleanly mergeable branches continue to the normal review or merge actions even when they are behind the target branch. Completed held plan tasks surface `awaiting_human` until you run `uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --auto-implement`.
 
 `uv run gza incomplete --list-fields` prints the unresolved-lineage projection set. `uv run gza incomplete --blocked-by-dropped --list-fields` prints the blocked-dropped task projection set.
 
@@ -1807,7 +1807,6 @@ docker_setup_command: "uv sync"
 timeout_minutes: 15
 max_turns: 80
 review_verify_timeout_seconds: 180
-recommend_rebase_behind_commits: 1
 max_noop_improve_cycles: 2
 work_count: 3
 

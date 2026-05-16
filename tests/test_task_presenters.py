@@ -104,7 +104,7 @@ def test_one_line_summarizes_multiple_unresolved_tasks_by_id_and_reason(tmp_path
     assert completed.prompt not in rendered
 
 
-def test_one_line_renders_recommend_rebase_reason(tmp_path: Path) -> None:
+def test_one_line_renders_merge_reason(tmp_path: Path) -> None:
     store = _store(tmp_path)
     owner = store.add("Owner prompt", task_type="implement")
 
@@ -116,13 +116,11 @@ def test_one_line_renders_recommend_rebase_reason(tmp_path: Path) -> None:
                 members=(owner,),
                 tree=None,
                 unresolved_tasks=(owner,),
-                values={"next_action_reason": "SKIP: branch is stale; branch is behind the target branch; rebase recommended"},
+                values={"next_action_reason": "Merge branch into main"},
             ),
         ),
         total_count=1,
     )
 
     rendered = result.render()
-    assert rendered == (
-        f"{owner.id}: SKIP: branch is stale; branch is behind the target branch; rebase recommended — Owner prompt"
-    )
+    assert rendered == f"{owner.id}: Merge branch into main — Owner prompt"

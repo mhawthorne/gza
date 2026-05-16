@@ -4793,7 +4793,7 @@ class TestShowCommand:
         assert exit_code == 0
         assert "Lifecycle: recovered, needs attention" in plain
 
-    def test_show_recommend_rebase_lifecycle_uses_shared_attention_reason(
+    def test_show_mergeable_behind_branch_uses_review_lifecycle(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         from gza.cli.query import cmd_show
@@ -4837,7 +4837,7 @@ class TestShowCommand:
 
         output = capsys.readouterr().out
         assert exit_code == 0
-        assert "Lifecycle: needs attention reason=branch-stale-recommend-rebase" in output
+        assert "Lifecycle: review pending" in output
 
     def test_show_lineage_statuses_reuse_top_level_show_status_colors(self, tmp_path: Path) -> None:
         """Show lineage status labels should use the same status palette as the top-level Status field."""

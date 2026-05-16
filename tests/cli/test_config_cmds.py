@@ -2892,8 +2892,8 @@ class TestWatchConfigValidation:
         with pytest.raises(ConfigError, match="watch.failure_backoff_max must be >= watch.failure_backoff_initial"):
             Config.load(tmp_path)
 
-    def test_review_verify_timeout_and_recommend_rebase_defaults_load(self, tmp_path: Path) -> None:
-        """Config.load should expose the stale-branch and review-timeout defaults."""
+    def test_review_verify_timeout_and_deprecated_recommend_rebase_defaults_load(self, tmp_path: Path) -> None:
+        """Config.load should expose the review timeout and deprecated compatibility default."""
         from gza.config import Config
 
         self._write_config(tmp_path, "")
@@ -2901,8 +2901,8 @@ class TestWatchConfigValidation:
         assert config.review_verify_timeout_seconds == 120
         assert config.recommend_rebase_behind_commits == 1
 
-    def test_review_verify_timeout_and_recommend_rebase_custom_values_load(self, tmp_path: Path) -> None:
-        """Config.load should preserve custom stale-branch config values."""
+    def test_review_verify_timeout_and_deprecated_recommend_rebase_custom_values_load(self, tmp_path: Path) -> None:
+        """Config.load should preserve the deprecated compatibility key while ignoring it at runtime."""
         from gza.config import Config
 
         self._write_config(
@@ -2923,14 +2923,14 @@ class TestWatchConfigValidation:
             ("recommend_rebase_behind_commits", "-1", "'recommend_rebase_behind_commits' must be non-negative"),
         ],
     )
-    def test_review_verify_timeout_and_recommend_rebase_invalid_values_fail(
+    def test_review_verify_timeout_and_deprecated_recommend_rebase_invalid_values_fail(
         self,
         tmp_path: Path,
         field: str,
         value: str,
         message: str,
     ) -> None:
-        """Config.load/validate should reject invalid stale-branch config values."""
+        """Config.load/validate should reject invalid review-timeout or compatibility-key values."""
         from gza.config import Config, ConfigError
 
         self._write_config(tmp_path, f"{field}: {value}\n")

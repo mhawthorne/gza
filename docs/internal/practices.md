@@ -56,3 +56,15 @@ suite is invoked via `uv run pytest`), so `sys.executable` points at the
 same interpreter `uv run` would launch — but without the per-invocation
 lockfile revalidation that `uv run` performs. Skipping that step removes a
 real chunk of the per-test budget and a common source of flakes.
+
+## Gitignored derived artifacts are not review blockers
+
+`.claude/skills/` is installed per-worktree by `gza skills-install` from the
+tracked `src/gza/skills/` source. It is gitignored — no commit can change it,
+so no `improve` task can close a blocker scoped to it. Reviewers must not
+flag drift between an installed copy and its bundled source as
+`CHANGES_REQUESTED`; the installer enforces alignment at runtime, not
+review. The same applies to any other gitignored derived artifact. If a
+property of the installed copy genuinely matters, test it by invoking the
+installer into `tmp_path` (see `tests/test_skills_install.py`) — not by
+asserting against the on-disk install state of the current worktree.

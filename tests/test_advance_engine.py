@@ -2368,7 +2368,7 @@ def test_approved_with_followups_and_newer_unresolved_comment_creates_improve(tm
     assert action["review_task"].id == review.id
 
 
-def test_stale_branch_returns_recommend_rebase_attention_action(tmp_path: Path) -> None:
+def test_mergeable_behind_branch_keeps_review_flow(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -2389,14 +2389,11 @@ def test_stale_branch_returns_recommend_rebase_attention_action(tmp_path: Path) 
 
     action = evaluate_advance_rules(config, store, git, task, "main")
 
-    assert action["type"] == "recommend_rebase"
-    assert action["needs_attention_reason"] == "branch-stale-recommend-rebase"
-    assert action["recommend_rebase"]["behind_count"] == 2
-    assert classify_advance_action(action) == "needs_attention"
-    assert "recommend_rebase" not in WORKER_CONSUMING_ACTIONS
+    assert action["type"] == "create_review"
+    assert classify_advance_action(action) == "actionable"
 
 
-def test_merge_conflict_still_wins_over_recommend_rebase(tmp_path: Path) -> None:
+def test_stale_conflicting_branch_emits_needs_rebase(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -2419,7 +2416,7 @@ def test_merge_conflict_still_wins_over_recommend_rebase(tmp_path: Path) -> None
     assert action["type"] == "needs_rebase"
 
 
-def test_failed_rebase_manual_resolution_still_wins_over_recommend_rebase(tmp_path: Path) -> None:
+def test_failed_rebase_manual_resolution_still_wins_over_clean_mergeable_tip(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -2463,7 +2460,7 @@ def test_non_stale_branch_keeps_existing_review_action(tmp_path: Path) -> None:
     assert action["type"] == "create_review"
 
 
-def test_approved_but_behind_branch_is_held_for_recommend_rebase(tmp_path: Path, monkeypatch) -> None:
+def test_approved_but_behind_branch_merges_when_clean(tmp_path: Path, monkeypatch) -> None:
     from gza import advance_engine as advance_engine_module
 
     store = _make_store(tmp_path)
@@ -2501,30 +2498,4 @@ def test_approved_but_behind_branch_is_held_for_recommend_rebase(tmp_path: Path,
     )
     action = evaluate_advance_rules(config, store, git, task, "main")
 
-    assert action["type"] == "recommend_rebase"
-
-
-def test_behind_count_error_is_visible_without_false_recommend_rebase(tmp_path: Path) -> None:
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-
-    task = store.add("Implement behind-count warning", task_type="implement")
-    assert task.id is not None
-    task.status = "completed"
-    task.completed_at = datetime.now(UTC)
-    task.branch = "feature/behind-warning"
-    task.merge_status = "unmerged"
-    task.has_commits = True
-    store.update(task)
-
-    git = _FakeGit(
-        can_merge=True,
-        existing_refs={"origin/feature/behind-warning"},
-        behind_count_error=RuntimeError("boom"),
-    )
-
-    action = evaluate_advance_rules(config, store, git, task, "main")
-
-    assert action["type"] == "create_review"
-    assert "Warning:" in action["description"]
-    assert "behind count unavailable" in action["description"]
+    assert action["type"] == "merge"

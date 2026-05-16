@@ -1,6 +1,6 @@
 # Internal Skills
 
-These skills are used within gza's own development workflow. They are not installed via `gza skills-install` — they live in gza's own `.claude/skills/` directory and are available when working inside the gza repository.
+These skills are used within gza's own development workflow. Their tracked source of truth lives under `src/gza/skills/`; when needed, `gza skills-install` installs derived copies into `.claude/skills/`. Treat `.claude/skills/` as local install state, not as the file you edit or review.
 
 ---
 

@@ -103,6 +103,57 @@ def _dedupe_categorized(categorized: CategorizedLearnings) -> CategorizedLearnin
     return result
 
 
+# Substrings (case-insensitive) that mark a learning as gating on gitignored
+# derived artifacts. Such learnings create unfixable review/improve loops
+# because the artifact is gitignored — no commit can close the blocker.
+# See docs/internal/practices.md "Gitignored derived artifacts are not review blockers".
+_FORBIDDEN_LEARNING_SUBSTRINGS = (
+    "installed runtime skill",
+    "installed skill copies",
+    "installed runtime copies",
+    ".claude/skills",
+)
+
+_INSTALLED_ARTIFACTS_TOPIC = "Docs And Skills"
+_INSTALLED_ARTIFACTS_CANONICAL_LEARNING = (
+    "Refresh installed skill artifacts for local verification, but review and improve "
+    "tasks must target bundled `src/gza/skills/` source rather than gitignored installs."
+)
+
+
+def _filter_forbidden_categorized(categorized: CategorizedLearnings) -> CategorizedLearnings:
+    """Drop generated learnings that would gate review on gitignored artifacts."""
+    result: CategorizedLearnings = {}
+    for topic, items in categorized.items():
+        kept = [
+            item for item in items
+            if not any(needle in item.lower() for needle in _FORBIDDEN_LEARNING_SUBSTRINGS)
+        ]
+        if kept:
+            result[topic] = kept
+    return result
+
+
+def _contains_installed_artifact_guidance(categorized: CategorizedLearnings) -> bool:
+    """Return True when learnings mention gitignored installed-artifact guidance."""
+    return any(
+        any(needle in item.lower() for needle in _FORBIDDEN_LEARNING_SUBSTRINGS)
+        for items in categorized.values()
+        for item in items
+    )
+
+
+def _add_canonical_installed_artifact_learning(
+    categorized: CategorizedLearnings,
+) -> CategorizedLearnings:
+    """Ensure learnings preserve the source-vs-installed-artifact distinction."""
+    updated = {topic: list(items) for topic, items in categorized.items()}
+    topic_items = list(updated.get(_INSTALLED_ARTIFACTS_TOPIC, []))
+    topic_items.append(_INSTALLED_ARTIFACTS_CANONICAL_LEARNING)
+    updated[_INSTALLED_ARTIFACTS_TOPIC] = _dedupe(topic_items)
+    return updated
+
+
 def _merge_categorized(
     existing: CategorizedLearnings, new: CategorizedLearnings
 ) -> CategorizedLearnings:
@@ -198,7 +249,11 @@ def _build_summarization_prompt(
         "- Current code or configuration state by itself; include the principle behind it instead\n"
         "- Generic software engineering advice\n"
         '- Vague platitudes ("write clean code", "test thoroughly")\n'
-        "- Repetitive or near-duplicate entries\n\n"
+        "- Repetitive or near-duplicate entries\n"
+        "- Guidance that gates review or improve cycles on gitignored derived artifacts\n"
+        "  (e.g. `.claude/skills/` installed runtime copies). Such artifacts cannot\n"
+        "  be committed, so an improve task can never close a blocker scoped to them.\n"
+        "  See docs/internal/practices.md.\n\n"
         "Output format: organize learnings under topic headers.\n"
         'Each topic is a markdown H2 header (e.g., "## Testing Patterns").\n'
         'Under each topic, list learnings as bullet points starting with "- ".\n'
@@ -347,7 +402,10 @@ def regenerate_learnings(
                     new_categorized = _merge_categorized(new_categorized, task_learnings)
             categorized = _merge_categorized(previous_categorized, new_categorized)
 
-    categorized = _dedupe_categorized(categorized)
+    had_installed_artifact_guidance = _contains_installed_artifact_guidance(categorized)
+    categorized = _filter_forbidden_categorized(_dedupe_categorized(categorized))
+    if had_installed_artifact_guidance:
+        categorized = _add_canonical_installed_artifact_learning(categorized)
     if not categorized:
         categorized = {DEFAULT_TOPIC: ["No strong patterns extracted yet; keep tasks explicit and scoped."]}
 

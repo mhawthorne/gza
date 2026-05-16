@@ -645,7 +645,7 @@ class Config:
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
     review_verify_timeout_seconds: int = DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS
-    recommend_rebase_behind_commits: int = DEFAULT_RECOMMEND_REBASE_BEHIND_COMMITS
+    recommend_rebase_behind_commits: int = DEFAULT_RECOMMEND_REBASE_BEHIND_COMMITS  # Deprecated compatibility key; ignored.
     learnings_window: int = DEFAULT_LEARNINGS_WINDOW
     learnings_interval: int = DEFAULT_LEARNINGS_INTERVAL
     learnings_max_items: int = DEFAULT_LEARNINGS_MAX_ITEMS

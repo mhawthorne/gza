@@ -52,6 +52,37 @@ def test_regenerate_learnings_writes_file_from_completed_tasks(tmp_path: Path):
     assert "Pending task should not be used" not in content
 
 
+def test_regenerate_learnings_drops_gitignored_artifact_guidance(tmp_path: Path):
+    """Generated learnings must not gate review on gitignored derived artifacts."""
+    store = _new_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="test")
+
+    t = store.add("Past task with bad learning", task_type="implement")
+    store.mark_completed(
+        t,
+        output_content=(
+            "## Docs And Skills\n"
+            "- Keep CLI text, operator docs, bundled skills, and installed runtime skill copies aligned.\n"
+            "- Refresh installed runtime skills through `uv run gza skills-install --update`.\n"
+            "- Test bundled and refreshed installed runtime skill copies when behavior changes.\n"
+            "- Real principle that should survive: prefer errors over silent fallbacks.\n"
+        ),
+        has_commits=False,
+    )
+
+    with patch("gza.runner.run", side_effect=RuntimeError("no provider in tests")):
+        regenerate_learnings(store, config, window=10)
+
+    content = (tmp_path / ".gza" / "learnings.md").read_text().lower()
+    assert "installed runtime skill" not in content
+    assert "installed skill copies" not in content
+    assert "installed runtime copies" not in content
+    assert ".claude/skills" not in content
+    assert "bundled `src/gza/skills/` source" in content
+    assert "gitignored installs" in content
+    assert "prefer errors over silent fallbacks" in content
+
+
 def test_regenerate_learnings_dedupes_items(tmp_path: Path):
     """Duplicate learnings across tasks should be deduplicated."""
     store = _new_store(tmp_path)
@@ -454,6 +485,19 @@ def test_build_summarization_prompt_distinguishes_state_from_guidance():
     assert "durable convention or principle" in prompt
     assert "past implementation choices unless they remain intentional guidance" in prompt
     assert "Current code or configuration state by itself" in prompt
+
+
+def test_build_summarization_prompt_excludes_gitignored_installed_artifact_blockers():
+    """Prompt should tell the model to preserve source-vs-installed-artifact guidance."""
+    from gza.db import Task
+
+    tasks: list[Task] = []
+    prompt = _build_summarization_prompt(tasks)
+
+    assert "gitignored derived artifacts" in prompt
+    assert "`.claude/skills/` installed runtime copies" in prompt
+    assert "an improve task can never close a blocker scoped to them" in prompt
+    assert "See docs/internal/practices.md." in prompt
 
 
 def test_build_summarization_prompt_no_existing_learnings():
