@@ -22,7 +22,6 @@ Practical examples showing common workflows with Gza.
 
 | Example | Description |
 |---------|-------------|
-| [Bulk Import](bulk-import.md) | Import multiple related tasks from YAML |
 | [Parallel Workers](parallel-workers.md) | Run multiple tasks concurrently |
 
 ## Quick Reference

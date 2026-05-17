@@ -2464,19 +2464,6 @@ class TestStatsCommand:
 
         assert result.returncode != 0
 
-
-class TestImportCommand:
-    """Tests for 'gza import' command."""
-
-    def test_import_no_file_specified(self, tmp_path: Path):
-        """Import command requires a file argument."""
-        setup_config(tmp_path)
-        result = run_gza("import", "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert "No file specified" in result.stdout
-
-
 class TestSyncReportCommand:
     """Tests for 'gza sync-report' command."""
 

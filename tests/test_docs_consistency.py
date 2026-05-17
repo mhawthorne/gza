@@ -375,12 +375,10 @@ def test_gza_rebase_docs_match_final_verify_contract() -> None:
     assert "Checks for uncommitted changes before starting (stops if any exist)" not in skills_doc_content
     assert "Fetches and rebases onto the target branch" not in advance_workflow_content
 
-
-def test_bulk_import_examples_use_tags_not_retired_group_aliases() -> None:
-    """Operator import examples should teach canonical tags syntax only."""
+def test_spec_examples_use_tags_not_retired_group_aliases() -> None:
+    """Operator spec examples should teach canonical tags syntax only."""
     docs_root = Path(__file__).resolve().parents[1] / "docs" / "examples"
     checked_files = [
-        docs_root / "bulk-import.md",
         docs_root / "using-specs.md",
     ]
 
@@ -650,6 +648,17 @@ def test_improve_related_skills_describe_comments_as_feedback_source() -> None:
     ).read_text()
     assert "unresolved task comments" in add_skill_content
     assert "comments-only improve is supported" in add_skill_content
+
+def test_skill_install_docs_and_internal_task_model_match_importer_cleanup() -> None:
+    """Skills docs and internal task-model docs should reflect current refresh/import guidance."""
+    repo_root = Path(__file__).resolve().parents[1]
+    skills_content = (repo_root / "docs" / "skills.md").read_text()
+    task_model_content = (repo_root / "docs" / "internal" / "task-model-canonical.md").read_text()
+
+    assert "refresh existing copies with `gza skills-install --update`" in skills_content
+    assert "get overwritten by `gza skills-install`" not in skills_content
+    assert "retired importer-specific entry points" in task_model_content
+    assert "importer/config flows" not in task_model_content
 
 
 def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:

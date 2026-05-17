@@ -33,7 +33,6 @@ from .config_cmds import (
     cmd_clean,
     cmd_config,
     cmd_config_keys,
-    cmd_import,
     cmd_init,
     cmd_learnings,
     cmd_skills_install,
@@ -2224,25 +2223,6 @@ def main() -> int:
     )
     add_common_args(sync_report_parser)
 
-    # import command
-    import_parser = subparsers.add_parser("import", help="Import tasks from a YAML file")
-    import_parser.add_argument(
-        "file",
-        nargs="?",
-        help="YAML file to import tasks from",
-    )
-    import_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview what would be imported without creating tasks",
-    )
-    import_parser.add_argument(
-        "--force", "-f",
-        action="store_true",
-        help="Skip duplicate detection and import all tasks",
-    )
-    add_common_args(import_parser)
-
     # ps command
     ps_parser = subparsers.add_parser(
         "ps",
@@ -2530,8 +2510,6 @@ def main() -> int:
             return cmd_show(args)
         elif args.command == "sync-report":
             return cmd_sync_report(args)
-        elif args.command == "import":
-            return cmd_import(args)
         elif args.command == "ps":
             return cmd_ps(args)
         elif args.command == "kill":

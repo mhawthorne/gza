@@ -9,7 +9,7 @@
 - High-level surfaces should build a declarative `TaskQuery` and route through `TaskQueryService`, even when the service internally delegates to optimized store helpers for canonical ordering.
 - Owner-keyed lineage rows are the canonical read model for unresolved branch ownership boundaries. Command surfaces should display or execute from the owner row and use `lifecycle_action_task` / `recovery_action_task` / `recovery_leaf_task` only as concrete execution details.
 - Do not introduce parallel task model modules (for example, a second `Task` dataclass in another module).
-- YAML-based task import remains supported via importer/config flows, but imported data is normalized into `gza.db`.
+- Task data now enters the system through the canonical CLI/config flows backed by `gza.db`; do not reintroduce retired importer-specific entry points.
 
 ## Read vs. Write Boundary
 

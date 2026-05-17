@@ -806,6 +806,16 @@ class TestCommandAliases:
         assert "invalid choice: 'cycle'" in result.stderr
         assert "iterate" in result.stderr
 
+    def test_import_command_is_rejected(self, tmp_path):
+        """Removed `import` command should now fail at parser validation."""
+        setup_config(tmp_path)
+
+        result = run_gza("import", "tasks.yaml", "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "invalid choice: 'import'" in result.stderr
+        assert "add" in result.stderr
+
     def test_iterate_dispatches_to_cmd_iterate(self, tmp_path):
         """`iterate` command should parse args and dispatch to cmd_iterate."""
         from gza.cli.main import main

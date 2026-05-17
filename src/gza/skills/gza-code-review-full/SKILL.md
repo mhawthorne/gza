@@ -464,7 +464,7 @@ Reviewer: Claude
 ### Issues Found
 | Resource Type | Location | Issue |
 |---------------|----------|-------|
-| file | skills_utils.py:89 | open() without context manager |
+| file | path/to/file.py:89 | open() without context manager |
 
 ## Type Safety
 

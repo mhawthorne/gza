@@ -121,11 +121,8 @@ tasks:
     depends_on: [2, 3]
 ```
 
-```bash
-$ gza import tasks.yaml
-Imported 4 tasks
-All tasks include spec: specs/user-preferences.md
-```
+Create the tasks inline from Claude Code with the `gza-task-add` skill, carrying
+`specs/user-preferences.md` forward as the shared spec context for each task.
 
 ## Tips for effective specs
 

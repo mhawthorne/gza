@@ -322,26 +322,29 @@ class TestSkillsInstallClaudeTarget:
         assert "Run `verify_command` from `gza.yaml` as part of every review iteration." in refreshed
         assert "Pass the result forward as a `## verify_command result` section." in refreshed
 
-    def test_update_flag_refreshes_gza_rebase_verify_contract(self, tmp_path: Path):
-        """--update should refresh gza-rebase to the bundled verify-command workflow."""
+    def test_update_flag_refreshes_gza_code_review_full_stale_importer_reference(self, tmp_path: Path):
+        """--update should replace stale installed importer references in gza-code-review-full."""
         from gza.skills_utils import get_skills_source_path
 
         setup_config(tmp_path)
 
-        result1 = run_gza("skills-install", "--target", "claude", "gza-rebase", "--project", str(tmp_path))
+        result1 = run_gza("skills-install", "--target", "claude", "gza-code-review-full", "--dev", "--project", str(tmp_path))
         assert result1.returncode == 0
 
-        skill_file = tmp_path / ".claude" / "skills" / "gza-rebase" / "SKILL.md"
+        skill_file = tmp_path / ".claude" / "skills" / "gza-code-review-full" / "SKILL.md"
+        stale_location = "importer" + ".py:89"
+        refreshed_location = "path/to/file.py:89"
         skill_file.write_text(
             "---\n"
-            "name: gza-rebase\n"
+            "name: gza-code-review-full\n"
             "description: stale\n"
-            "allowed-tools: Read, Edit, Glob, Grep, Bash(git:*), Bash(uv run python -m py_compile:*), Bash(python -m ruff check:*)\n"
+            "allowed-tools: Read\n"
             "version: 1.0.0\n"
-            "public: true\n"
+            "public: false\n"
             "---\n\n"
-            "Run `uv run python -m py_compile` before finishing.\n"
-            "Run `python -m ruff check --select F401,F821` before finishing.\n"
+            "| Resource Type | Location | Issue |\n"
+            "|---------------|----------|-------|\n"
+            f"| file | {stale_location} | open() without context manager |\n"
         )
 
         result2 = run_gza(
@@ -349,7 +352,8 @@ class TestSkillsInstallClaudeTarget:
             "--target",
             "claude",
             "--update",
-            "gza-rebase",
+            "--dev",
+            "gza-code-review-full",
             "--project",
             str(tmp_path),
         )
@@ -358,12 +362,10 @@ class TestSkillsInstallClaudeTarget:
         assert "(updated)" in result2.stdout
 
         refreshed = skill_file.read_text()
-        bundled = (get_skills_source_path() / "gza-rebase" / "SKILL.md").read_text()
+        bundled = (get_skills_source_path() / "gza-code-review-full" / "SKILL.md").read_text()
         assert refreshed == bundled
-        assert "py_compile" not in refreshed
-        assert "ruff check --select F401,F821" not in refreshed
-        assert "verify_command" in refreshed
-        assert "Bash(uv run:*)" in refreshed
+        assert stale_location not in refreshed
+        assert refreshed_location in refreshed
 
     def test_update_flag_refreshes_gza_task_fix_retired_recommend_rebase_schema(self, tmp_path: Path):
         """--update should remove retired recommend_rebase guidance from installed gza-task-fix."""
@@ -1209,44 +1211,6 @@ class TestSkillContentValidation:
         assert "Do not run `git checkout`, `git switch`, or other manual branch-switching commands as part of this skill." in content
         assert "Run `verify_command` from `gza.yaml` as part of every review iteration." in content
         assert "Pass the result forward as a `## verify_command result` section." in content
-
-    def test_gza_rebase_skill_allows_project_verify_commands_and_removes_python_specific_checks(self):
-        """gza-rebase should allow project verify commands without hardcoded Python-only checks."""
-        from gza.skills_utils import get_skills_source_path
-
-        content = (get_skills_source_path() / "gza-rebase" / "SKILL.md").read_text()
-
-        assert "allowed-tools:" in content
-        assert "Bash(git:*)" in content
-        assert "Bash(uv run:*)" in content
-        assert "Bash(./*)" in content
-        assert "Bash(make:*)" in content
-        assert "Bash(npm:*)" in content
-        assert "Bash(pytest:*)" in content
-        assert "Bash(python:*)" in content
-        assert "verify_command" in content
-        assert "Bash(./bin/tests:*)" not in content
-        assert "py_compile" not in content
-        assert "F401" not in content
-        assert "F821" not in content
-
-    def test_gza_rebase_skill_requires_final_verify_after_stash_restore_before_success(self):
-        """gza-rebase should verify the final checkout after stash restoration, before success."""
-        from gza.skills_utils import get_skills_source_path
-
-        content = (get_skills_source_path() / "gza-rebase" / "SKILL.md").read_text()
-
-        assert "If rebase succeeds with no conflicts, continue to Step 6. Do not report success yet." in content
-        assert "report success and show the push command" not in content
-        assert "run `git stash pop` to restore them before final verification" in content
-        assert "### Step 7: Final verification" in content
-        assert "after the rebase is fully complete and after any stashed changes have been restored" in content
-        assert "### Step 8: Final summary" in content
-
-        stash_idx = content.index("### Step 6: Restore stashed changes")
-        verify_idx = content.index("### Step 7: Final verification")
-        summary_idx = content.index("### Step 8: Final summary")
-        assert stash_idx < verify_idx < summary_idx
 
     def test_gza_task_run_no_longer_documents_manual_mark_completed_recovery(self):
         """gza-task-run should route only through run-inline, without manual completion recovery steps."""

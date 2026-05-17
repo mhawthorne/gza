@@ -160,7 +160,7 @@ Options:
 Update valid task types:
 
 ```python
-# In CLI task-type validation
+# In the CLI/task creation validation path
 if task_type not in ("task", "explore", "plan", "implement", "review", "improve"):
     errors.append(...)
 ```

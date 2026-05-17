@@ -685,20 +685,6 @@ gza delete <task_id> [options]
 | `--yes`, `-y` | Skip confirmation prompt |
 | `--force`, `-f` | Deprecated alias for `--yes` |
 
-### import
-
-Import tasks from a YAML file.
-
-```bash
-gza import [file] [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `file` | YAML file to import from |
-| `--dry-run` | Preview without creating tasks |
-| `--force`, `-f` | Skip duplicate detection |
-
 ### attach
 
 Attach to a running task. Claude uses an interactive kill/resume handoff session; Codex/Gemini attach read-only. See [Tmux Sessions](tmux.md) for details.

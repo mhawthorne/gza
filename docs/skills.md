@@ -252,7 +252,7 @@ The source of truth for all `/gza-*` skills is:
 src/gza/skills/<skill-name>/SKILL.md
 ```
 
-**Always edit skills in `src/gza/skills/`, never in `.claude/skills/`.** The `.claude/skills/` copies are installed artifacts that get overwritten by `gza skills-install`.
+**Always edit skills in `src/gza/skills/`, never in `.claude/skills/`.** The `.claude/skills/` copies are installed artifacts managed by `gza skills-install`; refresh existing copies with `gza skills-install --update` (or `--force` to overwrite).
 
 New skills are auto-discovered — adding a directory under `src/gza/skills/` with a `SKILL.md` file is sufficient. No registry to update.
 

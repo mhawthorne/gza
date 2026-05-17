@@ -217,5 +217,4 @@ gza iterate gza-1 --max-iterations 3
 - [Simple Task](examples/simple-task.md) — complete walkthrough of a single task
 - [Plan → Implement → Review](examples/plan-implement-review.md) — multi-phase workflow for larger features
 - [Parallel Workers](examples/parallel-workers.md) — running tasks concurrently
-- [Bulk Import](examples/bulk-import.md) — importing many tasks from YAML
 - [Configuration Reference](configuration.md) — all commands, options, and settings

@@ -1,4 +1,4 @@
-"""Configuration, stats, cleanup, init, import, and skills-install CLI commands."""
+"""Configuration, stats, cleanup, init, and skills-install CLI commands."""
 
 import argparse
 import json
@@ -21,7 +21,6 @@ from ..config_schema import CONFIG_KEY_REGISTRY
 from ..console import console
 from ..db import SqliteTaskStore, Task, task_id_numeric_key
 from ..git import Git
-from ..importer import import_tasks, parse_import_file, validate_import
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..log_paths import paired_log_paths, slug_from_log_path
 from ..merge_state import resolve_task_merge_state_for_target
@@ -2232,85 +2231,6 @@ def cmd_learnings(args: argparse.Namespace) -> int:
 
     print(f"Unknown learnings subcommand: {subcommand}", file=sys.stderr)
     return 1
-
-
-def cmd_import(args: argparse.Namespace) -> int:
-    """Import tasks from a YAML file."""
-    # Backward compatibility: if the positional argument is a directory,
-    # treat it as --project and require an explicit import file.
-    if args.file and Path(args.file).is_dir():
-        args.project_dir = Path(args.file).resolve()
-        args.file = None
-
-    config = Config.load(args.project_dir)
-    store = get_store(config)
-
-    # Determine which file to import
-    if args.file:
-        import_path = Path(args.file)
-        if not import_path.is_absolute():
-            import_path = config.project_dir / import_path
-    else:
-        print("Error: No file specified")
-        print("Usage: gza import <file> [--dry-run] [--force]")
-        return 1
-
-    # Parse the import file
-    tasks, default_group, default_spec, parse_errors = parse_import_file(import_path)
-
-    if parse_errors:
-        print("Error: Failed to parse import file:")
-        for error in parse_errors:
-            if error.task_index:
-                print(f"  Task {error.task_index}: {error.message}")
-            else:
-                print(f"  {error.message}")
-        return 1
-
-    # Validate the tasks
-    validation_errors = validate_import(tasks, config.project_dir, default_spec)
-
-    if validation_errors:
-        print("Error: Validation failed:")
-        for error in validation_errors:
-            if error.task_index:
-                print(f"  Task {error.task_index}: {error.message}")
-            else:
-                print(f"  {error.message}")
-        return 1
-
-    # Import the tasks
-    if args.dry_run:
-        print(f"Would import {len(tasks)} tasks:")
-    else:
-        print(f"Importing {len(tasks)} tasks...")
-
-    results, messages = import_tasks(
-        store=store,
-        tasks=tasks,
-        project_dir=config.project_dir,
-        dry_run=args.dry_run,
-        force=args.force,
-    )
-
-    for message in messages:
-        print(message)
-
-    # Summary
-    if args.dry_run:
-        return 0
-
-    created = sum(1 for r in results if not r.skipped)
-    skipped = sum(1 for r in results if r.skipped)
-
-    if skipped:
-        print(f"Imported {created} tasks ({skipped} skipped)")
-    else:
-        print(f"Imported {created} tasks")
-
-    return 0
-
-
 
 def _resolve_skill_install_targets(
     project_dir: Path,
