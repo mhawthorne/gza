@@ -195,6 +195,7 @@ _PROJECTION_PRESET_FIELDS: dict[str, tuple[str, ...]] = {
         "queue_position",
         "blocked",
         "blocking_id",
+        "blocking_status",
     ),
     TaskProjectionPreset.UNMERGED_DEFAULT: (
         "id",

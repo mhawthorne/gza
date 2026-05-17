@@ -12,8 +12,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from rich.console import Console
+from rich.text import Text
 
-from gza.cli import query as query_cli
+from gza.cli import _queue_render as queue_render_cli, query as query_cli, watch as watch_cli
 from gza.config import Config
 from gza.console import truncate
 from gza.db import Task
@@ -100,6 +101,25 @@ class _FastUnmergedGit:
 class _UnavailableGitHub:
     def is_available(self) -> bool:
         return False
+
+
+class _RecordingConsole:
+    def __init__(self) -> None:
+        self.outputs: list[object] = []
+
+    def print(self, renderable: object = "", *args, **kwargs) -> None:
+        self.outputs.append(renderable)
+
+
+def _styled_substrings(text: Text) -> dict[str, str | None]:
+    styled: dict[str, str | None] = {}
+    for span in text.spans:
+        styled[text.plain[span.start:span.end]] = span.style
+    return styled
+
+
+def _span_styles(text: Text) -> list[str | None]:
+    return [span.style for span in text.spans]
 
 
 def _setup_unmerged_env_fast(
@@ -2090,7 +2110,7 @@ class TestSearchCommand:
         root = store.add("needle root", task_type="implement")
         assert root.id is not None
         child = store.add("needle child", task_type="review", based_on=root.id, same_branch=True)
-        sibling_root = store.add("needle other root", task_type="implement")
+        store.add("needle other root", task_type="implement")
 
         deprecated_result = run_gza(
             "search",
@@ -2125,7 +2145,7 @@ class TestSearchCommand:
         root = store.add("needle root", task_type="implement")
         assert root.id is not None
         child = store.add("needle child", task_type="review", based_on=root.id, same_branch=True)
-        keep = store.add("needle keep", task_type="implement")
+        store.add("needle keep", task_type="implement")
 
         deprecated_result = run_gza(
             "search",
@@ -3171,6 +3191,60 @@ class TestQueueCommand:
         blocked_line = next(i for i, line in enumerate(lines) if "Blocked urgent" in line)
         assert lines[blocked_line + 1].strip() == f"[urgent]  blocked by {blocker.id}"
 
+    def test_queue_command_uses_shared_queue_theme_renderables(self, tmp_path: Path) -> None:
+        from gza.colors import QueueColors
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        blocker = store.add("Queue blocker")
+        urgent = store.add("Urgent ordered queue task", urgent=True)
+        blocked = store.add("Blocked queue task", depends_on=blocker.id)
+        assert urgent.id is not None
+        assert blocked.id is not None
+        store.set_queue_position(urgent.id, 1)
+
+        recording_console = _RecordingConsole()
+        config = Config.load(tmp_path)
+        queue_colors = QueueColors(
+            position="red",
+            blocked_marker="green",
+            task_id="cyan",
+            task_type="magenta",
+            prompt="white",
+            urgent="yellow",
+            blocked_by="blue",
+            explicit_position="bright_black",
+            summary="bright_white",
+        )
+        with (
+            patch.object(queue_render_cli._colors, "QUEUE_COLORS", queue_colors),  # noqa: SLF001
+            patch.object(watch_cli, "console", recording_console),
+            patch.object(watch_cli.Config, "load", return_value=config),
+        ):
+            exit_code = watch_cli.cmd_queue(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    queue_action=None,
+                    limit=10,
+                    all=True,
+                    tags=None,
+                    any_tag=False,
+                )
+            )
+
+        text_outputs = [output for output in recording_console.outputs if isinstance(output, Text)]
+        assert exit_code == 0
+        urgent_line = next(text for text in text_outputs if "Urgent ordered queue task" in text.plain)
+        urgent_meta = next(text for text in text_outputs if "[urgent]" in text.plain)
+        blocked_line = next(text for text in text_outputs if "Blocked queue task" in text.plain)
+        blocked_meta = next(text for text in text_outputs if f"blocked by {blocker.id}" in text.plain)
+
+        assert _span_styles(urgent_line) == ["red", "cyan", "magenta", "white"]
+        assert _styled_substrings(urgent_meta)["[urgent]"] == "yellow"
+        assert _styled_substrings(urgent_meta)["[#1]"] == "bright_black"
+        assert _span_styles(blocked_line) == ["green", "cyan", "magenta", "white"]
+        assert _span_styles(blocked_meta) == ["blue"]
+
     def test_next_tag_filters_pending_and_blocked_counts(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3187,6 +3261,62 @@ class TestQueueCommand:
         assert "Release blocked" not in result.stdout
         assert "Backlog runnable" not in result.stdout
         assert "1 task blocked by dependencies" in result.stdout
+
+    def test_next_command_uses_shared_queue_theme_renderables(self, tmp_path: Path) -> None:
+        from gza.colors import QueueColors
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        blocker = store.add("Next blocker")
+        urgent = store.add("Urgent next task", urgent=True)
+        blocked = store.add("Blocked next task", depends_on=blocker.id)
+        assert urgent.id is not None
+        assert blocked.id is not None
+        store.set_queue_position(urgent.id, 1)
+
+        recording_console = _RecordingConsole()
+        config = Config.load(tmp_path)
+        queue_colors = QueueColors(
+            position="red",
+            blocked_marker="green",
+            task_id="cyan",
+            task_type="magenta",
+            prompt="white",
+            urgent="yellow",
+            blocked_by="blue",
+            explicit_position="bright_black",
+            summary="bright_white",
+        )
+        with (
+            patch.object(queue_render_cli._colors, "QUEUE_COLORS", queue_colors),  # noqa: SLF001
+            patch.object(query_cli, "console", recording_console),
+            patch.object(query_cli.Config, "load", return_value=config),
+        ):
+            exit_code = query_cli.cmd_next(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    all=True,
+                    tags=None,
+                    any_tag=False,
+                )
+            )
+
+        text_outputs = [output for output in recording_console.outputs if isinstance(output, Text)]
+        assert exit_code == 0
+        urgent_line = next(text for text in text_outputs if "Urgent next task" in text.plain)
+        urgent_meta = next(text for text in text_outputs if "[urgent]" in text.plain)
+        blocked_line = next(text for text in text_outputs if "Blocked next task" in text.plain)
+        blocked_meta = next(
+            text
+            for text in text_outputs
+            if str(blocker.id) in text.plain and "blocked" in text.plain
+        )
+
+        assert _span_styles(urgent_line) == ["red", "cyan", "magenta", "white"]
+        assert _styled_substrings(urgent_meta)["[urgent]"] == "yellow"
+        assert _styled_substrings(urgent_meta)["[#1]"] == "bright_black"
+        assert _span_styles(blocked_line) == ["green", "cyan", "magenta", "white"]
+        assert _span_styles(blocked_meta) == ["blue"]
 
     def test_queue_and_next_tag_filters_are_case_insensitive(self, tmp_path: Path):
         """queue/next should match lowercase-stored tags for mixed-case --tag values."""
@@ -3535,152 +3665,6 @@ class TestShowCommand:
         assert "Traceback" not in result.stdout
         assert "Traceback" not in result.stderr
         assert "tasks.completion_reason" in result.stderr
-
-    def test_show_query_only_missing_tasks_project_id_surfaces_controlled_error_without_traceback(
-        self,
-        tmp_path: Path,
-    ):
-        """Show should fail closed with a schema error when tasks.project_id is missing."""
-        import sqlite3
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Task with missing project_id")
-        assert task.id is not None
-
-        db_path = tmp_path / ".gza" / "gza.db"
-        conn = sqlite3.connect(db_path)
-        conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
-        conn.execute(
-            """
-            CREATE TABLE tasks AS
-            SELECT
-                id,
-                prompt,
-                status,
-                task_type,
-                slug,
-                branch,
-                log_file,
-                report_file,
-                based_on,
-                has_commits,
-                duration_seconds,
-                num_steps_reported,
-                num_steps_computed,
-                num_turns,
-                num_turns_reported,
-                num_turns_computed,
-                attach_count,
-                attach_duration_seconds,
-                cost_usd,
-                created_at,
-                started_at,
-                running_pid,
-                completed_at,
-                "group",
-                depends_on,
-                spec,
-                create_review,
-                same_branch,
-                task_type_hint,
-                output_content,
-                session_id,
-                pr_number,
-                model,
-                provider,
-                provider_is_explicit,
-                urgent,
-                urgent_bumped_at,
-                queue_position,
-                input_tokens,
-                output_tokens,
-                merge_status,
-                merged_at,
-                failure_reason,
-                skip_learnings,
-                diff_files_changed,
-                diff_lines_added,
-                diff_lines_removed,
-                review_cleared_at,
-                review_score,
-                log_schema_version,
-                execution_mode,
-                base_branch
-            FROM tasks_old
-            """
-        )
-        conn.execute("DROP TABLE tasks_old")
-        conn.commit()
-        conn.close()
-
-        original_mode = db_path.stat().st_mode
-        os.chmod(db_path, 0o444)
-        try:
-            result = run_gza("show", str(task.id), "--project", str(tmp_path))
-        finally:
-            os.chmod(db_path, original_mode)
-
-        assert result.returncode == 1
-        assert "Error: Query-only DB open detected missing required column tasks.project_id" in result.stderr
-        assert "Traceback" not in result.stdout
-        assert "Traceback" not in result.stderr
-
-    def test_show_query_only_missing_tasks_table_surfaces_controlled_error_without_traceback(
-        self,
-        tmp_path: Path,
-    ):
-        """Show should fail closed with a schema error when the tasks table is missing."""
-        import sqlite3
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Task before dropping tasks table")
-        assert task.id is not None
-
-        db_path = tmp_path / ".gza" / "gza.db"
-        conn = sqlite3.connect(db_path)
-        conn.execute("DROP TABLE tasks")
-        conn.commit()
-        conn.close()
-
-        original_mode = db_path.stat().st_mode
-        os.chmod(db_path, 0o444)
-        try:
-            result = run_gza("show", str(task.id), "--project", str(tmp_path))
-        finally:
-            os.chmod(db_path, original_mode)
-
-        assert result.returncode == 1
-        assert "Error: Query-only DB open detected missing required table tasks" in result.stderr
-        assert "Traceback" not in result.stdout
-        assert "Traceback" not in result.stderr
-
-    def test_show_query_only_missing_task_comments_id_warns_without_traceback(self, tmp_path: Path):
-        """Show should degrade comments cleanly when task_comments.id is missing on a frozen DB."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Task with missing comment ids")
-        assert task.id is not None
-        store.add_comment(task.id, "Existing comment", source="direct")
-
-        db_path = tmp_path / ".gza" / "gza.db"
-        _drop_task_comments_column(db_path, "id")
-
-        original_mode = db_path.stat().st_mode
-        os.chmod(db_path, 0o444)
-        try:
-            result = run_gza("show", str(task.id), "--project", str(tmp_path))
-        finally:
-            os.chmod(db_path, original_mode)
-
-        assert result.returncode == 0
-        assert "Task with missing comment ids" in result.stdout
-        assert "Comments:" not in result.stdout
-        assert "Existing comment" not in result.stdout
-        assert "Traceback" not in result.stdout
-        assert "Traceback" not in result.stderr
-        assert "Warning: Query-only DB open detected incomplete task_comments schema" in result.stderr
 
     def test_show_query_only_missing_tasks_project_id_surfaces_controlled_error_without_traceback(
         self,
@@ -4744,8 +4728,8 @@ class TestShowCommand:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Exhausted recovery chains should surface the shared needs-attention verdict."""
-        from gza.cli.query import cmd_show
         from gza.advance_engine import format_needs_attention_lifecycle
+        from gza.cli.query import cmd_show
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4804,8 +4788,8 @@ class TestShowCommand:
         self, tmp_path: Path
     ) -> None:
         """Recovered needs-attention lifecycles must render with attention severity, not recovered green."""
-        from gza.cli.query import cmd_show
         from gza.advance_engine import with_needs_attention
+        from gza.cli.query import cmd_show
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4872,7 +4856,6 @@ class TestShowCommand:
                 )
             )
 
-        rendered = console.export_text(styles=True, clear=False)
         plain = console.export_text(clear=False)
         assert exit_code == 0
         assert "Lifecycle: recovered, needs attention" in plain
@@ -9805,73 +9788,6 @@ class TestUnmergedUnifiedQueryOutput:
         assert refreshed_unrelated_unit.state == "unmerged"
         assert refreshed_unrelated.merge_status == "unmerged"
 
-    def test_unmerged_default_refresh_ignores_historical_merged_unit_when_branch_is_reused(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        historical = store.add("Historical merged task", task_type="implement")
-        historical.status = "completed"
-        historical.completed_at = datetime.now(UTC)
-        historical.branch = "feature/reused"
-        historical.has_commits = True
-        historical.merge_status = "unmerged"
-        store.update(historical)
-        assert historical.id is not None
-        historical_unit = store.get_or_create_merge_unit_for_task(historical)
-        assert historical_unit is not None
-        store.set_merge_unit_state(historical_unit.id, "merged")
-
-        unrelated = store.add("Current reused branch task", task_type="implement")
-        unrelated.status = "completed"
-        unrelated.completed_at = datetime.now(UTC)
-        unrelated.branch = "feature/reused"
-        unrelated.has_commits = True
-        unrelated.merge_status = "unmerged"
-        store.update(unrelated)
-        assert unrelated.id is not None
-        unrelated_unit = store.get_or_create_merge_unit_for_task(unrelated)
-        assert unrelated_unit is not None
-        assert unrelated_unit.id != historical_unit.id
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=0,
-            json=True,
-            fields="id,prompt,merge_unit_id",
-        )
-
-        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
-
-        captured = capsys.readouterr()
-        assert result == 0
-        assert json.loads(captured.out) == [
-            {
-                "id": unrelated.id,
-                "prompt": "Current reused branch task",
-                "merge_unit_id": unrelated_unit.id,
-            }
-        ]
-
-        refreshed_historical = store.get(historical.id)
-        refreshed_unrelated = store.get(unrelated.id)
-        refreshed_historical_unit = store.resolve_merge_unit_for_task(historical.id)
-        refreshed_unrelated_unit = store.resolve_merge_unit_for_task(unrelated.id)
-        assert refreshed_historical is not None
-        assert refreshed_unrelated is not None
-        assert refreshed_historical_unit is not None
-        assert refreshed_unrelated_unit is not None
-        assert refreshed_historical_unit.state == "merged"
-        assert refreshed_historical.merge_status == "merged"
-        assert refreshed_unrelated_unit.state == "unmerged"
-        assert refreshed_unrelated.merge_status == "unmerged"
-
     def test_unmerged_live_target_json_fields_use_live_state_not_default_target_unit(
         self,
         tmp_path: Path,
@@ -10258,6 +10174,8 @@ class TestUnmergedUnifiedQueryOutput:
         assert "Rich output task" in captured.out
 
     def test_unmerged_default_text_attaches_review_verdict_color_via_theme(self, tmp_path: Path) -> None:
+        import gza.colors as current_colors
+
         store, task, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Color verdict task")
         review = store.add("Review color verdict", task_type="review")
         review.status = "completed"
@@ -10287,7 +10205,8 @@ class TestUnmergedUnifiedQueryOutput:
         )
 
         rendered = enriched.render("rich")
-        assert f"[{query_cli._colors.UNMERGED_COLORS.review_approved}]✓ approved[/{query_cli._colors.UNMERGED_COLORS.review_approved}]" in rendered
+        approved_color = current_colors.UNMERGED_COLORS.review_approved
+        assert f"[{approved_color}]✓ approved[/{approved_color}]" in rendered
 
     @pytest.mark.parametrize(
         ("verdict_text", "score", "badge_text", "expected_color_attr"),
@@ -10315,6 +10234,8 @@ class TestUnmergedUnifiedQueryOutput:
         badge_text: str,
         expected_color_attr: str,
     ) -> None:
+        import gza.colors as current_colors
+
         store, task, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Scored verdict task")
         review = store.add("Review scored verdict", task_type="review")
         review.status = "completed"
@@ -10345,7 +10266,7 @@ class TestUnmergedUnifiedQueryOutput:
         )
 
         rendered = enriched.render("rich")
-        expected_color = getattr(query_cli._colors.UNMERGED_COLORS, expected_color_attr)
+        expected_color = getattr(current_colors.UNMERGED_COLORS, expected_color_attr)
         assert rendered.count(f"({score})") == 1
         assert f"[{expected_color}]{badge_text} ({score})[/{expected_color}]" in rendered
 

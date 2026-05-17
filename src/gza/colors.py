@@ -232,14 +232,18 @@ class LineageColors:
 
 
 @dataclass(frozen=True)
-class NextColors:
-    """Colors for the ``gza next`` command pending-task list."""
+class QueueColors:
+    """Colors for queue-style task listings (``gza queue`` and ``gza next``)."""
 
+    position: str = default_color
+    blocked_marker: str = default_color
     task_id: str = default_color
+    task_type: str = default_color
     prompt: str = default_color
-    type: str = default_color
-    blocked: str = default_color
-    index: str = default_color
+    urgent: str = default_color
+    blocked_by: str = default_color
+    explicit_position: str = default_color
+    summary: str = default_color
 
 
 @dataclass(frozen=True)
@@ -326,7 +330,7 @@ class Theme:
     show: dict[str, str] = field(default_factory=dict)
     unmerged: dict[str, str] = field(default_factory=dict)
     lineage: dict[str, str] = field(default_factory=dict)
-    next_colors: dict[str, str] = field(default_factory=dict)
+    queue: dict[str, str] = field(default_factory=dict)
     runner: dict[str, str] = field(default_factory=dict)
     work: dict[str, str] = field(default_factory=dict)
     # Rich style-name overrides (e.g. "repr.number", "repr.path"). Applied to
@@ -347,7 +351,7 @@ class Theme:
             show=af(color, ShowColors),
             unmerged=af(color, UnmergedColors),
             lineage=af(color, LineageColors),
-            next_colors=af(color, NextColors),
+            queue=af(color, QueueColors),
             runner=af(color, RunnerColors),
             work=af(color, WorkColors),
         )
@@ -405,6 +409,14 @@ _THEME_MINIMAL = Theme(
     },
     task_stream={
         "step_header": f"{pink_light} bold",
+    },
+    queue={
+        "position": blue_bright,
+        "blocked_marker": yellow_warning,
+        "urgent": yellow_warning,
+        "blocked_by": yellow_warning,
+        "explicit_position": gray_secondary,
+        "summary": gray_secondary,
     },
     rich={
         "repr.number": orange,
@@ -508,7 +520,7 @@ def _build_themed_instances(
     show_c = _apply_domain_theme(ShowColors(), theme.show if theme else _no, base_ov, color_overrides)
     unmerged_c = _apply_domain_theme(UnmergedColors(), theme.unmerged if theme else _no, base_ov, color_overrides)
     lineage_c = _apply_domain_theme(LineageColors(), theme.lineage if theme else _no, base_ov, color_overrides)
-    next_c = _apply_domain_theme(NextColors(), theme.next_colors if theme else _no, base_ov, color_overrides)
+    queue_c = _apply_domain_theme(QueueColors(), theme.queue if theme else _no, base_ov, color_overrides)
     runner_c = _apply_domain_theme(RunnerColors(), theme.runner if theme else _no, base_ov, color_overrides)
     work_c = _apply_domain_theme(WorkColors(), theme.work if theme else _no, base_ov, color_overrides)
     rich_styles = dict(theme.rich) if theme else {}
@@ -520,7 +532,7 @@ def _build_themed_instances(
         "SHOW_COLORS": show_c,
         "UNMERGED_COLORS": unmerged_c,
         "LINEAGE_COLORS": lineage_c,
-        "NEXT_COLORS": next_c,
+        "QUEUE_COLORS": queue_c,
         "RUNNER_COLORS": runner_c,
         "WORK_COLORS": work_c,
         "TASK_COLORS_DICT": _flat_dataclass_dict(task_c),
@@ -529,7 +541,7 @@ def _build_themed_instances(
         "SHOW_COLORS_DICT": _flat_dataclass_dict(show_c),
         "UNMERGED_COLORS_DICT": _flat_dataclass_dict(unmerged_c),
         "LINEAGE_COLORS_DICT": _flat_dataclass_dict(lineage_c),
-        "NEXT_COLORS_DICT": _flat_dataclass_dict(next_c),
+        "QUEUE_COLORS_DICT": _flat_dataclass_dict(queue_c),
         "RUNNER_COLORS_DICT": _flat_dataclass_dict(runner_c),
         "WORK_COLORS_DICT": _flat_dataclass_dict(work_c),
         "LINEAGE_STATUS_COLORS": {
@@ -573,7 +585,7 @@ def set_theme(
     and ``c.TASK_COLORS`` is preferred for those.
     """
     global TASK_COLORS, STATUS_COLORS, TASK_STREAM_COLORS, SHOW_COLORS
-    global UNMERGED_COLORS, LINEAGE_COLORS, NEXT_COLORS, RUNNER_COLORS, WORK_COLORS
+    global UNMERGED_COLORS, LINEAGE_COLORS, QUEUE_COLORS, RUNNER_COLORS, WORK_COLORS
 
     inst = _build_themed_instances(theme_name, color_overrides or {})
 
@@ -584,7 +596,7 @@ def set_theme(
     SHOW_COLORS = inst["SHOW_COLORS"]
     UNMERGED_COLORS = inst["UNMERGED_COLORS"]
     LINEAGE_COLORS = inst["LINEAGE_COLORS"]
-    NEXT_COLORS = inst["NEXT_COLORS"]
+    QUEUE_COLORS = inst["QUEUE_COLORS"]
     RUNNER_COLORS = inst["RUNNER_COLORS"]
     WORK_COLORS = inst["WORK_COLORS"]
 
@@ -592,7 +604,7 @@ def set_theme(
     for name in (
         "TASK_COLORS_DICT", "STATUS_COLORS_DICT", "TASK_STREAM_COLORS_DICT",
         "SHOW_COLORS_DICT", "UNMERGED_COLORS_DICT", "LINEAGE_COLORS_DICT",
-        "NEXT_COLORS_DICT", "RUNNER_COLORS_DICT", "WORK_COLORS_DICT",
+        "QUEUE_COLORS_DICT", "RUNNER_COLORS_DICT", "WORK_COLORS_DICT",
         "LINEAGE_STATUS_COLORS", "PS_STATUS_COLORS", "RICH_STYLES_DICT",
     ):
         target = globals()[name]
@@ -612,7 +624,7 @@ TASK_STREAM_COLORS: TaskStreamColors = TaskStreamColors()
 SHOW_COLORS: ShowColors = ShowColors()
 UNMERGED_COLORS: UnmergedColors = UnmergedColors()
 LINEAGE_COLORS: LineageColors = LineageColors()
-NEXT_COLORS: NextColors = NextColors()
+QUEUE_COLORS: QueueColors = QueueColors()
 RUNNER_COLORS: RunnerColors = RunnerColors()
 WORK_COLORS: WorkColors = WorkColors()
 
@@ -626,7 +638,7 @@ TASK_STREAM_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(TASK_STREAM_COLOR
 SHOW_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(SHOW_COLORS)
 UNMERGED_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(UNMERGED_COLORS)
 LINEAGE_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(LINEAGE_COLORS)
-NEXT_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(NEXT_COLORS)
+QUEUE_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(QUEUE_COLORS)
 RUNNER_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(RUNNER_COLORS)
 WORK_COLORS_DICT: dict[str, str] = _flat_dataclass_dict(WORK_COLORS)
 

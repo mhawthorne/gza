@@ -24,7 +24,7 @@ Frozen dataclasses, one per output context:
 | `ShowColors` | `gza show` |
 | `UnmergedColors` | `gza unmerged` |
 | `LineageColors` | `gza lineage` |
-| `NextColors` | `gza next` |
+| `QueueColors` | Queue-style listings (`gza queue`, `gza next`) |
 | `RunnerColors` | Post-task runner summaries and next-step blocks |
 | `WorkColors` | Background work startup output and `gza advance` action text |
 

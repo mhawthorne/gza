@@ -16,7 +16,7 @@ from typing import Any, Literal, TypeVar, cast
 from .. import lineage
 from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
 from ..config import Config
-from ..console import prompt_available_width, shorten_prompt
+from ..console import console, prompt_available_width, shorten_prompt
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..git import Git, GitError
 from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
@@ -52,6 +52,12 @@ from ._common import (
     resolve_id,
     set_task_queue_position_scoped,
     set_task_urgency,
+)
+from ._queue_render import (
+    QueueRenderRow,
+    build_queue_summary,
+    print_queue_rows,
+    queue_render_widths,
 )
 from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
@@ -363,48 +369,6 @@ def _assess_isolated_merge_failure(
 def _format_prompt_for_width(prompt: str, *, prefix: int = 0, suffix: int = 0) -> str:
     available = prompt_available_width(prefix=prefix, suffix=suffix)
     return shorten_prompt(prompt, available)
-
-
-def _queue_row_extras(task: DbTask, *, config: Config, blocked: bool) -> list[str]:
-    extras: list[str] = []
-    if task.urgent:
-        extras.append("[urgent]")
-    if task.queue_position is not None:
-        extras.append(f"[#{task.queue_position}]")
-    if blocked:
-        blocking = _precondition_blocking_dependency_id(task, config) or task.depends_on
-        extras.append(f"blocked by {blocking}" if blocking else "blocked by dependency")
-    return extras
-
-
-def _print_queue_rows(
-    tasks: list[DbTask],
-    *,
-    blocked_task_ids: set[str],
-    config: Config,
-    pos_width: int,
-    id_width: int,
-    type_width: int,
-) -> None:
-    if not tasks:
-        return
-
-    runnable_index = 0
-
-    for task in tasks:
-        task_id = str(task.id)
-        blocked = task_id in blocked_task_ids
-        position = "-" if blocked else str(runnable_index + 1)
-        if not blocked:
-            runnable_index += 1
-        type_chip = f"[{task.task_type}]"
-        prefix = f"{position:>{pos_width}}  {task_id:<{id_width}}  {type_chip:<{type_width}}  "
-        queue_prompt = _format_prompt_for_width(task.prompt, prefix=len(prefix))
-        print(f"{prefix}{queue_prompt}")
-
-        extras = _queue_row_extras(task, config=config, blocked=blocked)
-        if extras:
-            print(f"{' ' * len(prefix)}{'  '.join(extras)}")
 
 
 def _format_hms() -> str:
@@ -2238,33 +2202,42 @@ def cmd_queue(args: argparse.Namespace) -> int:
     show_all = bool(getattr(args, "all", False)) or limit_arg in {0, -1}
     display_limit = None if show_all else max(1, int(limit_arg))
     visible_runnable = runnable_pending if display_limit is None else runnable_pending[:display_limit]
-    blocked_task_ids = {str(task.id) for task in blocked_pending if task.id is not None}
-    rendered_tasks = [*visible_runnable, *blocked_pending]
-    pos_width = max(1, len(str(len(visible_runnable))))
-    id_width = max(len(str(task.id)) for task in rendered_tasks)
-    type_width = max(len(f"[{task.task_type}]") for task in rendered_tasks)
+    rendered_rows = [
+        QueueRenderRow(task=task, position_text=str(index))
+        for index, task in enumerate(visible_runnable, 1)
+    ]
+    rendered_rows.extend(
+        QueueRenderRow(
+            task=task,
+            position_text="-",
+            blocked=True,
+            blocked_by_text=(
+                f"blocked by {blocking}"
+                if (blocking := (_precondition_blocking_dependency_id(task, config) or task.depends_on))
+                else "blocked by dependency"
+            ),
+        )
+        for task in blocked_pending
+    )
+    widths = queue_render_widths(rendered_rows)
 
-    _print_queue_rows(
-        visible_runnable,
-        blocked_task_ids=blocked_task_ids,
-        config=config,
-        pos_width=pos_width,
-        id_width=id_width,
-        type_width=type_width,
+    print_queue_rows(
+        console,
+        [row for row in rendered_rows if not row.blocked],
+        widths=widths,
     )
 
     if display_limit is not None and len(runnable_pending) > display_limit:
         remaining = len(runnable_pending) - display_limit
         plural = "tasks" if remaining != 1 else "task"
-        print(f"({remaining} more runnable {plural}; use -n 0, -n -1, or --all to show everything)")
+        console.print(build_queue_summary(
+            f"({remaining} more runnable {plural}; use -n 0, -n -1, or --all to show everything)"
+        ))
 
-    _print_queue_rows(
-        blocked_pending,
-        blocked_task_ids=blocked_task_ids,
-        config=config,
-        pos_width=pos_width,
-        id_width=id_width,
-        type_width=type_width,
+    print_queue_rows(
+        console,
+        [row for row in rendered_rows if row.blocked],
+        widths=widths,
     )
 
     return 0

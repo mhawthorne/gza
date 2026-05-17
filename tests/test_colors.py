@@ -11,7 +11,7 @@ import pytest
 
 def test_import_singleton_instances() -> None:
     from gza.colors import (  # noqa: F401
-        NEXT_COLORS,
+        QUEUE_COLORS,
         SHOW_COLORS,
         STATUS_COLORS,
         TASK_COLORS,
@@ -24,8 +24,8 @@ def test_import_singleton_instances() -> None:
 def test_import_dict_variants() -> None:
     from gza.colors import (  # noqa: F401
         LINEAGE_STATUS_COLORS,
-        NEXT_COLORS_DICT,
         PS_STATUS_COLORS,
+        QUEUE_COLORS_DICT,
         SHOW_COLORS_DICT,
         STATUS_COLORS_DICT,
         TASK_COLORS_DICT,
@@ -118,11 +118,21 @@ def test_unmerged_review_verdict_field_value_color_uses_themed_singleton() -> No
         c.set_theme(None)
 
 
-def test_next_colors_dict_keys() -> None:
-    from gza.colors import NEXT_COLORS_DICT
+def test_queue_colors_dict_keys() -> None:
+    from gza.colors import QUEUE_COLORS_DICT
 
-    expected_keys = {"task_id", "prompt", "type", "blocked", "index"}
-    assert set(NEXT_COLORS_DICT.keys()) == expected_keys
+    expected_keys = {
+        "position",
+        "blocked_marker",
+        "task_id",
+        "task_type",
+        "prompt",
+        "urgent",
+        "blocked_by",
+        "explicit_position",
+        "summary",
+    }
+    assert set(QUEUE_COLORS_DICT.keys()) == expected_keys
 
 
 def test_work_colors_dict_keys() -> None:
@@ -302,7 +312,7 @@ class TestSetTheme:
         assert c.SHOW_COLORS_DICT == dataclasses.asdict(c.SHOW_COLORS)
         assert c.UNMERGED_COLORS_DICT == dataclasses.asdict(c.UNMERGED_COLORS)
         assert c.LINEAGE_COLORS_DICT == dataclasses.asdict(c.LINEAGE_COLORS)
-        assert c.NEXT_COLORS_DICT == dataclasses.asdict(c.NEXT_COLORS)
+        assert c.QUEUE_COLORS_DICT == dataclasses.asdict(c.QUEUE_COLORS)
         assert c.RUNNER_COLORS_DICT == dataclasses.asdict(c.RUNNER_COLORS)
         assert c.WORK_COLORS_DICT == dataclasses.asdict(c.WORK_COLORS)
 
@@ -343,7 +353,7 @@ class TestBaseColorsPropagation:
             assert c.SHOW_COLORS.task_id == "#ff0000"
             assert c.UNMERGED_COLORS.task_id == "#ff0000"
             assert c.LINEAGE_COLORS.task_id == "#ff0000"
-            assert c.NEXT_COLORS.task_id == "#ff0000"
+            assert c.QUEUE_COLORS.task_id == "#ff0000"
         finally:
             del BUILT_IN_THEMES["_test_base_propagate"]
 
@@ -359,7 +369,7 @@ class TestBaseColorsPropagation:
             assert c.SHOW_COLORS.prompt == "#00ff00"
             assert c.UNMERGED_COLORS.prompt == "#00ff00"
             assert c.LINEAGE_COLORS.prompt == "#00ff00"
-            assert c.NEXT_COLORS.prompt == "#00ff00"
+            assert c.QUEUE_COLORS.prompt == "#00ff00"
         finally:
             del BUILT_IN_THEMES["_test_base_prompt"]
 
@@ -490,7 +500,7 @@ class TestThemeUniform:
 
         from gza.colors import (
             LineageColors,
-            NextColors,
+            QueueColors,
             ShowColors,
             StatusColors,
             TaskColors,
@@ -503,7 +513,7 @@ class TestThemeUniform:
             (TaskColors, "task"), (StatusColors, "status"),
             (TaskStreamColors, "task_stream"), (ShowColors, "show"),
             (UnmergedColors, "unmerged"), (LineageColors, "lineage"),
-            (NextColors, "next_colors"),
+            (QueueColors, "queue"),
         ]:
             domain_dict = getattr(t, attr)
             for f in dataclasses.fields(cls):
@@ -521,7 +531,7 @@ class TestThemeUniform:
             assert c.STATUS_COLORS.completed == "#ff00ff"
             assert c.SHOW_COLORS.heading == "#ff00ff"
             assert c.LINEAGE_COLORS.connector == "#ff00ff"
-            assert c.NEXT_COLORS.index == "#ff00ff"
+            assert c.QUEUE_COLORS.position == "#ff00ff"
         finally:
             del BUILT_IN_THEMES["_test_uniform"]
             c.set_theme(None)

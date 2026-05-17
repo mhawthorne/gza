@@ -23,12 +23,11 @@ from rich.markup import escape as rich_escape
 
 import gza.colors as _colors
 
-from ..colors import NEXT_COLORS_DICT, PS_STATUS_COLORS, SHOW_COLORS_DICT, pink
+from ..colors import PS_STATUS_COLORS, SHOW_COLORS_DICT, pink
 from ..config import Config
 from ..console import (
     MAX_PROMPT_DISPLAY,
     console,
-    get_terminal_width,
     prompt_available_width,
     shorten_prompt,
     truncate,
@@ -68,7 +67,6 @@ from ..task_query import (
     LineageRow as _LineageRow,
     PresentationSpec as _TaskPresentationSpec,
     ProjectionSpec as _TaskProjectionSpec,
-    SortSpec as _TaskSortSpec,
     TaskProjectionPreset as _TaskProjectionPreset,
     TaskQuery as _TaskQuery,
     TaskQueryPresets as _TaskQueryPresets,
@@ -100,6 +98,12 @@ from ._common import (
     parse_cli_tag_filters,
     resolve_id,
     validate_cli_tag_values,
+)
+from ._queue_render import (
+    QueueRenderRow as _QueueRenderRow,
+    build_blocked_count_summary as _build_blocked_count_summary,
+    print_queue_rows as _print_queue_rows,
+    queue_render_widths as _queue_render_widths,
 )
 from .advance_engine import (
     classify_advance_action,
@@ -541,47 +545,21 @@ def cmd_next(args: argparse.Namespace) -> int:
         print(f"Error: {exc}")
         return 1
 
-    pending_query = _TaskQuery(
-        scope="tasks",
-        limit=None,
-        statuses=("pending",),
-        tag_filters=tag_filters,
-        any_tag=any_tag,
-        sort=_TaskSortSpec(field="pickup_order", descending=False),
-    )
-    pending = [row.task for row in service.run(pending_query).rows if isinstance(row, _TaskRow)]
-    runnable = [
-        row.task
-        for row in service.run(_TaskQueryPresets.queue(limit=None, tags=tag_filters, any_tag=any_tag)).rows
+    queue_rows = [
+        row
+        for row in service.run(
+            _TaskQueryPresets.queue_listing(limit=None, tags=tag_filters, any_tag=any_tag)
+        ).rows
         if isinstance(row, _TaskRow)
     ]
-    blocked_query = _TaskQuery(
-        scope="tasks",
-        limit=None,
-        statuses=("pending",),
-        exclude_task_types=("internal",),
-        dependency_state=("blocked",),
-        tag_filters=tag_filters,
-        any_tag=any_tag,
-        sort=_TaskSortSpec(field="pickup_order", descending=False),
-        projection=_TaskProjectionSpec(fields=("blocking_id", "blocking_status")),
-    )
-    blocked_rows = service.run(blocked_query).rows
-    blocked: list[tuple[DbTask, str | None, str | None]] = [
-        (
-            row.task,
-            cast(str | None, row.values.get("blocking_id")),
-            cast(str | None, row.values.get("blocking_status")),
-        )
-        for row in blocked_rows
-        if isinstance(row, _TaskRow)
-    ]
+    runnable_rows = [row for row in queue_rows if not bool(row.values.get("blocked"))]
+    blocked_rows = [row for row in queue_rows if bool(row.values.get("blocked"))]
 
     # Check for orphaned/stale tasks once, regardless of whether pending tasks exist
     registry = WorkerRegistry(config.workers_path)
     orphaned = _get_orphaned_tasks(registry, store)
 
-    if not pending:
+    if not queue_rows:
         if tag_filters:
             console.print(f"No pending tasks matching tags: {', '.join(tag_filters)}")
         else:
@@ -591,54 +569,33 @@ def cmd_next(args: argparse.Namespace) -> int:
         return 0
 
     # Filter blocked tasks unless --all is specified
-    show_all = args.all if hasattr(args, 'all') else False
-
-    # Colors consistent with cmd_history
-    c = NEXT_COLORS_DICT
-
-    # Terminal-width-aware column widths
-    terminal_width = get_terminal_width()
-    idx_width = 3
-    id_width = 6    # e.g. "#1234" fits in 6 chars
-    type_width = 12  # e.g. "[implement]" = 11 chars + 1 space padding
-    # 2 spaces between each column (3 gaps)
-    fixed_cols = idx_width + 2 + id_width + 2 + type_width + 2
-    prompt_width = max(20, terminal_width - fixed_cols)
-
-    def _print_task_row(
-        i: int,
-        task: DbTask,
-        blocking_id: str | None = None,
-        blocking_status: str | None = None,
-    ) -> None:
-        idx_str = str(i)
-        id_str = f"{task.id}"
-        type_str = task.task_type or "implement"
-        # Build visible type label with brackets, padded to fixed width
-        type_visible = f"[{type_str}]"
-        type_padded = f"{type_visible:<{type_width}}"
-        first_line = task.prompt.split('\n')[0].strip()
-        blocked_text = (
-            _format_blocked_dependency_label(blocking_id, blocking_status)
-            if blocking_id or blocking_status
-            else ""
+    show_all = bool(getattr(args, "all", False))
+    rendered_rows = [
+        _QueueRenderRow(task=row.task, position_text=str(index))
+        for index, row in enumerate(runnable_rows, 1)
+    ]
+    if show_all:
+        rendered_rows.extend(
+            _QueueRenderRow(
+                task=row.task,
+                position_text="-",
+                blocked=True,
+                blocked_by_text=_format_blocked_dependency_label(
+                    cast(str | None, row.values.get("blocking_id")),
+                    cast(str | None, row.values.get("blocking_status")),
+                )[1:-1],
+            )
+            for row in blocked_rows
         )
-        blocked_label = f" [{c['blocked']}]{blocked_text}[/{c['blocked']}]" if blocked_text else ""
-        blocked_raw_len = len(f" {blocked_text}") if blocked_text else 0
-        avail = max(10, prompt_width - blocked_raw_len)
-        prompt_display = truncate(first_line, avail)
-        console.print(
-            f"[{c['index']}]{idx_str:>{idx_width}}[/{c['index']}]"
-            f"  [{c['task_id']}]{id_str:<{id_width}}[/{c['task_id']}]"
-            f"  [{c['type']}]{rich_escape(type_padded)}[/{c['type']}]"
-            f"  [{c['prompt']}]{prompt_display}[/{c['prompt']}]"
-            f"{blocked_label}"
-        )
+    widths = _queue_render_widths(rendered_rows)
 
     # Show runnable tasks
-    if runnable:
-        for i, task in enumerate(runnable, 1):
-            _print_task_row(i, task)
+    if rendered_rows:
+        _print_queue_rows(
+            console,
+            [row for row in rendered_rows if not row.blocked],
+            widths=widths,
+        )
     else:
         if not show_all:
             if tag_filters:
@@ -647,18 +604,19 @@ def cmd_next(args: argparse.Namespace) -> int:
                 console.print("No runnable tasks")
 
     # Show blocked tasks if --all is specified
-    if show_all and blocked:
-        if runnable:
+    if show_all and blocked_rows:
+        if runnable_rows:
             console.print()
-        for i, (task, blocking_id, blocking_status) in enumerate(blocked, len(runnable) + 1):
-            _print_task_row(i, task, blocking_id, blocking_status)
+        _print_queue_rows(
+            console,
+            [row for row in rendered_rows if row.blocked],
+            widths=widths,
+        )
 
     # Show blocked count at the bottom (only if not showing all)
-    if not show_all and blocked:
+    if not show_all and blocked_rows:
         console.print()
-        count = len(blocked)
-        plural = "tasks" if count != 1 else "task"
-        console.print(f"[{c['blocked']}]({count} {plural} blocked by dependencies)[/{c['blocked']}]")
+        console.print(_build_blocked_count_summary(len(blocked_rows)))
 
     if orphaned:
         _print_orphaned_warning(orphaned)
