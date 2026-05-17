@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,6 +31,7 @@ from gza.source_followup import (
 
 NEEDS_ATTENTION_LABEL = "Needs attention"
 ALLOW_NOOP_IMPROVE_TAG = "allow-noop-improve"
+DUPLICATE_BLOCKER_REVIEW_CYCLES = 3
 
 WORKER_CONSUMING_ACTIONS = frozenset(
     {
@@ -59,6 +61,17 @@ class PostMergeRebaseState:
     reason: str | None
     warning: str | None = None
     rebase_target_missing_merge_unit: bool = False
+
+
+@dataclass(frozen=True)
+class DuplicateBlockerStreak:
+    """Repeated primary-blocker streak for the latest completed review chain."""
+
+    cycles: int
+    fingerprint: tuple[str, str]
+    title: str
+    anchor: str
+    review_task_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -108,6 +121,7 @@ class AdvanceContext:
     consecutive_noop_improves: int = 0
     noop_improve_allowed: bool = False
     noop_improve_trigger: str | None = None
+    duplicate_blocker_streak: DuplicateBlockerStreak | None = None
     has_improve_after_review: bool = False
     has_fresh_unresolved_comments_since_latest_review: bool = False
     closing_review_action: dict[str, Any] | None = None
@@ -452,6 +466,117 @@ def _count_consecutive_noop_improves(improve_tasks: list[DbTask]) -> tuple[DbTas
     return latest_noop_improve, consecutive_noops
 
 
+def _normalize_blocker_title(title: str) -> str:
+    normalized = re.sub(r"`+", "", title).strip().lower()
+    normalized = re.sub(r"^#+\s*", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"^(?:[a-z]+-)?b\d+\s*[:.)-]?\s*", "", normalized)
+    return normalized.strip()
+
+
+def _normalize_blocker_anchor(value: str) -> str:
+    normalized = re.sub(r"`+", "", value).strip().lower()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def _primary_blocker_fingerprint(
+    report: ParsedReviewReport,
+) -> tuple[tuple[str, str], str, str] | None:
+    primary_blocker = next(
+        (finding for finding in report.findings if finding.severity == "BLOCKER"),
+        None,
+    )
+    if primary_blocker is None:
+        return None
+
+    title = _normalize_blocker_title(primary_blocker.title)
+    if not title:
+        return None
+
+    raw_anchor: str | None = None
+    if primary_blocker.open_state_citation:
+        citation_tokens = [
+            token.strip()
+            for token in primary_blocker.open_state_citation.split(",")
+            if token.strip()
+        ]
+        if citation_tokens:
+            raw_anchor = citation_tokens[0]
+    if raw_anchor is None and primary_blocker.fix_or_followup:
+        raw_anchor = primary_blocker.fix_or_followup
+    if raw_anchor is None:
+        return None
+
+    anchor = _normalize_blocker_anchor(raw_anchor)
+    if not anchor:
+        return None
+    return (title, anchor), primary_blocker.title, anchor
+
+
+def _completed_rebase_between(rebases: list[DbTask], older: DbTask, newer: DbTask) -> bool:
+    older_time = _task_event_time(older)
+    newer_time = _task_event_time(newer)
+    return any(older_time < _task_event_time(rebase) <= newer_time for rebase in rebases)
+
+
+def _count_duplicate_primary_blocker_streak(
+    config: Any,
+    reviews: list[DbTask],
+    completed_rebases: list[DbTask],
+) -> DuplicateBlockerStreak | None:
+    completed_reviews = sorted(
+        (review for review in reviews if review.status == "completed"),
+        key=_task_event_time,
+        reverse=True,
+    )
+    if not completed_reviews:
+        return None
+
+    latest_review = completed_reviews[0]
+    latest_report = get_review_report(Path(config.project_dir), latest_review)
+    if latest_report.verdict != "CHANGES_REQUESTED":
+        return None
+
+    latest_fingerprint = _primary_blocker_fingerprint(latest_report)
+    if latest_fingerprint is None or latest_review.id is None:
+        return None
+
+    fingerprint, title, anchor = latest_fingerprint
+    review_task_ids: list[str] = [latest_review.id]
+    streak = 1
+    newer_review = latest_review
+
+    for older_review in completed_reviews[1:]:
+        if _completed_rebase_between(completed_rebases, older_review, newer_review):
+            break
+
+        older_report = get_review_report(Path(config.project_dir), older_review)
+        if older_report.verdict != "CHANGES_REQUESTED":
+            break
+
+        older_fingerprint = _primary_blocker_fingerprint(older_report)
+        if older_fingerprint is None or older_review.id is None:
+            break
+
+        if older_fingerprint[0] != fingerprint:
+            break
+
+        streak += 1
+        review_task_ids.append(older_review.id)
+        newer_review = older_review
+        if streak >= DUPLICATE_BLOCKER_REVIEW_CYCLES:
+            return DuplicateBlockerStreak(
+                cycles=streak,
+                fingerprint=fingerprint,
+                title=title,
+                anchor=anchor,
+                review_task_ids=tuple(review_task_ids),
+            )
+
+    return None
+
+
 def _task_id(task: DbTask | None) -> str:
     """Render a task id for user-facing action descriptions."""
     if task is None or task.id is None:
@@ -526,6 +651,27 @@ def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]
             ),
         },
         reason="improve-no-op",
+    )
+
+
+def _duplicate_blocker_needs_attention_action(ctx: AdvanceContext) -> dict[str, Any]:
+    assert ctx.duplicate_blocker_streak is not None
+    streak = ctx.duplicate_blocker_streak
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                f"SKIP: same review blocker repeated for {streak.cycles} consecutive review cycles; "
+                "needs manual intervention"
+            ),
+            "duplicate_blocker": {
+                "cycles": streak.cycles,
+                "title": streak.title,
+                "anchor": streak.anchor,
+                "review_task_ids": streak.review_task_ids,
+            },
+        },
+        reason="duplicate-blocker-no-progress",
     )
 
 
@@ -1152,6 +1298,19 @@ def resolve_advance_context(
             rebase_invalidates_review = True
             review_invalidated_by_rebase = latest_completed_rebase
 
+    duplicate_blocker_streak = None
+    if (
+        task.task_type == "implement"
+        and review_verdict == "CHANGES_REQUESTED"
+        and not review_cleared
+        and active_review is None
+    ):
+        duplicate_blocker_streak = _count_duplicate_primary_blocker_streak(
+            config,
+            reviews,
+            completed_rebases,
+        )
+
     return AdvanceContext(
         task=task,
         task_type=task.task_type,
@@ -1193,6 +1352,7 @@ def resolve_advance_context(
         consecutive_noop_improves=consecutive_noop_improves,
         noop_improve_allowed=noop_improve_allowed,
         noop_improve_trigger=noop_improve_trigger,
+        duplicate_blocker_streak=duplicate_blocker_streak,
         has_improve_after_review=has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review=has_fresh_unresolved_comments_since_latest_review,
         closing_review_action=closing_review_action,
@@ -1512,6 +1672,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
         and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
         and not ctx.noop_improve_allowed,
         action=_noop_improve_needs_discussion_action,
+    ),
+    AdvanceRule(
+        name="review_duplicate_blocker_no_progress",
+        matches=lambda ctx: (not ctx.review_cleared)
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and ctx.duplicate_blocker_streak is not None,
+        action=_duplicate_blocker_needs_attention_action,
     ),
     AdvanceRule(
         name="review_max_cycles",

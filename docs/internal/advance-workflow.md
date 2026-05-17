@@ -124,6 +124,7 @@ A failed rebase is not cleared just because the latest implementation tip become
 | Verdict = `CHANGES_REQUESTED` AND improve is `in_progress` | `wait_improve` — skip |
 | Verdict = `CHANGES_REQUESTED` AND improve is `pending` | `run_improve` — spawn worker |
 | Consecutive completed no-op improves for the latest `(impl, review)` pair >= `max_noop_improve_cycles` and lineage is not tagged `allow-noop-improve` | `needs_discussion` — stop repeated no-op improve loops |
+| Verdict = `CHANGES_REQUESTED` AND the same primary blocker repeats for 3 consecutive completed review cycles with no completed rebase boundary between them | `needs_discussion` — reason `duplicate-blocker-no-progress`; stop the generic review/improve loop and require manual intervention |
 | Verdict = `CHANGES_REQUESTED` AND cycles >= `max_review_cycles` | `max_cycles_reached` — manual intervention |
 | Verdict = `CHANGES_REQUESTED` AND no improve exists | `improve` — create improve task |
 | Verdict = unknown | `needs_discussion` — manual intervention |
@@ -179,6 +180,8 @@ Implication for queries: **to find all improves for an (impl, review) pair, filt
 Likewise, post-completion side effects that logically target "the impl this improve belongs to" must walk up the `based_on` chain until a non-improve ancestor is found, because `task.based_on` on a retry/resume points at the previous improve, not the impl. The helper `runner._resolve_impl_ancestor()` encapsulates this walk.
 
 Completed improve tasks persist `changed_diff` to record whether the task changed the tracked aggregate review diff compared with the branch state captured immediately before the improve started. `changed_diff = 0` means the improve completed but made no tracked reviewable change, so the runner does not clear review state, resolve comments, or create a closing review. Advance counts consecutive no-op improves for the latest `(implementation, review)` pair and returns `needs_discussion` with reason `improve-no-op` once `max_noop_improve_cycles` is reached, unless the implementation/review/improve lineage is tagged `allow-noop-improve`. `NULL` is legacy/unknown and is treated as changed.
+
+Advance also computes a generic duplicate-blocker backstop from completed review reports only. When the latest completed `CHANGES_REQUESTED` review and the two immediately preceding completed review cycles all carry the same primary blocker fingerprint (normalized blocker title plus the first open-state citation, or the normalized required-fix text when no citation exists), the engine returns `needs_discussion` with reason `duplicate-blocker-no-progress`. The streak resets across any completed same-lineage rebase between the compared reviews, on any non-`CHANGES_REQUESTED` review, on missing blocker fingerprints, or when the primary blocker changes.
 
 ## Action Types
 
