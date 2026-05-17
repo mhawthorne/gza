@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1594,6 +1595,7 @@ def _run_review_verify_command(
     timeout_seconds: int = REVIEW_VERIFY_TIMEOUT_SECONDS,
 ) -> str:
     """Run the configured verify command for an autonomous review iteration."""
+    started_at = time.monotonic()
     try:
         result = subprocess.run(
             ["bash", "-lc", verify_command],
@@ -1616,6 +1618,14 @@ def _run_review_verify_command(
             exit_status="launch failed",
             failure=f"failed to launch verify_command: {exc}",
         )
+    elapsed = time.monotonic() - started_at
+    if elapsed > (0.8 * timeout_seconds):
+        warning_message = (
+            f"verify_command used {elapsed:.1f}s of {timeout_seconds}s budget - "
+            "suite is approaching the review wall; profile before it starts timing out"
+        )
+        logger.warning(warning_message)
+        console.print(f"[yellow]Warning: {warning_message}[/yellow]")
     return _format_review_verify_result(verify_command, result)
 
 

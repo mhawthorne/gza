@@ -641,6 +641,55 @@ class TestReviewContextFromChain:
 
         assert "verify_command timed out after 240s" in result
 
+    def test_run_review_verify_command_warns_when_near_timeout_budget(self, tmp_path: Path):
+        """Completed review verify runs should warn operators before they start timing out."""
+        completed = subprocess.CompletedProcess(
+            args=["bash", "-lc", "printf 'all good\\n'"],
+            returncode=0,
+            stdout="all good\n",
+            stderr="",
+        )
+
+        with patch("gza.runner.subprocess.run", return_value=completed), \
+             patch("gza.runner.console.print") as mock_print, \
+             patch("gza.runner.logger.warning") as mock_warning, \
+             patch("gza.runner.time.monotonic", side_effect=[100.0, 108.3]):
+            result = _run_review_verify_command(
+                "printf 'all good\\n'",
+                cwd=tmp_path,
+                timeout_seconds=10,
+            )
+
+        assert result == _format_review_verify_result("printf 'all good\\n'", completed)
+        mock_warning.assert_called_once()
+        warning_message = mock_warning.call_args.args[0]
+        assert "verify_command used 8.3s of 10s budget" in warning_message
+        assert "suite is approaching the review wall; profile before it starts timing out" in warning_message
+        mock_print.assert_called_once_with(f"[yellow]Warning: {warning_message}[/yellow]")
+
+    def test_run_review_verify_command_skips_warning_when_well_under_budget(self, tmp_path: Path):
+        """Fast review verify runs should not emit near-timeout warnings."""
+        completed = subprocess.CompletedProcess(
+            args=["bash", "-lc", "printf 'all good\\n'"],
+            returncode=0,
+            stdout="all good\n",
+            stderr="",
+        )
+
+        with patch("gza.runner.subprocess.run", return_value=completed), \
+             patch("gza.runner.console.print") as mock_print, \
+             patch("gza.runner.logger.warning") as mock_warning, \
+             patch("gza.runner.time.monotonic", side_effect=[200.0, 205.0]):
+            result = _run_review_verify_command(
+                "printf 'all good\\n'",
+                cwd=tmp_path,
+                timeout_seconds=10,
+            )
+
+        assert result == _format_review_verify_result("printf 'all good\\n'", completed)
+        mock_warning.assert_not_called()
+        mock_print.assert_not_called()
+
     def test_review_context_includes_changed_files_diffstat_and_diff(self, tmp_path: Path):
         """Review context should include changed files, diffstat, and inline diff."""
         db_path = tmp_path / "test.db"
