@@ -8,6 +8,8 @@ PYTEST_XDIST_WORKERS="${PYTEST_XDIST_WORKERS:-$DEFAULT_WORKERS}"
 PYTEST_FAULTHANDLER_TIMEOUT="${PYTEST_FAULTHANDLER_TIMEOUT:-2}"
 RUN_INTEGRATION=0
 
+echo "verify: cores=$CORES xdist_workers=$PYTEST_XDIST_WORKERS faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}s"
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -i|--integration)
