@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import hashlib
 import io
 import os
 import signal
@@ -337,6 +338,12 @@ class _IsolatedMergeFailureAssessment:
     reason: str | None = None
 
 
+@dataclass
+class _InstalledPackageDriftState:
+    startup_fingerprint: str
+    warned_fingerprint: str | None = None
+
+
 def _assess_isolated_merge_failure(
     merge_git: Git,
     branch: str,
@@ -359,6 +366,39 @@ def _format_prompt_for_width(prompt: str, *, prefix: int = 0, suffix: int = 0) -
 
 def _format_hms() -> str:
     return datetime.now(UTC).strftime("%H:%M:%S")
+
+
+def _installed_gza_package_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _installed_gza_package_fingerprint(package_root: Path | None = None) -> str:
+    root = package_root or _installed_gza_package_root()
+    hasher = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        if not path.is_file():
+            continue
+        relative_path = path.relative_to(root).as_posix()
+        hasher.update(relative_path.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(path.read_bytes())
+        hasher.update(b"\0")
+    return hasher.hexdigest()
+
+
+def _warn_if_installed_gza_changed(log: "_WatchLog", drift_state: _InstalledPackageDriftState | None) -> None:
+    if drift_state is None:
+        return
+    current_fingerprint = _installed_gza_package_fingerprint()
+    if current_fingerprint == drift_state.startup_fingerprint:
+        return
+    if current_fingerprint == drift_state.warned_fingerprint:
+        return
+    drift_state.warned_fingerprint = current_fingerprint
+    log.emit(
+        "WARNING",
+        "installed gza changed since watch started -- restart watch to pick up new code",
+    )
 
 
 def _format_scope_message(tags: tuple[str, ...] | None, *, any_tag: bool) -> str | None:
@@ -898,12 +938,14 @@ def _run_cycle(
     restart_failed_batch: int = 1,
     max_recovery_attempts: int = 1,
     show_skipped: bool = False,
+    installed_package_drift: _InstalledPackageDriftState | None = None,
 ) -> _CycleResult:
     from ._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
 
     tags = normalize_tag_filters(tags)
 
     log.begin_cycle()
+    _warn_if_installed_gza_changed(log, installed_package_drift)
     if not dry_run:
         reconcile_in_progress_tasks(config)
         prune_terminal_dead_workers(config)
@@ -1860,6 +1902,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
         return 1
 
     log = _WatchLog(config.project_dir / ".gza" / "watch.log", quiet=quiet)
+    installed_package_drift = _InstalledPackageDriftState(
+        startup_fingerprint=_installed_gza_package_fingerprint()
+    )
     stop_requested = False
 
     def _handle_shutdown(_signum: int, _frame: object) -> None:
@@ -1902,6 +1947,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 restart_failed_batch=restart_failed_batch,
                 max_recovery_attempts=max_recovery_attempts,
                 show_skipped=show_skipped,
+                installed_package_drift=installed_package_drift,
             )
             if preview_result.work_done:
                 try:
@@ -1942,6 +1988,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 restart_failed_batch=restart_failed_batch,
                 max_recovery_attempts=max_recovery_attempts,
                 show_skipped=show_skipped,
+                installed_package_drift=installed_package_drift,
             )
 
             current_snapshot = _task_snapshot(store)

@@ -28,9 +28,12 @@ from gza.cli.watch import (
     _emit_transition_events,
     _format_elapsed,
     _format_wake_message,
+    _installed_gza_package_fingerprint,
+    _InstalledPackageDriftState,
     _query_owner_rows,
     _run_cycle,
     _task_snapshot,
+    _warn_if_installed_gza_changed,
     _watch_iterate_impl_target,
     _WatchLog,
     cmd_watch,
@@ -6324,6 +6327,69 @@ def test_watch_log_inserts_blank_line_between_cycles(tmp_path: Path, capsys: pyt
         "\n"
         "18:13:47 WAKE      checking... (1 running, 0 pending, 0 slots)\n"
     )
+
+
+def test_installed_gza_package_fingerprint_changes_only_when_python_source_changes(tmp_path: Path) -> None:
+    """Package fingerprint should ignore mtimes and change when Python contents change."""
+    package_root = tmp_path / "gza"
+    package_root.mkdir()
+    alpha = package_root / "alpha.py"
+    beta = package_root / "nested" / "beta.py"
+    ignored = package_root / "notes.txt"
+    beta.parent.mkdir()
+    alpha.write_text("VALUE = 1\n")
+    beta.write_text("NAME = 'beta'\n")
+    ignored.write_text("ignored\n")
+
+    original = _installed_gza_package_fingerprint(package_root)
+
+    alpha.touch()
+    ignored.write_text("changed\n")
+    assert _installed_gza_package_fingerprint(package_root) == original
+
+    beta.write_text("NAME = 'beta2'\n")
+    assert _installed_gza_package_fingerprint(package_root) != original
+
+
+def test_watch_warns_once_per_installed_package_drift(tmp_path: Path) -> None:
+    """Watch should emit one WARNING per newly observed installed-package fingerprint drift."""
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
+
+    with patch(
+        "gza.cli.watch._installed_gza_package_fingerprint",
+        side_effect=["startup", "changed-1", "changed-1", "changed-2"],
+    ):
+        log.begin_cycle()
+        _warn_if_installed_gza_changed(log, drift_state)
+        log.emit("WAKE", "checking... (0 running, 0 pending, 1 slots)")
+        log.end_cycle()
+
+        log.begin_cycle()
+        _warn_if_installed_gza_changed(log, drift_state)
+        log.emit("WAKE", "checking... (0 running, 0 pending, 1 slots)")
+        log.end_cycle()
+
+        log.begin_cycle()
+        _warn_if_installed_gza_changed(log, drift_state)
+        log.emit("WAKE", "checking... (0 running, 0 pending, 1 slots)")
+        log.end_cycle()
+
+        log.begin_cycle()
+        _warn_if_installed_gza_changed(log, drift_state)
+        log.emit("WAKE", "checking... (0 running, 0 pending, 1 slots)")
+        log.end_cycle()
+
+    warning_lines = [line for line in log_path.read_text().splitlines() if "WARNING" in line]
+    assert len(warning_lines) == 2
+    assert all(
+        line.endswith(
+            "WARNING   installed gza changed since watch started -- restart watch to pick up new code"
+        )
+        for line in warning_lines
+    )
+    assert drift_state.warned_fingerprint == "changed-2"
 
 
 def test_cmd_watch_exits_when_idle_reaches_max_idle(tmp_path: Path) -> None:
