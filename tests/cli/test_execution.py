@@ -1026,7 +1026,7 @@ class TestRetryCommand:
         original.provider_is_explicit = True
         store.update(original)
 
-        retry_task = _create_retry_task(store, original)
+        retry_task = _create_retry_task(store, original, trigger_source="manual")
         assert retry_task.based_on == original.id
         assert retry_task.prompt == original.prompt
         assert retry_task.task_type == original.task_type
@@ -1065,7 +1065,7 @@ class TestRetryCommand:
         failed_rebase.completed_at = datetime.now(UTC)
         store.update(failed_rebase)
 
-        retry_task = _create_retry_task(store, failed_rebase)
+        retry_task = _create_retry_task(store, failed_rebase, trigger_source="manual")
         assert retry_task.based_on == failed_rebase.id
         assert retry_task.same_branch is True
         assert retry_task.base_branch is None
@@ -1114,7 +1114,7 @@ class TestRetryCommand:
         failed_rebase.completed_at = datetime.now(UTC)
         store.update(failed_rebase)
 
-        retry_task = _create_retry_task(store, failed_rebase)
+        retry_task = _create_retry_task(store, failed_rebase, trigger_source="manual")
         assert retry_task.id is not None
         assert retry_task.same_branch is True
         assert retry_task.base_branch is None
@@ -1155,6 +1155,7 @@ class TestRetryCommand:
         assert retry_task.same_branch is True
         assert retry_task.base_branch is None
         assert retry_task.branch == impl.branch
+        assert retry_task.trigger_source == "manual"
 
     def test_create_retry_task_automatic_rebase_retry_chain_prefers_impl_merge_unit(self, tmp_path: Path):
         """Automatic rebase recovery should ignore orphan retry merge units."""
@@ -1197,7 +1198,12 @@ class TestRetryCommand:
         failed_rebase.completed_at = datetime.now(UTC)
         store.update(failed_rebase)
 
-        retry_task = _create_retry_task(store, failed_rebase, automatic_recovery=True)
+        retry_task = _create_retry_task(
+            store,
+            failed_rebase,
+            trigger_source="auto-recovery",
+            automatic_recovery=True,
+        )
         assert retry_task.id is not None
         assert retry_task.same_branch is True
         assert retry_task.base_branch is None
@@ -1240,7 +1246,12 @@ class TestRetryCommand:
 
         assert store.resolve_merge_unit_for_task(failed_improve.id) is None
 
-        retry_task = _create_retry_task(store, failed_improve, automatic_recovery=True)
+        retry_task = _create_retry_task(
+            store,
+            failed_improve,
+            trigger_source="auto-recovery",
+            automatic_recovery=True,
+        )
         assert retry_task.id is not None
         assert retry_task.same_branch is True
         assert retry_task.base_branch is None
@@ -1280,7 +1291,12 @@ class TestRetryCommand:
         store.update(failed_improve)
         store.attach_task_to_merge_unit(failed_improve.id, impl_unit.id, "improve")
 
-        retry_task = _create_retry_task(store, failed_improve, automatic_recovery=True)
+        retry_task = _create_retry_task(
+            store,
+            failed_improve,
+            trigger_source="auto-recovery",
+            automatic_recovery=True,
+        )
         assert retry_task.id is not None
         assert retry_task.same_branch is True
         assert retry_task.base_branch is None
@@ -1324,7 +1340,12 @@ class TestRetryCommand:
         store.attach_task_to_merge_unit(failed_improve.id, impl_unit.id, "improve")
 
         if creation_mode == "automatic":
-            retry_task = _create_retry_task(store, failed_improve, automatic_recovery=True)
+            retry_task = _create_retry_task(
+                store,
+                failed_improve,
+                trigger_source="auto-recovery",
+                automatic_recovery=True,
+            )
         else:
             result = run_gza("retry", str(failed_improve.id), "--queue", "--project", str(tmp_path))
             assert result.returncode == 0
@@ -1417,7 +1438,7 @@ class TestRetryCommand:
         failed.completed_at = datetime.now(UTC)
         store.update(failed)
 
-        resumed = _create_resume_task(store, failed)
+        resumed = _create_resume_task(store, failed, trigger_source="manual")
 
         # With the session_id carried over, the provider must be frozen as an
         # explicit override so the runner cannot re-route to a different backend.
@@ -1425,6 +1446,7 @@ class TestRetryCommand:
         assert resumed.provider == "codex"
         assert resumed.provider_is_explicit is True
         assert resumed.recovery_origin == "resume"
+        assert resumed.trigger_source == "manual"
 
     def test_retry_with_background_flag(self, tmp_path: Path):
         """Retry command with --background spawns a worker for the new task."""
@@ -5996,6 +6018,7 @@ class TestIterateCommand:
 
         context = AdvanceActionExecutionContext(
             store=store,
+            trigger_source="manual",
             dry_run=False,
             max_resume_attempts=max_resume_attempts,
             use_iterate_for_create_implement=False,
@@ -6325,7 +6348,7 @@ class TestIterateCommand:
                 return 0
             raise AssertionError(f"unexpected task id: {task_id}")
 
-        def fake_create_review_task(_store, _impl_task):
+        def fake_create_review_task(_store, _impl_task, *, trigger_source, **_kwargs):
             nonlocal review2
             current_review1 = store.get(review1.id)
             assert current_review1 is not None
@@ -6486,7 +6509,7 @@ class TestIterateCommand:
                 return 0
             raise AssertionError(f"unexpected task id: {task_id}")
 
-        def fake_create_review_task(_store, _impl_task):
+        def fake_create_review_task(_store, _impl_task, *, trigger_source, **_kwargs):
             nonlocal review2
             current_review1 = store.get(review1.id)
             assert current_review1 is not None
@@ -6746,12 +6769,12 @@ class TestIterateCommand:
             store.update(task)
             return 0
 
-        def fake_create_review_task(_store, _impl_task):
+        def fake_create_review_task(_store, _impl_task, *, trigger_source, **_kwargs):
             if review_count == 0:
                 return review1
             return store.add(f"Review {review_count + 1}", task_type="review", depends_on=impl.id)
 
-        def fake_create_improve_task(_store, _impl_task, review_task):
+        def fake_create_improve_task(_store, _impl_task, review_task, *, trigger_source, **_kwargs):
             nonlocal improve_count
             improve_count += 1
             return store.add(
@@ -11529,7 +11552,7 @@ class TestIterateCommand:
                 return 0
             raise AssertionError(f"unexpected task id: {task_id}")
 
-        def fake_create_review_task(_store, _impl_task):
+        def fake_create_review_task(_store, _impl_task, *, trigger_source, **_kwargs):
             nonlocal next_review
             next_review = store.add("Closing review", task_type="review", depends_on=impl.id)
             return next_review

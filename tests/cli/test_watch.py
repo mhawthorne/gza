@@ -1197,6 +1197,7 @@ def test_watch_cycle_actionable_failed_descendant_still_spawns_recovery_worker(t
     recovery_children = store.get_based_on_children(failed_rebase.id)
     assert len(recovery_children) == 1
     assert recovery_children[0].id != failed_rebase.id
+    assert recovery_children[0].trigger_source == "watch"
 
 
 def test_watch_cycle_show_skipped_emits_skip_for_failed_descendant_without_attention(tmp_path: Path) -> None:

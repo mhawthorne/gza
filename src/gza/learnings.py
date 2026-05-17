@@ -292,6 +292,7 @@ def _run_learnings_task(
         prompt=prompt,
         task_type="internal",
         skip_learnings=True,
+        trigger_source="manual",
     )
 
     learn_task_id = learn_task.id

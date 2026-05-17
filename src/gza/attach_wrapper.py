@@ -164,7 +164,7 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
                 resume_task_id = decision.recovery_task_id
                 freshly_created = False
             else:
-                resume_task = _create_resume_task(store, task)
+                resume_task = _create_resume_task(store, task, trigger_source="auto-recovery")
                 assert resume_task.id is not None
                 resume_task_id = str(resume_task.id)
                 freshly_created = True
@@ -182,7 +182,7 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
                 resume_mode=True,
                 launch_mode="worker",
             )
-        resume_task = _create_resume_task(store, task)
+        resume_task = _create_resume_task(store, task, trigger_source="auto-recovery")
         assert resume_task.id is not None
         return _AttachHandoffTarget(
             task_id=str(resume_task.id),
@@ -195,7 +195,12 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
             retry_task_id = decision.recovery_task_id
             freshly_created = False
         else:
-            retry_task = _create_retry_task(store, task, automatic_recovery=True)
+            retry_task = _create_retry_task(
+                store,
+                task,
+                trigger_source="auto-recovery",
+                automatic_recovery=True,
+            )
             assert retry_task.id is not None
             retry_task_id = str(retry_task.id)
             freshly_created = True
@@ -214,7 +219,12 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
             resume_mode=False,
             launch_mode="worker",
         )
-    retry_task = _create_retry_task(store, task, automatic_recovery=True)
+    retry_task = _create_retry_task(
+        store,
+        task,
+        trigger_source="auto-recovery",
+        automatic_recovery=True,
+    )
     assert retry_task.id is not None
     return _AttachHandoffTarget(
         task_id=str(retry_task.id),

@@ -222,7 +222,13 @@ def test_create_rebase_task_prompt_forbids_remote_git_fallbacks(tmp_path: Path) 
     parent = store.add("Parent task", task_type="implement")
     assert parent.id is not None
 
-    rebase_task = _create_rebase_task(store, parent.id, "feature/test", "main")
+    rebase_task = _create_rebase_task(
+        store,
+        parent.id,
+        "feature/test",
+        "main",
+        trigger_source="manual",
+    )
 
     assert "local branch 'main'" in rebase_task.prompt
     assert "Use /gza-rebase --auto" in rebase_task.prompt

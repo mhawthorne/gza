@@ -1157,7 +1157,13 @@ def _run_cycle(
         def _create_rebase_from_task(parent_task: DbTask) -> DbTask:
             assert parent_task.id is not None
             assert parent_task.branch is not None
-            return _create_rebase_task(store, parent_task.id, parent_task.branch, target_branch)
+            return _create_rebase_task(
+                store,
+                parent_task.id,
+                parent_task.branch,
+                target_branch,
+                trigger_source="watch",
+            )
 
         def _create_implement_from_task(parent_task: DbTask) -> DbTask:
             assert parent_task.id is not None
@@ -1166,10 +1172,12 @@ def _run_cycle(
                 task_type="implement",
                 depends_on=parent_task.id,
                 tags=parent_task.tags,
+                trigger_source="watch",
             )
 
         executor_context = AdvanceActionExecutionContext(
             store=store,
+            trigger_source="watch",
             dry_run=dry_run,
             max_resume_attempts=max_recovery_attempts,
             use_iterate_for_create_implement=True,
@@ -1179,8 +1187,9 @@ def _run_cycle(
                 task,
                 rollback_on_failure=rollback_on_failure,
             ),
-            prepare_create_review=lambda t: _prepare_create_review_action(store, t),
-            create_resume_task=lambda t: _create_resume_task(store, t),
+            prepare_create_review=lambda t: _prepare_create_review_action(store, t, trigger_source="watch"),
+            create_resume_task=lambda t: _create_resume_task(store, t, trigger_source="watch"),
+            create_retry_task=lambda t: _create_retry_task(store, t, trigger_source="watch"),
             create_rebase_task=_create_rebase_from_task,
             create_implement_task=_create_implement_from_task,
             spawn_worker=_watch_spawn_worker,
@@ -1567,7 +1576,7 @@ def _run_cycle(
                     recovered_task = store.get(recovered_task_id)
                     assert recovered_task is not None
                 else:
-                    recovered_task = _create_resume_task(store, failed)
+                    recovered_task = _create_resume_task(store, failed, trigger_source="watch")
                     assert recovered_task.id is not None
                     recovered_task_id = str(recovered_task.id)
                 prepared_recovered_task = _prepare_task_for_immediate_execution(
@@ -1598,7 +1607,7 @@ def _run_cycle(
                     recovered_task = store.get(decision.recovery_task_id)
                     assert recovered_task is not None
                 else:
-                    recovered_task = _create_resume_task(store, failed)
+                    recovered_task = _create_resume_task(store, failed, trigger_source="watch")
                 prepared_recovered_task = _prepare_task_for_immediate_execution(
                     config,
                     recovered_task,
@@ -1652,7 +1661,12 @@ def _run_cycle(
                 assert existing_recovered_task is not None
                 recovered_task = existing_recovered_task
             else:
-                recovered_task = _create_retry_task(store, failed, automatic_recovery=True)
+                recovered_task = _create_retry_task(
+                    store,
+                    failed,
+                    trigger_source="watch",
+                    automatic_recovery=True,
+                )
                 assert recovered_task.id is not None
                 recovered_task_id = str(recovered_task.id)
             prepared_recovered_task = _prepare_task_for_immediate_execution(

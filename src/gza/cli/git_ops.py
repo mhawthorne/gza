@@ -1570,7 +1570,13 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         target = getattr(args, 'onto', None) or git.default_branch()
         if getattr(args, 'remote', False):
             target = f"origin/{target}"
-        rebase_task = _create_rebase_task(store, task_id, task.branch, target)
+        rebase_task = _create_rebase_task(
+            store,
+            task_id,
+            task.branch,
+            target,
+            trigger_source="manual",
+        )
         prepared_rebase_task = _prepare_task_for_immediate_execution(
             config,
             rebase_task,
@@ -1617,7 +1623,13 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     # Determine rebase target: use --onto if provided, else current branch
     rebase_target = getattr(args, 'onto', None) or current_branch
 
-    rebase_task = _create_rebase_task(store, task_id, task.branch, rebase_target)
+    rebase_task = _create_rebase_task(
+        store,
+        task_id,
+        task.branch,
+        rebase_target,
+        trigger_source="manual",
+    )
     assert rebase_task.id is not None
     rebase_task.branch = task.branch
     store.update(rebase_task)
@@ -2147,6 +2159,7 @@ def _cmd_advance_unimplemented(
             task_type="implement",
             depends_on=task.id,
             tags=task.tags,
+            trigger_source="manual",
         )
         print(f"✓ Created implement task {impl_task.id} for {task.task_type} {task.id}")
         created_count += 1
@@ -2178,10 +2191,15 @@ class _CreateReviewActionResult:
     message: str
 
 
-def _prepare_create_review_action(store: SqliteTaskStore, task: DbTask) -> _CreateReviewActionResult:
+def _prepare_create_review_action(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    trigger_source: str,
+) -> _CreateReviewActionResult:
     """Create or resolve the review task for an advance-style create_review action."""
     try:
-        review_task = _create_review_task(store, task)
+        review_task = _create_review_task(store, task, trigger_source=trigger_source)
     except DuplicateReviewError as exc:
         review_task = exc.active_review
         return _CreateReviewActionResult(
@@ -2253,6 +2271,7 @@ def _execute_merge_action(
                 review_task=review_task,
                 impl_task=merge_subject,
                 findings=followup_findings,
+                trigger_source="manual",
             )
 
     assert task.id is not None
@@ -2567,7 +2586,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
         def _create_rebase_from_task(parent_task: DbTask) -> DbTask:
             assert parent_task.id is not None
             assert parent_task.branch is not None
-            return _create_rebase_task(store, parent_task.id, parent_task.branch, target_branch)
+            return _create_rebase_task(
+                store,
+                parent_task.id,
+                parent_task.branch,
+                target_branch,
+                trigger_source="manual",
+            )
 
         def _create_implement_from_task(parent_task: DbTask) -> DbTask:
             assert parent_task.id is not None
@@ -2576,10 +2601,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 task_type="implement",
                 depends_on=parent_task.id,
                 tags=parent_task.tags,
+                trigger_source="manual",
             )
 
         return AdvanceActionExecutionContext(
             store=store,
+            trigger_source="manual",
             dry_run=dry_run_mode,
             max_resume_attempts=max_resume_attempts,
             use_iterate_for_create_implement=use_iterate_mode,
@@ -2589,9 +2616,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 task,
                 rollback_on_failure=rollback_on_failure,
             ),
-            prepare_create_review=lambda t: _prepare_create_review_action(store, t),
-            create_resume_task=lambda t: _create_resume_task(store, t),
-            create_retry_task=lambda t: _create_retry_task(store, t),
+            prepare_create_review=lambda t: _prepare_create_review_action(store, t, trigger_source="manual"),
+            create_resume_task=lambda t: _create_resume_task(store, t, trigger_source="manual"),
+            create_retry_task=lambda t: _create_retry_task(store, t, trigger_source="manual"),
             create_rebase_task=_create_rebase_from_task,
             create_implement_task=_create_implement_from_task,
             spawn_worker=lambda task_obj, _kind: _spawn_background_worker(

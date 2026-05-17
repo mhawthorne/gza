@@ -28,6 +28,7 @@ class AdvanceActionExecutionContext:
     """Execution dependencies for a single advance action."""
 
     store: SqliteTaskStore
+    trigger_source: str
     dry_run: bool
     max_resume_attempts: int
     use_iterate_for_create_implement: bool
@@ -500,10 +501,19 @@ def execute_advance_action(
             if context.create_retry_task is not None:
                 improve_task = context.create_retry_task(failed_improve)
             else:
-                improve_task = _create_retry_task(context.store, failed_improve)
+                improve_task = _create_retry_task(
+                    context.store,
+                    failed_improve,
+                    trigger_source=context.trigger_source,
+                )
         else:
             try:
-                improve_task = _create_improve_task(context.store, task, review_task)
+                improve_task = _create_improve_task(
+                    context.store,
+                    task,
+                    review_task,
+                    trigger_source=context.trigger_source,
+                )
             except ValueError as exc:
                 return AdvanceActionExecutionResult(
                     action_type=action_type,

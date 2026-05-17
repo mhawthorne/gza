@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from gza.cli._common import resolve_improve_action
+from gza.cli._common import _create_retry_task, resolve_improve_action
 from gza.cli.advance_executor import (
     AdvanceActionExecutionContext,
     AdvanceActionExecutionResult,
@@ -75,6 +75,7 @@ def test_improve_dry_run_modes_do_not_mutate_db(
     before_count = len(store.get_all())
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=True,
         max_resume_attempts=3,
         use_iterate_for_create_implement=False,
@@ -151,6 +152,7 @@ def test_improve_manual_review_returns_skip_without_mutation(tmp_path: Path) -> 
     before_count = len(store.get_all())
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=False,
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
@@ -208,6 +210,7 @@ def test_improve_dry_run_preserves_noop_warning_description(tmp_path: Path) -> N
 
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=True,
         max_resume_attempts=3,
         use_iterate_for_create_implement=False,
@@ -365,6 +368,7 @@ def test_improve_give_up_reports_automatic_recovery_disabled(tmp_path: Path) -> 
     before_count = len(store.get_all())
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=False,
         max_resume_attempts=0,
         use_iterate_for_create_implement=False,
@@ -401,7 +405,11 @@ def test_improve_give_up_reports_automatic_recovery_disabled(tmp_path: Path) -> 
     assert len(store.get_all()) == before_count
 
 
-def test_improve_retry_preserves_review_backed_execution_settings(tmp_path: Path) -> None:
+@pytest.mark.parametrize("trigger_source", ["manual", "watch"])
+def test_improve_retry_uses_context_trigger_source_and_preserves_review_backed_execution_settings(
+    tmp_path: Path,
+    trigger_source: str,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -438,6 +446,7 @@ def test_improve_retry_preserves_review_backed_execution_settings(tmp_path: Path
     spawned: list[tuple[str, str]] = []
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source=trigger_source,
         dry_run=False,
         max_resume_attempts=3,
         use_iterate_for_create_implement=False,
@@ -469,10 +478,15 @@ def test_improve_retry_preserves_review_backed_execution_settings(tmp_path: Path
     assert result.created_task.model == "gpt-5.4"
     assert result.created_task.provider == "codex"
     assert result.created_task.provider_is_explicit is True
+    assert result.created_task.trigger_source == trigger_source
     assert spawned == [(result.created_task.id, "improve")]
 
 
-def test_improve_executor_allows_followup_after_completed_noop_improve(tmp_path: Path) -> None:
+@pytest.mark.parametrize("trigger_source", ["manual", "watch"])
+def test_improve_executor_uses_context_trigger_source_for_followup_after_completed_noop_improve(
+    tmp_path: Path,
+    trigger_source: str,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -504,6 +518,7 @@ def test_improve_executor_allows_followup_after_completed_noop_improve(tmp_path:
     spawned: list[tuple[str, str]] = []
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source=trigger_source,
         dry_run=False,
         max_resume_attempts=3,
         use_iterate_for_create_implement=False,
@@ -530,6 +545,7 @@ def test_improve_executor_allows_followup_after_completed_noop_improve(tmp_path:
     assert result.created_task.id is not None
     assert result.created_task.based_on == noop_improve.id
     assert result.created_task.depends_on == review.id
+    assert result.created_task.trigger_source == trigger_source
     assert spawned == [(result.created_task.id, "improve")]
 
 
@@ -544,6 +560,7 @@ def test_create_review_skip_propagates_message_without_spawning(tmp_path: Path) 
 
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=False,
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
@@ -581,6 +598,7 @@ def test_create_review_can_route_through_iterate_before_creating_child(tmp_path:
     spawned: list[tuple[str, str]] = []
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=False,
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
@@ -637,6 +655,7 @@ def test_run_improve_can_return_fail_closed_iterate_skip_result(tmp_path: Path) 
     )
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=False,
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
@@ -697,6 +716,7 @@ def test_reused_failed_task_recovery_reports_reuse_message(
     spawned: list[tuple[str, str]] = []
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=False,
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
@@ -731,6 +751,48 @@ def test_reused_failed_task_recovery_reports_reuse_message(
     assert spawned == [(reused.id, expected_kind)]
 
 
+@pytest.mark.parametrize("trigger_source", ["manual", "watch"])
+def test_retry_action_uses_context_retry_factory_trigger_source(
+    tmp_path: Path,
+    trigger_source: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed task", task_type="plan")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    spawned: list[tuple[str, str]] = []
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source=trigger_source,
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_retry_task=lambda task: _create_retry_task(store, task, trigger_source=trigger_source),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda task_obj, kind: spawned.append((str(task_obj.id), kind)) or 0,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+    )
+
+    result = execute_advance_action(task=failed, action={"type": "retry"}, context=context)
+
+    assert result.status == "success"
+    assert result.created_task is not None
+    assert result.created_task.trigger_source == trigger_source
+    assert spawned == [(result.created_task.id, "plan")]
+
+
 def test_create_implement_uses_shared_lineage_and_selected_spawn_path(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -753,6 +815,7 @@ def test_create_implement_uses_shared_lineage_and_selected_spawn_path(tmp_path: 
 
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=False,
         max_resume_attempts=1,
         use_iterate_for_create_implement=True,
@@ -788,6 +851,7 @@ def test_needs_rebase_dry_run_does_not_create_task(tmp_path: Path) -> None:
     before_count = len(store.get_all())
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=True,
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
@@ -822,6 +886,7 @@ def test_advance_executor_skips_needs_rebase_if_target_already_merged_before_cre
 
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=False,
         max_resume_attempts=1,
         use_iterate_for_create_implement=False,
@@ -876,6 +941,7 @@ def test_needs_rebase_iterate_rolls_back_when_prepare_fails(tmp_path: Path) -> N
 
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=False,
         max_resume_attempts=1,
         use_iterate_for_create_implement=True,
@@ -947,6 +1013,7 @@ def test_needs_rebase_iterate_hands_prepared_metadata_to_spawn(tmp_path: Path) -
 
     context = AdvanceActionExecutionContext(
         store=store,
+        trigger_source="manual",
         dry_run=False,
         max_resume_attempts=1,
         use_iterate_for_create_implement=True,

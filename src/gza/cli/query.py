@@ -129,12 +129,17 @@ _TASK_FIELDS_WITHOUT_NEXT_ACTION: tuple[str, ...] = tuple(
     for field_name in _HISTORY_PROJECTION_FIELDS
     if field_name not in {"next_action", "next_action_reason", "next_action_owner_id"}
 )
-_HISTORY_EXPLICIT_PROJECTION_FIELDS: tuple[str, ...] = _TASK_FIELDS_WITHOUT_NEXT_ACTION
-_SEARCH_EXPLICIT_PROJECTION_FIELDS: tuple[str, ...] = _TASK_FIELDS_WITHOUT_NEXT_ACTION
+_TASK_EXPLICIT_PROJECTION_FIELDS: tuple[str, ...] = (
+    *_TASK_FIELDS_WITHOUT_NEXT_ACTION,
+    "trigger_source",
+)
+_HISTORY_EXPLICIT_PROJECTION_FIELDS: tuple[str, ...] = _TASK_EXPLICIT_PROJECTION_FIELDS
+_SEARCH_EXPLICIT_PROJECTION_FIELDS: tuple[str, ...] = _TASK_EXPLICIT_PROJECTION_FIELDS
 _INCOMPLETE_PROJECTION_FIELDS: tuple[str, ...] = _projection_fields(
     _TaskProjectionSpec(preset=_TaskProjectionPreset.INCOMPLETE_SUMMARY),
     scope="lineages",
 )
+_INCOMPLETE_PROJECTION_FIELDS = (*_INCOMPLETE_PROJECTION_FIELDS, "trigger_source")
 _INCOMPLETE_BLOCKED_DROPPED_PROJECTION_FIELDS: tuple[str, ...] = (
     "id",
     "prompt",
@@ -3110,6 +3115,10 @@ def _cmd_show_output(
         )
     if task.execution_mode:
         console.print(f"[{c['label']}]Execution Mode:[/{c['label']}] [{c['value']}]{task.execution_mode}[/{c['value']}]")
+    console.print(
+        f"[{c['label']}]Trigger Source:[/{c['label']}] "
+        f"[{c['value']}]{task.trigger_source or 'unknown'}[/{c['value']}]"
+    )
     if task.slug:
         console.print(f"[{c['label']}]Slug:[/{c['label']}] [{c['value']}]{task.slug}[/{c['value']}]")
     if task.based_on:

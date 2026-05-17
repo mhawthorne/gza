@@ -91,6 +91,7 @@ def create_review_task(
     store: SqliteTaskStore,
     impl_task: Task,
     *,
+    trigger_source: str,
     model: str | None = None,
     provider: str | None = None,
     prompt_mode: Literal["cli", "auto"] = "cli",
@@ -136,6 +137,7 @@ def create_review_task(
         based_on=impl_task.id,
         model=model,
         provider=provider,
+        trigger_source=trigger_source,
     )
     impl_unit = store.resolve_merge_unit_for_task(impl_task.id)
     if impl_unit is not None:
@@ -210,6 +212,7 @@ def create_or_reuse_followup_task(
     review_task: Task,
     impl_task: Task,
     finding: ReviewFinding,
+    trigger_source: str,
 ) -> tuple[Task, bool]:
     """Create or reuse an idempotent follow-up task for a parsed FOLLOWUP finding.
 
@@ -242,5 +245,6 @@ def create_or_reuse_followup_task(
         based_on=review_task.id,
         depends_on=impl_task.id,
         tags=inherited_tags,
+        trigger_source=trigger_source,
     )
     return created, True

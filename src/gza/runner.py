@@ -2565,7 +2565,7 @@ def _create_and_run_review_task(
 
     try:
         review_task = create_review_task(
-            store, review_target, prompt_mode="auto",
+            store, review_target, trigger_source="auto-recovery", prompt_mode="auto",
             project_prefix=config.project_prefix or None,
         )
     except DuplicateReviewError as e:
@@ -4177,7 +4177,7 @@ def _create_fix_follow_up_review_task(task: Task, store: SqliteTaskStore) -> Non
         return
 
     try:
-        review_task = create_review_task(store, root_impl, prompt_mode="auto")
+        review_task = create_review_task(store, root_impl, trigger_source="auto-recovery", prompt_mode="auto")
     except DuplicateReviewError as exc:
         active = exc.active_review
         print(

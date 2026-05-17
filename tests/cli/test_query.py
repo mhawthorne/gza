@@ -3465,6 +3465,24 @@ class TestShowCommand:
         assert result.returncode == 0
         assert "Execution Mode: skill_inline" in result.stdout
 
+    def test_show_displays_trigger_source_and_unknown_for_legacy_rows(self, tmp_path: Path):
+        """Show command should surface trigger source and label legacy NULL rows as unknown."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        manual = store.add("Task with trigger source", trigger_source="manual")
+        legacy = store.add("Legacy task without trigger source")
+        assert manual.id is not None
+        assert legacy.id is not None
+
+        manual_result = run_gza("show", str(manual.id), "--project", str(tmp_path))
+        legacy_result = run_gza("show", str(legacy.id), "--project", str(tmp_path))
+
+        assert manual_result.returncode == 0
+        assert "Trigger Source: manual" in manual_result.stdout
+        assert legacy_result.returncode == 0
+        assert "Trigger Source: unknown" in legacy_result.stdout
+
     def test_show_review_displays_verdict_and_score(self, tmp_path: Path):
         """Show command includes derived review verdict and score metadata."""
         setup_config(tmp_path)
@@ -11699,6 +11717,28 @@ class TestIncompleteCommand:
 
         assert result.returncode == 0
         assert json.loads(result.stdout) == [{"id": task.id, "status": "failed"}]
+        assert result.stderr == ""
+
+    def test_incomplete_cli_json_fields_can_project_trigger_source(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("cli json trigger source", task_type="implement", trigger_source="watch")
+        task.status = "failed"
+        task.completed_at = datetime.now(UTC)
+        task.failure_reason = "TEST_FAILURE"
+        store.update(task)
+
+        result = run_gza(
+            "incomplete",
+            "--json",
+            "--fields",
+            "id,trigger_source",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == [{"id": task.id, "trigger_source": "watch"}]
         assert result.stderr == ""
 
     def test_incomplete_cli_json_hides_merged_owner_with_orphan_same_branch_descendant(self, tmp_path: Path):

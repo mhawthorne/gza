@@ -193,26 +193,26 @@ class TestCreateReviewTask:
         store = self._mock_store()
         task = _task(task_type="explore")
         with pytest.raises(ValueError, match="explore task"):
-            create_review_task(store, task)
+            create_review_task(store, task, trigger_source="manual")
 
     def test_rejects_non_completed_task(self):
         store = self._mock_store()
         task = _task(status="failed")
         with pytest.raises(ValueError, match="failed"):
-            create_review_task(store, task)
+            create_review_task(store, task, trigger_source="manual")
 
     def test_rejects_none_id(self):
         store = self._mock_store()
         task = _task(id=None, status="completed")
         with pytest.raises(ValueError, match="without an ID"):
-            create_review_task(store, task)
+            create_review_task(store, task, trigger_source="manual")
 
     def test_raises_duplicate_review_error_for_pending(self):
         active = _task(id=50, task_type="review", status="pending")
         store = self._mock_store(existing_reviews=[active])
         task = _task(id=10)
         with pytest.raises(DuplicateReviewError) as exc_info:
-            create_review_task(store, task)
+            create_review_task(store, task, trigger_source="manual")
         assert exc_info.value.active_review is active
 
     def test_raises_duplicate_review_error_for_in_progress(self):
@@ -220,13 +220,13 @@ class TestCreateReviewTask:
         store = self._mock_store(existing_reviews=[active])
         task = _task(id=10)
         with pytest.raises(DuplicateReviewError):
-            create_review_task(store, task)
+            create_review_task(store, task, trigger_source="manual")
 
     def test_allows_review_when_existing_are_completed(self):
         completed = _task(id=50, task_type="review", status="completed")
         store = self._mock_store(existing_reviews=[completed])
         task = _task(id=10)
-        result = create_review_task(store, task)
+        result = create_review_task(store, task, trigger_source="manual")
         assert result is not None
         store.add.assert_called_once()
 
@@ -239,7 +239,7 @@ class TestCreateReviewTask:
             group="mygroup",
             based_on=None,
         )
-        create_review_task(store, task, prompt_mode="auto")
+        create_review_task(store, task, trigger_source="manual", prompt_mode="auto")
         call_kwargs = store.add.call_args[1]
         assert call_kwargs["prompt"] == "review add-feature"
         assert call_kwargs["task_type"] == "review"
@@ -257,7 +257,7 @@ class TestCreateReviewTask:
             depends_on=None,
         )
         store.get.side_effect = lambda task_id: parent if task_id == "gza-11" else None
-        create_review_task(store, impl, prompt_mode="auto")
+        create_review_task(store, impl, trigger_source="manual", prompt_mode="auto")
         assert store.add.call_args[1]["prompt"] == "review add-feature"
 
     @patch("gza.review_tasks.PromptBuilder")
@@ -266,14 +266,14 @@ class TestCreateReviewTask:
         mock_builder.review_task_prompt.return_value = "cli review prompt"
         store = self._mock_store()
         task = _task(id=10, prompt="implement widgets")
-        create_review_task(store, task, prompt_mode="cli")
+        create_review_task(store, task, trigger_source="manual", prompt_mode="cli")
         mock_builder.review_task_prompt.assert_called_once_with(10, "implement widgets")
         assert store.add.call_args[1]["prompt"] == "cli review prompt"
 
     def test_passes_model_and_provider(self):
         store = self._mock_store()
         task = _task(id=10)
-        create_review_task(store, task, model="opus-4", provider="anthropic", prompt_mode="auto")
+        create_review_task(store, task, trigger_source="manual", model="opus-4", provider="anthropic", prompt_mode="auto")
         call_kwargs = store.add.call_args[1]
         assert call_kwargs["model"] == "opus-4"
         assert call_kwargs["provider"] == "anthropic"
@@ -281,7 +281,7 @@ class TestCreateReviewTask:
     def test_model_and_provider_default_to_none(self):
         store = self._mock_store()
         task = _task(id=10)
-        create_review_task(store, task, prompt_mode="auto")
+        create_review_task(store, task, trigger_source="manual", prompt_mode="auto")
         call_kwargs = store.add.call_args[1]
         assert call_kwargs["model"] is None
         assert call_kwargs["provider"] is None
@@ -289,7 +289,7 @@ class TestCreateReviewTask:
     def test_review_is_based_on_implementation_task_id(self):
         store = self._mock_store()
         task = _task(id="gza-12", based_on="gza-11")
-        create_review_task(store, task, prompt_mode="auto")
+        create_review_task(store, task, trigger_source="manual", prompt_mode="auto")
         call_kwargs = store.add.call_args[1]
         assert call_kwargs["depends_on"] == "gza-12"
         assert call_kwargs["based_on"] == "gza-12"
@@ -300,7 +300,7 @@ class TestCreateReviewTask:
         unit = MagicMock()
         store.resolve_merge_unit_for_task.return_value = unit
 
-        create_review_task(store, impl, prompt_mode="auto")
+        create_review_task(store, impl, trigger_source="manual", prompt_mode="auto")
 
         store.resolve_merge_unit_for_task.assert_called_once_with("gza-12")
         review_task = store.add.return_value
@@ -409,6 +409,7 @@ class TestFollowupTasks:
             review_task=review_task,
             impl_task=impl_task,
             finding=finding,
+            trigger_source="manual",
         )
         assert reused is existing
         assert created_now is False
@@ -446,6 +447,7 @@ class TestFollowupTasks:
             review_task=review_task,
             impl_task=impl_task,
             finding=finding,
+            trigger_source="manual",
         )
         assert created is created_task
         assert created_now is True

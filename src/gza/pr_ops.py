@@ -101,6 +101,7 @@ def _generate_pr_content(
         prompt=prompt,
         task_type="internal",
         skip_learnings=True,
+        trigger_source="manual",
     )
 
     if internal_task.id is None:

@@ -1344,6 +1344,7 @@ class TestReviewContextFromChain:
             review_task=review_task,
             impl_task=impl_task,
             finding=followup_finding,
+            trigger_source="manual",
         )
         assert created_now is True
 
@@ -2197,6 +2198,9 @@ class TestReviewTaskSlugGeneration:
 
             # Verify failure code is returned
             assert exit_code == 1
+            created_reviews = store.get_reviews_for_task(impl_task.id)
+            assert len(created_reviews) == 1
+            assert created_reviews[0].trigger_source == "auto-recovery"
         finally:
             gza.runner.run = original_run
 
@@ -7021,7 +7025,12 @@ class TestExtractedRunInnerHelpers:
         failed_rebase.completed_at = datetime.now(UTC)
         store.update(failed_rebase)
 
-        first_recovery = _create_retry_task(store, failed_rebase, automatic_recovery=True)
+        first_recovery = _create_retry_task(
+            store,
+            failed_rebase,
+            trigger_source="auto-recovery",
+            automatic_recovery=True,
+        )
         assert first_recovery.id is not None
         first_recovery.slug = "20260512-rebase-branch-orphan"
         first_recovery.status = "failed"
@@ -7030,7 +7039,12 @@ class TestExtractedRunInnerHelpers:
         first_recovery.completed_at = datetime.now(UTC)
         store.update(first_recovery)
 
-        second_recovery = _create_retry_task(store, first_recovery, automatic_recovery=True)
+        second_recovery = _create_retry_task(
+            store,
+            first_recovery,
+            trigger_source="auto-recovery",
+            automatic_recovery=True,
+        )
         assert second_recovery.id is not None
         second_recovery.slug = "20260512-rebase-branch-orphan-2"
         assert second_recovery.same_branch is True
@@ -11162,6 +11176,7 @@ class TestDependencyMergePrecondition:
             review_task=review,
             impl_task=impl,
             finding=finding,
+            trigger_source="manual",
         )
         assert created_now is True
         assert followup.depends_on == impl.id

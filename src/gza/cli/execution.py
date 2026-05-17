@@ -473,6 +473,7 @@ def _create_extract_task(
         model=model,
         provider=provider,
         skip_learnings=skip_learnings,
+        trigger_source="manual",
     )
 
     bundle_dir: Path | None = None
@@ -809,6 +810,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
         model=model,
         provider=provider,
         skip_learnings=skip_learnings,
+        trigger_source="manual",
     )
     assert impl_task.id is not None
 
@@ -1218,6 +1220,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             provider=provider,
             recovery_origin=recovery_origin,
             skip_learnings=skip_learnings,
+            trigger_source="manual",
         )
         if mark_next:
             assert task.id is not None
@@ -1243,6 +1246,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             provider=provider,
             recovery_origin=recovery_origin,
             skip_learnings=skip_learnings,
+            trigger_source="manual",
         )
         if not new_task:
             return 1
@@ -1269,6 +1273,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             provider=provider,
             recovery_origin=recovery_origin,
             skip_learnings=skip_learnings,
+            trigger_source="manual",
         )
         if mark_next:
             assert task.id is not None
@@ -1580,7 +1585,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
     if successful_retry:
         return phase1_error(args, f"Task {task_id} already has a successful retry ({successful_retry.id}).")
 
-    new_task = _create_retry_task(store, task)
+    new_task = _create_retry_task(store, task, trigger_source="manual")
     assert new_task.id is not None
 
     def _emit_retry_created() -> None:
@@ -2061,7 +2066,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
         elif comments_action == "resume":
             assert existing_comments_improve is not None and existing_comments_improve.id is not None
             improve_task = _apply_comments_only_invocation_overrides(
-                _create_resume_task(store, existing_comments_improve)
+                _create_resume_task(store, existing_comments_improve, trigger_source="manual")
             )
             action_message = f"Created improve task {improve_task.id} (resume of {existing_comments_improve.id})"
         elif comments_action == "retry":
@@ -2071,7 +2076,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
             # reset to the current invocation defaults instead of inheriting
             # stale values from the failed improve task.
             improve_task = _apply_comments_only_invocation_overrides(
-                _create_retry_task(store, existing_comments_improve)
+                _create_retry_task(store, existing_comments_improve, trigger_source="manual")
             )
             action_message = f"Created improve task {improve_task.id} (retry of {existing_comments_improve.id})"
         else:
@@ -2080,6 +2085,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
                     store,
                     impl_task,
                     None,
+                    trigger_source="manual",
                     create_review=create_review,
                     create_pr=create_pr,
                     model=model,
@@ -2094,6 +2100,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
                 store,
                 impl_task,
                 review_task,
+                trigger_source="manual",
                 create_review=create_review,
                 create_pr=create_pr,
                 model=model,
@@ -2192,6 +2199,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
         tags=impl_task.tags,
         model=args.model if hasattr(args, "model") and args.model else None,
         provider=args.provider if hasattr(args, "provider") and args.provider else None,
+        trigger_source="manual",
     )
     assert fix_task.id is not None
 
@@ -2281,7 +2289,13 @@ def cmd_review(args: argparse.Namespace) -> int:
     model = args.model if hasattr(args, 'model') and args.model else None
     provider = args.provider if hasattr(args, 'provider') and args.provider else None
     try:
-        review_task = _create_review_task(store, impl_task, model=model, provider=provider)
+        review_task = _create_review_task(
+            store,
+            impl_task,
+            trigger_source="manual",
+            model=model,
+            provider=provider,
+        )
     except DuplicateReviewError as e:
         review = e.active_review
         print_phase1_message(args, f"Warning: A review task already exists for implementation {impl_task.id}")
@@ -2591,8 +2605,8 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                         )
                         return None, None
                     return (existing_resume, target_decision), None
-                return (_create_resume_task(store, target_failed_task), target_decision), None
-            return (_create_resume_task(store, target_failed_task), target_decision), None
+                return (_create_resume_task(store, target_failed_task, trigger_source="manual"), target_decision), None
+            return (_create_resume_task(store, target_failed_task, trigger_source="manual"), target_decision), None
         if decision.action != "resume":
             return None, (failed_task, decision)
         if decision.reuse_existing and decision.recovery_task_id is not None:
@@ -2605,7 +2619,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 )
                 return None, None
             return (existing_resume, decision), None
-        return (_create_resume_task(store, failed_task), decision), None
+        return (_create_resume_task(store, failed_task, trigger_source="manual"), decision), None
 
     engine_config = _AdvanceEngineConfigAdapter(
         project_dir=config.project_dir,
@@ -2947,7 +2961,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             if action_type == "create_review":
                 rollback_on_failure = True
                 try:
-                    action_task = _create_review_task(store, iterate_task)
+                    action_task = _create_review_task(store, iterate_task, trigger_source="auto-recovery")
                 except DuplicateReviewError as exc:
                     action_task = exc.active_review
                     if action_task.status != "pending":
@@ -3010,6 +3024,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     iterate_task.id,
                     iterate_task.branch,
                     preflight_context.target_branch,
+                    trigger_source="auto-recovery",
                 )
                 prepared_task = _prepare_task_for_immediate_execution(
                     config,
@@ -3066,15 +3081,20 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     return None, None
                 initial_resume = False
                 if improve_action == "resume" and failed_improve is not None:
-                    action_task = _create_resume_task(store, failed_improve)
+                    action_task = _create_resume_task(store, failed_improve, trigger_source="auto-recovery")
                     rollback_on_failure = True
                     initial_resume = True
                 elif improve_action == "retry" and failed_improve is not None:
-                    action_task = _create_retry_task(store, failed_improve)
+                    action_task = _create_retry_task(store, failed_improve, trigger_source="auto-recovery")
                     rollback_on_failure = True
                 else:
                     try:
-                        action_task = _create_improve_task(store, iterate_task, review_task)
+                        action_task = _create_improve_task(
+                            store,
+                            iterate_task,
+                            review_task,
+                            trigger_source="auto-recovery",
+                        )
                     except ValueError as exc:
                         print_phase1_message(args, f"  Error creating improve task: {exc}")
                         return None, 1
@@ -3163,7 +3183,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 None,
             )
         if use_retry:
-            run_start_task = _create_retry_task(store, iterate_task)
+            run_start_task = _create_retry_task(store, iterate_task, trigger_source="manual")
             prepared_task = _prepare_task_for_immediate_execution(
                 config,
                 run_start_task,
@@ -3410,7 +3430,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             if dry_run:
                 print(f"[dry-run] Would retry failed implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
                 return 0
-            run_start_task = _create_retry_task(store, impl_task)
+            run_start_task = _create_retry_task(store, impl_task, trigger_source="manual")
             _print_iterate_failed_start_message(
                 impl_task,
                 run_start_task,
@@ -3583,6 +3603,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             review_task=review_task,
             impl_task=impl_task,
             findings=followup_findings,
+            trigger_source="auto-recovery",
         )
         for followup_task in created_tasks:
             _append_summary_row(
@@ -3694,7 +3715,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         action_task: DbTask | None = None
         if action_type == "create_review":
             try:
-                action_task = _create_review_task(store, current_impl_task)
+                action_task = _create_review_task(store, current_impl_task, trigger_source="auto-recovery")
             except DuplicateReviewError as e:
                 action_task = e.active_review
                 assert action_task.id is not None
@@ -3932,7 +3953,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         prepared_review_task_id = action.get("_prepared_review_task_id")
 
         if action_type == "resume":
-            action_task = _create_resume_task(store, impl_task)
+            action_task = _create_resume_task(store, impl_task, trigger_source="manual")
             assert action_task.id is not None
             initial_resume = True
             print(f"  Resuming implementation as {action_task.id}...")
@@ -3956,7 +3977,13 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 print("  Skipping rebase: target implementation already merged.")
                 continue
             else:
-                action_task = _create_rebase_task(store, impl_task.id, impl_task.branch, target_branch)
+                action_task = _create_rebase_task(
+                    store,
+                    impl_task.id,
+                    impl_task.branch,
+                    target_branch,
+                    trigger_source="manual",
+                )
                 assert action_task.id is not None
                 print(f"  Created rebase task {action_task.id}...")
         elif action_type == "create_review":
@@ -3966,7 +3993,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 print(f"  Running review {action_task.id}...")
             else:
                 try:
-                    action_task = _create_review_task(store, impl_task)
+                    action_task = _create_review_task(store, impl_task, trigger_source="manual")
                 except DuplicateReviewError as e:
                     action_task = e.active_review
                     assert action_task.id is not None
@@ -4107,16 +4134,21 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     break
                 if improve_action == "resume" and failed_improve is not None:
                     assert failed_improve.id is not None
-                    action_task = _create_resume_task(store, failed_improve)
+                    action_task = _create_resume_task(store, failed_improve, trigger_source="manual")
                     initial_resume = True
                     print(f"  Created improve task {action_task.id} (resume of {failed_improve.id})")
                 elif improve_action == "retry" and failed_improve is not None:
                     assert failed_improve.id is not None
-                    action_task = _create_retry_task(store, failed_improve)
+                    action_task = _create_retry_task(store, failed_improve, trigger_source="manual")
                     print(f"  Created improve task {action_task.id} (retry of {failed_improve.id})")
                 else:
                     try:
-                        action_task = _create_improve_task(store, impl_task, review_task)
+                        action_task = _create_improve_task(
+                            store,
+                            impl_task,
+                            review_task,
+                            trigger_source="manual",
+                        )
                     except ValueError as e:
                         print(f"  Error creating improve task: {e}")
                         final_status = "blocked"
@@ -4384,7 +4416,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     # Create a new task (like retry) to track this resumed run.
     # The original task stays failed with its stats preserved.
-    new_task = _create_resume_task(store, task)
+    new_task = _create_resume_task(store, task, trigger_source="manual")
     assert new_task.id is not None
 
     def _emit_resume_created() -> None:

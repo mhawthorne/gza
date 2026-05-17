@@ -1400,6 +1400,8 @@ def _create_rebase_task(
     parent_task_id: str,
     branch: str,
     target_branch: str,
+    *,
+    trigger_source: str,
 ) -> DbTask:
     """Create a rebase task for resolving merge conflicts.
 
@@ -1419,6 +1421,7 @@ def _create_rebase_task(
         based_on=parent_task_id,
         same_branch=True,
         skip_learnings=True,
+        trigger_source=trigger_source,
     )
 
 
@@ -1591,6 +1594,8 @@ def get_review_score(config: Config, review_task: DbTask) -> int | None:
 def _create_review_task(
     store: SqliteTaskStore,
     impl_task: DbTask,
+    *,
+    trigger_source: str,
     model: str | None = None,
     provider: str | None = None,
 ) -> DbTask:
@@ -1602,6 +1607,7 @@ def _create_review_task(
     return create_review_task(
         store,
         impl_task,
+        trigger_source=trigger_source,
         prompt_mode="cli",
         model=model,
         provider=provider,
@@ -1614,6 +1620,7 @@ def _create_or_reuse_followup_tasks(
     review_task: DbTask,
     impl_task: DbTask,
     findings: tuple[ReviewFinding, ...],
+    trigger_source: str,
 ) -> tuple[list[DbTask], list[DbTask]]:
     """Create/reuse follow-up implement tasks for parsed FOLLOWUP findings.
 
@@ -1628,6 +1635,7 @@ def _create_or_reuse_followup_tasks(
             review_task=review_task,
             impl_task=impl_task,
             finding=finding,
+            trigger_source=trigger_source,
         )
         if created_now:
             created.append(task)
@@ -1755,6 +1763,8 @@ def _create_improve_task(
     store: SqliteTaskStore,
     impl_task: DbTask,
     review_task: DbTask | None,
+    *,
+    trigger_source: str,
     create_review: bool = False,
     create_pr: bool = False,
     model: str | None = None,
@@ -1802,6 +1812,7 @@ def _create_improve_task(
         create_pr=create_pr,
         model=model,
         provider=provider,
+        trigger_source=trigger_source,
     )
 
 
@@ -1923,7 +1934,12 @@ def _format_lineage(
     return "\n".join(lines)
 
 
-def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask:
+def _create_resume_task(
+    store: SqliteTaskStore,
+    original_task: DbTask,
+    *,
+    trigger_source: str,
+) -> DbTask:
     """Create a new resume task pointing to the original failed task.
 
     Copies prompt, task_type, tags, session_id, branch, model, etc.
@@ -1955,6 +1971,7 @@ def _create_resume_task(store: SqliteTaskStore, original_task: DbTask) -> DbTask
         provider=original_task.provider if preserve_provider else None,
         provider_is_explicit=preserve_provider,
         recovery_origin="resume",
+        trigger_source=trigger_source,
     )
     # Copy session_id and branch from original task so the resumed run
     # continues the Claude Code session and uses the same branch.
@@ -1969,6 +1986,7 @@ def _create_retry_task(
     store: SqliteTaskStore,
     original_task: DbTask,
     *,
+    trigger_source: str,
     automatic_recovery: bool = False,
 ) -> DbTask:
     """Create a fresh retry task pointing to the original task.
@@ -2005,6 +2023,7 @@ def _create_retry_task(
         provider_is_explicit=original_task.provider_is_explicit,
         base_branch=retry_base_branch,
         recovery_origin="retry",
+        trigger_source=trigger_source,
     )
     updates_needed = False
     if retry_task.same_branch and original_task.branch and retry_task.branch != original_task.branch:
@@ -2083,7 +2102,13 @@ def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
     git = Git(config.project_dir)
     default_branch = git.default_branch()
     store = get_store(config)
-    rebase_task = _create_rebase_task(store, task.id or task_id, task.branch, default_branch)
+    rebase_task = _create_rebase_task(
+        store,
+        task.id or task_id,
+        task.branch,
+        default_branch,
+        trigger_source="manual",
+    )
     assert rebase_task.id is not None
     rebase_task.branch = task.branch
     store.update(rebase_task)
@@ -2172,7 +2197,7 @@ def run_with_recovery(
                 resume_task = store.get(decision.recovery_task_id)
                 assert resume_task is not None
             else:
-                resume_task = _create_resume_task(store, refreshed)
+                resume_task = _create_resume_task(store, refreshed, trigger_source="auto-recovery")
             if on_recovery is not None:
                 on_recovery(refreshed, resume_task, decision)
             current_task = resume_task
@@ -2183,7 +2208,12 @@ def run_with_recovery(
             retry_task = store.get(decision.recovery_task_id)
             assert retry_task is not None
         else:
-            retry_task = _create_retry_task(store, refreshed, automatic_recovery=True)
+            retry_task = _create_retry_task(
+                store,
+                refreshed,
+                trigger_source="auto-recovery",
+                automatic_recovery=True,
+            )
         if on_recovery is not None:
             on_recovery(refreshed, retry_task, decision)
         current_task = retry_task
