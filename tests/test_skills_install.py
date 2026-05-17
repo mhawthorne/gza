@@ -322,6 +322,49 @@ class TestSkillsInstallClaudeTarget:
         assert "Run `verify_command` from `gza.yaml` as part of every review iteration." in refreshed
         assert "Pass the result forward as a `## verify_command result` section." in refreshed
 
+    def test_update_flag_refreshes_gza_rebase_verify_contract(self, tmp_path: Path):
+        """--update should restore the bundled gza-rebase verify-command contract."""
+        from gza.skills_utils import get_skills_source_path
+
+        setup_config(tmp_path)
+
+        result1 = run_gza("skills-install", "--target", "claude", "gza-rebase", "--project", str(tmp_path))
+        assert result1.returncode == 0
+
+        skill_file = tmp_path / ".claude" / "skills" / "gza-rebase" / "SKILL.md"
+        skill_file.write_text(
+            "---\n"
+            "name: gza-rebase\n"
+            "description: stale\n"
+            "allowed-tools: Bash(git:*), Bash(python:*)\n"
+            "version: 1.0.0\n"
+            "public: true\n"
+            "---\n\n"
+            "Run `python -m py_compile` and `uv run pytest` before success.\n"
+            "Use `origin/main` (default) and fetch when needed.\n"
+        )
+
+        result2 = run_gza(
+            "skills-install",
+            "--target",
+            "claude",
+            "--update",
+            "gza-rebase",
+            "--project",
+            str(tmp_path),
+        )
+        assert result2.returncode == 0
+        assert "updated 1" in result2.stdout
+        assert "(updated)" in result2.stdout
+
+        refreshed = skill_file.read_text()
+        bundled = (get_skills_source_path() / "gza-rebase" / "SKILL.md").read_text()
+        assert refreshed == bundled
+        assert "configured `verify_command`" in refreshed
+        assert "after any stashed changes have been restored" in refreshed
+        assert "python -m py_compile" not in refreshed
+        assert "`origin/main` (default)" not in refreshed
+
     def test_update_flag_refreshes_gza_code_review_full_stale_importer_reference(self, tmp_path: Path):
         """--update should replace stale installed importer references in gza-code-review-full."""
         from gza.skills_utils import get_skills_source_path
@@ -614,6 +657,19 @@ class TestSkillsInstallCommand:
 
 class TestSkillContentValidation:
     """Tests to validate skill content format and structure."""
+
+    def test_gza_rebase_uses_project_verify_command_instead_of_python_specific_checks(self):
+        """gza-rebase should keep project verification generic and post-stash."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-rebase" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "project `verify_command`" in content
+        assert "after any stashed changes have been restored" in content
+        assert "rely on the configured `verify_command`, not language-specific hardcoded checks" in content
+        assert "python -m py_compile" not in content
+        assert "verifies Python syntax" not in content
 
     def test_gza_plan_review_uses_supported_history_flag(self):
         """gza-plan-review should use supported gza history flags in command examples."""
