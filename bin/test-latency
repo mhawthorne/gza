@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+
+uv run python -m gza.test_latency "$@"
