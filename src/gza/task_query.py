@@ -336,6 +336,25 @@ class TaskQueryPresets:
         )
 
     @staticmethod
+    def queue_listing(
+        *,
+        limit: int | None = None,
+        tags: tuple[str, ...] | None = None,
+        any_tag: bool = False,
+    ) -> TaskQuery:
+        return TaskQuery(
+            scope="tasks",
+            limit=limit,
+            statuses=("pending",),
+            exclude_task_types=("internal",),
+            tag_filters=normalize_tag_filters(tags),
+            any_tag=any_tag,
+            sort=SortSpec(field="pickup_order", descending=False),
+            projection=ProjectionSpec(preset=TaskProjectionPreset.QUEUE_DEFAULT),
+            presentation=PresentationSpec(mode="flat"),
+        )
+
+    @staticmethod
     def unmerged(
         *,
         branch_owner_ids: tuple[str, ...],

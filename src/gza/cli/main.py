@@ -771,7 +771,7 @@ def main() -> int:
     # queue command
     queue_parser = subparsers.add_parser(
         "queue",
-        help="List runnable pending tasks in pickup order and manage urgent bump flags",
+        help="List pending queue tasks in pickup order and manage urgent bump flags",
     )
     add_common_args(queue_parser)
     queue_parser.set_defaults(limit=10, all=False)
@@ -780,7 +780,7 @@ def main() -> int:
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only list runnable tasks matching tag filters (repeatable); same scoped pickup order used by 'uv run gza watch --tag TAG'",
+        help="Only list pending tasks matching tag filters (repeatable); same scoped pickup order used by 'uv run gza watch --tag TAG'",
     )
     queue_parser.add_argument(
         "--any-tag",
@@ -793,12 +793,12 @@ def main() -> int:
         "--limit",
         type=_parse_queue_limit,
         metavar="N",
-        help="Show first N runnable tasks (default: 10; use 0, -1, or --all for all)",
+        help="Show first N runnable tasks (default: 10; blocked tasks are always shown; use 0, -1, or --all for all runnable tasks)",
     )
     queue_parser.add_argument(
         "--all",
         action="store_true",
-        help="Show all runnable tasks",
+        help="Show all runnable tasks (blocked tasks are always shown)",
     )
 
     def _add_queue_tag_scope_args(subparser: argparse.ArgumentParser, *, action: str) -> None:

@@ -630,6 +630,27 @@ def test_queue_preset_filters_to_tags(tmp_path: Path) -> None:
     assert prompts == ["Release runnable"]
 
 
+def test_queue_listing_preset_includes_blocked_tasks_after_runnable_rows(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    runnable = store.add("Runnable task")
+    blocker = store.add("Blocking task")
+    blocked = store.add("Blocked task", depends_on=blocker.id)
+    internal = store.add("Internal task", task_type="internal")
+    assert runnable.id is not None
+    assert blocker.id is not None
+    assert blocked.id is not None
+    assert internal.id is not None
+
+    service = TaskQueryService(store)
+    result = service.run(TaskQueryPresets.queue_listing())
+
+    prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
+    blocked_flags = [bool(row.values.get("blocked")) for row in result.rows if hasattr(row, "task")]
+
+    assert prompts == ["Runnable task", "Blocking task", "Blocked task"]
+    assert blocked_flags == [False, False, True]
+
+
 def test_task_query_tag_filter_matches_any_of_selected_tags(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.add("Release task", tags=("release",))

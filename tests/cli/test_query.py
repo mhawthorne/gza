@@ -2515,16 +2515,15 @@ class TestQueueCommand:
         result = run_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        lines = [line for line in result.stdout.splitlines() if line.strip()]
-        assert any("Urgent" in line and "[urgent]" in line for line in lines)
-        assert any("Normal 1" in line and "[normal]" in line for line in lines)
-        assert any("Normal 2" in line and "[normal]" in line for line in lines)
+        lines = result.stdout.splitlines()
+        assert any(line.strip() == "[urgent]" for line in lines)
         urgent_line = next(i for i, line in enumerate(lines) if "Urgent" in line)
         normal_1_line = next(i for i, line in enumerate(lines) if "Normal 1" in line)
         normal_2_line = next(i for i, line in enumerate(lines) if "Normal 2" in line)
         assert urgent_line < normal_1_line < normal_2_line
         assert str(normal_1.id) in lines[normal_1_line]
         assert str(normal_2.id) in lines[normal_2_line]
+        assert "[urgent]" not in lines[urgent_line]
 
     @pytest.mark.parametrize("all_value", ["0", "-1"])
     def test_queue_limit_zero_or_minus_one_shows_all(self, tmp_path: Path, all_value: str):
@@ -2631,7 +2630,7 @@ class TestQueueCommand:
 
         queue = run_gza("queue", "--project", str(tmp_path))
         assert queue.returncode == 0
-        lines = [line for line in queue.stdout.splitlines() if line.strip()]
+        lines = queue.stdout.splitlines()
         bumped_line = next(i for i, line in enumerate(lines) if "Bumped now" in line)
         older_line = next(i for i, line in enumerate(lines) if "Older urgent" in line)
         newer_line = next(i for i, line in enumerate(lines) if "Newer urgent" in line)
@@ -2690,12 +2689,12 @@ class TestQueueCommand:
 
         queue = run_gza("queue", "--project", str(tmp_path))
         assert queue.returncode == 0
-        lines = [line for line in queue.stdout.splitlines() if line.strip()]
+        lines = queue.stdout.splitlines()
         third_line = next(i for i, line in enumerate(lines) if "Third" in line)
         first_line = next(i for i, line in enumerate(lines) if "First" in line)
         second_line = next(i for i, line in enumerate(lines) if "Second" in line)
         assert third_line < first_line < second_line
-        assert "[#1]" in lines[third_line]
+        assert lines[third_line + 1].strip() == "[#1]"
 
     def test_queue_next_and_clear_manage_explicit_order(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -2712,9 +2711,10 @@ class TestQueueCommand:
 
         queue = run_gza("queue", "--tag", "release", "--project", str(tmp_path))
         assert queue.returncode == 0
-        lines = [line for line in queue.stdout.splitlines() if line.strip()]
-        assert "Second" in lines[0]
-        assert "[#1]" in lines[0]
+        lines = queue.stdout.splitlines()
+        second_line = next(i for i, line in enumerate(lines) if "Second" in line)
+        assert "Second" in lines[second_line]
+        assert lines[second_line + 1].strip() == "[#1]"
 
         clear = run_gza("queue", "clear", second.id, "--project", str(tmp_path))
         assert clear.returncode == 0
@@ -2965,13 +2965,14 @@ class TestQueueCommand:
         queue = run_gza("queue", "--tag", "release", "--project", str(tmp_path))
         assert queue.returncode == 0
 
-        lines = [line for line in queue.stdout.splitlines() if line.strip()]
-        assert "Release plain" in lines[0]
-        assert "Release backend" in lines[1]
-        assert "Release docs" in lines[2]
-        assert "[#1]" in lines[0]
-        assert "[#2]" in lines[1]
-        assert "[#3]" in lines[2]
+        lines = queue.stdout.splitlines()
+        first_idx = next(i for i, line in enumerate(lines) if "Release plain" in line)
+        second_idx = next(i for i, line in enumerate(lines) if "Release backend" in line)
+        third_idx = next(i for i, line in enumerate(lines) if "Release docs" in line)
+        assert first_idx < second_idx < third_idx
+        assert lines[first_idx + 1].strip() == "[#1]"
+        assert lines[second_idx + 1].strip() == "[#2]"
+        assert lines[third_idx + 1].strip() == "[#3]"
 
     def test_queue_tag_scoped_clear_shares_order_across_tasks_with_extra_tags(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -3039,23 +3040,32 @@ class TestQueueCommand:
         urgent_line = next(i for i, line in enumerate(lines) if "Older urgent" in line)
         assert ordered_line < urgent_line
 
-    def test_queue_excludes_non_pickable_internal_and_blocked_pending_tasks(self, tmp_path: Path):
-        """Queue pickup order output should only include runnable pending tasks."""
+    def test_queue_lists_blocked_pending_tasks_after_runnable_rows(self, tmp_path: Path):
+        """Queue should show blocked pending tasks at the bottom with direct blocker metadata."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         runnable = store.add("Runnable")
-        assert runnable.id is not None
         store.add("Internal pending", task_type="internal")
         blocker = store.add("Dependency blocker")
-        store.add("Blocked pending", depends_on=blocker.id)
+        blocked = store.add("Blocked pending", depends_on=blocker.id)
+        assert runnable.id is not None
+        assert blocker.id is not None
+        assert blocked.id is not None
 
-        result = run_gza("queue", "--project", str(tmp_path))
+        result = run_gza("queue", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Runnable" in result.stdout
         assert "Internal pending" not in result.stdout
-        assert "Blocked pending" not in result.stdout
+        assert "Blocked pending" in result.stdout
+        lines = result.stdout.splitlines()
+        runnable_line = next(i for i, line in enumerate(lines) if "Runnable" in line)
+        blocker_line = next(i for i, line in enumerate(lines) if "Dependency blocker" in line)
+        blocked_line = next(i for i, line in enumerate(lines) if "Blocked pending" in line)
+        assert runnable_line < blocker_line < blocked_line
+        assert lines[blocked_line].split()[0] == "-"
+        assert lines[blocked_line + 1].strip() == f"blocked by {blocker.id}"
 
     def test_queue_tag_filters_runnable_tasks_to_tag(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -3072,20 +3082,94 @@ class TestQueueCommand:
 
         assert result.returncode == 0
         assert "Release task" in result.stdout
+        assert "Release blocker" in result.stdout
+        assert "Blocked release task" in result.stdout
         assert "Other task" not in result.stdout
-        assert "Blocked release task" not in result.stdout
 
-    def test_queue_shows_no_runnable_tasks_when_only_non_pickable_pending_exist(self, tmp_path: Path):
+    def test_queue_shows_blocked_pending_tasks_when_no_runnable_tasks_exist(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         blocker = store.add("Internal blocker", task_type="internal")
-        store.add("Blocked pending", depends_on=blocker.id)
+        blocked = store.add("Blocked pending", depends_on=blocker.id)
+        assert blocker.id is not None
+        assert blocked.id is not None
 
         result = run_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "No runnable tasks" in result.stdout
+        assert "No pending tasks" not in result.stdout
+        assert "Blocked pending" in result.stdout
+        lines = result.stdout.splitlines()
+        blocked_line = next(i for i, line in enumerate(lines) if "Blocked pending" in line)
+        assert lines[blocked_line].split()[0] == "-"
+        assert lines[blocked_line + 1].strip() == f"blocked by {blocker.id}"
+
+    def test_queue_layout_keeps_first_line_columns_stable_and_second_line_aligned(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plain = store.add("Plain task")
+        urgent = store.add("Urgent task", urgent=True)
+        blocker = store.add("Blocking task")
+        blocked = store.add("Blocked task", depends_on=blocker.id)
+        assert plain.id is not None
+        assert urgent.id is not None
+        assert blocker.id is not None
+        assert blocked.id is not None
+
+        result = run_gza("queue", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        lines = result.stdout.splitlines()
+        plain_line = next(line for line in lines if "Plain task" in line)
+        urgent_line_index = next(i for i, line in enumerate(lines) if "Urgent task" in line)
+        blocked_line_index = next(i for i, line in enumerate(lines) if "Blocked task" in line)
+        urgent_line = lines[urgent_line_index]
+        blocked_line = lines[blocked_line_index]
+
+        plain_id_col = plain_line.index(str(plain.id))
+        plain_type_col = plain_line.index("[implement]")
+        plain_prompt_col = plain_line.index("Plain task")
+        assert urgent_line.index(str(urgent.id)) == plain_id_col
+        assert urgent_line.index("[implement]") == plain_type_col
+        assert urgent_line.index("Urgent task") == plain_prompt_col
+        assert blocked_line.index(str(blocked.id)) == plain_id_col
+        assert blocked_line.index("[implement]") == plain_type_col
+        assert blocked_line.index("Blocked task") == plain_prompt_col
+        assert blocked_line.split()[0] == "-"
+        assert lines[urgent_line_index + 1].startswith(" " * plain_prompt_col)
+        assert lines[blocked_line_index + 1].startswith(" " * plain_prompt_col)
+
+    def test_queue_vanilla_runnable_row_stays_single_line(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Vanilla task")
+        assert task.id is not None
+
+        result = run_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        lines = result.stdout.splitlines()
+        task_line = next(i for i, line in enumerate(lines) if "Vanilla task" in line)
+        assert task_line == len(lines) - 1
+
+    def test_queue_shows_urgent_and_blocked_metadata_on_same_second_line(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        blocker = store.add("Blocking task")
+        blocked_urgent = store.add("Blocked urgent", depends_on=blocker.id, urgent=True)
+        assert blocker.id is not None
+        assert blocked_urgent.id is not None
+
+        result = run_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        lines = result.stdout.splitlines()
+        blocked_line = next(i for i, line in enumerate(lines) if "Blocked urgent" in line)
+        assert lines[blocked_line + 1].strip() == f"[urgent]  blocked by {blocker.id}"
 
     def test_next_tag_filters_pending_and_blocked_counts(self, tmp_path: Path):
         setup_config(tmp_path)

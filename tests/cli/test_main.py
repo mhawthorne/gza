@@ -533,10 +533,10 @@ class TestHelpOutput:
         help_text = " ".join(queue_help.stdout.split())
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
-        assert "Show first N runnable tasks (default: 10; use 0, -1, or --all for all)" in help_text
-        assert "Show all runnable tasks" in help_text
-        assert "Show first N runnable tasks (default: 10; use `0`, `-1`, or `--all` for all)" in docs_text
-        assert "By default, `gza queue` shows the first 10 runnable tasks." in docs_text
+        assert "Show first N runnable tasks (default: 10; blocked tasks are always shown; use 0, -1, or --all for all runnable tasks)" in help_text
+        assert "Show all runnable tasks (blocked tasks are always shown)" in help_text
+        assert "Show first N runnable tasks (default: 10; blocked tasks are always shown; use `0`, `-1`, or `--all` for all runnable tasks)" in docs_text
+        assert "By default, `gza queue` shows the first 10 runnable tasks plus all blocked tasks." in docs_text
 
     def test_queue_ordering_language_is_consistent_between_help_docs_and_tag_scope_behavior(self, tmp_path):
         """Queue docs/help should consistently describe tag-scoped explicit ordering semantics."""

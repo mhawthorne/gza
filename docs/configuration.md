@@ -1298,7 +1298,7 @@ Use `--tag TAG` (repeatable) to scope the list to matching tags.
 
 ### queue
 
-Inspect and manage runnable pending queue ordering.
+Inspect and manage pending queue ordering.
 
 ```bash
 gza queue
@@ -1313,10 +1313,10 @@ gza queue clear <task_id>
 |--------|-------------|
 | `task_id` | Full prefixed task ID to reorder (for example `gza-1234`) |
 | `position` | 1-based explicit queue position for `queue move` |
-| `--tag TAG` | Only list runnable tasks matching tag filters (repeatable; same scoped pickup order used by `gza watch --tag TAG`) |
+| `--tag TAG` | Only list pending tasks matching tag filters (repeatable; same scoped pickup order used by `gza watch --tag TAG`) |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
-| `-n, --limit N` | Show first N runnable tasks (default: 10; use `0`, `-1`, or `--all` for all) |
-| `--all` | Show all runnable tasks |
+| `-n, --limit N` | Show first N runnable tasks (default: 10; blocked tasks are always shown; use `0`, `-1`, or `--all` for all runnable tasks) |
+| `--all` | Show all runnable tasks (blocked tasks are always shown) |
 
 Queue pickup ordering is:
 1. Explicit `queue_position` values in ascending order
@@ -1327,9 +1327,9 @@ Use `gza queue next <task_id>` to make a task the next ordered item, or `gza que
 When `queue move`, `queue next`, or `queue clear` include `--tag` filters, explicit ordering is shared across all tasks matching that tag scope, even when some tasks have additional unrelated tags.
 Those commands fail closed when the target task does not match the provided tag scope (`all` semantics by default, `any` with `--any-tag`) and do not mutate queue ordering in that case.
 When no tag scope is provided, queue-position edits keep existing exact tag-set bucket behavior.
-`gza queue` shows tasks that default worker pickup can run (internal and dependency-blocked pending tasks are excluded).
-By default, `gza queue` shows the first 10 runnable tasks. Use `-n 0`, `-n -1`, or `--all` to show everything.
-To treat a tag as a release slice, assign tasks with `uv run gza add --tag release-1.2 ...` and inspect them with `uv run gza queue --tag release-1.2`. That command is the canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order.
+`gza queue` shows runnable pending tasks first, then pending tasks blocked by unsatisfied direct dependencies at the bottom. Internal tasks remain excluded.
+By default, `gza queue` shows the first 10 runnable tasks plus all blocked tasks. Use `-n 0`, `-n -1`, or `--all` to show all runnable tasks too.
+To treat a tag as a release slice, assign tasks with `uv run gza add --tag release-1.2 ...` and inspect them with `uv run gza queue --tag release-1.2`. That command is the canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order, with currently blocked tasks shown separately at the bottom.
 Internally, queue-style task listing is routed through the unified task query layer so queue, next, and API consumers can share the same filter/order semantics.
 
 ### implement
