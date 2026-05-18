@@ -675,6 +675,16 @@ def _duplicate_blocker_needs_attention_action(ctx: AdvanceContext) -> dict[str, 
     )
 
 
+def _rebase_did_not_unblock_merge_action() -> dict[str, Any]:
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": "SKIP: completed rebase did not unblock merge; manual decision required",
+        },
+        reason="rebase-did-not-unblock-merge",
+    )
+
+
 def _failed_task_skip_action(ctx: AdvanceContext) -> dict[str, Any]:
     assert ctx.failed_recovery_decision is not None
     return failed_recovery_decision_to_action(
@@ -1488,6 +1498,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
             },
             reason="rebase-failed-needs-manual-resolution",
         ),
+    ),
+    AdvanceRule(
+        name="conflict_rebase_completed_but_still_blocked",
+        matches=lambda ctx: not ctx.can_merge and ctx.latest_completed_rebase is not None,
+        action=lambda _ctx: _rebase_did_not_unblock_merge_action(),
     ),
     AdvanceRule(
         name="conflict_needs_rebase",

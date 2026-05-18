@@ -91,6 +91,7 @@ Conflict detection uses the same target-branch resolution as task collection:
 |-----------|--------|
 | Branch cannot merge into the resolved target branch AND rebase child is `pending`/`in_progress` | `skip` — rebase already running |
 | Branch cannot merge into the resolved target branch AND rebase child is `failed` | `needs_discussion` — manual intervention required unless later local post-resolution proof exists |
+| Branch cannot merge into the resolved target branch AND a same-branch rebase child already completed | `needs_discussion` — reason `rebase-did-not-unblock-merge`; stop repeated no-op rebases |
 | Branch cannot merge into the resolved target branch AND no active rebase child | `needs_rebase` — create rebase task |
 
 A failed rebase is not cleared just because the latest implementation tip becomes mergeable again. If an implementation lineage still has no later approved or cleared review after that failed rebase, advance continues to surface `rebase-failed-needs-manual-resolution` instead of creating a first review from the now-clean tip, unless a later local post-resolution proof exists. The local proofs are intentionally narrow: a merged merge unit, exact branch-tip equality with the current target branch, or proof that the implementation branch already contains the current target tip.
@@ -137,7 +138,7 @@ When the engine emits `improve`, the caller (iterate) delegates to `resolve_impr
 | Shared failed-task recovery policy returns `resume` | `resume` — continue from the latest failed improve |
 | Shared failed-task recovery policy returns `retry` | `retry` — create a new improve attempt on the same shared branch |
 | `max_resume_attempts == 0` (automatic recovery disabled) | `give_up` — stop iterating; surface `automatic_recovery_disabled` as the stop reason |
-| Shared failed-task recovery policy returns `manual_review_required` (for example, failed resume descendants or a dropped recovery terminal) | `manual_review` — stop iterating and require operator intervention |
+| Shared failed-task recovery policy returns `retry_limit_reached` / `recovery_ambiguous` or another terminal manual-attention stop (for example, failed resume descendants or a dropped recovery terminal) | `manual_review` — stop iterating and require operator intervention |
 
 The improve flow now defers recovery edge selection to the shared recovery engine (`decide_failed_task_recovery`), and iterate also resolves fully recovered failed implement IDs through the same completed-descendant planner handoff used by advance/watch. That keeps iterate/advance/watch on one consistent resume/retry/manual-review boundary and avoids stale completed-recovery skip output on recovered ancestors.
 
@@ -246,8 +247,9 @@ When advance detects merge conflicts:
    - Runs the configured project `verify_command` on the final checkout before reporting success
 5. On completion, the host runner force-pushes the rebased branch (`git push --force-with-lease`)
 6. Advance sees no more conflicts on next run
-7. If a completed rebase is newer than the latest review → advance creates a fresh review before merging
-8. If the latest rebase task fails and there is no later successful same-branch rebase/recovery or later approved/cleared review → advance reports `needs_discussion` (no automatic retry)
+7. If a completed rebase is newer than the latest review and merge is now possible → advance creates a fresh review before merging
+8. If a completed same-branch rebase still leaves `can_merge=False` → advance reports `needs_discussion` with reason `rebase-did-not-unblock-merge` instead of queueing another identical rebase
+9. If the latest rebase task fails and there is no later successful same-branch rebase/recovery or later approved/cleared review → advance reports `needs_discussion` (no automatic retry)
 
 ### Docker considerations
 

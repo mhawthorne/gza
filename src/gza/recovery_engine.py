@@ -14,6 +14,7 @@ from .dependency_preconditions import get_unmerged_dependency_precondition, task
 from .failed_task_ordering import sort_failed_tasks
 from .failure_policy import is_resumable_failure_reason
 from .git import Git, GitError
+from .lifecycle_completion import task_is_complete_for_lifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ class _RecoveryChainSnapshot:
     direct_children: tuple[DbTask, ...]
     deeper_descendants: tuple[DbTask, ...]
     terminal_descendants: tuple[DbTask, ...]
+    latest_completed_terminal_descendant: DbTask | None
     completed_terminal_descendant: DbTask | None
 
 
@@ -243,6 +245,17 @@ def _descendant_sort_key(descendant: DbTask) -> tuple[datetime, int]:
     return (when, task_id_numeric_key(descendant.id))
 
 
+def _task_merge_state_for_recovery(store: SqliteTaskStore, task: DbTask) -> str | None:
+    if task.id is None:
+        return task.merge_status
+    unit = store.resolve_merge_unit_for_task(task.id)
+    return unit.state if unit is not None else task.merge_status
+
+
+def _task_is_complete_recovery_outcome(store: SqliteTaskStore, task: DbTask) -> bool:
+    return task_is_complete_for_lifecycle(task, merge_state=_task_merge_state_for_recovery(store, task))
+
+
 def _build_recovery_chain_snapshot(store: SqliteTaskStore, task: DbTask) -> _RecoveryChainSnapshot:
     steps_reversed: list[RecoveryRole] = []
     ancestor_ids_reversed: list[str] = []
@@ -296,8 +309,11 @@ def _build_recovery_chain_snapshot(store: SqliteTaskStore, task: DbTask) -> _Rec
         for descendant in descendants
         if descendant.id is not None and descendant.id not in parent_ids_with_recovery_children
     ]
-    completed_terminal_descendant: DbTask | None = None
+    latest_completed_terminal_descendant: DbTask | None = None
     if terminal_descendants and all(descendant.status == "completed" for descendant in terminal_descendants):
+        latest_completed_terminal_descendant = max(terminal_descendants, key=_descendant_sort_key)
+    completed_terminal_descendant: DbTask | None = None
+    if terminal_descendants and all(_task_is_complete_recovery_outcome(store, descendant) for descendant in terminal_descendants):
         completed_terminal_descendant = max(terminal_descendants, key=_descendant_sort_key)
 
     return _RecoveryChainSnapshot(
@@ -310,6 +326,7 @@ def _build_recovery_chain_snapshot(store: SqliteTaskStore, task: DbTask) -> _Rec
             descendant for descendant in descendants if descendant.id is not None and descendant.id not in direct_child_ids
         ),
         terminal_descendants=tuple(terminal_descendants),
+        latest_completed_terminal_descendant=latest_completed_terminal_descendant,
         completed_terminal_descendant=completed_terminal_descendant,
     )
 
@@ -379,7 +396,7 @@ def get_completed_sibling_recovery(store: SqliteTaskStore, task: DbTask) -> DbTa
             continue
         if _classify_recovery_edge(parent, sibling) is None:
             continue
-        if sibling.status == "completed":
+        if _task_is_complete_recovery_outcome(store, sibling):
             candidates.append(sibling)
             continue
         completed_descendant = _build_recovery_chain_snapshot(store, sibling).completed_terminal_descendant
@@ -597,7 +614,8 @@ def resolve_recovery_planning_task(store: SqliteTaskStore, task: DbTask) -> DbTa
     """Return the task that should own normal lifecycle planning for this lineage."""
     if task.status != "failed":
         return task
-    return get_completed_recovery_descendant(store, task) or task
+    snapshot = _build_recovery_chain_snapshot(store, task)
+    return snapshot.latest_completed_terminal_descendant or task
 
 
 def is_chain_resolved_by_recovery(store: SqliteTaskStore, task: DbTask) -> bool:
@@ -799,8 +817,8 @@ def decide_failed_task_recovery(
     if expected_action is None:
         return _skip_decision(
             task_id=task_id,
-            reason_code="manual_review_required",
-            reason_text="automatic recovery stops here; manual review required",
+            reason_code="retry_limit_reached",
+            reason_text="automatic recovery stops here; retry limit reached",
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,
         )
@@ -847,7 +865,7 @@ def decide_failed_task_recovery(
     if len(all_pending_children) > 1:
         return _skip_decision(
             task_id=task_id,
-            reason_code="manual_review_required",
+            reason_code="recovery_ambiguous",
             reason_text="multiple pending recovery children require manual review",
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,
@@ -966,10 +984,10 @@ def _get_failed_recovery_needs_attention_reason(
         return "automatic-recovery-disabled"
     if decision.reason_code == "manual_failure_reason":
         return "manual-failure-reason"
-    if decision.reason_code == "manual_review_required":
-        if decision.attempt_limit > 0 and decision.attempt_index >= decision.attempt_limit:
-            return "max-resume-attempts-reached"
-        return "manual-review-required"
+    if decision.reason_code in {"retry_limit_reached", "manual_review_required"}:
+        return "retry-limit-reached"
+    if decision.reason_code == "recovery_ambiguous":
+        return "recovery-ambiguous"
     if decision.reason_code != "recovery_has_newer_unresolved_descendant":
         return None
 

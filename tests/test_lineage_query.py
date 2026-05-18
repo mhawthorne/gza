@@ -754,6 +754,86 @@ def test_query_lineage_owner_rows_planning_skips_dropped_owner_lineage(tmp_path:
     assert rows == ()
 
 
+def test_query_lineage_owner_rows_planning_skips_dropped_only_descendants(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _set_completed(
+        impl,
+        when=datetime(2026, 5, 12, 9, 0, tzinfo=UTC),
+        branch="feature/dropped-only-descendants",
+        has_commits=True,
+    )
+    impl.merge_status = "merged"
+    store.update(impl)
+
+    dropped_rebase = store.add("Dropped rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert dropped_rebase.id is not None
+    _set_dropped(
+        dropped_rebase,
+        when=datetime(2026, 5, 12, 10, 0, tzinfo=UTC),
+        branch=impl.branch,
+        has_commits=True,
+    )
+    dropped_rebase.merge_status = "unmerged"
+    store.update(dropped_rebase)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    assert rows == ()
+
+
+def test_query_lineage_owner_rows_hides_failed_root_resolved_by_completed_recovery_descendant(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-root"
+    failed.branch = "feature/recovered-lineage"
+    failed.completed_at = datetime(2026, 5, 12, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    resumed = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    assert resumed.id is not None
+    _set_completed(
+        resumed,
+        when=datetime(2026, 5, 12, 10, 0, tzinfo=UTC),
+        branch=failed.branch,
+        has_commits=True,
+    )
+    resumed.merge_status = "merged"
+    resumed.session_id = failed.session_id
+    store.update(resumed)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    assert rows == ()
+
+
 def test_query_lineage_owner_rows_keeps_legitimate_impl_branch_rebase_descendant_actionable(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

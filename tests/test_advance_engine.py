@@ -695,6 +695,27 @@ def test_actionable_failed_recovery_actions_are_not_needs_attention(tmp_path: Pa
     assert classify_advance_action(action) == "actionable"
 
 
+def test_retry_limit_reached_failed_recovery_action_is_needs_attention(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    failed = store.add("Implement feature", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_STEPS"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    action = failed_recovery_decision_to_action(
+        failed,
+        decision,
+        needs_attention_reason="retry-limit-reached",
+    )
+
+    assert decision.reason_code == "retry_limit_reached"
+    assert classify_advance_action(action) == "needs_attention"
+
+
 def test_completed_fix_after_changes_requested_requires_fresh_review(tmp_path: Path, monkeypatch):
     """A completed code-changing fix must stale the prior review so advance creates a new one,
     instead of looping back on the old review's CHANGES_REQUESTED verdict."""
@@ -1820,6 +1841,51 @@ def test_conflict_needs_rebase_not_emitted_when_target_already_merged(tmp_path: 
 
     assert action["type"] == "skip"
     assert action["description"] == "SKIP: target implementation already merged (merge-unit-merged)"
+
+
+def test_conflict_needs_rebase_emitted_without_completed_rebase(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feature/rebase-needed"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=False), impl, "main")
+
+    assert action["type"] == "needs_rebase"
+
+
+def test_completed_rebase_that_still_blocks_merge_needs_attention(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feature/rebase-still-blocked"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    rebase = store.add("Completed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert rebase.id is not None
+    rebase.status = "completed"
+    rebase.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    rebase.branch = impl.branch
+    rebase.merge_status = "unmerged"
+    rebase.has_commits = True
+    store.update(rebase)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=False), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-did-not-unblock-merge"
+    assert classify_advance_action(action) == "needs_attention"
 
 
 def test_orphan_rebase_descendant_skips_when_canonical_target_merge_unit_is_merged(

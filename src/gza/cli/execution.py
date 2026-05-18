@@ -2530,7 +2530,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 decision=decision,
                 max_recovery_attempts=max(1, effective_max_resume_attempts),
             )
-            == "max-resume-attempts-reached"
+            == "retry-limit-reached"
         )
 
     def _resolve_manual_resume_override(
@@ -2827,7 +2827,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 if attention.action.get("needs_attention_reason") in {
                     "review-max-cycles-reached",
                     "automatic-recovery-disabled",
-                    "max-resume-attempts-reached",
+                    "retry-limit-reached",
                 }:
                     print(f"Recommended next step: uv run gza fix {iterate_task.id}")
             else:
@@ -2872,7 +2872,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             if initial_action.get("needs_attention_reason") in {
                 "review-max-cycles-reached",
                 "automatic-recovery-disabled",
-                "max-resume-attempts-reached",
+                "retry-limit-reached",
             }:
                 print(f"Recommended next step: uv run gza fix {iterate_task.id}")
             return 3
@@ -2903,7 +2903,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         if attention.action.get("needs_attention_reason") in {
             "review-max-cycles-reached",
             "automatic-recovery-disabled",
-            "max-resume-attempts-reached",
+            "retry-limit-reached",
         }:
             print(f"Recommended next step: uv run gza fix {fix_task_id}")
         return 3
@@ -4374,7 +4374,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         if final_attention_action.get("needs_attention_reason") in {
             "review-max-cycles-reached",
             "automatic-recovery-disabled",
-            "max-resume-attempts-reached",
+            "retry-limit-reached",
         }:
             print(f"Recommended next step: uv run gza fix {impl_task_key}")
         return 3

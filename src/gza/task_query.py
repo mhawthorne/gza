@@ -484,6 +484,7 @@ class TaskQueryService:
                     any_tag=query.any_tag,
                     date_filter=query.date_filter,
                     include_skipped=True,
+                    exclude_dropped_from_planning=True,
                     task_ids=query.task_ids,
                     owner_task_ids=query.branch_owner_ids,
                 ),

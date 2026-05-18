@@ -8652,7 +8652,7 @@ class TestIterateCommand:
         assert result.returncode == 3
         output = result.stdout + (result.stderr or "")
         assert output.count("Needs attention:") == 1
-        assert "reason=max-resume-attempts-reached" in output
+        assert "reason=retry-limit-reached" in output
         assert "Cannot resume failed implementation" not in output
 
     def test_failed_root_resume_with_existing_failed_resume_child_auto_iterate_uses_shared_attention(self, tmp_path: Path):
@@ -10205,7 +10205,7 @@ class TestIterateCommand:
         spawn_background.assert_not_called()
         assert "Next action: improve" in output
         assert "Needs attention:" in output
-        assert "reason=max-resume-attempts-reached" in output
+        assert "reason=retry-limit-reached" in output
         assert f"Recommended next step: uv run gza fix {impl.id}" in output
         assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 
@@ -10503,9 +10503,9 @@ class TestIterateCommand:
         assert run_foreground.call_count == 2
         assert run_foreground.call_args_list[0].kwargs.get("resume", False) is False
         assert run_foreground.call_args_list[1].kwargs.get("resume") is True
-        assert terminal_decision.reason_code == "manual_review_required"
+        assert terminal_decision.reason_code == "retry_limit_reached"
         assert expected_line in output
-        assert "reason=max-resume-attempts-reached" in output
+        assert "reason=retry-limit-reached" in output
         assert output.count("Needs attention:") == 1
         assert f"Implementation {failed_resume.id} failed (exit code 1)" not in output
         assert f"Recommended next step: uv run gza fix {impl.id}" in output
@@ -10589,9 +10589,9 @@ class TestIterateCommand:
         assert result == 3
         assert run_foreground.call_count == 1
         assert run_foreground.call_args.kwargs.get("resume") is True
-        assert terminal_decision.reason_code == "manual_review_required"
+        assert terminal_decision.reason_code == "retry_limit_reached"
         assert expected_line in output
-        assert "reason=max-resume-attempts-reached" in output
+        assert "reason=retry-limit-reached" in output
         assert output.count("Needs attention:") == 1
         assert f"Resume of {impl.id} failed" not in output
         assert f"Recommended next step: uv run gza fix {impl.id}" in output
@@ -10677,7 +10677,7 @@ class TestIterateCommand:
         assert run_foreground.call_count == 1
         assert run_foreground.call_args.kwargs.get("resume") is True
         assert f"Resuming failed implementation {failed_resume_descendant.id} as {manual_resume.id}..." in output
-        assert "reason=max-resume-attempts-reached" not in output
+        assert "reason=retry-limit-reached" not in output
         assert (
             f"warning: task {failed_resume_descendant.id} has hit max auto-resume attempts; proceeding because this resume is manual"
             in captured.err
@@ -11077,9 +11077,9 @@ class TestIterateCommand:
         assert run_foreground.call_count == 2
         assert run_foreground.call_args_list[0].kwargs.get("resume", False) is False
         assert run_foreground.call_args_list[1].kwargs.get("resume") is True
-        assert terminal_decision.reason_code == "manual_review_required"
+        assert terminal_decision.reason_code == "retry_limit_reached"
         assert expected_line in output
-        assert "reason=max-resume-attempts-reached" in output
+        assert "reason=retry-limit-reached" in output
         assert output.count("Needs attention:") == 1
         assert "Iterate blocked: improve_failed. Manual review required." not in output
 
@@ -11171,7 +11171,7 @@ class TestIterateCommand:
         assert run_foreground.call_count == 1
         assert run_foreground.call_args.kwargs.get("resume") is True
         assert f"Created improve task {manual_resume.id} (resume of {failed_resume.id})" in output
-        assert "reason=max-resume-attempts-reached" not in output
+        assert "reason=retry-limit-reached" not in output
         assert (
             f"warning: task {failed_resume.id} has hit max auto-resume attempts; proceeding because this resume is manual"
             in captured.err
@@ -11879,7 +11879,7 @@ class TestIterateCommand:
         assert target is not None
         assert target.id == second.id
         assert decision is not None
-        assert decision.reason_code == "manual_review_required"
+        assert decision.reason_code == "retry_limit_reached"
 
     def test_resolve_improve_action_still_resumes_within_cap(self, tmp_path: Path):
         """One failed attempt with max_resume_attempts=1 still resumes (cap not yet exceeded)."""

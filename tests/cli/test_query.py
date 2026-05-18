@@ -4838,7 +4838,7 @@ class TestShowCommand:
 
         attention_action = with_needs_attention(
             {"type": "skip", "description": "SKIP: automatic recovery exhausted"},
-            reason="max-resume-attempts-reached",
+            reason="retry-limit-reached",
         )
         console = Console(record=True, force_terminal=True, color_system="standard", width=300)
         show_colors = dict(query_cli.SHOW_COLORS_DICT)
@@ -11598,6 +11598,40 @@ class TestIncompleteCommand:
         first_line = next(line for line in output.splitlines() if line.strip() and not set(line.strip()) == {"-"})
         return first_line.split()[1]
 
+    @staticmethod
+    def _setup_merged_owner_with_live_descendant_fixture(tmp_path: Path) -> tuple[Task, Task]:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("merged owner plan", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+        assert plan.id is not None
+
+        impl = store.add("merged implementation owner", task_type="implement", based_on=plan.id)
+        store.mark_completed(impl, has_commits=True, branch="feature/cli-merged-owner-live-descendant")
+        assert impl.id is not None
+
+        unit = store.resolve_merge_unit_for_task(impl.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged")
+
+        followup = store.add(
+            "live unresolved improve descendant",
+            task_type="improve",
+            based_on=impl.id,
+        )
+        followup.status = "completed"
+        followup.completed_at = datetime.now(UTC)
+        followup.has_commits = True
+        followup.branch = "feature/cli-merged-owner-live-descendant-followup"
+        followup.merge_status = "unmerged"
+        store.update(followup)
+        assert followup.id is not None
+
+        return impl, followup
+
     def test_incomplete_text_fields_multi_field_uses_generic_blocks(
         self,
         tmp_path: Path,
@@ -11772,6 +11806,56 @@ class TestIncompleteCommand:
         assert json.loads(result.stdout) == []
         assert result.stderr == ""
 
+    def test_incomplete_normalization_keeps_merged_owner_with_live_unresolved_descendant(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        impl, followup = self._setup_merged_owner_with_live_descendant_fixture(tmp_path)
+
+        config = query_cli.Config.load(tmp_path)
+        store = query_cli.get_store(config, open_mode="readwrite")
+        service = query_cli._TaskQueryService(store)
+        result = service.run(
+            query_cli._TaskQueryPresets.incomplete(limit=None),
+            config=config,
+            git=None,
+            target_branch="main",
+        )
+
+        normalized = query_cli._normalize_incomplete_result_rows(  # noqa: SLF001
+            result,
+            service=service,
+            store=store,
+            config=config,
+            git=None,
+            target_branch="main",
+        )
+
+        assert len(normalized.rows) == 1
+        row = normalized.rows[0]
+        assert row.owner_task.id == impl.id
+        assert {task.id for task in row.unresolved_tasks} == {followup.id}
+
+    def test_incomplete_json_keeps_merged_owner_with_live_unresolved_descendant(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        impl, followup = self._setup_merged_owner_with_live_descendant_fixture(tmp_path)
+
+        result = query_cli.cmd_incomplete(
+            self._incomplete_args(tmp_path, fields="id,unresolved_ids", json=True)
+        )
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert json.loads(captured.out) == [
+            {
+                "id": impl.id,
+                "unresolved_ids": [followup.id],
+            }
+        ]
+
     def test_incomplete_cli_json_uses_real_next_action_when_git_context_is_available(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -11799,6 +11883,103 @@ class TestIncompleteCommand:
             }
         ]
         assert result.stderr == ""
+
+    def test_incomplete_keeps_failed_owner_visible_until_completed_recovery_code_is_merged(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed recovery owner", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "MAX_TURNS"
+        failed.completed_at = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+        failed.branch = "feature/recovery-owner"
+        failed.has_commits = True
+        store.update(failed)
+
+        completed_retry = store.add(
+            "Completed retry with unmerged code",
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+        )
+        assert completed_retry.id is not None
+        completed_retry.status = "completed"
+        completed_retry.completed_at = datetime(2026, 5, 11, 11, 0, tzinfo=UTC)
+        completed_retry.branch = "feature/recovery-owner-retry"
+        completed_retry.has_commits = True
+        completed_retry.merge_status = "unmerged"
+        store.update(completed_retry)
+
+        config = query_cli.Config.load(tmp_path)
+        service = query_cli._TaskQueryService(store)
+        result = service.run(
+            query_cli._TaskQueryPresets.incomplete(limit=None),
+            config=config,
+            git=_mock_unmerged_git(),
+            target_branch="main",
+        )
+
+        assert len(result.rows) == 1
+        row = result.rows[0]
+        assert row.owner_task.id == completed_retry.id
+        assert row.lifecycle_action_task is not None
+        assert row.lifecycle_action_task.id == completed_retry.id
+        assert row.recovery_action_task is None
+        assert {task.id for task in row.unresolved_tasks} == {completed_retry.id}
+
+    def test_incomplete_hides_failed_owner_after_completed_recovery_code_is_merged(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed merged recovery owner", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "MAX_TURNS"
+        failed.completed_at = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+        failed.branch = "feature/recovery-owner-merged"
+        failed.has_commits = True
+        store.update(failed)
+
+        completed_retry = store.add(
+            "Completed retry with merged code",
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+        )
+        assert completed_retry.id is not None
+        completed_retry.status = "completed"
+        completed_retry.completed_at = datetime(2026, 5, 11, 11, 0, tzinfo=UTC)
+        completed_retry.branch = "feature/recovery-owner-merged"
+        completed_retry.has_commits = True
+        completed_retry.merge_status = "unmerged"
+        store.update(completed_retry)
+
+        unit = store.create_merge_unit(
+            source_branch=completed_retry.branch,
+            target_branch="main",
+            owner_task_id=completed_retry.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(completed_retry.id, unit.id, "owner")
+        store.set_merge_unit_state(unit.id, "merged")
+
+        config = query_cli.Config.load(tmp_path)
+        service = query_cli._TaskQueryService(store)
+        result = service.run(
+            query_cli._TaskQueryPresets.incomplete(limit=None),
+            config=config,
+            git=_mock_unmerged_git(),
+            target_branch="main",
+        )
+
+        assert result.rows == ()
 
     def test_incomplete_cli_json_reports_held_plan_as_awaiting_human(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -12431,7 +12612,7 @@ class TestLineageOwnerParity:
         assert len(rows) == 1
         assert rows[0]["task_id"] == improve.id
 
-    def test_incomplete_roots_dropped_rebase_chain_at_impl_in_both_views(
+    def test_incomplete_hides_dropped_rebase_chain_in_both_views(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -12509,9 +12690,9 @@ class TestLineageOwnerParity:
         assert result == 0
         one_line_output = captured.out
         assert self._one_line_row_id(one_line_output) == impl.id
-        assert "rebase --resolve (conflicts detected)" in one_line_output
-        assert f"{dropped_one.id} (dropped)" in one_line_output
-        assert f"{dropped_two.id} (dropped)" in one_line_output
+        assert "completed rebase did not unblock merge; manual decision required" in one_line_output
+        assert f"{dropped_one.id} (dropped)" not in one_line_output
+        assert f"{dropped_two.id} (dropped)" not in one_line_output
 
         with patch("gza.cli.query.Git", return_value=git):
             result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None, tree=True))
@@ -12521,3 +12702,5 @@ class TestLineageOwnerParity:
         tree_output = captured.out
         assert self._tree_root_id(tree_output) == impl.id
         assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
+        assert f"{dropped_one.id} (dropped)" not in tree_output
+        assert f"{dropped_two.id} (dropped)" not in tree_output

@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from .db import MergeUnit, SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from .lifecycle_completion import task_is_complete_for_lifecycle
 from .source_followup import (
     SourceFollowupState,
     collect_non_dropped_implement_source_ids,
@@ -122,6 +123,36 @@ def _actionable_lifecycle_tasks(
     if include_dropped:
         allowed_statuses.add("dropped")
     return [task for task in unresolved_tasks if task.status in allowed_statuses]
+
+
+def _task_is_terminal_for_incomplete_display(
+    task: DbTask,
+    *,
+    merge_units_by_task_id: Mapping[str, MergeUnit],
+    exclude_dropped: bool,
+) -> bool:
+    if exclude_dropped and task.status == "dropped":
+        return True
+    if task.id is not None and _task_is_effectively_merged(task, merge_units_by_task_id=merge_units_by_task_id):
+        return True
+    return False
+
+
+def filter_display_unresolved_tasks_for_incomplete(
+    unresolved_tasks: Sequence[DbTask],
+    *,
+    merge_units_by_task_id: Mapping[str, MergeUnit],
+    exclude_dropped: bool,
+) -> tuple[DbTask, ...]:
+    return tuple(
+        task
+        for task in unresolved_tasks
+        if not _task_is_terminal_for_incomplete_display(
+            task,
+            merge_units_by_task_id=merge_units_by_task_id,
+            exclude_dropped=exclude_dropped,
+        )
+    )
 
 
 def _canonical_impl_branch_candidates(owner: DbTask, actionable_tasks: Sequence[DbTask]) -> list[DbTask]:
@@ -408,18 +439,8 @@ def is_lineage_resolved(snapshot: LineageOwnerSnapshot) -> LineageResolution:
 
 
 def _snapshot_task_is_complete(snapshot: LineageOwnerSnapshot, task: DbTask) -> bool:
-    if task.status in {"failed", "pending", "in_progress", "dropped"}:
-        return False
     merge_state = _task_effective_merge_state(task, merge_units_by_task_id=snapshot.merge_units_by_task_id)
-    if task.status == "completed":
-        if merge_state == "merged":
-            return True
-        if not task.has_commits:
-            return True
-        return False
-    if task.status == "unmerged":
-        return merge_state == "merged"
-    return False
+    return task_is_complete_for_lifecycle(task, merge_state=merge_state)
 
 
 def _build_owner_tree(
@@ -788,6 +809,14 @@ def query_lineage_owner_rows(
             continue
         if target_branch and owner_merge_unit is not None and owner_merge_unit.target_branch != target_branch:
             continue
+        unresolved_tasks = list(
+            filter_display_unresolved_tasks_for_incomplete(
+                unresolved_tasks,
+                merge_units_by_task_id=merge_units_by_member,
+                exclude_dropped=query.exclude_dropped_from_planning,
+            )
+        )
+
         if not unresolved_tasks:
             if not orphaned_same_branch_tasks:
                 continue
@@ -948,6 +977,7 @@ __all__ = [
     "LineageOwnerSnapshot",
     "LineageResolution",
     "UnresolvedLeafSummary",
+    "filter_display_unresolved_tasks_for_incomplete",
     "is_lineage_resolved",
     "query_lineage_owner_rows",
 ]

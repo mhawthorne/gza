@@ -1915,7 +1915,7 @@ def test_watch_cycle_restart_failed_starts_manually_queued_child_after_recovery_
 @pytest.mark.parametrize(
     ("failure_reason", "session_id", "max_recovery_attempts", "expected_reason_code"),
     [
-        ("MAX_TURNS", None, 1, "manual_review_required"),
+        ("MAX_TURNS", None, 1, "retry_limit_reached"),
         ("MAX_TURNS", "sess-123", 0, "automatic_recovery_disabled"),
     ],
 )
@@ -5686,6 +5686,103 @@ def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(
     assert "SKIP" not in text
 
 
+def test_watch_cycle_logs_attention_for_retry_limit_reached_action(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/retry-limit-attention"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.determine_next_action",
+            return_value={
+                "type": "skip",
+                "description": "SKIP: automatic recovery stops here; retry limit reached",
+                "needs_attention_reason": "retry-limit-reached",
+            },
+        ),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    text = log_path.read_text()
+    assert "ATTENTION" in text
+    assert "reason=retry-limit-reached" in text
+    assert "SKIP" not in text
+
+
+def test_watch_cycle_logs_attention_for_rebase_did_not_unblock_merge_without_spawning_rebase(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/rebase-still-blocked-watch"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.determine_next_action",
+            return_value={
+                "type": "needs_discussion",
+                "description": "SKIP: completed rebase did not unblock merge; manual decision required",
+                "needs_attention_reason": "rebase-did-not-unblock-merge",
+            },
+        ),
+        patch("gza.cli.watch._create_rebase_task") as create_rebase,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    text = log_path.read_text()
+    assert "ATTENTION" in text
+    assert "reason=rebase-did-not-unblock-merge" in text
+    create_rebase.assert_not_called()
+
+
 def test_watch_cycle_attention_uses_impl_owner_for_plan_owned_rebase_row(tmp_path: Path) -> None:
     """Plan-owned branch rows should reroot ATTENTION output to the implementation owner."""
     store, plan, impl, rebase = _setup_watch_plan_owned_branch_action_row(tmp_path)
@@ -6629,8 +6726,8 @@ def test_cmd_watch_restart_failed_dry_run_hides_skipped_by_default_and_sorts_old
     assert hidden_skip.id not in stdout
     assert f'{manual.id} implement "Manual failed implement" reason=manual-failure-reason' in normalized
     assert "TEST_FAILURE requires manual intervention" in normalized
-    assert f'{exhausted_child.id} implement "Failed resume attempt" reason=max-resume-attempts-reached' in normalized
-    assert "automatic recovery stops here; manual review required" in normalized
+    assert f'{exhausted_child.id} implement "Failed resume attempt" reason=retry-limit-reached' in normalized
+    assert "automatic recovery stops here; retry limit reached" in normalized
     assert f'{exhausted_root.id} implement "Failed resume root"' not in normalized
     assert "reason=newer-recovery-descendant-needs-attention" not in normalized
     assert "2 actionable (0 resume, 2 retry), 2 needs attention, 1 skipped hidden" in normalized
@@ -7349,8 +7446,8 @@ def test_cmd_watch_restart_failed_dry_run_saturates_retry_resume_attempt_display
     stdout = capsys.readouterr().out
     assert "attempt=3/2" not in stdout
     normalized = " ".join(stdout.split())
-    assert f'{resumed_retry.id} plan "Root failed plan" reason=max-resume-attempts-reached' in normalized
-    assert "automatic recovery stops here; manual review required" in normalized
+    assert f'{resumed_retry.id} plan "Root failed plan" reason=retry-limit-reached' in normalized
+    assert "automatic recovery stops here; retry limit reached" in normalized
 
 
 def test_collect_unhandled_failures_skips_actionable_recovery_failures(tmp_path: Path) -> None:

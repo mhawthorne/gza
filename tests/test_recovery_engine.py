@@ -12,6 +12,7 @@ from gza.git import GitError
 from gza.recovery_engine import (
     _MergeContext,
     _is_resolved_by_landed_lineage,
+    FailedRecoveryDecision,
     decide_failed_task_recovery,
     get_completed_recovery_descendant,
     get_completed_sibling_recovery,
@@ -21,6 +22,7 @@ from gza.recovery_engine import (
     is_chain_resolved_by_recovery,
     is_resolved_by_merged_target,
     list_failed_tasks_for_recovery,
+    resolve_recovery_planning_task,
 )
 from tests.cli.conftest import make_store, setup_config
 
@@ -480,7 +482,27 @@ def test_recovery_engine_timeout_without_session_requires_manual_review(tmp_path
     store, task = _failed_task(tmp_path, reason="MAX_STEPS", session_id=None)
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
     assert decision.action == "skip"
-    assert decision.reason_code == "manual_review_required"
+    assert decision.reason_code == "retry_limit_reached"
+    assert get_failed_recovery_needs_attention_reason(store, task, decision=decision, max_recovery_attempts=1) == (
+        "retry-limit-reached"
+    )
+
+
+def test_get_failed_recovery_needs_attention_reason_keeps_manual_review_required_alias(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="MAX_STEPS", session_id=None)
+    decision = FailedRecoveryDecision(
+        task_id=task.id,
+        action="skip",
+        reason_code="manual_review_required",
+        reason_text="legacy manual review required",
+        launch_mode="none",
+        attempt_index=2,
+        attempt_limit=2,
+    )
+
+    assert get_failed_recovery_needs_attention_reason(store, task, decision=decision, max_recovery_attempts=1) == (
+        "retry-limit-reached"
+    )
 
 
 def test_recovery_engine_manual_reason_skips(tmp_path: Path) -> None:
@@ -689,6 +711,46 @@ def test_get_completed_sibling_recovery_returns_completed_descendant_of_failed_s
     assert get_completed_sibling_recovery(store, failed_resume).id == completed_grandchild.id
 
 
+def test_completed_recovery_descendant_requires_merged_code_outcome(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-root"
+    failed.branch = "feature/root"
+    failed.has_commits = True
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    completed_retry = store.add(
+        failed.prompt,
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="resume",
+    )
+    assert completed_retry.id is not None
+    completed_retry.status = "completed"
+    completed_retry.session_id = failed.session_id
+    completed_retry.branch = failed.branch
+    completed_retry.has_commits = True
+    completed_retry.merge_status = "unmerged"
+    completed_retry.completed_at = datetime.now(UTC)
+    store.update(completed_retry)
+
+    assert is_chain_resolved_by_recovery(store, failed) is False
+    assert get_completed_recovery_descendant(store, failed) is None
+    assert resolve_recovery_planning_task(store, failed).id == completed_retry.id
+
+    completed_retry.merge_status = "merged"
+    store.update(completed_retry)
+
+    assert is_chain_resolved_by_recovery(store, failed) is True
+    assert get_completed_recovery_descendant(store, failed).id == completed_retry.id
+
+
 def test_get_completed_sibling_recovery_ignores_unresolved_sibling_chain(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -721,6 +783,48 @@ def test_get_completed_sibling_recovery_ignores_unresolved_sibling_chain(tmp_pat
     store.update(sibling_resume)
 
     assert get_completed_sibling_recovery(store, failed_resume) is None
+
+
+def test_get_completed_sibling_recovery_requires_merged_code_outcome(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="implement")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "NO_ACTIVITY"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.has_commits = True
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type="implement", based_on=root.id, recovery_origin="resume")
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_resume.session_id = root.session_id
+    failed_resume.branch = root.branch
+    failed_resume.has_commits = True
+    failed_resume.completed_at = datetime.now(UTC)
+    store.update(failed_resume)
+
+    completed_resume = store.add(root.prompt, task_type="implement", based_on=root.id, recovery_origin="resume")
+    assert completed_resume.id is not None
+    completed_resume.status = "completed"
+    completed_resume.session_id = root.session_id
+    completed_resume.branch = root.branch
+    completed_resume.has_commits = True
+    completed_resume.merge_status = "unmerged"
+    completed_resume.completed_at = datetime.now(UTC)
+    store.update(completed_resume)
+
+    assert get_completed_sibling_recovery(store, failed_resume) is None
+
+    completed_resume.merge_status = "merged"
+    store.update(completed_resume)
+
+    assert get_completed_sibling_recovery(store, failed_resume).id == completed_resume.id
 
 
 def test_get_completed_sibling_recovery_ignores_manual_sibling(tmp_path: Path) -> None:
@@ -978,7 +1082,7 @@ def test_recovery_engine_only_terminal_failed_node_remains_actionable(tmp_path: 
 
     child_decision = decide_failed_task_recovery(store, retry_child, max_recovery_attempts=3)
     assert child_decision.action == "skip"
-    assert child_decision.reason_code == "manual_review_required"
+    assert child_decision.reason_code == "retry_limit_reached"
 
 
 def test_recovery_engine_dropped_recovery_child_requires_shared_attention(tmp_path: Path) -> None:
@@ -1058,7 +1162,7 @@ def test_recovery_engine_failed_then_dropped_recovery_descendant_requires_shared
 
     child_decision = decide_failed_task_recovery(store, failed_resume, max_recovery_attempts=3)
     assert child_decision.action == "skip"
-    assert child_decision.reason_code == "manual_review_required"
+    assert child_decision.reason_code == "retry_limit_reached"
     assert is_chain_resolved_by_recovery(store, root) is False
     assert is_chain_resolved_by_recovery(store, failed_resume) is False
 
@@ -1158,7 +1262,7 @@ def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:
 
     decision = decide_failed_task_recovery(store, attempt, max_recovery_attempts=1)
     assert decision.action == "skip"
-    assert decision.reason_code == "manual_review_required"
+    assert decision.reason_code == "retry_limit_reached"
 
 
 def test_recovery_engine_resume_child_failure_stops(tmp_path: Path) -> None:
@@ -1175,7 +1279,7 @@ def test_recovery_engine_resume_child_failure_stops(tmp_path: Path) -> None:
 
     decision = decide_failed_task_recovery(store, child, max_recovery_attempts=1)
     assert decision.action == "skip"
-    assert decision.reason_code == "manual_review_required"
+    assert decision.reason_code == "retry_limit_reached"
 
 
 def test_recovery_engine_retry_child_timeout_gets_one_resume(tmp_path: Path) -> None:
@@ -1220,7 +1324,7 @@ def test_recovery_engine_retry_resume_child_failure_stops(tmp_path: Path) -> Non
 
     decision = decide_failed_task_recovery(store, resumed_retry, max_recovery_attempts=1)
     assert decision.action == "skip"
-    assert decision.reason_code == "manual_review_required"
+    assert decision.reason_code == "retry_limit_reached"
 
 
 def test_recovery_engine_retry_resume_failure_saturates_attempt_counter(tmp_path: Path) -> None:
@@ -1250,7 +1354,7 @@ def test_recovery_engine_retry_resume_failure_saturates_attempt_counter(tmp_path
 
     decision = decide_failed_task_recovery(store, resumed_retry, max_recovery_attempts=1)
     assert decision.action == "skip"
-    assert decision.reason_code == "manual_review_required"
+    assert decision.reason_code == "retry_limit_reached"
     assert (decision.attempt_index, decision.attempt_limit) == (2, 2)
 
 
@@ -1297,9 +1401,12 @@ def test_recovery_engine_multiple_pending_children_require_manual_review(tmp_pat
 
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
     assert decision.action == "skip"
-    assert decision.reason_code == "manual_review_required"
+    assert decision.reason_code == "recovery_ambiguous"
     assert decision.reason_text == "multiple pending recovery children require manual review"
     assert decision.recovery_task_id is None
+    assert get_failed_recovery_needs_attention_reason(store, task, decision=decision, max_recovery_attempts=1) == (
+        "recovery-ambiguous"
+    )
 
 
 def test_recovery_engine_pending_manual_follow_up_does_not_suppress_failed_parent(tmp_path: Path) -> None:

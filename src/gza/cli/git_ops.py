@@ -3044,7 +3044,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if aaction.get("needs_attention_reason") in {
                 "review-max-cycles-reached",
                 "automatic-recovery-disabled",
-                "max-resume-attempts-reached",
+                "retry-limit-reached",
             }:
                 _color = _advance_action_color(str(aaction.get("type", "skip")))
                 console.print(f"  [{_color}]Recommended next step: uv run gza fix {atask.id}[/{_color}]")

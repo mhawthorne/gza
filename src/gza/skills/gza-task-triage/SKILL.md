@@ -60,7 +60,7 @@ Map `next_action` (the `type` field) and `next_action_reason` to a classificatio
 | `needs_discussion` | `rebase-failed-needs-manual-resolution` | **failed rebase — check if target merged** |
 | `needs_discussion` | `merge-source-needs-manual-resolution` | **manual merge-source conflict** |
 | `max_cycles_reached` | `review-max-cycles-reached` | **review/improve churn — hand off to `/gza-task-fix`** |
-| `needs_discussion` | `manual-review-required` | **needs human code review** |
+| `needs_discussion` | `retry-limit-reached` / `recovery-ambiguous` / `manual-review-required` | **needs human code review** |
 | `resume` | various | **infra failure (timeout, worker died) — recommend `gza resume`** but DO NOT run it |
 | `skip` (other) | varies | **unknown — show context and let the user decide** |
 

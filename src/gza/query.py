@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from gza.db import SqliteTaskStore, Task, task_id_numeric_key
+from gza.lifecycle_completion import task_is_complete_for_lifecycle
 from gza.lineage import resolve_impl_task, walk_ancestors
 from gza.task_query import (
     DateFilter,
@@ -99,23 +100,7 @@ def is_lineage_complete(
     compatibility task-row ``merge_status``.
     """
     merge_state = _task_merge_state_for_target(task, store=store, target_branch=target_branch)
-    if task.status in {"failed", "pending", "in_progress", "dropped"}:
-        return False
-    if task.status == "completed":
-        if merge_state == "merged":
-            return True
-        # Non-code tasks (explore/plan/review) produce no commits; treat as complete
-        if not task.has_commits:
-            return True
-        # Code-producing tasks need explicit merge confirmation
-        if merge_state == "unmerged":
-            return False
-        # has_commits=True but merge_status is None: treat as incomplete
-        return False
-    if task.status == "unmerged":
-        return merge_state == "merged"
-    # Any unexpected status remains incomplete.
-    return False
+    return task_is_complete_for_lifecycle(task, merge_state=merge_state)
 
 
 def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
@@ -445,6 +430,7 @@ def query_incomplete(
             any_tag=f.any_tag,
             date_filter=date_filter,
             include_skipped=True,
+            exclude_dropped_from_planning=True,
         ),
         target_branch=target_branch,
     )

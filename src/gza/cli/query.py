@@ -33,6 +33,7 @@ from ..console import (
     truncate,
 )
 from ..db import (
+    MergeUnit,
     SqliteTaskStore,
     Task as DbTask,
     _is_readonly_snapshot_operational_error,
@@ -43,6 +44,7 @@ from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git, GitError, active_worktree_path_for_branch
 from ..github import GitHub
 from ..lineage import walk_based_on_descendants
+from ..lineage_query import filter_display_unresolved_tasks_for_incomplete
 from ..pr_ops import lookup_task_pr
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
@@ -1317,6 +1319,22 @@ def _normalize_incomplete_result_rows(
             continue
 
         owner_task = _resolve_incomplete_owner_task(store, row)
+        merge_units_by_task_id: dict[str, MergeUnit] = {}
+        for task in (owner_task, *row.members, *row.unresolved_tasks):
+            if task is None or task.id is None or task.id in merge_units_by_task_id:
+                continue
+            unit = store.resolve_merge_unit_for_task(task.id)
+            if unit is not None:
+                merge_units_by_task_id[task.id] = unit
+        unresolved_tasks = filter_display_unresolved_tasks_for_incomplete(
+            row.unresolved_tasks,
+            merge_units_by_task_id=merge_units_by_task_id,
+            exclude_dropped=True,
+        )
+        if owner_task.status == "dropped" or not unresolved_tasks:
+            changed = True
+            continue
+
         tree = row.tree
         members = row.members
         if owner_task.task_type == "implement":
@@ -1337,7 +1355,7 @@ def _normalize_incomplete_result_rows(
                     owner_task=owner_task,
                     members=members,
                     tree=tree,
-                    unresolved_tasks=row.unresolved_tasks,
+                    unresolved_tasks=unresolved_tasks,
                     lifecycle_action_task=row.lifecycle_action_task,
                     recovery_action_task=row.recovery_action_task,
                     recovery_leaf_task=row.recovery_leaf_task,

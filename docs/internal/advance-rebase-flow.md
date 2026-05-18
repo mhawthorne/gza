@@ -10,7 +10,8 @@ When `gza advance` encounters a completed task whose branch has merge conflicts 
    - `pending` or `in_progress` → skip (rebase already running, avoid duplicates)
    - `failed` with no later successful same-branch rebase/recovery, no later approved/cleared review, and no local post-resolution proof (`merge unit merged`, branch tip equals target tip, or branch contains the current target tip) → `needs_discussion` (manual intervention required)
    - rebase planning against a rebase descendant first resolves the canonical rebase target; if that target merge unit is already `merged`, or the descendant no longer attaches to any merge unit at all, advance skips instead of queueing another rebase against an orphan branch
-   - `completed` or no rebase child → create a new rebase task (`needs_rebase` action)
+   - `completed` and conflicts still remain → `needs_discussion` with reason `rebase-did-not-unblock-merge` (manual decision required before another rebase)
+   - no rebase child → create a new rebase task (`needs_rebase` action)
    - mergeable branches continue through the normal review/merge rules even if the branch is behind target or earlier local verify ran slowly
 
 ## How rebase tasks are created
