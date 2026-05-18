@@ -17,3 +17,25 @@
 - Reads should compose as a sequence of filters/sorts/projections in `TaskQuery`.
 - Point lookups that are immediately followed by a mutation (`store.get(task_id)` before update/delete) are still fine outside the query layer.
 - New CLI/API task-list features should add a query preset before adding another custom store read path.
+
+## Merge-State Axes
+
+gza tracks branch merge state across four different axes. They answer different questions and are not expected to agree in every case.
+
+1. `DB lifecycle state` is the canonical answer to lifecycle questions such as "has this work landed?", "should this owner row still appear in `gza incomplete`?", and "should `gza advance` short-circuit?" `TaskQueryService._branch_merge_state()` reads that lifecycle state from the merge unit first (`src/gza/task_query.py:919`), and same-target merge units treat `merge_unit.state == "merged"` as authoritative in `src/gza/merge_state.py:69` and `src/gza/cli/git_ops.py:2465-2471`. Do not cross-check this against strict git ancestry.
+2. `Ref existence` answers only whether a local or remote branch ref still points somewhere. A merged branch can still have a live ref, especially after a squash merge. Ref cleanup is intentionally independent from lifecycle state: `_reconcile_squash_merged_branch_with_origin()` rewrites surviving refs to the squash commit instead of deleting them (`src/gza/cli/git_ops.py:392`).
+3. `Content equivalence` is the live git proof for "is the work already in the target regardless of how it got there?" `Git.is_merged()` uses `merge-tree` to compare result trees, so it handles squash merges, rebases, and divergent-but-equivalent branches (`src/gza/git.py:822`). `reconcile_branch_merge_truth()` uses that check when reconciling branch truth without persisting lifecycle state (`src/gza/sync_ops.py:317`).
+4. `Strict ancestry` answers only whether one commit is reachable from another in the commit graph. `Git.is_ancestor()` is a thin wrapper around `git merge-base --is-ancestor` (`src/gza/git.py:676`). After a squash merge, a landed branch commonly fails this test. In gza, `resolve_post_merge_rebase_state()` uses ancestry only as proof that a stale failed-rebase blocker can be cleared because the implementation branch already contains the target tip (positive-proof branch at `src/gza/advance_engine.py:374-384`); it is not a substitute for merge lifecycle state.
+
+The expected squash-merge shape is therefore: `merge_unit.state == "merged"`, branch ref still exists, and `is_ancestor(branch, main) == false`. That combination is normal, not a corruption signal.
+
+Guidance for future callers:
+
+- Use DB lifecycle state for lifecycle and owner-row decisions.
+- Use `Git.is_merged()` when you need live git proof that the content landed.
+- Use `Git.is_ancestor()` only for ancestry-specific questions such as clearing stale post-rebase blockers.
+- If a `branch_merge_state` consumer really wants ancestry semantics, it is probably asking the wrong helper.
+
+## Task-Mode Guidance
+
+When task-mode code needs to answer "did this work land?" or "should this lineage still block follow-up automation?", prefer the merge unit's DB lifecycle state over branch existence or strict ancestry. A surviving branch after a squash merge is normal, and ancestry-only checks are too strict for task-mode lifecycle decisions.
