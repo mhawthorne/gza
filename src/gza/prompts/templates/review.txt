@@ -40,6 +40,11 @@ Section requirements:
     - Impact:
     - Required fix:
     - Required tests: (name targeted regression coverage tied to the failure mode; avoid generic test asks)
+  - Class-of-issue enumeration:
+    - When one blocker is an instance of a repeated code-surface pattern (lookup table, classifier, dispatcher, schema/field mapping, multi-field validator, or parallel per-field/per-type handling), audit for analogous gaps before writing the blocker. The audit boundary is the affected file plus any other files in the same module (the same depth-3 path under `src/`) that were touched by the diff, plus any obvious same-module sibling of the affected file.
+    - Report all still-open gaps for that same class in one blocker, with every affected `path:line` or `path:start-end` citation included in `Open-state citation:` regardless of file, and a `Required fix:` that closes the whole class.
+    - Do not create one blocker per field, branch, case, table row, or file unless the required fixes are materially different.
+    - Do not expand the audit beyond the same module, and do not expand isolated one-off defects - this rule applies only after you have found a repeated-pattern blocker shape.
 - ## Follow-Ups
   - If there are no non-blocking follow-ups, write exactly: None.
   - Otherwise list follow-ups with headings:
@@ -79,6 +84,7 @@ Blocking discipline:
 - If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.
 - Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.
 - For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.
+- For class-of-issue blockers, the closure condition must cover every enumerated instance across all cited paths, not just the first example.
 - Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.
 - Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.
 - `Open-state citation:` must contain one or more current-source references in `path:line` or `path:start-end` form; backticked citations and comma-separated multiple citations are allowed.

@@ -12,6 +12,7 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it.",
     "Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.",
     "Open-state citation:",
+    "Class-of-issue enumeration:",
     "Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.",
     "Treat unexplained deviations from the provided plan or request as BLOCKER.",
     "Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.",
@@ -157,6 +158,7 @@ class TestPromptBuilderBuild:
             not in result
         )
         assert "Treat a cited path or line range as an instance of a class of issue" in result
+        assert "reviewer-enumerated class" in result
         assert '"Extra scope" means unrelated changes, not other instances of the same blocker class.' in result
 
     def test_build_improve_comments_only_context_does_not_require_must_fix_structure(
@@ -343,6 +345,11 @@ class TestPromptBuilderBuild:
         assert "No plan or request provided." in result
         assert "unexplained deviations from the provided plan or request" in result
         assert "Reserve BLOCKER for:" in result
+        assert "lookup table" in result
+        assert "classifier" in result
+        assert "dispatcher" in result
+        assert "same depth-3 path under `src/`" in result
+        assert "do not expand isolated one-off defects" in result
         _assert_summary_checklist_contract(result)
         checklist_lines = re.findall(r"^\s*-\s.+\?$", result, flags=re.MULTILINE)
         assert len(checklist_lines) == REVIEW_SUMMARY_CHECKLIST_COUNT

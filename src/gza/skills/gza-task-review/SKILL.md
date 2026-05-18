@@ -176,6 +176,10 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 
 <Use ### B1, ### B2, ... for blockers. If none, write "None.">
 <Each blocker should include Evidence:, Open-state citation:, Impact:, Required fix:, Required tests:>
+<Class-of-issue enumeration: when one blocker is an instance of a repeated code-surface pattern (lookup table, classifier, dispatcher, schema/field mapping, multi-field validator, or parallel per-field/per-type handling), audit for analogous gaps before writing the blocker. The audit boundary is the affected file plus any other files in the same module (the same depth-3 path under `src/`) that were touched by the diff, plus any obvious same-module sibling of the affected file.>
+<Report all still-open gaps for that same class in one blocker, with every affected `path:line` or `path:start-end` citation included in `Open-state citation:` regardless of file, and a `Required fix:` that closes the whole class.>
+<Do not create one blocker per field, branch, case, table row, or file unless the required fixes are materially different.>
+<Do not expand the audit beyond the same module, and do not expand isolated one-off defects - this rule applies only after you have found a repeated-pattern blocker shape.>
 <Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
 <Treat unexplained deviations from the provided plan or request as BLOCKER.>
 <Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.>
@@ -183,6 +187,7 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 <If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.>
 <Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.>
 <For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.>
+<For class-of-issue blockers, the closure condition must cover every enumerated instance across all cited paths, not just the first example.>
 <Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.>
 <Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.>
 <If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`; use the trimmed failing output as Evidence and keep doing the normal code review in the same review.>
