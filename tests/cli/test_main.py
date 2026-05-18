@@ -352,6 +352,14 @@ class TestHelpOutput:
         assert "Non-pending tasks may only use tag mutation flags" in docs_text
         assert "remain pending-only" in normalized_help
         assert "remain pending-only" in docs_text
+        assert "--hold-for-review" in normalized_help
+        assert "--no-hold-for-review" in normalized_help
+        assert "--auto-implement" in normalized_help
+        assert "--hold-for-review" in docs_text
+        assert "--no-hold-for-review" in docs_text
+        assert "--auto-implement" in docs_text
+        assert "Compatibility alias for `--no-hold-for-review`" in normalized_help
+        assert "--no-hold-for-review` (preferred) or `--auto-implement` (compatibility alias)" in docs_text
 
         for flag in ("--add-tag", "--remove-tag", "--clear-tags", "--set-tags"):
             assert flag in normalized_help

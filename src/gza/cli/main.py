@@ -118,6 +118,33 @@ def _parse_queue_limit(value: str) -> int:
     return parsed
 
 
+class _TrackHoldForReviewAction(argparse.BooleanOptionalAction):
+    """Boolean optional action that records which hold-for-review flag spellings were used."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        super().__call__(parser, namespace, values, option_string)
+        if option_string is None:
+            return
+        used_flags = list(getattr(namespace, "hold_for_review_flags", ()))
+        used_flags.append(option_string)
+        setattr(namespace, "hold_for_review_flags", used_flags)
+
+
+class _TrackAutoImplementAliasAction(argparse.Action):
+    """Compatibility alias for `--no-hold-for-review` that records explicit legacy usage."""
+
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, False)
+        if option_string is None:
+            return
+        used_flags = list(getattr(namespace, "hold_for_review_flags", ()))
+        used_flags.append(option_string)
+        setattr(namespace, "hold_for_review_flags", used_flags)
+
+
 HIDDEN_COMMANDS: set[str] = set()
 
 
@@ -1429,12 +1456,14 @@ def main() -> int:
     # edit command
     edit_parser = subparsers.add_parser(
         "edit",
-        help="Edit a task; non-pending tasks only support tag edits except completed plan --auto-implement",
+        help="Edit a task; non-pending tasks only support tag edits except completed plan hold release",
         description="Edit an existing task. Pending tasks may use any supported edit flag.",
         epilog=(
             "Non-pending tasks may only use tag mutation flags "
             "(`--add-tag`, `--remove-tag`, `--clear-tags`, or `--set-tags`). "
-            "Completed plan tasks may also use `--auto-implement` to release a hold-for-review plan. "
+            "Pending plan tasks may use `--hold-for-review` or `--no-hold-for-review`. "
+            "Completed plan tasks may also use `--no-hold-for-review` "
+            "(preferred) or `--auto-implement` (compatibility alias) to release a hold-for-review plan. "
             "All other edit flags (`--based-on`, `--depends-on`, `--explore`, `--task`, "
             "`--review`, `--pr`, `--prompt`, `--prompt-file`, `--model`, `--provider`, "
             "and `--no-learnings`) remain pending-only."
@@ -1501,9 +1530,16 @@ def main() -> int:
         help="Enable automatic review task creation on completion",
     )
     edit_parser.add_argument(
+        "--hold-for-review",
+        action=_TrackHoldForReviewAction,
+        default=None,
+        help="For plan tasks, require manual review before automatic implementation follow-up",
+    )
+    edit_parser.add_argument(
         "--auto-implement",
-        action="store_true",
-        help="For plan tasks, enable automatic implementation follow-up",
+        action=_TrackAutoImplementAliasAction,
+        dest="hold_for_review",
+        help="Compatibility alias for `--no-hold-for-review`; retained for existing scripts",
     )
     edit_parser.add_argument(
         "--pr",

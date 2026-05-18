@@ -525,8 +525,150 @@ class TestEditCommand:
         assert updated is not None
         assert updated.auto_implement is True
 
-    def test_edit_auto_implement_rejects_non_plan_task(self, tmp_path: Path):
-        """The auto-implement release valve is plan-only."""
+    def test_edit_hold_for_review_allowed_for_pending_plan(self, tmp_path: Path):
+        """Pending plan tasks may add a hold-for-review in place."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Pending plan", task_type="plan", auto_implement=True)
+
+        result = run_gza("edit", str(task.id), "--hold-for-review", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Enabled hold-for-review" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.status == "pending"
+        assert updated.auto_implement is False
+
+    def test_edit_no_hold_for_review_allowed_for_pending_plan(self, tmp_path: Path):
+        """Pending held plan tasks may release the hold with the preferred flag name."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Held pending plan", task_type="plan", auto_implement=False)
+
+        result = run_gza("edit", str(task.id), "--no-hold-for-review", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "automatic implementation follow-up" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.status == "pending"
+        assert updated.auto_implement is True
+
+    def test_edit_hold_for_review_rejects_completed_plan(self, tmp_path: Path):
+        """Completed plans cannot add a hold during edit."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Completed plan", task_type="plan", auto_implement=True)
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("edit", str(task.id), "--hold-for-review", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "non-pending tasks only allow tag edits" in result.stdout
+        assert "--hold-for-review is only allowed for pending plan tasks" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.auto_implement is True
+        assert updated.tags == ()
+
+    def test_edit_hold_for_review_with_tag_rejects_completed_plan_without_mutating(self, tmp_path: Path):
+        """A tag edit cannot bypass the completed-plan hold-for-review restriction."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Completed plan", task_type="plan", auto_implement=True, tags=("backend",))
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            "--hold-for-review",
+            "--add-tag",
+            "release-1.2",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "--hold-for-review is only allowed for pending plan tasks" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.auto_implement is True
+        assert updated.tags == ("backend",)
+
+    def test_edit_no_hold_for_review_allowed_for_completed_plan(self, tmp_path: Path):
+        """Completed held plans may release the hold via the preferred flag name."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Held completed plan", task_type="plan", auto_implement=False)
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("edit", str(task.id), "--no-hold-for-review", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "automatic implementation follow-up" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.auto_implement is True
+
+    @pytest.mark.parametrize("flag", ["--no-hold-for-review", "--auto-implement"])
+    def test_edit_release_hold_with_tag_rejects_non_completed_non_pending_plan_without_mutating(
+        self, tmp_path: Path, flag: str
+    ):
+        """Non-completed non-pending plans cannot release a hold, even alongside tag edits."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("In-progress plan", task_type="plan", auto_implement=False, tags=("backend",))
+        task.status = "in_progress"
+        task.started_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            flag,
+            "--add-tag",
+            "release-1.2",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert (
+            "hold-for-review edits are only allowed for pending plan tasks, except completed plans may use "
+            "--no-hold-for-review or --auto-implement."
+        ) in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.auto_implement is False
+        assert updated.tags == ("backend",)
+
+    def test_edit_auto_implement_rejects_non_plan_task_with_legacy_message(self, tmp_path: Path):
+        """Legacy alias preserves its plan-only validation message on non-plan tasks."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -534,6 +676,43 @@ class TestEditCommand:
         task = store.add("Regular task", task_type="implement")
 
         result = run_gza("edit", str(task.id), "--auto-implement", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "--auto-implement is only valid for plan tasks" in result.stdout
+
+    @pytest.mark.parametrize("flag", ["--hold-for-review", "--no-hold-for-review"])
+    def test_edit_hold_flags_reject_non_plan_task(self, tmp_path: Path, flag: str):
+        """Preferred hold-for-review edit flags remain plan-only."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Regular task", task_type="implement")
+
+        result = run_gza("edit", str(task.id), flag, "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "hold-for-review flags are only valid for plan tasks" in result.stdout
+
+    @pytest.mark.parametrize(
+        "flags",
+        [
+            ("--auto-implement", "--hold-for-review"),
+            ("--hold-for-review", "--auto-implement"),
+            ("--auto-implement", "--no-hold-for-review"),
+        ],
+    )
+    def test_edit_hold_flags_with_auto_implement_preserve_legacy_non_plan_message(
+        self, tmp_path: Path, flags: tuple[str, ...]
+    ):
+        """Any non-plan edit including the legacy alias keeps the legacy validation signal."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Regular task", task_type="implement")
+
+        result = run_gza("edit", str(task.id), *flags, "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "--auto-implement is only valid for plan tasks" in result.stdout

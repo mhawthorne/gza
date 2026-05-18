@@ -1335,25 +1335,47 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if getattr(args, "skip_learnings", False):
         pending_only_flags.append("--no-learnings")
 
-    auto_implement_requested = bool(getattr(args, "auto_implement", False))
+    hold_for_review_requested = getattr(args, "hold_for_review", None)
+    hold_for_review_flags = tuple(getattr(args, "hold_for_review_flags", ()))
+    hold_flag_requested = hold_for_review_requested is not None
+    release_hold_requested = hold_for_review_requested is False
+    add_hold_requested = hold_for_review_requested is True
 
-    if auto_implement_requested and task.task_type != "plan":
-        print("Error: --auto-implement is only valid for plan tasks.")
+    if hold_flag_requested and task.task_type != "plan":
+        if "--auto-implement" in hold_for_review_flags:
+            print("Error: --auto-implement is only valid for plan tasks.")
+        else:
+            print("Error: hold-for-review flags are only valid for plan tasks.")
         return 1
 
-    non_pending_auto_implement_allowed = (
-        auto_implement_requested
+    non_pending_hold_edit_allowed = (
+        release_hold_requested
         and task.task_type == "plan"
         and task.status == "completed"
     )
 
-    if task.status != "pending" and (pending_only_flags or (not tag_mutation_flags and not non_pending_auto_implement_allowed)):
-        print(
-            f"Error: Task {task_id} is {task.status}; non-pending tasks only allow "
-            "tag edits via --set-tags, --add-tag, --remove-tag, or --clear-tags.",
-        )
-        if auto_implement_requested and not non_pending_auto_implement_allowed:
-            print("Error: --auto-implement is only allowed for completed plan tasks.")
+    non_pending_hold_error: str | None = None
+    if hold_flag_requested and task.status != "pending" and not non_pending_hold_edit_allowed:
+        if add_hold_requested and task.task_type == "plan" and task.status == "completed":
+            non_pending_hold_error = "Error: --hold-for-review is only allowed for pending plan tasks."
+        else:
+            non_pending_hold_error = (
+                "Error: hold-for-review edits are only allowed for pending plan tasks, "
+                "except completed plans may use --no-hold-for-review or --auto-implement."
+            )
+
+    if task.status != "pending" and (
+        pending_only_flags
+        or non_pending_hold_error is not None
+        or (not tag_mutation_flags and not non_pending_hold_edit_allowed)
+    ):
+        if pending_only_flags or (not tag_mutation_flags and not non_pending_hold_edit_allowed):
+            print(
+                f"Error: Task {task_id} is {task.status}; non-pending tasks only allow "
+                "tag edits via --set-tags, --add-tag, --remove-tag, or --clear-tags.",
+            )
+        if non_pending_hold_error is not None:
+            print(non_pending_hold_error)
         if pending_only_flags:
             print(f"Error: Pending-only edit flags requested: {', '.join(pending_only_flags)}")
         return 1
@@ -1458,9 +1480,14 @@ def cmd_edit(args: argparse.Namespace) -> int:
         update_messages.append(f"✓ Enabled automatic PR creation for task {task.id}")
         changed = True
 
-    if auto_implement_requested:
-        task.auto_implement = True
-        update_messages.append(f"✓ Enabled automatic implementation follow-up for plan task {task.id}")
+    if hold_flag_requested:
+        task.auto_implement = not hold_for_review_requested
+        if hold_for_review_requested:
+            update_messages.append(
+                f"✓ Enabled hold-for-review for plan task {task.id}; automatic implementation follow-up is disabled"
+            )
+        else:
+            update_messages.append(f"✓ Enabled automatic implementation follow-up for plan task {task.id}")
         changed = True
 
     # Handle --model flag
