@@ -6218,6 +6218,8 @@ class TestIterateCommand:
         )
         attention = resolve_execution_needs_attention(impl, result)
         assert attention is not None
+        assert attention.task.id == impl.id
+        assert attention.action["subject_task_id"] == impl.id
         return self._format_expected_attention_line(attention.task, attention.action)
 
     def _expected_failed_recovery_attention_line(
@@ -6242,6 +6244,8 @@ class TestIterateCommand:
         assert result is not None
         attention = resolve_execution_needs_attention(failed_task, result)
         assert attention is not None
+        assert attention.task.id == failed_task.id
+        assert attention.action["subject_task_id"] == failed_task.id
         return self._format_expected_attention_line(attention.task, attention.action)
 
     def _shared_failed_recovery_attention_lines(
@@ -6270,6 +6274,7 @@ class TestIterateCommand:
             max_recovery_attempts=max_resume_attempts,
         )
         assert advance_action is not None
+        assert advance_action["subject_task_id"] == failed_task.id
         watch_action = _failed_recovery_attention_action(
             store=store,
             task=failed_task,
@@ -6277,6 +6282,7 @@ class TestIterateCommand:
             max_recovery_attempts=max_resume_attempts,
         )
         assert watch_action is not None
+        assert watch_action["subject_task_id"] == failed_task.id
         iterate_result = build_failed_recovery_needs_attention_result(
             store=store,
             failed_task=failed_task,
@@ -6286,6 +6292,8 @@ class TestIterateCommand:
         assert iterate_result is not None
         iterate_attention = resolve_execution_needs_attention(failed_task, iterate_result)
         assert iterate_attention is not None
+        assert iterate_attention.task.id == failed_task.id
+        assert iterate_attention.action["subject_task_id"] == failed_task.id
         return (
             _format_needs_attention_line(failed_task, advance_action),
             _watch_needs_attention_message(failed_task, watch_action),

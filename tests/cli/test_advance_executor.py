@@ -191,6 +191,10 @@ def test_improve_manual_review_returns_skip_without_mutation(tmp_path: Path) -> 
     assert expected is not None
     assert result == expected
     assert len(store.get_all()) == before_count
+    attention = resolve_execution_needs_attention(impl, result)
+    assert attention is not None
+    assert attention.task.id == impl.id
+    assert attention.action["subject_task_id"] == impl.id
 
 
 def test_improve_dry_run_preserves_noop_warning_description(tmp_path: Path) -> None:
@@ -403,6 +407,10 @@ def test_improve_give_up_reports_automatic_recovery_disabled(tmp_path: Path) -> 
     assert result.attention_type == "automatic_recovery_disabled"
     assert result == expected
     assert len(store.get_all()) == before_count
+    attention = resolve_execution_needs_attention(impl, result)
+    assert attention is not None
+    assert attention.task.id == impl.id
+    assert attention.action["subject_task_id"] == impl.id
 
 
 @pytest.mark.parametrize("trigger_source", ["manual", "watch"])

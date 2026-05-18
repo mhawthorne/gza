@@ -17,11 +17,14 @@ from gza.advance_engine import (
     format_needs_attention_entry,
     format_needs_attention_entry_for_display,
     format_needs_attention_lifecycle,
+    get_action_subject_task_id,
     get_needs_attention_reason,
     is_needs_attention_action,
     is_resumable_failed_task,
+    require_needs_attention_subject,
     resolve_advance_context,
     resolve_closing_review_action,
+    resolve_subject_task,
     with_needs_attention,
 )
 from gza.db import SqliteTaskStore, Task as DbTask
@@ -66,8 +69,11 @@ __all__ = [
     "format_needs_attention_entry",
     "format_needs_attention_entry_for_display",
     "format_needs_attention_lifecycle",
+    "get_action_subject_task_id",
     "get_needs_attention_reason",
     "is_needs_attention_action",
     "resolve_advance_context",
+    "require_needs_attention_subject",
+    "resolve_subject_task",
     "with_needs_attention",
 ]

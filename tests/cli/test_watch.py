@@ -31,8 +31,10 @@ from gza.cli.watch import (
     _installed_gza_package_fingerprint,
     _InstalledPackageDriftState,
     _query_owner_rows,
+    _resolve_watch_attention_display_task,
     _run_cycle,
     _task_snapshot,
+    _watch_needs_attention_message,
     _warn_if_installed_gza_changed,
     _watch_iterate_impl_target,
     _WatchLog,
@@ -79,6 +81,49 @@ def _run_cycle_and_emit_transition_events(
     after = _task_snapshot(store)
     _emit_transition_events(before, after, store=store, config=config, log=log)
     return result
+
+
+def test_watch_attention_uses_declared_subject_for_held_plan(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Merged implement", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 18, 9, 0, tzinfo=UTC)
+    impl.branch = "feature/merged-parent"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "merged")
+
+    plan = store.add("Held plan", task_type="plan", based_on=impl.id, auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 5, 18, 10, 0, tzinfo=UTC)
+    store.update(plan)
+
+    git = _make_watch_git()
+    rows = _query_owner_rows(
+        store=store,
+        config=config,
+        git=git,
+        target_branch="main",
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.next_action is not None
+    assert row.next_action["type"] == "awaiting_human"
+
+    subject_task = _resolve_watch_attention_display_task(store, row)
+    assert subject_task.id == plan.id
+
+    message = _watch_needs_attention_message(subject_task, row.next_action)
+    assert plan.id in message
+    assert impl.id not in message
 
 
 def _setup_watch_owner_with_failed_rebase(tmp_path: Path, *, failure_reason: str):

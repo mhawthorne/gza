@@ -8,8 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from gza.cli.advance_engine import determine_next_action
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
 from gza.query import TaskLineageNode
 from gza.task_query import (
     DateFilter,
@@ -133,7 +135,189 @@ def test_incomplete_preset_projects_held_plan_as_awaiting_human_when_context_ava
     row = result.rows[0]
     assert hasattr(row, "owner_task")
     assert row.values["next_action"] == "awaiting_human"
+    assert row.values["next_action_owner_id"] == plan.id
     assert f"uv run gza implement {plan.id}" in str(row.values["next_action_reason"])
+
+
+def test_incomplete_preset_falls_back_to_owner_for_unknown_subject_task_id(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    config = SimpleNamespace(
+        max_resume_attempts=1,
+        advance_requires_review=True,
+        advance_create_reviews=True,
+        max_review_cycles=3,
+    )
+    git = SimpleNamespace(
+        can_merge=lambda source, target: False,
+        is_merged=lambda source, target: False,
+        resolve_fresh_merge_source=lambda branch: (f"origin/{branch}", None),
+        count_commits_behind=lambda source, target: 0,
+    )
+    impl = store.add("completed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/unknown-subject"
+    impl.has_commits = True
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    review = store.add("failed review", task_type="review", based_on=impl.id, depends_on=impl.id)
+    assert review.id is not None
+    review.status = "failed"
+    review.completed_at = datetime.now(UTC)
+    review.failure_reason = "REVIEW_CHANGES_REQUESTED"
+    store.update(review)
+
+    service = TaskQueryService(store)
+    row = service._collect_lineages_unlimited(  # noqa: SLF001
+        TaskQueryPresets.incomplete(limit=None),
+        config=config,
+        git=git,
+        target_branch="main",
+    )[0]
+    row = replace(
+        row,
+        next_action_data={
+            "type": "needs_discussion",
+            "description": "SKIP: manual intervention required",
+            "needs_attention_reason": "retry-limit-reached",
+            "subject_task_id": "gza-999999",
+        },
+    )
+
+    projected = service._project_lineage_row(  # noqa: SLF001
+        row,
+        TaskQueryPresets.incomplete(limit=None),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert projected.values["next_action_owner_id"] == impl.id
+
+
+def test_incomplete_preset_warns_and_falls_back_to_owner_for_missing_subject_task_id(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _store(tmp_path)
+    config = SimpleNamespace(
+        max_resume_attempts=1,
+        advance_requires_review=True,
+        advance_create_reviews=True,
+        max_review_cycles=3,
+    )
+    git = SimpleNamespace(
+        can_merge=lambda source, target: False,
+        is_merged=lambda source, target: False,
+        resolve_fresh_merge_source=lambda branch: (f"origin/{branch}", None),
+        count_commits_behind=lambda source, target: 0,
+    )
+    impl = store.add("completed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/missing-subject"
+    impl.has_commits = True
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    review = store.add("failed review", task_type="review", based_on=impl.id, depends_on=impl.id)
+    assert review.id is not None
+    review.status = "failed"
+    review.completed_at = datetime.now(UTC)
+    review.failure_reason = "REVIEW_CHANGES_REQUESTED"
+    store.update(review)
+
+    service = TaskQueryService(store)
+    row = service._collect_lineages_unlimited(  # noqa: SLF001
+        TaskQueryPresets.incomplete(limit=None),
+        config=config,
+        git=git,
+        target_branch="main",
+    )[0]
+    row = replace(
+        row,
+        next_action_data={
+            "type": "needs_discussion",
+            "description": "SKIP: manual intervention required",
+            "needs_attention_reason": "retry-limit-reached",
+        },
+    )
+
+    with caplog.at_level("WARNING", logger="gza.advance_engine"):
+        projected = service._project_lineage_row(  # noqa: SLF001
+            row,
+            TaskQueryPresets.incomplete(limit=None),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert projected.values["next_action_owner_id"] == impl.id
+    assert "without subject_task_id" in caplog.text
+
+
+def test_attention_subject_agrees_across_show_incomplete_and_watch_for_held_plan_lineage(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+    store = _store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Merged implement", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 18, 9, 0, tzinfo=UTC)
+    impl.branch = "feature/merged-parent"
+    impl.has_commits = True
+    impl.merge_status = "merged"
+    store.update(impl)
+
+    plan = store.add("Held plan", task_type="plan", based_on=impl.id, auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 5, 18, 10, 0, tzinfo=UTC)
+    store.update(plan)
+
+    git = SimpleNamespace(
+        can_merge=lambda source, target: True,
+        is_merged=lambda source, target: False,
+        resolve_fresh_merge_source=lambda branch: (f"origin/{branch}", None),
+        count_commits_behind=lambda source, target: 0,
+    )
+
+    show_action = determine_next_action(config, store, git, plan, "main")
+    assert show_action["subject_task_id"] == plan.id
+
+    service = TaskQueryService(store)
+    incomplete_result = service.run(
+        TaskQueryPresets.incomplete(limit=None),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    assert len(incomplete_result.rows) == 1
+    incomplete_row = incomplete_result.rows[0]
+    assert incomplete_row.values["next_action_owner_id"] == plan.id
+
+    from gza.cli.watch import _resolve_watch_attention_display_task, _watch_needs_attention_message
+
+    watch_rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    assert len(watch_rows) == 1
+    watch_row = watch_rows[0]
+    subject_task = _resolve_watch_attention_display_task(store, watch_row)
+    assert subject_task.id == plan.id
+    message = _watch_needs_attention_message(subject_task, watch_row.next_action or {})
+    assert plan.id in message
+    assert impl.id not in message
 
 
 def test_lifecycle_incomplete_prefers_merged_unit_state_over_stale_task_row(tmp_path: Path) -> None:

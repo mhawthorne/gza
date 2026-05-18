@@ -464,6 +464,7 @@ def test_query_lineage_owner_rows_surfaces_held_completed_plan_as_awaiting_human
     assert row.owner_task.id == plan.id
     assert row.next_action is not None
     assert row.next_action["type"] == "awaiting_human"
+    assert row.next_action["subject_task_id"] == plan.id
     assert f"uv run gza implement {plan.id}" in row.next_action["description"]
 
 
@@ -586,6 +587,7 @@ def test_query_lineage_owner_rows_marks_orphan_only_impl_lineage_for_manual_reso
     assert row.next_action is not None
     assert row.next_action["type"] == "needs_discussion"
     assert row.next_action["needs_attention_reason"] == "no-descendant-on-the-impl-branch"
+    assert row.next_action["subject_task_id"] == impl.id
     assert "no descendant on the impl branch" in row.next_action["description"]
     assert {task.id for task in row.unresolved_tasks if task.id is not None} == {orphan.id}
 

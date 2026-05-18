@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -13,8 +14,13 @@ from gza.branch_resolution import resolve_rebase_target_task
 from gza.console import prompt_available_width, shorten_prompt
 from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key, task_owns_merge_status
 from gza.git import ResolvedMergeSourceRef
+from gza.lineage import walk_ancestors
 from gza.merge_state import resolve_task_merge_state_for_target
-from gza.query import get_code_changing_descendants_for_root, get_reviews_for_root
+from gza.query import (
+    get_code_changing_descendants_for_root,
+    get_reviews_for_root,
+    resolve_lineage_root,
+)
 from gza.recovery_engine import (
     FailedRecoveryDecision,
     classify_failure_reason,
@@ -53,6 +59,7 @@ WORKER_CONSUMING_ACTIONS = frozenset(
     }
 )
 VERIFY_BLOCKED_REVIEW_THRESHOLD = 2
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -86,6 +93,7 @@ class DuplicateBlockerStreak:
 class AdvanceContext:
     """Resolved task state used by advance rules."""
 
+    store: SqliteTaskStore
     task: DbTask
     task_type: str
     has_branch: bool
@@ -594,6 +602,12 @@ def _task_id(task: DbTask | None) -> str:
     return task.id
 
 
+def _require_task_id(task: DbTask) -> str:
+    if task.id is None:
+        raise AssertionError("task.id must be set before building advance actions")
+    return task.id
+
+
 def _rebase_change_reason(rebase_task: DbTask | None) -> str:
     if rebase_task is None or rebase_task.changed_diff is True:
         return "changed diff"
@@ -661,6 +675,7 @@ def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]
             ),
         },
         reason="improve-no-op",
+        subject_task_id=ctx.task.id,
     )
 
 
@@ -682,25 +697,33 @@ def _duplicate_blocker_needs_attention_action(ctx: AdvanceContext) -> dict[str, 
             },
         },
         reason="duplicate-blocker-no-progress",
+        subject_task_id=ctx.task.id,
     )
 
 
-def _rebase_did_not_unblock_merge_action() -> dict[str, Any]:
+def _rebase_did_not_unblock_merge_action(ctx: AdvanceContext) -> dict[str, Any]:
     return with_needs_attention(
         {
             "type": "needs_discussion",
             "description": "SKIP: completed rebase did not unblock merge; manual decision required",
         },
         reason="rebase-did-not-unblock-merge",
+        subject_task_id=ctx.task.id,
     )
 
 
 def _failed_task_skip_action(ctx: AdvanceContext) -> dict[str, Any]:
     assert ctx.failed_recovery_decision is not None
+    subject_task_id = ctx.task.id
+    if ctx.task.task_type in {"review", "improve", "rebase"} and ctx.task.id is not None:
+        implement_task = _resolve_owning_implementation_task(ctx.store, ctx.task)
+        if implement_task is not None and implement_task.id is not None:
+            subject_task_id = implement_task.id
     return failed_recovery_decision_to_action(
         ctx.task,
         ctx.failed_recovery_decision,
         needs_attention_reason=ctx.failed_recovery_attention_reason,
+        subject_task_id=subject_task_id,
     )
 
 
@@ -713,11 +736,103 @@ def with_needs_attention(
     action: Mapping[str, Any],
     *,
     reason: str,
+    subject_task_id: str | None,
 ) -> dict[str, Any]:
     """Attach shared needs-attention metadata to an advance action."""
+    if not subject_task_id:
+        raise AssertionError("needs-attention actions require subject_task_id")
     annotated = dict(action)
     annotated["needs_attention_reason"] = reason
+    annotated["subject_task_id"] = subject_task_id
     return annotated
+
+
+def _resolve_owning_implementation_task(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+    if task.task_type == "implement":
+        return task
+
+    for ancestor in walk_ancestors(store, task, follow_based_on=True, follow_depends_on=True):
+        if ancestor.task_type == "implement":
+            return ancestor
+
+    lineage_root = resolve_lineage_root(store, task)
+    if lineage_root.task_type == "implement":
+        return lineage_root
+    return None
+
+
+def get_action_subject_task_id(action: Mapping[str, Any]) -> str | None:
+    value = action.get("subject_task_id")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def require_needs_attention_subject(action: Mapping[str, Any]) -> str:
+    if classify_advance_action(action) != "needs_attention":
+        return ""
+    subject_task_id = get_action_subject_task_id(action)
+    if subject_task_id is None:
+        raise AssertionError(f"needs-attention action missing subject_task_id: {action!r}")
+    return subject_task_id
+
+
+def resolve_subject_task(
+    store: SqliteTaskStore,
+    action: Mapping[str, Any],
+    row: Any | None = None,
+    *,
+    fallback_task: DbTask | None = None,
+) -> DbTask:
+    raw_subject_task_id = action.get("subject_task_id")
+    subject_task_id = get_action_subject_task_id(action)
+    if subject_task_id is not None:
+        subject_task = store.get(subject_task_id)
+        if subject_task is not None and subject_task.id == subject_task_id:
+            if row is None or _subject_matches_row_lineage(store, subject_task, row):
+                return subject_task
+            _LOG.warning("Ignoring subject_task_id=%s outside row lineage for action %s", subject_task_id, action)
+        else:
+            _LOG.warning("Ignoring invalid subject_task_id=%r for action %s", subject_task_id, action)
+    elif classify_advance_action(action) == "needs_attention":
+        if raw_subject_task_id is None:
+            _LOG.warning(
+                "Falling back for needs-attention action without subject_task_id: %s",
+                action,
+            )
+        else:
+            _LOG.warning(
+                "Falling back for needs-attention action with unusable subject_task_id=%r: %s",
+                raw_subject_task_id,
+                action,
+            )
+    if fallback_task is not None:
+        return fallback_task
+    raise AssertionError(f"Unable to resolve subject task for action: {action!r}")
+
+
+def _subject_matches_row_lineage(store: SqliteTaskStore, subject_task: DbTask, row: Any) -> bool:
+    candidate_ids: set[str] = set()
+    for task in (
+        getattr(row, "owner_task", None),
+        *(getattr(row, "members", ()) or ()),
+        *(getattr(row, "unresolved_tasks", ()) or ()),
+        getattr(row, "lifecycle_action_task", None),
+        getattr(row, "recovery_action_task", None),
+        getattr(row, "recovery_leaf_task", None),
+    ):
+        if isinstance(task, DbTask) and task.id is not None:
+            candidate_ids.add(task.id)
+    if subject_task.id in candidate_ids:
+        return True
+    if not candidate_ids or subject_task.id is None:
+        return False
+    subject_root_id = resolve_lineage_root(store, subject_task).id
+    return any(
+        resolve_lineage_root(store, candidate).id == subject_root_id
+        for candidate_id in candidate_ids
+        if (candidate := store.get(candidate_id)) is not None and candidate.id is not None
+    )
 
 
 def failed_recovery_decision_to_action(
@@ -725,6 +840,7 @@ def failed_recovery_decision_to_action(
     decision: FailedRecoveryDecision,
     *,
     needs_attention_reason: str | None = None,
+    subject_task_id: str | None = None,
 ) -> dict[str, Any]:
     """Convert a shared failed-task recovery decision into an advance action dict."""
     description = f"SKIP: {decision.reason_text}"
@@ -743,6 +859,11 @@ def failed_recovery_decision_to_action(
     }
     if needs_attention_reason is not None:
         action["needs_attention_reason"] = needs_attention_reason
+        subject_task_id = subject_task_id or task.id
+        if not isinstance(subject_task_id, str) or not subject_task_id.strip():
+            raise AssertionError("needs-attention failed-recovery actions require a valid subject_task_id")
+    if subject_task_id is not None:
+        action["subject_task_id"] = subject_task_id
     return action
 
 
@@ -764,10 +885,18 @@ def failed_recovery_decision_to_attention_action(
         task,
         decision,
         needs_attention_reason=attention_reason,
+        subject_task_id=task.id,
     )
     if classify_advance_action(action) != "needs_attention":
         return None
     return action
+
+
+def _default_subject_for_attention_action(ctx: AdvanceContext, action: Mapping[str, Any]) -> dict[str, Any]:
+    annotated = dict(action)
+    if classify_advance_action(annotated) == "needs_attention" and get_action_subject_task_id(annotated) is None:
+        annotated["subject_task_id"] = ctx.task.id
+    return annotated
 
 
 def get_needs_attention_reason(action: Mapping[str, Any]) -> str | None:
@@ -1221,6 +1350,7 @@ def resolve_advance_context(
 
     if task.task_type == "plan":
         return AdvanceContext(
+            store=store,
             task=task,
             task_type=task.task_type,
             has_branch=bool(task.branch),
@@ -1244,6 +1374,7 @@ def resolve_advance_context(
 
     if not task.branch:
         return AdvanceContext(
+            store=store,
             task=task,
             task_type=task.task_type,
             has_branch=False,
@@ -1363,6 +1494,7 @@ def resolve_advance_context(
         )
 
     return AdvanceContext(
+        store=store,
         task=task,
         task_type=task.task_type,
         has_branch=True,
@@ -1446,6 +1578,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 f"Awaiting human review: review the plan, then run 'uv run gza implement {ctx.task.id}' "
                 "to create implementation, or drop it if you decided not to implement."
             ),
+            "subject_task_id": ctx.task.id,
         },
     ),
     AdvanceRule(
@@ -1483,6 +1616,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 ),
             },
             reason="explore-needs-follow-up-decision",
+            subject_task_id=ctx.task.id,
         ),
     ),
     AdvanceRule(
@@ -1499,6 +1633,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 "description": f"SKIP: {ctx.merge_source_warning}",
             },
             reason="merge-source-needs-manual-resolution",
+            subject_task_id=ctx.task.id,
         ),
     ),
     AdvanceRule(
@@ -1540,12 +1675,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
             },
             reason="rebase-failed-needs-manual-resolution",
+            subject_task_id=ctx.task.id,
         ),
     ),
     AdvanceRule(
         name="conflict_rebase_completed_but_still_blocked",
         matches=lambda ctx: not ctx.can_merge and ctx.latest_completed_rebase is not None,
-        action=lambda _ctx: _rebase_did_not_unblock_merge_action(),
+        action=_rebase_did_not_unblock_merge_action,
     ),
     AdvanceRule(
         name="conflict_needs_rebase",
@@ -1584,6 +1720,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
             },
             reason="rebase-failed-needs-manual-resolution",
+            subject_task_id=ctx.task.id,
         ),
     ),
     AdvanceRule(
@@ -1595,12 +1732,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
             },
             reason="rebase-failed-needs-manual-resolution",
+            subject_task_id=ctx.task.id,
         ),
     ),
     AdvanceRule(
         name="closing_review_invariant",
         matches=lambda ctx: ctx.closing_review_action is not None,
-        action=lambda ctx: dict(ctx.closing_review_action or {}),
+        action=lambda ctx: _default_subject_for_attention_action(ctx, ctx.closing_review_action or {}),
     ),
     AdvanceRule(
         name="review_pending",
@@ -1719,6 +1857,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 "review_task": ctx.latest_completed_review,
             },
             reason="verify-blocked-no-code-issues",
+            subject_task_id=ctx.task.id,
         ),
     ),
     AdvanceRule(
@@ -1771,6 +1910,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 ),
             },
             reason="review-max-cycles-reached",
+            subject_task_id=ctx.task.id,
         ),
     ),
     AdvanceRule(
@@ -1792,6 +1932,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 "review_task": ctx.latest_completed_review,
             },
             reason="review-verdict-needs-manual-attention",
+            subject_task_id=ctx.task.id,
         ),
     ),
     AdvanceRule(
@@ -1850,6 +1991,8 @@ def evaluate_advance_rules(
 
     for rule in ADVANCE_RULES:
         if rule.matches(context):
-            return rule.action(context)
+            action = rule.action(context)
+            require_needs_attention_subject(action)
+            return action
 
     return {"type": "skip", "description": "SKIP: no matching rule (unexpected)"}

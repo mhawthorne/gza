@@ -831,6 +831,15 @@ class TaskQueryService:
             next_action_type = str(action_type_value) if action_type_value is not None else None
             next_action_reason = str(action_reason_value) if action_reason_value is not None else None
             next_action_owner_id = owner.id
+            if action and _action_is_needs_attention(action):
+                from gza.advance_engine import resolve_subject_task
+
+                next_action_owner_id = resolve_subject_task(
+                    self._store,
+                    action,
+                    row,
+                    fallback_task=owner,
+                ).id
 
         values: dict[str, object] = {
             "id": owner.id,
@@ -1118,6 +1127,28 @@ def _resolve_lineage_root(store: SqliteTaskStore, task: DbTask) -> DbTask:
     from gza.query import resolve_lineage_root
 
     return resolve_lineage_root(store, task)
+
+
+def _action_subject_task_id(action: Mapping[str, object]) -> str | None:
+    value = action.get("subject_task_id")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _action_is_needs_attention(action: Mapping[str, object]) -> bool:
+    value = action.get("needs_attention_reason")
+    if isinstance(value, str) and value:
+        return True
+    action_type = str(action.get("type", ""))
+    return action_type in {
+        "awaiting_human",
+        "needs_discussion",
+        "max_cycles_reached",
+        "max_improve_attempts",
+        "automatic_recovery_disabled",
+        "manual_review_required",
+    }
 
 
 def _build_lineage_tree(store: SqliteTaskStore, root_task: DbTask, *, max_depth: int | None) -> Any:

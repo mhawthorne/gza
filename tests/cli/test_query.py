@@ -4839,6 +4839,7 @@ class TestShowCommand:
         attention_action = with_needs_attention(
             {"type": "skip", "description": "SKIP: automatic recovery exhausted"},
             reason="retry-limit-reached",
+            subject_task_id=failed_root.id,
         )
         console = Console(record=True, force_terminal=True, color_system="standard", width=300)
         show_colors = dict(query_cli.SHOW_COLORS_DICT)

@@ -100,6 +100,7 @@ from .advance_engine import (
     determine_next_action,
     format_needs_attention_entry_for_display,
     resolve_closing_review_action,
+    resolve_subject_task,
 )
 from .advance_executor import (
     build_failed_recovery_needs_attention_result,
@@ -2850,9 +2851,10 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             print("Iterate waiting: improve_in_progress. Existing task is already in progress.")
             return 3
         if action_type == "max_cycles_reached":
+            subject_task = resolve_subject_task(store, initial_action, fallback_task=iterate_task)
             print(
                 f"{NEEDS_ATTENTION_LABEL}: "
-                f"{format_needs_attention_entry_for_display(iterate_task, action=initial_action, prefix=len(iterate_task.id or '') + 4)}"
+                f"{format_needs_attention_entry_for_display(subject_task, action=initial_action, prefix=len(subject_task.id or '') + 4)}"
             )
             assert iterate_task.id is not None
             completed_review_cycles = count_completed_review_cycles(store, iterate_task.id)
@@ -2865,9 +2867,10 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             print(f"Recommended next step: uv run gza fix {iterate_task.id}")
             return 3
         if classify_advance_action(initial_action) == "needs_attention":
+            subject_task = resolve_subject_task(store, initial_action, fallback_task=iterate_task)
             print(
                 f"{NEEDS_ATTENTION_LABEL}: "
-                f"{format_needs_attention_entry_for_display(iterate_task, action=initial_action, prefix=len(iterate_task.id or '') + 4)}"
+                f"{format_needs_attention_entry_for_display(subject_task, action=initial_action, prefix=len(subject_task.id or '') + 4)}"
             )
             if initial_action.get("needs_attention_reason") in {
                 "review-max-cycles-reached",
@@ -3919,7 +3922,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             final_stop_reason = action_type
             if classify_advance_action(action) == "needs_attention":
                 final_attention_action = action
-                final_attention_task = impl_task
+                final_attention_task = resolve_subject_task(store, action, fallback_task=impl_task)
             maybe_review = action.get("review_task")
             if isinstance(maybe_review, DbTask):
                 maybe_verdict = get_review_verdict(config, maybe_review) if maybe_review.status == "completed" else None

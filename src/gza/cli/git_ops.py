@@ -93,6 +93,7 @@ from .advance_engine import (
     classify_advance_action,
     determine_next_action,
     format_needs_attention_entry_for_display,
+    resolve_subject_task,
 )
 from .advance_executor import (
     AdvanceActionExecutionContext,
@@ -2695,7 +2696,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
     plan.sort(key=lambda item: _ADVANCE_ACTION_ORDER.get(item[2]['type'], 1))
 
     attention_plan = [
-        (row.owner_task, action)
+        (
+            resolve_subject_task(store, action, row, fallback_task=row.owner_task),
+            action,
+        )
         for row, _task, action in plan
         if classify_advance_action(action) == "needs_attention"
     ]
@@ -2736,7 +2740,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             preview_result = execute_advance_action(task=task, action=action, context=preview_context)
             attention = resolve_execution_needs_attention(task, preview_result)
             if attention is not None:
-                preview_attention_plan.append((row.owner_task, attention.action))
+                preview_attention_plan.append((getattr(attention, "task", row.owner_task), attention.action))
                 continue
             if preview_result.status == "dry_run" and preview_result.message:
                 description = preview_result.message
@@ -2880,7 +2884,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             skip_count += 1
             attention = resolve_execution_needs_attention(action_task, exec_result)
             if attention is not None:
-                attention_tasks.append((display_task, attention.action))
+                attention_tasks.append((getattr(attention, "task", display_task), attention.action))
             return
 
         if exec_result.status == "error":
@@ -2912,7 +2916,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
             console.print(f"      [{_color}]{action['description']}[/{_color}]")
             skip_count += 1
             if classify_advance_action(action) == "needs_attention":
-                attention_tasks.append((display_task, action))
+                attention_tasks.append(
+                    (resolve_subject_task(store, action, row, fallback_task=display_task), action)
+                )
             continue
 
         # Worker-spawning actions: check batch limit before proceeding

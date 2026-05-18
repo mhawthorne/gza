@@ -904,6 +904,7 @@ def query_lineage_owner_rows(
                 "type": "needs_discussion",
                 "description": "SKIP: no descendant on the impl branch; manual resolution required",
                 "needs_attention_reason": "no-descendant-on-the-impl-branch",
+                "subject_task_id": owner.id,
             }
         if planning_task is None and action is None:
             continue

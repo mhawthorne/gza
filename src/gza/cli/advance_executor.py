@@ -204,10 +204,15 @@ def resolve_execution_needs_attention(
         "description": result.message,
         "needs_attention_reason": result.attention_reason,
     }
+    subject_task = result.failed_improve or task
+    if result.action_type == "improve" and result.attention_type in {"automatic_recovery_disabled", "manual_review_required"}:
+        subject_task = task
+    if subject_task.id is not None:
+        action["subject_task_id"] = subject_task.id
     if classify_advance_action(action) != "needs_attention":
         return None
     return AdvanceExecutionNeedsAttention(
-        task=result.failed_improve or task,
+        task=subject_task,
         action=action,
     )
 

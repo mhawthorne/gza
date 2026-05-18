@@ -112,6 +112,7 @@ from .advance_engine import (
     determine_next_action,
     format_needs_attention_lifecycle,
     resolve_advance_context,
+    resolve_subject_task,
 )
 
 _LINEAGE_REL_LABELS = _QUERY_LINEAGE_REL_LABELS
@@ -1319,6 +1320,9 @@ def _normalize_incomplete_result_rows(
             continue
 
         owner_task = _resolve_incomplete_owner_task(store, row)
+        action = row.next_action_data
+        if action is not None and classify_advance_action(action) == "needs_attention":
+            owner_task = resolve_subject_task(store, action, row, fallback_task=owner_task)
         merge_units_by_task_id: dict[str, MergeUnit] = {}
         for task in (owner_task, *row.members, *row.unresolved_tasks):
             if task is None or task.id is None or task.id in merge_units_by_task_id:
@@ -1360,9 +1364,9 @@ def _normalize_incomplete_result_rows(
                     recovery_action_task=row.recovery_action_task,
                     recovery_leaf_task=row.recovery_leaf_task,
                     lineage_status=row.lineage_status,
-                    next_action_data=row.next_action_data,
-                ),
-                result.query,
+            next_action_data=row.next_action_data,
+        ),
+        result.query,
                 config=config,
                 git=git,
                 target_branch=target_branch,

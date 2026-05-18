@@ -4,22 +4,26 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from gza.advance_engine import (
+    ADVANCE_RULES,
     _resolve_and_persist_post_merge_rebase_state,
     WORKER_CONSUMING_ACTIONS,
     classify_advance_action,
     evaluate_advance_rules,
     failed_recovery_decision_to_action,
+    require_needs_attention_subject,
     resolve_advance_context,
     resolve_closing_review_action,
+    resolve_subject_task,
 )
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task as DbTask
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
-from gza.recovery_engine import decide_failed_task_recovery
+from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
 
 
@@ -417,6 +421,7 @@ def test_completed_explore_without_followup_needs_discussion(tmp_path: Path) -> 
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "explore-needs-follow-up-decision"
+    assert action["subject_task_id"] == explore.id
     assert "completed explore has no plan or implement follow-up" in action["description"]
 
 
@@ -438,6 +443,7 @@ def test_completed_explore_with_only_dropped_plan_descendant_still_needs_discuss
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "explore-needs-follow-up-decision"
+    assert action["subject_task_id"] == explore.id
     assert "completed explore has no plan or implement follow-up" in action["description"]
 
 
@@ -529,6 +535,7 @@ def test_completed_held_plan_awaits_human_review(tmp_path: Path) -> None:
         "to create implementation, or drop it if you decided not to implement."
     )
     assert classify_advance_action(action) == "needs_attention"
+    assert action["subject_task_id"] == plan.id
 
 
 def test_pending_branchless_plan_without_implement_descendant_uses_no_branch_skip(tmp_path: Path) -> None:
@@ -807,10 +814,126 @@ def test_retry_limit_reached_failed_recovery_action_is_needs_attention(tmp_path:
         failed,
         decision,
         needs_attention_reason="retry-limit-reached",
+        subject_task_id=failed.id,
     )
 
     assert decision.reason_code == "retry_limit_reached"
     assert classify_advance_action(action) == "needs_attention"
+    assert action["subject_task_id"] == failed.id
+
+
+def test_retry_limit_reached_failed_recovery_action_defaults_subject_to_failed_task(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+
+    failed = store.add("Implement feature", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_STEPS"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    action = failed_recovery_decision_to_action(
+        failed,
+        decision,
+        needs_attention_reason="retry-limit-reached",
+    )
+
+    assert decision.reason_code == "retry_limit_reached"
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["subject_task_id"] == failed.id
+
+
+def test_failed_review_terminal_skip_subjects_owning_implementation(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/failed-review-subject",
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+    )
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "failed"
+    review.failure_reason = "UNKNOWN"
+    review.completed_at = datetime(2026, 5, 15, 10, 0, tzinfo=UTC)
+    store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), review, "main")
+
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["subject_task_id"] == impl.id
+
+
+def test_failed_rebase_terminal_skip_subjects_owning_implementation(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/failed-rebase-subject",
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+    )
+    rebase = store.add("Failed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert rebase.id is not None
+    rebase.status = "failed"
+    rebase.failure_reason = "UNKNOWN"
+    rebase.completed_at = datetime(2026, 5, 15, 10, 0, tzinfo=UTC)
+    rebase.branch = impl.branch
+    store.update(rebase)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), rebase, "main")
+
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["subject_task_id"] == impl.id
+
+
+def test_failed_chained_improve_terminal_skip_subjects_owning_implementation(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/failed-chained-improve-subject",
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 15, 10, 0, tzinfo=UTC))
+
+    previous_improve = store.add(
+        "Previous improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    assert previous_improve.id is not None
+    previous_improve.status = "completed"
+    previous_improve.completed_at = datetime(2026, 5, 15, 11, 0, tzinfo=UTC)
+    previous_improve.branch = impl.branch
+    previous_improve.changed_diff = False
+    store.update(previous_improve)
+
+    failed_improve = store.add(
+        "Failed chained improve",
+        task_type="improve",
+        based_on=previous_improve.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "UNKNOWN"
+    failed_improve.completed_at = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
+    failed_improve.branch = impl.branch
+    store.update(failed_improve)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), failed_improve, "main")
+
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["subject_task_id"] == impl.id
 
 
 def test_completed_fix_after_changes_requested_requires_fresh_review(tmp_path: Path, monkeypatch):
@@ -1006,6 +1129,7 @@ def test_two_consecutive_noop_improves_return_needs_discussion(tmp_path: Path, m
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["subject_task_id"] == impl.id
     assert "2 consecutive no-op improves" in action["description"]
 
 
@@ -1096,6 +1220,7 @@ def test_three_consecutive_identical_primary_blockers_returns_needs_attention(
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "duplicate-blocker-no-progress"
+    assert action["subject_task_id"] == impl.id
     assert "3 consecutive review cycles" in action["description"]
     assert action["duplicate_blocker"]["cycles"] == 3
     assert action["duplicate_blocker"]["review_task_ids"] == (review3.id, review2.id, review1.id)
@@ -1559,6 +1684,7 @@ def test_comments_triggered_noop_improves_use_same_stop_rule(tmp_path: Path, mon
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["subject_task_id"] == impl.id
     assert "unresolved comments" in action["description"]
 
 
@@ -1697,6 +1823,7 @@ def test_failed_rebase_still_blocks_when_current_tip_needs_rebase(tmp_path: Path
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
 
 
 def test_failed_rebase_without_review_still_requires_manual_resolution(tmp_path: Path) -> None:
@@ -1733,6 +1860,7 @@ def test_failed_rebase_without_review_still_requires_manual_resolution(tmp_path:
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
     assert "failed, needs manual resolution" in action["description"]
 
 
@@ -1983,6 +2111,7 @@ def test_completed_rebase_that_still_blocks_merge_needs_attention(tmp_path: Path
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "rebase-did-not-unblock-merge"
     assert classify_advance_action(action) == "needs_attention"
+    assert action["subject_task_id"] == impl.id
 
 
 def test_orphan_rebase_descendant_skips_when_canonical_target_merge_unit_is_merged(
@@ -2479,6 +2608,7 @@ def test_two_consecutive_verify_timeout_only_reviews_need_attention(tmp_path: Pa
     assert classify_advance_action(action) == "needs_attention"
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "verify-blocked-no-code-issues"
+    assert action["subject_task_id"] == impl.id
 
 
 def test_single_verify_timeout_only_review_still_creates_improve(tmp_path: Path) -> None:
@@ -2856,6 +2986,7 @@ def test_diverged_local_and_origin_need_manual_resolution(tmp_path: Path) -> Non
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
     assert "diverged" in action["description"]
 
 
@@ -2889,6 +3020,7 @@ def test_diverged_local_and_origin_fail_closed_even_when_local_tip_matches_targe
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
     assert "diverged" in action["description"]
     assert "target implementation already merged" not in action["description"]
 
@@ -2901,6 +3033,225 @@ def test_diverged_local_and_origin_fail_closed_even_when_local_tip_matches_targe
     assert ctx.post_merge_rebase_state.already_merged is False
     assert ctx.post_merge_rebase_state.warning is not None
     assert "diverged" in ctx.post_merge_rebase_state.warning
+
+
+def test_review_unknown_verdict_uses_reviewed_task_as_subject(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/review-unknown-verdict",
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 15, 10, 0, tzinfo=UTC))
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="SOMETHING_ELSE",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "review-verdict-needs-manual-attention"
+    assert action["subject_task_id"] == impl.id
+    assert review.id is not None
+    assert action["review_task"].id == review.id
+
+
+def test_require_needs_attention_subject_rejects_missing_subject() -> None:
+    with pytest.raises(AssertionError, match="missing subject_task_id"):
+        require_needs_attention_subject(
+            {
+                "type": "needs_discussion",
+                "needs_attention_reason": "needs-discussion",
+                "description": "SKIP: manual intervention required",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_warning"),
+    [
+        (
+            {
+                "type": "needs_discussion",
+                "description": "SKIP: manual intervention required",
+                "needs_attention_reason": "retry-limit-reached",
+            },
+            "without subject_task_id",
+        ),
+        (
+            {
+                "type": "needs_discussion",
+                "description": "SKIP: manual intervention required",
+                "needs_attention_reason": "retry-limit-reached",
+                "subject_task_id": "",
+            },
+            "with unusable subject_task_id=''",
+        ),
+        (
+            {
+                "type": "needs_discussion",
+                "description": "SKIP: manual intervention required",
+                "needs_attention_reason": "retry-limit-reached",
+                "subject_task_id": 123,
+            },
+            "with unusable subject_task_id=123",
+        ),
+    ],
+)
+def test_resolve_subject_task_warns_before_falling_back_for_missing_or_unusable_subject(
+    tmp_path: Path,
+    action: dict[str, object],
+    expected_warning: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _make_store(tmp_path)
+    fallback_task = store.add("Fallback implement", task_type="implement")
+    assert fallback_task.id is not None
+
+    with caplog.at_level("WARNING", logger="gza.advance_engine"):
+        subject_task = resolve_subject_task(store, action, fallback_task=fallback_task)
+
+    assert subject_task.id == fallback_task.id
+    assert expected_warning in caplog.text
+
+
+def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 18, 9, 0, tzinfo=UTC)
+    impl.branch = "feature/generic-attention-subjects"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 18, 10, 0, tzinfo=UTC)
+    store.update(review)
+
+    noop_improve = store.add(
+        "No-op improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    assert noop_improve.id is not None
+    noop_improve.status = "completed"
+    noop_improve.completed_at = datetime(2026, 5, 18, 11, 0, tzinfo=UTC)
+    noop_improve.changed_diff = False
+    store.update(noop_improve)
+
+    failed_rebase = store.add(
+        "Failed rebase",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    failed_rebase.completed_at = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    failed_rebase.branch = impl.branch
+    store.update(failed_rebase)
+
+    ctx = SimpleNamespace(
+        store=store,
+        task=impl,
+        task_type=impl.task_type,
+        has_non_dropped_implement_descendant=False,
+        auto_implement_enabled=False,
+        merge_source_warning="feature branch diverged",
+        post_merge_rebase_state=SimpleNamespace(
+            already_merged=False,
+            rebase_target_missing_merge_unit=False,
+            reason="manual-resolution",
+        ),
+        can_merge=False,
+        rebase_pending_or_running=None,
+        rebase_failed=failed_rebase,
+        latest_completed_rebase=failed_rebase,
+        rebase_invalidates_review=False,
+        active_review=None,
+        review_invalidated_by_rebase=failed_rebase,
+        review_preserved_by_rebase=None,
+        latest_completed_review=review,
+        review_cleared=False,
+        review_verdict="CHANGES_REQUESTED",
+        followup_findings=(),
+        recent_verify_timeout_only_reviews=(review, review),
+        has_fresh_unresolved_comments_since_latest_review=True,
+        active_improve_running=None,
+        active_improve_pending=None,
+        latest_noop_improve=noop_improve,
+        consecutive_noop_improves=2,
+        max_noop_improve_cycles=2,
+        noop_improve_allowed=False,
+        noop_improve_trigger="comments",
+        duplicate_blocker_streak=SimpleNamespace(
+            cycles=3,
+            title="Repeated blocker",
+            anchor="src/gza/module.py:1",
+            review_task_ids=(review.id,),
+        ),
+        max_review_cycles=3,
+        completed_review_cycles=3,
+        failed_recovery_decision=FailedRecoveryDecision(
+            task_id=impl.id,
+            action="skip",
+            reason_code="retry_limit_reached",
+            reason_text="manual review required",
+            launch_mode="none",
+            attempt_index=1,
+            attempt_limit=1,
+        ),
+        failed_recovery_attention_reason="retry-limit-reached",
+        closing_review_action={
+            "type": "needs_discussion",
+            "description": "SKIP: closing review invariant needs manual attention",
+            "needs_attention_reason": "closing-review-invariant",
+        },
+        requires_review=True,
+        create_reviews=True,
+    )
+
+    names_with_needs_attention: set[str] = set()
+    for rule in ADVANCE_RULES:
+        action = rule.action(ctx)
+        if classify_advance_action(action) != "needs_attention":
+            continue
+        names_with_needs_attention.add(rule.name)
+        assert require_needs_attention_subject(action), rule.name
+
+    assert names_with_needs_attention == {
+        "failed_task_skip",
+        "awaiting_human_plan_review",
+        "explore_needs_followup_decision",
+        "merge_source_needs_manual_resolution",
+        "conflict_rebase_failed",
+        "conflict_rebase_completed_but_still_blocked",
+        "failed_rebase_without_successful_review",
+        "closing_review_invariant",
+        "fresh_comments_noop_improve_limit",
+        "review_verify_blocked_no_code_issues",
+        "review_noop_improve_limit",
+        "review_duplicate_blocker_no_progress",
+        "review_max_cycles",
+        "review_unknown_verdict",
+    }
 
 
 @pytest.mark.parametrize(

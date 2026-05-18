@@ -65,6 +65,7 @@ from .advance_engine import (
     determine_next_action,
     failed_recovery_decision_to_attention_action,
     format_needs_attention_entry_for_display,
+    resolve_subject_task,
 )
 from .advance_executor import (
     AdvanceActionExecutionContext,
@@ -133,8 +134,14 @@ def _watch_needs_attention_message(task: DbTask, action: dict) -> str:
 
 
 def _resolve_watch_attention_display_task(store: SqliteTaskStore, row: LineageOwnerRow) -> DbTask:
-    """Match watch ATTENTION row identity to the same row-level owner selection as incomplete."""
-    return _resolve_incomplete_owner_task(store, cast(Any, row))
+    """Resolve the declared attention subject, falling back to incomplete-owner behavior."""
+    action = row.next_action or {}
+    return resolve_subject_task(
+        store,
+        action,
+        row,
+        fallback_task=_resolve_incomplete_owner_task(store, cast(Any, row)),
+    )
 
 
 def _failed_recovery_attention_action(
@@ -1416,7 +1423,18 @@ def _run_cycle(
                     message = f"{display_task.id}: {message}"
                 attention = resolve_execution_needs_attention(task, exec_result)
                 if attention is not None and display_task.id is not None:
-                    display_task = _resolve_watch_attention_display_task(store, row)
+                    attention_task = getattr(attention, "task", display_task)
+                    attention_fallback = (
+                        _resolve_incomplete_owner_task(store, cast(Any, row))
+                        if "subject_task_id" not in attention.action
+                        else attention_task
+                    )
+                    display_task = resolve_subject_task(
+                        store,
+                        attention.action,
+                        row,
+                        fallback_task=attention_fallback,
+                    )
                     # Orthogonal to advance-plan classification: the action tried to run
                     # and the execution layer reported a worker/startup attention state.
                     log.emit_attention(
