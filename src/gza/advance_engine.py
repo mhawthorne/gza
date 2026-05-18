@@ -22,7 +22,14 @@ from gza.recovery_engine import (
     get_failed_recovery_needs_attention_reason,
 )
 from gza.resume_policy import is_resumable_failed_task as _is_resumable_failed_task
-from gza.review_verdict import ParsedReviewReport, ReviewFinding, get_review_report
+from gza.review_verdict import (
+    ParsedReviewReport,
+    ReviewBlockerSummary,
+    ReviewFinding,
+    get_review_report,
+    is_verify_timeout_only_review,
+    summarize_review_blockers,
+)
 from gza.source_followup import (
     collect_non_dropped_implement_source_ids,
     resolve_source_followup_state,
@@ -45,6 +52,7 @@ WORKER_CONSUMING_ACTIONS = frozenset(
         "retry",
     }
 )
+VERIFY_BLOCKED_REVIEW_THRESHOLD = 2
 
 
 @dataclass(frozen=True)
@@ -112,7 +120,9 @@ class AdvanceContext:
     review_cleared: bool = False
     review_verdict: str | None = None
     review_report: ParsedReviewReport | None = None
+    latest_review_blocker_summary: ReviewBlockerSummary | None = None
     followup_findings: tuple[ReviewFinding, ...] = ()
+    recent_verify_timeout_only_reviews: tuple[DbTask, ...] = ()
 
     completed_review_cycles: int = 0
     active_improve_running: DbTask | None = None
@@ -984,6 +994,16 @@ def _select_active_review(reviews: list[DbTask]) -> DbTask | None:
     return None
 
 
+def _get_review_output_content(config: Any, review_task: DbTask) -> str | None:
+    if review_task.output_content:
+        return review_task.output_content
+    if review_task.report_file:
+        report_path = Path(config.project_dir) / review_task.report_file
+        if report_path.exists():
+            return report_path.read_text()
+    return None
+
+
 def _resolve_review_state(
     config: Any,
     store: SqliteTaskStore,
@@ -995,7 +1015,9 @@ def _resolve_review_state(
     bool,
     str | None,
     ParsedReviewReport | None,
+    ReviewBlockerSummary | None,
     tuple[ReviewFinding, ...],
+    tuple[DbTask, ...],
     int,
     DbTask | None,
     DbTask | None,
@@ -1022,7 +1044,9 @@ def _resolve_review_state(
 
     review_verdict: str | None = None
     review_report: ParsedReviewReport | None = None
+    latest_review_blocker_summary: ReviewBlockerSummary | None = None
     followup_findings: tuple[ReviewFinding, ...] = ()
+    recent_verify_timeout_only_reviews: tuple[DbTask, ...] = ()
     completed_review_cycles = 0
     active_improve_running: DbTask | None = None
     active_improve_pending: DbTask | None = None
@@ -1047,6 +1071,9 @@ def _resolve_review_state(
     if latest_completed_review is not None:
         review_report = get_review_report(Path(config.project_dir), latest_completed_review)
         review_verdict = review_report.verdict
+        latest_review_blocker_summary = summarize_review_blockers(
+            _get_review_output_content(config, latest_completed_review)
+        )
         followup_findings = tuple(
             finding for finding in review_report.findings if finding.severity == "FOLLOWUP"
         )
@@ -1089,6 +1116,16 @@ def _resolve_review_state(
         if review_verdict == "CHANGES_REQUESTED":
             completed_review_cycles = count_completed_review_cycles(store, task.id)
 
+        verify_timeout_only_reviews: list[DbTask] = []
+        for review_task in completed_reviews:
+            review_content = _get_review_output_content(config, review_task)
+            if not is_verify_timeout_only_review(review_content):
+                break
+            verify_timeout_only_reviews.append(review_task)
+            if len(verify_timeout_only_reviews) >= VERIFY_BLOCKED_REVIEW_THRESHOLD:
+                break
+        recent_verify_timeout_only_reviews = tuple(verify_timeout_only_reviews)
+
     closing_review_action = resolve_closing_review_action(
         task=task,
         reviews=reviews,
@@ -1103,7 +1140,9 @@ def _resolve_review_state(
         review_cleared,
         review_verdict,
         review_report,
+        latest_review_blocker_summary,
         followup_findings,
+        recent_verify_timeout_only_reviews,
         completed_review_cycles,
         active_improve_running,
         active_improve_pending,
@@ -1279,7 +1318,9 @@ def resolve_advance_context(
         review_cleared,
         review_verdict,
         review_report,
+        latest_review_blocker_summary,
         followup_findings,
+        recent_verify_timeout_only_reviews,
         completed_review_cycles,
         active_improve_running,
         active_improve_pending,
@@ -1354,7 +1395,9 @@ def resolve_advance_context(
         review_cleared=review_cleared,
         review_verdict=review_verdict,
         review_report=review_report,
+        latest_review_blocker_summary=latest_review_blocker_summary,
         followup_findings=followup_findings,
+        recent_verify_timeout_only_reviews=recent_verify_timeout_only_reviews,
         completed_review_cycles=completed_review_cycles,
         active_improve_running=active_improve_running,
         active_improve_pending=active_improve_pending,
@@ -1657,6 +1700,26 @@ ADVANCE_RULES: list[AdvanceRule] = [
             "description": _merge_review_description("APPROVED", ctx.review_preserved_by_rebase),
             "review_task": ctx.latest_completed_review,
         },
+    ),
+    AdvanceRule(
+        name="review_verify_blocked_no_code_issues",
+        matches=lambda ctx: (not ctx.review_cleared)
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and len(ctx.recent_verify_timeout_only_reviews) >= VERIFY_BLOCKED_REVIEW_THRESHOLD
+        and ctx.active_improve_running is None
+        and ctx.active_improve_pending is None,
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": (
+                    f"SKIP: last {VERIFY_BLOCKED_REVIEW_THRESHOLD} review cycles only blocked on "
+                    "verify_command timeout; code may be correct but cannot be verified. "
+                    "Investigate test performance or verify_timeout config."
+                ),
+                "review_task": ctx.latest_completed_review,
+            },
+            reason="verify-blocked-no-code-issues",
+        ),
     ),
     AdvanceRule(
         name="review_wait_improve",

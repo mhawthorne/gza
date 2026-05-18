@@ -78,6 +78,7 @@ from .rebase_publish import publish_rebased_branch
 from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
 from .review_verdict import (
     compute_review_score,
+    is_verify_timeout_only_review,
     parse_review_report,
     parse_review_template,
     parse_review_verdict,
@@ -1919,6 +1920,28 @@ def _build_context_from_chain(
                 if review_content:
                     context_parts.append("## Review feedback to address:\n")
                     context_parts.append(review_content)
+                    if is_verify_timeout_only_review(review_content):
+                        context_parts.append("\n## Verify Timeout Guidance\n")
+                        context_parts.append(
+                            "The inbound review's only Blocker is a `verify_command` timeout. "
+                            "Treat this as a test-performance investigation first, not a generic "
+                            "code-correctness fix.\n"
+                        )
+                        context_parts.append(
+                            "- Re-run the exact configured `verify_command` once from the current branch tip to confirm the timeout is still current."
+                        )
+                        context_parts.append(
+                            "- If it still times out, run a narrower pytest duration probe such as `uv run pytest tests/ --durations=20` or the configured pytest subset with `--durations=20`."
+                        )
+                        context_parts.append(
+                            "- Compare against the baseline branch when practical to determine whether this branch introduced the slowdown."
+                        )
+                        context_parts.append(
+                            "- If this branch introduced the slowdown, fix or narrow the offending test."
+                        )
+                        context_parts.append(
+                            "- If the slowdown is pre-existing or environmental, report that explicitly and escalate; do not silently relax suite-wide guardrails or change `verify_timeout`."
+                        )
                 else:
                     context_parts.append(
                         "## Review feedback to address:\n"

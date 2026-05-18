@@ -122,6 +122,7 @@ A failed rebase is not cleared just because the latest implementation tip become
 | Verdict = `APPROVED` | `merge` |
 | Verdict = `APPROVED_WITH_FOLLOWUPS` with at least one parsed `FOLLOWUP` finding | `merge_with_followups` — create/reuse follow-up implement tasks, then merge |
 | Verdict = `APPROVED_WITH_FOLLOWUPS` with zero parsed `FOLLOWUP` findings | `needs_discussion` — fail closed; review output is inconsistent |
+| Verdict = `CHANGES_REQUESTED` AND last 2 completed reviews are verify-timeout-only AND no improve is `in_progress`/`pending` | `needs_discussion` — reason=`verify-blocked-no-code-issues` |
 | Verdict = `CHANGES_REQUESTED` AND improve is `in_progress` | `wait_improve` — skip |
 | Verdict = `CHANGES_REQUESTED` AND improve is `pending` | `run_improve` — spawn worker |
 | Consecutive completed no-op improves for the latest `(impl, review)` pair >= `max_noop_improve_cycles` and lineage is not tagged `allow-noop-improve` | `needs_discussion` — stop repeated no-op improve loops |

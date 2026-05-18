@@ -127,7 +127,6 @@ def _make_completed_impl_with_failed_rebase(
     impl.has_commits = True
     store.update(impl)
     store.get_or_create_merge_unit_for_task(impl)
-
     failed_rebase = store.add(
         f"Failed rebase for {impl.id}",
         task_type="rebase",
@@ -248,6 +247,104 @@ def _blocker_report(
             ),
         ),
         format_version="v2",
+    )
+
+
+def _timeout_only_review_report() -> str:
+    return (
+        "## Summary\n\n- Verify timed out.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: timed out during pytest\n"
+        "Evidence: verify_command timed out after 120s while running the configured suite.\n"
+        "Open-state citation: `src/gza/runner.py:903`\n"
+        "Impact: the branch cannot be verified autonomously.\n"
+        "Required fix: investigate the test-performance regression or prove the timeout is environmental.\n"
+        "Required tests: rerun the exact verify command and add a narrow regression if this branch caused the slowdown.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _timeout_only_review_report_evidence_only() -> str:
+    return (
+        "## Summary\n\n- Verify timed out.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure\n"
+        "Evidence: Failure: verify_command timed out after 120s while running the configured suite.\n"
+        "Open-state citation: `gza.yaml:5`\n"
+        "Impact: the branch cannot be considered verified.\n"
+        "Required fix: investigate the test-performance regression.\n"
+        "Required tests: rerun the exact configured verify_command after narrowing the slowdown.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _mixed_review_report() -> str:
+    return (
+        "## Summary\n\n- Mixed blockers.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: timed out during pytest\n"
+        "Evidence: verify_command timed out after 120s while running the configured suite.\n"
+        "Impact: branch cannot be verified.\n"
+        "Required fix: investigate the slowdown.\n"
+        "Required tests: rerun the suite.\n\n"
+        "### B2 Missing input validation\n"
+        "Evidence: request path still accepts malformed IDs.\n"
+        "Open-state citation: `src/gza/api.py:14`\n"
+        "Impact: malformed requests still crash.\n"
+        "Required fix: validate IDs before parsing.\n"
+        "Required tests: add malformed-ID regression coverage.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _structured_code_blocker_with_timeout_evidence_review_report() -> str:
+    return (
+        "## Summary\n\n- Validation missing and verify rerun timed out.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing input validation\n"
+        "Evidence: request path still accepts malformed IDs.\n"
+        "Open-state citation: `src/gza/api.py:14`\n"
+        "Impact: malformed requests still crash.\n"
+        "Required fix: validate IDs before parsing.\n"
+        "Required tests: add malformed-ID regression coverage, then rerun the exact verify command because "
+        "verify_command timed out after 120s during review.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _code_focused_blocker_with_timeout_in_open_state_review_report() -> str:
+    return (
+        "## Summary\n\n- Worker loop bug surfaces as a verify timeout.\n\n"
+        "## Blockers\n\n"
+        "### B1 Worker loop leaves mocked task incomplete until verify_command timeout\n"
+        "Evidence: the worker loop keeps spinning until verify_command timed out after 120s.\n"
+        "Open-state citation: `tests/cli/test_execution.py:7214`\n"
+        "Impact: the task never completes and the suite cannot pass.\n"
+        "Required fix: exit the worker loop when the mocked task reaches its terminal state.\n"
+        "Required tests: add a worker-loop regression that asserts the task completes well before the configured verify_command timeout.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _unstructured_mixed_review_report() -> str:
+    return (
+        "## Summary\n\n- Mixed blockers.\n\n"
+        "## Blockers\n\n"
+        "- verify_command timed out after 120s\n"
+        "- Missing validation still crashes malformed IDs\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
     )
 
 
@@ -2342,6 +2439,345 @@ def test_failed_rebase_with_older_review_clear_event_still_requires_manual_resol
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+
+
+def test_two_consecutive_verify_timeout_only_reviews_need_attention(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/verify-timeout-only"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review1 = store.add("Review round 1", task_type="review", depends_on=impl.id)
+    assert review1.id is not None
+    review1.status = "completed"
+    review1.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review1.output_content = _timeout_only_review_report()
+    store.update(review1)
+
+    improve1 = store.add("Improve round 1", task_type="improve", based_on=impl.id, depends_on=review1.id)
+    improve1.status = "completed"
+    improve1.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    improve1.branch = impl.branch
+    improve1.has_commits = True
+    store.update(improve1)
+
+    review2 = store.add("Review round 2", task_type="review", depends_on=impl.id)
+    review2.status = "completed"
+    review2.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    review2.output_content = _timeout_only_review_report()
+    store.update(review2)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-blocked-no-code-issues"
+
+
+def test_single_verify_timeout_only_review_still_creates_improve(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/verify-timeout-one-review"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review round 1", task_type="review", depends_on=impl.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.output_content = _timeout_only_review_report()
+    store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "improve"
+    assert action["review_task"].id == review.id
+
+
+def test_two_consecutive_evidence_only_verify_timeout_reviews_need_attention(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/verify-timeout-evidence-only"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review1 = store.add("Review round 1", task_type="review", depends_on=impl.id)
+    assert review1.id is not None
+    review1.status = "completed"
+    review1.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review1.output_content = _timeout_only_review_report_evidence_only()
+    store.update(review1)
+
+    improve1 = store.add("Improve round 1", task_type="improve", based_on=impl.id, depends_on=review1.id)
+    improve1.status = "completed"
+    improve1.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    improve1.branch = impl.branch
+    improve1.has_commits = True
+    store.update(improve1)
+
+    review2 = store.add("Review round 2", task_type="review", depends_on=impl.id)
+    review2.status = "completed"
+    review2.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    review2.output_content = _timeout_only_review_report_evidence_only()
+    store.update(review2)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-blocked-no-code-issues"
+
+
+def test_unstructured_mixed_reviews_do_not_trigger_verify_timeout_attention(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/unstructured-mixed-blockers"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review1 = store.add("Review round 1", task_type="review", depends_on=impl.id)
+    assert review1.id is not None
+    review1.status = "completed"
+    review1.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review1.output_content = _unstructured_mixed_review_report()
+    store.update(review1)
+
+    improve1 = store.add("Improve round 1", task_type="improve", based_on=impl.id, depends_on=review1.id)
+    improve1.status = "completed"
+    improve1.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    improve1.branch = impl.branch
+    improve1.has_commits = True
+    store.update(improve1)
+
+    review2 = store.add("Review round 2", task_type="review", depends_on=impl.id)
+    review2.status = "completed"
+    review2.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    review2.output_content = _unstructured_mixed_review_report()
+    store.update(review2)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "improve"
+    assert action["review_task"].id == review2.id
+    assert action.get("needs_attention_reason") != "verify-blocked-no-code-issues"
+
+
+def test_structured_code_blocker_with_timeout_evidence_does_not_trigger_verify_timeout_attention(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/structured-timeout-false-positive"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review1 = store.add("Review round 1", task_type="review", depends_on=impl.id)
+    assert review1.id is not None
+    review1.status = "completed"
+    review1.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review1.output_content = _structured_code_blocker_with_timeout_evidence_review_report()
+    store.update(review1)
+
+    improve1 = store.add("Improve round 1", task_type="improve", based_on=impl.id, depends_on=review1.id)
+    improve1.status = "completed"
+    improve1.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    improve1.branch = impl.branch
+    improve1.has_commits = True
+    store.update(improve1)
+
+    review2 = store.add("Review round 2", task_type="review", depends_on=impl.id)
+    review2.status = "completed"
+    review2.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    review2.output_content = _structured_code_blocker_with_timeout_evidence_review_report()
+    store.update(review2)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "improve"
+    assert action["review_task"].id == review2.id
+    assert action.get("needs_attention_reason") != "verify-blocked-no-code-issues"
+
+
+def test_code_focused_blocker_with_open_state_citation_does_not_trigger_verify_timeout_attention(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/code-focused-timeout-symptom"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review1 = store.add("Review round 1", task_type="review", depends_on=impl.id)
+    assert review1.id is not None
+    review1.status = "completed"
+    review1.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review1.output_content = _code_focused_blocker_with_timeout_in_open_state_review_report()
+    store.update(review1)
+
+    improve1 = store.add(
+        "Improve round 1", task_type="improve", based_on=impl.id, depends_on=review1.id
+    )
+    improve1.status = "completed"
+    improve1.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    improve1.branch = impl.branch
+    improve1.has_commits = True
+    store.update(improve1)
+
+    review2 = store.add("Review round 2", task_type="review", depends_on=impl.id)
+    review2.status = "completed"
+    review2.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    review2.output_content = _code_focused_blocker_with_timeout_in_open_state_review_report()
+    store.update(review2)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "improve"
+    assert action["review_task"].id == review2.id
+    assert action.get("needs_attention_reason") != "verify-blocked-no-code-issues"
+
+
+def test_mixed_blockers_still_hit_duplicate_blocker_reason(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_review_cycles = 2
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/mixed-blockers"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review1 = store.add("Review round 1", task_type="review", depends_on=impl.id)
+    assert review1.id is not None
+    review1.status = "completed"
+    review1.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review1.output_content = _mixed_review_report()
+    store.update(review1)
+
+    improve1 = store.add("Improve round 1", task_type="improve", based_on=impl.id, depends_on=review1.id)
+    improve1.status = "completed"
+    improve1.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    improve1.branch = impl.branch
+    improve1.has_commits = True
+    store.update(improve1)
+
+    review2 = store.add("Review round 2", task_type="review", depends_on=impl.id)
+    review2.status = "completed"
+    review2.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    review2.output_content = _mixed_review_report()
+    store.update(review2)
+
+    improve2 = store.add("Improve round 2", task_type="improve", based_on=improve1.id, depends_on=review2.id)
+    improve2.status = "completed"
+    improve2.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
+    improve2.branch = impl.branch
+    improve2.has_commits = True
+    store.update(improve2)
+
+    review3 = store.add("Review round 3", task_type="review", depends_on=impl.id)
+    review3.status = "completed"
+    review3.completed_at = datetime(2026, 5, 10, 14, 0, tzinfo=UTC)
+    review3.output_content = _mixed_review_report()
+    store.update(review3)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["needs_attention_reason"] == "duplicate-blocker-no-progress"
+
+
+def test_latest_two_timeout_only_reviews_override_max_cycles_reason(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/verify-timeout-late"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review1 = store.add("Review round 1", task_type="review", depends_on=impl.id)
+    assert review1.id is not None
+    review1.status = "completed"
+    review1.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review1.output_content = _mixed_review_report()
+    store.update(review1)
+
+    improve1 = store.add("Improve round 1", task_type="improve", based_on=impl.id, depends_on=review1.id)
+    assert improve1.id is not None
+    improve1.status = "completed"
+    improve1.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    improve1.branch = impl.branch
+    improve1.has_commits = True
+    store.update(improve1)
+
+    review2 = store.add("Review round 2", task_type="review", depends_on=impl.id)
+    assert review2.id is not None
+    review2.status = "completed"
+    review2.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    review2.output_content = _timeout_only_review_report()
+    store.update(review2)
+
+    improve2 = store.add("Improve round 2", task_type="improve", based_on=improve1.id, depends_on=review2.id)
+    assert improve2.id is not None
+    improve2.status = "completed"
+    improve2.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
+    improve2.branch = impl.branch
+    improve2.has_commits = True
+    store.update(improve2)
+
+    review3 = store.add("Review round 3", task_type="review", depends_on=impl.id)
+    review3.status = "completed"
+    review3.completed_at = datetime(2026, 5, 10, 14, 0, tzinfo=UTC)
+    review3.output_content = _timeout_only_review_report()
+    store.update(review3)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["needs_attention_reason"] == "verify-blocked-no-code-issues"
 
 
 def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: Path) -> None:

@@ -7,9 +7,12 @@ from gza.review_verdict import (
     ParsedReview,
     compute_review_score,
     get_backfillable_review_score,
+    is_verify_blocked_only_review,
+    is_verify_timeout_only_review,
     parse_review_report,
     parse_review_template,
     parse_review_verdict,
+    summarize_review_blockers,
     validate_review_report_contract,
 )
 
@@ -182,6 +185,230 @@ class TestValidateReviewReportContract:
         validation = validate_review_report_contract(content)
         assert validation.blockers_missing_open_state_citation == ()
         assert validation.blockers_with_malformed_open_state_citation == ("B1",)
+
+
+class TestVerifyBlockedReviewClassification:
+    def test_classifies_timeout_only_review_from_structured_blocker_with_open_state_citation(
+        self,
+    ) -> None:
+        content = (
+            "## Summary\n\n- Verify timed out.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: timed out during pytest\n"
+            "Evidence: verify_command timed out after 120s while running the configured suite.\n"
+            "Open-state citation: `src/gza/runner.py:903`\n"
+            "Impact: the branch cannot be verified autonomously.\n"
+            "Required fix: investigate the test-performance regression or prove the timeout is environmental.\n"
+            "Required tests: rerun the exact verify command and add a narrow regression if this branch caused the slowdown.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_timeout_count == 1
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 0
+        assert is_verify_timeout_only_review(content) is True
+        assert is_verify_blocked_only_review(content) is True
+
+    def test_does_not_classify_mixed_timeout_and_code_review_as_timeout_only(self) -> None:
+        content = (
+            "## Summary\n\n- Mixed blockers.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: timed out during pytest\n"
+            "Evidence: verify_command timed out after 120s while running the configured suite.\n"
+            "Open-state citation: `src/gza/runner.py:903`\n"
+            "Impact: branch cannot be verified.\n"
+            "Required fix: investigate the slowdown.\n"
+            "Required tests: rerun the suite.\n\n"
+            "### B2 Missing input validation\n"
+            "Evidence: request path still accepts malformed IDs.\n"
+            "Open-state citation: `src/gza/api.py:14`\n"
+            "Impact: malformed requests still crash.\n"
+            "Required fix: validate IDs before parsing.\n"
+            "Required tests: add malformed-ID regression coverage.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 2
+        assert summary.verify_timeout_count == 1
+        assert summary.unknown_or_code_count == 1
+        assert is_verify_timeout_only_review(content) is False
+        assert is_verify_blocked_only_review(content) is False
+
+    def test_does_not_classify_non_timeout_verify_failure_as_timeout_only(self) -> None:
+        content = (
+            "## Summary\n\n- Verify failed.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: mypy NameError in query output\n"
+            "Evidence: src/gza/cli/query.py:823: error: Name \"oops\" is not defined.\n"
+            "Impact: the configured verify_command fails, so the branch cannot pass autonomous review.\n"
+            "Required fix: define the referenced name or remove the bad reference so mypy passes.\n"
+            "Required tests: rerun mypy and add a targeted regression for the changed query path.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_timeout_count == 0
+        assert summary.verify_failure_count == 1
+        assert summary.unknown_or_code_count == 0
+        assert is_verify_timeout_only_review(content) is False
+        assert is_verify_blocked_only_review(content) is True
+
+    def test_does_not_classify_code_blocker_with_generic_verify_command_rerun_as_verify_failure(
+        self,
+    ) -> None:
+        content = (
+            "## Summary\n\n- Validation missing.\n\n"
+            "## Blockers\n\n"
+            "### B1 Missing input validation\n"
+            "Evidence: request path still accepts malformed IDs.\n"
+            "Open-state citation: `src/gza/api.py:14`\n"
+            "Impact: malformed requests still crash.\n"
+            "Required fix: validate IDs before parsing.\n"
+            "Required tests: add malformed-ID regression coverage and rerun verify_command.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_timeout_count == 0
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 1
+        assert is_verify_timeout_only_review(content) is False
+        assert is_verify_blocked_only_review(content) is False
+
+    def test_does_not_classify_code_focused_title_with_timeout_body_and_open_state_citation_as_timeout_only(
+        self,
+    ) -> None:
+        content = (
+            "## Summary\n\n- Worker loop bug surfaces as a verify timeout.\n\n"
+            "## Blockers\n\n"
+            "### B1 Worker loop leaves mocked task incomplete until verify_command timeout\n"
+            "Evidence: the worker loop keeps spinning until verify_command timed out after 120s.\n"
+            "Open-state citation: `tests/cli/test_execution.py:7214`\n"
+            "Impact: the task never completes and the suite cannot pass.\n"
+            "Required fix: exit the worker loop when the mocked task reaches its terminal state.\n"
+            "Required tests: add a worker-loop regression that asserts the task completes well before the configured verify_command timeout.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_timeout_count == 0
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 1
+        assert is_verify_timeout_only_review(content) is False
+        assert is_verify_blocked_only_review(content) is False
+
+    def test_classifies_structured_timeout_only_review_when_timeout_marker_is_only_in_evidence(
+        self,
+    ) -> None:
+        content = (
+            "## Summary\n\n- Verify timed out.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure\n"
+            "Evidence: Failure: verify_command timed out after 120s while running the configured suite.\n"
+            "Open-state citation: `gza.yaml:5`\n"
+            "Impact: the branch cannot be considered verified.\n"
+            "Required fix: investigate the test-performance regression.\n"
+            "Required tests: rerun the exact configured verify_command after narrowing the slowdown.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_timeout_count == 1
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 0
+        assert is_verify_timeout_only_review(content) is True
+        assert is_verify_blocked_only_review(content) is True
+
+    def test_does_not_classify_structured_code_blocker_with_timeout_evidence_as_timeout_only(
+        self,
+    ) -> None:
+        content = (
+            "## Summary\n\n- Validation missing and verify rerun timed out.\n\n"
+            "## Blockers\n\n"
+            "### B1 Missing input validation\n"
+            "Evidence: request path still accepts malformed IDs.\n"
+            "Open-state citation: `src/gza/api.py:14`\n"
+            "Impact: malformed requests still crash.\n"
+            "Required fix: validate IDs before parsing.\n"
+            "Required tests: add malformed-ID regression coverage, then rerun the exact verify command because "
+            "verify_command timed out after 120s during review.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_timeout_count == 0
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 1
+        assert is_verify_timeout_only_review(content) is False
+        assert is_verify_blocked_only_review(content) is False
+
+    def test_classifies_timeout_only_review_from_unstructured_blocker_section(self) -> None:
+        content = (
+            "## Summary\n\n- Verify timed out.\n\n"
+            "## Blockers\n\n"
+            "- verify_command timed out after 120s\n"
+            "- Exit status: timed out\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_timeout_count == 1
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 0
+        assert is_verify_timeout_only_review(content) is True
+
+    def test_does_not_classify_unstructured_mixed_blocker_section_as_timeout_only(self) -> None:
+        content = (
+            "## Summary\n\n- Mixed blockers.\n\n"
+            "## Blockers\n\n"
+            "- verify_command timed out after 120s\n"
+            "- Missing validation still crashes malformed IDs\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 0
+        assert summary.verify_timeout_count == 0
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 0
+        assert is_verify_timeout_only_review(content) is False
+        assert is_verify_blocked_only_review(content) is False
 
 
 def _template_review(

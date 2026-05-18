@@ -47,6 +47,30 @@ _CHECKLIST_LINE_PATTERN = re.compile(
     r"^\s*(?:[-*]|\d+[.)])?\s*(yes|no)\s*[-:]\s*(.+?)\s*$",
     re.IGNORECASE,
 )
+_VERIFY_COMMAND_PATTERN = re.compile(r"\bverify_command\b", re.IGNORECASE)
+_VERIFY_TIMEOUT_PATTERNS = (
+    re.compile(r"verify_command\s+timed\s+out", re.IGNORECASE),
+    re.compile(r"exit\s+status:\s*timed\s+out", re.IGNORECASE),
+    re.compile(r"timed\s+out\s+after\b", re.IGNORECASE),
+)
+_VERIFY_FAILURE_PATTERNS = (
+    re.compile(
+        r"\bverify_command\b\s+(?:failure|failures|failed|fails|failing|"
+        r"errored|broken|did\s+not\s+pass|did\s+not\s+succeed|"
+        r"exited\s+nonzero|exited\s+with\s+nonzero|"
+        r"returned\s+nonzero|returned\s+failure)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bverify_command\b[^\n]{0,80}\b(?:result|exit|exited|status|outcome)\b"
+        r"[^\n]{0,40}\b(?:fail|failed|failure|nonzero|non-zero|error)\b",
+        re.IGNORECASE,
+    ),
+)
+_BLOCKER_SECTION_PATTERN = re.compile(
+    r"^##\s+(Blockers|Must-Fix)\s*$\n?(.*?)(?=^##\s+|\Z)",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
 
 
 MUST_FIX_WEIGHT = 20
@@ -86,6 +110,26 @@ class ReviewOutcome:
 
     verdict: str | None
     followup_findings: tuple[ReviewFinding, ...]
+
+
+@dataclass(frozen=True)
+class ReviewBlockerSummary:
+    """Conservative classification of blocker types in a review report."""
+
+    blocker_count: int
+    verify_timeout_count: int
+    verify_failure_count: int
+    unknown_or_code_count: int
+
+    @property
+    def is_verify_timeout_only(self) -> bool:
+        return self.blocker_count > 0 and self.verify_timeout_count == self.blocker_count
+
+    @property
+    def is_verify_blocked_only(self) -> bool:
+        return self.blocker_count > 0 and (
+            self.verify_timeout_count + self.verify_failure_count == self.blocker_count
+        )
 
 
 @dataclass(frozen=True)
@@ -399,6 +443,168 @@ def parse_review_report(content: str | None) -> ParsedReviewReport:
         findings=tuple(findings),
         format_version=format_version,
     )
+
+
+def _contains_verify_timeout_marker(text: str) -> bool:
+    if not text:
+        return False
+    if _VERIFY_TIMEOUT_PATTERNS[0].search(text) or _VERIFY_TIMEOUT_PATTERNS[1].search(text):
+        return True
+    return bool(_VERIFY_COMMAND_PATTERN.search(text) and _VERIFY_TIMEOUT_PATTERNS[2].search(text))
+
+
+def _contains_verify_failure_marker(text: str) -> bool:
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _VERIFY_FAILURE_PATTERNS)
+
+
+def _contains_explicit_verify_timeout_subject(text: str) -> bool:
+    if not text:
+        return False
+    if _VERIFY_TIMEOUT_PATTERNS[1].search(text):
+        return True
+    lowered = text.lower()
+    return "verify_command" in lowered and ("timed out" in lowered or "timeout" in lowered)
+
+
+def _contains_open_state_like_citation(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_OPEN_STATE_CITATION_TOKEN_PATTERN.search(text))
+
+
+def _has_explicit_verify_timeout_subject_in_structured_fields(finding: ReviewFinding) -> bool:
+    subject_fields = (
+        finding.title,
+        finding.evidence,
+        finding.impact,
+        finding.fix_or_followup,
+    )
+    return any(_contains_explicit_verify_timeout_subject(field or "") for field in subject_fields)
+
+
+def _title_names_verify_command_as_subject(title: str | None) -> bool:
+    if not title:
+        return False
+    return bool(re.match(r"\s*verify_command\b", title, re.IGNORECASE))
+
+
+def _classify_blocker_finding(finding: ReviewFinding) -> str:
+    text = "\n".join(
+        part
+        for part in (
+            finding.title,
+            finding.body,
+            finding.evidence,
+            finding.impact,
+            finding.fix_or_followup,
+            finding.tests,
+        )
+        if part
+    )
+    if _contains_verify_timeout_marker(text):
+        # A blocker is only timeout-eligible when its title names verify_command as
+        # the subject. A code-focused title with body-only mentions of a timeout
+        # symptom (e.g. "Worker loop ... until verify_command timeout") describes a
+        # code defect with a timeout symptom, not a verify_command failure.
+        if not _title_names_verify_command_as_subject(finding.title):
+            return "code"
+        if not _has_explicit_verify_timeout_subject_in_structured_fields(finding):
+            return "code"
+
+        code_citation_fields = (
+            finding.evidence,
+            finding.impact,
+            finding.fix_or_followup,
+            finding.tests,
+        )
+        if any(_contains_open_state_like_citation(field or "") for field in code_citation_fields):
+            return "code"
+        return "verify_timeout"
+    if _contains_verify_failure_marker(text):
+        return "verify_failure"
+    return "code"
+
+
+def _is_timeout_only_raw_blocker_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped in {"```", "```text"}:
+        return True
+
+    normalized = stripped.lstrip("-* ").strip()
+    if _contains_verify_timeout_marker(normalized):
+        return True
+
+    if ":" in normalized:
+        _, _, remainder = normalized.partition(":")
+        remainder = remainder.strip()
+        return bool(remainder) and _contains_verify_timeout_marker(remainder)
+
+    return False
+
+
+def _raw_verify_timeout_only_blocker(content: str, report: ParsedReviewReport) -> bool:
+    if report.verdict != "CHANGES_REQUESTED" or report.findings:
+        return False
+    match = _BLOCKER_SECTION_PATTERN.search(content)
+    if match is None:
+        return False
+    blocker_body = match.group(2).strip()
+    if not blocker_body:
+        return False
+    if not _contains_verify_timeout_marker(blocker_body):
+        return False
+
+    return all(_is_timeout_only_raw_blocker_line(line) for line in blocker_body.splitlines())
+
+
+def summarize_review_blockers(content: str | None) -> ReviewBlockerSummary:
+    """Classify review blockers conservatively for lifecycle decisions."""
+    if not content:
+        return ReviewBlockerSummary(0, 0, 0, 0)
+
+    report = parse_review_report(content)
+    if report.verdict != "CHANGES_REQUESTED":
+        return ReviewBlockerSummary(0, 0, 0, 0)
+
+    blockers = [finding for finding in report.findings if finding.severity == "BLOCKER"]
+    if blockers:
+        verify_timeout_count = 0
+        verify_failure_count = 0
+        unknown_or_code_count = 0
+        for blocker in blockers:
+            kind = _classify_blocker_finding(blocker)
+            if kind == "verify_timeout":
+                verify_timeout_count += 1
+            elif kind == "verify_failure":
+                verify_failure_count += 1
+            else:
+                unknown_or_code_count += 1
+        return ReviewBlockerSummary(
+            blocker_count=len(blockers),
+            verify_timeout_count=verify_timeout_count,
+            verify_failure_count=verify_failure_count,
+            unknown_or_code_count=unknown_or_code_count,
+        )
+
+    if _raw_verify_timeout_only_blocker(content, report):
+        return ReviewBlockerSummary(
+            blocker_count=1,
+            verify_timeout_count=1,
+            verify_failure_count=0,
+            unknown_or_code_count=0,
+        )
+
+    return ReviewBlockerSummary(0, 0, 0, 0)
+
+
+def is_verify_timeout_only_review(content: str | None) -> bool:
+    return summarize_review_blockers(content).is_verify_timeout_only
+
+
+def is_verify_blocked_only_review(content: str | None) -> bool:
+    return summarize_review_blockers(content).is_verify_blocked_only
 
 
 def parse_review_verdict(content: str | None) -> str | None:

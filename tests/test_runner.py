@@ -1188,6 +1188,212 @@ class TestReviewContextFromChain:
         assert f"review task {review_task.id} exists but content unavailable" in context
         assert "flag as blocker" in context
 
+    def test_improve_context_includes_verify_timeout_guidance_for_timeout_only_review(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = (
+            "## Summary\n\n- Verify timed out.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: timed out during pytest\n"
+            "Evidence: verify_command timed out after 120s while running the configured suite.\n"
+            "Open-state citation: `src/gza/runner.py:903`\n"
+            "Impact: the branch cannot be verified autonomously.\n"
+            "Required fix: investigate the test-performance regression or prove the timeout is environmental.\n"
+            "Required tests: rerun the exact verify command and add a narrow regression if this branch caused the slowdown.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review_task)
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Verify Timeout Guidance" in context
+        assert "Treat this as a test-performance investigation first" in context
+        assert "do not silently relax suite-wide guardrails or change `verify_timeout`" in context
+
+    def test_improve_context_includes_verify_timeout_guidance_for_evidence_only_timeout_review(
+        self, tmp_path: Path
+    ):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = (
+            "## Summary\n\n- Verify timed out.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure\n"
+            "Evidence: Failure: verify_command timed out after 120s while running the configured suite.\n"
+            "Open-state citation: `gza.yaml:5`\n"
+            "Impact: the branch cannot be considered verified.\n"
+            "Required fix: investigate the test-performance regression.\n"
+            "Required tests: rerun the exact configured verify_command after narrowing the slowdown.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review_task)
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Verify Timeout Guidance" in context
+        assert "Treat this as a test-performance investigation first" in context
+
+    def test_improve_context_excludes_verify_timeout_guidance_for_code_blocker_review(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = (
+            "## Summary\n\n- Validation missing.\n\n"
+            "## Blockers\n\n"
+            "### B1 Missing input validation\n"
+            "Evidence: request path still accepts malformed IDs.\n"
+            "Open-state citation: `src/gza/api.py:14`\n"
+            "Impact: malformed requests still crash.\n"
+            "Required fix: validate IDs before parsing.\n"
+            "Required tests: add malformed-ID regression coverage.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review_task)
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Verify Timeout Guidance" not in context
+
+    def test_improve_context_excludes_verify_timeout_guidance_for_structured_code_blocker_with_timeout_evidence(
+        self, tmp_path: Path
+    ):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = (
+            "## Summary\n\n- Validation missing and verify rerun timed out.\n\n"
+            "## Blockers\n\n"
+            "### B1 Missing input validation\n"
+            "Evidence: request path still accepts malformed IDs.\n"
+            "Open-state citation: `src/gza/api.py:14`\n"
+            "Impact: malformed requests still crash.\n"
+            "Required fix: validate IDs before parsing.\n"
+            "Required tests: add malformed-ID regression coverage, then rerun the exact verify command because "
+            "verify_command timed out after 120s during review.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review_task)
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Verify Timeout Guidance" not in context
+
+    def test_improve_context_excludes_verify_timeout_guidance_for_unstructured_mixed_review(
+        self, tmp_path: Path
+    ):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = (
+            "## Summary\n\n- Mixed blockers.\n\n"
+            "## Blockers\n\n"
+            "- verify_command timed out after 120s\n"
+            "- Missing validation still crashes malformed IDs\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review_task)
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Verify Timeout Guidance" not in context
+
     def test_improve_context_includes_unresolved_comments(self, tmp_path: Path):
         """Improve context should include unresolved comments for the implementation task."""
         db_path = tmp_path / "test.db"
