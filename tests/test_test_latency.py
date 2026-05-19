@@ -73,4 +73,5 @@ def test_sub_millisecond_percentiles_still_select_slow_tail_rows() -> None:
     assert [item.nodeid for item in report.slow_tests_p95] == ["tests/test_alpha.py::test_slow"]
     assert [item.nodeid for item in report.slow_tests_p99] == ["tests/test_alpha.py::test_slow"]
     assert "## Slow tests (≥p95)" in markdown
-    assert "| 1ms | `tests/test_alpha.py::test_slow` |" in markdown
+    assert "1ms" in markdown
+    assert "`tests/test_alpha.py::test_slow`" in markdown

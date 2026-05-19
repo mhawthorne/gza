@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import math
+import subprocess
 import sys
 import time
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from typing import TextIO
+from pathlib import Path
 
 import pytest
 
@@ -46,26 +46,6 @@ class LatencyReport:
     p99_threshold_ms: int
     slow_tests_p95: list[MeasuredTest]
     slow_tests_p99: list[MeasuredTest]
-
-
-class _Tee(io.TextIOBase):
-    """Write to an in-memory buffer and a live stream."""
-
-    def __init__(self, sink: TextIO):
-        self._sink = sink
-        self._buffer = io.StringIO()
-
-    def write(self, s: str) -> int:
-        self._sink.write(s)
-        self._buffer.write(s)
-        return len(s)
-
-    def flush(self) -> None:
-        self._sink.flush()
-        self._buffer.flush()
-
-    def getvalue(self) -> str:
-        return self._buffer.getvalue()
 
 
 class _TimingPlugin:
@@ -175,6 +155,40 @@ def build_report(test_durations: list[MeasuredTest], total_wall_time_seconds: fl
     )
 
 
+def _render_table(headers: list[str], rows: list[list[str]], aligns: list[str]) -> list[str]:
+    """Render a GFM table with cells padded so columns align in plain text.
+
+    aligns: one of "l", "r", or "c" per column.
+    """
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            if len(cell) > widths[i]:
+                widths[i] = len(cell)
+
+    def pad(cell: str, width: int, align: str) -> str:
+        if align == "r":
+            return cell.rjust(width)
+        if align == "c":
+            return cell.center(width)
+        return cell.ljust(width)
+
+    def separator(width: int, align: str) -> str:
+        bar = "-" * max(width, 3)
+        if align == "r":
+            return bar[:-1] + ":"
+        if align == "c":
+            return ":" + bar[1:-1] + ":"
+        return bar
+
+    header_line = "| " + " | ".join(pad(h, widths[i], aligns[i]) for i, h in enumerate(headers)) + " |"
+    sep_line = "| " + " | ".join(separator(widths[i], aligns[i]) for i in range(len(headers))) + " |"
+    body_lines = [
+        "| " + " | ".join(pad(cell, widths[i], aligns[i]) for i, cell in enumerate(row)) + " |" for row in rows
+    ]
+    return [header_line, sep_line, *body_lines]
+
+
 def render_markdown(report: LatencyReport) -> str:
     """Render the report as GitHub-flavored markdown."""
     lines = [
@@ -186,22 +200,14 @@ def render_markdown(report: LatencyReport) -> str:
         "",
         "## Summary",
         "",
-        "| Percentile | Latency |",
-        "|---|---|",
     ]
-    for key in ("p50", "p75", "p90", "p95", "p99", "max"):
-        lines.append(f"| {key} | {_format_ms_int(report.percentiles_ms[key])} |")
-    lines.extend(
-        [
-            "",
-            "## Buckets",
-            "",
-            "| Bucket | Count | % of suite |",
-            "|---|---|---|",
-        ]
-    )
-    for bucket in report.buckets:
-        lines.append(f"| {bucket.label} | {bucket.count} | {bucket.suite_percent:.1f}% |")
+    summary_rows = [[key, _format_ms_int(report.percentiles_ms[key])] for key in ("p50", "p75", "p90", "p95", "p99", "max")]
+    lines.extend(_render_table(["Percentile", "Latency"], summary_rows, ["l", "r"]))
+
+    lines.extend(["", "## Buckets", ""])
+    bucket_rows = [[bucket.label, str(bucket.count), f"{bucket.suite_percent:.1f}%"] for bucket in report.buckets]
+    lines.extend(_render_table(["Bucket", "Count", "% of suite"], bucket_rows, ["l", "r", "r"]))
+
     lines.extend(
         [
             "",
@@ -213,12 +219,11 @@ def render_markdown(report: LatencyReport) -> str:
                 'Hand this list to an agent with "find a way to make these faster".'
             ),
             "",
-            "| Duration | Test |",
-            "|---|---|",
         ]
     )
-    for item in report.slow_tests_p95:
-        lines.append(f"| {_format_ms(item.duration_seconds)} | `{item.nodeid}` |")
+    p95_rows = [[_format_ms(item.duration_seconds), f"`{item.nodeid}`"] for item in report.slow_tests_p95]
+    lines.extend(_render_table(["Duration", "Test"], p95_rows, ["r", "l"]))
+
     lines.extend(
         [
             "",
@@ -229,12 +234,11 @@ def render_markdown(report: LatencyReport) -> str:
                 f"({_format_ms_int(report.p99_threshold_ms)}). Highest priority."
             ),
             "",
-            "| Duration | Test |",
-            "|---|---|",
         ]
     )
-    for item in report.slow_tests_p99:
-        lines.append(f"| {_format_ms(item.duration_seconds)} | `{item.nodeid}` |")
+    p99_rows = [[_format_ms(item.duration_seconds), f"`{item.nodeid}`"] for item in report.slow_tests_p99]
+    lines.extend(_render_table(["Duration", "Test"], p99_rows, ["r", "l"]))
+
     return "\n".join(lines) + "\n"
 
 
@@ -256,20 +260,16 @@ def render_summary(report: LatencyReport) -> str:
     )
 
 
-def run_pytest(pytest_args: list[str], *, echo_output: bool) -> tuple[int, list[MeasuredTest], float, str, str]:
+def run_pytest(pytest_args: list[str]) -> tuple[int, list[MeasuredTest], float]:
     """Run pytest and capture call-phase durations."""
     plugin = _TimingPlugin()
-    stdout_capture: io.StringIO | _Tee
-    stderr_capture: io.StringIO | _Tee
-    stdout_capture = _Tee(sys.stdout) if echo_output else io.StringIO()
-    stderr_capture = _Tee(sys.stderr) if echo_output else io.StringIO()
     started = time.perf_counter()
-    with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+    # Redirect pytest's stdout to stderr so progress is visible on the terminal
+    # while keeping our rendered report (markdown/JSON) on stdout pipeable.
+    with redirect_stdout(sys.stderr):
         exit_code = pytest.main(pytest_args, plugins=[plugin])
     finished = time.perf_counter()
-    stdout_text = stdout_capture.getvalue()
-    stderr_text = stderr_capture.getvalue()
-    return int(exit_code), plugin.test_durations, finished - started, stdout_text, stderr_text
+    return int(exit_code), plugin.test_durations, finished - started
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -299,23 +299,34 @@ def _write_output(text: str, output_path: str | None) -> None:
     if output_path is None:
         sys.stdout.write(text)
         return
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as handle:
         handle.write(text)
+
+
+def _repo_root() -> Path:
+    """Return the git repository top-level for the current working directory."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return Path(result.stdout.strip())
+
+
+def _default_report_path(json_mode: bool) -> str:
+    """Build tmp/test-latency-<YYYYmmddHHMMSS>.{md,json} under the repo root."""
+    tstamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    extension = "json" if json_mode else "md"
+    return str(_repo_root() / "tmp" / f"test-latency-{tstamp}.{extension}")
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
     pytest_args = _default_pytest_args(args.pytest_args)
-    exit_code, test_durations, total_wall_time_seconds, stdout_text, stderr_text = run_pytest(
-        pytest_args,
-        echo_output=args.summary,
-    )
+    exit_code, test_durations, total_wall_time_seconds = run_pytest(pytest_args)
     if exit_code != 0:
-        if not args.summary:
-            if stdout_text:
-                sys.stdout.write(stdout_text)
-            if stderr_text:
-                sys.stderr.write(stderr_text)
         return exit_code
     report = build_report(
         test_durations,
@@ -325,8 +336,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.summary:
         _write_output(render_summary(report) + "\n", args.output)
         return 0
+    output_path = args.output if args.output is not None else _default_report_path(args.json)
     rendered = render_json(report) if args.json else render_markdown(report)
-    _write_output(rendered, args.output)
+    _write_output(rendered, output_path)
+    if args.output is None:
+        print(f"wrote {output_path}", file=sys.stderr)
     return 0
 
 
