@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -27,10 +28,11 @@ def test_test_latency_script_emits_required_sections_and_json(tmp_path: Path) ->
     suite_dir = tmp_path / "latency_suite"
     _write_sample_suite(suite_dir)
     repo_root = Path(__file__).resolve().parents[1]
-    script_path = repo_root / "bin/test-latency"
+    cmd = [sys.executable, "-m", "gza.test_latency"]
 
+    markdown_output = tmp_path / "latency.md"
     result = subprocess.run(
-        [str(script_path), "--", str(suite_dir), "-q"],
+        [*cmd, "--output", str(markdown_output), "--", str(suite_dir), "-q"],
         capture_output=True,
         text=True,
         cwd=repo_root,
@@ -39,18 +41,19 @@ def test_test_latency_script_emits_required_sections_and_json(tmp_path: Path) ->
     )
 
     assert result.returncode == 0, result.stderr
-    assert "# Unit Test Latency Report" in result.stdout
-    assert "## Summary" in result.stdout
-    assert "## Buckets" in result.stdout
-    assert "## Slow tests (≥p95)" in result.stdout
-    assert "## Slow tests (≥p99)" in result.stdout
-    slow_p95_section = result.stdout.split("## Slow tests (≥p95)", maxsplit=1)[1]
-    assert "| Duration | Test |" in slow_p95_section
+    markdown = markdown_output.read_text(encoding="utf-8")
+    assert "# Unit Test Latency Report" in markdown
+    assert "## Summary" in markdown
+    assert "## Buckets" in markdown
+    assert "## Slow tests (≥p95)" in markdown
+    assert "## Slow tests (≥p99)" in markdown
+    slow_p95_section = markdown.split("## Slow tests (≥p95)", maxsplit=1)[1]
+    assert "| Duration | Test" in slow_p95_section
     assert "`" in slow_p95_section
 
     json_output = tmp_path / "latency.json"
     json_result = subprocess.run(
-        [str(script_path), "--json", "--output", str(json_output), "--", str(suite_dir), "-q"],
+        [*cmd, "--json", "--output", str(json_output), "--", str(suite_dir), "-q"],
         capture_output=True,
         text=True,
         cwd=repo_root,
