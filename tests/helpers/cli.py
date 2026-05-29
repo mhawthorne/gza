@@ -11,10 +11,20 @@ from unittest.mock import patch
 from gza.cli import main as cli_main
 
 
+class _PatchedStdin(io.StringIO):
+    def __init__(self, value: str, *, isatty: bool) -> None:
+        super().__init__(value)
+        self._isatty = isatty
+
+    def isatty(self) -> bool:
+        return self._isatty
+
+
 def run_gza(
     *args: str,
     cwd: Path | None = None,
     stdin_input: str | None = None,
+    stdin_isatty: bool = False,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run gza CLI in-process and capture stdout/stderr like subprocess.run."""
@@ -28,10 +38,11 @@ def run_gza(
     try:
         if cwd is not None:
             os.chdir(cwd)
+        stdin = _PatchedStdin(stdin_input or "", isatty=stdin_isatty)
         with (
             patch.dict(os.environ, run_env, clear=True),
             patch.object(sys, "argv", ["gza", *args]),
-            patch("sys.stdin", io.StringIO(stdin_input or "")),
+            patch("sys.stdin", stdin),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):

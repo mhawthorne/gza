@@ -1240,6 +1240,15 @@ def main() -> int:
         action="store_true",
         help="Overwrite existing gza.yaml file",
     )
+    init_parser.add_argument(
+        "--db",
+        choices=("local", "shared"),
+        help="Task database mode: local project DB or shared DB inherited/written into config",
+    )
+    init_parser.add_argument(
+        "--db-path",
+        help="Path to the shared task database; implies --db shared (default: ~/.gza/gza.db)",
+    )
 
     # log command
     log_parser = subparsers.add_parser("log", help="Display log for a task or worker")

@@ -30,6 +30,8 @@ from ._common import get_review_verdict, get_store, resolve_id
 
 logger = logging.getLogger(__name__)
 
+_INIT_SHARED_DB_PATH = "~/.gza/gza.db"
+
 
 def _percentile(sorted_vals: list[int], p: float) -> int:
     """Return the value at the p-th percentile (nearest-rank method)."""
@@ -172,6 +174,53 @@ def _build_score_analytics(records: list[_ScoreRecord], pipeline_min_samples: in
         ),
         "weekly_trend": weekly_rows,
     }
+
+
+def _resolve_init_db_path(project_dir: Path, db_path_value: str) -> Path:
+    resolved = Path(os.path.expanduser(db_path_value))
+    if not resolved.is_absolute():
+        resolved = project_dir / resolved
+    return resolved.resolve()
+
+
+def _init_has_global_shared_db_default(project_dir: Path) -> tuple[bool, Path | None]:
+    from ..config import DEFAULT_DB_FILE
+
+    user_data, _, _ = Config._load_user_config_data()
+    db_path_value = user_data.get("db_path")
+    if not isinstance(db_path_value, str) or not db_path_value:
+        return False, None
+
+    local_db_path = (project_dir / DEFAULT_DB_FILE).resolve()
+    resolved_db_path = _resolve_init_db_path(project_dir, db_path_value)
+    if resolved_db_path == local_db_path:
+        return False, None
+    return True, resolved_db_path
+
+
+def _normalize_init_db_args(
+    args: argparse.Namespace, *, is_interactive: bool
+) -> tuple[str | None, str | None, bool] | None:
+    """Normalize `gza init` DB flags and emit early CLI-only validation errors."""
+    if args.db_path and args.db == "local":
+        print("Error: --db-path cannot be used with --db local.", file=sys.stderr)
+        return None
+
+    db_mode = args.db
+    shared_db_path = args.db_path
+    db_choice_from_flags = args.db is not None or args.db_path is not None
+    if shared_db_path and db_mode is None:
+        db_mode = "shared"
+
+    if not is_interactive and db_mode is None:
+        print(
+            "Error: --db is required when running gza init non-interactively.\n"
+            "Pass --db local (project-local .gza/gza.db) or --db shared [--db-path PATH].",
+            file=sys.stderr,
+        )
+        return None
+
+    return db_mode, shared_db_path, db_choice_from_flags
 
 
 def _count_section_items(content: str, header_pattern: str) -> int:
@@ -2001,7 +2050,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     """Generate a new gza.yaml configuration file with defaults."""
     import importlib.resources
 
-    from ..config import CONFIG_FILENAME, LOCAL_CONFIG_FILENAME
+    from ..config import CONFIG_FILENAME, DEFAULT_DB_FILE, LOCAL_CONFIG_FILENAME
 
     # Derive project name from directory name
     default_project_name = args.project_dir.name
@@ -2016,8 +2065,27 @@ def cmd_init(args: argparse.Namespace) -> int:
     # Read the example template from the package
     template = importlib.resources.files("gza").joinpath("gza.yaml.example").read_text()
 
+    project_id = _generate_project_id(args.project_dir, default_project_name)
+
     # Check if running interactively (stdin is a TTY)
     is_interactive = sys.stdin.isatty()
+    normalized_db_args = _normalize_init_db_args(args, is_interactive=is_interactive)
+    if normalized_db_args is None:
+        return 1
+
+    db_mode, shared_db_path, db_choice_from_flags = normalized_db_args
+
+    try:
+        Config.preflight_init_user_config(
+            args.project_dir,
+            project_name=default_project_name,
+            project_id=project_id,
+        )
+    except ConfigError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    has_global_shared_default, _ = _init_has_global_shared_db_default(args.project_dir)
 
     if is_interactive:
         # Prompt for branch strategy
@@ -2032,21 +2100,32 @@ def cmd_init(args: argparse.Namespace) -> int:
             if choice in ("1", "2", "3", "4"):
                 break
             print("Invalid choice. Please enter 1, 2, 3, or 4.")
+
+        if db_mode is None:
+            print()
+            print("Task database:")
+            print(f"  1. local   - {DEFAULT_DB_FILE} (this project only)")
+            print(f"  2. shared  - {_INIT_SHARED_DB_PATH} (shared across all your projects & worktrees)")
+            while True:
+                db_choice = input("Choose [1-2, default=2]: ").strip() or "2"
+                if db_choice == "1":
+                    db_mode = "local"
+                    break
+                if db_choice == "2":
+                    db_mode = "shared"
+                    break
+                print("Invalid choice. Please enter 1 or 2.")
+
+        if (
+            db_mode == "shared"
+            and shared_db_path is None
+            and not has_global_shared_default
+            and not db_choice_from_flags
+        ):
+            shared_db_path = input(f"Shared DB path [default={_INIT_SHARED_DB_PATH}]: ").strip() or _INIT_SHARED_DB_PATH
     else:
-        # Non-interactive mode: use default (monorepo)
+        # Non-interactive mode: use default branch strategy after early DB validation.
         choice = "1"
-
-    project_id = _generate_project_id(args.project_dir, default_project_name)
-
-    try:
-        Config.preflight_init_user_config(
-            args.project_dir,
-            project_name=default_project_name,
-            project_id=project_id,
-        )
-    except ConfigError as exc:
-        print(f"Error: {exc}")
-        return 1
 
     # Replace project metadata placeholders
     config_content = template.replace("project_name: my-project", f"project_name: {default_project_name}")
@@ -2083,6 +2162,19 @@ def cmd_init(args: argparse.Namespace) -> int:
         default_type = input("Default type [default=feature]: ").strip() or "feature"
         custom_strategy = f'branch_strategy:\n  pattern: "{pattern}"\n  default_type: {default_type}'
         config_content = config_content.replace(default_branch_line, custom_strategy)
+
+    if db_mode == "shared":
+        if shared_db_path is not None:
+            db_path_value = shared_db_path
+        elif has_global_shared_default:
+            db_path_value = None
+        else:
+            db_path_value = _INIT_SHARED_DB_PATH
+    else:
+        db_path_value = DEFAULT_DB_FILE
+
+    if db_path_value is not None:
+        config_content = config_content.replace("# db_path: .gza/gza.db", f"db_path: {db_path_value}")
 
     config_path.write_text(config_content)
     print(f"✓ Created {config_path}")

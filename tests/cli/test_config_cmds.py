@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1040,9 +1041,63 @@ class TestLocalConfigOverrides:
 class TestInitCommand:
     """Tests for 'gza init' command."""
 
-    def test_init_creates_config(self, tmp_path: Path):
-        """Init command creates config in project root."""
-        result = run_gza("init", "--project", str(tmp_path))
+    @staticmethod
+    def _home_env(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+        del tmp_path
+        home_dir = Path(os.environ["HOME"])
+        return home_dir, {"HOME": str(home_dir)}
+
+    @staticmethod
+    def _active_db_path_line(content: str) -> str | None:
+        match = re.search(r"^db_path:\s*(.+)\s*$", content, re.MULTILINE)
+        return match.group(1) if match else None
+
+    def test_init_non_interactive_requires_db_choice(self, tmp_path: Path):
+        """Non-interactive init must require an explicit DB mode."""
+        _home_dir, env = self._home_env(tmp_path)
+
+        result = run_gza("init", "--project", str(tmp_path), env=env)
+
+        assert result.returncode == 1
+        assert "--db is required when running gza init non-interactively" in result.stderr
+        assert (tmp_path / "gza.yaml").exists() is False
+        assert (tmp_path / "gza.local.yaml.example").exists() is False
+        assert (tmp_path / ".gza" / "gza.db").exists() is False
+
+    def test_init_non_interactive_missing_db_wins_over_semantically_invalid_user_config(self, tmp_path: Path):
+        """Missing DB choice must fail before semantically invalid user config is loaded."""
+        home_dir, env = self._home_env(tmp_path)
+        write_user_config(home_dir, "db_path: 123\n")
+
+        result = run_gza("init", "--project", str(tmp_path), env=env)
+
+        assert result.returncode == 1
+        assert "--db is required when running gza init non-interactively" in result.stderr
+        assert "Invalid user config in ~/.gza/config.yaml" not in result.stdout
+        assert (tmp_path / "gza.yaml").exists() is False
+        assert (tmp_path / "gza.local.yaml.example").exists() is False
+        assert (tmp_path / ".gza" / "gza.db").exists() is False
+
+    def test_init_non_interactive_missing_db_wins_over_malformed_user_config(self, tmp_path: Path):
+        """Missing DB choice must fail before malformed user config is loaded."""
+        home_dir, env = self._home_env(tmp_path)
+        write_user_config(home_dir, "defaults:\n  model: [\n")
+
+        result = run_gza("init", "--project", str(tmp_path), env=env)
+
+        assert result.returncode == 1
+        assert "--db is required when running gza init non-interactively" in result.stderr
+        assert "Invalid YAML syntax in ~/.gza/config.yaml" not in result.stdout
+        assert (tmp_path / "gza.yaml").exists() is False
+        assert (tmp_path / "gza.local.yaml.example").exists() is False
+        assert (tmp_path / ".gza" / "gza.db").exists() is False
+
+    def test_init_creates_local_config_when_explicitly_requested(self, tmp_path: Path):
+        """Init command writes an explicit local db_path when local mode is chosen."""
+        from gza.config import Config
+
+        _home_dir, env = self._home_env(tmp_path)
+        result = run_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 0
         config_path = tmp_path / "gza.yaml"
@@ -1051,20 +1106,25 @@ class TestInitCommand:
         assert local_example_path.exists()
 
         # Verify project_name is set (derived from directory name)
-        content = config_path.read_text()
+        content = config_path.read_text(encoding="utf-8")
         assert "project_name:" in content
         assert tmp_path.name in content
         project_id_match = re.search(r"^project_id:\s*([a-z0-9]{1,64})\s*$", content, re.MULTILINE)
         assert project_id_match is not None
         assert project_id_match.group(1) != "default"
+        assert self._active_db_path_line(content) == ".gza/gza.db"
         assert "# iterate_max_iterations: 3" in content
+        with patch.dict(os.environ, env, clear=False):
+            assert Config.load(tmp_path).db_path == (tmp_path / ".gza" / "gza.db").resolve()
+        assert (tmp_path / ".gza" / "gza.db").exists()
 
     def test_init_project_id_remains_stable_after_move_and_clone(self, tmp_path: Path):
         """Init writes project_id once and moved/cloned projects keep that identity."""
         shared_db = tmp_path / "shared" / "gza.db"
-        env = {"GZA_DB_PATH": str(shared_db)}
+        _home_dir, env = self._home_env(tmp_path)
+        env["GZA_DB_PATH"] = str(shared_db)
 
-        result = run_gza("init", "--project", str(tmp_path), env=env)
+        result = run_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
         assert result.returncode == 0
 
         config_path = tmp_path / "gza.yaml"
@@ -1101,28 +1161,192 @@ class TestInitCommand:
         """Init should honor user-level shared DB defaults without writing an active project db_path."""
         from gza.config import Config
 
-        home_dir = Path(os.environ["HOME"])
+        home_dir, env = self._home_env(tmp_path)
         shared_db = home_dir / ".gza" / "gza.db"
         write_user_config(home_dir, f"db_path: {shared_db}\n")
 
-        result = run_gza("init", "--project", str(tmp_path))
+        result = run_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 0
         content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
         assert re.search(r"^project_id:\s*([a-z0-9]{1,64})\s*$", content, re.MULTILINE)
-        assert re.search(r"^db_path:\s*", content, re.MULTILINE) is None
+        assert self._active_db_path_line(content) is None
         assert "# db_path: .gza/gza.db" in content
 
-        config = Config.load(tmp_path)
+        with patch.dict(os.environ, env, clear=False):
+            config = Config.load(tmp_path)
         assert config.db_path == shared_db.resolve()
         assert shared_db.exists()
 
-    def test_init_rejects_semantically_invalid_user_config_before_writing_project_file(self, tmp_path: Path):
-        """Init should fail before writing gza.yaml when user config passes schema but fails runtime validation."""
-        home_dir = Path(os.environ["HOME"])
+    def test_init_local_writes_explicit_db_path_even_with_global_shared_default(self, tmp_path: Path):
+        """Local mode must opt out explicitly when a user-level shared default exists."""
+        from gza.config import Config
+
+        home_dir, env = self._home_env(tmp_path)
+        shared_db = home_dir / ".gza" / "shared.db"
+        write_user_config(home_dir, f"db_path: {shared_db}\n")
+
+        result = run_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
+
+        assert result.returncode == 0
+        content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
+        assert self._active_db_path_line(content) == ".gza/gza.db"
+        with patch.dict(os.environ, env, clear=False):
+            config = Config.load(tmp_path)
+        assert config.db_path == (tmp_path / ".gza" / "gza.db").resolve()
+        assert (tmp_path / ".gza" / "gza.db").exists()
+
+    def test_init_shared_without_global_default_writes_explicit_default_path(self, tmp_path: Path):
+        """Shared mode should write the default shared db_path when nothing is inherited."""
+        from gza.config import Config
+
+        home_dir, env = self._home_env(tmp_path)
+
+        result = run_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
+
+        assert result.returncode == 0
+        content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
+        assert self._active_db_path_line(content) == "~/.gza/gza.db"
+        with patch.dict(os.environ, env, clear=False):
+            config = Config.load(tmp_path)
+        assert config.db_path == (home_dir / ".gza" / "gza.db").resolve()
+        assert (home_dir / ".gza" / "gza.db").exists()
+
+    def test_init_db_path_flag_implies_shared_and_overrides_default(self, tmp_path: Path):
+        """--db-path should imply shared mode and drive the initialized database path."""
+        from gza.config import Config
+
+        _home_dir, env = self._home_env(tmp_path)
+        shared_db = tmp_path / "custom-shared" / "tasks.db"
+
+        result = run_gza("init", "--db-path", str(shared_db), "--project", str(tmp_path), env=env)
+
+        assert result.returncode == 0
+        content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
+        assert self._active_db_path_line(content) == str(shared_db)
+        with patch.dict(os.environ, env, clear=False):
+            config = Config.load(tmp_path)
+        assert config.db_path == shared_db.resolve()
+        assert shared_db.exists()
+
+    def test_init_rejects_local_db_with_db_path_flag(self, tmp_path: Path):
+        """Conflicting local mode and explicit shared path should fail."""
+        _home_dir, env = self._home_env(tmp_path)
+
+        result = run_gza(
+            "init",
+            "--db",
+            "local",
+            "--db-path",
+            str(tmp_path / "shared.db"),
+            "--project",
+            str(tmp_path),
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "--db-path cannot be used with --db local" in result.stderr
+        assert (tmp_path / "gza.yaml").exists() is False
+
+    def test_init_db_flag_conflict_wins_over_semantically_invalid_user_config(self, tmp_path: Path):
+        """Conflicting DB flags must fail before semantically invalid user config is loaded."""
+        home_dir, env = self._home_env(tmp_path)
         write_user_config(home_dir, "db_path: 123\n")
 
-        result = run_gza("init", "--project", str(tmp_path))
+        result = run_gza(
+            "init",
+            "--db",
+            "local",
+            "--db-path",
+            str(tmp_path / "shared.db"),
+            "--project",
+            str(tmp_path),
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "--db-path cannot be used with --db local" in result.stderr
+        assert "Invalid user config in ~/.gza/config.yaml" not in result.stdout
+        assert (tmp_path / "gza.yaml").exists() is False
+        assert (tmp_path / "gza.local.yaml.example").exists() is False
+        assert (tmp_path / ".gza" / "gza.db").exists() is False
+
+    def test_init_db_flag_conflict_wins_over_malformed_user_config(self, tmp_path: Path):
+        """Conflicting DB flags must fail before malformed user config is loaded."""
+        home_dir, env = self._home_env(tmp_path)
+        write_user_config(home_dir, "defaults:\n  model: [\n")
+
+        result = run_gza(
+            "init",
+            "--db",
+            "local",
+            "--db-path",
+            str(tmp_path / "shared.db"),
+            "--project",
+            str(tmp_path),
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "--db-path cannot be used with --db local" in result.stderr
+        assert "Invalid YAML syntax in ~/.gza/config.yaml" not in result.stdout
+        assert (tmp_path / "gza.yaml").exists() is False
+        assert (tmp_path / "gza.local.yaml.example").exists() is False
+        assert (tmp_path / ".gza" / "gza.db").exists() is False
+
+    def test_init_interactive_db_flag_shared_skips_shared_db_path_prompt(self, tmp_path: Path):
+        """Interactive init must honor --db shared without prompting for a shared DB path."""
+        from gza.config import Config
+
+        home_dir, env = self._home_env(tmp_path)
+
+        result = run_gza(
+            "init",
+            "--db",
+            "shared",
+            "--project",
+            str(tmp_path),
+            stdin_input="\n",
+            stdin_isatty=True,
+            env=env,
+        )
+
+        assert result.returncode == 0
+        assert "Shared DB path" not in result.stdout
+        content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
+        assert self._active_db_path_line(content) == "~/.gza/gza.db"
+        with patch.dict(os.environ, env, clear=False):
+            config = Config.load(tmp_path)
+        assert config.db_path == (home_dir / ".gza" / "gza.db").resolve()
+        assert (home_dir / ".gza" / "gza.db").exists()
+
+    def test_init_interactive_default_db_prompt_selects_shared(self, tmp_path: Path):
+        """Bare Enter on the DB prompt should choose shared mode."""
+        from gza.config import Config
+
+        home_dir, env = self._home_env(tmp_path)
+        result = run_gza(
+            "init",
+            "--project",
+            str(tmp_path),
+            stdin_input="\n\n\n",
+            stdin_isatty=True,
+            env=env,
+        )
+
+        assert result.returncode == 0
+        content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
+        assert "Task database:" in result.stdout
+        assert self._active_db_path_line(content) == "~/.gza/gza.db"
+        with patch.dict(os.environ, env, clear=False):
+            assert Config.load(tmp_path).db_path == (home_dir / ".gza" / "gza.db").resolve()
+
+    def test_init_rejects_semantically_invalid_user_config_before_writing_project_file(self, tmp_path: Path):
+        """Init should fail before writing gza.yaml when user config passes schema but fails runtime validation."""
+        home_dir, env = self._home_env(tmp_path)
+        write_user_config(home_dir, "db_path: 123\n")
+
+        result = run_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 1
         assert "Invalid user config in ~/.gza/config.yaml" in result.stdout
@@ -1132,10 +1356,10 @@ class TestInitCommand:
 
     def test_init_rejects_malformed_user_config_before_writing_project_file(self, tmp_path: Path):
         """Init should report malformed user config cleanly and avoid partial project files."""
-        home_dir = Path(os.environ["HOME"])
+        home_dir, env = self._home_env(tmp_path)
         write_user_config(home_dir, "defaults:\n  model: [\n")
 
-        result = run_gza("init", "--project", str(tmp_path))
+        result = run_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 1
         assert "Invalid YAML syntax in ~/.gza/config.yaml" in result.stdout
@@ -1144,9 +1368,10 @@ class TestInitCommand:
 
     def test_init_does_not_overwrite(self, tmp_path: Path):
         """Init command does not overwrite existing config without --force."""
+        _home_dir, env = self._home_env(tmp_path)
         setup_config(tmp_path, project_name="original")
 
-        result = run_gza("init", "--project", str(tmp_path))
+        result = run_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 1
         assert "already exists" in result.stdout
@@ -1157,11 +1382,12 @@ class TestInitCommand:
 
     def test_init_force_overwrites(self, tmp_path: Path):
         """Init command overwrites existing config with --force."""
+        _home_dir, env = self._home_env(tmp_path)
         setup_config(tmp_path, project_name="original")
         local_example_path = tmp_path / "gza.local.yaml.example"
         local_example_path.write_text("# stale local example\n")
 
-        result = run_gza("init", "--force", "--project", str(tmp_path))
+        result = run_gza("init", "--force", "--db", "local", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 0
 
