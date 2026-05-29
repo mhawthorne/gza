@@ -31,3 +31,9 @@ model: gpt-5.5
 #  review:
 #    model: claude-haiku-4-5-20251001
 project_id: gza
+
+# The gza dev repo always uses its own project-local task DB. Pin it explicitly
+# so it ignores any user-level shared db_path in ~/.gza/config.yaml (its dev/test
+# tasks must never be merged into a personal shared DB). Equals the built-in
+# default, so it is a no-op for anyone without a global shared config.
+db_path: .gza/gza.db

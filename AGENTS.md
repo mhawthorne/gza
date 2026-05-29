@@ -28,6 +28,8 @@ See `docs/` for detailed documentation:
 
 **Task management**: When the user mentions "task", "add a task", or asks to track something for later, use `uv run gza add "..."`. NEVER edit `etc/todo.txt` or other files manually.
 
+**Ask before implementing**: When the user asks for a substantive code change (a feature, fix, or refactor), do NOT start editing right away. First ask whether they want it filed as a gza task or worked on right now. Skip this only for trivial edits or when the user has already said which way they want it.
+
 **Failed tasks**: Do NOT run `uv run gza retry ...` or `uv run gza resume ...` unless the user explicitly asks for that exact action.
 
 **Always run from the project root.** Gza uses the current directory to find `gza.yaml` and `.gza/`.
