@@ -71,6 +71,7 @@ project_name: my-project
 # Task database path. Default is .gza/gza.db (project-local).
 # gza init now asks whether to use a local or shared task DB.
 # To opt into a shared DB after init, set db_path (for example ~/.gza/gza.db).
+# Shared DB mode also requires an explicit project_id in gza.yaml.
 # If ~/.gza/config.yaml already sets db_path, new projects can inherit it by
 # leaving this line commented.
 # If shared mode is active but a legacy local .gza/gza.db still exists, either:

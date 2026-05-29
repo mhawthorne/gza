@@ -50,7 +50,8 @@ class TestSharedDbImportCli:
             env={**os.environ, "HOME": str(home_dir)},
         )
         assert result.returncode == 1
-        assert "Legacy local DB detected" in result.stderr
+        assert "'project_id' is required when shared DB mode is active" in result.stderr
+        assert "project_id:" in result.stderr
         assert "--import-local-db" in result.stderr
 
     def test_import_local_db_is_idempotent_and_conflicts_fail_loudly(self, tmp_path: Path) -> None:

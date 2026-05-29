@@ -6346,41 +6346,34 @@ class TestSharedDbIsolationAndImportGating:
         config = Config.load(project_dir)
         assert config.project_id == "existinghash123"
 
-    def test_missing_project_id_uses_distinct_derived_ids_and_isolates_shared_db(
+    def test_missing_project_id_in_shared_mode_requires_explicit_legacy_id_with_remediation(
         self, tmp_path: Path
     ) -> None:
-        from gza.config import Config
+        from gza.config import Config, ConfigError
 
         shared_db = tmp_path / "shared" / "gza.db"
         project_a = tmp_path / "project-a"
-        project_b = tmp_path / "project-b"
         project_a.mkdir(parents=True, exist_ok=True)
-        project_b.mkdir(parents=True, exist_ok=True)
         (project_a / "gza.yaml").write_text(f"project_name: demo\ndb_path: {shared_db}\n", encoding="utf-8")
-        (project_b / "gza.yaml").write_text(f"project_name: demo\ndb_path: {shared_db}\n", encoding="utf-8")
 
-        config_a = Config.load(project_a)
-        config_b = Config.load(project_b)
-        assert config_a.project_id == _legacy_project_id(project_a, "demo")
-        assert config_b.project_id == _legacy_project_id(project_b, "demo")
-        assert config_a.project_id != config_b.project_id
+        expected_legacy_id = _legacy_project_id(project_a, "demo")
+        with pytest.raises(ConfigError) as exc_info:
+            Config.load(project_a)
 
-        store_a = SqliteTaskStore.from_config(config_a)
-        store_b = SqliteTaskStore.from_config(config_b)
+        message = str(exc_info.value)
+        assert "'project_id' is required when shared DB mode is active" in message
+        assert f"project_id: {expected_legacy_id}" in message
+        assert "uv run gza migrate --import-local-db --yes" in message
 
-        task_a = store_a.add("alpha task")
-        task_b = store_b.add("beta task")
-        assert task_a.id == "demo-1"
-        assert task_b.id == "demo-1"
-        assert [task.prompt for task in store_a.get_all()] == ["alpha task"]
-        assert [task.prompt for task in store_b.get_all()] == ["beta task"]
+        is_valid, errors, _warnings = Config.validate(project_a)
+        assert is_valid is False
+        assert any(f"project_id: {expected_legacy_id}" in err for err in errors)
 
     def test_config_load_missing_project_id_readonly_file_is_non_mutating(
         self,
         tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        from gza.config import Config
+        from gza.config import Config, ConfigError
 
         config_path = tmp_path / "gza.yaml"
         shared_db = tmp_path / "shared" / "gza.db"
@@ -6391,15 +6384,12 @@ class TestSharedDbIsolationAndImportGating:
         config_path.write_text(original, encoding="utf-8")
         config_path.chmod(0o444)
         try:
-            config = Config.load(tmp_path)
+            with pytest.raises(ConfigError, match="'project_id' is required when shared DB mode is active"):
+                Config.load(tmp_path)
         finally:
             config_path.chmod(0o644)
 
-        assert config.project_id
         assert config_path.read_text(encoding="utf-8") == original
-        captured = capsys.readouterr()
-        assert "project_id" in captured.err
-        assert "persist it" in captured.err.lower()
 
     def test_read_only_db_can_be_opened_for_reads(self, tmp_path: Path) -> None:
         db_path = tmp_path / "readonly.db"
@@ -7005,8 +6995,8 @@ class TestSharedDbIsolationAndImportGating:
         assert substep_row == ("2026-01-04T10:01:30+00:00",)
         assert comment_row == ("2026-01-04T10:03:00+00:00", "2026-01-04T10:04:00+00:00")
 
-    def test_shared_mode_missing_project_id_derives_non_default_identity(self, tmp_path: Path) -> None:
-        from gza.config import Config
+    def test_bootstrap_missing_shared_project_id_persists_legacy_identity_for_import(self, tmp_path: Path) -> None:
+        from gza.config import Config, bootstrap_missing_shared_project_id
 
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -7017,9 +7007,34 @@ class TestSharedDbIsolationAndImportGating:
             encoding="utf-8",
         )
 
+        project_id, updated = bootstrap_missing_shared_project_id(project_dir)
+        assert project_id == _legacy_project_id(project_dir, "demo")
+        assert updated is True
+
         config = Config.load(project_dir)
-        assert config.project_id != "default"
-        assert config.project_id == _legacy_project_id(project_dir, "demo")
+        assert config.project_id == project_id
+        assert f"project_id: {project_id}" in (project_dir / "gza.yaml").read_text(encoding="utf-8")
+
+    def test_bootstrap_missing_shared_project_id_respects_local_db_override(self, tmp_path: Path) -> None:
+        from gza.config import Config, bootstrap_missing_shared_project_id
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text("project_name: demo\n", encoding="utf-8")
+        (project_dir / "gza.local.yaml").write_text(
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        project_id, updated = bootstrap_missing_shared_project_id(project_dir)
+        assert project_id == _legacy_project_id(project_dir, "demo")
+        assert updated is True
+
+        config = Config.load(project_dir)
+        assert config.project_id == project_id
+        assert config.db_path == shared_db.resolve()
+        assert f"project_id: {project_id}" in (project_dir / "gza.yaml").read_text(encoding="utf-8")
 
     def test_shared_mode_rejects_project_id_default(self, tmp_path: Path) -> None:
         from gza.config import Config, ConfigError

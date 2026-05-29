@@ -370,6 +370,27 @@ def _read_yaml_dict(path: Path) -> dict:
     return data
 
 
+def _resolve_config_db_path(project_dir: Path, db_path_raw: str | None) -> Path:
+    """Resolve a config db_path relative to the project root."""
+    if db_path_raw:
+        resolved_db = Path(os.path.expanduser(db_path_raw))
+        if not resolved_db.is_absolute():
+            resolved_db = project_dir / resolved_db
+        return resolved_db.resolve()
+    return (project_dir / DEFAULT_DB_FILE).resolve()
+
+
+def _shared_db_project_id_required_message(project_dir: Path, project_name: str, resolved_db: Path) -> str:
+    """Return the shared-DB remediation message for omitted project_id."""
+    legacy_project_id = _generate_legacy_project_id(project_dir, project_name)
+    config_path = project_dir / CONFIG_FILENAME
+    return (
+        f"'project_id' is required when shared DB mode is active (db_path: {resolved_db}). "
+        f"Add 'project_id: {legacy_project_id}' to {config_path} to preserve this project's existing shared-DB rows, "
+        "or run 'uv run gza migrate --import-local-db --yes' to persist that identity while importing any legacy local DB."
+    )
+
+
 def persist_project_id_if_missing(project_dir: Path, project_id: str) -> bool:
     """Persist project_id into gza.yaml if it is currently absent.
 
@@ -394,6 +415,57 @@ def persist_project_id_if_missing(project_dir: Path, project_id: str) -> bool:
         lines.insert(insert_at, insertion)
     config_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return True
+
+
+def bootstrap_missing_shared_project_id(project_dir: Path, *, dry_run: bool = False) -> tuple[str | None, bool]:
+    """Persist the legacy shared-DB project_id for migrate --import-local-db.
+
+    Returns `(project_id, updated)` when shared DB mode omitted the project_id and
+    this helper derived the legacy identity for persistence. Returns `(None, False)`
+    when no bootstrap action is needed.
+    """
+    config_path = project_dir / CONFIG_FILENAME
+    (
+        data,
+        _source_map,
+        _user_config_path,
+        _user_config_active,
+        _local_override_path,
+        _local_overrides_active,
+    ) = Config._load_merged_config_data(project_dir)
+    project_data = _read_yaml_dict(config_path)
+
+    if "project_name" not in data or not data["project_name"]:
+        raise ConfigError(
+            f"'project_name' is required in {config_path}\n"
+            "Add 'project_name: your-project-name' to the config file."
+        )
+
+    db_path_raw = os.environ.get("GZA_DB_PATH")
+    if not db_path_raw:
+        raw_value = data.get("db_path", "")
+        if raw_value and not isinstance(raw_value, str):
+            raise ConfigError("'db_path' must be a string")
+        db_path_raw = raw_value
+
+    resolved_db = _resolve_config_db_path(project_dir, db_path_raw)
+    local_db_path = (project_dir / DEFAULT_DB_FILE).resolve()
+    if resolved_db == local_db_path:
+        return None, False
+
+    existing = project_data.get("project_id", "")
+    if existing:
+        if not isinstance(existing, str):
+            raise ConfigError("'project_id' must be a string")
+        if not _PROJECT_ID_RE.match(existing):
+            raise ConfigError("'project_id' must be 1-64 lowercase alphanumeric characters")
+        return None, False
+
+    project_id = _generate_legacy_project_id(project_dir, str(data["project_name"]))
+    if dry_run:
+        return project_id, False
+    updated = persist_project_id_if_missing(project_dir, project_id)
+    return project_id, updated
 
 
 def _remove_source_subtree(source_map: dict[str, str], prefix: str) -> None:
@@ -935,7 +1007,13 @@ class Config:
         )
 
     @classmethod
-    def load(cls, project_dir: Path, *, discover: bool = False) -> "Config":
+    def load(
+        cls,
+        project_dir: Path,
+        *,
+        discover: bool = False,
+        allow_derived_shared_project_id: bool = False,
+    ) -> "Config":
         """Load config from gza.yaml in project root.
 
         Raises ConfigError if config file is missing or project_name is not set.
@@ -959,6 +1037,7 @@ class Config:
             user_config_active=user_config_active,
             local_override_path=local_override_path,
             local_overrides_active=local_overrides_active,
+            allow_derived_shared_project_id=allow_derived_shared_project_id,
         )
 
     @classmethod
@@ -972,6 +1051,7 @@ class Config:
         user_config_active: bool,
         local_override_path: Path | None,
         local_overrides_active: bool,
+        allow_derived_shared_project_id: bool = False,
     ) -> "Config":
         """Build a Config from already-merged config data."""
         config_path = cls.config_path(project_dir)
@@ -1007,13 +1087,7 @@ class Config:
 
         project_name_raw = data["project_name"]
         local_db_path = (project_dir / DEFAULT_DB_FILE).resolve()
-        if db_path_raw:
-            resolved_db = Path(os.path.expanduser(str(db_path_raw)))
-            if not resolved_db.is_absolute():
-                resolved_db = project_dir / resolved_db
-            resolved_db = resolved_db.resolve()
-        else:
-            resolved_db = local_db_path
+        resolved_db = _resolve_config_db_path(project_dir, db_path_raw)
 
         project_id_raw = data.get("project_id", "")
         if project_id_raw:
@@ -1024,19 +1098,17 @@ class Config:
         else:
             if resolved_db == local_db_path:
                 project_id_raw = "default"
-            else:
+            elif allow_derived_shared_project_id:
                 project_id_raw = _generate_legacy_project_id(project_dir, str(project_name_raw))
                 source_map["project_id"] = "derived"
-                print(
-                    "Warning: 'project_id' is missing in gza.yaml; "
-                    f"using derived project_id '{project_id_raw}'. "
-                    "Run 'uv run gza migrate --import-local-db --yes' to persist it.",
-                    file=sys.stderr,
+            else:
+                raise ConfigError(
+                    _shared_db_project_id_required_message(project_dir, str(project_name_raw), resolved_db)
                 )
         if resolved_db != local_db_path and project_id_raw == "default":
             raise ConfigError(
                 "'project_id: default' is only valid with local DB mode (db_path: .gza/gza.db). "
-                "Set a unique project_id for shared DB mode or omit project_id to derive one."
+                "Set a unique project_id for shared DB mode."
             )
 
         # Parse and validate project_prefix
@@ -1880,25 +1952,20 @@ class Config:
         project_name_for_id = str(project_name_raw) if isinstance(project_name_raw, str) else ""
         db_path_raw = data.get("db_path")
         local_db_path = (project_dir / DEFAULT_DB_FILE).resolve()
-        if isinstance(db_path_raw, str) and db_path_raw:
-            resolved_db = Path(os.path.expanduser(db_path_raw))
-            if not resolved_db.is_absolute():
-                resolved_db = project_dir / resolved_db
-            resolved_db = resolved_db.resolve()
-        else:
-            resolved_db = local_db_path
+        resolved_db = _resolve_config_db_path(project_dir, db_path_raw if isinstance(db_path_raw, str) else None)
         project_id_effective = data.get("project_id")
         if not isinstance(project_id_effective, str) or not project_id_effective:
             if resolved_db == local_db_path:
                 project_id_effective = "default"
-            elif project_name_for_id:
-                project_id_effective = _generate_legacy_project_id(project_dir, project_name_for_id)
             else:
+                errors.append(
+                    _shared_db_project_id_required_message(project_dir, project_name_for_id, resolved_db)
+                )
                 project_id_effective = ""
         if resolved_db != local_db_path and project_id_effective == "default":
             errors.append(
                 "'project_id: default' is only valid with local DB mode (db_path: .gza/gza.db). "
-                "Set a unique project_id for shared DB mode or omit project_id to derive one."
+                "Set a unique project_id for shared DB mode."
             )
         if "project_prefix" in data and data["project_prefix"]:
             prefix_val = data["project_prefix"]

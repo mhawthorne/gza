@@ -2,6 +2,7 @@
 
 
 import importlib
+import os
 import re
 import sys
 from pathlib import Path
@@ -25,6 +26,106 @@ def _normalized_markdown_section(path: Path, heading: str) -> str:
 
 class TestHelpOutput:
     """Tests for CLI help output."""
+
+    def test_migrate_import_local_db_dry_run_bootstraps_missing_shared_project_id_from_user_config(
+        self, tmp_path: Path
+    ) -> None:
+        """Dry-run import should bootstrap legacy project_id when shared DB comes from user config."""
+        home_dir = Path(os.environ["HOME"])
+        shared_db = home_dir / ".gza" / "shared.db"
+        user_config = home_dir / ".gza" / "config.yaml"
+        user_config.parent.mkdir(parents=True, exist_ok=True)
+        user_config.write_text(f"db_path: {shared_db}\n", encoding="utf-8")
+
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: demo\n", encoding="utf-8")
+        legacy_store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix="demo")
+        legacy_store.add("legacy task")
+
+        result = run_gza("migrate", "--import-local-db", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "would persist missing project_id in gza.yaml" in result.stdout
+        assert "Dry-run: legacy local DB import preview" in result.stdout
+        assert "project_id: p" in result.stdout
+        assert "project_id:" not in config_path.read_text(encoding="utf-8")
+
+    def test_migrate_import_local_db_yes_bootstraps_missing_shared_project_id_from_user_config(
+        self, tmp_path: Path
+    ) -> None:
+        """Real import should persist legacy project_id before importing when shared DB comes from user config."""
+        home_dir = Path(os.environ["HOME"])
+        shared_db = home_dir / ".gza" / "shared.db"
+        user_config = home_dir / ".gza" / "config.yaml"
+        user_config.parent.mkdir(parents=True, exist_ok=True)
+        user_config.write_text(f"db_path: {shared_db}\n", encoding="utf-8")
+
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: demo\n", encoding="utf-8")
+        legacy_store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix="demo")
+        legacy_store.add("legacy task")
+
+        result = run_gza("migrate", "--import-local-db", "--yes", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Persisted project_id" in result.stdout
+        assert "Imported legacy local DB into shared DB." in result.stdout
+        assert "tasks_imported: 1" in result.stdout
+
+        config = Config.load(tmp_path)
+        assert f"project_id: {config.project_id}" in config_path.read_text(encoding="utf-8")
+        shared_store = SqliteTaskStore(shared_db, prefix=config.project_prefix, project_id=config.project_id)
+        assert [task.prompt for task in shared_store.get_all()] == ["legacy task"]
+
+    def test_migrate_import_local_db_yes_reports_persist_os_error_without_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Import should surface project_id persistence failures as a controlled CLI error."""
+        shared_db = tmp_path / "shared" / "gza.db"
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+        legacy_store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix="demo")
+        legacy_store.add("legacy task")
+
+        def _raise_persist_error(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        cli_main_module = importlib.import_module("gza.cli.main")
+        monkeypatch.setattr(cli_main_module, "bootstrap_missing_shared_project_id", _raise_persist_error)
+
+        result = run_gza("migrate", "--import-local-db", "--yes", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "project_id could not be persisted to" in result.stderr
+        assert str(config_path) in result.stderr
+        assert "disk full" in result.stderr
+        assert "Traceback" not in result.stderr
+        assert "Persisted project_id" not in result.stdout
+        assert "project_id:" not in config_path.read_text(encoding="utf-8")
+
+    def test_migrate_import_local_db_dry_run_bootstraps_missing_shared_project_id(self, tmp_path: Path) -> None:
+        """migrate --import-local-db should keep working for legacy shared configs without project_id."""
+        shared_db = tmp_path / "shared" / "gza.db"
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: demo\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+        legacy_store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix="demo")
+        legacy_store.add("legacy task")
+
+        result = run_gza("migrate", "--import-local-db", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "would persist missing project_id in gza.yaml" in result.stdout
+        assert "Dry-run: legacy local DB import preview" in result.stdout
+        assert "project_id: p" in result.stdout
+        assert "project_id:" not in config_path.read_text(encoding="utf-8")
 
     def test_history_lineage_depth_help_mentions_root_deduplicated_trees(self, tmp_path):
         """history --help should describe tree/root lineage semantics."""

@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..config import Config, ConfigError, discover_project_dir, persist_project_id_if_missing
+from ..config import Config, ConfigError, bootstrap_missing_shared_project_id, discover_project_dir
 from ..db import (
     InvalidTaskIdError,
     ManualMigrationRequired,
@@ -2595,8 +2595,48 @@ def main() -> int:
 
 def _cmd_migrate(args: "argparse.Namespace") -> int:
     """Handle the 'migrate' subcommand."""
+    if args.import_local_db and not args.yes and not args.dry_run:
+        answer = input(
+            "Import legacy local DB into active shared DB now? [y/N]: "
+        ).strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Import cancelled.")
+            return 1
+
+    if args.import_local_db:
+        try:
+            bootstrapped_project_id, updated = bootstrap_missing_shared_project_id(
+                args.project_dir,
+                dry_run=args.dry_run,
+            )
+        except ConfigError as e:
+            print(f"Error loading config: {e}", file=sys.stderr)
+            return 1
+        except OSError as e:
+            print(
+                "Error loading config: "
+                f"project_id could not be persisted to {Config.config_path(args.project_dir)}: {e}",
+                file=sys.stderr,
+            )
+            return 1
+        if bootstrapped_project_id:
+            if args.dry_run:
+                print(
+                    "Dry-run: would persist missing project_id in gza.yaml "
+                    f"as '{bootstrapped_project_id}' before import."
+                )
+            elif updated:
+                print(
+                    f"Persisted project_id '{bootstrapped_project_id}' "
+                    f"to {Config.config_path(args.project_dir)}"
+                )
+
     try:
-        config = Config.load(args.project_dir, discover=not bool(getattr(args, "project_explicit", False)))
+        config = Config.load(
+            args.project_dir,
+            discover=not bool(getattr(args, "project_explicit", False)),
+            allow_derived_shared_project_id=bool(args.import_local_db and args.dry_run),
+        )
     except ConfigError as e:
         print(f"Error loading config: {e}", file=sys.stderr)
         return 1
@@ -2604,37 +2644,6 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
     status = check_migration_status(config.db_path)
 
     if args.import_local_db:
-        if not args.yes and not args.dry_run:
-            answer = input(
-                "Import legacy local DB into active shared DB now? [y/N]: "
-            ).strip().lower()
-            if answer not in {"y", "yes"}:
-                print("Import cancelled.")
-                return 1
-
-        project_id_source = config.source_map.get("project_id", "")
-        if project_id_source == "derived":
-            if args.dry_run:
-                print(
-                    "Dry-run: would persist missing project_id in gza.yaml "
-                    f"as '{config.project_id}' before import."
-                )
-            else:
-                try:
-                    updated = persist_project_id_if_missing(config.project_dir, config.project_id)
-                except (ConfigError, OSError) as exc:
-                    print(f"Error: unable to persist project_id in gza.yaml: {exc}", file=sys.stderr)
-                    return 1
-                if updated:
-                    print(f"Persisted project_id '{config.project_id}' to {config.config_path(config.project_dir)}")
-                    try:
-                        config = Config.load(
-                            args.project_dir,
-                            discover=not bool(getattr(args, "project_explicit", False)),
-                        )
-                    except ConfigError as e:
-                        print(f"Error loading config after persisting project_id: {e}", file=sys.stderr)
-                        return 1
         try:
             result = import_legacy_local_db(config, dry_run=args.dry_run)
         except ValueError as exc:

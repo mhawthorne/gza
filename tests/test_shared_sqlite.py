@@ -33,7 +33,7 @@ def test_config_db_path_defaults_to_local_when_no_local_db(tmp_path: Path) -> No
 
 
 def test_config_db_path_respects_explicit_db_path(tmp_path: Path) -> None:
-    (tmp_path / "gza.yaml").write_text("project_name: demo\ndb_path: custom.db\n")
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nproject_id: demo\ndb_path: custom.db\n")
     config = Config.load(tmp_path)
     assert config.db_path == tmp_path / "custom.db"
 
@@ -54,7 +54,7 @@ def test_store_default_uses_discovered_project_dir(tmp_path: Path) -> None:
     nested = project / "a" / "b"
     nested.mkdir(parents=True)
     db_path = project / "shared.db"
-    (project / "gza.yaml").write_text(f"project_name: demo\ndb_path: {db_path}\n")
+    (project / "gza.yaml").write_text(f"project_name: demo\nproject_id: demo\ndb_path: {db_path}\n")
 
     store = SqliteTaskStore.default(nested)
     created = store.add("hello")

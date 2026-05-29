@@ -589,6 +589,7 @@ class TestLocalConfigOverrides:
         shared_db = tmp_path / "shared" / "gza.db"
         (tmp_path / "gza.yaml").write_text(
             "project_name: test\n"
+            "project_id: test\n"
             "db_path: .gza/gza.db\n"
         )
         (tmp_path / "gza.local.yaml").write_text(
@@ -678,7 +679,7 @@ class TestLocalConfigOverrides:
         home_dir = Path(os.environ["HOME"])
         shared_db = home_dir / ".gza" / "shared.db"
         write_user_config(home_dir, f"db_path: {shared_db}\nuse_docker: false\n")
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nproject_id: test\n")
 
         config = Config.load(tmp_path)
 
@@ -687,6 +688,18 @@ class TestLocalConfigOverrides:
         assert config.user_config_active is True
         assert config.source_map["db_path"] == "user"
         assert config.source_map["use_docker"] == "user"
+
+    def test_user_config_shared_db_requires_project_project_id(self, tmp_path: Path):
+        """User-level shared DB defaults still require project_id in the project config."""
+        from gza.config import Config, ConfigError
+
+        home_dir = Path(os.environ["HOME"])
+        shared_db = home_dir / ".gza" / "shared.db"
+        write_user_config(home_dir, f"db_path: {shared_db}\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+
+        with pytest.raises(ConfigError, match="'project_id' is required when shared DB mode is active"):
+            Config.load(tmp_path)
 
     def test_project_config_overrides_user_config(self, tmp_path: Path):
         """Project gza.yaml should win over user defaults."""
@@ -697,6 +710,7 @@ class TestLocalConfigOverrides:
         write_user_config(home_dir, f"db_path: {shared_db}\ntimeout_minutes: 30\n")
         (tmp_path / "gza.yaml").write_text(
             "project_name: test\n"
+            "project_id: test\n"
             "db_path: .gza/project.db\n"
             "timeout_minutes: 10\n"
         )
@@ -740,6 +754,7 @@ class TestLocalConfigOverrides:
         write_user_config(home_dir, f"db_path: {home_dir / '.gza' / 'user.db'}\n")
         (tmp_path / "gza.yaml").write_text(
             "project_name: test\n"
+            "project_id: test\n"
             "db_path: .gza/project.db\n"
         )
         (tmp_path / "gza.local.yaml").write_text("db_path: .gza/local.db\n")
