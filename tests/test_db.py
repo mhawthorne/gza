@@ -6581,9 +6581,13 @@ class TestSharedDbIsolationAndImportGating:
             patch("gza.db._db_metadata", return_value=marker_metadata),
             patch("gza.db._db_fingerprint", wraps=db_module._db_fingerprint) as fingerprint,
         ):
-            with pytest.raises(ConfigError, match="Legacy local DB detected"):
+            with pytest.raises(ConfigError) as exc_info:
                 SqliteTaskStore.from_config(config)
         fingerprint.assert_called_once_with(local_db)
+        message = str(exc_info.value)
+        assert "Legacy local DB detected" in message
+        assert "uv run gza migrate --import-local-db --yes" in message
+        assert "db_path: .gza/gza.db" in message
 
     def test_import_local_db_dry_run_pre_v37_missing_create_pr_defaults_false(self, tmp_path: Path) -> None:
         from gza.config import Config

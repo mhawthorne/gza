@@ -73,8 +73,9 @@ project_name: my-project
 # To opt into a shared DB after init, set db_path (for example ~/.gza/gza.db).
 # If ~/.gza/config.yaml already sets db_path, new projects can inherit it by
 # leaving this line commented.
-# If opting into shared mode with an existing legacy local .gza/gza.db, run:
+# If shared mode is active but a legacy local .gza/gza.db still exists, either:
 #   uv run gza migrate --import-local-db --yes
+# or keep the project local with:
 # db_path: .gza/gza.db
 
 # Directory for log files (relative to project directory)

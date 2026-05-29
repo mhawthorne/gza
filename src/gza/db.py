@@ -2254,9 +2254,13 @@ class SqliteTaskStore:
 
                     raise ConfigError(
                         "Legacy local DB detected at "
-                        f"{local_db} while active db_path is {active_db}. "
-                        "Run 'uv run gza migrate --import-local-db --yes' to import tasks "
-                        "and create an import marker."
+                        f"{local_db} while active db_path is {active_db}.\n"
+                        "Choose one:\n"
+                        "  - To move this project's tasks into the shared DB:\n"
+                        "      uv run gza migrate --import-local-db --yes\n"
+                        "  - To keep this project on its own local DB (do not merge into the shared DB):\n"
+                        f"      set `db_path: .gza/gza.db` in {project_dir / 'gza.yaml'} "
+                        f"(or {project_dir / 'gza.local.yaml'})."
                     )
         config_path = getattr(config, "config_path", None)
         resolved_config_path = (
