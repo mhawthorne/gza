@@ -1,5 +1,6 @@
 """Tests for database operations and task chaining."""
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -34,6 +35,28 @@ from gza.db import (
 from gza.review_tasks import build_auto_review_prompt
 from gza.runner import _compute_slug_override
 from gza.sync_ops import BranchCohort, sync_branch_cohorts
+
+
+def _legacy_project_id(project_dir: Path, project_name: str) -> str:
+    canonical_root = str(project_dir.resolve())
+    seed = f"{canonical_root}\n{project_name.strip().lower()}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return f"p{digest[:31]}"
+
+
+def test_generate_project_id_normalizes_readable_names(tmp_path: Path) -> None:
+    from gza.config import _generate_project_id
+
+    assert _generate_project_id(tmp_path, "tarantino-ui") == "tarantinoui"
+    assert _generate_project_id(tmp_path, "My App.2") == "myapp2"
+    assert _generate_project_id(tmp_path, "Release 2026.05") == "release202605"
+
+
+def test_generate_project_id_rejects_unsluggable_names(tmp_path: Path) -> None:
+    from gza.config import ConfigError, _generate_project_id
+
+    with pytest.raises(ConfigError, match="cannot be converted into a valid 'project_id'"):
+        _generate_project_id(tmp_path, "!!!")
 
 
 def test_is_readonly_operational_error_accepts_explicit_readonly_variants() -> None:
@@ -6307,6 +6330,22 @@ class TestMigrationUtilityFunctions:
 
 @pytest.mark.timeout(4, method="signal")
 class TestSharedDbIsolationAndImportGating:
+    def test_explicit_project_id_is_honored_unchanged(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_db = tmp_path / "shared" / "gza.db"
+        (project_dir / "gza.yaml").write_text(
+            "project_name: tarantino-ui\n"
+            "project_id: existinghash123\n"
+            f"db_path: {shared_db}\n",
+            encoding="utf-8",
+        )
+
+        config = Config.load(project_dir)
+        assert config.project_id == "existinghash123"
+
     def test_missing_project_id_uses_distinct_derived_ids_and_isolates_shared_db(
         self, tmp_path: Path
     ) -> None:
@@ -6322,6 +6361,8 @@ class TestSharedDbIsolationAndImportGating:
 
         config_a = Config.load(project_a)
         config_b = Config.load(project_b)
+        assert config_a.project_id == _legacy_project_id(project_a, "demo")
+        assert config_b.project_id == _legacy_project_id(project_b, "demo")
         assert config_a.project_id != config_b.project_id
 
         store_a = SqliteTaskStore.from_config(config_a)
@@ -6974,6 +7015,7 @@ class TestSharedDbIsolationAndImportGating:
 
         config = Config.load(project_dir)
         assert config.project_id != "default"
+        assert config.project_id == _legacy_project_id(project_dir, "demo")
 
     def test_shared_mode_rejects_project_id_default(self, tmp_path: Path) -> None:
         from gza.config import Config, ConfigError

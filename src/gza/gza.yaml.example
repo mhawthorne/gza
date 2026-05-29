@@ -7,7 +7,7 @@ project_name: my-project
 # gza init writes this automatically for new projects.
 # In local DB mode (default), `project_id: default` is allowed.
 # In shared mode (explicit db_path), project_id must be unique; if omitted,
-# gza derives one from project path/name and warns.
+# older configs derive a stable legacy ID from project path/name and warn.
 # project_id: myproject01
 
 # Optional local override file: gza.local.yaml (gitignored)

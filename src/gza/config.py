@@ -298,7 +298,19 @@ def discover_project_dir(start: Path) -> Path:
 
 
 def _generate_project_id(project_dir: Path, project_name: str) -> str:
-    """Generate a deterministic project ID when gza.yaml omits project_id."""
+    """Generate a readable project ID for persisted config writes."""
+    del project_dir  # Project IDs for new configs derive from the project name only.
+    project_id = re.sub(r"[^a-z0-9]+", "", project_name.strip().lower())
+    if not project_id:
+        raise ConfigError(
+            f"'project_name' {project_name!r} cannot be converted into a valid 'project_id'. "
+            "Set an explicit lowercase alphanumeric project_id in gza.yaml."
+        )
+    return project_id[:64]
+
+
+def _generate_legacy_project_id(project_dir: Path, project_name: str) -> str:
+    """Generate the legacy hashed project ID for omitted-id runtime fallback."""
     canonical_root = str(project_dir.resolve())
     seed = f"{canonical_root}\n{project_name.strip().lower()}"
     digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
@@ -660,7 +672,7 @@ class Config:
 
     def __post_init__(self):
         if not self.project_id:
-            self.project_id = _generate_project_id(self.project_dir, self.project_name)
+            self.project_id = _generate_legacy_project_id(self.project_dir, self.project_name)
         if not _PROJECT_ID_RE.match(self.project_id):
             raise ConfigError(
                 "'project_id' must be 1-64 lowercase alphanumeric characters"
@@ -1013,7 +1025,7 @@ class Config:
             if resolved_db == local_db_path:
                 project_id_raw = "default"
             else:
-                project_id_raw = _generate_project_id(project_dir, str(project_name_raw))
+                project_id_raw = _generate_legacy_project_id(project_dir, str(project_name_raw))
                 source_map["project_id"] = "derived"
                 print(
                     "Warning: 'project_id' is missing in gza.yaml; "
@@ -1880,7 +1892,7 @@ class Config:
             if resolved_db == local_db_path:
                 project_id_effective = "default"
             elif project_name_for_id:
-                project_id_effective = _generate_project_id(project_dir, project_name_for_id)
+                project_id_effective = _generate_legacy_project_id(project_dir, project_name_for_id)
             else:
                 project_id_effective = ""
         if resolved_db != local_db_path and project_id_effective == "default":

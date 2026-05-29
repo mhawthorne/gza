@@ -2065,8 +2065,6 @@ def cmd_init(args: argparse.Namespace) -> int:
     # Read the example template from the package
     template = importlib.resources.files("gza").joinpath("gza.yaml.example").read_text()
 
-    project_id = _generate_project_id(args.project_dir, default_project_name)
-
     # Check if running interactively (stdin is a TTY)
     is_interactive = sys.stdin.isatty()
     normalized_db_args = _normalize_init_db_args(args, is_interactive=is_interactive)
@@ -2076,6 +2074,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     db_mode, shared_db_path, db_choice_from_flags = normalized_db_args
 
     try:
+        project_id = _generate_project_id(args.project_dir, default_project_name)
         Config.preflight_init_user_config(
             args.project_dir,
             project_name=default_project_name,

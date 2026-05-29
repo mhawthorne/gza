@@ -1112,11 +1112,39 @@ class TestInitCommand:
         project_id_match = re.search(r"^project_id:\s*([a-z0-9]{1,64})\s*$", content, re.MULTILINE)
         assert project_id_match is not None
         assert project_id_match.group(1) != "default"
+        assert project_id_match.group(1) == re.sub(r"[^a-z0-9]+", "", tmp_path.name.lower())[:64]
         assert self._active_db_path_line(content) == ".gza/gza.db"
         assert "# iterate_max_iterations: 3" in content
         with patch.dict(os.environ, env, clear=False):
             assert Config.load(tmp_path).db_path == (tmp_path / ".gza" / "gza.db").resolve()
         assert (tmp_path / ".gza" / "gza.db").exists()
+
+    def test_init_derives_readable_project_id_from_project_name(self, tmp_path: Path):
+        """Init should persist a readable project_id derived from project_name."""
+        project_dir = tmp_path / "My App.2"
+        project_dir.mkdir()
+        _home_dir, env = self._home_env(tmp_path)
+
+        result = run_gza("init", "--db", "local", "--project", str(project_dir), env=env)
+
+        assert result.returncode == 0
+        content = (project_dir / "gza.yaml").read_text(encoding="utf-8")
+        project_id_match = re.search(r"^project_id:\s*([a-z0-9]{1,64})\s*$", content, re.MULTILINE)
+        assert project_id_match is not None
+        assert project_id_match.group(1) == "myapp2"
+
+    def test_init_invalid_project_name_requires_explicit_project_id(self, tmp_path: Path):
+        """Init should fail closed when project_name cannot produce a valid project_id."""
+        project_dir = tmp_path / "!!!"
+        project_dir.mkdir()
+        _home_dir, env = self._home_env(tmp_path)
+
+        result = run_gza("init", "--db", "local", "--project", str(project_dir), env=env)
+
+        assert result.returncode == 1
+        assert "cannot be converted into a valid 'project_id'" in result.stdout
+        assert "Set an explicit lowercase alphanumeric project_id in gza.yaml." in result.stdout
+        assert (project_dir / "gza.yaml").exists() is False
 
     def test_init_project_id_remains_stable_after_move_and_clone(self, tmp_path: Path):
         """Init writes project_id once and moved/cloned projects keep that identity."""
