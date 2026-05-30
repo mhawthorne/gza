@@ -51,10 +51,37 @@ def test_publish_rebased_branch_pushes_when_remote_ref_is_stale() -> None:
     git.push_force_with_lease.assert_called_once_with("feature/rebased", remote="origin")
 
 
-def test_publish_rebased_branch_raises_when_rebase_did_not_advance_known_baseline() -> None:
+def test_publish_rebased_branch_succeeds_when_rebase_is_already_up_to_date() -> None:
     git = Mock(spec=Git)
     git.rev_parse.return_value = "same-sha"
     git.rev_parse_if_exists.return_value = "same-sha"
+    git.is_ancestor.return_value = True
+    logger = Mock()
+
+    result = publish_rebased_branch(
+        git,
+        branch="feature/rebased",
+        baseline=RebaseDiffBaseline(
+            old_tip="same-sha",
+            target_at_start="target-sha",
+            merge_base_at_start="merge-base",
+        ),
+        logger=logger,
+    )
+
+    assert result.branch_advanced is False
+    assert result.pushed is False
+    git.is_ancestor.assert_called_once_with("target-sha", "feature/rebased")
+    git.push_force_with_lease.assert_not_called()
+    logger.error.assert_not_called()
+    assert any("already up to date" in call.args[0] for call in logger.info.call_args_list)
+
+
+def test_publish_rebased_branch_raises_when_rebase_did_not_advance_and_branch_is_stale() -> None:
+    git = Mock(spec=Git)
+    git.rev_parse.return_value = "same-sha"
+    git.rev_parse_if_exists.return_value = "same-sha"
+    git.is_ancestor.return_value = False
     logger = Mock()
 
     with pytest.raises(GitError, match="Rebase did not advance feature/rebased"):
@@ -69,5 +96,6 @@ def test_publish_rebased_branch_raises_when_rebase_did_not_advance_known_baselin
             logger=logger,
         )
 
+    git.is_ancestor.assert_called_once_with("target-sha", "feature/rebased")
     git.push_force_with_lease.assert_not_called()
     logger.error.assert_called_once()

@@ -857,7 +857,7 @@ def test_run_task_backed_rebase_remote_ref_lookup_failure_marks_task_failed(tmp_
     assert refreshed.failure_reason == "GIT_ERROR"
 
 
-def test_run_task_backed_rebase_non_advancing_publish_rejection_marks_task_failed(tmp_path) -> None:
+def test_run_task_backed_rebase_non_advancing_publish_succeeds_when_branch_is_already_up_to_date(tmp_path) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
     store = make_store(tmp_path)
@@ -880,11 +880,17 @@ def test_run_task_backed_rebase_non_advancing_publish_rejection_marks_task_faile
     worktree_git.current_branch.return_value = "feature/rebased"
     worktree_git.rebase.return_value = None
     worktree_git.rev_parse.return_value = "same-head"
-    worktree_git.rev_parse_if_exists.return_value = "remote-stale"
+    worktree_git.is_ancestor.return_value = True
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/rebased": "same-head",
+        "main": "base-old",
+        "origin/feature/rebased": "remote-stale",
+    }.get(ref)
 
     with (
         patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
         patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch("gza.cli.git_ops._branch_has_commits", return_value=True),
         patch(
             "gza.cli.git_ops.capture_rebase_diff_baseline",
             return_value=RebaseDiffBaseline(
@@ -892,6 +898,10 @@ def test_run_task_backed_rebase_non_advancing_publish_rejection_marks_task_faile
                 target_at_start="base-old",
                 merge_base_at_start="merge-base",
             ),
+        ),
+        patch(
+            "gza.cli.git_ops.compute_rebase_changed_diff",
+            return_value=RebaseDiffResult(changed_diff=False, detail="no (review preserved)"),
         ),
         patch("gza.cli.git_ops.invoke_provider_resolve") as invoke_provider_resolve,
     ):
@@ -903,14 +913,14 @@ def test_run_task_backed_rebase_non_advancing_publish_rejection_marks_task_faile
             target_branch="main",
         )
 
-    assert rc == 1
+    assert rc == 0
     invoke_provider_resolve.assert_not_called()
-    worktree_git.push_force_with_lease.assert_not_called()
+    worktree_git.push_force_with_lease.assert_called_once_with("feature/rebased", remote="origin")
 
     refreshed = store.get(rebase_task.id)
     assert refreshed is not None
-    assert refreshed.status == "failed"
-    assert refreshed.failure_reason == "GIT_ERROR"
+    assert refreshed.status == "completed"
+    assert refreshed.failure_reason is None
 
 
 @pytest.mark.timeout(4, method="signal")

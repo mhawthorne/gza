@@ -35,6 +35,13 @@ def _short_ref(ref: str | None | object) -> str:
     return "unknown"
 
 
+def _branch_already_contains_target(git: Git, *, branch: str, target: str | None) -> bool:
+    """Return True when the rebased branch already contains the target tip."""
+    if not target:
+        return False
+    return git.is_ancestor(target, branch)
+
+
 def publish_rebased_branch(
     git: Git,
     *,
@@ -76,13 +83,21 @@ def publish_rebased_branch(
             logger.info(f"Verifying rebased tip for {branch} at {_short_ref(local_sha)}.")
 
     if previous_sha is not None and previous_sha == local_sha:
-        message = (
-            f"Rebase did not advance {branch}: "
-            f"baseline tip and current tip are both {_short_ref(local_sha)}"
-        )
-        if logger is not None:
-            logger.error(message)
-        raise GitError(message)
+        if _branch_already_contains_target(git, branch=branch, target=baseline.target_at_start if baseline else None):
+            if logger is not None:
+                logger.info(
+                    f"Rebase already up to date for {branch}: "
+                    f"target {_short_ref(baseline.target_at_start if baseline else None)} "
+                    f"is already contained in {_short_ref(local_sha)}."
+                )
+        else:
+            message = (
+                f"Rebase did not advance {branch}: "
+                f"baseline tip and current tip are both {_short_ref(local_sha)}"
+            )
+            if logger is not None:
+                logger.error(message)
+            raise GitError(message)
 
     if not pushed:
         if logger is not None:
