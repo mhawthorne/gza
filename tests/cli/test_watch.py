@@ -3,6 +3,7 @@
 import argparse
 import signal
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,8 +34,10 @@ from gza.cli.watch import (
     _query_owner_rows,
     _resolve_watch_attention_display_task,
     _run_cycle,
+    _should_reexec_watch,
     _task_snapshot,
     _watch_needs_attention_message,
+    _watch_reexec_argv,
     _warn_if_installed_gza_changed,
     _watch_iterate_impl_target,
     _WatchLog,
@@ -6605,7 +6608,7 @@ def test_installed_gza_package_fingerprint_changes_only_when_python_source_chang
 
 
 def test_watch_warns_once_per_installed_package_drift(tmp_path: Path) -> None:
-    """Watch should emit one WARNING per newly observed installed-package fingerprint drift."""
+    """Watch should advertise deferred automatic re-exec once per new drift fingerprint."""
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
@@ -6615,22 +6618,22 @@ def test_watch_warns_once_per_installed_package_drift(tmp_path: Path) -> None:
         side_effect=["startup", "changed-1", "changed-1", "changed-2"],
     ):
         log.begin_cycle()
-        _warn_if_installed_gza_changed(log, drift_state)
+        _warn_if_installed_gza_changed(log, drift_state, auto_restart_on_drift=True)
         log.emit("WAKE", "checking... (0 running, 0 pending, 1 slots)")
         log.end_cycle()
 
         log.begin_cycle()
-        _warn_if_installed_gza_changed(log, drift_state)
+        _warn_if_installed_gza_changed(log, drift_state, auto_restart_on_drift=True)
         log.emit("WAKE", "checking... (0 running, 0 pending, 1 slots)")
         log.end_cycle()
 
         log.begin_cycle()
-        _warn_if_installed_gza_changed(log, drift_state)
+        _warn_if_installed_gza_changed(log, drift_state, auto_restart_on_drift=True)
         log.emit("WAKE", "checking... (0 running, 0 pending, 1 slots)")
         log.end_cycle()
 
         log.begin_cycle()
-        _warn_if_installed_gza_changed(log, drift_state)
+        _warn_if_installed_gza_changed(log, drift_state, auto_restart_on_drift=True)
         log.emit("WAKE", "checking... (0 running, 0 pending, 1 slots)")
         log.end_cycle()
 
@@ -6638,11 +6641,104 @@ def test_watch_warns_once_per_installed_package_drift(tmp_path: Path) -> None:
     assert len(warning_lines) == 2
     assert all(
         line.endswith(
-            "WARNING   installed gza changed since watch started -- restart watch to pick up new code"
+            "WARNING   installed gza changed since watch started -- watch will re-exec after the current batch drains"
         )
         for line in warning_lines
     )
     assert drift_state.warned_fingerprint == "changed-2"
+    assert drift_state.pending_restart_fingerprint == "changed-2"
+
+
+def test_watch_warns_for_manual_restart_when_auto_restart_on_drift_is_disabled(tmp_path: Path) -> None:
+    """Opting out should keep the explicit manual-restart operator warning."""
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
+
+    with patch("gza.cli.watch._installed_gza_package_fingerprint", return_value="changed-1"):
+        log.begin_cycle()
+        _warn_if_installed_gza_changed(log, drift_state, auto_restart_on_drift=False)
+        log.end_cycle()
+
+    warning_lines = [line for line in log_path.read_text().splitlines() if "WARNING" in line]
+    assert len(warning_lines) == 1
+    assert warning_lines[0].endswith(
+        "WARNING   installed gza changed since watch started -- restart watch to pick up new code"
+    )
+    assert drift_state.pending_restart_fingerprint == "changed-1"
+
+
+def test_watch_drift_state_does_not_request_reexec_when_fingerprint_is_unchanged(tmp_path: Path) -> None:
+    """No drift means no pending watch re-exec."""
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
+
+    with patch("gza.cli.watch._installed_gza_package_fingerprint", return_value="startup"):
+        log.begin_cycle()
+        _warn_if_installed_gza_changed(log, drift_state, auto_restart_on_drift=True)
+        log.end_cycle()
+
+    assert drift_state.pending_restart_fingerprint is None
+    assert _should_reexec_watch(
+        auto_restart_on_drift=True,
+        dry_run=False,
+        stop_requested=False,
+        cycle_result=_CycleResult(False, 0, 0),
+        drift_state=drift_state,
+    ) is False
+
+
+def test_watch_reexec_argv_preserves_requested_watch_flags(tmp_path: Path) -> None:
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=3,
+        poll=12,
+        max_idle=60,
+        max_iterations=7,
+        restart_failed=True,
+        restart_failed_batch=2,
+        max_resume_attempts=4,
+        dry_run=False,
+        show_skipped=True,
+        quiet=True,
+        yes=True,
+        tags=["release", "urgent"],
+        any_tag=True,
+        auto_restart_on_drift=False,
+    )
+
+    argv = _watch_reexec_argv(args)
+
+    assert argv == [
+        sys.executable,
+        "-m",
+        "gza",
+        "watch",
+        "--project",
+        str(tmp_path),
+        "--batch",
+        "3",
+        "--poll",
+        "12",
+        "--max-idle",
+        "60",
+        "--max-iterations",
+        "7",
+        "--restart-failed",
+        "--restart-failed-batch",
+        "2",
+        "--max-resume-attempts",
+        "4",
+        "--show-skipped",
+        "--quiet",
+        "--yes",
+        "--tag",
+        "release",
+        "--tag",
+        "urgent",
+        "--any-tag",
+        "--no-auto-restart-on-drift",
+    ]
 
 
 def test_cmd_watch_exits_when_idle_reaches_max_idle(tmp_path: Path) -> None:
@@ -6669,6 +6765,189 @@ def test_cmd_watch_exits_when_idle_reaches_max_idle(tmp_path: Path) -> None:
 
     assert rc == 0
     assert run_cycle.call_count == 2
+
+
+def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None:
+    """Watch should re-exec itself once drift is detected and no workers are left running."""
+    setup_config(tmp_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=2,
+        poll=5,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        tags=["release"],
+        any_tag=False,
+        restart_failed=True,
+        restart_failed_batch=1,
+        max_resume_attempts=2,
+        show_skipped=False,
+        auto_restart_on_drift=True,
+    )
+
+    cycle_results = iter(
+        [
+            _CycleResult(False, 1, 1),
+            _CycleResult(False, 0, 0),
+        ]
+    )
+
+    def run_cycle_with_drift(**kwargs) -> _CycleResult:
+        drift_state = kwargs["installed_package_drift"]
+        drift_state.pending_restart_fingerprint = "updated"
+        return next(cycle_results)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=run_cycle_with_drift) as run_cycle,
+        patch("gza.cli.watch._task_snapshot", return_value={}),
+        patch("gza.cli.watch._emit_transition_events"),
+        patch("gza.cli.watch._collect_completed_transition_ids", return_value=[]),
+        patch("gza.cli.watch._collect_unhandled_failures", return_value=[]),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch._installed_gza_package_fingerprint", return_value="startup"),
+        patch("gza.cli.watch.os.execv", side_effect=SystemExit(0)) as execv,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_watch(args)
+
+    assert excinfo.value.code == 0
+    assert run_cycle.call_count == 2
+    execv.assert_called_once()
+    assert execv.call_args.args == (
+        sys.executable,
+        [
+            sys.executable,
+            "-m",
+            "gza",
+            "watch",
+            "--project",
+            str(tmp_path),
+            "--batch",
+            "2",
+            "--poll",
+            "5",
+            "--max-iterations",
+            "10",
+            "--restart-failed",
+            "--restart-failed-batch",
+            "1",
+            "--max-resume-attempts",
+            "2",
+            "--quiet",
+            "--yes",
+            "--tag",
+            "release",
+        ],
+    )
+
+
+def test_cmd_watch_defers_reexec_until_batch_drains(tmp_path: Path) -> None:
+    """Drift should not force a mid-batch re-exec while workers are still running."""
+    setup_config(tmp_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        tags=None,
+        any_tag=False,
+        restart_failed=False,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+        show_skipped=False,
+        auto_restart_on_drift=True,
+    )
+
+    cycle_results = iter(
+        [
+            _CycleResult(False, 1, 0),
+            _CycleResult(False, 0, 0),
+        ]
+    )
+
+    def run_cycle_with_drift(**kwargs) -> _CycleResult:
+        drift_state = kwargs["installed_package_drift"]
+        drift_state.pending_restart_fingerprint = "updated"
+        return next(cycle_results)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=run_cycle_with_drift),
+        patch("gza.cli.watch._task_snapshot", return_value={}),
+        patch("gza.cli.watch._emit_transition_events"),
+        patch("gza.cli.watch._collect_completed_transition_ids", return_value=[]),
+        patch("gza.cli.watch._collect_unhandled_failures", return_value=[]),
+        patch("gza.cli.watch._sleep_interruptibly") as sleep_interruptibly,
+        patch("gza.cli.watch._installed_gza_package_fingerprint", return_value="startup"),
+        patch("gza.cli.watch.os.execv", side_effect=SystemExit(0)) as execv,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        with pytest.raises(SystemExit):
+            cmd_watch(args)
+
+    assert sleep_interruptibly.call_count == 1
+    execv.assert_called_once()
+
+
+def test_cmd_watch_shutdown_signal_wins_over_pending_reexec(tmp_path: Path) -> None:
+    """A shutdown signal in flight must suppress drift-triggered re-exec."""
+    setup_config(tmp_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        tags=None,
+        any_tag=False,
+        restart_failed=False,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+        show_skipped=False,
+        auto_restart_on_drift=True,
+    )
+
+    handlers: dict[signal.Signals, object] = {}
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        handlers[sig] = handler
+        return object()
+
+    def run_cycle_with_sigterm(**_kwargs) -> _CycleResult:
+        handler = handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+        drift_state = _kwargs["installed_package_drift"]
+        drift_state.pending_restart_fingerprint = "updated"
+        return _CycleResult(False, 0, 0)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=run_cycle_with_sigterm),
+        patch("gza.cli.watch._task_snapshot", return_value={}),
+        patch("gza.cli.watch._emit_transition_events"),
+        patch("gza.cli.watch._collect_completed_transition_ids", return_value=[]),
+        patch("gza.cli.watch._collect_unhandled_failures", return_value=[]),
+        patch("gza.cli.watch._installed_gza_package_fingerprint", return_value="startup"),
+        patch("gza.cli.watch.os.execv") as execv,
+        patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    execv.assert_not_called()
 
 
 def test_cmd_watch_dry_run_actionable_cycles_do_not_count_toward_max_idle(tmp_path: Path) -> None:

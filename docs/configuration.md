@@ -1512,6 +1512,7 @@ need to break out promptly from a long or blocked watch pass.
 | `--dry-run` | Show what watch would do without executing; with `--restart-failed`, print the full failed-recovery report and exit |
 | `--show-skipped` | With `--restart-failed`, include skipped failed tasks in the dry-run recovery report and live watch logs |
 | `--quiet` | Write events to `.gza/watch.log` only |
+| `--[no-]auto-restart-on-drift` | When installed `gza` code changes while watch is running, re-exec at the next drained batch boundary to load the new code (default: enabled) |
 | `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG` to preview the same scoped pickup order |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
 
@@ -1533,6 +1534,8 @@ When tag filters are active, watch emits an explicit scope line to console and `
 Manual-operator advance outcomes such as `needs_discussion`, `max_cycles_reached`, exhausted failed-task recovery, and improve-recovery stop reasons are surfaced as `ATTENTION` lines in watch output instead of one-shot deduped `SKIP` lines. Watch reuses the same formatted task line as `uv run gza advance`, including the stable `reason=...` policy slug, and repeats those reminders while the task still resolves to the same human-needed next action. Attention row identity comes from the action's declared subject task, so held plans and similar follow-up gates render against the task the operator should inspect. Ordinary wait/skip states keep the existing `SKIP` dedupe behavior.
 
 Multiline watch log messages are rendered with continuation indentation so wake, repair, and recovery output stays readable in both stdout and `.gza/watch.log`. `WAKE` lines now include a `live workers:` block when running workers can be identified, listing active task IDs and any anonymous workers that do not currently map to a live task row.
+
+When watch detects that the installed `gza` package fingerprint has changed since startup, it logs the drift immediately and, by default, re-execs itself once the current batch drains and no worker remains running. Pass `--no-auto-restart-on-drift` to keep the previous warn-only behavior.
 
 If a watch-time merge attempt fails only because the task branch is already merged into the target branch, watch runs the shared branch-truth reconciliation path, marks the task merged, and logs the repair as informational reconciliation instead of surfacing a misleading merge failure.
 

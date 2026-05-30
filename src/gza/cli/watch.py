@@ -358,6 +358,7 @@ class _IsolatedMergeFailureAssessment:
 class _InstalledPackageDriftState:
     startup_fingerprint: str
     warned_fingerprint: str | None = None
+    pending_restart_fingerprint: str | None = None
 
 
 def _assess_isolated_merge_failure(
@@ -402,19 +403,81 @@ def _installed_gza_package_fingerprint(package_root: Path | None = None) -> str:
     return hasher.hexdigest()
 
 
-def _warn_if_installed_gza_changed(log: "_WatchLog", drift_state: _InstalledPackageDriftState | None) -> None:
+def _warn_if_installed_gza_changed(
+    log: "_WatchLog",
+    drift_state: _InstalledPackageDriftState | None,
+    *,
+    auto_restart_on_drift: bool,
+) -> None:
     if drift_state is None:
         return
     current_fingerprint = _installed_gza_package_fingerprint()
     if current_fingerprint == drift_state.startup_fingerprint:
+        drift_state.pending_restart_fingerprint = None
         return
+    drift_state.pending_restart_fingerprint = current_fingerprint
     if current_fingerprint == drift_state.warned_fingerprint:
         return
     drift_state.warned_fingerprint = current_fingerprint
+    if auto_restart_on_drift:
+        message = (
+            "installed gza changed since watch started -- watch will re-exec "
+            "after the current batch drains"
+        )
+    else:
+        message = "installed gza changed since watch started -- restart watch to pick up new code"
     log.emit(
         "WARNING",
-        "installed gza changed since watch started -- restart watch to pick up new code",
+        message,
     )
+
+
+def _should_reexec_watch(
+    *,
+    auto_restart_on_drift: bool,
+    dry_run: bool,
+    stop_requested: bool,
+    cycle_result: "_CycleResult",
+    drift_state: _InstalledPackageDriftState | None,
+) -> bool:
+    if not auto_restart_on_drift or dry_run or stop_requested or drift_state is None:
+        return False
+    if drift_state.pending_restart_fingerprint is None:
+        return False
+    return cycle_result.running == 0
+
+
+def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
+    argv = [sys.executable, "-m", "gza", "watch", "--project", str(args.project_dir)]
+    if getattr(args, "batch", None) is not None:
+        argv.extend(["--batch", str(args.batch)])
+    if getattr(args, "poll", None) is not None:
+        argv.extend(["--poll", str(args.poll)])
+    if getattr(args, "max_idle", None) is not None:
+        argv.extend(["--max-idle", str(args.max_idle)])
+    if getattr(args, "max_iterations", None) is not None:
+        argv.extend(["--max-iterations", str(args.max_iterations)])
+    if getattr(args, "restart_failed", False):
+        argv.append("--restart-failed")
+    if getattr(args, "restart_failed_batch", None) is not None:
+        argv.extend(["--restart-failed-batch", str(args.restart_failed_batch)])
+    if getattr(args, "max_resume_attempts", None) is not None:
+        argv.extend(["--max-resume-attempts", str(args.max_resume_attempts)])
+    if getattr(args, "dry_run", False):
+        argv.append("--dry-run")
+    if getattr(args, "show_skipped", False):
+        argv.append("--show-skipped")
+    if getattr(args, "quiet", False):
+        argv.append("--quiet")
+    if getattr(args, "yes", False):
+        argv.append("--yes")
+    for tag in getattr(args, "tags", None) or ():
+        argv.extend(["--tag", tag])
+    if getattr(args, "any_tag", False):
+        argv.append("--any-tag")
+    if not getattr(args, "auto_restart_on_drift", True):
+        argv.append("--no-auto-restart-on-drift")
+    return argv
 
 
 def _format_scope_message(tags: tuple[str, ...] | None, *, any_tag: bool) -> str | None:
@@ -954,6 +1017,7 @@ def _run_cycle(
     restart_failed_batch: int = 1,
     max_recovery_attempts: int = 1,
     show_skipped: bool = False,
+    auto_restart_on_drift: bool = True,
     installed_package_drift: _InstalledPackageDriftState | None = None,
 ) -> _CycleResult:
     from ._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
@@ -961,7 +1025,11 @@ def _run_cycle(
     tags = normalize_tag_filters(tags)
 
     log.begin_cycle()
-    _warn_if_installed_gza_changed(log, installed_package_drift)
+    _warn_if_installed_gza_changed(
+        log,
+        installed_package_drift,
+        auto_restart_on_drift=auto_restart_on_drift,
+    )
     if not dry_run:
         reconcile_in_progress_tasks(config)
         prune_terminal_dead_workers(config)
@@ -1931,6 +1999,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         args.max_iterations if args.max_iterations is not None else config.watch.max_iterations
     )
     restart_failed = bool(getattr(args, "restart_failed", False))
+    auto_restart_on_drift = bool(getattr(args, "auto_restart_on_drift", True))
     restart_failed_batch = (
         args.restart_failed_batch
         if getattr(args, "restart_failed_batch", None) is not None
@@ -2000,6 +2069,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     old_sigint = signal.signal(signal.SIGINT, _handle_shutdown)
     old_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
+    reexec_fingerprint: str | None = None
 
     try:
         idle_seconds = 0
@@ -2033,6 +2103,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 restart_failed_batch=restart_failed_batch,
                 max_recovery_attempts=max_recovery_attempts,
                 show_skipped=show_skipped,
+                auto_restart_on_drift=auto_restart_on_drift,
                 installed_package_drift=installed_package_drift,
             )
             if preview_result.work_done:
@@ -2076,6 +2147,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 restart_failed_batch=restart_failed_batch,
                 max_recovery_attempts=max_recovery_attempts,
                 show_skipped=show_skipped,
+                auto_restart_on_drift=auto_restart_on_drift,
                 installed_package_drift=installed_package_drift,
             )
 
@@ -2112,6 +2184,25 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 any_tag=any_tag,
             )
             previous_snapshot = current_snapshot
+
+            if _should_reexec_watch(
+                auto_restart_on_drift=auto_restart_on_drift,
+                dry_run=dry_run,
+                stop_requested=stop_requested,
+                cycle_result=cycle_result,
+                drift_state=installed_package_drift,
+            ):
+                reexec_fingerprint = installed_package_drift.pending_restart_fingerprint
+                assert reexec_fingerprint is not None
+                log.emit(
+                    "INFO",
+                    (
+                        "re-execing watch to load updated gza "
+                        f"{installed_package_drift.startup_fingerprint}"
+                        f"->{reexec_fingerprint}"
+                    ),
+                )
+                break
 
             if unhandled_failures:
                 failure_streak += len(unhandled_failures)
@@ -2168,6 +2259,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     if stop_signal is not None:
         return 128 + stop_signal
+
+    if reexec_fingerprint is not None:
+        exec_argv = _watch_reexec_argv(args)
+        try:
+            os.execv(sys.executable, exec_argv)
+        except OSError as exc:
+            log.emit("ERROR", f"watch re-exec failed: {exc}")
+            if quiet:
+                print(f"watch re-exec failed: {exc}", file=sys.stderr, flush=True)
+            return 1
 
     return 0
 

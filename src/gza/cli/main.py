@@ -782,6 +782,13 @@ def main() -> int:
         help="Write events to .gza/watch.log only",
     )
     watch_parser.add_argument(
+        "--auto-restart-on-drift",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="auto_restart_on_drift",
+        help="Re-exec watch at a drained batch boundary when the installed gza code changes (default: enabled)",
+    )
+    watch_parser.add_argument(
         "-y", "--yes",
         action="store_true",
         help="Skip confirmation prompt before the first watch pass",
