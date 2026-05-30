@@ -16,6 +16,7 @@
 | `.gza/learnings.md` | Copied from `config.project_dir/.gza/` into worktree | Yes |
 | Summary files | Worktree dir created in task context; agent writes there; read back after | Yes |
 | `~/.codex`, `~/.claude` | Host home dir, mounted into Docker via `config_dir` | Yes (in Docker) |
+| Git remotes / network (`origin/*` refs, fetch, push) | Host (task context) only | **No** — worktree exposes only local refs, and there is no network to fetch them |
 
 ## How existing resources flow between contexts
 
@@ -53,3 +54,4 @@ The host runner copies `.gza/learnings.md` from `config.project_dir/.gza/` into 
 2. If the agent needs to **write** a file that persists beyond the task, the write should happen in task context (using DB-stored output), not rely on the worktree (which is ephemeral).
 3. Docker adds another layer: symlinks to host paths won't work. Copying into the worktree works for both native and Docker since the worktree is mounted as `/workspace`.
 4. Provider home dirs (`~/.claude`, `~/.codex`) are a separate mechanism — mounted via Docker's `-v` flag, controlled by the provider's `config_dir` setting. Don't conflate with project-level `.gza/` files.
+5. **Remote git is host-only.** The agent context has no network and no `origin/*` remote-tracking refs. Any operation that must reach origin — fetch, push, `--force-with-lease`, rebase-onto-origin — runs in **task context** (advance/watch/`git_ops`), never dispatched to an agent or `rebase` task. A flow that hands an agent an `origin/<branch>` target silently fails: the ref isn't present and the agent cannot fetch it, so the rebase no-ops and surfaces as a git error. Reconcile against origin host-side; only hand the agent a content rebase against a **local** target.
