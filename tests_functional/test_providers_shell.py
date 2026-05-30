@@ -3,6 +3,7 @@
 import os
 import shlex
 import subprocess
+from pathlib import Path
 
 
 class TestDockerEntrypointFunctional:
@@ -102,3 +103,44 @@ class TestDockerEntrypointFunctional:
         state_lines = state_file.read_text().splitlines()
         assert state_lines == ["sync", "run", "run"]
         assert "lazy-sync" not in state_lines
+
+    def test_uv_sync_creates_venv_under_scoped_workdir(self, tmp_path: Path) -> None:
+        """uv sync should materialize .venv in the scoped project cwd, not repo root."""
+        workspace = tmp_path / "workspace"
+        project_dir = workspace / "services" / "foo"
+        project_dir.mkdir(parents=True)
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake_uv = bin_dir / "uv"
+        fake_uv.write_text(
+            "#!/bin/bash\n"
+            "set -e\n"
+            'cmd="${1:-}"\n'
+            'if [ "$cmd" = "sync" ]; then\n'
+            '    mkdir -p .venv\n'
+            '    pwd > "$UV_SYNC_CWD_FILE"\n'
+            "    exit 0\n"
+            "fi\n"
+            'echo "unexpected command: $cmd" >&2\n'
+            "exit 1\n"
+        )
+        fake_uv.chmod(0o755)
+
+        sync_cwd_file = tmp_path / "uv-sync-cwd.txt"
+        env = os.environ.copy()
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        env["UV_SYNC_CWD_FILE"] = str(sync_cwd_file)
+
+        result = subprocess.run(
+            ["bash", "-c", "uv sync"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert sync_cwd_file.read_text().strip() == str(project_dir)
+        assert (project_dir / ".venv").is_dir()
+        assert not (workspace / ".venv").exists()

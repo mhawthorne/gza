@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import shlex
 import shutil
 import subprocess
@@ -329,14 +330,15 @@ def build_docker_cmd(
         List of command arguments (without the actual CLI command)
     """
     stdio_flag = "-it" if interactive else "-i"
+    venv_tmpfs_target = posixpath.join(docker_workdir or "/workspace", ".venv")
     cmd = [
         "timeout", f"{timeout_minutes}m",
         "docker", "run", "--rm", stdio_flag,
         "-v", f"{work_dir}:/workspace",
-        # Shadow host /workspace/.venv from bind mount with a writable tmpfs mount.
+        # Shadow the active project .venv from the bind mount with a writable tmpfs.
         # Anonymous volumes default to root-owned directories, which break `uv sync`
         # under the non-root `gza` user inside the container.
-        "--tmpfs", "/workspace/.venv:rw,exec,mode=1777",
+        "--tmpfs", f"{venv_tmpfs_target}:rw,exec,mode=1777",
         "-w", docker_workdir,
     ]
 
