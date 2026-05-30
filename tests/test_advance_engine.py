@@ -229,6 +229,31 @@ def _add_completed_rebase(
     return rebase
 
 
+def _add_failed_rebase_attempts(
+    store: SqliteTaskStore,
+    impl: DbTask,
+    *,
+    hours: tuple[int, ...],
+) -> list[DbTask]:
+    assert impl.id is not None
+    failed_rebases: list[DbTask] = []
+    for hour in hours:
+        failed_rebase = store.add(
+            f"Failed rebase {hour}",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
+        failed_rebase.branch = impl.branch
+        failed_rebase.failure_reason = "GIT_ERROR"
+        store.update(failed_rebase)
+        failed_rebases.append(failed_rebase)
+    return failed_rebases
+
+
 def _blocker_report(
     title: str,
     *,
@@ -2133,19 +2158,7 @@ def test_rebase_failure_circuit_breaker_trips_after_three_failures_without_progr
         when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
     )
 
-    for hour in (10, 11, 12):
-        failed_rebase = store.add(
-            f"Failed rebase {hour}",
-            task_type="rebase",
-            based_on=impl.id,
-            same_branch=True,
-        )
-        assert failed_rebase.id is not None
-        failed_rebase.status = "failed"
-        failed_rebase.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
-        failed_rebase.branch = impl.branch
-        failed_rebase.failure_reason = "GIT_ERROR"
-        store.update(failed_rebase)
+    _add_failed_rebase_attempts(store, impl, hours=(10, 11, 12))
 
     action = evaluate_advance_rules(
         config,
@@ -2168,6 +2181,93 @@ def test_rebase_failure_circuit_breaker_trips_after_three_failures_without_progr
     assert "feature/rebase-breaker" in action["description"]
     assert "after 3 failed attempts" in action["description"]
     assert action["rebase_failure_streak"]["attempts"] == 3
+    assert classify_advance_action(action) == "needs_attention"
+
+
+def test_rebase_failure_circuit_breaker_resets_after_completed_rebase(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-breaker-reset-rebase",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    _add_failed_rebase_attempts(store, impl, hours=(10, 11, 12))
+    _add_completed_rebase(store, impl, when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC))
+
+    git = _FakeGit(can_merge=False)
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    assert ctx.rebase_failure_streak is None
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-did-not-unblock-merge"
+    assert classify_advance_action(action) == "needs_attention"
+
+
+def test_rebase_failure_circuit_breaker_resets_after_completed_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-breaker-reset-review",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    _add_failed_rebase_attempts(store, impl, hours=(10, 11, 12))
+    _add_completed_review(store, impl, when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC))
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(can_merge=False)
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    assert ctx.rebase_failure_streak is None
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_rebase"
+    assert "needs_attention_reason" not in action
+
+
+def test_rebase_failure_circuit_breaker_resets_after_completed_code_change(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-breaker-reset-code-change",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 9, 30, tzinfo=UTC))
+    _add_failed_rebase_attempts(store, impl, hours=(10, 11, 12))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+
+    git = _FakeGit(can_merge=False)
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    assert ctx.rebase_failure_streak is None
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
     assert classify_advance_action(action) == "needs_attention"
 
 
