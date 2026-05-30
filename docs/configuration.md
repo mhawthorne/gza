@@ -28,6 +28,7 @@ Gza reads configuration from three YAML layers:
 | `tasks_file` | String | `tasks.yaml` | Path to legacy tasks file |
 | `log_dir` | String | `.gza/logs` | Directory for log files |
 | `use_docker` | Boolean | `true` | Whether to run Claude in Docker container |
+| `enforce_project_scope` | Boolean | `true` | Fail code-task commits that stage paths outside the project subtree or declared in-repo local deps. Tasks tagged `cross-project` are exempt. |
 | `docker_image` | String | `{project_name}-gza` | Custom Docker image name |
 | `docker_setup_command` | String | `""` | Pre-warm hook run synchronously in Docker before provider CLI starts |
 | `docker_volumes` | List | `[]` | Custom Docker volume mounts (e.g., `["/host:/container:ro"]`) |
@@ -60,6 +61,15 @@ Gza reads configuration from three YAML layers:
 | `theme` | String | *(none)* | Built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. Override with `gza.local.yaml`. |
 | `colors` | Dict | `{}` | Ad-hoc map of `field_name: rich_color_string` applied on top of `theme` (highest priority). Allowed in `gza.local.yaml`. |
 
+### Project Scope Enforcement
+
+When `gza.yaml` lives below the git repo root, Gza treats that subdirectory as the default write boundary for code tasks. Commits that stage files outside the project subtree fail with `PROJECT_SCOPE_VIOLATION` unless one of these is true:
+
+- `enforce_project_scope: false`
+- The task has the reserved `cross-project` tag
+
+In-repo local dependencies resolved from `uv.lock` widen the allowed write scope automatically. Out-of-repo local dependencies stay read-only in Docker via auto-injected bind mounts.
+
 ### Local Overrides (gza.local.yaml)
 
 Use `gza.local.yaml` for machine-specific settings that should not be committed.
@@ -78,7 +88,7 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `watch`, `iterate_max_iterations`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `colors`
+`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `watch`, `iterate_max_iterations`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `colors`
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`, `verify_command`

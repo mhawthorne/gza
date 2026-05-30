@@ -458,7 +458,14 @@ class GeminiProvider(Provider):
             print("Error: Failed to build Docker image")
             return RunResult(exit_code=1)
 
-        cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes, config.docker_volumes, config.docker_setup_command)
+        cmd = build_docker_cmd(
+            docker_config,
+            work_dir,
+            config.timeout_minutes,
+            config.docker_volumes,
+            config.docker_setup_command,
+            getattr(config, "docker_workdir", "/workspace"),
+        )
         # Insert Gemini headless env before the image name (last element from build_docker_cmd).
         for env_value in ("GEMINI_SHELL_ENABLED=true", GEMINI_TRUST_WORKSPACE_ENV):
             cmd.insert(-1, "-e")
@@ -509,7 +516,11 @@ class GeminiProvider(Provider):
             cmd.extend(["-m", config.model])
 
         return self._run_with_output_parsing(
-            cmd, conversation_log_file, config.timeout_minutes, config.model, cwd=work_dir,
+            cmd,
+            conversation_log_file,
+            config.timeout_minutes,
+            config.model,
+            cwd=(getattr(config, "provider_cwd", None) or work_dir),
             chat_text_display_length=config.chat_text_display_length,
             max_steps=config.max_steps,
             on_step_count=on_step_count,

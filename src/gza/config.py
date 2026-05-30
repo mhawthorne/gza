@@ -47,6 +47,7 @@ DEFAULT_LOG_DIR = f".{APP_NAME}/logs"
 DEFAULT_WORKERS_DIR = f".{APP_NAME}/workers"
 DEFAULT_TIMEOUT_MINUTES = 10
 DEFAULT_USE_DOCKER = True
+DEFAULT_ENFORCE_PROJECT_SCOPE = True
 DEFAULT_BRANCH_MODE = "multi"  # "single" or "multi"
 DEFAULT_MAX_STEPS = 50
 DEFAULT_MAX_TURNS = 50
@@ -89,6 +90,7 @@ DEFAULT_LEARNINGS_INTERVAL = 5
 DEFAULT_LEARNINGS_MAX_ITEMS = 50
 VALID_CONFIG_FIELDS = {
     "project_name", "project_id", "project_prefix", "tasks_file", "log_dir", "db_path", "use_docker",
+    "enforce_project_scope",
     "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps",
     "max_turns", "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
     "reasoning_effort", "defaults", "task_types", "providers", "branch_strategy", "chat_text_display_length",
@@ -103,6 +105,7 @@ VALID_CONFIG_FIELDS = {
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "db_path": None,
     "use_docker": None,
+    "enforce_project_scope": None,
     "docker_image": None,
     "docker_volumes": None,
     "docker_setup_command": None,
@@ -190,6 +193,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
 USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "db_path": None,
     "use_docker": None,
+    "enforce_project_scope": None,
     "docker_image": None,
     "docker_volumes": None,
     "docker_setup_command": None,
@@ -694,6 +698,7 @@ class Config:
     tasks_file: str = DEFAULT_TASKS_FILE
     log_dir: str = DEFAULT_LOG_DIR
     use_docker: bool = DEFAULT_USE_DOCKER
+    enforce_project_scope: bool = DEFAULT_ENFORCE_PROJECT_SCOPE
     docker_image: str = ""
     docker_volumes: list[str] = field(default_factory=list)
     timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES
@@ -741,6 +746,8 @@ class Config:
     user_config_active: bool = False
     local_override_path: Path | None = None
     local_overrides_active: bool = False
+    provider_cwd: Path | None = None
+    docker_workdir: str = "/workspace"
 
     def __post_init__(self):
         if not self.project_id:
@@ -1207,6 +1214,9 @@ class Config:
             raise ConfigError("'reasoning_effort' must be a string")
 
         docker_volumes = data.get("docker_volumes", [])
+        enforce_project_scope = data.get("enforce_project_scope", DEFAULT_ENFORCE_PROJECT_SCOPE)
+        if not isinstance(enforce_project_scope, bool):
+            raise ConfigError("'enforce_project_scope' must be a boolean (true/false)")
 
         # Expand tilde in volume paths
         expanded_volumes = []
@@ -1803,6 +1813,7 @@ class Config:
             log_dir=data.get("log_dir", DEFAULT_LOG_DIR),
             db_path_value=db_path_raw or "",
             use_docker=use_docker,
+            enforce_project_scope=enforce_project_scope,
             docker_image=data.get("docker_image", ""),
             docker_volumes=docker_volumes,
             docker_setup_command=data.get("docker_setup_command", ""),
@@ -1986,6 +1997,9 @@ class Config:
 
         if "use_docker" in data and not isinstance(data["use_docker"], bool):
             errors.append("'use_docker' must be a boolean (true/false)")
+
+        if "enforce_project_scope" in data and not isinstance(data["enforce_project_scope"], bool):
+            errors.append("'enforce_project_scope' must be a boolean (true/false)")
 
         if "docker_image" in data and not isinstance(data["docker_image"], str):
             errors.append("'docker_image' must be a string")

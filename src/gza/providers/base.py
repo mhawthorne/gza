@@ -310,6 +310,7 @@ def build_docker_cmd(
     timeout_minutes: int,
     docker_volumes: list[str] | None = None,
     docker_setup_command: str = "",
+    docker_workdir: str = "/workspace",
     interactive: bool = False,
 ) -> list[str]:
     """Build the base Docker run command.
@@ -320,6 +321,7 @@ def build_docker_cmd(
         timeout_minutes: Timeout in minutes
         docker_volumes: Optional list of custom volume mounts (e.g., ["/host:/container:ro"])
         docker_setup_command: Optional setup command to run inside container before CLI starts
+        docker_workdir: Working directory inside the container
         interactive: If True, allocate a TTY (-it) for interactive use (e.g. attach handoff).
             When False, attach only stdin (-i) which is required for streaming-json pipe mode.
 
@@ -335,7 +337,7 @@ def build_docker_cmd(
         # Anonymous volumes default to root-owned directories, which break `uv sync`
         # under the non-root `gza` user inside the container.
         "--tmpfs", "/workspace/.venv:rw,exec,mode=1777",
-        "-w", "/workspace",
+        "-w", docker_workdir,
     ]
 
     # If work_dir is a git worktree, mount the host .git directory so git

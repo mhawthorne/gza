@@ -506,7 +506,14 @@ class CodexProvider(Provider):
             print("Error: Failed to build Docker image")
             return RunResult(exit_code=1)
 
-        cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes, config.docker_volumes, config.docker_setup_command)
+        cmd = build_docker_cmd(
+            docker_config,
+            work_dir,
+            config.timeout_minutes,
+            config.docker_volumes,
+            config.docker_setup_command,
+            getattr(config, "docker_workdir", "/workspace"),
+        )
 
         if resume_session_id:
             cmd.extend([
@@ -523,9 +530,10 @@ class CodexProvider(Provider):
                 cmd.extend(["-m", config.model])
             self._append_reasoning_effort_override(cmd, config.reasoning_effort)
         else:
+            docker_cwd = getattr(config, "docker_workdir", "/workspace")
             cmd.extend([
                 "codex",
-                *build_headless_exec_args("/workspace"),  # Worktree metadata may be unavailable inside containers
+                *build_headless_exec_args(docker_cwd),  # Worktree metadata may be unavailable inside containers
             ])
 
             # Add model if specified
@@ -560,7 +568,10 @@ class CodexProvider(Provider):
         cmd = self.build_noninteractive_command(config, work_dir, resume_session_id)
 
         return self._run_with_output_parsing(
-            cmd, conversation_log_file, config.timeout_minutes, cwd=work_dir,
+            cmd,
+            conversation_log_file,
+            config.timeout_minutes,
+            cwd=(getattr(config, "provider_cwd", None) or work_dir),
             stdin_input=prompt, model=config.model,
             max_steps=config.max_steps,
             chat_text_display_length=config.chat_text_display_length,
@@ -596,9 +607,10 @@ class CodexProvider(Provider):
                 cmd.extend(["-m", config.model])
             cls._append_reasoning_effort_override(cmd, config.reasoning_effort)
         else:
+            effective_work_dir = getattr(config, "provider_cwd", None) or work_dir
             cmd.extend([
                 "codex",
-                *build_headless_exec_args(work_dir),  # Worktree metadata may be unavailable in detached review contexts
+                *build_headless_exec_args(effective_work_dir),  # Worktree metadata may be unavailable in detached review contexts
             ])
 
             # Add model if specified

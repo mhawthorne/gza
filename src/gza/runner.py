@@ -102,6 +102,8 @@ EXTRACTION_PRECHECK_FAILURE_REASON = "EXTRACTION_PRECHECK_FAILED"
 EXTRACTION_ALREADY_MERGED_COMPLETION_REASON = "EXTRACTION_ALREADY_MERGED"
 
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
+PROJECT_SCOPE_VIOLATION_FAILURE_REASON = "PROJECT_SCOPE_VIOLATION"
+CROSS_PROJECT_TAG = "cross-project"
 
 
 @dataclass(frozen=True)
@@ -128,12 +130,222 @@ class ResolvedRunFailure:
     reason: str
     status: str
     outcome_message: str
+
+
+@dataclass(frozen=True)
+class LocalDependency:
+    """Resolved local dependency path from ``uv.lock``."""
+
+    source_path: Path
+    resolved_path: Path
+    repo_relative_path: Path | None
+
+    @property
+    def is_in_repo(self) -> bool:
+        return self.repo_relative_path is not None
+
+
+@dataclass(frozen=True)
+class ProjectBoundary:
+    """Repo/project boundary and resolved local-dependency set."""
+
+    repo_root: Path
+    scope_root: Path
+    local_dependencies: tuple[LocalDependency, ...]
+
+    @property
+    def in_repo_dependency_paths(self) -> frozenset[Path]:
+        return frozenset(
+            dep.repo_relative_path
+            for dep in self.local_dependencies
+            if dep.repo_relative_path is not None
+        )
+
+    @property
+    def out_of_repo_dependency_paths(self) -> frozenset[Path]:
+        return frozenset(dep.resolved_path for dep in self.local_dependencies if not dep.is_in_repo)
+
+    @property
+    def project_rooted_paths(self) -> frozenset[Path]:
+        return frozenset({self.scope_root, *self.in_repo_dependency_paths})
 def _git_error_failure() -> ResolvedRunFailure:
     return ResolvedRunFailure(
         reason="GIT_ERROR",
         status="Failed: git error",
         outcome_message="Outcome: failed (GIT_ERROR)",
     )
+
+
+def _task_is_cross_project(task: Task) -> bool:
+    """Return whether a task carries the reserved cross-project scope tag."""
+    return CROSS_PROJECT_TAG in task.tags
+
+
+def _resolve_repo_root(project_dir: Path) -> Path:
+    """Resolve the git repo root that contains ``project_dir``."""
+    current = project_dir.resolve()
+    while True:
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            return project_dir.resolve()
+        current = parent
+
+
+def _resolve_local_dependencies_from_uv_lock(project_dir: Path, repo_root: Path) -> tuple[LocalDependency, ...]:
+    """Resolve local path dependencies from ``uv.lock``."""
+    uv_lock_path = project_dir / "uv.lock"
+    if not uv_lock_path.exists():
+        return ()
+
+    try:
+        with open(uv_lock_path, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        logger.warning("Failed to read/parse %s; skipping local dependency resolution", uv_lock_path)
+        return ()
+
+    packages = data.get("package")
+    if not isinstance(packages, list):
+        return ()
+
+    resolved: dict[Path, LocalDependency] = {}
+    for package in packages:
+        if not isinstance(package, dict):
+            continue
+        source = package.get("source")
+        if not isinstance(source, dict):
+            continue
+
+        raw_path: str | None = None
+        for key in ("editable", "directory", "path"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                raw_path = value.strip()
+                break
+        if raw_path is None or raw_path == ".":
+            continue
+
+        source_path = Path(raw_path)
+        dep_path = source_path if source_path.is_absolute() else (project_dir / source_path)
+        resolved_path = dep_path.resolve()
+        if resolved_path == project_dir.resolve():
+            continue
+
+        repo_relative_path: Path | None
+        try:
+            repo_relative_path = resolved_path.relative_to(repo_root)
+        except ValueError:
+            repo_relative_path = None
+
+        resolved.setdefault(
+            resolved_path,
+            LocalDependency(
+                source_path=source_path,
+                resolved_path=resolved_path,
+                repo_relative_path=repo_relative_path,
+            ),
+        )
+
+    return tuple(sorted(resolved.values(), key=lambda dep: str(dep.resolved_path)))
+
+
+def _project_boundary(config: Config) -> ProjectBoundary:
+    """Return cached repo/project boundary metadata for ``config.project_dir``."""
+    cached = getattr(config, "_project_boundary_cache", None)
+    if isinstance(cached, ProjectBoundary):
+        return cached
+
+    project_dir = config.project_dir.resolve()
+    repo_root = _resolve_repo_root(project_dir)
+    try:
+        scope_root = project_dir.relative_to(repo_root)
+    except ValueError:
+        scope_root = Path(".")
+
+    boundary = ProjectBoundary(
+        repo_root=repo_root,
+        scope_root=scope_root,
+        local_dependencies=_resolve_local_dependencies_from_uv_lock(project_dir, repo_root),
+    )
+    setattr(config, "_project_boundary_cache", boundary)
+    return boundary
+
+
+def _container_project_root(boundary: ProjectBoundary) -> Path:
+    """Return the mounted container path for the configured project root."""
+    container_root = Path("/workspace")
+    if boundary.scope_root == Path("."):
+        return container_root
+    return container_root / boundary.scope_root
+
+
+def _container_execution_dir(boundary: ProjectBoundary, *, cross_project: bool) -> Path:
+    """Return the container cwd for provider execution."""
+    if cross_project or boundary.scope_root == Path("."):
+        return Path("/workspace")
+    return _container_project_root(boundary)
+
+
+def _worktree_project_root(worktree_path: Path, boundary: ProjectBoundary) -> Path:
+    """Return the host worktree path that corresponds to ``config.project_dir``."""
+    if boundary.scope_root == Path("."):
+        return worktree_path
+    return worktree_path / boundary.scope_root
+
+
+def _worktree_execution_dir(worktree_path: Path, boundary: ProjectBoundary, *, cross_project: bool) -> Path:
+    """Return the host cwd for provider execution."""
+    if cross_project or boundary.scope_root == Path("."):
+        return worktree_path
+    return _worktree_project_root(worktree_path, boundary)
+
+
+def _worktree_path_for_project_path(config: Config, worktree_path: Path, project_path: Path) -> Path:
+    """Map a project-local path into the matching worktree path."""
+    rel_path = project_path.relative_to(config.project_dir)
+    return _worktree_project_root(worktree_path, _project_boundary(config)) / rel_path
+
+
+def _container_path_for_project_path(config: Config, project_path: Path) -> Path:
+    """Map a project-local path into the matching container path."""
+    rel_path = project_path.relative_to(config.project_dir)
+    return _container_project_root(_project_boundary(config)) / rel_path
+
+
+def _build_runtime_docker_volumes(config: Config) -> list[str]:
+    """Return configured Docker volumes plus read-only mounts for out-of-repo deps."""
+    volumes = list(getattr(config, "docker_volumes", []))
+    for dep_path in sorted(_project_boundary(config).out_of_repo_dependency_paths):
+        mount = f"{dep_path}:{dep_path}:ro"
+        if mount not in volumes:
+            volumes.append(mount)
+    return volumes
+
+
+def _path_is_under_any_scope(path: Path, allowed_roots: frozenset[Path]) -> bool:
+    """Return whether ``path`` is within one of the allowed repo-relative roots."""
+    if Path(".") in allowed_roots:
+        return True
+    for root in allowed_roots:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _find_out_of_scope_paths(config: Config, files_to_stage: set[str]) -> list[str]:
+    """Return sorted repo-relative paths that violate the current project scope."""
+    allowed_roots = _project_boundary(config).project_rooted_paths
+    violations: list[str] = []
+    for path_str in sorted(files_to_stage):
+        path = Path(path_str)
+        if not _path_is_under_any_scope(path, allowed_roots):
+            violations.append(path_str)
+    return violations
 
 
 def _interrupt_signal_name() -> str | None:
@@ -3105,37 +3317,16 @@ def _snapshot_task_db_to_worktree(db_path: Path, worktree_path: Path) -> None:
 def _create_local_dep_symlinks(config: Config, worktree_path: Path) -> None:
     """Create symlinks for local path dependencies so uv can resolve them in worktrees.
 
-    Parses [tool.uv.sources] from the project's pyproject.toml and creates
-    symlinks in the worktree's ancestor directories so that relative path
-    references resolve to the same real directories as they would from the
-    original project root.
+    Uses the resolved local-dependency set from ``uv.lock`` and creates
+    symlinks for relative out-of-repo deps in the worktree's ancestor
+    directories so path references resolve exactly as they do from the project
+    checkout. Absolute host paths already resolve natively and are skipped.
     """
-    pyproject = config.project_dir / "pyproject.toml"
-    if not pyproject.exists():
-        return
-
-    try:
-        with open(pyproject, "rb") as f:
-            data = tomllib.load(f)
-    except Exception:
-        logger.warning("Failed to read/parse %s; skipping local dep symlinks", pyproject)
-        return
-
-    sources = data.get("tool", {}).get("uv", {}).get("sources", {})
-    if not sources:
-        return
-
-    for _dep_name, entry in sources.items():
-        if not isinstance(entry, dict):
+    for dep in _project_boundary(config).local_dependencies:
+        dep_rel = dep.source_path
+        if dep.is_in_repo or dep_rel.is_absolute():
             continue
-        raw_path = entry.get("path")
-        if not raw_path:
-            continue
-        dep_rel = Path(raw_path)
-        # Skip absolute paths — they work everywhere without symlinks
-        if dep_rel.is_absolute():
-            continue
-        dep_real_path = (config.project_dir / dep_rel).resolve()
+        dep_real_path = dep.resolved_path
         if not dep_real_path.exists():
             logger.debug("Local dep %s does not exist on disk; skipping symlink", dep_real_path)
             continue
@@ -3719,6 +3910,40 @@ def _complete_code_task(
             candidate_stage_paths,
             status_paths,
         )
+        if (
+            files_to_stage
+            and getattr(config, "enforce_project_scope", True)
+            and not _task_is_cross_project(task)
+        ):
+            out_of_scope_paths = _find_out_of_scope_paths(config, files_to_stage)
+            if out_of_scope_paths:
+                failure_message = (
+                    "Project scope violation: refusing to commit out-of-scope paths:\n"
+                    + "\n".join(f"- {path}" for path in out_of_scope_paths)
+                )
+                error_message(failure_message)
+                write_log_entry(
+                    log_file,
+                    {
+                        "type": "gza",
+                        "subtype": "outcome",
+                        "message": failure_message,
+                        "failure_reason": PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
+                        "out_of_scope_paths": out_of_scope_paths,
+                    },
+                )
+                _mark_task_failed(
+                    task=task,
+                    config=config,
+                    store=store,
+                    log_file=log_file,
+                    stats=stats,
+                    branch=branch_name,
+                    explicit_reason=PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
+                    error_type=None,
+                    exit_code=1,
+                )
+                return 0
         has_uncommitted = bool(files_to_stage)
 
         if not has_uncommitted:
@@ -4521,16 +4746,19 @@ def _run_inner(
     assert summary_path is not None, f"Code task type '{task.task_type}' must have a summary path"
     summary_dir = summary_path.parent
     summary_dir.mkdir(parents=True, exist_ok=True)
+    boundary = _project_boundary(config)
+    cross_project = _task_is_cross_project(task)
+    provider_cwd = _worktree_execution_dir(worktree_path, boundary, cross_project=cross_project)
 
     # Create summary directory structure in worktree
-    worktree_summary_dir = worktree_path / summary_dir.relative_to(config.project_dir)
+    worktree_summary_dir = _worktree_path_for_project_path(config, worktree_path, summary_dir)
     worktree_summary_dir.mkdir(parents=True, exist_ok=True)
-    worktree_summary_path = worktree_path / summary_path.relative_to(config.project_dir)
+    worktree_summary_path = _worktree_path_for_project_path(config, worktree_path, summary_path)
 
     # For Docker containers, use /workspace-relative path instead of host worktree path
     # For native mode, use the actual worktree path
     if config.use_docker:
-        prompt_summary_path = Path("/workspace") / summary_path.relative_to(config.project_dir)
+        prompt_summary_path = _container_path_for_project_path(config, summary_path)
     else:
         prompt_summary_path = worktree_summary_path
 
@@ -4560,6 +4788,10 @@ def _run_inner(
     # Copy learnings file into worktree so the agent can read it
     _snapshot_task_db_to_worktree(_resolve_task_db_path(config), worktree_path)
     _copy_learnings_to_worktree(config, worktree_path)
+
+    task_config.provider_cwd = provider_cwd
+    task_config.docker_workdir = str(_container_execution_dir(boundary, cross_project=cross_project))
+    task_config.docker_volumes = _build_runtime_docker_volumes(config)
 
     if not config.use_docker:
         _create_local_dep_symlinks(config, worktree_path)
@@ -4886,16 +5118,19 @@ def _run_non_code_task(
         if git:
             git._run("worktree", "add", "--detach", str(worktree_path), base_ref)
 
-        # Create report directory structure in worktree
-        worktree_report_dir = worktree_path / report_path.parent.relative_to(config.project_dir)
+    # Create report directory structure in worktree
+        boundary = _project_boundary(config)
+        cross_project = _task_is_cross_project(task)
+        provider_cwd = _worktree_execution_dir(worktree_path, boundary, cross_project=cross_project)
+        worktree_report_dir = _worktree_path_for_project_path(config, worktree_path, report_path.parent)
         worktree_report_dir.mkdir(parents=True, exist_ok=True)
-        worktree_report_path = worktree_path / report_path.relative_to(config.project_dir)
+        worktree_report_path = _worktree_path_for_project_path(config, worktree_path, report_path)
 
         # For Docker containers, use /workspace-relative path instead of host worktree path
         # The container only has /workspace mounted, so we need to use a path inside that
         # For native mode, use the actual worktree path
         if config.use_docker:
-            prompt_report_path = Path("/workspace") / report_path.relative_to(config.project_dir)
+            prompt_report_path = _container_path_for_project_path(config, report_path)
         else:
             prompt_report_path = worktree_report_path
 
@@ -4911,6 +5146,10 @@ def _run_non_code_task(
         # Internal orchestration tasks do not implicitly consume learnings context.
         if task.task_type not in ("internal", "learn"):
             _copy_learnings_to_worktree(config, worktree_path)
+
+        config.provider_cwd = provider_cwd
+        config.docker_workdir = str(_container_execution_dir(boundary, cross_project=cross_project))
+        config.docker_volumes = _build_runtime_docker_volumes(config)
 
         if not config.use_docker:
             _create_local_dep_symlinks(config, worktree_path)
@@ -4939,7 +5178,7 @@ def _run_non_code_task(
                     review_verify_timeout_seconds = REVIEW_VERIFY_TIMEOUT_SECONDS
                 review_verify_result = _run_review_verify_command(
                     verify_command,
-                    cwd=worktree_path,
+                    cwd=provider_cwd,
                     timeout_seconds=review_verify_timeout_seconds,
                 )
             prompt = build_prompt(

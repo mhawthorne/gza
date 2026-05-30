@@ -754,6 +754,7 @@ class ClaudeProvider(Provider):
             config.timeout_minutes,
             config.docker_volumes,
             config.docker_setup_command,
+            getattr(config, "docker_workdir", "/workspace"),
             interactive=True,
         )
         cmd.append("claude")
@@ -790,7 +791,7 @@ class ClaudeProvider(Provider):
             cmd,
             conversation_log_file,
             ops_log_file,
-            cwd=work_dir,
+            cwd=(getattr(config, "provider_cwd", None) or work_dir),
             timeout_minutes=config.timeout_minutes,
             on_session_id=on_session_id,
             on_step_count=on_step_count,
@@ -821,7 +822,14 @@ class ClaudeProvider(Provider):
             print("Error: Failed to build Docker image")
             return RunResult(exit_code=1)
 
-        cmd = build_docker_cmd(docker_config, work_dir, config.timeout_minutes, config.docker_volumes, config.docker_setup_command)
+        cmd = build_docker_cmd(
+            docker_config,
+            work_dir,
+            config.timeout_minutes,
+            config.docker_volumes,
+            config.docker_setup_command,
+            getattr(config, "docker_workdir", "/workspace"),
+        )
         cmd.append("claude")
         cmd.extend(self._build_claude_args(config, resume_session_id))
 
@@ -862,7 +870,12 @@ class ClaudeProvider(Provider):
         cmd = self.build_noninteractive_command(config, work_dir, resume_session_id)
 
         return self._run_with_output_parsing(
-            cmd, conversation_log_file, config.timeout_minutes, cwd=work_dir, stdin_input=prompt, model=config.model,
+            cmd,
+            conversation_log_file,
+            config.timeout_minutes,
+            cwd=(getattr(config, "provider_cwd", None) or work_dir),
+            stdin_input=prompt,
+            model=config.model,
             chat_text_display_length=config.chat_text_display_length,
             on_session_id=on_session_id,
             on_step_count=on_step_count,
@@ -931,7 +944,7 @@ class ClaudeProvider(Provider):
         cmd.extend(config.claude.args)
 
         # Run with inherited stdin/stdout/stderr (connected to the PTY via the proxy)
-        result = subprocess.run(cmd, cwd=work_dir)
+        result = subprocess.run(cmd, cwd=(getattr(config, "provider_cwd", None) or work_dir))
 
         with open(proxy_log_file, "a") as f:
             f.write(_json.dumps({

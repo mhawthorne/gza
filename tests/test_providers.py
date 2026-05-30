@@ -720,6 +720,26 @@ class TestBuildDockerCmd:
         tmpfs_idx = cmd.index("--tmpfs")
         assert cmd[tmpfs_idx + 1] == "/workspace/.venv:rw,exec,mode=1777"
 
+    def test_custom_container_workdir(self, tmp_path):
+        """Should allow a scoped Docker working directory under /workspace."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=".testconfig",
+            env_vars=[],
+        )
+
+        cmd = build_docker_cmd(
+            docker_config,
+            tmp_path,
+            timeout_minutes=10,
+            docker_workdir="/workspace/services/foo",
+        )
+
+        workdir_idx = cmd.index("-w")
+        assert cmd[workdir_idx + 1] == "/workspace/services/foo"
+
     def test_passes_setup_command_as_env_var(self, tmp_path):
         """Should pass GZA_DOCKER_SETUP_COMMAND when docker_setup_command is set."""
         docker_config = DockerConfig(

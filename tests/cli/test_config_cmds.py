@@ -495,6 +495,30 @@ class TestLocalConfigOverrides:
         cfg = Config.load(tmp_path)
         assert cfg.use_docker is False
 
+    def test_enforce_project_scope_loads_from_config(self, tmp_path: Path):
+        """Project-scope enforcement should be configurable."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "enforce_project_scope: false\n"
+        )
+
+        from gza.config import Config
+
+        cfg = Config.load(tmp_path)
+        assert cfg.enforce_project_scope is False
+
+    def test_validate_rejects_non_boolean_enforce_project_scope(self, tmp_path: Path):
+        """Config validation should reject invalid enforce_project_scope values."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "enforce_project_scope: nope\n"
+        )
+
+        result = run_gza("validate", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "enforce_project_scope" in result.stdout
+
     def test_config_command_shows_effective_values_with_sources(self, tmp_path: Path):
         """gza config --json should include effective values and source attribution."""
 

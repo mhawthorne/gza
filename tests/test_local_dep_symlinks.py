@@ -1,4 +1,4 @@
-"""Tests for _create_local_dep_symlinks in runner.py."""
+"""Tests for uv.lock-driven local dependency resolution in runner.py."""
 
 from pathlib import Path
 from unittest.mock import Mock
@@ -14,19 +14,20 @@ def make_config(project_dir: Path, use_docker: bool = False):
     return config
 
 
-def write_pyproject(project_dir: Path, sources: dict) -> None:
-    """Write a pyproject.toml with the given [tool.uv.sources] content."""
-    lines = ["[tool.uv.sources]\n"]
-    for name, entry in sources.items():
-        path_val = entry.get("path", "")
-        lines.append(f'{name} = {{ path = "{path_val}" }}\n')
-    content = "".join(lines)
-    (project_dir / "pyproject.toml").write_text(content)
+def write_uv_lock(project_dir: Path, entries: list[dict[str, str]]) -> None:
+    """Write a minimal uv.lock with the given local-source entries."""
+    lines: list[str] = []
+    for entry in entries:
+        lines.append("[[package]]\n")
+        lines.append('name = "dep"\n')
+        source_bits = ", ".join(f'{key} = "{value}"' for key, value in entry.items())
+        lines.append(f"source = {{ {source_bits} }}\n")
+    (project_dir / "uv.lock").write_text("".join(lines))
 
 
 class TestNoopCases:
-    def test_no_pyproject(self, tmp_path):
-        """No pyproject.toml — returns silently."""
+    def test_no_uv_lock(self, tmp_path):
+        """No uv.lock — returns silently."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         worktree = tmp_path / "worktree"
@@ -34,11 +35,11 @@ class TestNoopCases:
         config = make_config(project_dir)
         _create_local_dep_symlinks(config, worktree)  # no error
 
-    def test_no_uv_sources_section(self, tmp_path):
-        """pyproject.toml exists but has no [tool.uv.sources] — returns silently."""
+    def test_no_package_entries(self, tmp_path):
+        """uv.lock exists but has no package entries — returns silently."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
-        (project_dir / "pyproject.toml").write_text("[project]\nname = 'foo'\n")
+        (project_dir / "uv.lock").write_text("version = 1\n")
         worktree = tmp_path / "worktree"
         worktree.mkdir()
         config = make_config(project_dir)
@@ -48,7 +49,7 @@ class TestNoopCases:
         """Dep path doesn't exist on host — no symlink created, no error."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
-        write_pyproject(project_dir, {"missing": {"path": "../nonexistent"}})
+        write_uv_lock(project_dir, [{"directory": "../nonexistent"}])
         worktree = tmp_path / "worktrees" / "project" / "task-1"
         worktree.mkdir(parents=True)
         config = make_config(project_dir)
@@ -62,8 +63,7 @@ class TestNoopCases:
         project_dir.mkdir()
         dep_dir = tmp_path / "abs_dep"
         dep_dir.mkdir()
-        content = f'[tool.uv.sources]\ndep = {{ path = "{dep_dir}" }}\n'
-        (project_dir / "pyproject.toml").write_text(content)
+        write_uv_lock(project_dir, [{"editable": str(dep_dir)}])
         worktree = tmp_path / "worktrees" / "project" / "task-1"
         worktree.mkdir(parents=True)
         config = make_config(project_dir)
@@ -80,7 +80,7 @@ class TestSymlinkCreation:
         project_dir.mkdir(parents=True)
         shared_lib = tmp_path / "work" / "shared-lib"
         shared_lib.mkdir()
-        write_pyproject(project_dir, {"shared-lib": {"path": "../shared-lib"}})
+        write_uv_lock(project_dir, [{"directory": "../shared-lib"}])
 
         worktree = tmp_path / "worktrees" / "myproject" / "task-123"
         worktree.mkdir(parents=True)
@@ -97,7 +97,7 @@ class TestSymlinkCreation:
         project_dir.mkdir(parents=True)
         core_lib = tmp_path / "libs" / "core"
         core_lib.mkdir(parents=True)
-        write_pyproject(project_dir, {"core": {"path": "../../libs/core"}})
+        write_uv_lock(project_dir, [{"path": "../../libs/core"}])
 
         worktree = tmp_path / "gza-worktrees" / "myproject" / "task-1"
         worktree.mkdir(parents=True)
@@ -116,13 +116,7 @@ class TestSymlinkCreation:
         dep_a.mkdir()
         dep_b = tmp_path / "work" / "dep-b"
         dep_b.mkdir()
-
-        content = (
-            "[tool.uv.sources]\n"
-            'dep-a = { path = "../dep-a" }\n'
-            'dep-b = { path = "../dep-b" }\n'
-        )
-        (project_dir / "pyproject.toml").write_text(content)
+        write_uv_lock(project_dir, [{"directory": "../dep-a"}, {"editable": "../dep-b"}])
 
         worktree = tmp_path / "worktrees" / "proj" / "task-1"
         worktree.mkdir(parents=True)
@@ -142,7 +136,7 @@ class TestIdempotency:
         project_dir.mkdir(parents=True)
         shared_lib = tmp_path / "work" / "shared-lib"
         shared_lib.mkdir()
-        write_pyproject(project_dir, {"shared-lib": {"path": "../shared-lib"}})
+        write_uv_lock(project_dir, [{"directory": "../shared-lib"}])
 
         worktree = tmp_path / "worktrees" / "myproject" / "task-1"
         worktree.mkdir(parents=True)
@@ -168,7 +162,7 @@ class TestIdempotency:
         shared_lib.mkdir()
         wrong_target = tmp_path / "work" / "other"
         wrong_target.mkdir()
-        write_pyproject(project_dir, {"shared-lib": {"path": "../shared-lib"}})
+        write_uv_lock(project_dir, [{"directory": "../shared-lib"}])
 
         worktree = tmp_path / "worktrees" / "myproject" / "task-1"
         worktree.mkdir(parents=True)
@@ -191,7 +185,7 @@ class TestIdempotency:
         project_dir.mkdir(parents=True)
         shared_lib = tmp_path / "work" / "shared-lib"
         shared_lib.mkdir()
-        write_pyproject(project_dir, {"shared-lib": {"path": "../shared-lib"}})
+        write_uv_lock(project_dir, [{"directory": "../shared-lib"}])
 
         worktree = tmp_path / "worktrees" / "myproject" / "task-1"
         worktree.mkdir(parents=True)
@@ -212,7 +206,7 @@ class TestIdempotency:
         project_dir.mkdir(parents=True)
         shared_lib = tmp_path / "work" / "shared-lib"
         shared_lib.mkdir()
-        write_pyproject(project_dir, {"shared-lib": {"path": "../shared-lib"}})
+        write_uv_lock(project_dir, [{"directory": "../shared-lib"}])
 
         worktree1 = tmp_path / "worktrees" / "myproject" / "task-1"
         worktree1.mkdir(parents=True)
@@ -243,7 +237,7 @@ class TestWorkspaceMemberSkip:
         sub_pkg = worktree / "packages" / "sub"
         sub_pkg.mkdir(parents=True)
         # The dep path resolves inside the worktree — should be skipped
-        write_pyproject(project_dir, {"sub": {"path": "./packages/sub"}})
+        write_uv_lock(project_dir, [{"directory": "./packages/sub"}])
         config = make_config(project_dir)
         _create_local_dep_symlinks(config, worktree)
         # No symlink created because the path is inside the worktree

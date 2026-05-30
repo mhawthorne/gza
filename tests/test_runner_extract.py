@@ -14,6 +14,7 @@ from gza.providers import RunResult
 from gza.runner import (
     EXTRACTION_ALREADY_MERGED_COMPLETION_REASON,
     EXTRACTION_PRECHECK_FAILURE_REASON,
+    ProjectBoundary,
     _complete_code_task,
     _seed_extraction_bundle_if_present,
     run,
@@ -48,6 +49,13 @@ def _build_config(tmp_path: Path, db_path: Path) -> Config:
     config.learnings_window = 25
     config.claude = Mock(args=[])
     config.tmux = Mock(session_name=None)
+    config.docker_volumes = []
+    config.enforce_project_scope = True
+    config._project_boundary_cache = ProjectBoundary(
+        repo_root=tmp_path,
+        scope_root=Path("."),
+        local_dependencies=(),
+    )
     return config
 
 
@@ -517,6 +525,110 @@ def test_complete_code_task_does_not_commit_when_seeded_paths_reverted_to_clean(
     assert refreshed.failure_reason == "UNKNOWN"
 
 
+def test_complete_code_task_fails_on_out_of_scope_paths(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = store.add("Scoped task", task_type="implement")
+    task.slug = "20260427-scope"
+    task.status = "in_progress"
+    store.update(task)
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path / "services" / "foo"
+    config.project_dir.mkdir(parents=True)
+    config.log_path = config.project_dir / ".gza" / "logs"
+    config.log_path.mkdir(parents=True, exist_ok=True)
+    config.enforce_project_scope = True
+
+    log_file = config.log_path / "scope.log"
+    worktree_summary_path = tmp_path / "worktree-summary.md"
+    worktree_summary_path.write_text("# Summary\n")
+    summary_path = config.project_dir / ".gza" / "summaries" / "scope.md"
+
+    worktree_git = Mock()
+    worktree_git.status_porcelain.return_value = {("M", "services/bar/file.py")}
+
+    with patch("gza.runner._project_boundary") as mock_boundary:
+        mock_boundary.return_value = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        rc = _complete_code_task(
+            task,
+            config,
+            store,
+            worktree_git,
+            log_file,
+            "feature/scope",
+            TaskStats(duration_seconds=1.0, num_steps_computed=1, cost_usd=0.0),
+            0,
+            pre_run_status=set(),
+            worktree_summary_path=worktree_summary_path,
+            summary_path=summary_path,
+            summary_dir=summary_path.parent,
+        )
+
+    assert rc == 0
+    worktree_git.add.assert_not_called()
+    worktree_git.commit.assert_not_called()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert refreshed.failure_reason == "PROJECT_SCOPE_VIOLATION"
+
+
+def test_complete_code_task_allows_out_of_scope_paths_for_cross_project_tag(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = store.add("Cross-project task", task_type="implement")
+    task.slug = "20260427-cross-project"
+    task.status = "in_progress"
+    task.tags = ("cross-project",)
+    store.update(task)
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path / "services" / "foo"
+    config.project_dir.mkdir(parents=True)
+    config.log_path = config.project_dir / ".gza" / "logs"
+    config.log_path.mkdir(parents=True, exist_ok=True)
+    config.enforce_project_scope = True
+
+    log_file = config.log_path / "cross-project.log"
+    worktree_summary_path = tmp_path / "worktree-summary.md"
+    worktree_summary_path.write_text("# Summary\n")
+    summary_path = config.project_dir / ".gza" / "summaries" / "cross-project.md"
+
+    worktree_git = Mock()
+    worktree_git.status_porcelain.return_value = {("M", "services/bar/file.py")}
+    worktree_git.default_branch.return_value = "main"
+    worktree_git.get_diff_numstat.return_value = "1\t1\tservices/bar/file.py\n"
+    worktree_git._run.return_value = Mock(stdout="", returncode=0, stderr="")
+
+    with patch("gza.runner._project_boundary") as mock_boundary, \
+         patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+        mock_boundary.return_value = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        rc = _complete_code_task(
+            task,
+            config,
+            store,
+            worktree_git,
+            log_file,
+            "feature/cross-project",
+            TaskStats(duration_seconds=1.0, num_steps_computed=1, cost_usd=0.0),
+            0,
+            pre_run_status=set(),
+            worktree_summary_path=worktree_summary_path,
+            summary_path=summary_path,
+            summary_dir=summary_path.parent,
+        )
+
+    assert rc == 0
+    worktree_git.add.assert_called_once_with("services/bar/file.py")
+    assert worktree_git.commit.call_count == 1
+
 def test_run_marks_failed_when_extraction_precheck_fails(tmp_path: Path) -> None:
     db_path = tmp_path / "test.db"
     store = SqliteTaskStore(db_path, prefix="testproject")
@@ -581,11 +693,12 @@ def test_run_marks_failed_when_extraction_precheck_fails(tmp_path: Path) -> None
     )
 
     with (
-        patch("gza.runner.get_provider", return_value=mock_provider),
-        patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
-        patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
-        patch("gza.runner.load_dotenv"),
-    ):
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
+            patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+            patch("gza.runner._resolve_repo_root", return_value=tmp_path),
+            patch("gza.runner.load_dotenv"),
+        ):
         rc = run(config, task_id=task.id)
 
     assert rc == 1
