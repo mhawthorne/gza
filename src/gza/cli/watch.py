@@ -6,6 +6,7 @@ import hashlib
 import io
 import os
 import signal
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1945,11 +1946,20 @@ def cmd_watch(args: argparse.Namespace) -> int:
         startup_fingerprint=_installed_gza_package_fingerprint()
     )
     stop_requested = False
+    stop_signal: int | None = None
+    sigint_count = 0
 
     def _handle_shutdown(_signum: int, _frame: object) -> None:
-        nonlocal stop_requested
+        nonlocal stop_requested, stop_signal, sigint_count
+        if _signum == signal.SIGINT:
+            sigint_count += 1
+            if sigint_count >= 2:
+                raise KeyboardInterrupt
         stop_requested = True
+        stop_signal = _signum
         log.emit("INFO", "shutting down (workers left running)")
+        if quiet:
+            print("shutting down (workers left running)", file=sys.stderr, flush=True)
 
     old_sigint = signal.signal(signal.SIGINT, _handle_shutdown)
     old_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
@@ -1991,8 +2001,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
             if preview_result.work_done:
                 try:
                     answer = input("\nProceed? [y/N] ").strip().lower()
-                except (EOFError, KeyboardInterrupt):
+                except EOFError:
                     answer = ""
+                except KeyboardInterrupt:
+                    raise
                 if answer not in ("y", "yes"):
                     print("Aborted.")
                     return 0
@@ -2116,6 +2128,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
     finally:
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
+
+    if stop_signal is not None:
+        return 128 + stop_signal
 
     return 0
 

@@ -14,6 +14,9 @@ SELF_PATH = Path(__file__).resolve()
 # - based_on chain cycle detection
 # - historical docs that refer to removed legacy filenames/commands verbatim
 ALLOWED_CYCLE_LINES = {
+    ("docs/incidents/2026-05-30-rebase-noop-loop.md", "  watch scheduler (urgent → recovery → normal) with a per-cycle recovery cap;"),
+    ("docs/incidents/2026-05-30-rebase-noop-loop.md", "mislabeled as `GIT_ERROR`, and nothing stopped the cycle — so ~95 identical dead"),
+    ("docs/incidents/2026-05-30-rebase-noop-loop.md", "  watch cycle. Forever."),
     ("docs/internal/stats-subcommands.md", "Ports the functionality of the former `bin/review-cycle-stats.py` script into the CLI. Shows per-implementation-task review iteration stats, weekly groupings, iteration-count distribution, and per-model issue counts."),
     ("docs/internal/stats-subcommands.md", "- `bin/review-cycle-stats.py` was removed in the same PR this subcommand was added. Use `gza stats reviews` instead."),
     ("src/gza/lineage.py", '                return None, f"{label} task {task.id} has a cycle in its based_on chain"'),

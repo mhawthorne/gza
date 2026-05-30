@@ -4,6 +4,7 @@
 import importlib
 import os
 import re
+import signal
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -957,6 +958,95 @@ class TestCommandAliases:
         args = cmd_watch.call_args.args[0]
         assert args.command == "watch"
         assert args.batch == 2
+
+    @pytest.mark.parametrize(
+        ("command", "argv_tail", "patch_target"),
+        [
+            ("watch", [], "gza.cli.main.cmd_watch"),
+            ("iterate", ["testproject-1"], "gza.cli.main.cmd_iterate"),
+        ],
+    )
+    def test_keyboard_interrupt_returns_130_without_traceback(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        command: str,
+        argv_tail: list[str],
+        patch_target: str,
+    ) -> None:
+        """Top-level dispatch should convert KeyboardInterrupt into a clean SIGINT exit."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(sys, "argv", ["gza", command, *argv_tail, "--project", str(tmp_path)]),
+            patch(patch_target, side_effect=KeyboardInterrupt),
+        ):
+            rc = main()
+
+        captured = capsys.readouterr()
+        assert rc == 130
+        assert captured.out == ""
+        assert captured.err == "stopping due to ctrl+c\n"
+        assert "Traceback" not in captured.err
+
+    def test_keyboard_interrupt_during_project_discovery_returns_130(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Project-dir discovery should use the same clean SIGINT exit path."""
+        from gza.cli.main import main
+
+        with (
+            patch.object(sys, "argv", ["gza", "watch"]),
+            patch("gza.cli.main.discover_project_dir", side_effect=KeyboardInterrupt),
+        ):
+            rc = main()
+
+        captured = capsys.readouterr()
+        assert rc == 130
+        assert captured.out == ""
+        assert captured.err == "stopping due to ctrl+c\n"
+        assert "Traceback" not in captured.err
+
+    def test_watch_second_sigint_escapes_to_top_level_clean_shutdown(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A second Ctrl-C during watch should unwind promptly to the top-level 130 exit."""
+        from gza.cli.main import main
+        from gza.cli.watch import _CycleResult
+
+        setup_config(tmp_path)
+        handlers: dict[int, object] = {}
+
+        def fake_signal(sig, handler):
+            previous = handlers.get(sig, signal.SIG_DFL)
+            handlers[sig] = handler
+            return previous
+
+        def fake_run_cycle(**_kwargs):
+            handler = handlers[signal.SIGINT]
+            assert callable(handler)
+            handler(signal.SIGINT, None)
+            handler(signal.SIGINT, None)
+            return _CycleResult(True, 0, 0)
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["gza", "watch", "--project", str(tmp_path), "--yes", "--quiet"],
+            ),
+            patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
+            patch("gza.cli.watch._run_cycle", side_effect=fake_run_cycle),
+        ):
+            rc = main()
+
+        captured = capsys.readouterr()
+        assert rc == 130
+        assert captured.out == ""
+        assert captured.err == "shutting down (workers left running)\nstopping due to ctrl+c\n"
+        assert "Traceback" not in captured.err
 
     @pytest.mark.parametrize(
         ("queue_action", "argv_tail"),

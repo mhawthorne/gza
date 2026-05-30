@@ -1485,6 +1485,10 @@ Continuously maintain a target number of concurrent workers.
 uv run gza watch [options]
 ```
 
+Press `Ctrl+C` to stop the watch loop cleanly. `gza` exits with status `130`
+and leaves any in-flight workers running. Press `Ctrl+C` a second time if you
+need to break out promptly from a long or blocked watch pass.
+
 | Option | Description |
 |--------|-------------|
 | `--batch N` | Target concurrent workers (default: `watch.batch` or `5`) |

@@ -8622,8 +8622,10 @@ def test_watch_cycle_restart_failed_queue_events_use_queue_label(tmp_path: Path)
     assert not any(line.split(maxsplit=2)[1] == "PHASE" for line in log_lines)
 
 
-def test_cmd_watch_interrupts_sleep_promptly_on_signal(tmp_path: Path) -> None:
-    """Signal-triggered shutdown should interrupt poll waiting without sleeping the full interval."""
+def test_cmd_watch_interrupts_sleep_promptly_on_sigint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SIGINT should stop watch promptly, emit a clean shutdown line, and return 130."""
     setup_config(tmp_path)
 
     args = argparse.Namespace(
@@ -8649,9 +8651,9 @@ def test_cmd_watch_interrupts_sleep_promptly_on_signal(tmp_path: Path) -> None:
     def fake_sleep(seconds: float) -> None:
         sleep_calls.append(seconds)
         if len(sleep_calls) == 1:
-            handler = handlers[signal.SIGTERM]
+            handler = handlers[signal.SIGINT]
             assert callable(handler)
-            handler(signal.SIGTERM, None)
+            handler(signal.SIGINT, None)
 
     with (
         patch("gza.cli.watch._run_cycle", return_value=_CycleResult(True, 0, 0)) as run_cycle,
@@ -8660,10 +8662,37 @@ def test_cmd_watch_interrupts_sleep_promptly_on_signal(tmp_path: Path) -> None:
     ):
         rc = cmd_watch(args)
 
-    assert rc == 0
+    captured = capsys.readouterr()
+    assert rc == 130
     assert run_cycle.call_count == 1
     assert sleep_calls
     assert max(sleep_calls) < args.poll
+    assert captured.out == ""
+    assert captured.err == "shutting down (workers left running)\n"
+
+
+def test_cmd_watch_does_not_swallow_keyboard_interrupt_during_confirmation(tmp_path: Path) -> None:
+    """Ctrl-C during the confirmation prompt should escape for top-level SIGINT handling."""
+    setup_config(tmp_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=300,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=False,
+    )
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(True, 0, 0)),
+        patch("builtins.input", side_effect=KeyboardInterrupt),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: signal.SIG_DFL),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            cmd_watch(args)
 
 
 def test_watch_cycle_logs_create_review_validation_skip(tmp_path: Path) -> None:

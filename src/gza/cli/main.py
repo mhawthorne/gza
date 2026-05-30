@@ -157,6 +157,11 @@ def add_hidden_parser(subparsers, name: str, **kwargs):
     return parser
 
 
+def _keyboard_interrupt_exit() -> int:
+    print("stopping due to ctrl+c", file=sys.stderr)
+    return 130
+
+
 def main() -> int:
     parser = GzaArgumentParser(
         description="Gza - AI agent task runner",
@@ -2431,20 +2436,23 @@ def main() -> int:
 
     # Validate and resolve project_dir
     project_explicit = False
-    if hasattr(args, "project_dir"):
-        raw_project = getattr(args, "project_dir", None)
-        project_explicit = raw_project is not None
-        args.project_dir = Path(raw_project or ".").resolve()
-        setattr(args, "project_explicit", project_explicit)
-        if not args.project_dir.is_dir():
-            print(f"Error: {args.project_dir} is not a directory")
-            return 1
-        if not project_explicit:
-            try:
-                args.project_dir = discover_project_dir(args.project_dir)
-            except ConfigError:
-                # Let the command-specific config load surface the normal error path.
-                pass
+    try:
+        if hasattr(args, "project_dir"):
+            raw_project = getattr(args, "project_dir", None)
+            project_explicit = raw_project is not None
+            args.project_dir = Path(raw_project or ".").resolve()
+            setattr(args, "project_explicit", project_explicit)
+            if not args.project_dir.is_dir():
+                print(f"Error: {args.project_dir} is not a directory")
+                return 1
+            if not project_explicit:
+                try:
+                    args.project_dir = discover_project_dir(args.project_dir)
+                except ConfigError:
+                    # Let the command-specific config load surface the normal error path.
+                    pass
+    except KeyboardInterrupt:
+        return _keyboard_interrupt_exit()
 
     # Commands where reconciling orphaned in-progress tasks is useful.
     _RECONCILE_COMMANDS = {
@@ -2569,6 +2577,8 @@ def main() -> int:
             return cmd_skills_install(args, default_targets=["all"])
         elif args.command == "migrate":
             return _cmd_migrate(args)
+    except KeyboardInterrupt:
+        return _keyboard_interrupt_exit()
     except ManualMigrationRequired as e:
         print(f"Error: {e}", file=sys.stderr)
         print("Run 'gza migrate' to upgrade the database.", file=sys.stderr)
