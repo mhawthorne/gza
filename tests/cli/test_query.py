@@ -184,6 +184,31 @@ def _lineage_root_id(output: str) -> str:
     return match.group(0)
 
 
+def _seed_same_branch_merge_owner_and_improve(tmp_path: Path) -> tuple[Task, Task]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Owning implement", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.has_commits = True
+    owner.branch = "feature/shared-branch"
+    owner.merge_status = "unmerged"
+    owner.completed_at = datetime(2026, 5, 4, 11, 0, 0, tzinfo=UTC)
+    store.update(owner)
+
+    improve = store.add("Shared-branch improve", task_type="improve", based_on=owner.id)
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.has_commits = True
+    improve.branch = owner.branch
+    improve.merge_status = "unmerged"
+    improve.completed_at = datetime(2026, 5, 4, 11, 10, 0, tzinfo=UTC)
+    store.update(improve)
+
+    return owner, improve
+
+
 def _setup_lineage_owner_parity_fixture(tmp_path: Path) -> dict[str, Task]:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -4681,34 +4706,15 @@ class TestShowCommand:
         assert "Lifecycle:" not in output
         assert "Lineage:" not in output
 
-    def test_show_prints_merge_status_only_for_merge_owner_rows(
+    def test_show_prints_merge_status_for_merge_owner_rows(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Show should suppress stale row-local merge metadata on same-branch follow-up tasks."""
+        """Show should render merge status for the branch-owning row."""
         from gza.cli.query import cmd_show
 
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
+        owner, _improve = _seed_same_branch_merge_owner_and_improve(tmp_path)
 
-        owner = store.add("Owning implement", task_type="implement")
-        assert owner.id is not None
-        owner.status = "completed"
-        owner.has_commits = True
-        owner.branch = "feature/shared-branch"
-        owner.merge_status = "unmerged"
-        owner.completed_at = datetime(2026, 5, 4, 11, 0, 0, tzinfo=UTC)
-        store.update(owner)
-
-        improve = store.add("Shared-branch improve", task_type="improve", based_on=owner.id)
-        assert improve.id is not None
-        improve.status = "completed"
-        improve.has_commits = True
-        improve.branch = owner.branch
-        improve.merge_status = "unmerged"
-        improve.completed_at = datetime(2026, 5, 4, 11, 10, 0, tzinfo=UTC)
-        store.update(improve)
-
-        owner_exit = cmd_show(
+        exit_code = cmd_show(
             argparse.Namespace(
                 project_dir=tmp_path,
                 task_id=str(owner.id),
@@ -4720,9 +4726,20 @@ class TestShowCommand:
                 metadata_only=True,
             )
         )
-        owner_output = capsys.readouterr().out
+        output = capsys.readouterr().out
 
-        improve_exit = cmd_show(
+        assert exit_code == 0
+        assert "Merge Status: unmerged" in output
+
+    def test_show_suppresses_merge_status_for_same_branch_follow_up_rows(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Show should suppress stale row-local merge metadata on same-branch follow-up tasks."""
+        from gza.cli.query import cmd_show
+
+        _owner, improve = _seed_same_branch_merge_owner_and_improve(tmp_path)
+
+        exit_code = cmd_show(
             argparse.Namespace(
                 project_dir=tmp_path,
                 task_id=str(improve.id),
@@ -4734,13 +4751,11 @@ class TestShowCommand:
                 metadata_only=True,
             )
         )
-        improve_output = capsys.readouterr().out
+        output = capsys.readouterr().out
 
-        assert owner_exit == 0
-        assert "Merge Status: unmerged" in owner_output
-        assert improve_exit == 0
-        assert "Type: improve" in improve_output
-        assert "Merge Status:" not in improve_output
+        assert exit_code == 0
+        assert "Type: improve" in output
+        assert "Merge Status:" not in output
 
     def test_show_failed_recovery_chain_needs_attention_uses_shared_wording(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

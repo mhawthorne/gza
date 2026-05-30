@@ -14,7 +14,6 @@ _ALLOWED_DIRECT_FAILURE_REASON_ASSIGNMENTS = {
     ("src/gza/db.py", "mark_failed"),
 }
 
-
 class _FailureReasonOwnershipVisitor(ast.NodeVisitor):
     def __init__(self, *, repo_root: Path, path: Path) -> None:
         self._repo_root = repo_root
@@ -75,7 +74,10 @@ class _FailureReasonOwnershipVisitor(ast.NodeVisitor):
 def _find_failure_reason_ownership_violations(repo_root: Path, source_root: Path) -> list[str]:
     violations: list[str] = []
     for path in sorted(source_root.rglob("*.py")):
-        tree = ast.parse(path.read_text(), filename=str(path))
+        source = path.read_text()
+        if "failure_reason" not in source and "mark_failed" not in source:
+            continue
+        tree = ast.parse(source, filename=str(path))
         visitor = _FailureReasonOwnershipVisitor(repo_root=repo_root, path=path)
         visitor.visit(tree)
         violations.extend(visitor.violations)
@@ -139,6 +141,55 @@ def test_failure_reason_ownership_guard_flags_direct_production_assignment(tmp_p
     (source_root / "bad.py").write_text(
         "def bypass_shared_owner(task):\n"
         "    task.failure_reason = \"TEST_FAILURE\"\n",
+        encoding="utf-8",
+    )
+
+    assert _find_failure_reason_ownership_violations(repo_root, source_root) == [
+        "src/gza/bad.py:2",
+    ]
+
+
+def test_failure_reason_ownership_guard_prefilter_keeps_keyword_and_whitespace_variants(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path
+    source_root = repo_root / "src" / "gza"
+    source_root.mkdir(parents=True)
+
+    (source_root / "good.py").write_text(
+        "class Recorder:\n"
+        "    def mark_failed(self, *, failure_reason=None):\n"
+        "        return failure_reason\n\n"
+        "def allowed(recorder):\n"
+        "    recorder.mark_failed (\n"
+        "        failure_reason='TIMEOUT',\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+    (source_root / "bad.py").write_text(
+        "def bad(task):\n"
+        "    task.failure_reason = (\n"
+        "        'TIMEOUT'\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+
+    assert _find_failure_reason_ownership_violations(repo_root, source_root) == [
+        "src/gza/bad.py:2",
+        "src/gza/good.py:6",
+    ]
+
+
+def test_failure_reason_ownership_guard_prefilter_keeps_annotated_assignment_variants(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path
+    source_root = repo_root / "src" / "gza"
+    source_root.mkdir(parents=True)
+
+    (source_root / "bad.py").write_text(
+        "def bad(task):\n"
+        "    task.failure_reason: str = 'TIMEOUT'\n",
         encoding="utf-8",
     )
 

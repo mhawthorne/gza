@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
+from pathlib import Path
 
+import gza.test_latency as test_latency
 from gza.test_latency import MeasuredTest, build_report, render_json, render_markdown, render_summary
 
 
@@ -75,3 +78,19 @@ def test_sub_millisecond_percentiles_still_select_slow_tail_rows() -> None:
     assert "## Slow tests (≥p95)" in markdown
     assert "1ms" in markdown
     assert "`tests/test_alpha.py::test_slow`" in markdown
+
+
+def test_default_report_path_uses_tmp_under_repo_root(monkeypatch) -> None:
+    """Default latency reports should go under tmp/, not the tracked repo root."""
+    monkeypatch.setattr(test_latency, "_repo_root", lambda: Path("/repo"))
+    monkeypatch.setattr(
+        test_latency,
+        "datetime",
+        type("FakeDateTime", (), {"now": staticmethod(lambda: datetime(2026, 5, 30, 3, 31, 59))}),
+    )
+
+    markdown_path = test_latency._default_report_path(json_mode=False)
+    json_path = test_latency._default_report_path(json_mode=True)
+
+    assert markdown_path == "/repo/tmp/test-latency-20260530033159.md"
+    assert json_path == "/repo/tmp/test-latency-20260530033159.json"

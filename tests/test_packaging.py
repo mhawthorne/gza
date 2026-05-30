@@ -2,10 +2,29 @@
 
 import ast
 import importlib.util
+import re
 import tomllib
 from pathlib import Path
 
 import pytest
+
+
+_DIRECT_GIT_RUN_CALL = re.compile(r"\.\s*_run\s*\(")
+_CLI_SUBPROCESS_RUN_CALL = re.compile(r"\bsubprocess\s*\.\s*run\s*\(")
+
+
+def _has_direct_git_run_candidate(source: str) -> bool:
+    return _DIRECT_GIT_RUN_CALL.search(source) is not None
+
+
+def _has_cli_subprocess_candidate(source: str) -> bool:
+    return _CLI_SUBPROCESS_RUN_CALL.search(source) is not None and (
+        "sys.executable" in source
+        or "'gza'" in source
+        or '"gza"' in source
+        or "'uv'" in source
+        or '"uv"' in source
+    )
 
 
 def _load_module(path: Path, module_name: str):
@@ -17,21 +36,39 @@ def _load_module(path: Path, module_name: str):
     return module
 
 
+def _iter_unit_suite_boundary_candidate_files(tests_root: Path) -> list[Path]:
+    candidates: set[Path] = set(tests_root.rglob("test_*.py"))
+    candidates.update(tests_root.rglob("conftest.py"))
+
+    helpers_root = tests_root / "helpers"
+    if helpers_root.exists():
+        candidates.update(helpers_root.rglob("*.py"))
+
+    return sorted(candidates)
+
+
 def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
     violations: list[str] = []
-
-    suspicious_patterns = ("_run(", "subprocess.run(", "run_gza_subprocess", "tests_functional")
-    unit_files = sorted(tests_root.rglob("*.py"))
+    unit_files = _iter_unit_suite_boundary_candidate_files(tests_root)
 
     for test_file in unit_files:
         source = test_file.read_text()
-        if not any(pattern in source for pattern in suspicious_patterns):
+        has_direct_git_run_call = _has_direct_git_run_candidate(source)
+        has_cli_subprocess_call = _has_cli_subprocess_candidate(source)
+        has_cli_subprocess_helper = "run_gza_subprocess" in source
+        has_tests_functional_import = "tests_functional" in source
+        if not (
+            has_direct_git_run_call
+            or has_cli_subprocess_call
+            or has_cli_subprocess_helper
+            or has_tests_functional_import
+        ):
             continue
 
         module = ast.parse(source, filename=str(test_file))
         parent_map = (
             {child: parent for parent in ast.walk(module) for child in ast.iter_child_nodes(parent)}
-            if "_run(" in source
+            if has_direct_git_run_call
             else {}
         )
 
@@ -96,13 +133,16 @@ def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
                 f"{test_file}:{node.lineno} direct Git._run shell command belongs in tests_functional/"
             )
 
-        for node in ast.walk(module):
-            if not isinstance(node, ast.ImportFrom):
-                continue
-            if node.module == "tests_functional" or (node.module and node.module.startswith("tests_functional.")):
-                violations.append(
-                    f"{test_file}:{node.lineno} unit tests must not import tests_functional modules"
-                )
+        if "tests_functional" in source:
+            for node in ast.walk(module):
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                if node.module == "tests_functional" or (
+                    node.module and node.module.startswith("tests_functional.")
+                ):
+                    violations.append(
+                        f"{test_file}:{node.lineno} unit tests must not import tests_functional modules"
+                    )
 
     return violations
 
@@ -205,6 +245,59 @@ def test_unit_test_conftest_injects_only_unit_watchdog() -> None:
     assert plain_unit_2.markers[0].mark.kwargs == {"method": "signal"}
 
     assert explicit_timeout.markers == []
+
+
+def test_unit_test_conftest_injects_timeout_when_default_env_is_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tests/conftest.py should still inject a watchdog when the override env is unset."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    monkeypatch.delenv("GZA_UNIT_TEST_TIMEOUT_MS", raising=False)
+    module = _load_module(conftest_path, "tests_timeout_conftest_default")
+
+    class FakeItem:
+        def __init__(self) -> None:
+            self.markers: list[pytest.MarkDecorator] = []
+
+        def get_closest_marker(self, _name: str):
+            return None
+
+        def add_marker(self, marker: pytest.MarkDecorator) -> None:
+            self.markers.append(marker)
+
+    item = FakeItem()
+    module.pytest_collection_modifyitems([item])
+
+    assert module.UNIT_TEST_TIMEOUT_SECONDS == module.UNIT_TEST_TIMEOUT_MS / 1000
+    assert len(item.markers) == 1
+    assert item.markers[0].mark.args == (module.UNIT_TEST_TIMEOUT_SECONDS,)
+    assert item.markers[0].mark.kwargs == {"method": "signal"}
+
+
+def test_unit_test_conftest_uses_millisecond_timeout_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """tests/conftest.py should convert the millisecond override to the timeout marker budget."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    monkeypatch.setenv("GZA_UNIT_TEST_TIMEOUT_MS", "500")
+    module = _load_module(conftest_path, "tests_timeout_conftest_ms_override")
+
+    class FakeItem:
+        def __init__(self) -> None:
+            self.markers: list[pytest.MarkDecorator] = []
+
+        def get_closest_marker(self, _name: str):
+            return None
+
+        def add_marker(self, marker: pytest.MarkDecorator) -> None:
+            self.markers.append(marker)
+
+    item = FakeItem()
+    module.pytest_collection_modifyitems([item])
+
+    assert module.UNIT_TEST_TIMEOUT_MS == 500
+    assert module.UNIT_TEST_TIMEOUT_SECONDS == 0.5
+    assert len(item.markers) == 1
+    assert item.markers[0].mark.args == (0.5,)
+    assert item.markers[0].mark.kwargs == {"method": "signal"}
 
 
 def test_functional_suite_conftest_injects_functional_watchdog() -> None:
@@ -327,6 +420,82 @@ def test_unit_suite_boundary_flags_unmarked_direct_git_run(tmp_path: Path) -> No
 
     assert violations == [
         f"{nested_test}:5 direct Git._run shell command belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_whitespace_formatted_git_run(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_real_shell_spacing.py"
+    nested_test.write_text(
+        "from gza.git import Git\n\n"
+        "def test_real_git_shell(tmp_path):\n"
+        "    git = Git(tmp_path)\n"
+        "    git._run ('status')\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:5 direct Git._run shell command belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_spaced_dot_git_run(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_real_shell_spaced_dot.py"
+    nested_test.write_text(
+        "from gza.git import Git\n\n"
+        "def test_real_git_shell(tmp_path):\n"
+        "    git = Git(tmp_path)\n"
+        "    git . _run('status')\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:5 direct Git._run shell command belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_whitespace_formatted_cli_subprocess(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_cli_subprocess_spacing.py"
+    nested_test.write_text(
+        "import subprocess\n"
+        "import sys\n\n"
+        "def test_cli_subprocess_spacing():\n"
+        "    subprocess.run ([sys.executable, '-m', 'gza', 'next'])\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:5 CLI subprocess invocation belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_spaced_dot_cli_subprocess(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_cli_subprocess_spaced_dot.py"
+    nested_test.write_text(
+        "import subprocess\n"
+        "import sys\n\n"
+        "def test_cli_subprocess_spacing():\n"
+        "    subprocess . run([sys.executable, '-m', 'gza', 'next'])\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:5 CLI subprocess invocation belongs in tests_functional/"
     ]
 
 

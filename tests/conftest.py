@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-UNIT_TEST_TIMEOUT_SECONDS = int(os.environ.get("GZA_UNIT_TEST_TIMEOUT_SECONDS", "1"))
+UNIT_TEST_TIMEOUT_MS = int(os.environ.get("GZA_UNIT_TEST_TIMEOUT_MS", "1000"))
+UNIT_TEST_TIMEOUT_SECONDS = UNIT_TEST_TIMEOUT_MS / 1000
 
 
 def pytest_collection_modifyitems(items):

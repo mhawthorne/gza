@@ -13,6 +13,22 @@ the suite-wide default. The default catches drift at the smallest unit, at
 the moment a regression is introduced. Replacing it with a downstream bound
 trades early-localized detection for late-aggregate detection.
 
+For the unit suite, keep median latency below 25ms, p95 below 150ms, and p99
+below 250ms. Those are warning thresholds, not budgets to spend.
+
+The unit-suite watchdog is configured through `GZA_UNIT_TEST_TIMEOUT_MS`. In
+the cleanup stage, keep the effective default at 1000ms while driving the
+slow tail down. The rollout target is 500ms, and any unit test approaching
+that limit is a latency bug. Tests at or above 400ms require deliberate
+classification: optimize in place, move subprocess or real-shell coverage to
+`tests_functional/`, or add a narrow `@pytest.mark.timeout(1.0,
+method="signal")` override with a comment explaining why the test must remain
+in `tests/`.
+
+Fixture setup and teardown time count against the unit watchdog. Do not assume
+fixture cost is free, and do not switch to `func_only=True` just to hide slow
+setup or teardown.
+
 ## Don't concrete over removals
 
 When undoing a protection, leave the door open to re-add it. Assertions that
