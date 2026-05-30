@@ -21,8 +21,8 @@ gza migrate [--status]    # Run manual DB migrations (e.g. v25/v26 task-ID migra
 See `docs/` for detailed documentation:
 - [docs/configuration.md](docs/configuration.md) — full command list, all options, config reference
 - [docs/skills.md](docs/skills.md) — skill usage and authoring
-- [docs/tmux.md](docs/tmux.md) — tmux session attach/detach workflow
 - [docs/docker.md](docs/docker.md) — Docker setup, custom Dockerfiles, provider auth
+- [docs/internal/](docs/internal/README.md) — internal architecture, design notes & practices (index)
 
 ## Critical Rules
 
@@ -35,6 +35,8 @@ See `docs/` for detailed documentation:
 **Always run from the project root.** Gza uses the current directory to find `gza.yaml` and `.gza/`.
 
 **Do NOT run git commands.** Gza handles branching, committing, and pushing automatically.
+
+**Remote git is host-side only.** Agent context (the worktree, especially in Docker) has no network and no `origin/*` refs. Any operation that reaches origin — fetch, push, force-with-lease, rebase-onto-origin — must run in task context, never in an agent or `rebase` task. See [docs/internal/task-vs-agent-context.md](docs/internal/task-vs-agent-context.md).
 
 **Run /gza-test-and-fix before completing any task.** This runs mypy and pytest, fixes failures, and commits. Do not mark a task done until it passes.
 
@@ -88,9 +90,7 @@ Edit skills in `src/gza/skills/`, never in `.claude/skills/` (installed artifact
 
 ## Config Fields (new/notable)
 
-- `project_prefix` — prefix for generated task IDs (1–12 chars, lowercase alphanumeric only — no hyphens, since hyphen is the separator in task IDs). Defaults to `project_name`. Task IDs take the form `{prefix}-{decimal_seq}` (e.g. `gza-1234`). Also affects `task.slug`: `YYYYMMDD-{prefix}-{slug}`. See [docs/configuration.md](docs/configuration.md).
-- `theme` — built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. See [docs/configuration.md](docs/configuration.md).
-- `colors` — ad-hoc dict of `field_name: rich_color_string` applied on top of `theme`; overrides always win. Allowed in `gza.local.yaml`.
+- `project_prefix` — prefix for generated task IDs (1–12 chars, lowercase alphanumeric only — no hyphens, since hyphen is the separator in task IDs). Defaults to `project_name`. Task IDs take the form `{prefix}-{decimal_seq}` (e.g. `gza-1234`). Also affects `task.slug`: `YYYYMMDD-{prefix}-{slug}`. Full config reference (incl. `theme`/`colors`): [docs/configuration.md](docs/configuration.md).
 
 ## Conventions
 
