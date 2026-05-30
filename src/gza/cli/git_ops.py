@@ -48,6 +48,7 @@ from ..rebase_diff import capture_rebase_diff_baseline, compute_rebase_changed_d
 from ..rebase_publish import publish_rebased_branch
 from ..recovery_engine import list_failed_tasks_for_recovery, resolve_recovery_planning_task
 from ..runner import (
+    WIP_INTERRUPTED_COMMIT_SUBJECT,
     TaskExecutionLogger,
     ensure_task_log_path,
     get_effective_config_for_task,
@@ -269,9 +270,13 @@ def _reconcile_diverged_branch_with_origin(
             except GitError:
                 pass
             return BranchDivergenceReconcileResult(
-                status="needs_rebase",
-                message=f"Mechanical rebase onto '{remote_ref}' hit conflicts: {rebase_error}",
-                rebase_target=remote_ref,
+                status="needs_attention",
+                message=(
+                    f"SKIP: mechanical rebase onto '{remote_ref}' hit conflicts: {rebase_error}. "
+                    "Resolve the origin divergence manually; the sandboxed rebase worker cannot access "
+                    "that remote-tracking ref."
+                ),
+                attention_reason="reconcile-needs-manual-resolution",
             )
 
         publish_result = publish_rebased_branch(
@@ -315,16 +320,48 @@ def _is_benign_gza_rewrite_divergence(
         return False
 
     # Rewritten task branches keep the same patch content while changing commit IDs
-    # and often their base ancestry. Require symmetric patch-equivalence so we only
-    # publish directly when each side's unique commits are already applied on the
-    # other side. This preserves the paused-savepoint finalize case and broader
-    # gza-driven rewrites, while still falling back to fetch/rebase when the remote
-    # ref contains newly visible external commits.
-    return git.is_merged(branch, into=remote_ref, use_cherry=True) and git.is_merged(
+    # and often their base ancestry. Publish directly when we can prove either
+    # symmetric patch-equivalence or that the remote-only commits are gza-authored
+    # dead WIP savepoints superseded by newer local work.
+    if git.is_merged(branch, into=remote_ref, use_cherry=True) and git.is_merged(
         remote_ref,
         into=branch,
         use_cherry=True,
+    ):
+        return True
+    return _remote_unique_commits_are_all_wip_savepoints(
+        git,
+        branch=branch,
+        remote_ref=remote_ref,
     )
+
+
+def _remote_unique_commits_are_all_wip_savepoints(
+    git: Git,
+    *,
+    branch: str,
+    remote_ref: str,
+) -> bool:
+    """Return True when the remote-only side is entirely stale gza WIP savepoints."""
+    merge_base_result = git._run("merge-base", branch, remote_ref, check=False)
+    if merge_base_result.returncode != 0:
+        return False
+    merge_base = merge_base_result.stdout.strip()
+    if not merge_base:
+        return False
+
+    remote_unique_subjects_result = git._run(
+        "log",
+        "--format=%s",
+        f"{merge_base}..{remote_ref}",
+        "--not",
+        branch,
+        check=False,
+    )
+    if remote_unique_subjects_result.returncode != 0:
+        return False
+    subjects = [line.strip() for line in remote_unique_subjects_result.stdout.splitlines() if line.strip()]
+    return bool(subjects) and all(subject.startswith(WIP_INTERRUPTED_COMMIT_SUBJECT) for subject in subjects)
 
 
 def _tracking_ref_refresh_command(*, remote: str, branch: str) -> str:

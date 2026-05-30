@@ -1281,6 +1281,7 @@ REVIEW_DIR = f".{APP_NAME}/reviews"
 INTERNAL_DIR = f".{APP_NAME}/internal"
 SUMMARY_DIR = f".{APP_NAME}/summaries"
 WIP_DIR = f".{APP_NAME}/wip"
+WIP_INTERRUPTED_COMMIT_SUBJECT = "WIP: gza task interrupted"
 BACKUP_DIR = f".{APP_NAME}/backups"
 
 
@@ -2558,7 +2559,12 @@ def _save_wip_changes(
 
     # Commit changes with --no-verify
     try:
-        worktree_git._run("commit", "--no-verify", "-m", f"WIP: gza task interrupted\n\nTask ID: {task.slug}")
+        worktree_git._run(
+            "commit",
+            "--no-verify",
+            "-m",
+            f"{WIP_INTERRUPTED_COMMIT_SUBJECT}\n\nTask ID: {task.slug}",
+        )
         console.print(f"[yellow]Saved WIP commit on branch: {branch_name}[/yellow]")
     except GitError as e:
         # If commit fails, that's okay - we have the diff backup
@@ -2591,7 +2597,7 @@ def _restore_wip_changes(
     # Check if the last commit is a WIP commit
     try:
         last_commit_msg = worktree_git._run("log", "-1", "--pretty=%B", check=False).stdout.strip()
-        if last_commit_msg.startswith("WIP: gza task interrupted"):
+        if last_commit_msg.startswith(WIP_INTERRUPTED_COMMIT_SUBJECT):
             console.print("[green]Found WIP commit on branch - resuming from there[/green]")
             return
     except GitError:

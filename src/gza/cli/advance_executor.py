@@ -63,9 +63,10 @@ class AdvanceActionExecutionContext:
 class BranchDivergenceReconcileResult:
     """Outcome of a direct local/origin branch-divergence reconciliation attempt."""
 
-    status: Literal["reconciled", "needs_rebase", "error"]
+    status: Literal["reconciled", "needs_rebase", "needs_attention", "error"]
     message: str
     rebase_target: str | None = None
+    attention_reason: str | None = None
 
 
 @dataclass
@@ -941,6 +942,14 @@ def execute_advance_action(
                 action_type=action_type,
                 status="error",
                 message=outcome.message,
+            )
+        if outcome.status == "needs_attention":
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message=outcome.message,
+                attention_type="needs_discussion",
+                attention_reason=outcome.attention_reason or "reconcile-needs-manual-resolution",
             )
 
         rebase_target = outcome.rebase_target or f"origin/{task.branch}"

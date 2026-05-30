@@ -9,6 +9,7 @@ import pytest
 from gza.cli.git_ops import _reconcile_diverged_branch_with_origin
 from gza.config import Config
 from gza.git import Git, active_worktree_path_for_branch
+from gza.runner import WIP_INTERRUPTED_COMMIT_SUBJECT
 from tests.cli.conftest import make_store, run_gza, setup_config
 from tests_functional.git_helpers import setup_git_repo_with_task_branch
 
@@ -28,7 +29,7 @@ def _setup_git_repo(tmp_path: Path) -> Git:
 
 
 def test_reconcile_diverged_branch_with_origin_force_pushes_paused_savepoint_rewrite(tmp_path: Path) -> None:
-    """Equivalent paused-savepoint divergence should publish directly without rebase."""
+    """Finalized local work should clobber a stale remote WIP savepoint with a lease."""
     setup_config(tmp_path)
     config = Config.load(tmp_path)
     git = _setup_git_repo(tmp_path)
@@ -42,16 +43,16 @@ def test_reconcile_diverged_branch_with_origin_force_pushes_paused_savepoint_rew
     branch = "feature/rewrite"
     file_path = tmp_path / "feature.txt"
     git._run("checkout", "-b", branch)
-    file_path.write_text("finalized\n")
+    file_path.write_text("partial\n")
     git._run("add", "feature.txt")
-    git._run("commit", "-m", "WIP: gza task paused")
+    git._run("commit", "-m", f"{WIP_INTERRUPTED_COMMIT_SUBJECT}\n\nTask ID: gza-1")
     git._run("push", "-u", "origin", branch)
 
     remote_wip_tip = git.rev_parse(f"origin/{branch}")
     base_tip = git.rev_parse("main")
 
     git._run("reset", "--hard", base_tip)
-    file_path.write_text("finalized\n")
+    file_path.write_text("partial\nfinalized\n")
     git._run("add", "feature.txt")
     git._run("commit", "-m", "Finalize task")
     local_final_tip = git.rev_parse(branch)
