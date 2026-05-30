@@ -374,7 +374,8 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
         elif is_shared_branch_descendant(task, root):
             owner = root
         elif (
-            (recovery_root_id := get_recovery_chain_root_task_id(store, task)) is not None
+            task.status == "failed"
+            and (recovery_root_id := get_recovery_chain_root_task_id(store, task)) is not None
             and recovery_root_id != task.id
             and recovery_root_id in task_by_id
         ):

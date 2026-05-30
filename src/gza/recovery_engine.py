@@ -232,9 +232,9 @@ def _classify_recovery_edge(parent: DbTask, child: DbTask) -> RecoveryRole | Non
     if child.recovery_origin == "manual":
         return None
     if child.recovery_origin == "resume":
-        return "resume" if _is_resume_recovery_edge(parent, child) else None
+        return "resume"
     if child.recovery_origin == "retry":
-        return "retry" if _matches_retry_recovery_invariants(parent, child) else None
+        return "retry"
     return _classify_legacy_recovery_edge(parent, child)
 
 

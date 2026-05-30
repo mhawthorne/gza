@@ -631,6 +631,46 @@ def test_recovery_engine_marks_multi_step_resume_chain_as_resolved(tmp_path: Pat
     assert get_recovery_chain_root_task_id(store, completed_resume) == root.id
 
 
+def test_recovery_engine_marks_explicit_forked_resume_chain_as_resolved(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="implement")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "MAX_TURNS"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type=root.task_type, based_on=root.id, recovery_origin="resume")
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "MAX_TURNS"
+    failed_resume.session_id = "sess-forked"
+    failed_resume.branch = "feature/root-2"
+    failed_resume.completed_at = datetime.now(UTC)
+    store.update(failed_resume)
+
+    completed_resume = store.add(
+        failed_resume.prompt,
+        task_type=failed_resume.task_type,
+        based_on=failed_resume.id,
+        recovery_origin="resume",
+    )
+    assert completed_resume.id is not None
+    completed_resume.status = "completed"
+    completed_resume.session_id = failed_resume.session_id
+    completed_resume.branch = failed_resume.branch
+    completed_resume.completed_at = datetime.now(UTC)
+    store.update(completed_resume)
+
+    assert is_chain_resolved_by_recovery(store, root) is True
+    assert get_completed_recovery_descendant(store, root).id == completed_resume.id
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == []
+
+
 def test_get_completed_sibling_recovery_returns_completed_resume_sibling(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -1562,6 +1602,55 @@ def test_recovery_engine_completed_same_payload_legacy_manual_follow_up_differen
     assert decision.reason_code == "MAX_TURNS"
     assert decision.recovery_task_id is None
     assert decision.reuse_existing is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+
+def test_recovery_engine_explicit_retry_provenance_is_authoritative_for_resolution(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed implement", task_type="implement")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "INFRASTRUCTURE_ERROR"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_retry = store.add(root.prompt, task_type="implement", based_on=root.id, recovery_origin="retry")
+    assert failed_retry.id is not None
+    failed_retry.status = "failed"
+    failed_retry.failure_reason = "MAX_TURNS"
+    failed_retry.session_id = "sess-forked"
+    failed_retry.branch = "feature/forked"
+    failed_retry.completed_at = datetime.now(UTC)
+    store.update(failed_retry)
+
+    completed_retry = store.add(
+        failed_retry.prompt,
+        task_type="implement",
+        based_on=failed_retry.id,
+        recovery_origin="retry",
+    )
+    assert completed_retry.id is not None
+    completed_retry.status = "completed"
+    completed_retry.session_id = "sess-forked-2"
+    completed_retry.branch = "feature/forked-2"
+    completed_retry.completed_at = datetime.now(UTC)
+    store.update(completed_retry)
+
+    root_chain = get_recovery_chain_state(store, root)
+    assert root_chain.role == "original"
+    assert root_chain.steps == ()
+    assert root_chain.root_task_id == root.id
+    assert root_chain.resolved_task_id == completed_retry.id
+    assert is_chain_resolved_by_recovery(store, root) is True
+    assert get_completed_recovery_descendant(store, root).id == completed_retry.id
+    assert get_recovery_chain_root_task_id(store, completed_retry) == root.id
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == []
 
 
 def test_recovery_engine_non_recovery_break_blocks_deeper_recovery_resolution_for_root(tmp_path: Path) -> None:
