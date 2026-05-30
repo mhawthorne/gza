@@ -5175,6 +5175,116 @@ def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
     assert not any(" REBASE " in line for line in lines)
 
 
+def test_watch_cycle_reconcile_conflict_respects_zero_slots(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/watch-reconcile-zero-slots"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={
+                "type": "reconcile_branch_divergence",
+                "description": "Reconcile diverged local/origin refs",
+            },
+        ),
+        patch(
+            "gza.cli.watch._reconcile_diverged_branch_with_origin",
+            return_value=SimpleNamespace(
+                status="needs_rebase",
+                message="Mechanical rebase conflicted",
+                rebase_target="origin/feature/watch-reconcile-zero-slots",
+            ),
+        ),
+        patch("gza.cli.watch._create_rebase_task", side_effect=AssertionError("rebase task should not be created")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    assert "no watch worker slots available for rebase" in log_path.read_text()
+
+
+def test_watch_cycle_reconcile_conflict_spawns_rebase_and_logs_start(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/watch-reconcile-conflict"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    rebase_task = SimpleNamespace(id="watch-rebase-id")
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={
+                "type": "reconcile_branch_divergence",
+                "description": "Reconcile diverged local/origin refs",
+            },
+        ),
+        patch(
+            "gza.cli.watch._reconcile_diverged_branch_with_origin",
+            return_value=SimpleNamespace(
+                status="needs_rebase",
+                message="Mechanical rebase conflicted",
+                rebase_target="origin/feature/watch-reconcile-conflict",
+            ),
+        ),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.watch._create_rebase_task", return_value=rebase_task) as create_rebase,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert create_rebase.call_count == 1
+    assert spawn_worker.call_count == 1
+    assert f"START     {rebase_task.id} rebase" in log_path.read_text()
+
+
 def test_watch_cycle_skips_iterate_for_already_reachable_branch_with_stale_merge_state(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

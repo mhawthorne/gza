@@ -97,6 +97,7 @@ from .advance_engine import (
 )
 from .advance_executor import (
     AdvanceActionExecutionContext,
+    BranchDivergenceReconcileResult,
     execute_advance_action,
     resolve_execution_needs_attention,
 )
@@ -123,6 +124,207 @@ class SquashBranchReconcileResult:
     reason: str | None = None
     manual_source_ref: str | None = None
     expected_remote_oid: str | None = None
+
+
+def _reconcile_diverged_branch_with_origin(
+    config: Config,
+    git: Git,
+    task: DbTask,
+    *,
+    remote: str = "origin",
+) -> BranchDivergenceReconcileResult:
+    """Reconcile a diverged local/origin branch without consuming a worker slot."""
+    if not task.branch:
+        return BranchDivergenceReconcileResult(
+            status="error",
+            message=f"Cannot reconcile divergence for task {task.id}: branch is missing",
+        )
+
+    branch = task.branch
+    remote_ref = f"{remote}/{branch}"
+    remote_sha_before_push = git.rev_parse_if_exists(remote_ref)
+    if not remote_sha_before_push:
+        return BranchDivergenceReconcileResult(
+            status="error",
+            message=f"Cannot reconcile divergence for '{branch}': missing '{remote_ref}'",
+        )
+    local_sha = git.rev_parse_if_exists(branch)
+    if not local_sha:
+        return BranchDivergenceReconcileResult(
+            status="error",
+            message=f"Cannot reconcile divergence for '{branch}': missing local branch",
+        )
+
+    resolved_merge_source = git.resolve_fresh_merge_source(branch, remote=remote)
+    needs_mechanical_rebase = False
+    fetched_remote_for_rebase = False
+    local_ahead = git.count_commits_ahead(branch, remote_ref)
+    remote_ahead = git.count_commits_ahead(remote_ref, branch)
+    if local_sha == remote_sha_before_push:
+        return BranchDivergenceReconcileResult(
+            status="reconciled",
+            message=f"'{branch}' is already aligned with '{remote_ref}'",
+        )
+    if resolved_merge_source.ref == branch:
+        needs_mechanical_rebase = False
+    elif resolved_merge_source.ref == remote_ref:
+        needs_mechanical_rebase = True
+    elif local_ahead > 0 and remote_ahead > 0:
+        needs_mechanical_rebase = not _is_benign_gza_rewrite_divergence(
+            git,
+            branch=branch,
+            remote_ref=remote_ref,
+            local_ahead=local_ahead,
+            remote_ahead=remote_ahead,
+        )
+    else:
+        message = resolved_merge_source.warning or (
+            f"Unable to determine how to reconcile '{branch}' against '{remote_ref}'"
+        )
+        return BranchDivergenceReconcileResult(
+            status="error",
+            message=message,
+        )
+
+    if not needs_mechanical_rebase:
+        try:
+            git.push_ref_force_with_lease(
+                branch,
+                branch,
+                remote=remote,
+                expected_remote_oid=remote_sha_before_push,
+            )
+            return BranchDivergenceReconcileResult(
+                status="reconciled",
+                message=f"Reconciled '{branch}' with --force-with-lease",
+            )
+        except GitError as push_error:
+            try:
+                git.fetch(remote)
+            except GitError as fetch_error:
+                return BranchDivergenceReconcileResult(
+                    status="error",
+                    message=f"Failed to fetch {remote} after force-with-lease rejection: {fetch_error}",
+                )
+
+            remote_sha_after_fetch = git.rev_parse_if_exists(remote_ref)
+            if not remote_sha_after_fetch:
+                return BranchDivergenceReconcileResult(
+                    status="error",
+                    message=f"Fetch completed but '{remote_ref}' is still unavailable",
+                )
+            if remote_sha_after_fetch == remote_sha_before_push:
+                return BranchDivergenceReconcileResult(
+                    status="error",
+                    message=(
+                        f"Force-with-lease push failed for '{branch}' without a remote ref change: {push_error}"
+                    ),
+                )
+            remote_sha_before_push = remote_sha_after_fetch
+            needs_mechanical_rebase = True
+            fetched_remote_for_rebase = True
+
+    if needs_mechanical_rebase and not fetched_remote_for_rebase:
+        try:
+            git.fetch(remote)
+        except GitError as fetch_error:
+            return BranchDivergenceReconcileResult(
+                status="error",
+                message=f"Failed to fetch {remote} before rebasing '{branch}' onto '{remote_ref}': {fetch_error}",
+            )
+        remote_sha_after_fetch = git.rev_parse_if_exists(remote_ref)
+        if not remote_sha_after_fetch:
+            return BranchDivergenceReconcileResult(
+                status="error",
+                message=f"Fetch completed but '{remote_ref}' is still unavailable",
+            )
+        remote_sha_before_push = remote_sha_after_fetch
+
+    worktree_suffix = task.id or branch.replace("/", "-")
+    worktree_path = config.worktree_path / f"advance-reconcile-{worktree_suffix}"
+    try:
+        cleanup_worktree_for_branch(
+            git,
+            branch,
+            force=True,
+            permitted_root_paths=managed_worktree_root_paths(config),
+        )
+        if worktree_path.exists():
+            git.worktree_remove(worktree_path, force=True)
+            if worktree_path.exists():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        git._run("worktree", "add", str(worktree_path), branch)
+        worktree_git = Git(worktree_path)
+        baseline = capture_rebase_diff_baseline(
+            worktree_git,
+            branch=branch,
+            target=remote_ref,
+        )
+        try:
+            worktree_git.rebase(remote_ref)
+        except GitError as rebase_error:
+            try:
+                worktree_git.rebase_abort()
+            except GitError:
+                pass
+            return BranchDivergenceReconcileResult(
+                status="needs_rebase",
+                message=f"Mechanical rebase onto '{remote_ref}' hit conflicts: {rebase_error}",
+                rebase_target=remote_ref,
+            )
+
+        publish_result = publish_rebased_branch(
+            worktree_git,
+            branch=branch,
+            baseline=baseline,
+            remote=remote,
+        )
+        publish_detail = (
+            "and pushed with --force-with-lease"
+            if publish_result.pushed
+            else "and verified origin was already aligned"
+        )
+        return BranchDivergenceReconcileResult(
+            status="reconciled",
+            message=f"Rebased '{branch}' onto '{remote_ref}' {publish_detail}",
+        )
+    except (GitError, ValueError) as exc:
+        return BranchDivergenceReconcileResult(
+            status="error",
+            message=f"Failed to reconcile divergence for '{branch}': {exc}",
+        )
+    finally:
+        if worktree_path.exists():
+            try:
+                git.worktree_remove(worktree_path, force=True)
+            except GitError:
+                shutil.rmtree(worktree_path, ignore_errors=True)
+
+
+def _is_benign_gza_rewrite_divergence(
+    git: Git,
+    *,
+    branch: str,
+    remote_ref: str,
+    local_ahead: int,
+    remote_ahead: int,
+) -> bool:
+    """Recognize rewrite-only divergence that is safe to publish directly."""
+    if local_ahead <= 0 or remote_ahead <= 0:
+        return False
+
+    # Rewritten task branches keep the same patch content while changing commit IDs
+    # and often their base ancestry. Require symmetric patch-equivalence so we only
+    # publish directly when each side's unique commits are already applied on the
+    # other side. This preserves the paused-savepoint finalize case and broader
+    # gza-driven rewrites, while still falling back to fetch/rebase when the remote
+    # ref contains newly visible external commits.
+    return git.is_merged(branch, into=remote_ref, use_cherry=True) and git.is_merged(
+        remote_ref,
+        into=branch,
+        use_cherry=True,
+    )
 
 
 def _tracking_ref_refresh_command(*, remote: str, branch: str) -> str:
@@ -2366,6 +2568,7 @@ def _advance_action_color(action_type: str) -> str:
         return ac.merge
     if action_type in (
         'needs_rebase',
+        'reconcile_branch_divergence',
         'awaiting_human',
         'needs_discussion',
         'max_cycles_reached',
@@ -2595,6 +2798,17 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 trigger_source="manual",
             )
 
+        def _create_targeted_rebase_from_task(parent_task: DbTask, rebase_target: str) -> DbTask:
+            assert parent_task.id is not None
+            assert parent_task.branch is not None
+            return _create_rebase_task(
+                store,
+                parent_task.id,
+                parent_task.branch,
+                rebase_target,
+                trigger_source="manual",
+            )
+
         def _create_implement_from_task(parent_task: DbTask) -> DbTask:
             assert parent_task.id is not None
             return store.add(
@@ -2612,6 +2826,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
             max_resume_attempts=max_resume_attempts,
             use_iterate_for_create_implement=use_iterate_mode,
             use_iterate_for_needs_rebase=use_iterate_mode,
+            can_spawn_worker=lambda _kind: batch_limit is None or workers_started < batch_limit,
+            no_worker_capacity_message=lambda worker_label: (
+                f"SKIP: batch limit reached ({workers_started}/{batch_limit}), cannot start {worker_label} worker"
+                if batch_limit is not None
+                else f"SKIP: no worker capacity available for {worker_label}"
+            ),
             prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
                 config,
                 task,
@@ -2622,6 +2842,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             create_retry_task=lambda t: _create_retry_task(store, t, trigger_source="manual"),
             create_rebase_task=_create_rebase_from_task,
             create_implement_task=_create_implement_from_task,
+            create_targeted_rebase_task=_create_targeted_rebase_from_task,
             spawn_worker=lambda task_obj, _kind: _spawn_background_worker(
                 _worker_args(), config, task_id=str(task_obj.id), quiet=True, prepared_task=task_obj
             ),
@@ -2665,6 +2886,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 prepared_resume=mode == "resume",
                 prepared_phase="preloop",
             ),
+            reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(config, git, t),
         )
 
     plan: list[tuple[LineageOwnerRow, DbTask, dict[str, Any]]] = []
@@ -2899,7 +3121,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         if success_message:
             console.print(f"      [{_c_ok}]✓ {success_message}[/{_c_ok}]")
 
-        if exec_result.worker_started:
+        if exec_result.worker_started or (exec_result.work_done and not exec_result.worker_consuming):
             success_count += 1
         elif exec_result.worker_consuming:
             error_count += 1

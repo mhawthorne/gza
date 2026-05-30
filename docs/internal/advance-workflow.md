@@ -92,6 +92,7 @@ Conflict detection uses the same target-branch resolution as task collection:
 | Branch cannot merge into the resolved target branch AND rebase child is `pending`/`in_progress` | `skip` — rebase already running |
 | Branch cannot merge into the resolved target branch AND rebase child is `failed` | `needs_discussion` — manual intervention required unless later local post-resolution proof exists |
 | Branch cannot merge into the resolved target branch AND a same-branch rebase child already completed | `needs_discussion` — reason `rebase-did-not-unblock-merge`; stop repeated no-op rebases |
+| Local branch and `origin/<branch>` diverged | `reconcile_branch_divergence` — publish directly with `--force-with-lease` when the local branch is strictly ahead or when the divergence is only a gza rewrite of equivalent patch content; if `origin/<branch>` is already ahead or the remote side has genuinely distinct commits, fetch + mechanically rebase onto `origin/<branch>` before publishing, and fall through to a rebase task only on real conflicts (subject to normal worker-slot limits) |
 | Branch cannot merge into the resolved target branch AND no active rebase child AND the branch does not already contain the target tip | `needs_rebase` — create rebase task |
 | Branch cannot merge into the resolved target branch AND the branch already contains the target tip AND the lineage task is still incomplete | `needs_discussion` — rebase is already proved unnecessary; surface the incomplete lineage instead of looping |
 

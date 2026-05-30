@@ -80,6 +80,7 @@ from .git_ops import (
     _execute_merge_action,
     _merge_single_task as _git_ops_merge_single_task,
     _prepare_create_review_action,
+    _reconcile_diverged_branch_with_origin,
     _require_default_branch,
     _unimplemented_implement_prompt,
     cleanup_failed_merge_checkout,
@@ -1173,6 +1174,17 @@ def _run_cycle(
                 trigger_source="watch",
             )
 
+        def _create_targeted_rebase_from_task(parent_task: DbTask, rebase_target: str) -> DbTask:
+            assert parent_task.id is not None
+            assert parent_task.branch is not None
+            return _create_rebase_task(
+                store,
+                parent_task.id,
+                parent_task.branch,
+                rebase_target,
+                trigger_source="watch",
+            )
+
         def _create_implement_from_task(parent_task: DbTask) -> DbTask:
             assert parent_task.id is not None
             return store.add(
@@ -1190,6 +1202,10 @@ def _run_cycle(
             max_resume_attempts=max_recovery_attempts,
             use_iterate_for_create_implement=True,
             use_iterate_for_needs_rebase=False,
+            can_spawn_worker=lambda _kind: slots > 0,
+            no_worker_capacity_message=lambda worker_label: (
+                f"SKIP: no watch worker slots available for {worker_label}"
+            ),
             prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
                 config,
                 task,
@@ -1200,6 +1216,7 @@ def _run_cycle(
             create_retry_task=lambda t: _create_retry_task(store, t, trigger_source="watch"),
             create_rebase_task=_create_rebase_from_task,
             create_implement_task=_create_implement_from_task,
+            create_targeted_rebase_task=_create_targeted_rebase_from_task,
             spawn_worker=_watch_spawn_worker,
             spawn_resume_worker=_watch_spawn_resume_worker,
             spawn_iterate_worker=_watch_spawn_iterate,
@@ -1239,6 +1256,7 @@ def _run_cycle(
                 running_task_ids=running_task_id_set,
                 target_branch=target_branch,
             ),
+            reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(config, git, t),
         )
 
         for row, task, action in action_plan:
@@ -1407,9 +1425,12 @@ def _run_cycle(
                     )
                 continue
 
-            if not is_worker_consuming_advance_action(str(action_type)) or action_type == "resume":
+            if (
+                not is_worker_consuming_advance_action(str(action_type))
+                and action_type != "reconcile_branch_divergence"
+            ) or action_type == "resume":
                 continue
-            if slots <= 0:
+            if is_worker_consuming_advance_action(str(action_type)) and slots <= 0:
                 continue
 
             exec_result = execute_advance_action(task=task, action=action, context=executor_context)
@@ -1496,7 +1517,14 @@ def _run_cycle(
                     log.emit("START", f"(new) implement for {display_task.id} [dry-run]")
                 elif action_type == "needs_rebase" and display_task.id is not None:
                     log.emit("START", f"(new) rebase for {display_task.id} [dry-run]")
-                slots -= 1
+                elif action_type == "reconcile_branch_divergence" and display_task.id is not None:
+                    if exec_result.worker_label == "rebase" and child_id is not None:
+                        log.emit("START", f"{child_id} rebase [dry-run]")
+                        started_task_ids.add(str(child_id))
+                    else:
+                        log.emit("START", f"{display_task.id} reconcile divergence [dry-run]")
+                if exec_result.worker_consuming:
+                    slots -= 1
                 work_done = True
                 continue
 
@@ -1518,10 +1546,19 @@ def _run_cycle(
                     log.emit("START", f"{child_id} improve")
                 elif action_type == "create_implement":
                     log.emit("START", f"{child_id} implement")
-                elif action_type == "needs_rebase":
+                elif action_type == "needs_rebase" or exec_result.worker_label == "rebase":
                     log.emit("START", f"{child_id} rebase")
                 started_task_ids.add(str(child_id))
-                slots -= 1
+                if exec_result.worker_consuming:
+                    slots -= 1
+                work_done = True
+            elif exec_result.status == "success" and action_type == "reconcile_branch_divergence":
+                if display_task.id is not None:
+                    log.emit(
+                        "REPAIR",
+                        f"{display_task.id}: {exec_result.success_message or exec_result.message}",
+                        dedupe_key=f"advance-reconcile:{display_task.id}",
+                    )
                 work_done = True
 
     # 2) Recovery queue for failed tasks.

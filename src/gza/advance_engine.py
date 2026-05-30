@@ -977,6 +977,11 @@ def is_needs_attention_action(action: Mapping[str, Any]) -> bool:
     return get_needs_attention_reason(action) is not None
 
 
+def is_diverged_merge_source_warning(warning: str | None) -> bool:
+    """Return True when the merge-source warning indicates local/remote divergence."""
+    return isinstance(warning, str) and "diverged" in warning.lower()
+
+
 def classify_advance_action(action: Mapping[str, Any]) -> str:
     """Bucket advance outcomes into actionable, needs_attention, or skip."""
     if is_needs_attention_action(action):
@@ -1738,6 +1743,18 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="no_branch",
         matches=lambda ctx: not ctx.has_branch,
         action=lambda ctx: {"type": "skip", "description": _no_branch_description(ctx)},
+    ),
+    AdvanceRule(
+        name="merge_source_needs_reconcile",
+        matches=lambda ctx: is_diverged_merge_source_warning(ctx.merge_source_warning),
+        action=lambda ctx: {
+            "type": "reconcile_branch_divergence",
+            "description": (
+                f"Reconcile diverged local/origin refs for '{ctx.task.branch}'"
+                if ctx.task.branch
+                else "Reconcile diverged local/origin refs"
+            ),
+        },
     ),
     AdvanceRule(
         name="merge_source_needs_manual_resolution",

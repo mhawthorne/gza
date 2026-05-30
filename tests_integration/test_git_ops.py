@@ -2,9 +2,12 @@
 
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from gza.cli.git_ops import _reconcile_diverged_branch_with_origin
+from gza.config import Config
 from gza.git import Git, active_worktree_path_for_branch
 from tests.cli.conftest import make_store, run_gza, setup_config
 from tests_functional.git_helpers import setup_git_repo_with_task_branch
@@ -22,6 +25,52 @@ def _setup_git_repo(tmp_path: Path) -> Git:
     git._run("add", "README.md")
     git._run("commit", "-m", "Initial commit")
     return git
+
+
+def test_reconcile_diverged_branch_with_origin_force_pushes_paused_savepoint_rewrite(tmp_path: Path) -> None:
+    """Equivalent paused-savepoint divergence should publish directly without rebase."""
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    git = _setup_git_repo(tmp_path)
+
+    origin_path = tmp_path / "origin.git"
+    origin_path.mkdir()
+    Git(origin_path)._run("init", "--bare")
+    git._run("remote", "add", "origin", str(origin_path))
+    git._run("push", "-u", "origin", "main")
+
+    branch = "feature/rewrite"
+    file_path = tmp_path / "feature.txt"
+    git._run("checkout", "-b", branch)
+    file_path.write_text("finalized\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "WIP: gza task paused")
+    git._run("push", "-u", "origin", branch)
+
+    remote_wip_tip = git.rev_parse(f"origin/{branch}")
+    base_tip = git.rev_parse("main")
+
+    git._run("reset", "--hard", base_tip)
+    file_path.write_text("finalized\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Finalize task")
+    local_final_tip = git.rev_parse(branch)
+
+    assert local_final_tip != remote_wip_tip
+    assert git.count_commits_ahead(branch, f"origin/{branch}") == 1
+    assert git.count_commits_ahead(f"origin/{branch}", branch) == 1
+
+    result = _reconcile_diverged_branch_with_origin(
+        config,
+        git,
+        SimpleNamespace(id="gza-1", branch=branch),
+    )
+
+    assert result.status == "reconciled"
+    assert "force-with-lease" in result.message
+
+    git.fetch("origin")
+    assert git.rev_parse(f"origin/{branch}") == local_final_tip
 
 
 def test_advance_spawns_rebase_worker_on_conflicts(tmp_path: Path) -> None:

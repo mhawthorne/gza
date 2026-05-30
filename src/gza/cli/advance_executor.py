@@ -46,6 +46,8 @@ class AdvanceActionExecutionContext:
     # create_implement) omit the kwargs; the needs_rebase iterate path passes
     # prepared_task=<rebase child> so worker metadata points at the prepared row.
     spawn_iterate_worker: Callable[..., int]
+    can_spawn_worker: Callable[[str], bool] | None = None
+    no_worker_capacity_message: Callable[[str], str] | None = None
     is_rebase_target_already_merged: Callable[[DbTask], bool] | None = None
     prefer_iterate_for_action: Callable[
         [DbTask, dict[str, Any]],
@@ -53,6 +55,17 @@ class AdvanceActionExecutionContext:
     ] | None = None
     spawn_iterate_recovery: Callable[[DbTask, Literal["resume", "retry"], DbTask], int] | None = None
     create_retry_task: Callable[[DbTask], DbTask] | None = None
+    create_targeted_rebase_task: Callable[[DbTask, str], DbTask] | None = None
+    reconcile_diverged_branch: Callable[[DbTask], BranchDivergenceReconcileResult] | None = None
+
+
+@dataclass(frozen=True)
+class BranchDivergenceReconcileResult:
+    """Outcome of a direct local/origin branch-divergence reconciliation attempt."""
+
+    status: Literal["reconciled", "needs_rebase", "error"]
+    message: str
+    rebase_target: str | None = None
 
 
 @dataclass
@@ -96,6 +109,7 @@ _WORKER_ACTIONS = frozenset(
         "retry",
         "create_implement",
         "needs_rebase",
+        "reconcile_branch_divergence",
     }
 )
 
@@ -280,6 +294,27 @@ def _prepare_background_start(
             worker_label=worker_label,
         )
     return prepared_task, None
+
+
+def _worker_capacity_blocked_result(
+    *,
+    action_type: str,
+    context: AdvanceActionExecutionContext,
+    worker_label: str,
+) -> AdvanceActionExecutionResult | None:
+    if context.can_spawn_worker is None or context.can_spawn_worker(worker_label):
+        return None
+    message = (
+        context.no_worker_capacity_message(worker_label)
+        if context.no_worker_capacity_message is not None
+        else f"SKIP: no worker capacity available for {worker_label}"
+    )
+    return AdvanceActionExecutionResult(
+        action_type=action_type,
+        status="skip",
+        message=message,
+        worker_label=worker_label,
+    )
 
 
 def _maybe_route_action_through_iterate(
@@ -866,6 +901,80 @@ def execute_advance_action(
             rc=rc,
             handled_task_id=prepared_rebase_task.id,
             worker_label=worker_label,
+            created_task=prepared_rebase_task,
+        )
+        result.success_message = f"Created rebase task {prepared_rebase_task.id}"
+        return result
+
+    if action_type == "reconcile_branch_divergence":
+        if task.id is None or not task.branch:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="error",
+                message=f"Cannot reconcile divergence: task {task.id} has no branch",
+            )
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=action.get("description", "Reconcile diverged local/origin refs"),
+                worker_consuming=False,
+                work_done=True,
+            )
+        if context.reconcile_diverged_branch is None:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="error",
+                message="missing branch reconciliation helper",
+            )
+
+        outcome = context.reconcile_diverged_branch(task)
+        if outcome.status == "reconciled":
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="success",
+                message=outcome.message,
+                work_done=True,
+            )
+        if outcome.status == "error":
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="error",
+                message=outcome.message,
+            )
+
+        rebase_target = outcome.rebase_target or f"origin/{task.branch}"
+        capacity_blocked = _worker_capacity_blocked_result(
+            action_type=action_type,
+            context=context,
+            worker_label="rebase",
+        )
+        if capacity_blocked is not None:
+            return capacity_blocked
+        create_rebase_task = context.create_targeted_rebase_task
+        rebase_task = (
+            create_rebase_task(task, rebase_target)
+            if create_rebase_task is not None
+            else context.create_rebase_task(task)
+        )
+        prepared_rebase_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=rebase_task,
+            worker_label="rebase",
+            rollback_on_failure=True,
+        )
+        if prepared_rebase_task is None:
+            assert prepare_error is not None
+            return prepare_error
+
+        assert prepared_rebase_task.id is not None
+        rc = context.spawn_worker(prepared_rebase_task, "rebase")
+        result = _spawn_result(
+            action_type=action_type,
+            rc=rc,
+            handled_task_id=prepared_rebase_task.id,
+            worker_label="rebase",
             created_task=prepared_rebase_task,
         )
         result.success_message = f"Created rebase task {prepared_rebase_task.id}"

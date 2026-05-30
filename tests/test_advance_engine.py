@@ -3143,7 +3143,7 @@ def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: 
     assert ctx_with_stale_local_branch.can_merge is True
 
 
-def test_diverged_local_and_origin_need_manual_resolution(tmp_path: Path) -> None:
+def test_diverged_local_and_origin_are_routed_to_reconcile(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -3170,10 +3170,8 @@ def test_diverged_local_and_origin_need_manual_resolution(tmp_path: Path) -> Non
         "main",
     )
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
-    assert action["subject_task_id"] == impl.id
-    assert "diverged" in action["description"]
+    assert action["type"] == "reconcile_branch_divergence"
+    assert "Reconcile diverged local/origin refs" in action["description"]
 
 
 def test_diverged_local_and_origin_fail_closed_even_when_local_tip_matches_target(
@@ -3204,10 +3202,7 @@ def test_diverged_local_and_origin_fail_closed_even_when_local_tip_matches_targe
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
-    assert action["subject_task_id"] == impl.id
-    assert "diverged" in action["description"]
+    assert action["type"] == "reconcile_branch_divergence"
     assert "target implementation already merged" not in action["description"]
 
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)

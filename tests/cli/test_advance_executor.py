@@ -11,6 +11,7 @@ from gza.cli._common import _create_retry_task, resolve_improve_action
 from gza.cli.advance_executor import (
     AdvanceActionExecutionContext,
     AdvanceActionExecutionResult,
+    BranchDivergenceReconcileResult,
     build_improve_needs_attention_result,
     execute_advance_action,
     resolve_execution_needs_attention,
@@ -1060,3 +1061,136 @@ def test_needs_rebase_iterate_hands_prepared_metadata_to_spawn(tmp_path: Path) -
     assert result.created_task.id == rebase.id
     assert result.handled_task_id == rebase.id
     assert result.success_message == f"Created rebase task {rebase.id}"
+
+
+def test_reconcile_branch_divergence_dry_run_does_not_mutate_db(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    _mark_completed(task, branch="feature/reconcile-dry-run")
+    store.update(task)
+
+    before_count = len(store.get_all())
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=True,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+    )
+
+    result = execute_advance_action(
+        task=task,
+        action={"type": "reconcile_branch_divergence", "description": "Reconcile diverged refs"},
+        context=context,
+    )
+
+    assert result.status == "dry_run"
+    assert result.worker_consuming is False
+    assert len(store.get_all()) == before_count
+
+
+def test_reconcile_branch_divergence_reports_direct_success(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    _mark_completed(task, branch="feature/reconcile-direct")
+    store.update(task)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        reconcile_diverged_branch=lambda _task: BranchDivergenceReconcileResult(
+            status="reconciled",
+            message="Reconciled 'feature/reconcile-direct' with --force-with-lease",
+        ),
+    )
+
+    result = execute_advance_action(
+        task=task,
+        action={"type": "reconcile_branch_divergence"},
+        context=context,
+    )
+
+    assert result.status == "success"
+    assert result.work_done is True
+    assert "force-with-lease" in result.message
+
+
+def test_reconcile_branch_divergence_conflict_creates_targeted_rebase_task(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/reconcile-conflict")
+    store.update(impl)
+
+    captured: dict[str, object] = {}
+
+    def _create_targeted_rebase(parent: DbTask, rebase_target: str) -> DbTask:
+        captured["target"] = rebase_target
+        return store.add(
+            prompt=f"Rebase {parent.branch} onto {rebase_target}",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        create_targeted_rebase_task=_create_targeted_rebase,
+        spawn_worker=lambda _task, _kind: 0,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        reconcile_diverged_branch=lambda _task: BranchDivergenceReconcileResult(
+            status="needs_rebase",
+            message="Mechanical rebase conflicted",
+            rebase_target="origin/feature/reconcile-conflict",
+        ),
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={"type": "reconcile_branch_divergence"},
+        context=context,
+    )
+
+    assert result.status == "success"
+    assert captured["target"] == "origin/feature/reconcile-conflict"
+    assert result.success_message.startswith("Created rebase task ")

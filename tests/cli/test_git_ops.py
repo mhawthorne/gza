@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from gza.cli.git_ops import (
+    _reconcile_diverged_branch_with_origin,
     SquashBranchReconcileResult,
     _build_auto_merge_args,
     _classify_squash_reconcile_push_failure,
@@ -21,7 +22,8 @@ from gza.cli.git_ops import (
     cmd_advance,
 )
 from gza.config import Config
-from gza.git import Git, GitError, ResolvedGitRef
+from gza.git import Git, GitError, ResolvedGitRef, ResolvedMergeSourceRef
+from gza.lineage_query import LineageOwnerRow
 from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult
 from gza.worktree_roots import managed_worktree_root_paths
 
@@ -1183,8 +1185,335 @@ def test_advance_execution_prefers_local_branch_when_origin_is_stale(
     assert f"Merging 'origin/{branch}' into 'main'" not in output
 
 
+def test_reconcile_diverged_branch_with_origin_force_pushes_gza_rewrite(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    task = SimpleNamespace(id="gza-1", branch="feature/rewrite")
+
+    git = MagicMock(spec=Git)
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "origin/feature/rewrite": "remote-old",
+        "feature/rewrite": "local-new",
+    }.get(ref)
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(
+        None,
+        (
+            "Local branch 'feature/rewrite' and remote-tracking ref 'origin/feature/rewrite' diverged. "
+            "Push, fetch, or reconcile them before advancing or merging."
+        ),
+    )
+    git.count_commits_ahead.side_effect = [1, 1]
+    git.is_merged.return_value = True
+
+    result = _reconcile_diverged_branch_with_origin(config, git, task)
+
+    assert result.status == "reconciled"
+    assert "force-with-lease" in result.message
+    git.push_ref_force_with_lease.assert_called_once_with(
+        "feature/rewrite",
+        "feature/rewrite",
+        remote="origin",
+        expected_remote_oid="remote-old",
+    )
+    git.fetch.assert_not_called()
+    assert git.is_merged.call_args_list == [
+        call("feature/rewrite", into="origin/feature/rewrite", use_cherry=True),
+        call("origin/feature/rewrite", into="feature/rewrite", use_cherry=True),
+    ]
+
+
+def test_reconcile_diverged_branch_with_origin_force_pushes_stale_origin_rewrite(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    task = SimpleNamespace(id="gza-1b", branch="feature/rebased-rewrite")
+
+    git = MagicMock(spec=Git)
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "origin/feature/rebased-rewrite": "remote-pre-rebase-tip",
+        "feature/rebased-rewrite": "local-rebased-tip",
+    }.get(ref)
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(
+        None,
+        (
+            "Local branch 'feature/rebased-rewrite' and remote-tracking ref "
+            "'origin/feature/rebased-rewrite' diverged. Push, fetch, or reconcile them "
+            "before advancing or merging."
+        ),
+    )
+    git.count_commits_ahead.side_effect = [2, 2]
+    git.is_merged.side_effect = [True, True]
+
+    result = _reconcile_diverged_branch_with_origin(config, git, task)
+
+    assert result.status == "reconciled"
+    assert "force-with-lease" in result.message
+    git.push_ref_force_with_lease.assert_called_once_with(
+        "feature/rebased-rewrite",
+        "feature/rebased-rewrite",
+        remote="origin",
+        expected_remote_oid="remote-pre-rebase-tip",
+    )
+    git.fetch.assert_not_called()
+    assert git.is_merged.call_args_list == [
+        call("feature/rebased-rewrite", into="origin/feature/rebased-rewrite", use_cherry=True),
+        call("origin/feature/rebased-rewrite", into="feature/rebased-rewrite", use_cherry=True),
+    ]
+
+
+def test_reconcile_diverged_branch_with_origin_rebases_already_fetched_external_commits(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    task = SimpleNamespace(id="gza-2a", branch="feature/already-fetched-external")
+
+    git = MagicMock(spec=Git)
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "origin/feature/already-fetched-external": "remote-visible",
+        "feature/already-fetched-external": "local-tip",
+    }.get(ref)
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(
+        None,
+        (
+            "Local branch 'feature/already-fetched-external' and remote-tracking ref "
+            "'origin/feature/already-fetched-external' diverged. Push, fetch, or reconcile them "
+            "before advancing or merging."
+        ),
+    )
+    git.count_commits_ahead.side_effect = [1, 1]
+    git.is_merged.side_effect = [True, False]
+
+    worktree_git = MagicMock(spec=Git)
+    worktree_git.rebase.return_value = None
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=worktree_git),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline("old", "target", "base"),
+        ),
+        patch("gza.cli.git_ops.publish_rebased_branch") as publish_rebased_branch,
+    ):
+        result = _reconcile_diverged_branch_with_origin(config, git, task)
+
+    assert result.status == "reconciled"
+    git.push_ref_force_with_lease.assert_not_called()
+    git.fetch.assert_called_once_with("origin")
+    worktree_git.rebase.assert_called_once_with("origin/feature/already-fetched-external")
+    publish_rebased_branch.assert_called_once()
+    assert git.is_merged.call_args_list == [
+        call(
+            "feature/already-fetched-external",
+            into="origin/feature/already-fetched-external",
+            use_cherry=True,
+        ),
+        call(
+            "origin/feature/already-fetched-external",
+            into="feature/already-fetched-external",
+            use_cherry=True,
+        ),
+    ]
+
+
+def test_reconcile_diverged_branch_with_origin_reports_already_aligned_after_rebase(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    task = SimpleNamespace(id="gza-2b", branch="feature/already-aligned")
+
+    git = MagicMock(spec=Git)
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "origin/feature/already-aligned": "remote-visible",
+        "feature/already-aligned": "local-tip",
+    }.get(ref)
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(
+        None,
+        (
+            "Local branch 'feature/already-aligned' and remote-tracking ref "
+            "'origin/feature/already-aligned' diverged. Push, fetch, or reconcile them "
+            "before advancing or merging."
+        ),
+    )
+    git.count_commits_ahead.side_effect = [1, 1]
+    git.is_merged.side_effect = [True, False]
+
+    worktree_git = MagicMock(spec=Git)
+    worktree_git.rebase.return_value = None
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=worktree_git),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline("old", "target", "base"),
+        ),
+        patch(
+            "gza.cli.git_ops.publish_rebased_branch",
+            return_value=SimpleNamespace(pushed=False),
+        ),
+    ):
+        result = _reconcile_diverged_branch_with_origin(config, git, task)
+
+    assert result.status == "reconciled"
+    assert "verified origin was already aligned" in result.message
+    assert "and pushed" not in result.message
+
+
+def test_reconcile_diverged_branch_with_origin_rebases_after_remote_moves(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    task = SimpleNamespace(id="gza-2", branch="feature/external")
+
+    git = MagicMock(spec=Git)
+    git.rev_parse_if_exists.side_effect = ["remote-old", "local-tip", "remote-new"]
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef("feature/external")
+    git.count_commits_ahead.side_effect = [1, 0]
+    git.push_ref_force_with_lease.side_effect = GitError("stale info")
+
+    worktree_git = MagicMock(spec=Git)
+    worktree_git.rebase.return_value = None
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=worktree_git),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline("old", "target", "base"),
+        ),
+        patch("gza.cli.git_ops.publish_rebased_branch") as publish_rebased_branch,
+    ):
+        result = _reconcile_diverged_branch_with_origin(config, git, task)
+
+    assert result.status == "reconciled"
+    assert "Rebased 'feature/external' onto 'origin/feature/external'" in result.message
+    git.fetch.assert_called_once_with("origin")
+    worktree_git.rebase.assert_called_once_with("origin/feature/external")
+    publish_rebased_branch.assert_called_once()
+
+
+def test_reconcile_diverged_branch_with_origin_routes_conflicts_to_rebase(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    task = SimpleNamespace(id="gza-3", branch="feature/conflict")
+
+    git = MagicMock(spec=Git)
+    git.rev_parse_if_exists.side_effect = ["remote-old", "local-tip", "remote-new"]
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef("feature/conflict")
+    git.count_commits_ahead.side_effect = [1, 0]
+    git.push_ref_force_with_lease.side_effect = GitError("stale info")
+
+    worktree_git = MagicMock(spec=Git)
+    worktree_git.rebase.side_effect = GitError("conflict")
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=worktree_git),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline("old", "target", "base"),
+        ),
+    ):
+        result = _reconcile_diverged_branch_with_origin(config, git, task)
+
+    assert result.status == "needs_rebase"
+    assert result.rebase_target == "origin/feature/conflict"
+    worktree_git.rebase_abort.assert_called_once()
+
+
+def test_advance_batch_limit_skips_reconcile_conflict_fallback_without_spawning_rebase(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    first = store.add("Needs explicit rebase", task_type="implement")
+    second = store.add("Needs reconcile fallback", task_type="implement")
+    for task, branch in ((first, "feature/needs-rebase"), (second, "feature/reconcile-fallback")):
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        task.merge_status = "unmerged"
+        task.has_commits = True
+        store.update(task)
+
+    first_row = LineageOwnerRow(
+        owner_task=first,
+        members=(first,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "needs_rebase", "description": "Create rebase task"},
+        next_action_reason="test",
+        unresolved_tasks=(first,),
+        unresolved_leaf_summary=(),
+    )
+    second_row = LineageOwnerRow(
+        owner_task=second,
+        members=(second,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={
+            "type": "reconcile_branch_divergence",
+            "description": "Reconcile diverged local/origin refs",
+        },
+        next_action_reason="test",
+        unresolved_tasks=(second,),
+        unresolved_leaf_summary=(),
+    )
+
+    created_rebases: list[str] = []
+
+    def _create_rebase_task(_store, parent_id: str, branch: str, target: str, *, trigger_source: str):
+        created = _store.add(
+            prompt=f"Rebase {branch} onto {target}",
+            task_type="rebase",
+            based_on=parent_id,
+            same_branch=True,
+            trigger_source=trigger_source,
+        )
+        assert created.id is not None
+        created_rebases.append(created.id)
+        return created
+
+    args = _advance_args(tmp_path, first.id)
+    args.task_id = None
+    args.batch = 1
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[first_row, second_row]),
+        patch("gza.cli.git_ops._create_rebase_task", side_effect=_create_rebase_task),
+        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _config, task, **_k: task),
+        patch("gza.cli.git_ops._spawn_background_worker", return_value=0) as spawn_worker,
+        patch(
+            "gza.cli.git_ops._reconcile_diverged_branch_with_origin",
+            return_value=SimpleNamespace(
+                status="needs_rebase",
+                message="Mechanical rebase conflicted",
+                rebase_target="origin/feature/reconcile-fallback",
+            ),
+        ),
+    ):
+        rc = cmd_advance(args)
+
+    assert rc == 0
+    assert spawn_worker.call_count == 1
+    assert len(created_rebases) == 1
+    output = capsys.readouterr().out
+    assert "batch limit reached (1/1), cannot start rebase worker" in output
+
+
 @pytest.mark.timeout(4, method="signal")
-def test_advance_dry_run_surfaces_diverged_merge_source_for_manual_resolution(
+def test_advance_dry_run_surfaces_diverged_merge_source_for_reconcile(
     tmp_path: Path,
     capsys,
 ) -> None:
@@ -1228,10 +1557,9 @@ def test_advance_dry_run_surfaces_diverged_merge_source_for_manual_resolution(
 
     output = capsys.readouterr().out
     assert rc == 0
-    assert "Needs attention" in output
-    assert "merge-source-needs-manual-resolution" in output
-    assert f"origin/{branch}" in output
-    assert "diverged" in output
+    assert "Would advance 1 task(s):" in output
+    assert "Reconcile diverged local/origin refs" in output
+    assert "Needs attention" not in output
 
 
 def test_rebase_background_creator_phase_failure_cleans_up_created_task_and_artifacts(tmp_path: Path) -> None:
