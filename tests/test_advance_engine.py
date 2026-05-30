@@ -2027,6 +2027,42 @@ def test_failed_rebase_clears_when_branch_contains_current_target_tip(
     assert refreshed_unit.state == "unmerged"
 
 
+def test_already_rebased_incomplete_lineage_returns_needs_attention_instead_of_rebase(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    pending_resume = store.add("Resume implement", task_type="implement")
+    assert pending_resume.id is not None
+    pending_resume.status = "pending"
+    pending_resume.branch = "feature/already-rebased-incomplete"
+    pending_resume.merge_status = "unmerged"
+    store.update(pending_resume)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=False,
+            ref_shas={
+                pending_resume.branch: "branch-sha",
+                "main": "target-sha",
+            },
+            ancestor_pairs={("main", pending_resume.branch): True},
+        ),
+        pending_resume,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "branch-already-rebased-lineage-incomplete"
+    assert action["subject_task_id"] == pending_resume.id
+    assert "already contains the target tip" in action["description"]
+    assert "no further rebase will help" in action["description"]
+    assert classify_advance_action(action) == "needs_attention"
+
+
 def test_failed_rebase_resolution_precedence_merge_unit_wins(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -2083,6 +2119,56 @@ def test_conflict_needs_rebase_emitted_without_completed_rebase(tmp_path: Path) 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=False), impl, "main")
 
     assert action["type"] == "needs_rebase"
+
+
+def test_rebase_failure_circuit_breaker_trips_after_three_failures_without_progress(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-breaker",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    for hour in (10, 11, 12):
+        failed_rebase = store.add(
+            f"Failed rebase {hour}",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
+        failed_rebase.branch = impl.branch
+        failed_rebase.failure_reason = "GIT_ERROR"
+        store.update(failed_rebase)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=False,
+            ref_shas={
+                impl.branch: "branch-sha",
+                "main": "target-sha",
+            },
+            ancestor_pairs={("main", impl.branch): True},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-failure-circuit-breaker"
+    assert action["subject_task_id"] == impl.id
+    assert "feature/rebase-breaker" in action["description"]
+    assert "after 3 failed attempts" in action["description"]
+    assert action["rebase_failure_streak"]["attempts"] == 3
+    assert classify_advance_action(action) == "needs_attention"
 
 
 def test_completed_rebase_that_still_blocks_merge_needs_attention(tmp_path: Path) -> None:
@@ -3180,16 +3266,22 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
             rebase_target_missing_merge_unit=False,
             reason="manual-resolution",
         ),
-        can_merge=False,
-        rebase_pending_or_running=None,
-        rebase_failed=failed_rebase,
-        latest_completed_rebase=failed_rebase,
-        rebase_invalidates_review=False,
-        active_review=None,
-        review_invalidated_by_rebase=failed_rebase,
-        review_preserved_by_rebase=None,
-        latest_completed_review=review,
-        review_cleared=False,
+            can_merge=False,
+            rebase_pending_or_running=None,
+            rebase_failed=failed_rebase,
+            latest_completed_rebase=failed_rebase,
+            rebase_failure_streak=SimpleNamespace(
+                attempts=3,
+                branch=impl.branch,
+                failed_task_ids=(failed_rebase.id,),
+            ),
+            rebase_invalidates_review=False,
+            active_review=None,
+            review_invalidated_by_rebase=failed_rebase,
+            review_preserved_by_rebase=None,
+            latest_completed_review=review,
+            latest_completed_code_change=impl,
+            review_cleared=False,
         review_verdict="CHANGES_REQUESTED",
         followup_findings=(),
         recent_verify_timeout_only_reviews=(review, review),
@@ -3241,8 +3333,10 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         "awaiting_human_plan_review",
         "explore_needs_followup_decision",
         "merge_source_needs_manual_resolution",
+        "conflict_rebase_failure_circuit_breaker",
         "conflict_rebase_failed",
         "conflict_rebase_completed_but_still_blocked",
+        "already_rebased_but_lineage_incomplete",
         "failed_rebase_without_successful_review",
         "closing_review_invariant",
         "fresh_comments_noop_improve_limit",

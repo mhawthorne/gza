@@ -45,6 +45,7 @@ from gza.source_followup import (
 NEEDS_ATTENTION_LABEL = "Needs attention"
 ALLOW_NOOP_IMPROVE_TAG = "allow-noop-improve"
 DUPLICATE_BLOCKER_REVIEW_CYCLES = 3
+REBASE_FAILURE_CIRCUIT_BREAKER_ATTEMPTS = 3
 
 WORKER_CONSUMING_ACTIONS = frozenset(
     {
@@ -90,6 +91,15 @@ class DuplicateBlockerStreak:
 
 
 @dataclass(frozen=True)
+class RebaseFailureStreak:
+    """Repeated failed rebases with no later successful lineage progress."""
+
+    attempts: int
+    branch: str
+    failed_task_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class AdvanceContext:
     """Resolved task state used by advance rules."""
 
@@ -118,6 +128,7 @@ class AdvanceContext:
     rebase_pending_or_running: DbTask | None = None
     rebase_failed: DbTask | None = None
     latest_completed_rebase: DbTask | None = None
+    rebase_failure_streak: RebaseFailureStreak | None = None
     rebase_invalidates_review: bool = False
     review_preserved_by_rebase: DbTask | None = None
     review_invalidated_by_rebase: DbTask | None = None
@@ -125,6 +136,7 @@ class AdvanceContext:
     reviews: list[DbTask] | None = None
     active_review: DbTask | None = None
     latest_completed_review: DbTask | None = None
+    latest_completed_code_change: DbTask | None = None
     review_cleared: bool = False
     review_verdict: str | None = None
     review_report: ParsedReviewReport | None = None
@@ -712,6 +724,52 @@ def _rebase_did_not_unblock_merge_action(ctx: AdvanceContext) -> dict[str, Any]:
     )
 
 
+def _branch_contains_target_tip(ctx: AdvanceContext) -> bool:
+    state = ctx.post_merge_rebase_state
+    if state is None:
+        return False
+    return state.rebase_resolution_proved or state.target_is_ancestor_of_branch is True
+
+
+def _rebase_failure_circuit_breaker_action(ctx: AdvanceContext) -> dict[str, Any]:
+    assert ctx.rebase_failure_streak is not None
+    streak = ctx.rebase_failure_streak
+    latest_failed_id = streak.failed_task_ids[0] if streak.failed_task_ids else _task_id(ctx.rebase_failed)
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                f"SKIP: rebase circuit breaker tripped for branch '{streak.branch}' after "
+                f"{streak.attempts} failed attempts with no intervening successful rebase, review, "
+                f"or code change (latest {latest_failed_id}); manual intervention required"
+            ),
+            "rebase_failure_streak": {
+                "attempts": streak.attempts,
+                "branch": streak.branch,
+                "failed_task_ids": streak.failed_task_ids,
+            },
+        },
+        reason="rebase-failure-circuit-breaker",
+        subject_task_id=ctx.task.id,
+    )
+
+
+def _already_rebased_but_lineage_incomplete_action(ctx: AdvanceContext) -> dict[str, Any]:
+    branch = ctx.task.branch or "unknown"
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                f"SKIP: branch '{branch}' already contains the target tip, but "
+                f"{ctx.task.status} {ctx.task_type} {_task_id(ctx.task)} is still incomplete; "
+                "no further rebase will help"
+            ),
+        },
+        reason="branch-already-rebased-lineage-incomplete",
+        subject_task_id=ctx.task.id,
+    )
+
+
 def _failed_task_skip_action(ctx: AdvanceContext) -> dict[str, Any]:
     assert ctx.failed_recovery_decision is not None
     subject_task_id = ctx.task.id
@@ -1027,6 +1085,49 @@ def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
     return ctx.review_verdict not in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
 
 
+def _count_rebase_failure_streak(
+    *,
+    task: DbTask,
+    rebase_children: list[DbTask],
+    latest_completed_rebase: DbTask | None,
+    latest_completed_review: DbTask | None,
+    latest_completed_code_change: DbTask | None,
+    review_cleared_at: datetime | None,
+) -> RebaseFailureStreak | None:
+    branch = task.branch
+    if not branch:
+        return None
+
+    progress_times: list[datetime] = []
+    if latest_completed_rebase is not None:
+        progress_times.append(_task_event_time(latest_completed_rebase))
+    if latest_completed_review is not None:
+        progress_times.append(_task_event_time(latest_completed_review))
+    if latest_completed_code_change is not None:
+        progress_times.append(_task_event_time(latest_completed_code_change))
+    if review_cleared_at is not None:
+        progress_times.append(_normalize_time(review_cleared_at))
+    progress_boundary = max(progress_times) if progress_times else None
+
+    failed_rebases = [
+        child
+        for child in rebase_children
+        if child.status == "failed"
+        and child.branch == branch
+        and (progress_boundary is None or _task_event_time(child) > progress_boundary)
+    ]
+    if not failed_rebases:
+        return None
+
+    failed_rebases.sort(key=_task_event_time, reverse=True)
+    failed_task_ids = tuple(child.id for child in failed_rebases if child.id is not None)
+    return RebaseFailureStreak(
+        attempts=len(failed_rebases),
+        branch=branch,
+        failed_task_ids=failed_task_ids,
+    )
+
+
 def _latest_unresolved_comment_time(store: SqliteTaskStore, task_id: str) -> datetime | None:
     unresolved_comments = store.get_comments(task_id, unresolved_only=True)
     if not unresolved_comments:
@@ -1156,6 +1257,7 @@ def _resolve_review_state(
     str | None,
     bool,
     bool,
+    DbTask | None,
     dict[str, Any] | None,
 ]:
     """Resolve review/improve lineage state for the implementation root task."""
@@ -1281,6 +1383,7 @@ def _resolve_review_state(
         noop_improve_trigger,
         has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review,
+        latest_completed_code_change,
         closing_review_action,
     )
 
@@ -1461,6 +1564,7 @@ def resolve_advance_context(
         noop_improve_trigger,
         has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review,
+        latest_completed_code_change,
         closing_review_action,
 ) = _resolve_review_state(config, store, task)
 
@@ -1493,6 +1597,15 @@ def resolve_advance_context(
             completed_rebases,
         )
 
+    rebase_failure_streak = _count_rebase_failure_streak(
+        task=task,
+        rebase_children=rebase_children,
+        latest_completed_rebase=latest_completed_rebase,
+        latest_completed_review=latest_completed_review,
+        latest_completed_code_change=latest_completed_code_change,
+        review_cleared_at=task.review_cleared_at,
+    )
+
     return AdvanceContext(
         store=store,
         task=task,
@@ -1518,12 +1631,14 @@ def resolve_advance_context(
         rebase_pending_or_running=rebase_pending_or_running,
         rebase_failed=rebase_failed,
         latest_completed_rebase=latest_completed_rebase,
+        rebase_failure_streak=rebase_failure_streak,
         rebase_invalidates_review=rebase_invalidates_review,
         review_preserved_by_rebase=review_preserved_by_rebase,
         review_invalidated_by_rebase=review_invalidated_by_rebase,
         reviews=reviews,
         active_review=active_review,
         latest_completed_review=latest_completed_review,
+        latest_completed_code_change=latest_completed_code_change,
         review_cleared=review_cleared,
         review_verdict=review_verdict,
         review_report=review_report,
@@ -1667,6 +1782,15 @@ ADVANCE_RULES: list[AdvanceRule] = [
         },
     ),
     AdvanceRule(
+        name="conflict_rebase_failure_circuit_breaker",
+        matches=lambda ctx: (
+            not ctx.can_merge
+            and ctx.rebase_failure_streak is not None
+            and ctx.rebase_failure_streak.attempts >= REBASE_FAILURE_CIRCUIT_BREAKER_ATTEMPTS
+        ),
+        action=_rebase_failure_circuit_breaker_action,
+    ),
+    AdvanceRule(
         name="conflict_rebase_failed",
         matches=lambda ctx: not ctx.can_merge and _failed_rebase_still_blocks_advance(ctx),
         action=lambda ctx: with_needs_attention(
@@ -1685,8 +1809,17 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="conflict_needs_rebase",
-        matches=lambda ctx: not ctx.can_merge,
+        matches=lambda ctx: not ctx.can_merge and not _branch_contains_target_tip(ctx),
         action=lambda ctx: {"type": "needs_rebase", "description": "rebase --resolve (conflicts detected)"},
+    ),
+    AdvanceRule(
+        name="already_rebased_but_lineage_incomplete",
+        matches=lambda ctx: (
+            not ctx.can_merge
+            and _branch_contains_target_tip(ctx)
+            and ctx.task.status != "completed"
+        ),
+        action=_already_rebased_but_lineage_incomplete_action,
     ),
     AdvanceRule(
         name="post_rebase_run_pending_review",

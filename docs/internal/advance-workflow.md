@@ -92,9 +92,12 @@ Conflict detection uses the same target-branch resolution as task collection:
 | Branch cannot merge into the resolved target branch AND rebase child is `pending`/`in_progress` | `skip` — rebase already running |
 | Branch cannot merge into the resolved target branch AND rebase child is `failed` | `needs_discussion` — manual intervention required unless later local post-resolution proof exists |
 | Branch cannot merge into the resolved target branch AND a same-branch rebase child already completed | `needs_discussion` — reason `rebase-did-not-unblock-merge`; stop repeated no-op rebases |
-| Branch cannot merge into the resolved target branch AND no active rebase child | `needs_rebase` — create rebase task |
+| Branch cannot merge into the resolved target branch AND no active rebase child AND the branch does not already contain the target tip | `needs_rebase` — create rebase task |
+| Branch cannot merge into the resolved target branch AND the branch already contains the target tip AND the lineage task is still incomplete | `needs_discussion` — rebase is already proved unnecessary; surface the incomplete lineage instead of looping |
 
-A failed rebase is not cleared just because the latest implementation tip becomes mergeable again. If an implementation lineage still has no later approved or cleared review after that failed rebase, advance continues to surface `rebase-failed-needs-manual-resolution` instead of creating a first review from the now-clean tip, unless a later local post-resolution proof exists. The local proofs are intentionally narrow: a merged merge unit, exact branch-tip equality with the current target branch, or proof that the implementation branch already contains the current target tip.
+A failed rebase is not cleared just because the latest implementation tip becomes mergeable again. If an implementation lineage still has no later approved or cleared review after that failed rebase, advance continues to surface `rebase-failed-needs-manual-resolution` instead of creating a first review from the now-clean tip, unless a later local post-resolution proof exists. The local proofs are intentionally narrow: a merged merge unit, exact branch-tip equality with the current target branch, or proof that the implementation branch already contains the current target tip. That proof now suppresses fresh `needs_rebase` planning as well: when the branch already contains the target, advance either continues with the ordinary review/merge flow or raises one shared `needs_attention` row for the real non-rebase blocker.
+
+Repeated failed rebases are bounded independently of the ordinary failed-rebase rule. Once the same branch accumulates 3 failed rebase attempts with no intervening successful rebase, completed review, review clear, or completed code change, advance/watch stop creating more rebases and emit `needs_discussion` with reason `rebase-failure-circuit-breaker`.
 
 ### 5. Post-rebase review invalidation
 
