@@ -13,7 +13,7 @@ from typing import Literal
 
 from gza.db import SqliteTaskStore, Task, task_id_numeric_key
 from gza.lifecycle_completion import task_is_complete_for_lifecycle
-from gza.lineage import resolve_impl_task, walk_ancestors
+from gza.lineage import resolve_impl_task, walk_ancestors, walk_based_on_descendants
 from gza.task_query import (
     DateFilter,
     TaskQuery,
@@ -486,12 +486,31 @@ def get_base_task_slug(task: Task) -> str | None:
 
 
 def get_reviews_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
-    """Get reviews for a root task, with fallback for unlinked manual reviews."""
+    """Get reviews for a root task, including same-merge-unit branchless reviews."""
     if root_task.id is None:
         return []
-    reviews = store.get_reviews_for_task(root_task.id)
-    if reviews:
-        return reviews
+
+    reviews_by_id: dict[str, Task] = {}
+    for review in store.get_reviews_for_task(root_task.id):
+        if review.id is not None:
+            reviews_by_id.setdefault(review.id, review)
+
+    merge_unit = store.resolve_merge_unit_for_task(root_task.id)
+    if merge_unit is not None:
+        for task in store.list_tasks_for_merge_unit(merge_unit.id):
+            if task.task_type == "review" and task.id is not None:
+                reviews_by_id.setdefault(task.id, task)
+
+    if reviews_by_id:
+        return sorted(
+            reviews_by_id.values(),
+            key=lambda review: (
+                review.completed_at is not None,
+                review.completed_at or datetime.min.replace(tzinfo=UTC),
+            ),
+            reverse=True,
+        )
+
     slug = get_task_slug(root_task)
     if not slug:
         return []
@@ -512,14 +531,31 @@ def get_fixes_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
     return store.get_fix_tasks_by_root(root_task.id)
 
 
+def get_same_branch_implement_descendants_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
+    """Return same-branch implement resume/retry descendants for a root task."""
+    if root_task.id is None:
+        return []
+
+    descendants: list[Task] = []
+    for task in walk_based_on_descendants(store, root_task, task_type="implement"):
+        if root_task.branch and task.branch and task.branch != root_task.branch:
+            continue
+        descendants.append(task)
+    return descendants
+
+
 def get_code_changing_descendants_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
-    """Return same-branch code-changing descendants (improves + fixes) of a root task.
+    """Return same-branch code-changing descendants of a root task.
 
     Used by review-freshness logic: any completed task here invalidates a prior
     review the same way an improve does, because the task ran on the impl's
     shared branch after the review was written.
     """
-    return [*get_improves_for_root(store, root_task), *get_fixes_for_root(store, root_task)]
+    return [
+        *get_same_branch_implement_descendants_for_root(store, root_task),
+        *get_improves_for_root(store, root_task),
+        *get_fixes_for_root(store, root_task),
+    ]
 
 
 _LINEAGE_REL_LABELS: dict[str, str] = {

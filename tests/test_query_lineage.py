@@ -115,6 +115,7 @@ class TestGetReviewsForRoot:
 
     def test_returns_linked_reviews_when_found(self):
         store = MagicMock()
+        store.resolve_merge_unit_for_task.return_value = None
         review = _make_task(id=10, task_type="review")
         store.get_reviews_for_task.return_value = [review]
         root = _make_task(id=1)
@@ -123,9 +124,23 @@ class TestGetReviewsForRoot:
         assert result == [review]
         store.get_unlinked_reviews_for_slug.assert_not_called()
 
+    def test_includes_merge_unit_attached_reviews(self):
+        store = MagicMock()
+        store.get_reviews_for_task.return_value = []
+        store.resolve_merge_unit_for_task.return_value = _make_task(id="mu-1")
+        attached_review = _make_task(id=30, task_type="review")
+        store.list_tasks_for_merge_unit.return_value = [attached_review]
+        root = _make_task(id=1)
+
+        result = get_reviews_for_root(store, root)
+
+        assert result == [attached_review]
+        store.get_unlinked_reviews_for_slug.assert_not_called()
+
     def test_falls_back_to_unlinked_reviews(self):
         store = MagicMock()
         store.get_reviews_for_task.return_value = []
+        store.resolve_merge_unit_for_task.return_value = None
         unlinked_review = _make_task(id=20, task_type="review")
         store.get_unlinked_reviews_for_slug.return_value = [unlinked_review]
         root = _make_task(id=1, slug="20260305-my-feature")
@@ -135,6 +150,7 @@ class TestGetReviewsForRoot:
     def test_returns_empty_when_no_slug_for_fallback(self):
         store = MagicMock()
         store.get_reviews_for_task.return_value = []
+        store.resolve_merge_unit_for_task.return_value = None
         root = _make_task(id=1, slug=None)
         result = get_reviews_for_root(store, root)
         assert result == []
@@ -143,6 +159,7 @@ class TestGetReviewsForRoot:
     def test_returns_empty_when_no_linked_and_no_unlinked(self):
         store = MagicMock()
         store.get_reviews_for_task.return_value = []
+        store.resolve_merge_unit_for_task.return_value = None
         store.get_unlinked_reviews_for_slug.return_value = []
         root = _make_task(id=1, slug="20260305-my-feature")
         result = get_reviews_for_root(store, root)

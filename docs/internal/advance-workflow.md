@@ -154,9 +154,11 @@ The improve flow now defers recovery edge selection to the shared recovery engin
 | Condition | Action |
 |-----------|--------|
 | Reviews exist but all cleared | `merge` — previous review addressed |
-| Non-implement task type (plan, explore, etc.) | `merge` — no review required |
+| Standalone non-implement task type (plan, explore, etc.), or a merge-unit lineage whose owner does not require review | `merge` — no review required |
 
-### 8. Implement with no review
+Merge-unit members inherit the review state and review requirement of the actionable implementation lineage member on that shared branch. When the compatibility owner row is a failed historical implement and the current code lives on a completed resume descendant, closing-review state and post-rebase invalidation both resolve against that completed descendant. A completed `rebase` or other same-branch member of such an implement-owned merge unit must create or wait on that lineage review before merge when no review evidence exists yet.
+
+### 8. Implementation-owned lineage with no review
 
 | Condition | Action |
 |-----------|--------|

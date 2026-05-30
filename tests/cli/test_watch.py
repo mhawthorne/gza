@@ -6277,6 +6277,83 @@ def test_watch_cycle_create_review_routes_impl_chain_through_iterate(tmp_path: P
     )
 
 
+def test_watch_cycle_completed_rebase_without_owner_review_routes_to_iterate_before_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed_owner = store.add("Original implement", task_type="implement")
+    assert failed_owner.id is not None
+    failed_owner.status = "failed"
+    failed_owner.failure_reason = "MAX_STEPS"
+    failed_owner.completed_at = datetime.now(UTC)
+    failed_owner.branch = "feature/rebase-review-gate"
+    failed_owner.has_commits = True
+    store.update(failed_owner)
+    store.set_merge_status(failed_owner.id, "unmerged")
+    store.get_or_create_merge_unit_for_task(failed_owner)
+
+    resumed = store.add("Resumed implement", task_type="implement", based_on=failed_owner.id)
+    assert resumed.id is not None
+    resumed.status = "completed"
+    resumed.completed_at = datetime.now(UTC)
+    resumed.branch = failed_owner.branch
+    resumed.has_commits = True
+    store.update(resumed)
+    store.set_merge_status(resumed.id, "unmerged")
+    store.get_or_create_merge_unit_for_task(resumed)
+
+    rebase = store.add("Completed rebase", task_type="rebase", based_on=resumed.id, same_branch=True)
+    assert rebase.id is not None
+    rebase.status = "completed"
+    rebase.completed_at = datetime.now(UTC)
+    rebase.branch = resumed.branch
+    rebase.changed_diff = False
+    store.update(rebase)
+    store.get_or_create_merge_unit_for_task(rebase)
+
+    config = Config.load(tmp_path)
+    rows = _query_owner_rows(
+        store=store,
+        config=config,
+        git=_make_watch_git(),
+        target_branch="main",
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+    assert any(row.owner_task.id == failed_owner.id for row in rows)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._execute_merge_action", side_effect=AssertionError("merge should not run before review")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == resumed.id
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and f"{resumed.id} iterate" in line
+        for line in log_path.read_text().splitlines()
+    )
+
+
 def test_watch_review_spawn_logs_start_and_review_transition_logs_verdict(tmp_path: Path) -> None:
     """Standalone review fallback should log START; REVIEW is only for completed verdict transitions."""
     setup_config(tmp_path)

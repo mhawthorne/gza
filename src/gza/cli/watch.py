@@ -94,6 +94,25 @@ _WATCH_ITERATE_ROUTED_ACTIONS = frozenset({"create_review", "run_review", "impro
 T = TypeVar("T")
 
 
+def _resolve_watch_iterate_impl_for_task(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+    """Resolve the implementation iterate target for a same-branch lifecycle member."""
+    if task.task_type == "implement":
+        return task if task.id is not None else None
+
+    current: DbTask | None = task
+    visited: set[str] = set()
+    while current is not None and current.id is not None:
+        if current.id in visited:
+            return None
+        visited.add(current.id)
+        if current.task_type == "implement":
+            return current
+        if current.based_on is None:
+            return None
+        current = store.get(current.based_on)
+    return None
+
+
 def _merge_single_task(
     task_id: str,
     config: Config,
@@ -237,9 +256,9 @@ def _watch_iterate_impl_target(
     impl_task: DbTask | None = None
 
     if action_type in {"create_review", "improve"}:
-        if task.task_type != "implement" or task.id is None:
+        impl_task = _resolve_watch_iterate_impl_for_task(store, task)
+        if impl_task is None or impl_task.id is None:
             return None
-        impl_task = task
     elif action_type == "run_review":
         review_task = action.get("review_task")
         if not isinstance(review_task, DbTask) or review_task.id is None:

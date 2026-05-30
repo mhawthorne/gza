@@ -229,6 +229,36 @@ def _add_completed_rebase(
     return rebase
 
 
+def _make_failed_owner_with_completed_resume_descendant(
+    store: SqliteTaskStore,
+    *,
+    branch: str,
+    failed_at: datetime,
+    resumed_at: datetime,
+) -> tuple[DbTask, DbTask]:
+    owner = store.add("Original implement", task_type="implement")
+    assert owner.id is not None
+    owner.status = "failed"
+    owner.failure_reason = "MAX_STEPS"
+    owner.completed_at = failed_at
+    owner.branch = branch
+    owner.merge_status = "unmerged"
+    owner.has_commits = True
+    store.update(owner)
+    store.get_or_create_merge_unit_for_task(owner)
+
+    resumed = store.add("Resumed implement", task_type="implement", based_on=owner.id)
+    assert resumed.id is not None
+    resumed.status = "completed"
+    resumed.completed_at = resumed_at
+    resumed.branch = branch
+    resumed.merge_status = "unmerged"
+    resumed.has_commits = True
+    store.update(resumed)
+    store.get_or_create_merge_unit_for_task(resumed)
+    return owner, resumed
+
+
 def _add_failed_rebase_attempts(
     store: SqliteTaskStore,
     impl: DbTask,
@@ -769,6 +799,160 @@ def test_rebase_after_review_with_unknown_diff_requires_fresh_review(tmp_path: P
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
     assert action["type"] == "create_review"
     assert action["description"] == f"Create review (rebase {rebase.id} change unknown)"
+
+
+def test_completed_rebase_without_prior_review_creates_owner_review(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-owner-no-review",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    store.get_or_create_merge_unit_for_task(impl)
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    store.get_or_create_merge_unit_for_task(rebase)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), rebase, "main")
+
+    assert action["type"] == "create_review"
+    assert action["description"] == "Create closing review (latest implementation has no review yet)"
+
+
+def test_completed_rebase_under_resumed_implement_without_review_creates_review(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    _failed_owner, resumed = _make_failed_owner_with_completed_resume_descendant(
+        store,
+        branch="feature/rebase-resume-no-review",
+        failed_at=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        resumed_at=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        resumed,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    store.get_or_create_merge_unit_for_task(rebase)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), rebase, "main")
+
+    assert action["type"] == "create_review"
+    assert action["description"] == "Create closing review (latest implementation has no review yet)"
+
+
+def test_completed_rebase_with_approved_owner_review_merges(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-owner-approved",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    store.get_or_create_merge_unit_for_task(impl)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    store.get_or_create_merge_unit_for_task(rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, task: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), rebase, "main")
+
+    assert review.id is not None
+    assert action["type"] == "merge"
+    assert action["review_task"].id == review.id
+    assert action["description"] == f"Merge (review APPROVED, preserved across rebase {rebase.id})"
+
+
+def test_completed_changed_rebase_under_resumed_implement_invalidates_prior_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    _failed_owner, resumed = _make_failed_owner_with_completed_resume_descendant(
+        store,
+        branch="feature/rebase-resume-invalidates-review",
+        failed_at=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        resumed_at=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
+    )
+    _add_completed_review(store, resumed, when=datetime(2026, 5, 10, 11, 30, tzinfo=UTC))
+    rebase = _add_completed_rebase(
+        store,
+        resumed,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    store.get_or_create_merge_unit_for_task(rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, task: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), rebase, "main")
+
+    assert action["type"] == "create_review"
+    assert action["description"] == f"Create review (rebase {rebase.id} changed diff)"
+
+
+def test_completed_rebase_with_changed_diff_invalidates_owner_review(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-owner-invalidates-review",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    store.get_or_create_merge_unit_for_task(impl)
+    _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    store.get_or_create_merge_unit_for_task(rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, task: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), rebase, "main")
+
+    assert action["type"] == "create_review"
+    assert action["description"] == f"Create review (rebase {rebase.id} changed diff)"
 
 
 def test_evaluate_resumes_timeout_retry_descendant_once(tmp_path: Path):

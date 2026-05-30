@@ -14,7 +14,7 @@ from gza.branch_resolution import resolve_rebase_target_task
 from gza.console import prompt_available_width, shorten_prompt
 from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key, task_owns_merge_status
 from gza.git import ResolvedMergeSourceRef
-from gza.lineage import walk_ancestors
+from gza.lineage import walk_ancestors, walk_based_on_descendants
 from gza.merge_state import resolve_task_merge_state_for_target
 from gza.query import (
     get_code_changing_descendants_for_root,
@@ -134,6 +134,7 @@ class AdvanceContext:
     review_invalidated_by_rebase: DbTask | None = None
 
     reviews: list[DbTask] | None = None
+    review_root_task: DbTask | None = None
     active_review: DbTask | None = None
     latest_completed_review: DbTask | None = None
     latest_completed_code_change: DbTask | None = None
@@ -1393,6 +1394,60 @@ def _resolve_review_state(
     )
 
 
+def _resolve_impl_ancestor_by_based_on(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+    """Resolve the nearest implementation ancestor for same-branch task lineages."""
+    visited: set[str] = set()
+    current: DbTask | None = task
+    while current is not None:
+        if current.id is not None:
+            if current.id in visited:
+                return None
+            visited.add(current.id)
+        if current.task_type == "implement":
+            return current
+        if current.based_on is None:
+            return None
+        current = store.get(current.based_on)
+    return None
+
+
+def _resolve_review_root_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    """Resolve the implementation task whose review state gates this branch lineage."""
+    candidate = task
+    if task.id is not None:
+        merge_unit = store.resolve_merge_unit_for_task(task.id)
+        if merge_unit is not None:
+            representative = store.resolve_merge_unit_representative_task(
+                merge_unit,
+                preferred_task_id=task.id,
+                require_actionable=True,
+            )
+            if representative is not None:
+                candidate = representative
+            else:
+                owner = store.resolve_merge_unit_owner_task(merge_unit)
+                if owner is not None:
+                    candidate = owner
+
+    impl_ancestor = _resolve_impl_ancestor_by_based_on(store, candidate)
+    if impl_ancestor is not None:
+        return impl_ancestor
+    return candidate
+
+
+def _get_same_branch_rebase_descendants_for_root(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
+    """Return same-branch rebase descendants nested under the review-gated impl root."""
+    if root_task.id is None:
+        return []
+
+    return [
+        child
+        for child in walk_based_on_descendants(store, root_task)
+        if child.task_type == "rebase"
+        and (root_task.branch is None or child.branch is None or child.branch == root_task.branch)
+    ]
+
+
 def resolve_advance_context(
     config: Any,
     store: SqliteTaskStore,
@@ -1505,6 +1560,7 @@ def resolve_advance_context(
         )
 
     merge_source = _resolve_current_merge_source(git, task.branch)
+    review_root_task = _resolve_review_root_task(store, task)
     if persist_post_merge_rebase_state:
         post_merge_rebase_state = _resolve_and_persist_post_merge_rebase_state(
             store,
@@ -1532,11 +1588,9 @@ def resolve_advance_context(
         or merge_state == "merged"
         or (bool(merge_source.ref) and git.can_merge(merge_source.ref, target_branch))
     )
-    rebase_children = [
-        child
-        for child in store.get_lineage_children(task.id)
-        if child.task_type == "rebase" and (task.branch is None or child.branch is None or child.branch == task.branch)
-    ]
+    rebase_root_task = review_root_task if review_root_task.task_type == "implement" else task
+    assert rebase_root_task.id is not None
+    rebase_children = _get_same_branch_rebase_descendants_for_root(store, rebase_root_task)
     rebase_pending_or_running = next((c for c in rebase_children if c.status in {"pending", "in_progress"}), None)
     failed_rebases = [c for c in rebase_children if c.status == "failed"]
     rebase_failed = max(failed_rebases, key=_task_event_time) if failed_rebases else None
@@ -1571,7 +1625,7 @@ def resolve_advance_context(
         has_fresh_unresolved_comments_since_latest_review,
         latest_completed_code_change,
         closing_review_action,
-) = _resolve_review_state(config, store, task)
+) = _resolve_review_state(config, store, review_root_task)
 
     rebase_invalidates_review = False
     review_preserved_by_rebase: DbTask | None = None
@@ -1641,6 +1695,7 @@ def resolve_advance_context(
         review_preserved_by_rebase=review_preserved_by_rebase,
         review_invalidated_by_rebase=review_invalidated_by_rebase,
         reviews=reviews,
+        review_root_task=review_root_task,
         active_review=active_review,
         latest_completed_review=latest_completed_review,
         latest_completed_code_change=latest_completed_code_change,

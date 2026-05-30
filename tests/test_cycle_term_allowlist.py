@@ -15,6 +15,7 @@ SELF_PATH = Path(__file__).resolve()
 # - historical docs that refer to removed legacy filenames/commands verbatim
 ALLOWED_CYCLE_LINES = {
     ("docs/incidents/2026-05-30-rebase-noop-loop.md", "  watch scheduler (urgent → recovery → normal) with a per-cycle recovery cap;"),
+    ("docs/internal/sessions/2026-05-30-rebase-loop-and-followups.md", "| gza-3949 | plan | v0.6.0 | queued (deps gza-3947) | Explicit 3-tier watch scheduler: urgent → recovery → normal, with per-cycle recovery cap |"),
     ("docs/incidents/2026-05-30-rebase-noop-loop.md", "mislabeled as `GIT_ERROR`, and nothing stopped the cycle — so ~95 identical dead"),
     ("docs/incidents/2026-05-30-rebase-noop-loop.md", "  watch cycle. Forever."),
     ("docs/internal/stats-subcommands.md", "Ports the functionality of the former `bin/review-cycle-stats.py` script into the CLI. Shows per-implementation-task review iteration stats, weekly groupings, iteration-count distribution, and per-model issue counts."),

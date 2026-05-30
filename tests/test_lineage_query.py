@@ -867,6 +867,7 @@ def test_query_lineage_owner_rows_keeps_legitimate_impl_branch_rebase_descendant
         branch="feature/canonical",
         has_commits=True,
     )
+    descendant.changed_diff = False
     descendant.merge_status = "unmerged"
     store.update(descendant)
 
