@@ -1,4 +1,4 @@
-"""Shell-command regression tests for provider entrypoints."""
+"""Shell-command regression tests for provider entrypoints and setup cwd behavior."""
 
 import os
 import shlex
@@ -104,8 +104,10 @@ class TestDockerEntrypointFunctional:
         assert state_lines == ["sync", "run", "run"]
         assert "lazy-sync" not in state_lines
 
-    def test_uv_sync_creates_venv_under_scoped_workdir(self, tmp_path: Path) -> None:
-        """uv sync should materialize .venv in the scoped project cwd, not repo root."""
+
+class TestSetupCommandCwdFunctional:
+    def test_uv_sync_uses_scoped_project_cwd_for_venv_creation(self, tmp_path: Path) -> None:
+        """Host-side `uv sync` should create `.venv` under the current scoped project cwd."""
         workspace = tmp_path / "workspace"
         project_dir = workspace / "services" / "foo"
         project_dir.mkdir(parents=True)
