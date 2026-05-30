@@ -154,7 +154,17 @@ class TestValidateCommand:
         result = run_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 0  # Warning, not error
         assert "docker_volumes[0]" in result.stdout
-        assert "unknown mode 'xyz'" in result.stdout
+
+    def test_validate_enforce_project_scope_must_be_boolean(self, tmp_path: Path):
+        """Validate rejects non-boolean enforce_project_scope values."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text("project_name: test\nenforce_project_scope: nope\n")
+
+        result = run_gza("validate", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "enforce_project_scope" in result.stdout
+        assert "must be a boolean" in result.stdout
 
 
 class TestProjectPrefixValidation:

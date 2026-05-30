@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from rich.console import Console
@@ -557,6 +557,35 @@ class TestBuildDockerCmd:
         assert cmd[tmpfs_idx + 1] == "/workspace/.venv:rw,exec,mode=1777"
         assert volume_mounts[0] == f"{tmp_path}:/workspace"
 
+    def test_mounts_repo_root_and_scoped_workdir_for_project_subdir(self, tmp_path):
+        """Project subdirs should mount the full repo while keeping cwd inside the project."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=".testconfig",
+            env_vars=[],
+        )
+
+        project_dir = tmp_path / "services" / "api"
+        project_dir.mkdir(parents=True)
+        git_config_miss = Mock(returncode=1, stdout="", stderr="")
+
+        def fake_run(args, **kwargs):
+            if args[:4] == ["git", "-C", str(project_dir), "rev-parse"]:
+                return Mock(returncode=0, stdout=f"{tmp_path}\n", stderr="")
+            if args[:2] == ["git", "config"]:
+                return git_config_miss
+            raise AssertionError(f"Unexpected subprocess call: {args}")
+
+        with patch("gza.providers.base.subprocess.run", side_effect=fake_run):
+            cmd = build_docker_cmd(docker_config, project_dir, timeout_minutes=10)
+
+        mount_idx = cmd.index("-v")
+        assert cmd[mount_idx + 1] == f"{tmp_path}:/workspace"
+        workdir_idx = cmd.index("-w")
+        assert cmd[workdir_idx + 1] == "/workspace/services/api"
+
     def test_mounts_config_dir(self, tmp_path):
         """Should mount provider config directory."""
         docker_config = DockerConfig(
@@ -642,6 +671,29 @@ class TestBuildDockerCmd:
 
         assert "/host/datasets:/datasets:ro" in volume_mounts
         assert "/host/models:/models" in volume_mounts
+
+    def test_mounts_out_of_repo_deps_read_only(self, tmp_path):
+        """Out-of-repo local deps should be passed through as read-only bind mounts."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=".testconfig",
+            env_vars=[],
+        )
+
+        dep_path = tmp_path / "external-lib"
+        dep_path.mkdir()
+        cmd = build_docker_cmd(
+            docker_config,
+            tmp_path,
+            timeout_minutes=10,
+            docker_volumes=[f"{dep_path}:{dep_path}:ro"],
+        )
+
+        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
+        volume_mounts = [cmd[i + 1] for i in v_indices]
+        assert f"{dep_path}:{dep_path}:ro" in volume_mounts
 
     def test_custom_volumes_added_after_standard_mounts(self, tmp_path):
         """Custom volumes should be added after workspace and config mounts."""

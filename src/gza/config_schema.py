@@ -65,6 +65,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ),
     ConfigKeySpec("docker_volumes", "list[str]", [], "Extra Docker volume mounts (`source:dest[:mode]`)."),
     ConfigKeySpec("db_path", "str", ".gza/gza.db", "SQLite database path."),
+    ConfigKeySpec("enforce_project_scope", "bool", True, "Reject commits outside the project subtree unless the task is tagged `cross-project`."),
     ConfigKeySpec("interactive_worktree_dir", "str", "", "Base path for interactive worktree operations."),
     ConfigKeySpec("iterate_max_iterations", "int", 3, "Default iteration budget for `gza iterate`."),
     ConfigKeySpec("learnings_interval", "int", 5, "Auto-regenerate learnings every N completed tasks (0 disables)."),

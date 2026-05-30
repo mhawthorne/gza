@@ -17,6 +17,7 @@ from .base import (
     PreflightCheckResult,
     Provider,
     RunResult,
+    _resolve_docker_mount_root_and_cwd,
     build_docker_cmd,
     ensure_docker_image,
     verify_docker_credentials,
@@ -523,9 +524,10 @@ class CodexProvider(Provider):
                 cmd.extend(["-m", config.model])
             self._append_reasoning_effort_override(cmd, config.reasoning_effort)
         else:
+            _mount_root, container_cwd = _resolve_docker_mount_root_and_cwd(work_dir)
             cmd.extend([
                 "codex",
-                *build_headless_exec_args("/workspace"),  # Worktree metadata may be unavailable inside containers
+                *build_headless_exec_args(container_cwd),
             ])
 
             # Add model if specified

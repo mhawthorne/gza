@@ -1,5 +1,6 @@
 """Main Gza runner orchestration."""
 
+import copy
 import inspect
 import json
 import logging
@@ -12,7 +13,7 @@ import sys
 import time
 import tomllib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass, replace as dataclass_replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -102,6 +103,8 @@ EXTRACTION_PRECHECK_FAILURE_REASON = "EXTRACTION_PRECHECK_FAILED"
 EXTRACTION_ALREADY_MERGED_COMPLETION_REASON = "EXTRACTION_ALREADY_MERGED"
 
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
+PROJECT_SCOPE_FAILURE_REASON = "PROJECT_SCOPE_VIOLATION"
+CROSS_PROJECT_TAG = "cross-project"
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,48 @@ class ResolvedRunFailure:
     reason: str
     status: str
     outcome_message: str
+
+
+@dataclass(frozen=True)
+class ResolvedLocalDependency:
+    """One uv.lock-resolved local dependency path."""
+
+    raw_path: str
+    resolved_path: Path
+    repo_relative_path: Path | None
+
+    @property
+    def is_in_repo(self) -> bool:
+        return self.repo_relative_path is not None
+
+    @property
+    def is_relative(self) -> bool:
+        return not Path(self.raw_path).is_absolute()
+
+
+@dataclass(frozen=True)
+class ProjectBoundary:
+    """Resolved repo/project boundary and local dependency scope."""
+
+    repo_root: Path
+    scope_root: Path
+    local_dependencies: tuple[ResolvedLocalDependency, ...] = ()
+
+    @property
+    def in_repo_dependency_paths(self) -> tuple[Path, ...]:
+        return tuple(
+            dep.repo_relative_path
+            for dep in self.local_dependencies
+            if dep.repo_relative_path is not None
+        )
+
+    @property
+    def out_of_repo_dependencies(self) -> tuple[ResolvedLocalDependency, ...]:
+        return tuple(dep for dep in self.local_dependencies if dep.repo_relative_path is None)
+
+    @property
+    def allowed_repo_paths(self) -> tuple[Path, ...]:
+        return (self.scope_root, *self.in_repo_dependency_paths)
 def _git_error_failure() -> ResolvedRunFailure:
     return ResolvedRunFailure(
         reason="GIT_ERROR",
@@ -3102,45 +3147,201 @@ def _snapshot_task_db_to_worktree(db_path: Path, worktree_path: Path) -> None:
     snapshot_path.chmod(0o444)
 
 
+def _path_is_under(path: Path, root: Path) -> bool:
+    """Return whether ``path`` is equal to or nested under ``root``."""
+    return path == root or root in path.parents
+
+
+def _dedupe_paths(paths: list[Path]) -> tuple[Path, ...]:
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for path in paths:
+        normalized = Path(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return tuple(ordered)
+
+
+def _resolve_repo_root(project_dir: Path) -> Path:
+    """Resolve the git repo root for ``project_dir``.
+
+    Tests may construct throwaway directories without git metadata; fall back to
+    the project directory in that case so pure logic tests can still run.
+    """
+    resolved = project_dir.resolve()
+    for candidate in (resolved, *resolved.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return resolved
+
+
+def _resolve_local_dependencies(project_dir: Path, repo_root: Path) -> tuple[ResolvedLocalDependency, ...]:
+    """Resolve uv local path dependencies from ``uv.lock``."""
+    lockfile = project_dir / "uv.lock"
+    if not lockfile.exists():
+        return ()
+
+    try:
+        with open(lockfile, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        logger.warning("Failed to read/parse %s; skipping local dependency resolution", lockfile)
+        return ()
+
+    packages = data.get("package", [])
+    if not isinstance(packages, list):
+        return ()
+
+    dependencies: list[ResolvedLocalDependency] = []
+    for package in packages:
+        if not isinstance(package, dict):
+            continue
+        source = package.get("source")
+        if not isinstance(source, dict):
+            continue
+        raw_path: str | None = None
+        for key in ("editable", "directory", "path"):
+            value = source.get(key)
+            if isinstance(value, str):
+                raw_path = value
+                break
+        if raw_path is None:
+            continue
+
+        source_path = Path(raw_path)
+        if source_path == Path("."):
+            continue
+
+        resolved_path = (project_dir / source_path).resolve() if not source_path.is_absolute() else source_path.resolve()
+        repo_relative_path: Path | None
+        try:
+            repo_relative_path = resolved_path.relative_to(repo_root)
+        except ValueError:
+            repo_relative_path = None
+
+        dependency = ResolvedLocalDependency(
+            raw_path=raw_path,
+            resolved_path=resolved_path,
+            repo_relative_path=repo_relative_path,
+        )
+        if dependency not in dependencies:
+            dependencies.append(dependency)
+
+    return tuple(dependencies)
+
+
+def _resolve_project_boundary(config: Config) -> ProjectBoundary:
+    """Resolve the repo-relative project scope and uv local dependency set."""
+    repo_root = _resolve_repo_root(config.project_dir)
+    try:
+        scope_root = config.project_dir.resolve().relative_to(repo_root)
+    except ValueError:
+        scope_root = Path(".")
+    return ProjectBoundary(
+        repo_root=repo_root,
+        scope_root=scope_root,
+        local_dependencies=_resolve_local_dependencies(config.project_dir, repo_root),
+    )
+
+
+def _project_repo_relative_path(project_path: Path, config: Config, boundary: ProjectBoundary) -> Path:
+    """Map a project-rooted path into the repo-relative worktree layout."""
+    relative_path = project_path.relative_to(config.project_dir)
+    if boundary.scope_root == Path("."):
+        return relative_path
+    return boundary.scope_root / relative_path
+
+
+def _project_worktree_path(
+    project_path: Path,
+    config: Config,
+    worktree_path: Path,
+    boundary: ProjectBoundary,
+) -> Path:
+    """Map a project-rooted path into the corresponding path inside a worktree."""
+    return worktree_path / _project_repo_relative_path(project_path, config, boundary)
+
+
+def _project_workspace_path(project_path: Path, config: Config, boundary: ProjectBoundary) -> Path:
+    """Map a project-rooted path into the Docker container workspace mount."""
+    return Path("/workspace") / _project_repo_relative_path(project_path, config, boundary)
+
+
+def _task_is_cross_project(task: Task) -> bool:
+    return CROSS_PROJECT_TAG in set(task.tags)
+
+
+def _task_runtime_work_dir(worktree_path: Path, boundary: ProjectBoundary, task: Task) -> Path:
+    """Return the cwd that provider runs should use for this task."""
+    if _task_is_cross_project(task) or boundary.scope_root == Path("."):
+        return worktree_path
+    return worktree_path / boundary.scope_root
+
+
+def _task_docker_volumes(config: Config, boundary: ProjectBoundary) -> list[str]:
+    """Return configured Docker mounts plus read-only mounts for out-of-repo deps."""
+    volumes = list(getattr(config, "docker_volumes", []) or [])
+    for dep in boundary.out_of_repo_dependencies:
+        mount = f"{dep.resolved_path}:{dep.resolved_path}:ro"
+        if mount not in volumes:
+            volumes.append(mount)
+    return volumes
+
+
+def _config_with_task_docker_volumes(config: Config, boundary: ProjectBoundary) -> Config:
+    """Return a config-like object with task-specific derived Docker mounts."""
+    volumes = _task_docker_volumes(config, boundary)
+    if is_dataclass(config) and not isinstance(config, type):
+        return dataclass_replace(config, docker_volumes=volumes)
+    cloned = copy.copy(config)
+    setattr(cloned, "docker_volumes", volumes)
+    return cloned
+
+
+def _is_path_in_allowed_scope(path: str, allowed_roots: tuple[Path, ...]) -> bool:
+    relative_path = Path(path)
+    return any(_path_is_under(relative_path, allowed_root) for allowed_root in allowed_roots)
+
+
+def _expand_repo_relative_paths(repo_root: Path, paths: list[str]) -> list[str]:
+    """Expand directory-like repo-relative paths into concrete file paths when possible."""
+    expanded: list[str] = []
+    for raw_path in paths:
+        candidate = repo_root / raw_path
+        if candidate.is_dir():
+            children = sorted(
+                child.relative_to(repo_root).as_posix()
+                for child in candidate.rglob("*")
+                if child.is_file()
+            )
+            if children:
+                expanded.extend(children)
+                continue
+        expanded.append(raw_path)
+    return sorted(dict.fromkeys(expanded))
+
+
 def _create_local_dep_symlinks(config: Config, worktree_path: Path) -> None:
     """Create symlinks for local path dependencies so uv can resolve them in worktrees.
 
-    Parses [tool.uv.sources] from the project's pyproject.toml and creates
-    symlinks in the worktree's ancestor directories so that relative path
-    references resolve to the same real directories as they would from the
-    original project root.
+    Reads uv.lock's resolved local dependency set and creates symlinks in the
+    worktree's ancestor directories so relative source paths continue to resolve
+    from the worktree exactly as they do from the original project root.
     """
-    pyproject = config.project_dir / "pyproject.toml"
-    if not pyproject.exists():
-        return
-
-    try:
-        with open(pyproject, "rb") as f:
-            data = tomllib.load(f)
-    except Exception:
-        logger.warning("Failed to read/parse %s; skipping local dep symlinks", pyproject)
-        return
-
-    sources = data.get("tool", {}).get("uv", {}).get("sources", {})
-    if not sources:
-        return
-
-    for _dep_name, entry in sources.items():
-        if not isinstance(entry, dict):
-            continue
-        raw_path = entry.get("path")
-        if not raw_path:
-            continue
-        dep_rel = Path(raw_path)
-        # Skip absolute paths — they work everywhere without symlinks
+    boundary = _resolve_project_boundary(config)
+    worktree_project_dir = worktree_path if boundary.scope_root == Path(".") else worktree_path / boundary.scope_root
+    for dep in boundary.out_of_repo_dependencies:
+        dep_rel = Path(dep.raw_path)
         if dep_rel.is_absolute():
             continue
-        dep_real_path = (config.project_dir / dep_rel).resolve()
+        dep_real_path = dep.resolved_path
         if not dep_real_path.exists():
             logger.debug("Local dep %s does not exist on disk; skipping symlink", dep_real_path)
             continue
         # Compute where the symlink should land (resolve relative path from worktree)
-        symlink_location = (worktree_path / dep_rel).resolve()
+        symlink_location = (worktree_project_dir / dep_rel).resolve()
         # Skip paths inside the worktree itself (workspace members)
         try:
             symlink_location.relative_to(worktree_path)
@@ -3698,6 +3899,7 @@ def _complete_code_task(
     seeded_paths: set[str] | None = None,
     improve_diff_baseline: ImproveDiffBaseline | None = None,
     rebase_diff_baseline: RebaseDiffBaseline | None = None,
+    project_boundary: ProjectBoundary | None = None,
 ) -> int:
     """Handle successful code-task completion (staging, commit, completion state, output).
 
@@ -3709,6 +3911,7 @@ def _complete_code_task(
     if skip_commit:
         has_uncommitted = False
     else:
+        boundary = project_boundary or _resolve_project_boundary(config)
         seeded_paths = seeded_paths or set()
         # Compute which files changed during the provider run (selective staging)
         post_run_status = worktree_git.status_porcelain()
@@ -3719,6 +3922,49 @@ def _complete_code_task(
             candidate_stage_paths,
             status_paths,
         )
+        if (
+            files_to_stage
+            and getattr(config, "enforce_project_scope", True)
+            and not _task_is_cross_project(task)
+            and boundary.scope_root != Path(".")
+        ):
+            allowed_roots = _dedupe_paths([boundary.scope_root, *boundary.in_repo_dependency_paths])
+            out_of_scope = sorted(
+                path for path in files_to_stage
+                if not _is_path_in_allowed_scope(path, allowed_roots)
+            )
+            if out_of_scope:
+                repo_dir = getattr(worktree_git, "repo_dir", boundary.repo_root)
+                reported_paths = _expand_repo_relative_paths(repo_dir, out_of_scope)
+                allowed_display = ", ".join(path.as_posix() for path in allowed_roots)
+                violation_lines = "\n".join(f"- {path}" for path in reported_paths)
+                failure_message = (
+                    "Task modified files outside the allowed project scope.\n"
+                    f"Allowed roots: {allowed_display}\n"
+                    f"Out-of-scope paths:\n{violation_lines}"
+                )
+                error_message(f"Error: {failure_message}")
+                write_log_entry(
+                    log_file,
+                    {
+                        "type": "gza",
+                        "subtype": "outcome",
+                        "message": failure_message,
+                        "failure_reason": PROJECT_SCOPE_FAILURE_REASON,
+                        "out_of_scope_paths": reported_paths,
+                    },
+                )
+                _mark_task_failed(
+                    task=task,
+                    config=config,
+                    store=store,
+                    log_file=log_file,
+                    branch=branch_name,
+                    explicit_reason=PROJECT_SCOPE_FAILURE_REASON,
+                    error_type=None,
+                    exit_code=1,
+                )
+                return 1
         has_uncommitted = bool(files_to_stage)
 
         if not has_uncommitted:
@@ -4521,16 +4767,18 @@ def _run_inner(
     assert summary_path is not None, f"Code task type '{task.task_type}' must have a summary path"
     summary_dir = summary_path.parent
     summary_dir.mkdir(parents=True, exist_ok=True)
+    project_boundary = _resolve_project_boundary(config)
+    runtime_work_dir = _task_runtime_work_dir(worktree_path, project_boundary, task)
 
     # Create summary directory structure in worktree
-    worktree_summary_dir = worktree_path / summary_dir.relative_to(config.project_dir)
+    worktree_summary_dir = _project_worktree_path(summary_dir, config, worktree_path, project_boundary)
     worktree_summary_dir.mkdir(parents=True, exist_ok=True)
-    worktree_summary_path = worktree_path / summary_path.relative_to(config.project_dir)
+    worktree_summary_path = _project_worktree_path(summary_path, config, worktree_path, project_boundary)
 
     # For Docker containers, use /workspace-relative path instead of host worktree path
     # For native mode, use the actual worktree path
     if config.use_docker:
-        prompt_summary_path = Path("/workspace") / summary_path.relative_to(config.project_dir)
+        prompt_summary_path = _project_workspace_path(summary_path, config, project_boundary)
     else:
         prompt_summary_path = worktree_summary_path
 
@@ -4561,6 +4809,9 @@ def _run_inner(
     _snapshot_task_db_to_worktree(_resolve_task_db_path(config), worktree_path)
     _copy_learnings_to_worktree(config, worktree_path)
 
+    effective_task_config = task_config
+    if config.use_docker:
+        effective_task_config = _config_with_task_docker_volumes(task_config, project_boundary)
     if not config.use_docker:
         _create_local_dep_symlinks(config, worktree_path)
 
@@ -4665,10 +4916,10 @@ def _run_inner(
         provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type)
         result = _call_provider_run(
             provider,
-            task_config,
+            effective_task_config,
             provider_prompt,
             log_file,
-            worktree_path,
+            runtime_work_dir,
             provider_run_kwargs=provider_run_kwargs,
         )
 
@@ -4747,6 +4998,7 @@ def _run_inner(
             seeded_paths=seeded_paths,
             improve_diff_baseline=improve_diff_baseline,
             rebase_diff_baseline=rebase_diff_baseline,
+            project_boundary=project_boundary,
         )
 
     except GitError as e:
@@ -4850,6 +5102,7 @@ def _run_non_code_task(
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
     report_file_relative = str(report_path.relative_to(config.project_dir))
+    project_boundary = _resolve_project_boundary(config)
 
     # Create worktree in /tmp for Docker compatibility on macOS
     assert task.slug is not None
@@ -4885,17 +5138,18 @@ def _run_non_code_task(
         console.print(f"Creating worktree: {worktree_path}")
         if git:
             git._run("worktree", "add", "--detach", str(worktree_path), base_ref)
+        runtime_work_dir = _task_runtime_work_dir(worktree_path, project_boundary, task)
 
         # Create report directory structure in worktree
-        worktree_report_dir = worktree_path / report_path.parent.relative_to(config.project_dir)
+        worktree_report_dir = _project_worktree_path(report_path.parent, config, worktree_path, project_boundary)
         worktree_report_dir.mkdir(parents=True, exist_ok=True)
-        worktree_report_path = worktree_path / report_path.relative_to(config.project_dir)
+        worktree_report_path = _project_worktree_path(report_path, config, worktree_path, project_boundary)
 
         # For Docker containers, use /workspace-relative path instead of host worktree path
         # The container only has /workspace mounted, so we need to use a path inside that
         # For native mode, use the actual worktree path
         if config.use_docker:
-            prompt_report_path = Path("/workspace") / report_path.relative_to(config.project_dir)
+            prompt_report_path = _project_workspace_path(report_path, config, project_boundary)
         else:
             prompt_report_path = worktree_report_path
 
@@ -4912,6 +5166,9 @@ def _run_non_code_task(
         if task.task_type not in ("internal", "learn"):
             _copy_learnings_to_worktree(config, worktree_path)
 
+        effective_task_config = config
+        if config.use_docker:
+            effective_task_config = _config_with_task_docker_volumes(config, project_boundary)
         if not config.use_docker:
             _create_local_dep_symlinks(config, worktree_path)
 
@@ -4939,7 +5196,7 @@ def _run_non_code_task(
                     review_verify_timeout_seconds = REVIEW_VERIFY_TIMEOUT_SECONDS
                 review_verify_result = _run_review_verify_command(
                     verify_command,
-                    cwd=worktree_path,
+                    cwd=runtime_work_dir,
                     timeout_seconds=review_verify_timeout_seconds,
                 )
             prompt = build_prompt(
@@ -4985,10 +5242,10 @@ def _run_non_code_task(
             provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type)
             result = _call_provider_run(
                 provider,
-                config,
+                effective_task_config,
                 provider_prompt,
                 log_file,
-                worktree_path,
+                runtime_work_dir,
                 provider_run_kwargs=provider_run_kwargs,
             )
         except KeyboardInterrupt:

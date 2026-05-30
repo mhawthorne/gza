@@ -27,6 +27,9 @@ project_name: my-project
 # Whether to run Claude in Docker container
 # use_docker: true
 
+# Reject commits outside the project subtree unless the task is tagged cross-project
+# enforce_project_scope: true
+
 # Custom Docker image name (defaults to <project_name>-gza)
 # docker_image: ""
 

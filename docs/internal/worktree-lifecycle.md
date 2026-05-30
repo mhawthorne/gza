@@ -50,15 +50,15 @@ It creates a **temporary** worktree at `config.worktree_path / rebase_task.id` f
 
 ## Local path dependency symlinks
 
-When a project's `pyproject.toml` contains local path dependencies under
-`[tool.uv.sources]` (e.g. `path = "../shared-lib"`), those relative paths break
-inside worktrees because the worktree lives at a different parent directory than
-the original project root.
+When a project's `uv.lock` resolves local path dependencies (for example
+`source = { directory = "../shared-lib" }`), those relative paths break inside
+worktrees because the worktree lives at a different parent directory than the
+original project root.
 
-After creating a worktree, gza automatically resolves each relative path entry in
-`[tool.uv.sources]`, finds where that path would resolve *from the worktree*, and
-creates a symlink at that location pointing to the real directory on the host. For
-example:
+After creating a worktree, gza automatically resolves each out-of-repo relative
+path entry from `uv.lock`, finds where that path would resolve *from the
+worktree*, and creates a symlink at that location pointing to the real
+directory on the host. For example:
 
 - Project at `/Users/me/work/myproject`, dep `path = "../shared-lib"` → real path
   `/Users/me/work/shared-lib`
@@ -68,7 +68,7 @@ example:
   `/Users/me/work/shared-lib`
 
 **Rules:**
-- Only relative paths are handled (absolute paths work everywhere, no fixup needed).
+- Only out-of-repo relative paths are symlinked (absolute paths already resolve natively; in-repo deps are already present in the worktree).
 - Only paths that actually exist on disk are symlinked (no dangling symlinks).
 - Paths inside the worktree itself (workspace members) are skipped.
 - Symlinks are idempotent: if the correct symlink already exists, it is skipped.
@@ -76,9 +76,9 @@ example:
   directory), a warning is logged and the existing path is left untouched.
 - Symlinks persist in `/tmp` — they are shared across concurrent worktrees for the
   same project and cleaned up by the OS on reboot.
-- **Docker mode**: symlinks are not created in Docker mode. Docker users should
-  use `docker_volumes` and `docker_setup_command` to mount local dependencies
-  inside the container.
+- **Docker mode**: symlinks are not created. Gza automatically adds read-only
+  bind mounts for out-of-repo uv local deps so `uv sync` sees the same absolute
+  paths inside the container.
 
 ## Key invariant: one worktree per branch
 

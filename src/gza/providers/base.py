@@ -132,6 +132,39 @@ def _get_config_dir_volume_args(docker_config: DockerConfig) -> list[str]:
     return args
 
 
+def _resolve_docker_mount_root_and_cwd(work_dir: Path) -> tuple[Path, str]:
+    """Resolve the bind-mounted repo root and matching in-container cwd.
+
+    When callers pass a project subdirectory inside a git worktree, Docker still
+    needs the whole checkout mounted at `/workspace` so in-repo dependencies and
+    git metadata remain visible. The cwd should still land in the task's scoped
+    project directory.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(work_dir), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return work_dir, "/workspace"
+
+    if result.returncode != 0:
+        return work_dir, "/workspace"
+
+    mount_root = Path(result.stdout.strip()).resolve()
+    try:
+        relative_cwd = work_dir.resolve().relative_to(mount_root)
+    except ValueError:
+        return work_dir, "/workspace"
+
+    if relative_cwd == Path("."):
+        return mount_root, "/workspace"
+    return mount_root, f"/workspace/{relative_cwd.as_posix()}"
+
+
 def _get_image_created_time(image_name: str) -> float | None:
     """Get the creation timestamp of a Docker image.
 
@@ -326,16 +359,17 @@ def build_docker_cmd(
     Returns:
         List of command arguments (without the actual CLI command)
     """
+    mount_root, container_cwd = _resolve_docker_mount_root_and_cwd(work_dir)
     stdio_flag = "-it" if interactive else "-i"
     cmd = [
         "timeout", f"{timeout_minutes}m",
         "docker", "run", "--rm", stdio_flag,
-        "-v", f"{work_dir}:/workspace",
+        "-v", f"{mount_root}:/workspace",
         # Shadow host /workspace/.venv from bind mount with a writable tmpfs mount.
         # Anonymous volumes default to root-owned directories, which break `uv sync`
         # under the non-root `gza` user inside the container.
         "--tmpfs", "/workspace/.venv:rw,exec,mode=1777",
-        "-w", "/workspace",
+        "-w", container_cwd,
     ]
 
     # If work_dir is a git worktree, mount the host .git directory so git
@@ -343,7 +377,7 @@ def build_docker_cmd(
     # absolute host path (e.g. /Users/.../project/.git/worktrees/<name>) that
     # doesn't exist in the container.  Mounting the main .git dir at the same
     # host path makes the reference resolve transparently.
-    git_file = work_dir / ".git"
+    git_file = mount_root / ".git"
     if git_file.is_file():
         try:
             first_line = git_file.read_text().splitlines()[0].strip()

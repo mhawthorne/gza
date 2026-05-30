@@ -62,6 +62,7 @@ addopts = "-x"
 pythonpath = ["."]
 timeout_method = "signal"
 markers = [
+    "functional: mark test as functional test (spawns subprocesses or real git repos)",
     "integration: mark test as integration test (requires credentials and Docker)",
 ]
 
