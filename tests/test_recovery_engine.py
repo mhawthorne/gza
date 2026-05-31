@@ -13,6 +13,7 @@ from gza.recovery_engine import (
     _MergeContext,
     _is_resolved_by_landed_lineage,
     FailedRecoveryDecision,
+    classify_failure_reason,
     decide_failed_task_recovery,
     get_completed_recovery_descendant,
     get_completed_sibling_recovery,
@@ -478,6 +479,17 @@ def test_recovery_engine_infra_failure_chooses_retry(tmp_path: Path) -> None:
     assert decision.launch_mode == "worker"
 
 
+def test_recovery_engine_provider_empty_turn_is_retryable(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, task_type="plan", reason="PROVIDER_EMPTY_TURN", session_id=None)
+
+    assert classify_failure_reason("PROVIDER_EMPTY_TURN") == "retryable"
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "retry"
+    assert decision.launch_mode == "worker"
+    assert decision.reason_code == "PROVIDER_EMPTY_TURN"
+
+
 def test_recovery_engine_timeout_without_session_requires_manual_review(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="MAX_STEPS", session_id=None)
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
@@ -510,6 +522,21 @@ def test_recovery_engine_manual_reason_skips(tmp_path: Path) -> None:
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
     assert decision.action == "skip"
     assert decision.reason_code == "manual_failure_reason"
+
+
+def test_recovery_engine_provider_empty_turn_stops_at_retry_limit(tmp_path: Path) -> None:
+    store, root = _failed_task(tmp_path, reason="PROVIDER_EMPTY_TURN", session_id=None)
+    retry_child = store.add(root.prompt, task_type=root.task_type, based_on=root.id, depends_on=root.depends_on)
+    assert retry_child.id is not None
+    retry_child.status = "failed"
+    retry_child.failure_reason = "PROVIDER_EMPTY_TURN"
+    retry_child.completed_at = datetime.now(UTC)
+    store.update(retry_child)
+
+    decision = decide_failed_task_recovery(store, retry_child, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "retry_limit_reached"
+    assert (decision.attempt_index, decision.attempt_limit) == (2, 2)
 
 
 def test_recovery_engine_review_timeout_chooses_resume(tmp_path: Path) -> None:

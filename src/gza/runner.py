@@ -481,6 +481,74 @@ def _write_stats_entry(log_file: Path, stats: TaskStats) -> None:
     )
 
 
+def _observed_step_count(stats: TaskStats) -> int:
+    """Return the runner's canonical observed step count for a provider run."""
+    return stats.num_steps_computed or stats.num_steps_reported or 0
+
+
+def _extract_provider_stderr_tail(log_file: Path) -> str:
+    """Return the last useful provider stderr/process-output tail from the ops log."""
+    ops_log = ops_log_path_for(log_file)
+    process_lines: list[str] = []
+    stderr_tail = ""
+    try:
+        with open(ops_log) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                candidate = entry.get("stderr_tail")
+                if isinstance(candidate, str) and candidate.strip():
+                    stderr_tail = candidate
+                if entry.get("source") != "provider" or entry.get("subtype") != "process_output":
+                    continue
+                message = entry.get("provider_output") or entry.get("message")
+                if isinstance(message, str) and message.strip():
+                    process_lines.append(message)
+    except OSError:
+        return ""
+    if process_lines:
+        return "\n".join(process_lines)[-2000:]
+    return stderr_tail[-2000:]
+
+
+def _log_has_empty_turn_signature(log_file: Path) -> bool:
+    """Return whether the conversation log matches a provider empty-turn hiccup."""
+    saw_started = False
+    saw_turn_completed = False
+    saw_activity_item = False
+    try:
+        with open(log_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                event_type = entry.get("type")
+                if event_type in {"thread.started", "turn.started"}:
+                    saw_started = True
+                    continue
+                if event_type == "turn.completed":
+                    saw_turn_completed = True
+                    continue
+                if event_type in {"assistant", "result", "item.started", "item.completed", "tool_call"}:
+                    saw_activity_item = True
+    except OSError:
+        return False
+    return saw_started and not saw_turn_completed and not saw_activity_item
+
+
 def _finalize_completed_code_task(
     *,
     task: Task,
@@ -3895,6 +3963,7 @@ def _complete_code_task(
     seeded_paths: set[str] | None = None,
     improve_diff_baseline: ImproveDiffBaseline | None = None,
     rebase_diff_baseline: RebaseDiffBaseline | None = None,
+    error_type: str | None = None,
 ) -> int:
     """Handle successful code-task completion (staging, commit, completion state, output).
 
@@ -3959,13 +4028,24 @@ def _complete_code_task(
             if commits_ahead == 0:
                 # No uncommitted changes and no commits on branch - real failure
                 # Note: No need to save WIP here since there are no changes
-                failure_reason = _resolve_failure_reason(
-                    error_type=None,
-                    exit_code=exit_code,
-                    log_file=log_file,
-                    stats=stats,
-                    fallback_to_log=True,
+                empty_turn = (
+                    exit_code == 0
+                    and error_type is None
+                    and _observed_step_count(stats) == 0
+                    and _log_has_empty_turn_signature(log_file)
                 )
+                failure_reason = (
+                    "PROVIDER_EMPTY_TURN"
+                    if empty_turn
+                    else _resolve_failure_reason(
+                        error_type=None,
+                        exit_code=exit_code,
+                        log_file=log_file,
+                        stats=stats,
+                        fallback_to_log=True,
+                    )
+                )
+                provider_stderr_tail = _extract_provider_stderr_tail(log_file) if empty_turn else ""
                 task_footer(
                     task,
                     stats,
@@ -3980,6 +4060,7 @@ def _complete_code_task(
                         "message": "Outcome: failed (no changes made)",
                         "exit_code": exit_code,
                         "failure_reason": failure_reason,
+                        **({"stderr_tail": provider_stderr_tail} if provider_stderr_tail else {}),
                     },
                 )
                 write_log_entry(
@@ -3987,10 +4068,10 @@ def _complete_code_task(
                     {
                         "type": "gza",
                         "subtype": "stats",
-                        "message": f"Stats: {stats.num_steps_computed or stats.num_steps_reported or 0} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
+                        "message": f"Stats: {_observed_step_count(stats)} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
                         "duration_seconds": stats.duration_seconds,
                         "cost_usd": stats.cost_usd,
-                        "num_steps": stats.num_steps_computed or stats.num_steps_reported or 0,
+                        "num_steps": _observed_step_count(stats),
                     },
                 )
                 _mark_task_failed(
@@ -4985,6 +5066,7 @@ def _run_inner(
             seeded_paths=seeded_paths,
             improve_diff_baseline=improve_diff_baseline,
             rebase_diff_baseline=rebase_diff_baseline,
+            error_type=result.error_type,
         )
 
     except GitError as e:

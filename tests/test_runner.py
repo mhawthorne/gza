@@ -1,5 +1,6 @@
 """Tests for runner module."""
 
+import json
 import logging
 import os
 import sqlite3
@@ -7402,6 +7403,98 @@ class TestExtractedRunInnerHelpers:
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.status == "failed"
+
+    def test_complete_code_task_classifies_empty_turn_as_provider_empty_turn(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement empty turn", task_type="implement")
+        task.slug = "20260531-empty-turn"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text('{"type":"thread.started"}\n{"type":"turn.started"}\n')
+        ops_log_path_for(log_file).write_text(
+            '{"type":"gza","stream":"ops","source":"provider","subtype":"process_output","message":"provider stderr line"}\n'
+        )
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+
+        rc = _complete_code_task(
+            task,
+            config,
+            store,
+            worktree_git,
+            log_file,
+            "test/branch",
+            TaskStats(duration_seconds=1.0, num_steps_reported=0, cost_usd=0.01),
+            0,
+            pre_run_status=set(),
+            worktree_summary_path=tmp_path / "worktree-summary.md",
+            summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+            summary_dir=tmp_path / ".gza" / "summaries",
+        )
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "PROVIDER_EMPTY_TURN"
+        ops_entries = [
+            json.loads(line)
+            for line in ops_log_path_for(log_file).read_text().splitlines()
+            if line.strip()
+        ]
+        outcome_entry = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
+        assert outcome_entry["failure_reason"] == "PROVIDER_EMPTY_TURN"
+        assert outcome_entry["stderr_tail"] == "provider stderr line"
+
+    def test_complete_code_task_keeps_genuine_no_change_run_non_retryable(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement no-op", task_type="implement")
+        task.slug = "20260531-genuine-no-op"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text('{"type":"thread.started"}\n{"type":"turn.started"}\n{"type":"turn.completed"}\n')
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+
+        rc = _complete_code_task(
+            task,
+            config,
+            store,
+            worktree_git,
+            log_file,
+            "test/branch",
+            TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+            0,
+            pre_run_status=set(),
+            worktree_summary_path=tmp_path / "worktree-summary.md",
+            summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+            summary_dir=tmp_path / ".gza" / "summaries",
+        )
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "UNKNOWN"
+        decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
+        assert decision.action == "skip"
+        assert decision.reason_code == "manual_failure_reason"
 
     def test_complete_code_task_selectively_stages_new_files(self, tmp_path: Path):
         """Completion helper should stage only provider-introduced changes."""
