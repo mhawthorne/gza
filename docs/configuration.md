@@ -1537,7 +1537,7 @@ Manual-operator advance outcomes such as `needs_discussion`, `max_cycles_reached
 
 Multiline watch log messages are rendered with continuation indentation so wake, repair, and recovery output stays readable in both stdout and `.gza/watch.log`. `WAKE` lines now include a `live workers:` block when running workers can be identified, listing active task IDs and any anonymous workers that do not currently map to a live task row.
 
-When watch detects that the installed `gza` package fingerprint has changed since startup, it logs the drift immediately and, by default, re-execs itself once the current batch drains and no worker remains running. Pass `--no-auto-restart-on-drift` to keep the previous warn-only behavior.
+When watch detects that the installed `gza` package fingerprint has changed since startup, it logs the drift immediately and, by default, re-execs itself once the current batch drains and no worker remains running. The re-exec is treated as a continuation of the already-approved watch session, so it auto-resumes without showing the first-pass confirmation prompt again. Pass `--no-auto-restart-on-drift` to keep the previous warn-only behavior.
 
 If a watch-time merge attempt fails only because the task branch is already merged into the target branch, watch runs the shared branch-truth reconciliation path, marks the task merged, and logs the repair as informational reconciliation instead of surfacing a misleading merge failure.
 

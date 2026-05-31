@@ -6809,6 +6809,7 @@ def test_watch_reexec_argv_preserves_requested_watch_flags(tmp_path: Path) -> No
         "--show-skipped",
         "--quiet",
         "--yes",
+        "--resumed-reexec",
         "--tag",
         "release",
         "--tag",
@@ -6844,6 +6845,65 @@ def test_cmd_watch_exits_when_idle_reaches_max_idle(tmp_path: Path) -> None:
     assert run_cycle.call_count == 2
 
 
+def test_cmd_watch_resumed_reexec_skips_first_pass_confirmation_and_logs_auto_resume(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=False,
+        resumed_reexec=True,
+    )
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+        patch("builtins.input") as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch._sleep_interruptibly"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 1
+    input_mock.assert_not_called()
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "auto-resumed after code update (skipping first-pass confirmation)" in log_text
+
+
+def test_cmd_watch_first_start_preserves_confirmation_prompt(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=False,
+        resumed_reexec=False,
+    )
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(True, 0, 0)) as run_cycle,
+        patch("builtins.input", return_value="n") as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 1
+    input_mock.assert_called_once_with("\nProceed? [y/N] ")
+
+
 def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None:
     """Watch should re-exec itself once drift is detected and no workers are left running."""
     setup_config(tmp_path)
@@ -6857,6 +6917,7 @@ def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None
         dry_run=False,
         quiet=True,
         yes=True,
+        resumed_reexec=False,
         tags=["release"],
         any_tag=False,
         restart_failed=True,
@@ -6917,6 +6978,7 @@ def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None
             "2",
             "--quiet",
             "--yes",
+            "--resumed-reexec",
             "--tag",
             "release",
         ],
@@ -6936,6 +6998,7 @@ def test_cmd_watch_defers_reexec_until_batch_drains(tmp_path: Path) -> None:
         dry_run=False,
         quiet=True,
         yes=True,
+        resumed_reexec=False,
         tags=None,
         any_tag=False,
         restart_failed=False,
@@ -6988,6 +7051,7 @@ def test_cmd_watch_shutdown_signal_wins_over_pending_reexec(tmp_path: Path) -> N
         dry_run=False,
         quiet=True,
         yes=True,
+        resumed_reexec=False,
         tags=None,
         any_tag=False,
         restart_failed=False,
@@ -9150,6 +9214,7 @@ def test_cmd_watch_does_not_swallow_keyboard_interrupt_during_confirmation(tmp_p
         dry_run=False,
         quiet=True,
         yes=False,
+        resumed_reexec=False,
     )
 
     with (

@@ -794,6 +794,13 @@ def main() -> int:
         help="Skip confirmation prompt before the first watch pass",
     )
     watch_parser.add_argument(
+        "--resumed-reexec",
+        action="store_true",
+        default=False,
+        dest="resumed_reexec",
+        help=argparse.SUPPRESS,
+    )
+    watch_parser.add_argument(
         "--tag",
         action="append",
         dest="tags",

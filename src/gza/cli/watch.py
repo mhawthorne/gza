@@ -490,6 +490,7 @@ def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
         argv.append("--quiet")
     if getattr(args, "yes", False):
         argv.append("--yes")
+    argv.append("--resumed-reexec")
     for tag in getattr(args, "tags", None) or ():
         argv.extend(["--tag", tag])
     if getattr(args, "any_tag", False):
@@ -2106,7 +2107,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
             )
             return 0
 
-        skip_confirm = dry_run or bool(getattr(args, "yes", False))
+        resumed_reexec = bool(getattr(args, "resumed_reexec", False))
+        skip_confirm = dry_run or bool(getattr(args, "yes", False)) or resumed_reexec
+        if resumed_reexec:
+            log.emit(
+                "INFO",
+                "auto-resumed after code update (skipping first-pass confirmation)",
+            )
         if not skip_confirm:
             preview_result = _run_cycle(
                 config=config,

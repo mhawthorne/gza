@@ -584,6 +584,7 @@ class TestHelpOutput:
         assert "--restart-failed-batch" in text
         assert "--max-resume-attempts" in text
         assert "--show-skipped" in text
+        assert "--resumed-reexec" not in text
 
     def test_watch_help_and_docs_describe_recovery_dry_run_and_attempt_scope(self, tmp_path):
         """watch help/docs should document the recovery dry-run surface and true attempt-cap scope."""
@@ -980,6 +981,28 @@ class TestCommandAliases:
         args = cmd_watch.call_args.args[0]
         assert args.command == "watch"
         assert args.batch == 2
+
+    def test_watch_hidden_resumed_reexec_flag_still_parses(self, tmp_path):
+        """Hidden internal watch flags should stay callable without appearing in help."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["gza", "watch", "--resumed-reexec", "--project", str(tmp_path)],
+            ),
+            patch("gza.cli.main.cmd_watch", return_value=0) as cmd_watch,
+        ):
+            rc = main()
+
+        assert rc == 0
+        cmd_watch.assert_called_once()
+        args = cmd_watch.call_args.args[0]
+        assert args.command == "watch"
+        assert args.resumed_reexec is True
 
     @pytest.mark.parametrize(
         ("command", "argv_tail", "patch_target"),
