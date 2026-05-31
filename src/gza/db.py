@@ -4250,23 +4250,45 @@ class SqliteTaskStore:
             return
         owner = self._legacy_merge_status_owner_for_unit(unit)
         legacy_status = merge_unit_legacy_state(unit.state)
-        for task in tasks:
-            if task.id is None:
-                continue
-            if owner is not None and task.id == owner.id and task_owns_merge_status(task):
-                task.merge_status = legacy_status
-                task.merged_at = unit.merged_at if legacy_status == "merged" else None
-            else:
-                task.merge_status = None
-                task.merged_at = None
-            task.pr_number = unit.pr_number
-            task.pr_state = unit.pr_state
-            task.pr_last_synced_at = unit.pr_last_synced_at
-            task.sync_last_synced_at = unit.sync_last_synced_at
-            task.diff_files_changed = unit.diff_files_changed
-            task.diff_lines_added = unit.diff_lines_added
-            task.diff_lines_removed = unit.diff_lines_removed
-            self.update(task)
+        with self._connect() as conn:
+            for task in tasks:
+                if task.id is None:
+                    continue
+                if owner is not None and task.id == owner.id and task_owns_merge_status(task):
+                    merge_status = legacy_status
+                    merged_at = unit.merged_at if legacy_status == "merged" else None
+                else:
+                    merge_status = None
+                    merged_at = None
+
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET merge_status = ?,
+                        merged_at = ?,
+                        pr_number = ?,
+                        pr_state = ?,
+                        pr_last_synced_at = ?,
+                        sync_last_synced_at = ?,
+                        diff_files_changed = ?,
+                        diff_lines_added = ?,
+                        diff_lines_removed = ?
+                    WHERE project_id = ? AND id = ?
+                    """,
+                    (
+                        merge_status,
+                        _format_db_timestamp(merged_at),
+                        unit.pr_number,
+                        unit.pr_state,
+                        _format_db_timestamp(unit.pr_last_synced_at),
+                        _format_db_timestamp(unit.sync_last_synced_at),
+                        unit.diff_files_changed,
+                        unit.diff_lines_added,
+                        unit.diff_lines_removed,
+                        self._project_id,
+                        task.id,
+                    ),
+                )
 
     def set_merge_unit_state(
         self,

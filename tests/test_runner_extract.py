@@ -17,6 +17,7 @@ from gza.runner import (
     ProjectBoundary,
     _complete_code_task,
     _seed_extraction_bundle_if_present,
+    _strip_owned_artifact_patch_sections,
     run,
 )
 
@@ -294,6 +295,185 @@ def test_seed_extraction_bundle_accepts_quoted_diff_headers(tmp_path: Path) -> N
     worktree_git.apply_patch_file_result.assert_called_once()
 
 
+def test_strip_owned_artifact_patch_sections_drops_gza_owned_files() -> None:
+    patch_text = (
+        "diff --git a/.gza/summaries/task.md b/.gza/summaries/task.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/.gza/summaries/task.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+summary\n"
+        "diff --git a/src/file.py b/src/file.py\n"
+        "index e69de29..8c7e5a6 100644\n"
+        "--- a/src/file.py\n"
+        "+++ b/src/file.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+print('hello')\n"
+    )
+
+    filtered_patch, stripped_paths = _strip_owned_artifact_patch_sections(patch_text)
+
+    assert stripped_paths == (".gza/summaries/task.md",)
+    assert ".gza/summaries/task.md" not in filtered_patch
+    assert "src/file.py" in filtered_patch
+
+
+def test_seed_extraction_bundle_ignores_owned_artifact_paths(tmp_path: Path) -> None:
+    task_store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = task_store.add("Extracted task", task_type="implement")
+    task.slug = "20260427-target-owned"
+    task_store.update(task)
+
+    project_bundle = tmp_path / ".gza" / "extractions" / task.slug
+    project_bundle.mkdir(parents=True, exist_ok=True)
+    (project_bundle / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "source_branch": "feature/source",
+                "source_base_ref": "main",
+                "target_task_id": task.id,
+                "target_slug": task.slug,
+                "selected_paths": ["src/file.py", ".gza/summaries/task.md"],
+                "touched_paths": ["src/file.py", ".gza/summaries/task.md"],
+                "patch_path": "selected.patch",
+            }
+        )
+    )
+    (project_bundle / "selected.patch").write_text(
+        "diff --git a/.gza/summaries/task.md b/.gza/summaries/task.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/.gza/summaries/task.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+summary\n"
+        "diff --git a/src/file.py b/src/file.py\n"
+        "index e69de29..8c7e5a6 100644\n"
+        "--- a/src/file.py\n"
+        "+++ b/src/file.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+print('hello')\n"
+    )
+    (project_bundle / "prompt.md").write_text("seed prompt\n")
+
+    worktree = tmp_path / "worktree-owned"
+    worktree.mkdir()
+    log_file = tmp_path / "logs" / "task-owned.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+    worktree_git = Mock()
+    worktree_git.ref_exists.return_value = False
+    worktree_git.apply_patch_file_result.return_value = GitApplyResult(
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+
+    seeded = _seed_extraction_bundle_if_present(
+        task,
+        config,
+        worktree,
+        worktree_git,
+        log_file,
+        resume=False,
+    )
+
+    assert seeded.seeded_paths == frozenset({"src/file.py"})
+    applied_patch_path = worktree_git.apply_patch_file_result.call_args.args[0]
+    assert ".gza/summaries/task.md" not in applied_patch_path.read_text()
+    assert "src/file.py" in applied_patch_path.read_text()
+
+
+def test_seed_extraction_bundle_ignores_scoped_owned_artifact_paths_in_subdir_project(tmp_path: Path) -> None:
+    project_dir = tmp_path / "tarantino-ui"
+    project_dir.mkdir()
+    task_store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = task_store.add("Extracted task", task_type="implement")
+    task.slug = "20260427-target-owned-scoped"
+    task_store.update(task)
+
+    project_bundle = project_dir / ".gza" / "extractions" / task.slug
+    project_bundle.mkdir(parents=True, exist_ok=True)
+    (project_bundle / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "source_branch": "feature/source",
+                "source_base_ref": "main",
+                "target_task_id": task.id,
+                "target_slug": task.slug,
+                "selected_paths": ["tarantino-ui/src/file.py", "tarantino-ui/.gza/summaries/task.md"],
+                "touched_paths": ["tarantino-ui/src/file.py", "tarantino-ui/.gza/summaries/task.md"],
+                "patch_path": "selected.patch",
+            }
+        )
+    )
+    scoped_patch = (
+        "diff --git a/tarantino-ui/.gza/summaries/task.md b/tarantino-ui/.gza/summaries/task.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tarantino-ui/.gza/summaries/task.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+summary\n"
+        "diff --git a/tarantino-ui/src/file.py b/tarantino-ui/src/file.py\n"
+        "index e69de29..8c7e5a6 100644\n"
+        "--- a/tarantino-ui/src/file.py\n"
+        "+++ b/tarantino-ui/src/file.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+print('hello')\n"
+    )
+    (project_bundle / "selected.patch").write_text(scoped_patch)
+    (project_bundle / "prompt.md").write_text("seed prompt\n")
+
+    worktree = tmp_path / "worktree-owned-scoped"
+    worktree.mkdir()
+    log_file = tmp_path / "logs" / "task-owned-scoped.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    config = Mock(spec=Config)
+    config.project_dir = project_dir
+    config._project_boundary_cache = ProjectBoundary(
+        repo_root=tmp_path,
+        scope_root=Path("tarantino-ui"),
+        local_dependencies=(),
+    )
+    worktree_git = Mock()
+    worktree_git.ref_exists.side_effect = lambda ref: ref in {"feature/source", "main"}
+    worktree_git.get_diff_patch_for_paths.return_value = scoped_patch
+    worktree_git.reverse_check_patch_file_result.return_value = GitApplyResult(
+        returncode=1,
+        stdout="",
+        stderr="",
+    )
+    worktree_git.apply_patch_file_result.return_value = GitApplyResult(
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+
+    seeded = _seed_extraction_bundle_if_present(
+        task,
+        config,
+        worktree,
+        worktree_git,
+        log_file,
+        resume=False,
+    )
+
+    assert seeded.seeded_paths == frozenset({"tarantino-ui/src/file.py"})
+    worktree_git.get_diff_patch_for_paths.assert_any_call(
+        "main...feature/source",
+        ("tarantino-ui/src/file.py",),
+        binary=True,
+    )
+    applied_patch_path = worktree_git.apply_patch_file_result.call_args.args[0]
+    applied_patch = applied_patch_path.read_text()
+    assert "tarantino-ui/.gza/summaries/task.md" not in applied_patch
+    assert "tarantino-ui/src/file.py" in applied_patch
+
+
 def test_seed_extraction_bundle_retries_after_runtime_patch_artifact_left_by_failed_attempt(
     tmp_path: Path,
 ) -> None:
@@ -421,6 +601,109 @@ def test_complete_code_task_stages_seeded_paths_even_without_provider_edits(tmp_
 
     assert rc == 0
     worktree_git.add.assert_any_call("src/file.py")
+    assert worktree_git.commit.call_count == 1
+
+
+def test_complete_code_task_does_not_stage_owned_artifact_paths(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = store.add("Extracted task", task_type="implement")
+    task.slug = "20260427-seeded-owned"
+    task.status = "in_progress"
+    store.update(task)
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+    config.log_path = tmp_path / "logs"
+    config.log_path.mkdir(parents=True, exist_ok=True)
+
+    log_file = config.log_path / "seeded-owned.log"
+    worktree_summary_path = tmp_path / "worktree-summary.md"
+    worktree_summary_path.write_text("# Summary\n")
+    summary_path = tmp_path / ".gza" / "summaries" / "seeded-owned.md"
+
+    worktree_git = Mock()
+    worktree_git.status_porcelain.return_value = {("M", ".gza/summaries/seeded-owned.md")}
+    worktree_git.default_branch.return_value = "main"
+    worktree_git.count_commits_ahead.return_value = 0
+
+    with patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+        rc = _complete_code_task(
+            task,
+            config,
+            store,
+            worktree_git,
+            log_file,
+            "feature/seeded-owned",
+            TaskStats(duration_seconds=1.0, num_steps_computed=1, cost_usd=0.0),
+            0,
+            pre_run_status=set(),
+            worktree_summary_path=worktree_summary_path,
+            summary_path=summary_path,
+            summary_dir=summary_path.parent,
+            seeded_paths={".gza/summaries/seeded-owned.md"},
+        )
+
+    assert rc == 0
+    worktree_git.add.assert_not_called()
+    worktree_git.commit.assert_not_called()
+
+
+def test_complete_code_task_does_not_stage_scoped_owned_artifact_paths_in_subdir_project(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = store.add("Extracted task", task_type="implement")
+    task.slug = "20260427-seeded-owned-scoped"
+    task.status = "in_progress"
+    store.update(task)
+
+    project_dir = tmp_path / "tarantino-ui"
+    project_dir.mkdir()
+
+    config = Mock(spec=Config)
+    config.project_dir = project_dir
+    config.log_path = project_dir / ".gza" / "logs"
+    config.log_path.mkdir(parents=True, exist_ok=True)
+    config._project_boundary_cache = ProjectBoundary(
+        repo_root=tmp_path,
+        scope_root=Path("tarantino-ui"),
+        local_dependencies=(),
+    )
+
+    log_file = config.log_path / "seeded-owned-scoped.log"
+    worktree_summary_path = tmp_path / "worktree-summary.md"
+    worktree_summary_path.write_text("# Summary\n")
+    summary_path = project_dir / ".gza" / "summaries" / "seeded-owned-scoped.md"
+
+    worktree_git = Mock()
+    worktree_git.status_porcelain.return_value = {
+        ("M", "tarantino-ui/.gza/summaries/seeded-owned-scoped.md"),
+        ("M", "tarantino-ui/src/file.py"),
+    }
+    worktree_git.default_branch.return_value = "main"
+    worktree_git.get_diff_numstat.return_value = "1\t1\ttarantino-ui/src/file.py\n"
+    worktree_git._run.return_value = Mock(stdout="", returncode=0, stderr="")
+
+    with patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+        rc = _complete_code_task(
+            task,
+            config,
+            store,
+            worktree_git,
+            log_file,
+            "feature/seeded-owned-scoped",
+            TaskStats(duration_seconds=1.0, num_steps_computed=1, cost_usd=0.0),
+            0,
+            pre_run_status=set(),
+            worktree_summary_path=worktree_summary_path,
+            summary_path=summary_path,
+            summary_dir=summary_path.parent,
+            seeded_paths={
+                "tarantino-ui/.gza/summaries/seeded-owned-scoped.md",
+                "tarantino-ui/src/file.py",
+            },
+        )
+
+    assert rc == 0
+    worktree_git.add.assert_called_once_with("tarantino-ui/src/file.py")
     assert worktree_git.commit.call_count == 1
 
 

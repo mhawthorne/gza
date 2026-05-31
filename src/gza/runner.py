@@ -104,6 +104,7 @@ EXTRACTION_ALREADY_MERGED_COMPLETION_REASON = "EXTRACTION_ALREADY_MERGED"
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
 PROJECT_SCOPE_VIOLATION_FAILURE_REASON = "PROJECT_SCOPE_VIOLATION"
 CROSS_PROJECT_TAG = "cross-project"
+_GZA_OWNED_DIR_NAMES = (".gza", ".claude")
 
 
 @dataclass(frozen=True)
@@ -179,6 +180,82 @@ def _git_error_failure() -> ResolvedRunFailure:
 def _task_is_cross_project(task: Task) -> bool:
     """Return whether a task carries the reserved cross-project scope tag."""
     return CROSS_PROJECT_TAG in task.tags
+
+
+def _normalize_repo_relative_path(path: str) -> str:
+    """Normalize a repo-relative path string for prefix comparisons."""
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lstrip("/")
+
+
+def _gza_owned_path_prefixes(boundary: ProjectBoundary | None = None) -> tuple[str, ...]:
+    """Return repo-relative prefixes that represent gza-owned directories."""
+    prefixes = list(_GZA_OWNED_DIR_NAMES)
+    if boundary is not None and boundary.scope_root != Path("."):
+        scope_prefix = _normalize_repo_relative_path(boundary.scope_root.as_posix())
+        prefixes.extend(f"{scope_prefix}/{dirname}" for dirname in _GZA_OWNED_DIR_NAMES)
+    return tuple(prefixes)
+
+
+def _is_gza_owned_path(path: str, *, boundary: ProjectBoundary | None = None) -> bool:
+    """Return whether a path points at gza-owned worktree/project state."""
+    normalized = _normalize_repo_relative_path(path)
+    return any(normalized == prefix or normalized.startswith(f"{prefix}/") for prefix in _gza_owned_path_prefixes(boundary))
+
+
+def _filter_owned_artifact_paths(
+    paths: set[str] | frozenset[str] | tuple[str, ...] | list[str],
+    *,
+    boundary: ProjectBoundary | None = None,
+) -> set[str]:
+    """Drop gza-owned artifact paths from a path collection."""
+    return {path for path in paths if not _is_gza_owned_path(path, boundary=boundary)}
+
+
+def _strip_owned_artifact_patch_sections(
+    patch_text: str,
+    *,
+    boundary: ProjectBoundary | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    """Drop diff sections that touch gza-owned artifact paths."""
+    if not patch_text.strip() or "diff --git " not in patch_text:
+        return patch_text, ()
+
+    preamble: list[str] = []
+    current_section: list[str] = []
+    sections: list[list[str]] = []
+
+    for line in patch_text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current_section:
+                sections.append(current_section)
+            current_section = [line]
+            continue
+        if current_section:
+            current_section.append(line)
+        else:
+            preamble.append(line)
+
+    if current_section:
+        sections.append(current_section)
+
+    kept_sections: list[str] = []
+    stripped_paths: set[str] = set()
+    for section in sections:
+        section_text = "".join(section)
+        touched_paths = parse_patch_touched_paths(section_text)
+        owned_paths = {path for path in touched_paths if _is_gza_owned_path(path, boundary=boundary)}
+        if owned_paths:
+            stripped_paths.update(owned_paths)
+            continue
+        kept_sections.append(section_text)
+
+    if not kept_sections:
+        return "", tuple(sorted(stripped_paths))
+
+    return "".join([*preamble, *kept_sections]), tuple(sorted(stripped_paths))
 
 
 def _resolve_repo_root(project_dir: Path) -> Path:
@@ -2661,6 +2738,7 @@ def _restore_wip_changes(
     """
     if not task.slug and not original_task_id:
         return
+    boundary = _project_boundary(config)
 
     # Check if the last commit is a WIP commit
     try:
@@ -2685,6 +2763,18 @@ def _restore_wip_changes(
     if wip_file and wip_file.exists():
         diff_content = wip_file.read_text()
         if diff_content.strip():
+            diff_content, stripped_paths = _strip_owned_artifact_patch_sections(
+                diff_content,
+                boundary=boundary,
+            )
+            if stripped_paths:
+                console.print(
+                    "[yellow]Ignoring gza-owned artifact paths while restoring WIP diff: "
+                    f"{', '.join(stripped_paths)}[/yellow]"
+                )
+            if not diff_content.strip():
+                console.print("[yellow]Stored WIP diff only touched gza-owned artifacts; nothing to restore[/yellow]")
+                return
             console.print(f"[yellow]WIP commit not found - applying stored diff from {wip_file.relative_to(config.project_dir)}[/yellow]")
             try:
                 # Apply the diff
@@ -3069,6 +3159,7 @@ def _seed_extraction_bundle_if_present(
     """Copy/apply extraction bundle before provider execution when configured for the task."""
     if resume or not task.slug:
         return ExtractionSeedResult()
+    boundary = _project_boundary(config)
 
     project_bundle_dir = extraction_bundle_path(config.project_dir, task.slug)
     if not project_bundle_dir.exists():
@@ -3095,8 +3186,19 @@ def _seed_extraction_bundle_if_present(
     )
 
     patch_text = load_patch_text(patch_path)
+    patch_text, stripped_patch_paths = _strip_owned_artifact_patch_sections(
+        patch_text,
+        boundary=boundary,
+    )
+    if stripped_patch_paths:
+        patch_path = _write_runtime_patch_file(
+            worktree_bundle_dir,
+            "selected.runtime.patch",
+            patch_text,
+        )
     stored_touched_paths = parse_patch_touched_paths(patch_text)
-    if not stored_touched_paths:
+    owned_manifest_paths: set[str] = set()
+    if not stored_touched_paths and not stripped_patch_paths:
         raise ExtractionError("Extraction patch has no touched file paths")
 
     declared_raw = manifest.get("touched_paths")
@@ -3111,8 +3213,10 @@ def _seed_extraction_bundle_if_present(
         if not isinstance(path_value, str) or not path_value:
             raise ExtractionError("Extraction manifest selected/touched paths must be non-empty strings")
         declared_paths.add(path_value)
+    owned_manifest_paths.update(path for path in declared_paths if _is_gza_owned_path(path, boundary=boundary))
+    declared_paths = _filter_owned_artifact_paths(declared_paths, boundary=boundary)
 
-    if not declared_paths:
+    if not declared_paths and not stripped_patch_paths:
         raise ExtractionError("Extraction manifest is missing selected/touched path declarations")
 
     unexpected = sorted(set(stored_touched_paths) - declared_paths)
@@ -3126,7 +3230,24 @@ def _seed_extraction_bundle_if_present(
         raise ExtractionError("Extraction manifest selected_paths must be a non-empty list")
     if any(not isinstance(path_value, str) or not path_value for path_value in selected_paths_raw):
         raise ExtractionError("Extraction manifest selected_paths must contain non-empty strings")
-    selected_paths: tuple[str, ...] = tuple(selected_paths_raw)
+    owned_manifest_paths.update(path for path in selected_paths_raw if _is_gza_owned_path(path, boundary=boundary))
+    selected_paths = tuple(path for path in selected_paths_raw if not _is_gza_owned_path(path, boundary=boundary))
+
+    excluded_owned_paths = sorted(set(stripped_patch_paths) | owned_manifest_paths)
+    if excluded_owned_paths:
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "info",
+                "message": "Ignored gza-owned artifact paths while preparing extraction seed",
+                "excluded_paths": excluded_owned_paths,
+            },
+        )
+    if not stored_touched_paths and excluded_owned_paths:
+        return ExtractionSeedResult()
+    if not selected_paths:
+        return ExtractionSeedResult()
 
     stored_hunk_count = _count_patch_hunks(patch_text)
     source_branch = manifest.get("source_branch")
@@ -3203,6 +3324,20 @@ def _seed_extraction_bundle_if_present(
 
     if runtime_refresh_available:
         assert current_patch_text is not None
+        current_patch_text, stripped_runtime_paths = _strip_owned_artifact_patch_sections(
+            current_patch_text,
+            boundary=boundary,
+        )
+        if stripped_runtime_paths:
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "info",
+                    "message": "Ignored gza-owned artifact paths while refreshing extraction seed patch",
+                    "excluded_paths": list(stripped_runtime_paths),
+                },
+            )
         current_hunk_count = _count_patch_hunks(current_patch_text)
         write_log_entry(
             log_file,
@@ -3249,8 +3384,10 @@ def _seed_extraction_bundle_if_present(
                     ),
                 )
         current_touched_paths = parse_patch_touched_paths(current_patch_text)
-        if not current_touched_paths:
+        if not current_touched_paths and not stripped_runtime_paths:
             raise ExtractionError("Runtime re-derived extraction patch has no touched file paths")
+        if not current_touched_paths:
+            return ExtractionSeedResult()
         unexpected_runtime = sorted(set(current_touched_paths) - declared_paths)
         if unexpected_runtime:
             raise ExtractionError(
@@ -3947,9 +4084,11 @@ def _setup_code_task_worktree(
 def _filter_stageable_paths(
     candidate_paths: set[str],
     status_paths: set[str],
+    *,
+    boundary: ProjectBoundary | None = None,
 ) -> set[str]:
     """Keep only paths that can be staged without pathspec failures."""
-    return {path for path in candidate_paths if path in status_paths}
+    return {path for path in candidate_paths if path in status_paths and not _is_gza_owned_path(path, boundary=boundary)}
 
 
 def _complete_code_task(
@@ -3987,6 +4126,7 @@ def _complete_code_task(
         has_uncommitted = False
     else:
         seeded_paths = seeded_paths or set()
+        boundary = _project_boundary(config)
         # Compute which files changed during the provider run (selective staging)
         post_run_status = worktree_git.status_porcelain()
         new_changes = post_run_status - pre_run_status
@@ -3995,6 +4135,7 @@ def _complete_code_task(
         files_to_stage = _filter_stageable_paths(
             candidate_stage_paths,
             status_paths,
+            boundary=boundary,
         )
         if (
             files_to_stage
