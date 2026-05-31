@@ -673,6 +673,11 @@ class Git:
             return None
         return result.stdout.strip()
 
+    def merge_base(self, ref1: str, ref2: str) -> str:
+        """Return the merge-base commit SHA for two refs."""
+        result = self._run("merge-base", ref1, ref2)
+        return result.stdout.strip()
+
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         """Return True when ``ancestor`` is reachable from ``descendant``."""
         result = self._run(

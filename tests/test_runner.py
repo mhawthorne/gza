@@ -968,6 +968,11 @@ class TestReviewContextFromChain:
 
         mock_git = Mock(spec=Git)
         mock_git.default_branch.return_value = "main"
+        mock_git.merge_base.return_value = "abc1234base"
+        mock_git.rev_parse.side_effect = lambda ref: {
+            "main": "def5678main",
+            "test/feature-branch": "fed4321head",
+        }[ref]
         mock_git.get_diff_numstat.return_value = "10\t2\tsrc/a.py\n3\t1\tsrc/b.py\n"
         mock_git.get_diff_stat.return_value = (
             " src/a.py | 12 ++++++++++\n src/b.py | 4 +++-\n 2 files changed, 13 insertions(+), 3 deletions(-)"
@@ -977,6 +982,10 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(review_task, store, tmp_path, mock_git)
 
         assert "## Implementation Diff Context" in context
+        assert "Implementation head: test/feature-branch (fed4321head)" in context
+        assert "Local default branch: main (def5678main)" in context
+        assert "Review base (merge-base): abc1234base" in context
+        assert "Revision range: main...test/feature-branch" in context
         assert "Changed files:" in context
         assert "- src/a.py" in context
         assert "- src/b.py" in context

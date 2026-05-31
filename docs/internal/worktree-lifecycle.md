@@ -18,7 +18,10 @@ When `main_checkout_isolate: true`, `gza watch` maintains a dedicated integratio
 
 ### Code tasks (implement, improve)
 
-- **implement**: Creates a new worktree with a new branch based on `origin/main`.
+- **implement**: Creates a new worktree with a new branch based on `_select_worktree_base_ref()`.
+  That helper prefers the local default branch when local and `origin/<default>` are equal,
+  when local is ahead, or when the refs have diverged; it uses `origin/<default>` only when the
+  remote-tracking ref is strictly ahead.
 - **improve**: Uses `same_branch=True`. Creates a worktree at its own path but checks out the *same branch* as the implementation task. The previous worktree for that branch is removed first (`cleanup_worktree_for_branch`).
 
 When a code task is finalized with uncommitted changes, gza writes a single commit with:

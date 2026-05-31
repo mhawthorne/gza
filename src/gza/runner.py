@@ -2166,6 +2166,7 @@ def _parse_changed_files_from_numstat(numstat_output: str) -> list[str]:
 def _build_review_diff_context(
     git: Git,
     revision_range: str,
+    default_branch: str,
     branch_name: str,
     *,
     diff_small_threshold: int = DIFF_SMALL_THRESHOLD,
@@ -2179,11 +2180,17 @@ def _build_review_diff_context(
     files_changed, lines_added, lines_removed = parse_diff_numstat(numstat_output)
     total_lines = lines_added + lines_removed
     changed_files = _parse_changed_files_from_numstat(numstat_output)
+    review_base_sha = git.merge_base(default_branch, branch_name)
+    default_branch_sha = git.rev_parse(default_branch)
+    branch_head_sha = git.rev_parse(branch_name)
 
     parts = [
         "## Implementation Diff Context",
         "",
         f"Implementation branch: {branch_name}",
+        f"Implementation head: {branch_name} ({branch_head_sha})",
+        f"Local default branch: {default_branch} ({default_branch_sha})",
+        f"Review base (merge-base): {review_base_sha}",
         f"Revision range: {revision_range}",
         f"Files changed: {files_changed}, lines added: {lines_added}, lines removed: {lines_removed}",
     ]
@@ -2459,6 +2466,7 @@ def _build_context_from_chain(
                             _build_review_diff_context(
                                 git,
                                 revision_range,
+                                default_branch,
                                 impl_task.branch,
                                 diff_small_threshold=_int_or_default(
                                     getattr(config, "review_diff_small_threshold", None),
@@ -3830,8 +3838,9 @@ def run(
     git = Git(config.project_dir)
     default_branch = git.default_branch()
 
-    # Pull latest on default branch (without switching away from user's current branch)
-    # We do this by fetching and then basing the worktree on origin/default_branch
+    # Refresh origin/default_branch when possible, then choose the worktree base later via
+    # _select_worktree_base_ref(), which prefers the local default branch unless origin is
+    # strictly ahead.
     try:
         git._run("fetch", "origin", default_branch)
     except GitError:
