@@ -28,6 +28,8 @@ Skills are **installed from the gza package** into the worktree's `.claude/skill
 
 The task context creates a summary **directory** in the worktree and tells the agent (via the prompt) to write its summary there. After the agent finishes, the summary is **read back from the worktree** into the project. The flow is worktree → project, not the other way around.
 
+Even though those summaries and other host-injected worktree resources live under `.gza/` or `.claude/`, they are treated as gza-owned state, not task output. Restore, extraction-seed, and final staging paths explicitly exclude both repo-root and scoped-project forms of those directories (for example `.gza/...` and `tarantino-ui/.gza/...`) so `git apply`-based flows cannot commit them even when `.gitignore` would be bypassed in monorepo subdir projects.
+
 ### Provider config dirs (`~/.claude`, `~/.codex`)
 
 Each provider has a `config_dir` setting (e.g., `".claude"`, `".codex"`) that controls whether its home directory is mounted into Docker. For example, Codex with OAuth sets `config_dir=".codex"`, which mounts `~/.codex` → `/home/gza/.codex` in the container. This gives the agent access to auth credentials and provider-level settings. This is the **provider's own config**, not the project's `.gza/` directory.

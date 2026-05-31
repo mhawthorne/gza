@@ -2728,6 +2728,43 @@ class TestMergeStatus:
         assert merged_impl.merge_status == "merged"
         assert merged_impl.merged_at == merged_unit.merged_at
 
+    def test_set_merge_unit_state_preserves_unrelated_task_fields(self, tmp_path: Path) -> None:
+        """Dual-write merge projection should not rewrite unrelated task columns."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        impl.slug = "20260531-merge-projection"
+        impl.output_content = "kept"
+        store.mark_completed(impl, has_commits=True, branch="feature/remerge")
+        store.update(impl)
+        assert impl.id is not None
+
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        synced_at = datetime.now(UTC).replace(microsecond=0)
+        store.set_merge_unit_state(
+            impl_unit.id,
+            "merged",
+            merged_by_task_id=impl.id,
+            pr_number=42,
+            pr_state="open",
+            pr_last_synced_at=synced_at,
+            sync_last_synced_at=synced_at,
+            diff_stats=(3, 10, 2),
+        )
+
+        refreshed = store.get(impl.id)
+        assert refreshed is not None
+        assert refreshed.prompt == "Implement feature"
+        assert refreshed.status == "completed"
+        assert refreshed.slug == "20260531-merge-projection"
+        assert refreshed.output_content == "kept"
+        assert refreshed.merge_status == "merged"
+        assert refreshed.pr_number == 42
+        assert refreshed.pr_state == "open"
+
     def test_set_merge_unit_state_public_db_unset_preserves_existing_optional_fields(
         self, tmp_path: Path
     ) -> None:

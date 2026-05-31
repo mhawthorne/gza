@@ -31,6 +31,7 @@ from gza.runner import (
     REVIEW_IMPROVE_LINEAGE_LIMIT,
     SUMMARY_DIR,
     RunInvocationContext,
+    WIP_DIR,
     _build_code_task_commit_subject,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
@@ -45,6 +46,7 @@ from gza.runner import (
     _format_review_verify_result,
     _get_task_output,
     _post_complete_code_task,
+    _restore_wip_changes,
     _resolve_code_task_branch_name,
     _run_inner,
     _run_non_code_task,
@@ -149,6 +151,140 @@ class TestPostReviewToPr:
         assert refreshed.pr_number == 42
         assert refreshed.pr_state == "open"
         gh.add_pr_comment.assert_not_called()
+
+
+def test_restore_wip_changes_ignores_owned_artifact_paths(tmp_path: Path) -> None:
+    task_store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = task_store.add("Restore task", task_type="implement")
+    task.slug = "20260531-restore"
+    task_store.update(task)
+
+    wip_dir = tmp_path / WIP_DIR
+    wip_dir.mkdir(parents=True, exist_ok=True)
+    (wip_dir / f"{task.slug}.diff").write_text(
+        "diff --git a/.gza/summaries/task.md b/.gza/summaries/task.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/.gza/summaries/task.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+summary\n"
+        "diff --git a/src/file.py b/src/file.py\n"
+        "index e69de29..8c7e5a6 100644\n"
+        "--- a/src/file.py\n"
+        "+++ b/src/file.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+print('hello')\n"
+    )
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+
+    worktree_git = Mock()
+    worktree_git._run.side_effect = [
+        Mock(stdout="regular commit", returncode=0, stderr=""),
+        Mock(stdout="", returncode=0, stderr=""),
+        Mock(stdout="", returncode=0, stderr=""),
+    ]
+
+    _restore_wip_changes(
+        task,
+        worktree_git,
+        config,
+        branch_name="feature/restore",
+    )
+
+    apply_call = worktree_git._run.call_args_list[1]
+    assert apply_call.args[:2] == ("apply", "--cached")
+    applied_patch = apply_call.kwargs["stdin"].decode()
+    assert ".gza/summaries/task.md" not in applied_patch
+    assert "src/file.py" in applied_patch
+
+
+def test_restore_wip_changes_skips_owned_artifact_only_patch(tmp_path: Path) -> None:
+    task_store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = task_store.add("Restore task", task_type="implement")
+    task.slug = "20260531-restore-owned-only"
+    task_store.update(task)
+
+    wip_dir = tmp_path / WIP_DIR
+    wip_dir.mkdir(parents=True, exist_ok=True)
+    (wip_dir / f"{task.slug}.diff").write_text(
+        "diff --git a/.gza/summaries/task.md b/.gza/summaries/task.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/.gza/summaries/task.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+summary\n"
+    )
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+
+    worktree_git = Mock()
+    worktree_git._run.return_value = Mock(stdout="regular commit", returncode=0, stderr="")
+
+    _restore_wip_changes(
+        task,
+        worktree_git,
+        config,
+        branch_name="feature/restore",
+    )
+
+    worktree_git._run.assert_called_once()
+
+
+def test_restore_wip_changes_ignores_scoped_owned_artifact_paths_in_subdir_project(tmp_path: Path) -> None:
+    project_dir = tmp_path / "tarantino-ui"
+    project_dir.mkdir()
+    task_store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = task_store.add("Restore task", task_type="implement")
+    task.slug = "20260531-restore-scoped"
+    task_store.update(task)
+
+    wip_dir = project_dir / WIP_DIR
+    wip_dir.mkdir(parents=True, exist_ok=True)
+    (wip_dir / f"{task.slug}.diff").write_text(
+        "diff --git a/tarantino-ui/.gza/summaries/task.md b/tarantino-ui/.gza/summaries/task.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tarantino-ui/.gza/summaries/task.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+summary\n"
+        "diff --git a/tarantino-ui/src/file.py b/tarantino-ui/src/file.py\n"
+        "index e69de29..8c7e5a6 100644\n"
+        "--- a/tarantino-ui/src/file.py\n"
+        "+++ b/tarantino-ui/src/file.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+print('hello')\n"
+    )
+
+    config = Mock(spec=Config)
+    config.project_dir = project_dir
+    config._project_boundary_cache = ProjectBoundary(
+        repo_root=tmp_path,
+        scope_root=Path("tarantino-ui"),
+        local_dependencies=(),
+    )
+
+    worktree_git = Mock()
+    worktree_git._run.side_effect = [
+        Mock(stdout="regular commit", returncode=0, stderr=""),
+        Mock(stdout="", returncode=0, stderr=""),
+        Mock(stdout="", returncode=0, stderr=""),
+    ]
+
+    _restore_wip_changes(
+        task,
+        worktree_git,
+        config,
+        branch_name="feature/restore-scoped",
+    )
+
+    apply_call = worktree_git._run.call_args_list[1]
+    assert apply_call.args[:2] == ("apply", "--cached")
+    applied_patch = apply_call.kwargs["stdin"].decode()
+    assert "tarantino-ui/.gza/summaries/task.md" not in applied_patch
+    assert "tarantino-ui/src/file.py" in applied_patch
 
 
 class TestGetTaskOutput:
