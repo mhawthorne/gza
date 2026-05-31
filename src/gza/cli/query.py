@@ -1660,7 +1660,7 @@ def _enrich_unmerged_result(
     needs_pr_metadata = "pr_url" in effective_fields
     gh: GitHub | None = None
     gh_available: bool | None = None
-    if needs_pr_metadata:
+    if needs_pr_metadata and config.pr_integration:
         gh = GitHub()
     rows: list[_TaskRow | _LineageRow] = []
 
@@ -1863,13 +1863,14 @@ def _enrich_unmerged_result(
                 branch_deleted = bool(representative_branch)
 
         pr_url: str | None = None
-        if needs_pr_metadata and gh is not None:
+        if needs_pr_metadata and gh is not None and config.pr_integration:
             if gh_available is None:
                 gh_available = gh.is_available()
             pr_lookup = lookup_task_pr(
                 owner_task,
                 gh=gh,
                 available=gh_available,
+                pr_integration=config.pr_integration,
                 include_number=False,
             )
             if pr_lookup.found and pr_lookup.pr_url:

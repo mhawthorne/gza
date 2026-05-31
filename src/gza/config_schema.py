@@ -49,6 +49,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         True,
         "Require a valid current review before lifecycle auto-merge.",
     ),
+    ConfigKeySpec(
+        "pr_integration",
+        "bool",
+        True,
+        "Enable GitHub PR discovery, commenting, and auto-create flows. Set false to skip all gh-backed PR operations for the project.",
+    ),
     ConfigKeySpec("branch_mode", "str", "multi", "Git branch mode: `single` or `multi`."),
     ConfigKeySpec("branch_strategy", "str | object", "{project}/{date}-{slug}", "Branch naming strategy preset or object."),
     ConfigKeySpec("branch_strategy.default_type", "str", "feature", "Default type token for branch strategy patterns."),

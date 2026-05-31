@@ -5,11 +5,14 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from gza.github import GitHub, GitHubError, GitHubLookupError, PullRequest, PullRequestDetails
+from gza.github import GitHub, GitHubError, GitHubLookupError, GitHubRepoUnsupportedError, PullRequest, PullRequestDetails
 
 
 class TestGitHubRun:
     """Tests for GitHub._run() method."""
+
+    def teardown_method(self):
+        GitHub.clear_pr_support_cache()
 
     @patch('subprocess.run')
     def test_run_success(self, mock_run):
@@ -49,6 +52,21 @@ class TestGitHubRun:
 
         assert result.returncode == 1
         assert result.stderr == "error"
+
+    @patch('subprocess.run')
+    def test_run_marks_repo_unsupported_for_known_host_error(self, mock_run):
+        """Known gh remote errors should become a typed unsupported-repo verdict."""
+        mock_run.return_value = Mock(
+            returncode=1,
+            stdout="",
+            stderr="none of the git remotes configured for this repository point to a known GitHub host",
+        )
+        gh = GitHub()
+
+        with pytest.raises(GitHubRepoUnsupportedError):
+            gh._run("pr", "view", "feature/test")
+
+        assert GitHub.cached_pr_support() is False
 
     @patch('subprocess.run')
     def test_run_with_multiple_args(self, mock_run):

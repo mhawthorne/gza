@@ -51,6 +51,7 @@ Gza reads configuration from three YAML layers:
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
 | `review_verify_timeout_seconds` | Integer | `120` | Timeout for autonomous review `verify_command` runs |
+| `pr_integration` | Boolean | `true` | Enable GitHub PR discovery/comment/create flows; set `false` to skip all `gh`-backed PR operations for the project |
 | `recommend_rebase_behind_commits` | Integer | `1` | Deprecated compatibility key; accepted but ignored by current lifecycle planning |
 | `max_noop_improve_cycles` | Integer | `2` | Cap for consecutive no-op improves before lifecycle automation stops for discussion |
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
@@ -88,7 +89,7 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `require_review_before_merge`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `colors`
+`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `require_review_before_merge`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `colors`
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`, `verify_command`
@@ -822,6 +823,7 @@ max_turns
 main_checkout_isolate
 merge_squash_threshold
 model
+pr_integration
 reasoning_effort
 project_name
 project_prefix
@@ -1245,7 +1247,7 @@ gza improve <impl_task_id> [options]
 | `impl_task_id` | Full prefixed task ID (implement, improve, review, or fix — auto-resolves to root implementation; e.g. `gza-1234`) |
 | `--review-id ID` | Explicit full prefixed review task ID to base the improve on (overrides auto-pick of most recent completed review; e.g. `gza-1234`) |
 | `--review` | Auto-create review task on completion; if the branch already has an open PR, push same-branch improve commits first |
-| `--pr` | Auto-create/reuse a GitHub PR after successful code-task completion |
+| `--pr` | Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |

@@ -9,7 +9,7 @@ from typing import Any, Literal, cast
 
 from .db import DB_UNSET, MergeUnit, SqliteTaskStore, Task, task_owns_merge_status
 from .git import Git, GitError, parse_diff_numstat, resolve_ref_if_possible
-from .github import GitHub, GitHubError, PullRequestDetails
+from .github import GitHub, GitHubError, PullRequestDetails, is_github_repo_unsupported_error
 
 _UNSET = object()
 DEFAULT_SYNC_CACHE_SECONDS = 300
@@ -510,6 +510,8 @@ def _enrich_branch_pr_state(
     try:
         resolved_pr = resolve_branch_pr(gh, branch, cached_pr_numbers=cached_numbers, allow_discovery=True)
     except GitHubError as exc:
+        if is_github_repo_unsupported_error(exc):
+            return _BranchPersistenceUpdate()
         result.errors.append(str(exc))
         return _BranchPersistenceUpdate()
 
@@ -719,6 +721,7 @@ def sync_branch_cohorts(
     *,
     include_git: bool,
     include_pr: bool,
+    pr_integration: bool = True,
     dry_run: bool = False,
     fetch_remote: bool = True,
     allow_cached_remote_target_ref_without_fetch: bool = False,
@@ -795,20 +798,32 @@ def sync_branch_cohorts(
 
     gh: GitHub | None = None
     gh_available = False
-    if include_pr:
+    if include_pr and pr_integration:
         _emit_progress(progress, "Checking GitHub CLI auth")
         gh = GitHub()
-        gh_available = gh.is_available()
-        _emit_progress(progress, "GitHub CLI auth OK" if gh_available else "GitHub CLI unavailable")
-        if not gh_available:
+        if gh.cached_pr_support() is False:
+            _emit_progress(progress, "GitHub PR integration unavailable for this repo")
+        else:
+            gh_available = gh.is_available()
+            _emit_progress(progress, "GitHub CLI auth OK" if gh_available else "GitHub CLI unavailable")
+        if gh.cached_pr_support() is False:
+            gh_available = False
+        elif not gh_available:
             partial_failure = True
             for result in results:
                 result.errors.append("GitHub CLI (gh) is not installed or not authenticated")
+    elif include_pr:
+        _emit_progress(progress, "PR integration disabled by project config")
+        gh_available = False
+        gh = None
 
     total = len(eligible_cohorts)
     for idx, (cohort, result) in enumerate(zip(eligible_cohorts, results, strict=True)):
         _emit_progress(progress, f"[{idx + 1}/{total}] {cohort.branch}")
         if include_pr and gh_available and gh is not None:
+            if gh.cached_pr_support() is False:
+                gh_available = False
+                continue
             if result.skipped_reason is not None:
                 continue
             pr_update = _enrich_branch_pr_state(

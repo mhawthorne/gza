@@ -55,7 +55,7 @@ from .failure_reasons import (
     resolve_failure_reason as _resolve_failure_reason,
 )
 from .git import Git, GitApplyResult, GitError, cleanup_worktree_for_branch, is_rebase_in_progress, parse_diff_numstat
-from .github import GitHub, GitHubError
+from .github import GitHub, GitHubError, is_github_repo_unsupported_error
 from .improve_diff import (
     ImproveDiffBaseline,
     capture_improve_diff_baseline,
@@ -2847,6 +2847,8 @@ def post_review_to_pr(
     impl_task: Task,
     store: SqliteTaskStore,
     project_dir: Path,
+    *,
+    pr_integration: bool = True,
     required: bool = False,
 ) -> None:
     """Post a review task's output to its associated PR.
@@ -2858,7 +2860,16 @@ def post_review_to_pr(
         project_dir: Project directory
         required: If True, error if PR not found; if False, skip silently
     """
+    if not pr_integration:
+        if required:
+            print("Info: PR requested but skipped: PR integration disabled by project config")
+        return
+
     gh = GitHub()
+    if gh.cached_pr_support() is False:
+        if required:
+            print("Info: PR requested but skipped: project has no GitHub-capable remote")
+        return
 
     # Check gh is available
     if not gh.is_available():
@@ -2880,6 +2891,10 @@ def post_review_to_pr(
                 allow_discovery=True,
             )
         except GitHubError as exc:
+            if is_github_repo_unsupported_error(exc):
+                if required:
+                    print("Info: PR requested but skipped: project has no GitHub-capable remote")
+                return
             if required:
                 print(f"Error: Failed to look up PR for task {impl_task.id}: {exc}")
             else:
@@ -3002,6 +3017,7 @@ def _create_and_run_review_task(
 
 def _sync_completed_code_task_branch_for_live_pr(
     task: Task,
+    config: Config,
     store: SqliteTaskStore,
     git: Git,
 ) -> bool:
@@ -3012,8 +3028,8 @@ def _sync_completed_code_task_branch_for_live_pr(
     auto-review flow because no PR-facing action can be taken anyway.
     """
     task_label = f"{task.task_type.capitalize()} task {task.id}"
-    result = sync_task_branch_if_live_pr(task, store, git)
-    if result.ok or result.status == "gh_unavailable":
+    result = sync_task_branch_if_live_pr(task, store, git, pr_integration=config.pr_integration)
+    if result.ok or result.status in {"gh_unavailable", "disabled", "unsupported"}:
         return True
 
     if result.status == "lookup_failed":
@@ -3060,10 +3076,17 @@ def _ensure_work_pr_for_completed_code_task(
         task,
         store,
         git,
+        pr_integration=config.pr_integration,
         content_builder=lambda: build_task_pr_content(task, git, config, store),
         draft=False,
         merged_behavior="skip",
     )
+    if result.ok and result.status == "disabled":
+        print("Info: PR requested but skipped: PR integration disabled by project config")
+        return True
+    if result.ok and result.status == "unsupported":
+        print("Info: PR requested but skipped: project has no GitHub-capable remote")
+        return True
     if result.ok and result.status == "cached" and result.pr_number:
         print(f"Info: Reusing cached PR #{result.pr_number} for task {task.id}: {result.pr_url}")
         return True
@@ -4473,7 +4496,12 @@ def _post_complete_code_task(
                 ) == "merged":
                     store.set_merge_status(refreshed_impl.id, "unmerged")
             if task.create_review:
-                improve_follow_up_ready = _sync_completed_code_task_branch_for_live_pr(task, store, worktree_git)
+                improve_follow_up_ready = _sync_completed_code_task_branch_for_live_pr(
+                    task,
+                    config,
+                    store,
+                    worktree_git,
+                )
             if improve_follow_up_ready and impl_ancestor and impl_ancestor.id is not None:
                 store.clear_review_state(impl_ancestor.id)
                 store.resolve_comments(
@@ -4539,7 +4567,12 @@ def _post_complete_code_task(
         )
         if fix_code_changed:
             if task.create_review:
-                fix_auto_review_ready = _sync_completed_code_task_branch_for_live_pr(task, store, worktree_git)
+                fix_auto_review_ready = _sync_completed_code_task_branch_for_live_pr(
+                    task,
+                    config,
+                    store,
+                    worktree_git,
+                )
             else:
                 _create_fix_follow_up_review_task(task, store)
 
@@ -5697,7 +5730,14 @@ def _run_non_code_task(
         if task.task_type == "review" and task.depends_on:
             impl_task = store.get(task.depends_on)
             if impl_task:
-                post_review_to_pr(task, impl_task, store, config.project_dir, required=False)
+                post_review_to_pr(
+                    task,
+                    impl_task,
+                    store,
+                    config.project_dir,
+                    pr_integration=config.pr_integration,
+                    required=False,
+                )
 
         verdict: str | None = None
         if task.task_type == "review":

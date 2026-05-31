@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 from gza.db import SqliteTaskStore
 from gza.git import GitError
-from gza.github import GitHubError, PullRequestDetails
+from gza.github import GitHub, GitHubError, PullRequestDetails
 from gza.sync_ops import (
     BranchCohort,
     build_branch_cohorts_for_task_ids,
@@ -1341,6 +1341,62 @@ def test_sync_branch_cohorts_preserves_cached_pr_state_on_lookup_failure(tmp_pat
     assert refreshed.pr_number == 41
     assert refreshed.pr_state == "open"
     assert refreshed.pr_last_synced_at == old_synced_at
+
+
+def test_sync_branch_cohorts_treats_repo_unsupported_pr_lookup_as_skip_and_stops_later_lookups(tmp_path):
+    GitHub.clear_pr_support_cache()
+    try:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        first = _completed_branch_task(store, "First task", "feature/pr-unsupported-first")
+        second = _completed_branch_task(store, "Second task", "feature/pr-unsupported-second")
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
+
+        unsupported = (
+            "gh pr list --head feature/pr-unsupported-first failed: "
+            "none of the git remotes configured for this repository point to a known github host"
+        )
+
+        gh = Mock(spec=GitHub)
+        gh.is_available.return_value = True
+        gh.cached_pr_support.side_effect = GitHub.cached_pr_support
+        gh.get_pr_details.return_value = None
+
+        def _raise_unsupported(branch: str):
+            GitHub._mark_pr_unsupported()
+            raise GitHubError(
+                unsupported.replace("feature/pr-unsupported-first", branch)
+            )
+
+        gh.discover_pr_by_branch.side_effect = _raise_unsupported
+
+        with patch("gza.sync_ops.GitHub", return_value=gh):
+            results, partial = sync_branch_cohorts(
+                store,
+                git,
+                [
+                    BranchCohort(branch="feature/pr-unsupported-first", tasks=(first,)),
+                    BranchCohort(branch="feature/pr-unsupported-second", tasks=(second,)),
+                ],
+                include_git=False,
+                include_pr=True,
+                dry_run=False,
+                fetch_remote=False,
+            )
+
+        assert partial is False
+        assert [result.errors for result in results] == [[], []]
+        assert all(
+            "known github host" not in action.lower()
+            for result in results
+            for action in (*result.actions, *result.warnings, *result.errors)
+        )
+        gh.discover_pr_by_branch.assert_called_once_with("feature/pr-unsupported-first")
+        assert GitHub.cached_pr_support() is False
+    finally:
+        GitHub.clear_pr_support_cache()
 
 
 def test_sync_branch_cohorts_pr_only_does_not_mark_merged_from_local_git_heuristic(tmp_path):

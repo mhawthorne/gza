@@ -62,6 +62,7 @@ DEFAULT_CLAUDE_ARGS = [
 ]
 DEFAULT_ADVANCE_CREATE_REVIEWS = True
 DEFAULT_REQUIRE_REVIEW_BEFORE_MERGE = True
+DEFAULT_PR_INTEGRATION = True
 REMOVED_ADVANCE_REVIEW_KEY = "advance_requires_review"
 RENAMED_REQUIRE_REVIEW_KEY = "require_review_before_merge"
 DEFAULT_ADVANCE_MODE = "default"
@@ -97,7 +98,7 @@ VALID_CONFIG_FIELDS = {
     "max_turns", "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
     "reasoning_effort", "defaults", "task_types", "providers", "branch_strategy", "chat_text_display_length",
     "verify_command",
-    "advance_create_reviews", "require_review_before_merge", "advance_mode", "max_resume_attempts",
+    "advance_create_reviews", "require_review_before_merge", "pr_integration", "advance_mode", "max_resume_attempts",
     "max_review_cycles", "max_noop_improve_cycles", "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
     "review_diff_medium_threshold", "review_context_file_limit", "review_verify_timeout_seconds",
@@ -165,6 +166,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "verify_command": None,
     "advance_create_reviews": None,
     "require_review_before_merge": None,
+    "pr_integration": None,
     "max_resume_attempts": None,
     "max_review_cycles": None,
     "max_noop_improve_cycles": None,
@@ -254,6 +256,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "chat_text_display_length": None,
     "advance_create_reviews": None,
     "require_review_before_merge": None,
+    "pr_integration": None,
     "watch": {
         "batch": None,
         "poll": None,
@@ -737,6 +740,7 @@ class Config:
     verify_command: str = ""  # Command to run before finishing (e.g., mypy + pytest)
     advance_create_reviews: bool = DEFAULT_ADVANCE_CREATE_REVIEWS
     require_review_before_merge: bool = DEFAULT_REQUIRE_REVIEW_BEFORE_MERGE
+    pr_integration: bool = DEFAULT_PR_INTEGRATION
     advance_mode: str = DEFAULT_ADVANCE_MODE
     max_resume_attempts: int = DEFAULT_MAX_RESUME_ATTEMPTS
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
@@ -1562,6 +1566,9 @@ class Config:
         require_review_before_merge = bool(
             data.get("require_review_before_merge", DEFAULT_REQUIRE_REVIEW_BEFORE_MERGE)
         )
+        if "pr_integration" in data and not isinstance(data["pr_integration"], bool):
+            raise ConfigError("'pr_integration' must be a boolean (true/false)")
+        pr_integration = bool(data.get("pr_integration", DEFAULT_PR_INTEGRATION))
         advance_mode = str(data.get("advance_mode", DEFAULT_ADVANCE_MODE))
         if advance_mode not in {"default", "iterate"}:
             raise ConfigError("'advance_mode' must be 'default' or 'iterate'")
@@ -1865,6 +1872,7 @@ class Config:
             verify_command=data.get("verify_command", ""),
             advance_create_reviews=advance_create_reviews,
             require_review_before_merge=require_review_before_merge,
+            pr_integration=pr_integration,
             advance_mode=advance_mode,
             max_resume_attempts=max_resume_attempts,
             max_review_cycles=max_review_cycles,
@@ -2269,6 +2277,8 @@ class Config:
 
         if "require_review_before_merge" in data and not isinstance(data["require_review_before_merge"], bool):
             errors.append("'require_review_before_merge' must be a boolean (true/false)")
+        if "pr_integration" in data and not isinstance(data["pr_integration"], bool):
+            errors.append("'pr_integration' must be a boolean (true/false)")
         if "max_resume_attempts" in data:
             if not _is_strict_int(data["max_resume_attempts"]):
                 errors.append("'max_resume_attempts' must be an integer")

@@ -4,12 +4,63 @@ from unittest.mock import Mock, patch
 
 from gza.db import SqliteTaskStore
 from gza.git import GitError
-from gza.github import GitHubError, PullRequestDetails
+from gza.github import GitHub, GitHubError, PullRequestDetails
 from gza.pr_ops import ensure_task_pr, lookup_task_pr, sync_task_branch_if_live_pr
 
 
 class TestEnsureTaskPr:
     """Focused regressions for PR ensure/create helper behavior."""
+
+    def teardown_method(self):
+        GitHub.clear_pr_support_cache()
+
+    def test_non_github_repo_short_circuits_after_cached_verdict(self, tmp_path):
+        """Once gh marked the repo unsupported, ensure_task_pr should not shell out again."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Implement X", task_type="implement")
+        task.branch = "feature/non-github"
+        store.update(task)
+
+        git = Mock()
+
+        gh = Mock()
+        gh.cached_pr_support.return_value = False
+
+        with patch("gza.pr_ops.GitHub", return_value=gh):
+            result = ensure_task_pr(
+                task,
+                store,
+                git,
+                title="Manual title",
+                body="body",
+            )
+
+        assert result.ok is True
+        assert result.status == "unsupported"
+        gh.is_available.assert_not_called()
+
+    def test_pr_integration_false_short_circuits_without_github(self, tmp_path):
+        """Project config override should skip PR work without instantiating gh."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Implement X", task_type="implement")
+        task.branch = "feature/config-disabled"
+        store.update(task)
+
+        git = Mock()
+
+        with patch("gza.pr_ops.GitHub") as github_cls:
+            result = ensure_task_pr(
+                task,
+                store,
+                git,
+                pr_integration=False,
+                title="Manual title",
+                body="body",
+            )
+
+        assert result.ok is True
+        assert result.status == "disabled"
+        github_cls.assert_not_called()
 
     def test_cached_pr_is_revalidated_and_cleared_when_missing(self, tmp_path):
         """Stale cached PR numbers must not be treated as authoritative."""
@@ -87,6 +138,46 @@ class TestEnsureTaskPr:
         git.push_branch.assert_called_once_with("feature/existing-pr")
         output = capsys.readouterr().out
         assert "Pushing branch 'feature/existing-pr' to origin..." in output
+
+    def test_non_github_repo_discovery_skips_push_and_returns_unsupported(self, tmp_path):
+        """Unsupported-repo discovery must win before any push attempt."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add("Implement X", task_type="implement")
+        task.branch = "feature/non-github-discovery"
+        store.update(task)
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git.needs_push.return_value = True
+
+        gh = Mock()
+        gh.is_available.return_value = True
+        gh.cached_pr_support.side_effect = GitHub.cached_pr_support
+
+        def _raise_unsupported(branch: str):
+            GitHub._mark_pr_unsupported()
+            raise GitHubError(
+                f"gh pr list --head {branch} failed: "
+                "none of the git remotes configured for this repository point to a known GitHub host"
+            )
+
+        gh.discover_pr_by_branch.side_effect = _raise_unsupported
+
+        with patch("gza.pr_ops.GitHub", return_value=gh):
+            result = ensure_task_pr(
+                task,
+                store,
+                git,
+                title="Manual title",
+                body="body",
+            )
+
+        assert result.ok is True
+        assert result.status == "unsupported"
+        assert result.error == "project has no GitHub-capable remote"
+        git.needs_push.assert_not_called()
+        git.push_branch.assert_not_called()
+        assert GitHub.cached_pr_support() is False
 
     def test_closed_cached_pr_creates_a_new_pr_for_still_unmerged_branch(self, tmp_path):
         """Closed or merged cached PRs should not block creating a replacement PR."""

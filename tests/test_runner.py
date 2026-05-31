@@ -15,7 +15,7 @@ import pytest
 from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError
-from gza.github import GitHubError, PullRequestDetails
+from gza.github import GitHub, GitHubError, PullRequestDetails
 from gza.improve_diff import ImproveDiffResult
 from gza.lineage import get_plan_for_task
 from gza.log_paths import ops_log_path_for
@@ -120,6 +120,36 @@ class TestGetTaskOutputPaths:
 class TestPostReviewToPr:
     """Tests for posting review output to pull requests."""
 
+    def test_non_github_repo_skips_silently_for_non_required_review(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement feature", task_type="implement")
+        impl_task.branch = "feature/non-github"
+        store.update(impl_task)
+
+        review_task = store.add("Review feature", task_type="review")
+        review_task.output_content = "Looks good"
+        store.update(review_task)
+
+        gh = Mock()
+        gh.cached_pr_support.return_value = False
+
+        with patch("gza.runner.GitHub", return_value=gh):
+            post_review_to_pr(
+                review_task,
+                impl_task,
+                store,
+                tmp_path,
+                pr_integration=True,
+                required=False,
+            )
+
+        assert capsys.readouterr().out == ""
+        gh.is_available.assert_not_called()
+
     def test_lookup_failure_preserves_cached_pr_state_and_surfaces_error(
         self,
         tmp_path: Path,
@@ -151,6 +181,97 @@ class TestPostReviewToPr:
         assert refreshed.pr_number == 42
         assert refreshed.pr_state == "open"
         gh.add_pr_comment.assert_not_called()
+
+
+def test_ensure_work_pr_for_completed_code_task_leaves_one_skip_note_for_non_github_repo(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Implement feature", task_type="implement")
+    task.branch = "feature/non-github-pr"
+    store.update(task)
+
+    config = Mock(spec=Config)
+    config.pr_integration = True
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.count_commits_ahead.return_value = 1
+
+    with patch(
+        "gza.runner.ensure_task_pr",
+        return_value=Mock(ok=True, status="unsupported", pr_number=None, pr_url=None, error="project has no GitHub-capable remote"),
+    ):
+        assert _ensure_work_pr_for_completed_code_task(task, config, store, git) is True
+
+    assert capsys.readouterr().out.strip() == "Info: PR requested but skipped: project has no GitHub-capable remote"
+
+
+def test_ensure_work_pr_for_completed_code_task_discovers_non_github_repo_before_push(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    GitHub.clear_pr_support_cache()
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Implement feature", task_type="implement")
+    task.branch = "feature/non-github-before-push"
+    store.update(task)
+
+    config = Mock(spec=Config)
+    config.pr_integration = True
+
+    git = Mock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.count_commits_ahead.return_value = 1
+
+    gh = Mock()
+    gh.is_available.return_value = True
+    gh.cached_pr_support.side_effect = GitHub.cached_pr_support
+
+    def _raise_unsupported(branch: str):
+        GitHub._mark_pr_unsupported()
+        raise GitHubError(
+            f"gh pr list --head {branch} failed: "
+            "none of the git remotes configured for this repository point to a known GitHub host"
+        )
+
+    gh.discover_pr_by_branch.side_effect = _raise_unsupported
+
+    with patch("gza.pr_ops.GitHub", return_value=gh):
+        assert _ensure_work_pr_for_completed_code_task(task, config, store, git) is True
+
+    assert capsys.readouterr().out.strip() == "Info: PR requested but skipped: project has no GitHub-capable remote"
+    git.needs_push.assert_not_called()
+    git.push_branch.assert_not_called()
+    GitHub.clear_pr_support_cache()
+
+
+def test_post_review_to_pr_short_circuits_when_pr_integration_disabled(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    impl_task = store.add("Implement feature", task_type="implement")
+    impl_task.branch = "feature/config-disabled"
+    store.update(impl_task)
+
+    review_task = store.add("Review feature", task_type="review")
+    review_task.output_content = "Looks good"
+    store.update(review_task)
+
+    with patch("gza.runner.GitHub") as github_cls:
+        post_review_to_pr(
+            review_task,
+            impl_task,
+            store,
+            tmp_path,
+            pr_integration=False,
+            required=False,
+        )
+
+    assert capsys.readouterr().out == ""
+    github_cls.assert_not_called()
 
 
 def test_restore_wip_changes_ignores_owned_artifact_paths(tmp_path: Path) -> None:
@@ -3550,7 +3671,7 @@ class TestRunNonCodeTaskPRPosting:
         # Track if post_review_to_pr was called
         pr_post_called = []
 
-        def mock_post_review_to_pr(review_task, impl_task, store, project_dir, required=False):
+        def mock_post_review_to_pr(review_task, impl_task, store, project_dir, required=False, **kwargs):
             pr_post_called.append({
                 'review_id': review_task.id,
                 'impl_id': impl_task.id,
@@ -4275,7 +4396,7 @@ class TestMaxStepsHandling:
         # Track if post_review_to_pr was called
         pr_post_called = []
 
-        def mock_post_review_to_pr(review_task, impl_task, store, project_dir, required=False):
+        def mock_post_review_to_pr(review_task, impl_task, store, project_dir, required=False, **kwargs):
             pr_post_called.append(True)
 
         # Mock provider

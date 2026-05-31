@@ -3,6 +3,7 @@
 import json
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 
 class GitHubError(Exception):
@@ -12,6 +13,11 @@ class GitHubError(Exception):
 
 class GitHubLookupError(GitHubError):
     """GitHub PR lookup failed for reasons other than explicit not-found."""
+    pass
+
+
+class GitHubRepoUnsupportedError(GitHubLookupError):
+    """gh cannot map the current repository to a known GitHub host."""
     pass
 
 
@@ -40,6 +46,40 @@ class GitHub:
         "no pull requests found",
         "pull request not found",
     )
+    _NON_GITHUB_REMOTE_MARKERS = (
+        "none of the git remotes configured for this repository point to a known github host",
+    )
+    _PR_SUPPORT_CACHE: dict[str, bool] = {}
+
+    @classmethod
+    def _cache_key(cls) -> str:
+        return str(Path.cwd().resolve())
+
+    @classmethod
+    def cached_pr_support(cls) -> bool | None:
+        """Return cached PR capability verdict for the current project, if any."""
+        return cls._PR_SUPPORT_CACHE.get(cls._cache_key())
+
+    @classmethod
+    def _mark_pr_supported(cls) -> None:
+        cls._PR_SUPPORT_CACHE[cls._cache_key()] = True
+
+    @classmethod
+    def _mark_pr_unsupported(cls) -> None:
+        cls._PR_SUPPORT_CACHE[cls._cache_key()] = False
+
+    @classmethod
+    def clear_pr_support_cache(cls) -> None:
+        """Reset cached PR capability verdicts. Used by tests."""
+        cls._PR_SUPPORT_CACHE.clear()
+
+    def _is_repo_unsupported(self, stderr: str) -> bool:
+        message = str(stderr).lower()
+        return any(marker in message for marker in self._NON_GITHUB_REMOTE_MARKERS)
+
+    def _raise_repo_unsupported(self, command: str, stderr: str) -> None:
+        self._mark_pr_unsupported()
+        raise GitHubRepoUnsupportedError(f"{command} failed: {stderr.strip()}")
 
     def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         """Run a gh command."""
@@ -49,6 +89,9 @@ class GitHub:
             text=True,
         )
         if check and result.returncode != 0:
+            command = f"gh {' '.join(args)}"
+            if self._is_repo_unsupported(result.stderr):
+                self._raise_repo_unsupported(command, result.stderr)
             raise GitHubError(f"gh {' '.join(args)} failed: {result.stderr}")
         return result
 
@@ -91,6 +134,7 @@ class GitHub:
             args.append("--draft")
 
         result = self._run(*args)
+        self._mark_pr_supported()
 
         # gh pr create outputs the PR URL
         url = result.stdout.strip()
@@ -114,8 +158,11 @@ class GitHub:
         """
         result = self._run("pr", "view", head, "--json", "url", check=False)
         if result.returncode == 0:
+            self._mark_pr_supported()
             data = json.loads(result.stdout)
             return data.get("url")
+        if self._is_repo_unsupported(result.stderr):
+            self._raise_repo_unsupported(f"gh pr view {head}", result.stderr)
         return None
 
     def get_pr_number(self, branch: str) -> int | None:
@@ -129,10 +176,13 @@ class GitHub:
         """
         result = self._run("pr", "view", branch, "--json", "number", "-q", ".number", check=False)
         if result.returncode == 0 and result.stdout.strip():
+            self._mark_pr_supported()
             try:
                 return int(result.stdout.strip())
             except ValueError:
                 return None
+        if result.returncode != 0 and self._is_repo_unsupported(result.stderr):
+            self._raise_repo_unsupported(f"gh pr view {branch}", result.stderr)
         return None
 
     def _is_pr_not_found(self, stderr: str) -> bool:
@@ -168,11 +218,14 @@ class GitHub:
         )
         command = f"gh pr view {pr_ref}"
         if result.returncode != 0:
+            if self._is_repo_unsupported(result.stderr):
+                self._raise_repo_unsupported(command, result.stderr)
             if self._is_pr_not_found(result.stderr):
                 return None
             raise GitHubLookupError(f"{command} failed: {result.stderr.strip()}")
         if not result.stdout.strip():
             raise GitHubLookupError(f"{command} returned empty output")
+        self._mark_pr_supported()
         return self._parse_pr_details(result.stdout, command=command)
 
     def discover_pr_by_branch(self, branch: str) -> PullRequestDetails | None:
@@ -192,6 +245,8 @@ class GitHub:
         )
         command = f"gh pr list --head {branch}"
         if result.returncode != 0:
+            if self._is_repo_unsupported(result.stderr):
+                self._raise_repo_unsupported(command, result.stderr)
             raise GitHubLookupError(f"{command} failed: {result.stderr.strip()}")
         if not result.stdout.strip():
             raise GitHubLookupError(f"{command} returned empty output")
@@ -206,6 +261,7 @@ class GitHub:
         item = data[0]
         if not isinstance(item, dict):
             raise GitHubLookupError(f"{command} returned malformed PR list")
+        self._mark_pr_supported()
         return self._parse_pr_details(json.dumps(item), command=command)
 
     def get_pr_url(self, pr_ref: str | int) -> str | None:
@@ -224,7 +280,19 @@ class GitHub:
             GitHubError: If comment fails
         """
         self._run("pr", "comment", str(pr_number), "--body", body)
+        self._mark_pr_supported()
 
     def close_pr(self, pr_number: int) -> None:
         """Close a pull request without deleting its branch."""
         self._run("pr", "close", str(pr_number))
+        self._mark_pr_supported()
+
+
+def is_github_repo_unsupported_error(error: Exception | str) -> bool:
+    """Return True when gh reported the current repo is not on a known GitHub host."""
+    if isinstance(error, GitHubRepoUnsupportedError):
+        return True
+    return any(
+        marker in str(error).lower()
+        for marker in GitHub._NON_GITHUB_REMOTE_MARKERS
+    )

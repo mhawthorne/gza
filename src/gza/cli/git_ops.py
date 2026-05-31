@@ -2067,6 +2067,7 @@ def cmd_pr(args: argparse.Namespace) -> int:
         task,
         store,
         git,
+        pr_integration=config.pr_integration,
         content_builder=lambda: _build_pr_content_for_cmd_pr(task, git, config, store, title_override=args.title),
         draft=args.draft,
         merged_behavior="error",
@@ -2084,6 +2085,12 @@ def cmd_pr(args: argparse.Namespace) -> int:
         print("Error: GitHub CLI (gh) is not installed or not authenticated")
         print("Install: https://cli.github.com/")
         print("Auth: gh auth login")
+        return 1
+    if result.status == "disabled":
+        print("Error: PR integration is disabled by project config (`pr_integration: false`)")
+        return 1
+    if result.status == "unsupported":
+        print("Error: Project has no GitHub-capable remote")
         return 1
     if result.status == "lookup_failed":
         print(f"Error looking up PR:\n{result.error}")
@@ -2154,6 +2161,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             cohorts,
             include_git=include_git,
             include_pr=include_pr,
+            pr_integration=config.pr_integration,
             dry_run=bool(getattr(args, "dry_run", False)),
             fetch_remote=not bool(getattr(args, "no_fetch", False)),
             progress=_progress,

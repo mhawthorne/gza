@@ -11,7 +11,7 @@ from .console import MAX_PR_BODY_LENGTH, MAX_PR_TITLE_LENGTH, truncate
 from .db import SqliteTaskStore, Task
 from .failure_reasons import mark_task_failed_from_cause
 from .git import Git, GitError
-from .github import GitHub, GitHubError
+from .github import GitHub, GitHubError, is_github_repo_unsupported_error
 from .prompts import PromptBuilder
 from .sync_ops import resolve_branch_pr
 
@@ -20,6 +20,8 @@ PrEnsureStatus = Literal[
     "existing",
     "created",
     "merged",
+    "disabled",
+    "unsupported",
     "gh_unavailable",
     "lookup_failed",
     "push_failed",
@@ -30,12 +32,22 @@ PrSyncStatus = Literal[
     "no_live_pr",
     "already_synced",
     "pushed",
+    "disabled",
+    "unsupported",
     "gh_unavailable",
     "lookup_failed",
     "push_failed",
 ]
-PrLookupStatus = Literal["cached", "existing", "missing", "gh_unavailable"]
+PrLookupStatus = Literal["cached", "existing", "missing", "disabled", "unsupported", "gh_unavailable"]
 PrContentBuilder = Callable[[], tuple[str, str]]
+
+
+def _cached_pr_support(gh: GitHub) -> bool | None:
+    """Read the optional per-project PR capability cache from a GitHub client."""
+    getter = getattr(gh, "cached_pr_support", None)
+    if callable(getter):
+        return getter()
+    return None
 
 
 @dataclass(frozen=True)
@@ -250,17 +262,28 @@ def lookup_task_pr(
     store: SqliteTaskStore | None = None,
     gh: GitHub | None = None,
     available: bool | None = None,
+    pr_integration: bool = True,
     refresh_cache: bool = False,
     include_number: bool = True,
 ) -> LookupTaskPrResult:
     """Resolve an existing open PR for a task without creating or pushing anything."""
+    if not pr_integration:
+        return LookupTaskPrResult(found=False, status="disabled")
+
     gh_client = gh or GitHub()
+    if _cached_pr_support(gh_client) is False:
+        return LookupTaskPrResult(found=False, status="unsupported")
     gh_available = gh_client.is_available() if available is None else available
     if not gh_available:
         return LookupTaskPrResult(found=False, status="gh_unavailable")
 
     if task.pr_number:
-        pr_url = gh_client.get_pr_url(task.pr_number)
+        try:
+            pr_url = gh_client.get_pr_url(task.pr_number)
+        except GitHubError as exc:
+            if is_github_repo_unsupported_error(exc):
+                return LookupTaskPrResult(found=False, status="unsupported")
+            raise
         if pr_url:
             return LookupTaskPrResult(
                 found=True,
@@ -275,11 +298,21 @@ def lookup_task_pr(
     if not task.branch:
         return LookupTaskPrResult(found=False, status="missing")
 
-    pr_url = gh_client.pr_exists(task.branch)
+    try:
+        pr_url = gh_client.pr_exists(task.branch)
+    except GitHubError as exc:
+        if is_github_repo_unsupported_error(exc):
+            return LookupTaskPrResult(found=False, status="unsupported")
+        raise
     if not pr_url:
         return LookupTaskPrResult(found=False, status="missing")
 
-    pr_number = gh_client.get_pr_number(task.branch) if include_number else None
+    try:
+        pr_number = gh_client.get_pr_number(task.branch) if include_number else None
+    except GitHubError as exc:
+        if is_github_repo_unsupported_error(exc):
+            return LookupTaskPrResult(found=False, status="unsupported")
+        raise
     if refresh_cache and store is not None and pr_number:
         task.pr_number = pr_number
         store.update(task)
@@ -290,12 +323,18 @@ def sync_task_branch_if_live_pr(
     task: Task,
     store: SqliteTaskStore,
     git: Git,
+    *,
+    pr_integration: bool = True,
 ) -> SyncTaskBranchResult:
     """Push a task branch only when it already has an open pull request."""
     if not task.branch:
         return SyncTaskBranchResult(ok=True, status="no_branch")
+    if not pr_integration:
+        return SyncTaskBranchResult(ok=True, status="disabled")
 
     gh = GitHub()
+    if _cached_pr_support(gh) is False:
+        return SyncTaskBranchResult(ok=True, status="unsupported")
     if not gh.is_available():
         return SyncTaskBranchResult(ok=False, status="gh_unavailable", error="GitHub CLI not available")
 
@@ -316,6 +355,8 @@ def sync_task_branch_if_live_pr(
             allow_discovery=True,
         )
     except GitHubError as e:
+        if is_github_repo_unsupported_error(e):
+            return SyncTaskBranchResult(ok=True, status="unsupported", error=str(e))
         return SyncTaskBranchResult(ok=False, status="lookup_failed", error=str(e))
 
     if resolved_pr.details is not None:
@@ -377,6 +418,7 @@ def ensure_task_pr(
     store: SqliteTaskStore,
     git: Git,
     *,
+    pr_integration: bool = True,
     title: str | None = None,
     body: str | None = None,
     content_builder: PrContentBuilder | None = None,
@@ -386,21 +428,18 @@ def ensure_task_pr(
     """Ensure a PR exists for a task branch using the shared decision tree."""
     if not task.branch:
         return EnsureTaskPrResult(ok=False, status="create_failed", error="Task has no branch")
+    if not pr_integration:
+        return EnsureTaskPrResult(ok=True, status="disabled", error="PR integration disabled by project config")
 
     gh = GitHub()
+    if _cached_pr_support(gh) is False:
+        return EnsureTaskPrResult(ok=True, status="unsupported", error="project has no GitHub-capable remote")
     if not gh.is_available():
         return EnsureTaskPrResult(ok=False, status="gh_unavailable")
 
     default_branch = git.default_branch()
     if merged_behavior == "error" and git.is_merged(task.branch, default_branch):
         return EnsureTaskPrResult(ok=False, status="merged", error=default_branch)
-
-    try:
-        if git.needs_push(task.branch):
-            print(f"Pushing branch '{task.branch}' to origin...")
-            git.push_branch(task.branch)
-    except GitError as e:
-        return EnsureTaskPrResult(ok=False, status="push_failed", error=str(e))
 
     pr_lookup_time = datetime.now(UTC)
     try:
@@ -411,6 +450,8 @@ def ensure_task_pr(
             allow_discovery=True,
         )
     except GitHubError as e:
+        if is_github_repo_unsupported_error(e):
+            return EnsureTaskPrResult(ok=True, status="unsupported", error="project has no GitHub-capable remote")
         return EnsureTaskPrResult(ok=False, status="lookup_failed", error=str(e))
     if resolved_pr.details is not None:
         task.pr_number = resolved_pr.details.number
@@ -418,6 +459,18 @@ def ensure_task_pr(
         task.pr_last_synced_at = pr_lookup_time
         store.update(task)
         if resolved_pr.details.state == "open":
+            try:
+                if git.needs_push(task.branch):
+                    print(f"Pushing branch '{task.branch}' to origin...")
+                    git.push_branch(task.branch)
+            except GitError as e:
+                return EnsureTaskPrResult(
+                    ok=False,
+                    status="push_failed",
+                    pr_url=resolved_pr.details.url,
+                    pr_number=resolved_pr.details.number,
+                    error=str(e),
+                )
             return EnsureTaskPrResult(
                 ok=True,
                 status="cached" if resolved_pr.source == "cached" else "existing",
@@ -434,6 +487,13 @@ def ensure_task_pr(
         if merged_behavior == "error":
             return EnsureTaskPrResult(ok=False, status="merged", error=default_branch)
         return EnsureTaskPrResult(ok=True, status="merged")
+
+    try:
+        if git.needs_push(task.branch):
+            print(f"Pushing branch '{task.branch}' to origin...")
+            git.push_branch(task.branch)
+    except GitError as e:
+        return EnsureTaskPrResult(ok=False, status="push_failed", error=str(e))
 
     if title is None or body is None:
         if content_builder is None:
@@ -453,6 +513,8 @@ def ensure_task_pr(
             draft=draft,
         )
     except GitHubError as e:
+        if is_github_repo_unsupported_error(e):
+            return EnsureTaskPrResult(ok=True, status="unsupported", error="project has no GitHub-capable remote")
         return EnsureTaskPrResult(ok=False, status="create_failed", error=str(e))
 
     if pr.number:

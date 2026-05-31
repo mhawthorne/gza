@@ -51,3 +51,15 @@ def test_advance_create_reviews_registry_description_matches_manual_refresh_sema
     advance_reviews_spec = next(spec for spec in CONFIG_KEY_REGISTRY if spec.key == "advance_create_reviews")
     assert "review gating still requires them" in advance_reviews_spec.description
     assert "manual attention" in advance_reviews_spec.description
+
+
+def test_config_load_parses_pr_integration_false(tmp_path) -> None:
+    """Explicit project opt-out should round-trip through Config.load."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "pr_integration: false\n"
+    )
+
+    config = Config.load(tmp_path)
+
+    assert config.pr_integration is False
