@@ -29,6 +29,26 @@ Database lookups happen on the host before the worktree is even created. The wor
 
 Current review context logic lives in `_build_context_from_chain()` and `_build_review_diff_context()` in `src/gza/runner.py`.
 
+## Diff base
+
+The review diffs against the branch's **local fork point**, and this is intentional.
+
+The diff range is `{default_branch}...{impl_branch}` (three-dot). By definition `git diff A...B` is
+`git diff $(git merge-base A B) B`, so the review base is the merge-base of the local default branch
+and the implementation branch — i.e. exactly what the branch changed since it forked. Trunk commits
+that landed *after* the fork are excluded, because they are at or before the merge-base.
+
+The bare `{default_branch}` name (e.g. `master`) resolves to the **local** `refs/heads/<default>`,
+not `origin/<default>` — gitrevisions resolves heads before remotes. The `get_diff*` helpers in
+`src/gza/git.py` pass the range straight to `git diff`, so no separate merge-base computation is
+needed; the three-dot operator already does it.
+
+**Review never reasons about origin or remote freshness.** Keeping local trunk current is a separate
+concern — the sync layer's job, at defined boundaries (see
+[`specs/distributed-sync-engine.md`](../../specs/distributed-sync-engine.md)) — not review's. By the
+time review runs, it simply diffs against whatever local trunk is. Do not add origin fallbacks, a
+local-vs-origin "pick latest" heuristic, or path/project filtering to the review base.
+
 ## What the worktree contains
 
 The worktree is a git checkout of the implementation branch. It contains:

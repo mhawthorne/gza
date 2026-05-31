@@ -84,6 +84,6 @@ All additive — `ADD COLUMN env_id TEXT NOT NULL DEFAULT ''`, then rebuild PKs 
 
 ## Out of Scope
 
-- The sync engine itself (cr-sqlite integration, schedule, transport).
+- The sync engine itself (cr-sqlite integration, schedule, transport) — see [Distributed Development — Sync Engine](distributed-sync-engine.md).
 - Conflict resolution for non-PK fields (e.g. two envs editing the same task's `prompt`).
 - Cross-env worktree / branch coordination beyond unique naming.
