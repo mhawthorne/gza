@@ -456,7 +456,7 @@ def test_run_task_backed_rebase_reconciles_parent_merge_status_when_rebased_bran
     setup_config(tmp_path)
     config_path = tmp_path / "gza.yaml"
     config_text = config_path.read_text()
-    config_path.write_text(config_text + "advance_requires_review: false\n")
+    config_path.write_text(config_text + "require_review_before_merge: false\n")
     config = Config.load(tmp_path)
     store = make_store(tmp_path)
 
@@ -935,7 +935,7 @@ def test_advance_explicit_merge_refuses_when_checkout_does_not_match_canonical_t
     setup_config(tmp_path)
     config_path = tmp_path / "gza.yaml"
     config_text = config_path.read_text()
-    config_path.write_text(config_text + "advance_requires_review: false\n")
+    config_path.write_text(config_text + "require_review_before_merge: false\n")
 
     store = make_store(tmp_path)
 

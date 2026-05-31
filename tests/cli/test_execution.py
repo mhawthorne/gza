@@ -6377,7 +6377,7 @@ class TestIterateCommand:
             project_dir=tmp_path,
             use_docker=False,
             project_prefix="testproject",
-            advance_requires_review=False,
+            require_review_before_merge=False,
             advance_create_reviews=True,
             max_review_cycles=3,
             max_resume_attempts=1,
@@ -7467,7 +7467,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
             iterate_max_iterations=1,
         )
@@ -7589,7 +7589,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
             workers_path=tmp_path / ".gza" / "workers",
         )
@@ -7900,7 +7900,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -7969,7 +7969,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -8034,7 +8034,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -8120,7 +8120,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         captured_spawn: dict[str, object] = {}
@@ -8248,7 +8248,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -8456,7 +8456,7 @@ class TestIterateCommand:
             project_dir=tmp_path,
             use_docker=False,
             project_prefix="testproject",
-            advance_requires_review=False,
+            require_review_before_merge=False,
             advance_create_reviews=True,
             max_review_cycles=3,
             max_resume_attempts=1,
@@ -8525,7 +8525,7 @@ class TestIterateCommand:
             project_dir=tmp_path,
             use_docker=False,
             project_prefix="testproject",
-            advance_requires_review=False,
+            require_review_before_merge=False,
             advance_create_reviews=True,
             max_review_cycles=3,
             max_resume_attempts=1,
@@ -8599,7 +8599,7 @@ class TestIterateCommand:
             project_dir=tmp_path,
             use_docker=False,
             project_prefix="testproject",
-            advance_requires_review=False,
+            require_review_before_merge=False,
             advance_create_reviews=True,
             max_review_cycles=3,
             max_resume_attempts=1,
@@ -8748,7 +8748,7 @@ class TestIterateCommand:
             project_dir=tmp_path,
             use_docker=False,
             project_prefix="testproject",
-            advance_requires_review=False,
+            require_review_before_merge=False,
             advance_create_reviews=True,
             max_review_cycles=3,
             max_resume_attempts=1,
@@ -8807,7 +8807,7 @@ class TestIterateCommand:
         mock_git.can_merge.return_value = True
         engine_config = _AdvanceEngineConfigAdapter(
             project_dir=tmp_path,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
             max_review_cycles=3,
             max_resume_attempts=1,
@@ -9455,7 +9455,7 @@ class TestIterateCommand:
         mock_git.can_merge.return_value = True
         engine_config = _AdvanceEngineConfigAdapter(
             project_dir=tmp_path,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
             max_review_cycles=3,
             max_resume_attempts=1,
@@ -9565,7 +9565,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_review_cycles=3,
             max_resume_attempts=0,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -9634,7 +9634,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_review_cycles=3,
             max_resume_attempts=1,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -9710,7 +9710,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_review_cycles=7,
             max_resume_attempts=1,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -9791,7 +9791,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_review_cycles=3,
             max_resume_attempts=1,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -9837,7 +9837,7 @@ class TestIterateCommand:
         config = Config.load(tmp_path)
         config.max_review_cycles = 3
         config.max_resume_attempts = 1
-        config.advance_requires_review = True
+        config.require_review_before_merge = True
         config.advance_create_reviews = True
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
@@ -9888,7 +9888,7 @@ class TestIterateCommand:
         impl = self._make_completed_impl(store)
         config = Config.load(tmp_path)
         config.max_resume_attempts = 1
-        config.advance_requires_review = True
+        config.require_review_before_merge = True
         config.advance_create_reviews = True
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
@@ -9944,7 +9944,7 @@ class TestIterateCommand:
 
         config = Config.load(tmp_path)
         config.max_resume_attempts = 1
-        config.advance_requires_review = True
+        config.require_review_before_merge = True
         config.advance_create_reviews = True
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
@@ -10014,7 +10014,7 @@ class TestIterateCommand:
 
         config = Config.load(tmp_path)
         config.max_resume_attempts = 1
-        config.advance_requires_review = True
+        config.require_review_before_merge = True
         config.advance_create_reviews = True
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
@@ -10093,7 +10093,7 @@ class TestIterateCommand:
 
         config = Config.load(tmp_path)
         config.max_resume_attempts = 1
-        config.advance_requires_review = True
+        config.require_review_before_merge = True
         config.advance_create_reviews = True
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
@@ -10179,7 +10179,7 @@ class TestIterateCommand:
         config = Config.load(tmp_path)
         config.max_resume_attempts = 1
         config.max_review_cycles = 3
-        config.advance_requires_review = True
+        config.require_review_before_merge = True
         config.advance_create_reviews = True
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
@@ -10252,7 +10252,7 @@ class TestIterateCommand:
         config = Config.load(tmp_path)
         config.max_resume_attempts = 0
         config.max_review_cycles = 3
-        config.advance_requires_review = True
+        config.require_review_before_merge = True
         config.advance_create_reviews = True
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
@@ -10342,7 +10342,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_review_cycles=3,
             max_resume_attempts=1,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -10468,7 +10468,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
             workers_path=tmp_path / ".gza" / "workers",
         )
@@ -10554,7 +10554,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
             workers_path=tmp_path / ".gza" / "workers",
         )
@@ -10651,7 +10651,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -10737,7 +10737,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
 
@@ -10808,7 +10808,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -10906,7 +10906,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
 
@@ -11031,7 +11031,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -11139,7 +11139,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -11233,7 +11233,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -11314,7 +11314,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -11380,7 +11380,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -11518,7 +11518,7 @@ class TestIterateCommand:
         mock_git.can_merge.return_value = True
         engine_config = _AdvanceEngineConfigAdapter(
             project_dir=tmp_path,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
             max_review_cycles=3,
             max_resume_attempts=1,
@@ -11797,7 +11797,7 @@ class TestIterateCommand:
         mock_git.can_merge.return_value = True
         engine_config = _AdvanceEngineConfigAdapter(
             project_dir=tmp_path,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
             max_review_cycles=3,
             max_resume_attempts=1,
@@ -11954,7 +11954,7 @@ class TestIterateCommand:
             max_resume_attempts=3,
             max_review_cycles=3,
             max_noop_improve_cycles=2,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -12682,7 +12682,7 @@ class TestIterateCommand:
             project_prefix="testproject",
             max_resume_attempts=1,
             max_review_cycles=3,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
         )
         mock_git = MagicMock()
@@ -12795,7 +12795,7 @@ class TestIterateCommand:
         mock_git.can_merge.return_value = False
         engine_config = _AdvanceEngineConfigAdapter(
             project_dir=tmp_path,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
             max_review_cycles=3,
             max_resume_attempts=1,
@@ -14371,7 +14371,7 @@ class TestForegroundInvocationContextWiring:
             use_docker=False,
             project_prefix="testproject",
             iterate_max_iterations=3,
-            advance_requires_review=False,
+            require_review_before_merge=False,
             advance_create_reviews=True,
             max_review_cycles=3,
             max_resume_attempts=1,

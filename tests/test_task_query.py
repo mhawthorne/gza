@@ -96,7 +96,7 @@ def test_incomplete_preset_projects_real_next_action_when_context_available(tmp_
         TaskQueryPresets.incomplete(limit=None),
         config=SimpleNamespace(
             max_resume_attempts=1,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
             max_review_cycles=3,
         ),
@@ -123,7 +123,7 @@ def test_incomplete_preset_projects_held_plan_as_awaiting_human_when_context_ava
         TaskQueryPresets.incomplete(limit=None),
         config=SimpleNamespace(
             max_resume_attempts=1,
-            advance_requires_review=True,
+            require_review_before_merge=True,
             advance_create_reviews=True,
             max_review_cycles=3,
         ),
@@ -143,7 +143,7 @@ def test_incomplete_preset_falls_back_to_owner_for_unknown_subject_task_id(tmp_p
     store = _store(tmp_path)
     config = SimpleNamespace(
         max_resume_attempts=1,
-        advance_requires_review=True,
+        require_review_before_merge=True,
         advance_create_reviews=True,
         max_review_cycles=3,
     )
@@ -205,7 +205,7 @@ def test_incomplete_preset_warns_and_falls_back_to_owner_for_missing_subject_tas
     store = _store(tmp_path)
     config = SimpleNamespace(
         max_resume_attempts=1,
-        advance_requires_review=True,
+        require_review_before_merge=True,
         advance_create_reviews=True,
         max_review_cycles=3,
     )

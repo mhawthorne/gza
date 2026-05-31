@@ -2431,7 +2431,7 @@ class _AdvanceEngineConfigAdapter:
     """Minimal config surface required by determine_next_action()."""
 
     project_dir: Any
-    advance_requires_review: bool
+    require_review_before_merge: bool
     advance_create_reviews: bool
     max_review_cycles: int
     max_resume_attempts: int
@@ -2651,7 +2651,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
 
     engine_config = _AdvanceEngineConfigAdapter(
         project_dir=config.project_dir,
-        advance_requires_review=bool(getattr(config, "advance_requires_review", True)),
+        require_review_before_merge=bool(getattr(config, "require_review_before_merge", True)),
         advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
         max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 2),
@@ -3497,7 +3497,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     )
     engine_config = _AdvanceEngineConfigAdapter(
         project_dir=config.project_dir,
-        advance_requires_review=bool(getattr(config, "advance_requires_review", True)),
+        require_review_before_merge=bool(getattr(config, "require_review_before_merge", True)),
         advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
         max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 2),
@@ -3668,7 +3668,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     )
     engine_config = _AdvanceEngineConfigAdapter(
         project_dir=config.project_dir,
-        advance_requires_review=bool(getattr(config, "advance_requires_review", True)),
+        require_review_before_merge=bool(getattr(config, "require_review_before_merge", True)),
         advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
         max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 2),

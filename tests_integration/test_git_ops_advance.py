@@ -2003,9 +2003,9 @@ class TestAdvanceCommand:
 
     def test_advance_batch_merge_does_not_count_toward_limit(self, tmp_path: Path):
         """advance --batch B: merge actions don't count toward the worker limit."""
-        # Use advance_requires_review=false so unreviewed tasks merge directly
+        # Use require_review_before_merge=false so unreviewed tasks merge directly
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\ndb_path: .gza/gza.db\nadvance_requires_review: false\n"
+            "project_name: test-project\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
 
@@ -2423,13 +2423,13 @@ class TestAdvanceCommand:
             f"Expected all merges before first spawn, got call order: {call_log}"
         )
 
-    def test_advance_requires_review_true_create_true_creates_review_for_unreviewed(self, tmp_path: Path):
-        """advance creates a review when advance_requires_review=True, advance_create_reviews=True."""
+    def test_require_review_before_merge_true_create_true_creates_review_for_unreviewed(self, tmp_path: Path):
+        """advance creates a review when require_review_before_merge=True, advance_create_reviews=True."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test-project\ndb_path: .gza/gza.db\n"
             "advance_create_reviews: true\n"
-            "advance_requires_review: true\n"
+            "require_review_before_merge: true\n"
         )
         store = make_store(tmp_path)
 
@@ -2455,13 +2455,13 @@ class TestAdvanceCommand:
         assert reviews[0].task_type == 'review'
         assert store.get(task.id).merge_status != "merged"
 
-    def test_advance_requires_review_true_create_false_skips_unreviewed(self, tmp_path: Path):
+    def test_require_review_before_merge_true_create_false_skips_unreviewed(self, tmp_path: Path):
         """advance skips unreviewed implement tasks when advance_create_reviews=False."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test-project\ndb_path: .gza/gza.db\n"
             "advance_create_reviews: false\n"
-            "advance_requires_review: true\n"
+            "require_review_before_merge: true\n"
         )
         store = make_store(tmp_path)
 
@@ -2472,12 +2472,12 @@ class TestAdvanceCommand:
         action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'skip'
 
-    def test_advance_requires_review_false_merges_unreviewed(self, tmp_path: Path):
-        """advance merges unreviewed implement tasks when advance_requires_review=False."""
+    def test_require_review_before_merge_false_merges_unreviewed(self, tmp_path: Path):
+        """advance merges unreviewed implement tasks when require_review_before_merge=False."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test-project\ndb_path: .gza/gza.db\n"
-            "advance_requires_review: false\n"
+            "require_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
 
@@ -2503,12 +2503,12 @@ class TestAdvanceCommand:
         assert store.get_reviews_for_task(task.id) == []
 
     def test_advance_review_cleared_always_merges_regardless_of_config(self, tmp_path: Path):
-        """advance merges when review is cleared by improve, even with advance_requires_review=True."""
+        """advance merges when review is cleared by improve, even with require_review_before_merge=True."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test-project\ndb_path: .gza/gza.db\n"
             "advance_create_reviews: true\n"
-            "advance_requires_review: true\n"
+            "require_review_before_merge: true\n"
         )
         store = make_store(tmp_path)
 
@@ -2546,7 +2546,45 @@ class TestAdvanceCommand:
         assert rc == 0
         assert store.get(task.id).merge_status == "merged"
 
-    # Planned test #5 (advance_requires_review=True, APPROVED review → merge) is covered by
+    def test_advance_dry_run_refreshes_stale_approved_review_instead_of_merging(self, tmp_path: Path):
+        """advance --dry-run should plan a fresh review after a code-changing rebase invalidates approval."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path)
+
+        review_task = store.add(
+            f"Review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+        )
+        review_task.status = "completed"
+        review_task.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        review_task.output_content = "**Verdict: APPROVED**"
+        store.update(review_task)
+
+        rebase_task = store.add(
+            f"Rebase {task.id}",
+            task_type="rebase",
+            based_on=task.id,
+            same_branch=True,
+        )
+        rebase_task.status = "completed"
+        rebase_task.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+        rebase_task.branch = task.branch
+        rebase_task.has_commits = True
+        rebase_task.changed_diff = True
+        store.update(rebase_task)
+
+        result = run_gza("advance", "--dry-run", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"Create review (rebase {rebase_task.id} changed diff)" in result.stdout
+        assert str(task.id) in result.stdout
+        assert "Merge (review APPROVED" not in result.stdout
+
+    # Planned test #5 (require_review_before_merge=True, APPROVED review → merge) is covered by
     # the pre-existing test_advance_merges_approved_task, which verifies this happy path.
 
     def test_advance_default_config_creates_review_for_unreviewed(self, tmp_path: Path):
@@ -2559,9 +2597,9 @@ class TestAdvanceCommand:
         task = self._create_implement_task_with_branch(store, git, tmp_path)
 
         config = Config.load(tmp_path)
-        # Defaults: advance_create_reviews=True, advance_requires_review=True
+        # Defaults: advance_create_reviews=True, require_review_before_merge=True
         assert config.advance_create_reviews is True
-        assert config.advance_requires_review is True
+        assert config.require_review_before_merge is True
 
         action = evaluate_advance_rules(config, store, git, task, "main")
         assert action['type'] == 'create_review'
@@ -3579,7 +3617,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
             "db_path: .gza/gza.db\n"
-            "advance_requires_review: false\n"
+            "require_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
         failed_task = self._create_failed_task(store, session_id="sess-abc", failure_reason="MAX_STEPS")
@@ -3709,7 +3747,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
             "db_path: .gza/gza.db\n"
-            "advance_requires_review: false\n"
+            "require_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
 
@@ -3752,7 +3790,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
             "db_path: .gza/gza.db\n"
-            "advance_requires_review: false\n"
+            "require_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
 
@@ -3786,7 +3824,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
             "db_path: .gza/gza.db\n"
-            "advance_requires_review: false\n"
+            "require_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
 
@@ -3816,7 +3854,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
             "db_path: .gza/gza.db\n"
-            "advance_requires_review: false\n"
+            "require_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
 
@@ -3849,7 +3887,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
             "db_path: .gza/gza.db\n"
-            "advance_requires_review: false\n"
+            "require_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
 
@@ -3896,7 +3934,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
             "db_path: .gza/gza.db\n"
-            "advance_requires_review: false\n"
+            "require_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
 
@@ -3942,7 +3980,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
             "db_path: .gza/gza.db\n"
-            "advance_requires_review: false\n"
+            "require_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
 
@@ -3990,7 +4028,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
             "db_path: .gza/gza.db\n"
-            "advance_requires_review: false\n"
+            "require_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
 
@@ -4023,7 +4061,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
             "db_path: .gza/gza.db\n"
-            "advance_requires_review: false\n"
+            "require_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
 
@@ -4071,7 +4109,7 @@ class TestAdvanceCommand:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
             "db_path: .gza/gza.db\n"
-            "advance_requires_review: false\n"
+            "require_review_before_merge: false\n"
         )
         store = make_store(tmp_path)
 

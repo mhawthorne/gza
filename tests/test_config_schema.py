@@ -44,3 +44,10 @@ def test_docker_setup_command_registry_description_mentions_prewarm_execution() 
     assert "Pre-warm" in docker_setup_spec.description
     assert "synchronously" in docker_setup_spec.description
     assert "before provider CLI starts" in docker_setup_spec.description
+
+
+def test_advance_create_reviews_registry_description_matches_manual_refresh_semantics() -> None:
+    """Config metadata should explain that review creation follows review-gating rules."""
+    advance_reviews_spec = next(spec for spec in CONFIG_KEY_REGISTRY if spec.key == "advance_create_reviews")
+    assert "review gating still requires them" in advance_reviews_spec.description
+    assert "manual attention" in advance_reviews_spec.description

@@ -1528,6 +1528,85 @@ def _resolve_impl_ancestor_by_based_on(store: SqliteTaskStore, task: DbTask) -> 
     return None
 
 
+def _is_implementation_owned_lineage(ctx: AdvanceContext) -> bool:
+    """Whether this lineage inherits merge review gating from an implementation root."""
+    return (ctx.review_root_task or ctx.task).task_type == "implement"
+
+
+def has_valid_review_for_merge(ctx: AdvanceContext) -> bool:
+    """Return whether current review evidence is fresh enough to allow auto-merge."""
+    if not _is_implementation_owned_lineage(ctx):
+        return True
+    if not ctx.requires_review:
+        return True
+    if ctx.rebase_invalidates_review:
+        return False
+    if ctx.closing_review_action is not None:
+        return False
+    if ctx.latest_completed_review is None:
+        return False
+    if ctx.review_cleared:
+        return True
+    return ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
+
+
+def _closing_review_requires_automation(ctx: AdvanceContext) -> bool:
+    """Whether a closing-review action should preempt later merge fallback rules."""
+    if ctx.closing_review_action is None:
+        return False
+    if not _is_implementation_owned_lineage(ctx):
+        return False
+    if not ctx.requires_review:
+        return False
+    return True
+
+
+def _stale_rebase_review_refresh_required(ctx: AdvanceContext) -> bool:
+    """Whether a stale post-rebase review must still be refreshed before merge."""
+    if not ctx.rebase_invalidates_review:
+        return False
+    if not _is_implementation_owned_lineage(ctx):
+        return False
+    if not ctx.requires_review:
+        return False
+    return True
+
+
+def _active_review_requires_automation(ctx: AdvanceContext) -> bool:
+    """Whether an active review should still block merge automation."""
+    if ctx.review_cleared or ctx.active_review is None:
+        return False
+    if ctx.rebase_invalidates_review and _is_implementation_owned_lineage(ctx) and not ctx.requires_review:
+        return False
+    return True
+
+
+def _closing_review_invariant_action(ctx: AdvanceContext) -> dict[str, Any]:
+    """Return the enforced closing-review action, failing closed when auto-review is disabled."""
+    assert ctx.closing_review_action is not None
+
+    if ctx.closing_review_action.get("type") == "create_review" and not ctx.create_reviews:
+        review_root_task = getattr(ctx, "review_root_task", None)
+        subject_task_id = (
+            review_root_task.id
+            if review_root_task is not None and review_root_task.id is not None
+            else ctx.task.id
+        )
+        return with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": (
+                    "SKIP: closing review required before merge and advance_create_reviews=false "
+                    "(run gza review manually)"
+                ),
+            },
+            reason="closing-review-needs-manual-refresh",
+            subject_task_id=subject_task_id,
+        )
+
+    return _default_subject_for_attention_action(ctx, ctx.closing_review_action)
+
+
 def _resolve_review_root_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
     """Resolve the implementation task whose review state gates this branch lineage."""
     candidate = task
@@ -1634,7 +1713,7 @@ def resolve_advance_context(
             task=task,
             task_type=task.task_type,
             has_branch=bool(task.branch),
-            requires_review=config.advance_requires_review,
+            requires_review=config.require_review_before_merge,
             create_reviews=config.advance_create_reviews,
             max_review_cycles=config.max_review_cycles,
             max_noop_improve_cycles=effective_max_noop_improves,
@@ -1658,7 +1737,7 @@ def resolve_advance_context(
             task=task,
             task_type=task.task_type,
             has_branch=False,
-            requires_review=config.advance_requires_review,
+            requires_review=config.require_review_before_merge,
             create_reviews=config.advance_create_reviews,
             max_review_cycles=config.max_review_cycles,
             max_noop_improve_cycles=effective_max_noop_improves,
@@ -1794,7 +1873,7 @@ def resolve_advance_context(
         task=task,
         task_type=task.task_type,
         has_branch=True,
-        requires_review=config.advance_requires_review,
+        requires_review=config.require_review_before_merge,
         create_reviews=config.advance_create_reviews,
         max_review_cycles=config.max_review_cycles,
         max_noop_improve_cycles=effective_max_noop_improves,
@@ -2031,7 +2110,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="post_rebase_run_pending_review",
-        matches=lambda ctx: ctx.rebase_invalidates_review and ctx.active_review is not None and ctx.active_review.status == "pending",
+        matches=lambda ctx: (
+            _stale_rebase_review_refresh_required(ctx)
+            and ctx.create_reviews
+            and ctx.active_review is not None
+            and ctx.active_review.status == "pending"
+        ),
         action=lambda ctx: {
             "type": "run_review",
             "description": _rebase_pending_review_description(ctx.active_review, ctx.review_invalidated_by_rebase),
@@ -2040,7 +2124,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="post_rebase_wait_review",
-        matches=lambda ctx: ctx.rebase_invalidates_review and ctx.active_review is not None and ctx.active_review.status == "in_progress",
+        matches=lambda ctx: (
+            _stale_rebase_review_refresh_required(ctx)
+            and ctx.create_reviews
+            and ctx.active_review is not None
+            and ctx.active_review.status == "in_progress"
+        ),
         action=lambda ctx: {
             "type": "wait_review",
             "description": _rebase_wait_review_description(ctx.active_review, ctx.review_invalidated_by_rebase),
@@ -2049,8 +2138,27 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="post_rebase_create_review",
-        matches=lambda ctx: ctx.rebase_invalidates_review,
-        action=lambda ctx: {"type": "create_review", "description": _rebase_create_review_description(ctx.review_invalidated_by_rebase)},
+        matches=lambda ctx: _stale_rebase_review_refresh_required(ctx) and ctx.create_reviews,
+        action=lambda ctx: {
+            "type": "create_review",
+            "description": _rebase_create_review_description(ctx.review_invalidated_by_rebase),
+        },
+    ),
+    AdvanceRule(
+        name="stale_review_needs_manual_refresh",
+        matches=lambda ctx: _stale_rebase_review_refresh_required(ctx) and not ctx.create_reviews,
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": "SKIP: review must be refreshed before merge",
+            },
+            reason="stale-review-needs-manual-refresh",
+            subject_task_id=(
+                ctx.task.id
+                if getattr(ctx, "review_root_task", None) is None
+                else getattr(ctx.review_root_task, "id", ctx.task.id)
+            ),
+        ),
     ),
     AdvanceRule(
         name="failed_rebase_without_successful_review",
@@ -2078,12 +2186,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="closing_review_invariant",
-        matches=lambda ctx: ctx.closing_review_action is not None,
-        action=lambda ctx: _default_subject_for_attention_action(ctx, ctx.closing_review_action or {}),
+        matches=_closing_review_requires_automation,
+        action=_closing_review_invariant_action,
     ),
     AdvanceRule(
         name="review_pending",
-        matches=lambda ctx: (not ctx.review_cleared)
+        matches=lambda ctx: _active_review_requires_automation(ctx)
         and ctx.active_review is not None
         and ctx.active_review.status == "pending",
         action=lambda ctx: {
@@ -2094,7 +2202,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_in_progress",
-        matches=lambda ctx: (not ctx.review_cleared)
+        matches=lambda ctx: _active_review_requires_automation(ctx)
         and ctx.active_review is not None
         and ctx.active_review.status == "in_progress",
         action=lambda ctx: {
@@ -2160,7 +2268,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_approved_with_followups",
-        matches=lambda ctx: (not ctx.review_cleared)
+        matches=lambda ctx: has_valid_review_for_merge(ctx)
+        and (not ctx.review_cleared)
         and ctx.latest_completed_review is not None
         and ctx.review_verdict == "APPROVED_WITH_FOLLOWUPS"
         and bool(ctx.followup_findings),
@@ -2173,7 +2282,10 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_approved",
-        matches=lambda ctx: (not ctx.review_cleared) and ctx.latest_completed_review is not None and ctx.review_verdict == "APPROVED",
+        matches=lambda ctx: has_valid_review_for_merge(ctx)
+        and (not ctx.review_cleared)
+        and ctx.latest_completed_review is not None
+        and ctx.review_verdict == "APPROVED",
         action=lambda ctx: {
             "type": "merge",
             "description": _merge_review_description("APPROVED", ctx.review_preserved_by_rebase),
@@ -2278,12 +2390,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="reviews_all_cleared",
-        matches=lambda ctx: ctx.review_cleared and ctx.latest_completed_review is not None,
+        matches=lambda ctx: has_valid_review_for_merge(ctx) and ctx.review_cleared and ctx.latest_completed_review is not None,
         action=lambda ctx: {"type": "merge", "description": "Merge (previous review addressed)"},
     ),
     AdvanceRule(
         name="non_implement_no_review",
-        matches=lambda ctx: ctx.task_type != "implement",
+        matches=lambda ctx: not _is_implementation_owned_lineage(ctx),
         action=lambda ctx: {"type": "merge", "description": "Merge task (no review yet)"},
     ),
     AdvanceRule(
@@ -2301,7 +2413,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="implement_no_review_required",
-        matches=lambda ctx: True,
+        matches=lambda ctx: not ctx.requires_review,
         action=lambda ctx: {"type": "merge", "description": "Merge task (no review yet)"},
     ),
 ]
