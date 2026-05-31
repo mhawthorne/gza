@@ -80,6 +80,15 @@ For each task, `evaluate_advance_rules()` returns an action from `src/gza/advanc
 | Completed task has no branch | `skip` — completed `<type>` task has no branch; no mergeable commits found |
 | Non-completed task has no branch | `skip` — `<status>` `<type>` task has no branch; no merge action available |
 
+### Strict project scope
+
+Before advance queues rebase, review, improve, or merge work for a code-changing branch, it checks the branch diff against the task's strict project scope. This uses the existing project-boundary machinery, but for this verdict only the configured project subdirectory is writable: declared in-repo dependency paths are treated as out of scope unless the task is explicitly tagged `cross-project`.
+
+| Condition | Action |
+|-----------|--------|
+| Branch diff includes any path outside the strict project scope AND task is not tagged `cross-project` | `needs_discussion` — park for human review immediately, list the offending paths, and tell the operator to tag `cross-project` and re-advance if intended or fix the branch |
+| Branch diff cannot be inspected reliably for the strict-scope check | `needs_discussion` — fail closed, say that strict project scope could not be verified, and stop all automation until the operator fixes the ref/diff problem or tags `cross-project` if the wider scope is intended |
+
 ### 4. Merge conflicts
 
 Conflict detection uses the same target-branch resolution as task collection:

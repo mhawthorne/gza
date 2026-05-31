@@ -169,6 +169,10 @@ class ProjectBoundary:
     @property
     def project_rooted_paths(self) -> frozenset[Path]:
         return frozenset({self.scope_root, *self.in_repo_dependency_paths})
+
+    @property
+    def strict_project_rooted_paths(self) -> frozenset[Path]:
+        return frozenset({self.scope_root})
 def _git_error_failure() -> ResolvedRunFailure:
     return ResolvedRunFailure(
         reason="GIT_ERROR",
@@ -414,9 +418,19 @@ def _path_is_under_any_scope(path: Path, allowed_roots: frozenset[Path]) -> bool
     return False
 
 
-def _find_out_of_scope_paths(config: Config, files_to_stage: set[str]) -> list[str]:
+def _find_out_of_scope_paths(
+    config: Config,
+    files_to_stage: set[str],
+    *,
+    strict_scope: bool = False,
+) -> list[str]:
     """Return sorted repo-relative paths that violate the current project scope."""
-    allowed_roots = _project_boundary(config).project_rooted_paths
+    boundary = _project_boundary(config)
+    allowed_roots = (
+        boundary.strict_project_rooted_paths
+        if strict_scope
+        else boundary.project_rooted_paths
+    )
     violations: list[str] = []
     for path_str in sorted(files_to_stage):
         path = Path(path_str)

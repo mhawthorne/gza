@@ -22,6 +22,7 @@ from gza.advance_engine import (
 )
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task as DbTask
+from gza.git import GitError
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
@@ -42,6 +43,8 @@ class _FakeGit:
         legacy_merge_source_ref: str | None = None,
         behind_count: int | None = None,
         behind_count_error: Exception | None = None,
+        name_status_by_range: dict[str, str] | None = None,
+        name_status_error_by_range: dict[str, Exception] | None = None,
     ):
         self._can_merge = can_merge
         self._can_merge_by_ref = can_merge_by_ref or {}
@@ -54,9 +57,12 @@ class _FakeGit:
         self._legacy_merge_source_ref = legacy_merge_source_ref
         self._behind_count = behind_count
         self._behind_count_error = behind_count_error
+        self._name_status_by_range = name_status_by_range or {}
+        self._name_status_error_by_range = name_status_error_by_range or {}
         self.rev_parse_calls: list[str] = []
         self.is_ancestor_calls: list[tuple[str, str]] = []
         self.behind_calls: list[tuple[str, str]] = []
+        self.name_status_calls: list[str] = []
 
     def can_merge(self, source_branch: str, target_branch: str) -> bool:
         return self._can_merge_by_ref.get((source_branch, target_branch), self._can_merge)
@@ -107,6 +113,19 @@ class _FakeGit:
             raise self._behind_count_error
         return self._behind_count
 
+    def get_diff_name_status(
+        self,
+        revision_range: str,
+        paths: tuple[str, ...] | list[str] = (),
+        *,
+        check: bool = False,
+    ) -> str:
+        self.name_status_calls.append(revision_range)
+        error = self._name_status_error_by_range.get(revision_range)
+        if error is not None:
+            raise error
+        return self._name_status_by_range.get(revision_range, "")
+
 
 def _make_store(tmp_path: Path) -> SqliteTaskStore:
     (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
@@ -114,6 +133,52 @@ def _make_store(tmp_path: Path) -> SqliteTaskStore:
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return SqliteTaskStore(db_path, prefix=config.project_prefix)
+
+
+def _set_subdir_project_boundary(config: Config, tmp_path: Path) -> None:
+    from gza.runner import ProjectBoundary
+
+    repo_root = tmp_path
+    project_dir = tmp_path / "services" / "foo"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    config.project_dir = project_dir
+    config.enforce_project_scope = True
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        ),
+    )
+
+
+def _set_subdir_project_boundary_with_dependency(config: Config, tmp_path: Path) -> None:
+    from gza.runner import LocalDependency, ProjectBoundary
+
+    repo_root = tmp_path
+    project_dir = tmp_path / "services" / "foo"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    dependency_path = tmp_path / "dre"
+    dependency_path.mkdir(parents=True, exist_ok=True)
+    config.project_dir = project_dir
+    config.enforce_project_scope = True
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("services/foo"),
+            local_dependencies=(
+                LocalDependency(
+                    source_path=Path("../../dre"),
+                    resolved_path=dependency_path.resolve(),
+                    repo_relative_path=Path("dre"),
+                ),
+            ),
+        ),
+    )
 
 
 def _make_completed_impl_with_failed_rebase(
@@ -1246,6 +1311,167 @@ def test_completed_improve_without_review_clear_creates_closing_review(
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
     assert action["type"] == "create_review", action
     assert action["description"] == "Create closing review (code changed since the last review)"
+
+
+def test_out_of_scope_sibling_project_change_parks_for_human(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/scope-sibling",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={
+            "main...feat/scope-sibling": "M\tservices/foo/app.py\nM\tdre/web/src/app.tsx\n",
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "project-scope-violation"
+    assert action["subject_task_id"] == impl.id
+    assert action["failure_reason"] == "PROJECT_SCOPE_VIOLATION"
+    assert action["out_of_scope_paths"] == ("dre/web/src/app.tsx",)
+    assert "Tag `cross-project` and re-advance if intended, or fix the branch." in action["description"]
+
+
+def test_out_of_scope_declared_dependency_change_parks_for_human(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary_with_dependency(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/scope-dependency",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={
+            "main...feat/scope-dependency": "M\tservices/foo/app.py\nM\tdre/lib/util.py\n",
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "project-scope-violation"
+    assert action["out_of_scope_paths"] == ("dre/lib/util.py",)
+
+
+def test_in_project_only_change_advances_normally_under_strict_scope(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/in-scope-only",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={
+            "main...feat/in-scope-only": "M\tservices/foo/app.py\nA\tservices/foo/src/feature.py\n",
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_review"
+    assert "review" in action["description"].lower()
+
+
+def test_cross_project_tag_allows_out_of_scope_change_to_advance(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/cross-project-scope",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    impl.tags = ("cross-project",)
+    store.update(impl)
+
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={
+            "main...feat/cross-project-scope": "M\tservices/foo/app.py\nM\tdre/web/src/app.tsx\n",
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_review"
+    assert action.get("needs_attention_reason") is None
+
+
+def test_strict_scope_diff_exception_parks_for_human(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/scope-inspection-exception",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+
+    class _RaisingGit(_FakeGit):
+        def get_diff_name_status(
+            self,
+            revision_range: str,
+            paths: tuple[str, ...] | list[str] = (),
+            *,
+            check: bool = False,
+        ) -> str:
+            self.name_status_calls.append(revision_range)
+            raise RuntimeError("diff probe blew up")
+
+    action = evaluate_advance_rules(config, store, _RaisingGit(can_merge=True), impl, "main")
+
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "project-scope-unverified"
+    assert action["subject_task_id"] == impl.id
+    assert action["type"] not in {"create_review", "improve", "needs_rebase", "merge", "merge_with_followups"}
+    assert "strict project scope could not be verified" in action["description"]
+    assert "diff probe blew up" in action["description"]
+
+
+def test_strict_scope_uninspectable_git_diff_parks_for_human(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/scope-uninspectable-diff",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        name_status_error_by_range={
+            "main...feat/scope-uninspectable-diff": GitError("git diff --name-status main...feat/scope-uninspectable-diff failed:\nfatal: bad revision"),
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "project-scope-unverified"
+    assert action["subject_task_id"] == impl.id
+    assert action["type"] not in {"create_review", "improve", "needs_rebase", "merge", "merge_with_followups"}
+    assert "strict project scope could not be verified" in action["description"]
+    assert "fatal: bad revision" in action["description"]
 
 
 def test_one_noop_improve_permits_another_improve_with_warning_description(tmp_path: Path, monkeypatch) -> None:
@@ -3540,6 +3766,7 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         has_non_dropped_implement_descendant=False,
         auto_implement_enabled=False,
         merge_source_warning="feature branch diverged",
+        strict_scope_inspection_error="fatal: bad revision",
         post_merge_rebase_state=SimpleNamespace(
             already_merged=False,
             rebase_target_missing_merge_unit=False,
@@ -3612,6 +3839,8 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         "awaiting_human_plan_review",
         "explore_needs_followup_decision",
         "merge_source_needs_manual_resolution",
+        "strict_project_scope_unverified",
+        "strict_project_scope_violation",
         "conflict_rebase_failure_circuit_breaker",
         "conflict_rebase_failed",
         "conflict_rebase_completed_but_still_blocked",

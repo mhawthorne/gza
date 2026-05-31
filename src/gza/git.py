@@ -703,13 +703,22 @@ class Git:
             args.append(old_oid)
         self._run(*args)
 
-    def get_diff_name_status(self, revision_range: str, paths: tuple[str, ...] | list[str] = ()) -> str:
+    def get_diff_name_status(
+        self,
+        revision_range: str,
+        paths: tuple[str, ...] | list[str] = (),
+        *,
+        check: bool = False,
+    ) -> str:
         """Get machine-readable name/status output for a revision range and optional paths."""
         args = ["diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", revision_range]
         if paths:
             args.append("--")
             args.extend(paths)
         result = self._run(*args, check=False)
+        if check and result.returncode != 0:
+            error_output = result.stderr or result.stdout
+            raise GitError(f"git diff --name-status {revision_range} failed:\n{error_output}")
         return result.stdout.strip()
 
     def get_commit_name_status(self, commit_ref: str, paths: tuple[str, ...] | list[str] = ()) -> str:

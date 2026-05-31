@@ -107,6 +107,35 @@ def test_find_out_of_scope_paths_allows_scope_root_and_in_repo_deps(tmp_path: Pa
     assert violations == ["services/bar/other.py"]
 
 
+def test_find_out_of_scope_paths_strict_scope_blocks_in_repo_deps(tmp_path: Path) -> None:
+    project_dir = tmp_path / "repo" / "services" / "foo"
+    project_dir.mkdir(parents=True)
+    config = Config(project_dir=project_dir, project_name="foo")
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=tmp_path / "repo",
+            scope_root=Path("services/foo"),
+            local_dependencies=(
+                LocalDependency(
+                    source_path=Path("../../libs/shared"),
+                    resolved_path=(tmp_path / "repo" / "libs" / "shared").resolve(),
+                    repo_relative_path=Path("libs/shared"),
+                ),
+            ),
+        ),
+    )
+
+    violations = _find_out_of_scope_paths(
+        config,
+        {"services/foo/app.py", "libs/shared/util.py"},
+        strict_scope=True,
+    )
+
+    assert violations == ["libs/shared/util.py"]
+
+
 def test_find_out_of_scope_paths_is_noop_for_root_scope(tmp_path: Path) -> None:
     config = Config(project_dir=tmp_path, project_name="repo")
     setattr(

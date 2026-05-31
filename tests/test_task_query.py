@@ -152,6 +152,7 @@ def test_incomplete_preset_falls_back_to_owner_for_unknown_subject_task_id(tmp_p
         is_merged=lambda source, target: False,
         resolve_fresh_merge_source=lambda branch: (f"origin/{branch}", None),
         count_commits_behind=lambda source, target: 0,
+        get_diff_name_status=lambda revision_range, paths=(), check=False: "",
     )
     impl = store.add("completed implementation", task_type="implement")
     assert impl.id is not None
@@ -213,6 +214,7 @@ def test_incomplete_preset_warns_and_falls_back_to_owner_for_missing_subject_tas
         is_merged=lambda source, target: False,
         resolve_fresh_merge_source=lambda branch: (f"origin/{branch}", None),
         count_commits_behind=lambda source, target: 0,
+        get_diff_name_status=lambda revision_range, paths=(), check=False: "",
     )
     impl = store.add("completed implementation", task_type="implement")
     assert impl.id is not None
@@ -286,6 +288,7 @@ def test_attention_subject_agrees_across_show_incomplete_and_watch_for_held_plan
         is_merged=lambda source, target: False,
         resolve_fresh_merge_source=lambda branch: (f"origin/{branch}", None),
         count_commits_behind=lambda source, target: 0,
+        get_diff_name_status=lambda revision_range, paths=(), check=False: "",
     )
 
     show_action = determine_next_action(config, store, git, plan, "main")
@@ -400,6 +403,7 @@ def test_incomplete_projection_uses_review_flow_for_mergeable_behind_branch(tmp_
             is_merged=lambda source, target: False,
             resolve_fresh_merge_source=lambda branch: ("origin/feature/stale-projection", None),
             count_commits_behind=lambda source, target: 1,
+            get_diff_name_status=lambda revision_range, paths=(), check=False: "",
         ),
         target_branch="main",
     )
@@ -448,6 +452,7 @@ def test_incomplete_projection_uses_merge_flow_for_approved_behind_branch(tmp_pa
                 None,
             ),
             count_commits_behind=lambda source, target: 1,
+            get_diff_name_status=lambda revision_range, paths=(), check=False: "",
         ),
         target_branch="main",
     )
