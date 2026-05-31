@@ -22,7 +22,7 @@
 
 ### Skills (`ensure_all_skills`)
 
-Skills are **installed from the gza package** into the worktree's `.claude/skills/` directory before the provider launches. This is not a copy from `.gza/` — it's an install from bundled skill definitions. See `runner.py:1403-1408`.
+Skills are **installed from the gza package** into the worktree's `.claude/skills/` directory before the provider launches. This is not a copy from `.gza/` — it's an install from bundled skill definitions. The staging happens in `src/gza/runner.py` via `_stage_worktree_agent_resources()`, which calls `ensure_all_skills()`.
 
 ### Summary files
 
