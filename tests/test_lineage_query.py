@@ -263,6 +263,57 @@ def test_query_lineage_owner_rows_completed_explore_without_followup_needs_atten
     assert row.next_action["needs_attention_reason"] == "explore-needs-follow-up-decision"
 
 
+def test_query_lineage_owner_rows_surfaces_strict_scope_violation_paths(tmp_path: Path) -> None:
+    from gza.runner import ProjectBoundary
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.project_dir = tmp_path / "services" / "foo"
+    config.project_dir.mkdir(parents=True, exist_ok=True)
+    config.enforce_project_scope = True
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        ),
+    )
+
+    impl = store.add("Scoped implement", task_type="implement")
+    assert impl.id is not None
+    _set_completed(
+        impl,
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        branch="feature/scoped-violation",
+        has_commits=True,
+    )
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+    git.get_diff_name_status.return_value = "M\tservices/foo/app.py\nM\tdre/web/src/app.tsx\n"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.next_action is not None
+    assert row.next_action["type"] == "needs_discussion"
+    assert row.next_action["needs_attention_reason"] == "project-scope-violation"
+    assert row.next_action["out_of_scope_paths"] == ("dre/web/src/app.tsx",)
+    assert "Tag `cross-project` and re-advance if intended, or fix the branch." in row.next_action["description"]
+
+
 def test_query_lineage_owner_rows_keeps_completed_explore_with_only_dropped_plan_descendant(
     tmp_path: Path,
 ) -> None:

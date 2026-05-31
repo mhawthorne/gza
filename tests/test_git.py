@@ -1765,6 +1765,16 @@ class TestExtractionGitHelpers:
                 check=False,
             )
 
+    def test_get_diff_name_status_check_raises_on_nonzero_exit(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=128, stdout="", stderr="fatal: bad revision")
+            with pytest.raises(GitError, match="fatal: bad revision"):
+                git.get_diff_name_status("main...feature", check=True)
+
     def test_get_diff_patch_for_paths_uses_rename_copy_detection(self, tmp_path: Path):
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()

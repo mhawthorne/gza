@@ -36,6 +36,14 @@ from gza.review_verdict import (
     is_verify_timeout_only_review,
     summarize_review_blockers,
 )
+from gza.runner import (
+    CROSS_PROJECT_TAG,
+    PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
+    _filter_owned_artifact_paths,
+    _find_out_of_scope_paths,
+    _project_boundary,
+    _task_is_cross_project,
+)
 from gza.source_followup import (
     collect_non_dropped_implement_source_ids,
     resolve_source_followup_state,
@@ -125,6 +133,8 @@ class AdvanceContext:
     post_merge_rebase_state: PostMergeRebaseState | None = None
     merge_state: str | None = None
     can_merge: bool = True
+    strict_scope_violation_paths: tuple[str, ...] = ()
+    strict_scope_inspection_error: str | None = None
     rebase_pending_or_running: DbTask | None = None
     rebase_failed: DbTask | None = None
     latest_completed_rebase: DbTask | None = None
@@ -172,6 +182,14 @@ class AdvanceRule:
     name: str
     matches: Callable[[AdvanceContext], bool]
     action: Callable[[AdvanceContext], dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class StrictScopeInspection:
+    """Resolved strict-scope inspection state for advance-time gating."""
+
+    violation_paths: tuple[str, ...] = ()
+    inspection_error: str | None = None
 
 
 def _resolve_current_merge_source(git: Any, branch: str) -> ResolvedMergeSourceRef:
@@ -721,6 +739,105 @@ def _rebase_did_not_unblock_merge_action(ctx: AdvanceContext) -> dict[str, Any]:
             "description": "SKIP: completed rebase did not unblock merge; manual decision required",
         },
         reason="rebase-did-not-unblock-merge",
+        subject_task_id=ctx.task.id,
+    )
+
+
+def _parse_changed_paths_from_name_status(name_status_output: str) -> set[str]:
+    """Extract touched repo-relative paths from git diff --name-status output."""
+    if not isinstance(name_status_output, str):
+        return set()
+    changed_paths: set[str] = set()
+    for line in name_status_output.splitlines():
+        parts = [part.strip() for part in line.split("\t") if part.strip()]
+        if len(parts) < 2:
+            continue
+        changed_paths.update(parts[1:])
+    return changed_paths
+
+
+def _resolve_strict_scope_inspection(
+    config: Any,
+    git: Any,
+    task: DbTask,
+    *,
+    merge_source_ref: str | None,
+    target_branch: str,
+) -> StrictScopeInspection:
+    """Return out-of-scope branch paths that should park automation for humans."""
+    if not getattr(config, "enforce_project_scope", False):
+        return StrictScopeInspection()
+    if _task_is_cross_project(task):
+        return StrictScopeInspection()
+    if task.task_type not in {"task", "implement", "improve", "fix", "rebase"}:
+        return StrictScopeInspection()
+    if not merge_source_ref:
+        return StrictScopeInspection()
+
+    revision_range = f"{target_branch}...{merge_source_ref}"
+    try:
+        name_status_output = git.get_diff_name_status(revision_range, check=True)
+    except Exception as exc:
+        detail = " ".join(str(exc).split())
+        _LOG.warning(
+            "Failed to inspect branch diff for strict project scope (%s): %s",
+            revision_range,
+            detail,
+        )
+        return StrictScopeInspection(inspection_error=detail)
+
+    changed_paths = _parse_changed_paths_from_name_status(name_status_output or "")
+    if not changed_paths:
+        return StrictScopeInspection()
+
+    filtered_paths = _filter_owned_artifact_paths(
+        changed_paths,
+        boundary=_project_boundary(config),
+    )
+    return StrictScopeInspection(
+        violation_paths=tuple(
+            _find_out_of_scope_paths(
+                config,
+                filtered_paths,
+                strict_scope=True,
+            )
+        )
+    )
+
+
+def _strict_scope_violation_action(ctx: AdvanceContext) -> dict[str, Any]:
+    violation_paths = tuple(getattr(ctx, "strict_scope_violation_paths", ()))
+    paths = ", ".join(violation_paths)
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                "SKIP: branch includes out-of-scope paths outside the strict project scope: "
+                f"{paths}. Tag `{CROSS_PROJECT_TAG}` and re-advance if intended, or fix the branch."
+            ),
+            "failure_reason": PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
+            "out_of_scope_paths": violation_paths,
+        },
+        reason="project-scope-violation",
+        subject_task_id=ctx.task.id,
+    )
+
+
+def _strict_scope_unverified_action(ctx: AdvanceContext) -> dict[str, Any]:
+    detail = getattr(ctx, "strict_scope_inspection_error", None) or "unknown diff inspection failure"
+    merge_source_ref = getattr(ctx, "merge_source_ref", None) or ctx.task.branch or "unknown"
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                "SKIP: strict project scope could not be verified for branch diff "
+                f"`{merge_source_ref}`. No automation will proceed until the diff/ref problem is fixed "
+                f"or the task is tagged `{CROSS_PROJECT_TAG}` if the wider scope is intended. "
+                f"Inspection error: {detail}"
+            ),
+            "strict_scope_inspection_error": detail,
+        },
+        reason="project-scope-unverified",
         subject_task_id=ctx.task.id,
     )
 
@@ -1583,6 +1700,13 @@ def resolve_advance_context(
         git=git,
         target_branch=target_branch,
     )
+    strict_scope_inspection = _resolve_strict_scope_inspection(
+        config,
+        git,
+        task,
+        merge_source_ref=merge_source.ref,
+        target_branch=target_branch,
+    )
     can_merge = (
         post_merge_rebase_state.already_merged
         or merge_state == "merged"
@@ -1687,6 +1811,8 @@ def resolve_advance_context(
         post_merge_rebase_state=post_merge_rebase_state,
         merge_state=merge_state,
         can_merge=can_merge,
+        strict_scope_violation_paths=strict_scope_inspection.violation_paths,
+        strict_scope_inspection_error=strict_scope_inspection.inspection_error,
         rebase_pending_or_running=rebase_pending_or_running,
         rebase_failed=rebase_failed,
         latest_completed_rebase=latest_completed_rebase,
@@ -1844,6 +1970,16 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="already_merged",
         matches=lambda ctx: ctx.merge_state == "merged",
         action=lambda ctx: {"type": "skip", "description": "SKIP: already merged into target branch"},
+    ),
+    AdvanceRule(
+        name="strict_project_scope_unverified",
+        matches=lambda ctx: ctx.strict_scope_inspection_error is not None,
+        action=_strict_scope_unverified_action,
+    ),
+    AdvanceRule(
+        name="strict_project_scope_violation",
+        matches=lambda ctx: bool(ctx.strict_scope_violation_paths),
+        action=_strict_scope_violation_action,
     ),
     AdvanceRule(
         name="conflict_rebase_running",

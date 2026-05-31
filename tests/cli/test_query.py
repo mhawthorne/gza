@@ -12287,6 +12287,53 @@ class TestIncompleteCommand:
         assert self._tree_root_id(tree_output) == impl.id
         assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
 
+    def test_incomplete_surfaces_strict_scope_unverified_needs_attention(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement scope verification", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+        impl.branch = "feature/scope-verification"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        store.update(impl)
+        assert impl.id is not None
+
+        unit = store.create_merge_unit(
+            source_branch=impl.branch,
+            target_branch="main",
+            owner_task_id=impl.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(impl.id, unit.id, "owner")
+
+        class _ScopeInspectionFailingGit(_FastUnmergedGit):
+            def get_diff_name_status(
+                self,
+                revision_range: str,
+                paths: tuple[str, ...] | list[str] = (),
+                *,
+                check: bool = False,
+            ) -> str:
+                raise GitError("git diff --name-status main...feature/scope-verification failed:\nfatal: bad revision")
+
+        git = _ScopeInspectionFailingGit()
+
+        with patch("gza.cli.query.Git", return_value=git):
+            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None))
+        captured = capsys.readouterr()
+
+        assert result == 0
+        one_line_output = captured.out
+        assert self._one_line_row_id(one_line_output) == impl.id
+        assert "strict project scope could not be verified" in one_line_output
+        assert "fatal: bad revision" in one_line_output
+
 
 class TestLineageOwnerParity:
     @staticmethod
