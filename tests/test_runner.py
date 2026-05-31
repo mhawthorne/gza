@@ -27,6 +27,7 @@ from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
+    ProjectBoundary,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
     SUMMARY_DIR,
     RunInvocationContext,
@@ -53,6 +54,7 @@ from gza.runner import (
     _setup_code_task_worktree,
     _slug_exists,
     _snapshot_task_db_to_worktree,
+    _stage_worktree_agent_resources,
     backup_database,
     build_prompt,
     generate_slug,
@@ -2050,6 +2052,76 @@ class TestSnapshotTaskDbToWorktree:
         _snapshot_task_db_to_worktree(tmp_path / ".gza" / "gza.db", worktree_dir)
 
         assert not (worktree_dir / ".gza" / "gza.db").exists()
+
+
+class TestStageWorktreeAgentResources:
+    """Tests for scoped worktree resource staging."""
+
+    def test_subdir_project_stages_snapshot_and_skills_under_scope_root(self, tmp_path: Path) -> None:
+        repo_root = tmp_path / "repo"
+        project_dir = repo_root / "services" / "foo"
+        worktree_dir = tmp_path / "worktree"
+        db_path = project_dir / ".gza" / "gza.db"
+        project_dir.mkdir(parents=True)
+        worktree_dir.mkdir()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO items (name) VALUES ('alpha')")
+        conn.commit()
+        conn.close()
+
+        config = Mock(spec=Config)
+        config.project_dir = project_dir
+        config.db_path = db_path
+
+        with patch("gza.skills_utils.ensure_all_skills", return_value=2) as mock_install:
+            installed = _stage_worktree_agent_resources(
+                config,
+                worktree_dir,
+                boundary=ProjectBoundary(
+                    repo_root=repo_root,
+                    scope_root=Path("services/foo"),
+                    local_dependencies=(),
+                ),
+            )
+
+        assert installed == 2
+        mock_install.assert_called_once_with(worktree_dir / "services" / "foo" / ".claude" / "skills")
+        assert (worktree_dir / "services" / "foo" / ".gza" / "gza.db").exists()
+        assert not (worktree_dir / ".gza" / "gza.db").exists()
+
+    def test_repo_root_project_stages_snapshot_and_skills_at_worktree_root(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "repo"
+        worktree_dir = tmp_path / "worktree"
+        db_path = project_dir / ".gza" / "gza.db"
+        project_dir.mkdir(parents=True)
+        worktree_dir.mkdir()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO items (name) VALUES ('alpha')")
+        conn.commit()
+        conn.close()
+
+        config = Mock(spec=Config)
+        config.project_dir = project_dir
+        config.db_path = db_path
+
+        with patch("gza.skills_utils.ensure_all_skills", return_value=1) as mock_install:
+            installed = _stage_worktree_agent_resources(
+                config,
+                worktree_dir,
+                boundary=ProjectBoundary(
+                    repo_root=project_dir,
+                    scope_root=Path("."),
+                    local_dependencies=(),
+                ),
+            )
+
+        assert installed == 1
+        mock_install.assert_called_once_with(worktree_dir / ".claude" / "skills")
+        assert (worktree_dir / ".gza" / "gza.db").exists()
 
 
     def test_run_non_code_task_creates_readonly_snapshot(self, tmp_path: Path):

@@ -10,8 +10,8 @@
 
 | Resource | Location | Accessible in agent context? |
 |---|---|---|
-| `.gza/` (DB snapshot + copied learnings) | Worktree-local copy created by host runner | Yes — point-in-time snapshot for reads |
-| `.claude/skills/` | Installed into worktree via `ensure_all_skills()` | Yes |
+| `.gza/gza.db` | Worktree-local snapshot created by host runner at the scoped project root (`<worktree>/<project-scope>/.gza/gza.db`) | Yes — point-in-time snapshot for reads |
+| `.claude/skills/` | Installed into the scoped project root in the worktree via `ensure_all_skills()` | Yes |
 | `docs/internal/` | In git, checked out in worktree | Yes |
 | `.gza/learnings.md` | Copied from `config.project_dir/.gza/` into worktree | Yes |
 | Summary files | Worktree dir created in task context; agent writes there; read back after | Yes |
@@ -38,7 +38,7 @@ In Docker, the worktree is mounted as `/workspace`. So any file copied into the 
 
 ## Task DB snapshot model
 
-Before provider launch, the host runner copies the live task DB into the worktree as `.gza/gza.db` using SQLite's backup API. This gives agents a consistent point-in-time view of task state.
+Before provider launch, the host runner copies the live task DB into the worktree as `.gza/gza.db` under the scoped project root using SQLite's backup API. This gives agents a consistent point-in-time view of task state.
 
 The snapshot file is then `chmod 0444`. Reads succeed from inside the worktree, while writes fail with SQLite read-only I/O errors (`attempt to write a readonly database` / similar). This now matters for `gza unmerged`: plain default-branch `uv run gza unmerged` refreshes canonical merge truth and therefore requires a writable DB snapshot. Live-target views such as `uv run gza unmerged --target BRANCH` remain read-only.
 

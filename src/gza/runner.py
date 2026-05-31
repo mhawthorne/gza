@@ -3388,6 +3388,17 @@ def _snapshot_task_db_to_worktree(db_path: Path, worktree_path: Path) -> None:
     snapshot_path.chmod(0o444)
 
 
+def _stage_worktree_agent_resources(config: Config, worktree_path: Path, boundary: ProjectBoundary) -> int:
+    """Install bundled skills and the read-only DB snapshot at the scoped project root."""
+    from .skills_utils import ensure_all_skills
+
+    scoped_worktree_root = _worktree_project_root(worktree_path, boundary)
+    skills_dir = scoped_worktree_root / ".claude" / "skills"
+    n_installed = ensure_all_skills(skills_dir)
+    _snapshot_task_db_to_worktree(_resolve_task_db_path(config), scoped_worktree_root)
+    return n_installed
+
+
 def _create_local_dep_symlinks(config: Config, worktree_path: Path) -> None:
     """Create symlinks for local path dependencies so uv can resolve them in worktrees.
 
@@ -4865,15 +4876,12 @@ def _run_inner(
         task.num_steps_computed = count
         store.update(task)
 
-    # Ensure all bundled skills are available in the worktree
-    from .skills_utils import ensure_all_skills
-    skills_dir = worktree_path / ".claude" / "skills"
-    n_installed = ensure_all_skills(skills_dir)
+    # Ensure bundled skills and the readonly task DB snapshot are available at project scope.
+    n_installed = _stage_worktree_agent_resources(config, worktree_path, boundary)
     if n_installed:
         console.print(f"Installed {n_installed} skill(s) into worktree")
 
     # Copy learnings file into worktree so the agent can read it
-    _snapshot_task_db_to_worktree(_resolve_task_db_path(config), worktree_path)
     _copy_learnings_to_worktree(config, worktree_path)
 
     task_config.provider_cwd = provider_cwd
@@ -5222,14 +5230,10 @@ def _run_non_code_task(
         else:
             prompt_report_path = worktree_report_path
 
-        # Ensure all bundled skills are available in the worktree
-        from .skills_utils import ensure_all_skills
-        skills_dir = worktree_path / ".claude" / "skills"
-        n_installed = ensure_all_skills(skills_dir)
+        # Ensure bundled skills and the readonly task DB snapshot are available at project scope.
+        n_installed = _stage_worktree_agent_resources(config, worktree_path, boundary)
         if n_installed:
             console.print(f"Installed {n_installed} skill(s) into worktree")
-
-        _snapshot_task_db_to_worktree(_resolve_task_db_path(config), worktree_path)
 
         # Internal orchestration tasks do not implicitly consume learnings context.
         if task.task_type not in ("internal", "learn"):
