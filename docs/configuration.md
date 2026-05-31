@@ -88,7 +88,7 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `watch`, `iterate_max_iterations`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `colors`
+`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `require_review_before_merge`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `colors`
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`, `verify_command`
@@ -790,7 +790,7 @@ The following keys are currently discoverable via `gza config keys`:
 ```text
 advance_create_reviews
 advance_mode
-advance_requires_review
+require_review_before_merge
 branch_mode
 branch_strategy
 branch_strategy.default_type

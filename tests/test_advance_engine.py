@@ -866,6 +866,138 @@ def test_rebase_after_review_with_unknown_diff_requires_fresh_review(tmp_path: P
     assert action["description"] == f"Create review (rebase {rebase.id} change unknown)"
 
 
+def test_stale_review_with_auto_review_disabled_needs_manual_refresh(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.advance_create_reviews = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/stale-review-manual-refresh",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["description"] == "SKIP: review must be refreshed before merge"
+    assert action["needs_attention_reason"] == "stale-review-needs-manual-refresh"
+    assert action["subject_task_id"] == impl.id
+
+
+@pytest.mark.parametrize("refresh_review_status", ["pending", "in_progress"])
+def test_stale_refresh_review_with_auto_review_disabled_needs_manual_refresh(
+    tmp_path: Path,
+    monkeypatch,
+    refresh_review_status: str,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.advance_create_reviews = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/stale-review-active-{refresh_review_status}",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    refresh_review = store.add(f"Refresh review {impl.id}", task_type="review", depends_on=impl.id)
+    assert refresh_review.id is not None
+    refresh_review.status = refresh_review_status
+    refresh_review.created_at = datetime(2026, 5, 10, 12, 30, tzinfo=UTC)
+    store.update(refresh_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["description"] == "SKIP: review must be refreshed before merge"
+    assert action["needs_attention_reason"] == "stale-review-needs-manual-refresh"
+    assert action["subject_task_id"] == impl.id
+
+
+@pytest.mark.parametrize(
+    ("refresh_review_status", "refresh_review_completed_at"),
+    [
+        (None, None),
+        ("pending", None),
+        ("in_progress", None),
+    ],
+)
+def test_stale_review_with_review_requirement_disabled_merges(
+    tmp_path: Path,
+    monkeypatch,
+    refresh_review_status: str | None,
+    refresh_review_completed_at: datetime | None,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    del refresh_review_completed_at
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.advance_create_reviews = True
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/stale-review-disabled",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+
+    if refresh_review_status is not None:
+        refresh_review = store.add(f"Refresh review {impl.id}", task_type="review", depends_on=impl.id)
+        assert refresh_review.id is not None
+        refresh_review.status = refresh_review_status
+        refresh_review.created_at = datetime(2026, 5, 10, 12, 30, tzinfo=UTC)
+        store.update(refresh_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "merge"
+    assert action["type"] not in {"create_review", "run_review", "wait_review"}
+
+
 def test_completed_rebase_without_prior_review_creates_owner_review(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -1311,6 +1443,54 @@ def test_completed_improve_without_review_clear_creates_closing_review(
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
     assert action["type"] == "create_review", action
     assert action["description"] == "Create closing review (code changed since the last review)"
+
+
+def test_completed_improve_with_auto_review_disabled_needs_manual_closing_review_attention(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A required closing review must fail closed when auto-review creation is disabled."""
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.advance_create_reviews = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/closing-review-manual-refresh",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    improve = store.add(
+        f"Improve {impl.id}",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    improve.branch = impl.branch
+    improve.has_commits = True
+    store.update(improve)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert (
+        action["description"]
+        == "SKIP: closing review required before merge and advance_create_reviews=false (run gza review manually)"
+    )
+    assert action["needs_attention_reason"] == "closing-review-needs-manual-refresh"
+    assert action["subject_task_id"] == impl.id
 
 
 def test_out_of_scope_sibling_project_change_parks_for_human(tmp_path: Path) -> None:
@@ -3845,6 +4025,7 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         "conflict_rebase_failed",
         "conflict_rebase_completed_but_still_blocked",
         "already_rebased_but_lineage_incomplete",
+        "stale_review_needs_manual_refresh",
         "failed_rebase_without_successful_review",
         "closing_review_invariant",
         "fresh_comments_noop_improve_limit",
@@ -3923,6 +4104,50 @@ def test_closing_review_invariant_does_not_create_duplicate_review(
         assert action is not None
         assert action["type"] == expected_action_type
         assert action.get("review_task").id == closing_review.id
+
+
+def test_completed_improve_with_review_requirement_disabled_merges_without_closing_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/closing-review-disabled",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    improve = store.add(
+        f"Improve {impl.id}",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    improve.branch = impl.branch
+    improve.has_commits = True
+    store.update(improve)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge (review APPROVED)"
+    assert action.get("review_task") is not None
+    assert action["review_task"].id == review.id
 
 
 def test_failed_improve_does_not_require_closing_review(tmp_path: Path) -> None:

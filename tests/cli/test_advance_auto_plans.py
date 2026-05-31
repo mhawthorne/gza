@@ -182,7 +182,7 @@ def test_advance_type_plan_filters_to_plans_only(tmp_path: Path, capsys) -> None
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
-        "advance_requires_review: false\n"
+        "require_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
     plan = _create_completed_plan(store, "Design feature X")
@@ -202,7 +202,7 @@ def test_advance_type_implement_filters_to_implements_only(tmp_path: Path, capsy
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
-        "advance_requires_review: false\n"
+        "require_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
     _create_completed_plan(store, "Design feature X")
@@ -214,7 +214,7 @@ def test_advance_type_implement_filters_to_implements_only(tmp_path: Path, capsy
     output = capsys.readouterr().out
     assert rc == 0
     assert str(impl.id) in output
-    assert "Create closing review" in output
+    assert "Merge task (no review yet)" in output
     assert "Create and start implement" not in output
 
 

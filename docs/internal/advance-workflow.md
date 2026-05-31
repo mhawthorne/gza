@@ -46,8 +46,8 @@ Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `advance_requires_review` | `true` | Implement tasks must have a passing review before merge |
-| `advance_create_reviews` | `true` | Auto-create review tasks for implements. The invariant-closing review after a completed write is always enforced. |
+| `require_review_before_merge` | `true` | Implement tasks must have a valid current review before merge |
+| `advance_create_reviews` | `true` | Auto-create review tasks for implements when review gating still requires them; otherwise lifecycle parks for manual attention instead of creating reviews. |
 | `max_resume_attempts` | `1` | Shared automatic failed-task recovery toggle (`0` disables; any positive value enables the fixed bounded resume/retry policy) |
 | `max_review_cycles` | `3` | Max review→improve cycles before flagging for manual intervention |
 | `max_noop_improve_cycles` | `2` | Max consecutive no-op improves before lifecycle automation stops for discussion |
@@ -113,7 +113,9 @@ Repeated failed rebases are bounded independently of the ordinary failed-rebase 
 
 | Condition | Action |
 |-----------|--------|
-| A completed rebase on the implementation branch exists that is newer than the latest review | `create_review` — rebase may have introduced changes |
+| Review requirement for the implementation-owned lineage is disabled (`require_review_before_merge=false`) | Fall through to the normal no-review merge path; do not create, run, or wait on a stale refresh review |
+| A completed rebase on the implementation branch exists that is newer than the latest review AND `advance_create_reviews=true` | `create_review` — rebase may have introduced changes |
+| A completed rebase on the implementation branch exists that is newer than the latest review AND `advance_create_reviews=false` | `needs_discussion` — park and require a manual review refresh before merge |
 
 ### 6. Review state (when reviews exist)
 
@@ -121,6 +123,7 @@ Repeated failed rebases are bounded independently of the ordinary failed-rebase 
 
 | Condition | Action |
 |-----------|--------|
+| Review requirement for the implementation-owned lineage is disabled (`require_review_before_merge=false`) | Fall through to the normal no-review merge path; do not create, run, or wait on a stale refresh review, and do not enforce the closing-review gate |
 | Active review is `pending` | `run_review` — spawn worker for it |
 | Active review is `in_progress` | `wait_review` — skip |
 | Completed improve exists after latest review | `create_review` — code changed, need fresh review |
@@ -132,8 +135,8 @@ Repeated failed rebases are bounded independently of the ordinary failed-rebase 
 | Latest review is `pending` | `run_review` — spawn worker |
 | Latest review is `in_progress` | `wait_review` — skip |
 | Task type is `implement`, verdict is `APPROVED`/`APPROVED_WITH_FOLLOWUPS` (or review is cleared), and unresolved comments are newer than the latest completed review | Prefer improve flow (`wait_improve`/`run_improve`/`improve`) before any merge |
-| Verdict = `APPROVED` | `merge` |
-| Verdict = `APPROVED_WITH_FOLLOWUPS` with at least one parsed `FOLLOWUP` finding | `merge_with_followups` — create/reuse follow-up implement tasks, then merge |
+| Verdict = `APPROVED` and the review is still valid for the current mergeable diff | `merge` |
+| Verdict = `APPROVED_WITH_FOLLOWUPS` with at least one parsed `FOLLOWUP` finding and the review is still valid for the current mergeable diff | `merge_with_followups` — create/reuse follow-up implement tasks, then merge |
 | Verdict = `APPROVED_WITH_FOLLOWUPS` with zero parsed `FOLLOWUP` findings | `needs_discussion` — fail closed; review output is inconsistent |
 | Verdict = `CHANGES_REQUESTED` AND last 2 completed reviews are verify-timeout-only AND no improve is `in_progress`/`pending` | `needs_discussion` — reason=`verify-blocked-no-code-issues` |
 | Verdict = `CHANGES_REQUESTED` AND improve is `in_progress` | `wait_improve` — skip |
@@ -162,7 +165,7 @@ The improve flow now defers recovery edge selection to the shared recovery engin
 
 | Condition | Action |
 |-----------|--------|
-| Reviews exist but all cleared | `merge` — previous review addressed |
+| Reviews exist but all cleared, and no newer rebase or closing-review requirement invalidates that state | `merge` — previous review addressed |
 | Standalone non-implement task type (plan, explore, etc.), or a merge-unit lineage whose owner does not require review | `merge` — no review required |
 
 Merge-unit members inherit the review state and review requirement of the actionable implementation lineage member on that shared branch. When the compatibility owner row is a failed historical implement and the current code lives on a completed resume descendant, closing-review state and post-rebase invalidation both resolve against that completed descendant. A completed `rebase` or other same-branch member of such an implement-owned merge unit must create or wait on that lineage review before merge when no review evidence exists yet.
@@ -171,8 +174,8 @@ Merge-unit members inherit the review state and review requirement of the action
 
 | Condition | Action |
 |-----------|--------|
-| `advance_requires_review=true` | `create_review` |
-| `advance_requires_review=false` | `merge` |
+| `require_review_before_merge=true` | `create_review` |
+| `require_review_before_merge=false` | `merge` |
 
 ### 9. Failed task recovery
 

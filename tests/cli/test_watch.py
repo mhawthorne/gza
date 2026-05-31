@@ -7462,7 +7462,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_descendant_visible_under_
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
-        "advance_requires_review: false\n"
+        "require_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -7527,7 +7527,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_pendi
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
-        "advance_requires_review: false\n"
+        "require_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -7582,7 +7582,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_faile
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
-        "advance_requires_review: false\n"
+        "require_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -7638,7 +7638,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_compl
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
-        "advance_requires_review: false\n"
+        "require_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -7707,7 +7707,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_compl
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
-        "advance_requires_review: false\n"
+        "require_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -7775,7 +7775,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_root_visible_across_non_r
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
-        "advance_requires_review: false\n"
+        "require_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -7847,7 +7847,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_fix_visible_under_complet
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
-        "advance_requires_review: false\n"
+        "require_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 

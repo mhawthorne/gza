@@ -495,6 +495,60 @@ class TestLocalConfigOverrides:
         cfg = Config.load(tmp_path)
         assert cfg.use_docker is False
 
+    def test_local_override_allows_lifecycle_review_toggles(self, tmp_path: Path):
+        """Local overrides should accept both lifecycle review toggles."""
+        from gza.config import Config
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "advance_create_reviews: true\n"
+            "require_review_before_merge: true\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "advance_create_reviews: false\n"
+            "require_review_before_merge: false\n"
+        )
+
+        cfg = Config.load(tmp_path)
+
+        assert cfg.advance_create_reviews is False
+        assert cfg.require_review_before_merge is False
+        assert cfg.source_map["advance_create_reviews"] == "local"
+        assert cfg.source_map["require_review_before_merge"] == "local"
+
+    @pytest.mark.parametrize("value", ["1", '"yes"', "null"])
+    def test_local_override_rejects_non_boolean_require_review_before_merge(self, tmp_path: Path, value: str):
+        """Local overrides should still run the strict boolean validator for renamed review gating."""
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text("project_name: test\nrequire_review_before_merge: true\n")
+        (tmp_path / "gza.local.yaml").write_text(f"require_review_before_merge: {value}\n")
+
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert "'require_review_before_merge' must be a boolean (true/false)" in errors
+
+        with pytest.raises(ConfigError, match="require_review_before_merge"):
+            Config.load(tmp_path)
+
+    def test_local_override_removed_review_key_has_rename_hint(self, tmp_path: Path) -> None:
+        """Local overrides should surface the rename hint for the removed review gate key."""
+        from gza.config import Config, ConfigError
+
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.local.yaml").write_text("advance_requires_review: false\n")
+
+        expected = (
+            "Invalid configuration key 'advance_requires_review' in gza.local.yaml: "
+            "renamed to 'require_review_before_merge'. Update your config and try again."
+        )
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert expected in errors
+
+        with pytest.raises(ConfigError, match=re.escape(expected)):
+            Config.load(tmp_path)
+
     def test_enforce_project_scope_loads_from_config(self, tmp_path: Path):
         """Project-scope enforcement should be configurable."""
         (tmp_path / "gza.yaml").write_text(
@@ -987,6 +1041,65 @@ class TestLocalConfigOverrides:
             "Invalid user config key 'branch_mode' in ~/.gza/config.yaml. Put project-specific settings in gza.yaml."
         ]
         assert warnings == []
+
+    def test_user_config_allows_lifecycle_review_toggles(self, tmp_path: Path):
+        """User config should accept both lifecycle review toggles and feed the shared loader."""
+        from gza.config import Config
+
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(
+            home_dir,
+            "advance_create_reviews: false\n"
+            "require_review_before_merge: false\n",
+        )
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+
+        cfg = Config.load(tmp_path)
+
+        assert cfg.advance_create_reviews is False
+        assert cfg.require_review_before_merge is False
+        assert cfg.source_map["advance_create_reviews"] == "user"
+        assert cfg.source_map["require_review_before_merge"] == "user"
+
+    @pytest.mark.parametrize("key,value", [("advance_create_reviews", '"yes"'), ("require_review_before_merge", "1")])
+    def test_user_config_rejects_non_boolean_lifecycle_review_toggles(
+        self,
+        tmp_path: Path,
+        key: str,
+        value: str,
+    ) -> None:
+        """User config should still hit strict boolean validation for lifecycle review toggles."""
+        from gza.config import Config, ConfigError
+
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, f"{key}: {value}\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert f"'{key}' must be a boolean (true/false)" in errors
+
+        with pytest.raises(ConfigError, match=re.escape(f"'{key}' must be a boolean (true/false)")):
+            Config.load(tmp_path)
+
+    def test_user_config_removed_review_key_has_rename_hint(self, tmp_path: Path) -> None:
+        """User config should surface the rename hint for the removed review gate key."""
+        from gza.config import Config, ConfigError
+
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "advance_requires_review: false\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+
+        expected = (
+            "Invalid configuration key 'advance_requires_review' in ~/.gza/config.yaml: "
+            "renamed to 'require_review_before_merge'. Update your config and try again."
+        )
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert expected in errors
+
+        with pytest.raises(ConfigError, match=re.escape(expected)):
+            Config.load(tmp_path)
 
     def test_docs_configuration_mentions_gza_db_path_override(self):
         """Operator docs should document GZA_DB_PATH override and precedence."""
@@ -3141,6 +3254,49 @@ class TestWatchConfigValidation:
         assert "'main_checkout_isolate' must be a boolean (true/false)" in errors
 
         with pytest.raises(ConfigError, match="main_checkout_isolate"):
+            Config.load(tmp_path)
+
+    def test_require_review_before_merge_defaults_true(self, tmp_path: Path) -> None:
+        """Config.load defaults require_review_before_merge to true."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "")
+        config = Config.load(tmp_path)
+        assert config.require_review_before_merge is True
+
+    @pytest.mark.parametrize("value", ["1", '"yes"', "null"])
+    def test_require_review_before_merge_invalid_values_rejected(self, tmp_path: Path, value: str) -> None:
+        """Config.load and validate reject non-boolean require_review_before_merge values."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, f"require_review_before_merge: {value}\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert "'require_review_before_merge' must be a boolean (true/false)" in errors
+
+        with pytest.raises(ConfigError, match="require_review_before_merge"):
+            Config.load(tmp_path)
+
+    def test_legacy_advance_requires_review_key_fails_with_rename_hint(self, tmp_path: Path) -> None:
+        """Config.load should fail loudly on the removed advance_requires_review key."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, "advance_requires_review: false\n")
+
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert (
+            "Unknown configuration field: 'advance_requires_review' "
+            "(renamed to 'require_review_before_merge')"
+        ) in errors
+
+        with pytest.raises(
+            ConfigError,
+            match=re.escape(
+                "'advance_requires_review' has been renamed to 'require_review_before_merge'. "
+                "Update your config and try again."
+            ),
+        ):
             Config.load(tmp_path)
 
     def test_config_watch_null_max_idle_loads(self, tmp_path: Path) -> None:
