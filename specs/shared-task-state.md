@@ -1,5 +1,12 @@
 # Shared Task State for Parallel Agents
 
+> **Scope:** This documents the **current single-host model** — one machine, a shared SQLite DB
+> mounted into task containers. For **multi-machine distributed development**, see
+> [Distributed Development — ID Generation](distributed-development.md) and
+> [Distributed Development — Sync Engine](distributed-sync-engine.md). Those supersede the
+> "Future Considerations" below: the chosen direction **keeps SQLite** (via a cr-sqlite CRDT layer
+> with changesets synced over S3), rather than migrating to PostgreSQL.
+
 ## Problem
 
 When multiple agents run in parallel (in Docker containers), they need to observe each other's work to avoid conflicts and coordinate task execution.
@@ -35,8 +42,14 @@ class TaskStore(Protocol):
     def list_in_progress(self) -> list[Task]
 ```
 
-This allows swapping `SqliteTaskStore` for `PostgresTaskStore` later without changing application code.
+This keeps storage decoupled from application code — useful for testing and for the distributed
+CRDT-backed store (see Future Considerations). Note the distributed direction keeps SQLite rather
+than swapping in a `PostgresTaskStore`.
 
 ## Future Considerations
 
-For distributed agents across multiple machines, SQLite won't work (no network-based locking). At that point, migrate to PostgreSQL or another network-accessible database. The `TaskStore` abstraction ensures this is a straightforward swap.
+For multi-machine distributed development, the direction is **not** a PostgreSQL migration. SQLite is
+retained and made multi-master via a CRDT layer (cr-sqlite), with changesets replicated between
+environments over S3. See [Distributed Development — Sync Engine](distributed-sync-engine.md) for the
+replication design and [Distributed Development — ID Generation](distributed-development.md) for the
+collision-free ID scheme that makes cross-environment row merges possible.
