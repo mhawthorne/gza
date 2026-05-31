@@ -535,7 +535,7 @@ gza work [task_id...] [options]
 | `--background`, `-b` | Run worker in background |
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks (run even if depends_on output is not yet merged) |
-| `--pr` | Create/reuse a GitHub PR for completed code tasks before auto-created review runs (when the branch has commits) |
+| `--pr` | Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable |
 | `--tag TAG` | Only pick pending tasks matching tag filters when no task IDs are specified (repeatable) |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
 
@@ -559,7 +559,7 @@ gza add [prompt] [options]
 | `--depends-on ID` | Set dependency on another task by full prefixed task ID (e.g. `gza-1234`) |
 | `--review` | Auto-create review task on completion |
 | `--hold-for-review` | For `--type plan`, require manual review before any automatic implementation follow-up |
-| `--pr` | Auto-create/reuse a GitHub PR after successful code-task completion |
+| `--pr` | Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable |
 | `--same-branch` | Continue on depends_on task's branch |
 | `--spec FILE` | Path to spec file for context |
 | `--prompt-file FILE` | Read prompt from file (for non-interactive use) |
@@ -590,7 +590,7 @@ gza edit <task_id> [options]
 | `--review` | Enable automatic review task creation on completion |
 | `--hold-for-review`, `--no-hold-for-review` | For plan tasks, require or release manual review before automatic implementation follow-up |
 | `--auto-implement` | Compatibility alias for `--no-hold-for-review`; retained for existing scripts |
-| `--pr` | Enable automatic PR creation on successful code-task completion |
+| `--pr` | Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable |
 | `--prompt TEXT` | Set new prompt directly (use `-` for stdin) |
 | `--prompt-file FILE` | Read new prompt from file |
 | `--model MODEL` | Override model for this task |
@@ -1365,7 +1365,7 @@ gza implement <plan_task_id> [prompt] [options]
 | `plan_task_id` | Full prefixed completed plan task ID to implement (e.g. `gza-1234`) |
 | `prompt` | Implementation prompt (defaults to plan-derived prompt) |
 | `--review` | Auto-create review task on completion |
-| `--pr` | Auto-create/reuse a GitHub PR after successful code-task completion |
+| `--pr` | Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable |
 | `--tag TAG` | Add task tag (repeatable) |
 | `--same-branch` | Continue on depends_on task's branch instead of creating new |
 | `--branch-type TYPE` | Set branch type hint for branch naming |
@@ -1402,7 +1402,7 @@ gza extract SOURCE --files-from FILE [options]
 | `--files-from FILE` | Read newline-delimited selected files from file |
 | `--prompt TEXT` | Additional operator intent appended to the drafted prompt |
 | `--review` | Auto-create review task on completion |
-| `--pr` | Auto-create/reuse a GitHub PR after successful code-task completion |
+| `--pr` | Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable |
 | `--tag TAG` | Add task tag (repeatable) |
 | `--branch-type TYPE` | Set branch type hint for branch naming |
 | `--base-branch BRANCH` | Override base branch used for source diff and new task branch creation |
@@ -1588,13 +1588,13 @@ uv run gza sync [task_id ...] [options]
 | `--pr-only` | Only reconcile PR metadata and stale-PR cleanup; skip git diff refresh |
 | `--no-fetch` | Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch |
 
-Use `uv run gza unmerged` for the daily "what still needs to be merged?" check. `uv run gza sync` remains the broader explicit branch and PR reconciliation command. It:
+Use `uv run gza unmerged` for the daily "what still needs to be merged?" check. `uv run gza sync` remains the broader explicit branch and PR reconciliation command. When `pr_integration: true`, it also performs project-level `gh`-backed PR discovery/comment/create flows. Set `pr_integration: false` to disable those PR operations. It:
 - dedupes work by branch, writing shared branch metadata back to every same-branch task row that carries commits while persisting merge status only on the merge-owning row
 - refreshes cached `merge_status`, `diff_*` stats, `pr_number`, `pr_state`, `pr_last_synced_at`, and `sync_last_synced_at`
 - discovers PRs by branch for bounded candidates that need PR reconciliation
 - auto-closes stale open PRs only after posting a comment and only when a fresh `origin/<default-branch>` fetch proves the branch content is already present upstream
 
-The only GitHub-side exceptions outside `uv run gza sync` are improve and fix completion with `--review`: before auto-running the follow-up review, gza may do a narrow branch-scoped live-PR check and push for that same branch. It does not replace `uv run gza sync` for broader cache refresh, merge-state reconciliation, or stale-PR cleanup.
+The only GitHub-side exceptions outside `uv run gza sync` are improve and fix completion with `--review`: before auto-running the follow-up review, gza may do a narrow branch-scoped live-PR check and push for that same branch when `pr_integration: true`. With `pr_integration: false`, those same branch-scoped PR checks are skipped. It does not replace `uv run gza sync` for broader cache refresh, merge-state reconciliation, or stale-PR cleanup.
 
 Default `uv run gza sync` scope is intentionally bounded. It includes unresolved branches, tasks with known or unknown open-PR cache state, and recently touched PR-intended work. Pass explicit task IDs to force-sync specific branch cohorts outside that default window. That bounded scope is acceptable because `uv run gza sync` is no longer the primary daily merge-truth refresh surface.
 
@@ -1707,7 +1707,7 @@ Gza supports several task types, each with distinct behavior:
 **Typical workflow:**
 
 1. `plan` - Design the approach, saved to `.gza/plans/`
-2. `implement --based-on <plan_id> --review --pr` - Build per plan, auto-create review and ensure a PR exists for later review comments
+2. `implement --based-on <plan_id> --review --pr` - Build per plan, auto-create review, and request PR creation/reuse at successful completion for later review comments when PRs are available
 3. `review` runs automatically, saved to `.gza/reviews/`
 4. If changes requested: `improve <impl_id>` addresses feedback on same branch
 

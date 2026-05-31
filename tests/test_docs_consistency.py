@@ -503,6 +503,27 @@ def test_plan_implement_review_example_uses_uv_run_gza_shell_snippets() -> None:
         assert not stripped.startswith("> $ gza ")
 
 
+def test_plan_implement_review_example_describes_pr_as_completion_time_request() -> None:
+    """Workflow example should describe `--pr` as a best-effort completion-time request."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    example_content = (docs_root / "examples" / "plan-implement-review.md").read_text()
+
+    required_snippets = [
+        "request PR creation or reuse after it completes successfully",
+        "evaluated at completion time and skipped without failing when PRs are unavailable",
+        "post PR comments automatically when a PR exists",
+    ]
+    stale_snippets = [
+        "open or reuse a PR as soon as it first completes",
+        "post PR comments automatically:",
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in example_content
+    for snippet in stale_snippets:
+        assert snippet not in example_content
+
+
 def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     """Touched recovery docs should keep canonical `uv run gza ...` command wording."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"

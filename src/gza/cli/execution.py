@@ -1478,7 +1478,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     # Handle --pr flag
     if getattr(args, "create_pr", False):
         task.create_pr = True
-        update_messages.append(f"✓ Enabled automatic PR creation for task {task.id}")
+        update_messages.append(f"✓ Enabled PR creation/reuse request for successful completion of task {task.id}")
         changed = True
 
     if hold_flag_requested:

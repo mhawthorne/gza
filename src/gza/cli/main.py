@@ -228,7 +228,7 @@ def main() -> int:
         "--pr",
         action="store_true",
         dest="create_pr",
-        help="Create/reuse a GitHub PR after successful code-task completion (when branch has commits)",
+        help="Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable",
     )
     work_parser.add_argument(
         "--tag",
@@ -1433,7 +1433,7 @@ def main() -> int:
         "--pr",
         action="store_true",
         dest="create_pr",
-        help="Auto-create/reuse a GitHub PR after successful code-task completion",
+        help="Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable",
     )
     add_parser.add_argument(
         "--same-branch",
@@ -1566,7 +1566,7 @@ def main() -> int:
         "--pr",
         action="store_true",
         dest="create_pr",
-        help="Enable automatic PR creation on successful code-task completion",
+        help="Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable",
     )
     edit_parser.add_argument(
         "--prompt-file",
@@ -1748,7 +1748,7 @@ def main() -> int:
         "--pr",
         action="store_true",
         dest="create_pr",
-        help="Auto-create/reuse a GitHub PR after successful code-task completion",
+        help="Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable",
     )
     improve_parser.add_argument(
         "--review-id",
@@ -1959,7 +1959,7 @@ def main() -> int:
         "--pr",
         action="store_true",
         dest="create_pr",
-        help="Auto-create/reuse a GitHub PR after successful code-task completion",
+        help="Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable",
     )
     implement_parser.add_argument(
         "--tag",
@@ -2085,7 +2085,7 @@ def main() -> int:
         "--pr",
         action="store_true",
         dest="create_pr",
-        help="Auto-create/reuse a GitHub PR after successful code-task completion",
+        help="Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable",
     )
     extract_parser.add_argument(
         "--tag",

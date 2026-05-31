@@ -735,7 +735,7 @@ class TestEditCommand:
         assert updated.create_review is True
 
     def test_edit_pr_flag(self, tmp_path: Path):
-        """Edit command can enable automatic PR creation."""
+        """Edit command can enable completion-time PR creation/reuse intent."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -746,6 +746,7 @@ class TestEditCommand:
         result = run_gza("edit", str(task.id), "--pr", "--project", str(tmp_path))
 
         assert result.returncode == 0
+        assert f"Enabled PR creation/reuse request for successful completion of task {task.id}" in result.stdout
 
         updated = store.get(task.id)
         assert updated.create_pr is True
@@ -764,7 +765,7 @@ class TestEditCommand:
 
         assert result.returncode == 0
         assert "automatic review task creation" in result.stdout
-        assert "automatic PR creation" in result.stdout
+        assert f"Enabled PR creation/reuse request for successful completion of task {task.id}" in result.stdout
 
         updated = store.get(task.id)
         assert updated is not None
@@ -792,7 +793,7 @@ class TestEditCommand:
         )
 
         assert result.returncode == 0
-        assert "automatic PR creation" in result.stdout
+        assert f"Enabled PR creation/reuse request for successful completion of task {task.id}" in result.stdout
         assert "Set model override" in result.stdout
 
         updated = store.get(task.id)
@@ -821,7 +822,7 @@ class TestEditCommand:
         )
 
         assert result.returncode == 0
-        assert "automatic PR creation" in result.stdout
+        assert f"Enabled PR creation/reuse request for successful completion of task {task.id}" in result.stdout
         assert "Added tags" in result.stdout
 
         updated = store.get(task.id)

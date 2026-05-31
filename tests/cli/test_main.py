@@ -426,19 +426,38 @@ class TestHelpOutput:
         assert "front of the urgent lane" in docs_text
         assert "picked up before normal queue items" not in docs_text
 
-    def test_work_pr_help_and_docs_are_aligned(self, tmp_path):
-        """`work --pr` should be documented in CLI help and canonical configuration docs."""
+    def test_public_pr_help_and_docs_use_completion_time_request_wording(self, tmp_path):
+        """Public `--pr` help/docs should use the same deferred request wording."""
         setup_config(tmp_path)
 
-        help_result = run_gza("work", "--help", "--project", str(tmp_path))
-        assert help_result.returncode == 0
-        normalized_help = " ".join(help_result.stdout.split())
-        assert "--pr" in help_result.stdout
-        assert "Create/reuse a GitHub PR after successful code-task completion" in normalized_help
+        expected = (
+            "Request auto-create/reuse of a GitHub PR after successful code-task completion; "
+            "evaluated at completion time and skipped without failing when PRs are unavailable"
+        )
+
+        for command, section in (
+            ("work", "work"),
+            ("add", "add"),
+            ("edit", "edit"),
+            ("improve", "improve"),
+            ("implement", "implement"),
+            ("extract", "extract"),
+        ):
+            help_result = run_gza(command, "--help", "--project", str(tmp_path))
+            assert help_result.returncode == 0
+            normalized_help = " ".join(help_result.stdout.split())
+            docs_text = _normalized_markdown_section(Path("docs/configuration.md"), section)
+
+            assert "--pr" in help_result.stdout
+            assert expected in normalized_help
+            assert expected in docs_text
 
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
-        assert "--pr" in docs_text
-        assert "Create/reuse a GitHub PR for completed code tasks before auto-created review runs" in docs_text
+        assert (
+            "implement --based-on <plan_id> --review --pr` - Build per plan, auto-create review, and request PR "
+            "creation/reuse at successful completion for later review comments when PRs are available"
+        ) in docs_text
+        assert "ensure a PR exists for later review comments" not in docs_text
 
     def test_edit_help_and_docs_describe_non_pending_tag_only_restriction(self, tmp_path):
         """`edit --help` and docs should both explain the non-pending tag-only contract."""
@@ -499,7 +518,10 @@ class TestHelpOutput:
         assert "uv run gza sync [task_id ...] [options]" in docs_text
         assert "Use `uv run gza unmerged` for the daily \"what still needs to be merged?\" check." in docs_text
         assert "`uv run gza sync` remains the broader explicit branch and PR reconciliation command." in docs_text
+        assert "When `pr_integration: true`, it also performs project-level `gh`-backed PR discovery/comment/create flows." in docs_text
+        assert "Set `pr_integration: false` to disable those PR operations." in docs_text
         assert "The only GitHub-side exceptions outside `uv run gza sync` are improve and fix completion with `--review`" in docs_text
+        assert "With `pr_integration: false`, those same branch-scoped PR checks are skipped." in docs_text
         assert "Run `uv run gza sync` after those merges" in docs_text
 
     def test_improve_help_and_docs_describe_narrow_pr_sync_before_auto_review(self, tmp_path):
