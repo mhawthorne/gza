@@ -1,12 +1,12 @@
 ---
 name: gza-rebase
-description: Rebase current branch on main, with interactive conflict resolution. Use when rebasing, merging, or resolving git conflicts.
+description: Rebase current branch onto the requested target branch, with interactive conflict resolution. Use when rebasing, merging, or resolving git conflicts.
 allowed-tools: Read, Edit, Glob, Grep, Bash(git:*), Bash(uv run:*), Bash(./*), Bash(make:*), Bash(npm:*), Bash(pytest:*), Bash(python:*), Bash(awk:*), Bash(sed:*)
 version: 1.0.0
 public: true
 ---
 
-# Rebase on Main
+# Rebase onto Target Branch
 
 Rebase the current branch onto a local target branch, resolving any merge conflicts interactively.
 
@@ -34,14 +34,20 @@ Rebase the current branch onto a local target branch, resolving any merge confli
 
 ### Step 2: Choose rebase target
 
-1. Prompt the user to choose between:
-   - `main` (local - default) - Use the local branch already present in the repo
-   - `origin/main` (remote) - Only use this when the caller explicitly asked for a remote rebase
-2. In `--auto` mode, do not choose or synthesize a remote target. Rebase only onto the local target already provided by the caller.
+1. Determine whether the caller already named the target branch in the prompt or request.
+   - If the caller named a target branch (for example `master`), use that exact branch name. Do not substitute `main` or any other default.
+2. If the caller did not name a target branch, resolve the repo's primary branch:
+   - First try `git symbolic-ref --quiet --short refs/remotes/origin/HEAD` and strip any leading `origin/`.
+   - If that does not produce a branch name, fall back to whichever of `main` or `master` exists locally by checking `git show-ref --verify --quiet refs/heads/<name>`.
+   - If no primary branch can be determined, stop and report the failure instead of assuming `main`.
+3. In default mode, if the caller did not already fix the target branch, prompt the user to choose between:
+   - `<resolved-target>` (local - default) - Use the local branch already present in the repo
+   - `origin/<resolved-target>` (remote) - Only use this when the caller explicitly asked for a remote rebase
+4. In `--auto` mode, do not choose or synthesize a remote target. Rebase only onto the local target already provided by the caller or resolved locally in this step.
 
 ### Step 3: Fetch and attempt rebase
 
-1. If and only if the caller explicitly requested a remote rebase in non-`--auto` mode, run `git fetch origin main`
+1. If and only if the caller explicitly requested a remote rebase in non-`--auto` mode, run `git fetch origin <resolved-target>`
 2. Run `git rebase <chosen-target>`
 3. If rebase succeeds with no conflicts, continue to Step 6. Do not report success yet.
 4. If the chosen local target does not exist, stop and report the missing ref. Do not try remote probes or alternate transports.
@@ -76,12 +82,12 @@ If changes were stashed in Step 1, run `git stash pop` to restore them before fi
 
 ### Step 7: Final verification
 
-Before declaring success, determine the project `verify_command` by running `uv run gza config` and reading the `verify_command` value. Also note `inner_verify_command` if present. If config loading fails, fall back to reading the values directly from `gza.yaml`.
+Before declaring success, read `verify_command` directly from `gza.yaml` as the project `verify_command`. Also note `inner_verify_command` if present. If `uv run gza config` is available in this environment, you may use it as an optional confirmation or to inspect merged config, but do not treat `gza config` failure as an error when `gza.yaml` was readable.
 
 - If you need quick feedback while fixing verification fallout, use `inner_verify_command` when configured, or otherwise use targeted tests for the files you touched.
 - Run the configured full `verify_command` from the project root or worktree root after the rebase is fully complete, after any stashed changes have been restored, and after the last planned code change.
 - Fix any failures you surface in your own context and do not declare success until the full verification passes.
-- If no `verify_command` is configured, say so explicitly before finishing.
+- If `gza.yaml` has no `verify_command`, stop and report that it must be set before this skill can complete successfully.
 
 ### Step 8: Final summary
 

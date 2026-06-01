@@ -379,6 +379,9 @@ def test_gza_rebase_docs_match_final_verify_contract() -> None:
     assert "default mode, checks for uncommitted changes before starting and stops if any exist" in skills_doc_content
     assert "In `--auto` mode, stashes uncommitted changes before rebasing" in skills_doc_content
     assert "relies only on local refs already present" in skills_doc_content
+    assert "Honors the caller-provided local target branch" in skills_doc_content
+    assert "origin/HEAD" in skills_doc_content
+    assert "uv run gza config` only as an optional confirmation" in skills_doc_content
 
     assert "project `verify_command`" in skill_content
     assert "after any stashed changes have been restored" in skill_content
@@ -386,6 +389,10 @@ def test_gza_rebase_docs_match_final_verify_contract() -> None:
     assert "Do NOT use remote git operations." in skill_content
     assert "In default mode: if any exist, stop and ask the user to commit or stash them" in skill_content
     assert "In `--auto` mode: if any exist, run `git stash` to save them." in skill_content
+    assert "If the caller named a target branch (for example `master`), use that exact branch name." in skill_content
+    assert "git symbolic-ref --quiet --short refs/remotes/origin/HEAD" in skill_content
+    assert "Do not substitute `main`" in skill_content
+    assert "read `verify_command` directly from `gza.yaml`" in skill_content
 
     assert "Rebases onto the already-present local target branch without fetching or other remote operations" in advance_workflow_content
     assert "Restores stashed changes before final verification" in advance_workflow_content
@@ -394,6 +401,18 @@ def test_gza_rebase_docs_match_final_verify_contract() -> None:
     assert "origin/main` (default)" not in skills_doc_content
     assert "Checks for uncommitted changes before starting (stops if any exist)" not in skills_doc_content
     assert "Fetches and rebases onto the target branch" not in advance_workflow_content
+
+
+def test_gza_test_and_fix_docs_lead_with_gza_yaml_verify_command_lookup() -> None:
+    """Worker-facing verify docs should prefer gza.yaml over gza CLI lookup."""
+    repo_root = Path(__file__).resolve().parents[1]
+    skills_doc_content = (repo_root / "docs" / "skills.md").read_text()
+    skill_content = (repo_root / "src" / "gza" / "skills" / "gza-test-and-fix" / "SKILL.md").read_text()
+
+    assert "reads `verify_command` from `gza.yaml` first" in skills_doc_content
+    assert "treats `uv run gza config` as optional" in skills_doc_content
+    assert "Read `verify_command` directly from `gza.yaml`" in skill_content
+    assert "do not treat `gza config` failure as an error when `gza.yaml` was readable" in skill_content
 
 def test_spec_examples_use_tags_not_retired_group_aliases() -> None:
     """Operator spec examples should teach canonical tags syntax only."""

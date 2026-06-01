@@ -365,6 +365,48 @@ class TestSkillsInstallClaudeTarget:
         assert "python -m py_compile" not in refreshed
         assert "`origin/main` (default)" not in refreshed
 
+    def test_update_flag_refreshes_gza_test_and_fix_verify_lookup_contract(self, tmp_path: Path):
+        """--update should restore the bundled gza-test-and-fix gza.yaml-first lookup contract."""
+        from gza.skills_utils import get_skills_source_path
+
+        setup_config(tmp_path)
+
+        result1 = run_gza("skills-install", "--target", "claude", "gza-test-and-fix", "--project", str(tmp_path))
+        assert result1.returncode == 0
+
+        skill_file = tmp_path / ".claude" / "skills" / "gza-test-and-fix" / "SKILL.md"
+        skill_file.write_text(
+            "---\n"
+            "name: gza-test-and-fix\n"
+            "description: stale\n"
+            "allowed-tools: Read, Edit, Bash(uv run:*), Bash(git:*)\n"
+            "version: 3.0.0\n"
+            "public: true\n"
+            "---\n\n"
+            "Run `uv run gza config` and extract `verify_command` first.\n"
+            "If that fails, fall back to `gza.yaml`.\n"
+        )
+
+        result2 = run_gza(
+            "skills-install",
+            "--target",
+            "claude",
+            "--update",
+            "gza-test-and-fix",
+            "--project",
+            str(tmp_path),
+        )
+        assert result2.returncode == 0
+        assert "updated 1" in result2.stdout
+        assert "(updated)" in result2.stdout
+
+        refreshed = skill_file.read_text()
+        bundled = (get_skills_source_path() / "gza-test-and-fix" / "SKILL.md").read_text()
+        assert refreshed == bundled
+        assert "Read `verify_command` directly from `gza.yaml`" in refreshed
+        assert "do not treat `gza config` failure as an error when `gza.yaml` was readable" in refreshed
+        assert "Run `uv run gza config` and extract `verify_command` first." not in refreshed
+
     def test_update_flag_refreshes_gza_code_review_full_stale_importer_reference(self, tmp_path: Path):
         """--update should replace stale installed importer references in gza-code-review-full."""
         from gza.skills_utils import get_skills_source_path
@@ -670,6 +712,31 @@ class TestSkillContentValidation:
         assert "rely on the configured `verify_command`, not language-specific hardcoded checks" in content
         assert "python -m py_compile" not in content
         assert "verifies Python syntax" not in content
+
+    def test_gza_rebase_preserves_named_target_and_local_primary_branch_fallback(self):
+        """gza-rebase should use the caller target when present and resolve the primary branch otherwise."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-rebase" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "If the caller named a target branch (for example `master`), use that exact branch name." in content
+        assert "Do not substitute `main` or any other default." in content
+        assert "git symbolic-ref --quiet --short refs/remotes/origin/HEAD" in content
+        assert "whichever of `main` or `master` exists locally" in content
+        assert "If no primary branch can be determined, stop and report the failure instead of assuming `main`." in content
+
+    def test_worker_skills_read_gza_yaml_before_optional_gza_config_lookup(self):
+        """Worker-facing skills should prefer gza.yaml because gza CLI may be unavailable in containers."""
+        from gza.skills_utils import get_skills_source_path
+
+        rebase_content = (get_skills_source_path() / "gza-rebase" / "SKILL.md").read_text()
+        test_and_fix_content = (get_skills_source_path() / "gza-test-and-fix" / "SKILL.md").read_text()
+
+        assert "read `verify_command` directly from `gza.yaml`" in rebase_content
+        assert "do not treat `gza config` failure as an error when `gza.yaml` was readable" in rebase_content
+        assert "Read `verify_command` directly from `gza.yaml`" in test_and_fix_content
+        assert "do not treat `gza config` failure as an error when `gza.yaml` was readable" in test_and_fix_content
 
     def test_gza_plan_review_uses_supported_history_flag(self):
         """gza-plan-review should use supported gza history flags in command examples."""

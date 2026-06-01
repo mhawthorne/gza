@@ -215,7 +215,7 @@ def test_invoke_provider_resolve_does_not_create_internal_tasks_and_logs_to_pare
     assert "Running provider command: /gza-rebase --auto --continue" in log_text
 
 
-def test_create_rebase_task_prompt_forbids_remote_git_fallbacks(tmp_path: Path) -> None:
+def test_create_rebase_task_prompt_preserves_caller_target_branch_and_forbids_remote_git_fallbacks(tmp_path: Path) -> None:
     from gza.cli import _create_rebase_task
 
     store = SqliteTaskStore(tmp_path / "test.db")
@@ -226,11 +226,12 @@ def test_create_rebase_task_prompt_forbids_remote_git_fallbacks(tmp_path: Path) 
         store,
         parent.id,
         "feature/test",
-        "main",
+        "master",
         trigger_source="manual",
     )
 
-    assert "local branch 'main'" in rebase_task.prompt
+    assert "local branch 'master'" in rebase_task.prompt
+    assert "local branch 'main'" not in rebase_task.prompt
     assert "Use /gza-rebase --auto" in rebase_task.prompt
     assert "Do not fetch from origin or any other remote" in rebase_task.prompt
     assert "do not run git ls-remote" in rebase_task.prompt

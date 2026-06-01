@@ -14,7 +14,7 @@ Run the project's `verify_command` (from `gza.yaml`), fix any errors, and commit
 
 ### Step 1: Get verify_command
 
-Run `uv run gza config` and extract the `verify_command` value. If `gza config` itself fails (e.g. due to a config-loading bug), fall back to reading `verify_command` directly from `gza.yaml`. If it is empty or not set, stop and tell the user to set `verify_command` in `gza.yaml`.
+Read `verify_command` directly from `gza.yaml` and note `inner_verify_command` if present. If `uv run gza config` is available in this environment, you may use it as an optional confirmation or to inspect merged config, but do not treat `gza config` failure as an error when `gza.yaml` was readable. If `verify_command` is empty or not set in `gza.yaml`, stop and tell the user to set `verify_command` in `gza.yaml`.
 
 ### Step 2: Run verify_command and fix errors (max 3 iterations)
 
