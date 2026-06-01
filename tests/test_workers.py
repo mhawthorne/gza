@@ -244,6 +244,40 @@ def test_registry_is_running(temp_workers_dir):
     assert not registry.is_running("w-test-fake")
 
 
+def test_registry_is_running_rejects_zombie_state(temp_workers_dir):
+    """Zombie PIDs should not be treated as running."""
+    registry = WorkerRegistry(temp_workers_dir)
+    worker = WorkerMetadata(
+        worker_id="w-test-zombie",
+        pid=os.getpid(),
+        pid_start_ticks=123,
+        task_id="gza-3",
+        status="running",
+    )
+    registry.register(worker)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("gza.workers._read_linux_proc_stat", lambda _pid: ("Z", 123))
+        assert not registry.is_running("w-test-zombie")
+
+
+def test_registry_is_running_rejects_reused_pid_with_mismatched_start_ticks(temp_workers_dir):
+    """A reused PID must not be matched to an older worker entry."""
+    registry = WorkerRegistry(temp_workers_dir)
+    worker = WorkerMetadata(
+        worker_id="w-test-reused-pid",
+        pid=os.getpid(),
+        pid_start_ticks=123,
+        task_id="gza-4",
+        status="running",
+    )
+    registry.register(worker)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("gza.workers._read_linux_proc_stat", lambda _pid: ("S", 999))
+        assert not registry.is_running("w-test-reused-pid")
+
+
 def test_registry_record_and_consume_interrupt_request(temp_workers_dir):
     """Interrupt attribution should round-trip once and then be removed."""
     registry = WorkerRegistry(temp_workers_dir)
@@ -323,6 +357,71 @@ def test_registry_ensure_running_preserves_terminal_status(temp_workers_dir):
     assert retrieved.status == "completed"
     assert retrieved.exit_code == 0
     assert retrieved.startup_log_file == ".gza/workers/w-race-terminal-startup.log"
+
+
+def test_registry_ensure_running_refreshes_pid_start_ticks_when_pid_changes(temp_workers_dir):
+    """Updating a worker ID to a new PID must refresh start ticks for liveness checks."""
+    registry = WorkerRegistry(temp_workers_dir)
+    registry.register(
+        WorkerMetadata(
+            worker_id="w-pid-refresh",
+            pid=111,
+            pid_start_ticks=123,
+            task_id="gza-5",
+            started_at=datetime.now(UTC).isoformat(),
+            status="running",
+        )
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("gza.workers._read_linux_proc_stat", lambda pid: ("S", 999) if pid == 222 else None)
+        updated = registry.ensure_running(
+            WorkerMetadata(
+                worker_id="w-pid-refresh",
+                pid=222,
+                task_id="gza-5",
+            )
+        )
+        assert updated.pid_start_ticks == 999
+        assert registry.is_running("w-pid-refresh")
+
+    retrieved = registry.get("w-pid-refresh")
+    assert retrieved is not None
+    assert retrieved.pid == 222
+    assert retrieved.pid_start_ticks == 999
+
+
+def test_registry_ensure_running_clears_pid_start_ticks_when_pid_changes_and_proc_stat_missing(
+    temp_workers_dir,
+):
+    """A PID change must not retain start ticks from the previous process identity."""
+    registry = WorkerRegistry(temp_workers_dir)
+    registry.register(
+        WorkerMetadata(
+            worker_id="w-pid-clear",
+            pid=111,
+            pid_start_ticks=123,
+            task_id="gza-6",
+            started_at=datetime.now(UTC).isoformat(),
+            status="running",
+        )
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("gza.workers._read_linux_proc_stat", lambda pid: None if pid == 222 else ("S", 123))
+        updated = registry.ensure_running(
+            WorkerMetadata(
+                worker_id="w-pid-clear",
+                pid=222,
+                task_id="gza-6",
+            )
+        )
+
+    retrieved = registry.get("w-pid-clear")
+    assert updated.pid_start_ticks is None
+    assert retrieved is not None
+    assert retrieved.pid == 222
+    assert retrieved.pid_start_ticks is None
 
 
 def test_registry_remove(temp_workers_dir):

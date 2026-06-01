@@ -2643,6 +2643,34 @@ class TestWorkCommandMultiTask:
 class TestBackgroundWorkerCommand:
     """Tests for background worker subprocess command construction."""
 
+    def test_spawn_detached_worker_process_starts_background_reaper(self, tmp_path: Path):
+        """Detached bare worker launches should start a background waiter to reap the child."""
+        from gza.cli._common import _spawn_detached_worker_process
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 4321
+        mock_thread = MagicMock()
+
+        with (
+            patch("gza.cli._common.subprocess.Popen", return_value=mock_proc),
+            patch("gza.cli._common.threading.Thread", return_value=mock_thread) as thread_cls,
+        ):
+            proc, startup_log = _spawn_detached_worker_process(["echo", "hi"], config, "w-reap-test")
+
+        assert proc is mock_proc
+        assert startup_log == ".gza/workers/w-reap-test-startup.log"
+        thread_cls.assert_called_once()
+        kwargs = thread_cls.call_args.kwargs
+        assert callable(kwargs["target"])
+        kwargs["target"]()
+        mock_proc.wait.assert_called_once_with()
+        assert kwargs["name"] == "gza-worker-reaper-4321"
+        assert kwargs["daemon"] is True
+        mock_thread.start.assert_called_once_with()
+
     def test_background_worker_command_uses_project_flag(self, tmp_path: Path):
         """Background worker subprocess must pass project dir with --project flag, not as positional arg.
 
@@ -3811,6 +3839,42 @@ class TestReconciliation:
 
         assert registry.get("w-stale-live-terminal") is None
         assert "Warning: Pruning stale terminal worker w-stale-live-terminal" in capsys.readouterr().err
+
+    def test_prune_terminal_dead_workers_silently_removes_zombie_pid(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Zombie worker PIDs should be pruned via the dead-worker path without a stale warning."""
+        from gza.cli._common import prune_terminal_dead_workers
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Terminal task with zombie worker")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-zombie-terminal",
+                task_id=task.id,
+                pid=os.getpid(),
+                pid_start_ticks=123,
+                status="running",
+            )
+        )
+
+        with patch("gza.workers._read_linux_proc_stat", return_value=("Z", 123)):
+            prune_terminal_dead_workers(config)
+
+        assert registry.get("w-zombie-terminal") is None
+        assert "Pruning stale terminal worker" not in capsys.readouterr().err
 
     def test_prune_terminal_dead_workers_prunes_old_terminal_worker_without_completed_at(
         self,

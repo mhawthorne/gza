@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -613,7 +614,22 @@ def _spawn_detached_worker_process(
             start_new_session=True,
             cwd=config.project_dir,
         )
+    _start_detached_process_reaper(proc)
     return proc, str(startup_log_path.relative_to(config.project_dir))
+
+
+def _start_detached_process_reaper(proc: subprocess.Popen) -> None:
+    """Reap short-lived detached children so the parent does not leave zombies behind."""
+
+    def _wait_for_exit() -> None:
+        with contextlib.suppress(Exception):
+            proc.wait()
+
+    threading.Thread(
+        target=_wait_for_exit,
+        name=f"gza-worker-reaper-{proc.pid}",
+        daemon=True,
+    ).start()
 
 
 def _rollback_background_worker_launch(

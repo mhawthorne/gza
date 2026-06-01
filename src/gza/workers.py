@@ -7,6 +7,38 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 
+def _read_linux_proc_stat(pid: int) -> tuple[str, int] | None:
+    """Return Linux proc state and start ticks for a PID when available."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+
+    rparen = stat_text.rfind(")")
+    if rparen == -1:
+        return None
+
+    fields = stat_text[rparen + 2 :].split()
+    if len(fields) <= 19:
+        return None
+
+    state = fields[0]
+    try:
+        start_ticks = int(fields[19])
+    except ValueError:
+        return None
+    return state, start_ticks
+
+
+def _read_pid_start_ticks(pid: int) -> int | None:
+    """Return Linux proc start ticks for a PID when available."""
+    proc_stat = _read_linux_proc_stat(pid)
+    if proc_stat is None:
+        return None
+    _, start_ticks = proc_stat
+    return start_ticks
+
+
 @dataclass
 class WorkerMetadata:
     """Minimal metadata for a worker process index."""
@@ -17,6 +49,7 @@ class WorkerMetadata:
     # Legacy compatibility fields. New writes should avoid relying on these.
     task_slug: str | None = None
     started_at: str | None = None
+    pid_start_ticks: int | None = None
     status: str = "running"
     log_file: str | None = None
     worktree: str | None = None
@@ -53,12 +86,29 @@ class WorkerMetadata:
             # Workers are ephemeral; callers resolve via resolve_task_id if needed.
             task_id = str(raw_task_id)
 
+        raw_pid_start_ticks = data.get("pid_start_ticks")
+        pid_start_ticks: int | None
+        if raw_pid_start_ticks is None:
+            pid_start_ticks = None
+        else:
+            try:
+                pid_start_ticks = int(raw_pid_start_ticks)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Worker metadata has invalid pid_start_ticks: {raw_pid_start_ticks!r}"
+                ) from exc
+            if pid_start_ticks <= 0:
+                raise ValueError(
+                    f"Worker metadata has non-positive pid_start_ticks: {pid_start_ticks}"
+                )
+
         return WorkerMetadata(
             worker_id=str(data.get("worker_id", "")),
             task_id=task_id,
             pid=pid,
             task_slug=data.get("task_slug"),
             started_at=data.get("started_at"),
+            pid_start_ticks=pid_start_ticks,
             status=data.get("status", "running"),
             log_file=data.get("log_file"),
             worktree=data.get("worktree"),
@@ -111,6 +161,8 @@ class WorkerRegistry:
             raise ValueError(f"Cannot register worker with non-positive pid: {worker.pid}")
         if worker.started_at is None:
             worker.started_at = datetime.now(UTC).isoformat()
+        if worker.pid_start_ticks is None:
+            worker.pid_start_ticks = _read_pid_start_ticks(worker.pid)
         metadata_path = self._metadata_path(worker.worker_id)
         metadata_path.write_text(json.dumps(worker.to_dict(), indent=2))
         self._pid_path(worker.worker_id).write_text(str(worker.pid))
@@ -156,6 +208,7 @@ class WorkerRegistry:
                 self.update(existing)
             return existing
 
+        pid_changed = existing.pid != worker.pid
         existing.pid = worker.pid
         if worker.task_id is not None:
             existing.task_id = worker.task_id
@@ -172,6 +225,12 @@ class WorkerRegistry:
             existing.tmux_session = worker.tmux_session
         if existing.started_at is None:
             existing.started_at = worker.started_at
+        if worker.pid_start_ticks is not None:
+            existing.pid_start_ticks = worker.pid_start_ticks
+        elif pid_changed:
+            existing.pid_start_ticks = _read_pid_start_ticks(existing.pid)
+        elif existing.pid_start_ticks is None:
+            existing.pid_start_ticks = _read_pid_start_ticks(existing.pid)
         existing.status = "running"
         existing.exit_code = None
         existing.completion_reason = None
@@ -211,6 +270,14 @@ class WorkerRegistry:
         worker = self.get(worker_id)
         if not worker or worker.pid <= 0:
             return False
+        proc_stat = _read_linux_proc_stat(worker.pid)
+        if proc_stat is not None:
+            state, start_ticks = proc_stat
+            if state == "Z":
+                return False
+            if worker.pid_start_ticks is not None and worker.pid_start_ticks != start_ticks:
+                return False
+            return True
         try:
             os.kill(worker.pid, 0)
             return True
