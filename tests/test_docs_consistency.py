@@ -571,8 +571,10 @@ def test_watch_attention_docs_describe_sticky_manual_attention_behavior() -> Non
     watch_section = config_content.split("### watch", 1)[1].split("### learnings", 1)[0]
 
     assert "surfaced as `ATTENTION` lines in watch output instead of one-shot deduped `SKIP` lines" in watch_section
+    assert "watch does not re-select them for a fresh iterate worker in the meantime" in watch_section
     assert "Ordinary wait/skip states keep the existing `SKIP` dedupe behavior." in watch_section
     assert "sticky `ATTENTION` log lines instead of deduped `SKIP` lines" in internal_content
+    assert "watch reuses that parked action instead of recomputing a fresh lifecycle step" in internal_content
     assert "Ordinary watch skip/wait lines remain deduped across cycles." in internal_content
 
 

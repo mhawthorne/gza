@@ -435,6 +435,7 @@ def test_watch_owner_rows_keep_lifecycle_merge_candidate_and_failed_recovery_sep
     review = store.add("Review merge owner", task_type="review", based_on=impl.id)
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
     assert review.id is not None
     store.get_or_create_merge_unit_for_task(review)
@@ -4685,6 +4686,7 @@ def test_watch_cycle_advances_run_improve_action(tmp_path: Path) -> None:
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     improve = store.add(
@@ -4743,6 +4745,7 @@ def test_watch_cycle_improve_action_with_disabled_auto_recovery_routes_to_iterat
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     failed_improve = store.add(
@@ -5058,8 +5061,8 @@ def test_watch_cycle_improve_action_with_manual_review_failure_routes_to_iterate
     assert f"{impl.id} iterate" in log_text
 
 
-def test_watch_cycle_attempt_capped_improve_chain_routes_to_iterate(tmp_path: Path) -> None:
-    """Watch should hand attempt-capped improve chains to iterate instead of stopping locally."""
+def test_watch_cycle_attempt_capped_improve_chain_stays_parked_without_iterate_respawn(tmp_path: Path) -> None:
+    """Watch should park attempt-capped improve chains instead of re-spawning iterate."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -5108,6 +5111,90 @@ def test_watch_cycle_attempt_capped_improve_chain_routes_to_iterate(tmp_path: Pa
         patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("iterate should not respawn for parked manual review"),
+        ) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    assert _task_count(store) == before_count
+    assert spawn_iterate.call_count == 0
+    text = log_path.read_text()
+    assert "ATTENTION" in text
+    assert "reason=retry-limit-reached" in text
+    assert f"{impl.id} iterate" not in text
+
+
+def test_watch_cycle_runs_pending_improve_even_when_failed_chain_is_parked(tmp_path: Path) -> None:
+    """A pending improve should still run even if older improve attempts exhausted auto-recovery."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/parked-run-improve"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+    git.can_merge.return_value = True
+
+    previous_id = impl.id
+    for _attempt in range(config.max_resume_attempts + 1):
+        failed = store.add(
+            "Failed improve attempt",
+            task_type="improve",
+            depends_on=review.id,
+            based_on=previous_id,
+            same_branch=True,
+        )
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "MAX_STEPS"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+        previous_id = failed.id
+
+    pending_improve = store.add(
+        "Pending improve after manual intervention",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=previous_id,
+        same_branch=True,
+    )
+    assert pending_improve.id is not None
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.determine_next_action",
+            return_value={"type": "run_improve", "improve_task": pending_improve},
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
@@ -5120,11 +5207,12 @@ def test_watch_cycle_attempt_capped_improve_chain_routes_to_iterate(tmp_path: Pa
         )
 
     assert result.work_done is True
-    assert _task_count(store) == before_count
     assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
     text = log_path.read_text()
+    assert f"START     {impl.id} iterate" in text
     assert "ATTENTION" not in text
-    assert f"{impl.id} iterate" in text
+    assert "reason=retry-limit-reached" not in text
 
 
 def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
@@ -5889,6 +5977,104 @@ def test_watch_cycle_logs_attention_for_retry_limit_reached_action(tmp_path: Pat
     assert "ATTENTION" in text
     assert "reason=retry-limit-reached" in text
     assert "SKIP" not in text
+
+
+def test_watch_cycle_skips_parked_retry_limit_lineage_without_recomputing_or_spawning(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/parked-retry-limit"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "MAX_TURNS"
+    failed_improve.session_id = "sess-parked-improve"
+    failed_improve.branch = impl.branch
+    failed_improve.completed_at = datetime.now(UTC)
+    store.update(failed_improve)
+
+    exhausted_improve = store.add(
+        "Failed retry improve",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=failed_improve.id,
+        same_branch=True,
+    )
+    assert exhausted_improve.id is not None
+    exhausted_improve.status = "failed"
+    exhausted_improve.failure_reason = "TIMEOUT"
+    exhausted_improve.session_id = failed_improve.session_id
+    exhausted_improve.branch = impl.branch
+    exhausted_improve.completed_at = datetime.now(UTC)
+    store.update(exhausted_improve)
+
+    config = Config.load(tmp_path)
+    git = _make_watch_git()
+    rows = _query_owner_rows(
+        store=store,
+        config=config,
+        git=git,
+        target_branch="main",
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.lifecycle_action_task is not None
+    assert row.lifecycle_action_task.id == impl.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "improve"
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("parked lineage should not spawn iterate"),
+        ) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    assert spawn_iterate.call_count == 0
+
+    log_text = log_path.read_text()
+    assert "ATTENTION" in log_text
+    assert "reason=retry-limit-reached" in log_text
+    assert not any(line.split(maxsplit=2)[1] == "START" for line in log_text.splitlines())
 
 
 def test_watch_cycle_logs_attention_for_rebase_did_not_unblock_merge_without_spawning_rebase(
@@ -9497,6 +9683,7 @@ def test_watch_iterate_helper_skips_duplicate_impl_worker_for_pending_child(tmp_
         action={"type": "run_improve", "improve_task": improve},
         running_task_ids={impl.id},
         target_branch="main",
+        max_recovery_attempts=1,
     )
 
     assert result is not None

@@ -51,6 +51,7 @@ from ._common import (
     get_store,
     parse_cli_tag_filters,
     resolve_id,
+    resolve_improve_action,
     set_task_queue_position_scoped,
     set_task_urgency,
 )
@@ -66,11 +67,13 @@ from .advance_engine import (
     determine_next_action,
     failed_recovery_decision_to_attention_action,
     format_needs_attention_entry_for_display,
+    get_needs_attention_reason,
     resolve_subject_task,
 )
 from .advance_executor import (
     AdvanceActionExecutionContext,
     AdvanceActionExecutionResult,
+    build_improve_needs_attention_result,
     execute_advance_action,
     resolve_execution_needs_attention,
 )
@@ -91,6 +94,8 @@ from .query import _resolve_incomplete_owner_task
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
 _WATCH_ITERATE_ROUTED_ACTIONS = frozenset({"create_review", "run_review", "improve", "run_improve"})
+_WATCH_PARKED_LINEAGE_POLICY: Literal["skip"] = "skip"
+_WATCH_PARKED_NEEDS_ATTENTION_REASONS = frozenset({"retry-limit-reached", "manual-review-required"})
 T = TypeVar("T")
 
 
@@ -152,6 +157,58 @@ def _watch_skip_message(task: DbTask, action: dict) -> str:
 
 def _watch_needs_attention_message(task: DbTask, action: dict) -> str:
     return format_needs_attention_entry_for_display(task, action=action)
+
+
+def _watch_parked_lineage_action(row: LineageOwnerRow) -> dict[str, Any] | None:
+    """Return the row's already-parked manual-review action when watch should not respawn work."""
+    action = row.next_action
+    if action is None:
+        return None
+    reason = get_needs_attention_reason(action)
+    if reason not in _WATCH_PARKED_NEEDS_ATTENTION_REASONS:
+        return None
+    if _WATCH_PARKED_LINEAGE_POLICY == "skip":
+        return action
+    return None
+
+
+def _watch_parked_iterate_result(
+    *,
+    store: SqliteTaskStore,
+    impl_task: DbTask,
+    action: dict[str, object],
+    action_type: str,
+    max_recovery_attempts: int,
+) -> AdvanceActionExecutionResult | None:
+    """Preflight iterate-routed improve actions that would only re-park immediately."""
+    if _WATCH_PARKED_LINEAGE_POLICY != "skip" or action_type != "improve":
+        return None
+
+    review_task: DbTask | None
+    review = action.get("review_task")
+    review_task = review if isinstance(review, DbTask) else None
+
+    if review_task is None or review_task.id is None or impl_task.id is None:
+        return None
+
+    improve_mode, failed_improve, improve_decision = resolve_improve_action(
+        store,
+        impl_task.id,
+        review_task.id,
+        max_resume_attempts=max_recovery_attempts,
+    )
+    result = build_improve_needs_attention_result(
+        store=store,
+        impl_task=impl_task,
+        review_task=review_task,
+        improve_mode=improve_mode,
+        failed_improve=failed_improve,
+        improve_decision=improve_decision,
+        max_resume_attempts=max_recovery_attempts,
+    )
+    if result is None or result.attention_reason not in _WATCH_PARKED_NEEDS_ATTENTION_REASONS:
+        return None
+    return result
 
 
 def _resolve_watch_attention_display_task(store: SqliteTaskStore, row: LineageOwnerRow) -> DbTask:
@@ -247,6 +304,7 @@ def _watch_iterate_impl_target(
     action: dict[str, object],
     running_task_ids: set[str],
     target_branch: str,
+    max_recovery_attempts: int,
 ) -> DbTask | AdvanceActionExecutionResult | None:
     action_type = str(action.get("type", "skip"))
     if action_type not in _WATCH_ITERATE_ROUTED_ACTIONS:
@@ -364,6 +422,16 @@ def _watch_iterate_impl_target(
             message=f"{impl_task.id}: iterate already running for implementation chain",
             guarded_pending_task_id=guarded_pending_task_id,
         )
+    parked_result = _watch_parked_iterate_result(
+        store=store,
+        impl_task=impl_task,
+        action=action,
+        action_type=action_type,
+        max_recovery_attempts=max_recovery_attempts,
+    )
+    if parked_result is not None:
+        parked_result.guarded_pending_task_id = guarded_pending_task_id
+        return parked_result
     return impl_task
 
 
@@ -1158,11 +1226,14 @@ def _run_cycle(
         action_plan: list[tuple[LineageOwnerRow, DbTask, dict]] = []
         for row in lifecycle_rows:
             task = row.lifecycle_action_task or row.owner_task
+            parked_action = _watch_parked_lineage_action(row)
             action_plan.append(
                 (
                     row,
                     task,
-                    determine_next_action(
+                    parked_action
+                    if parked_action is not None
+                    else determine_next_action(
                         config,
                         store,
                         git,
@@ -1171,7 +1242,7 @@ def _run_cycle(
                         impl_based_on_ids=impl_based_on_ids,
                     ),
                 )
-        )
+            )
         action_plan.sort(
             key=lambda item: (
                 _WATCH_ADVANCE_ACTION_ORDER.get(item[2].get("type", ""), 1),
@@ -1343,6 +1414,7 @@ def _run_cycle(
                 action=action,
                 running_task_ids=running_task_id_set,
                 target_branch=target_branch,
+                max_recovery_attempts=max_recovery_attempts,
             ),
             reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(config, git, t),
         )
