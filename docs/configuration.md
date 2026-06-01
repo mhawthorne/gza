@@ -28,7 +28,7 @@ Gza reads configuration from three YAML layers:
 | `tasks_file` | String | `tasks.yaml` | Path to legacy tasks file |
 | `log_dir` | String | `.gza/logs` | Directory for log files |
 | `use_docker` | Boolean | `true` | Whether to run Claude in Docker container |
-| `enforce_project_scope` | Boolean | `true` | Fail code-task commits that stage paths outside the project subtree or declared in-repo local deps. Tasks tagged `cross-project` are exempt. |
+| `enforce_project_scope` | Boolean | `true` | Fail code-task commits that stage paths outside the project subtree or declared in-repo local deps. Tasks tagged `cross-project` may span multiple discovered project roots, including new roots declared by changed `gza.yaml` files on the branch, but still fail if they touch paths outside all discovered or branch-declared project roots. |
 | `docker_image` | String | `{project_name}-gza` | Custom Docker image name |
 | `docker_setup_command` | String | `""` | Pre-warm hook run synchronously in Docker before provider CLI starts |
 | `docker_volumes` | List | `[]` | Custom Docker volume mounts (e.g., `["/host:/container:ro"]`) |
@@ -73,9 +73,11 @@ Gza reads configuration from three YAML layers:
 When `gza.yaml` lives below the git repo root, Gza treats that subdirectory as the default write boundary for code tasks. Commits that stage files outside the project subtree fail with `PROJECT_SCOPE_VIOLATION` unless one of these is true:
 
 - `enforce_project_scope: false`
-- The task has the reserved `cross-project` tag
+- The task has the reserved `cross-project` tag and every changed path falls under a discovered sibling project root, or under a new project root declared by a changed `gza.yaml` on the branch
 
 In-repo local dependencies resolved from `uv.lock` widen the allowed write scope automatically. Out-of-repo local dependencies stay read-only in Docker via auto-injected bind mounts.
+
+For `cross-project` tasks, execution still stays anchored to the configured project root. Verification is per affected project: Gza discovers changed project roots from the branch diff, including project configs added on the branch itself, then runs each affected project's own `verify_command` from that project's root. Affected projects with no `verify_command` are reported as skipped rather than silently treated as passing.
 
 ### Local Overrides (gza.local.yaml)
 

@@ -79,6 +79,11 @@ from .learnings import maybe_auto_regenerate_learnings
 from .lineage import get_plan_for_task
 from .log_paths import TaskLogPaths, ops_log_path_for, resolve_ops_log_path, resolve_task_log_paths
 from .pr_ops import build_task_pr_content, ensure_task_pr, sync_task_branch_if_live_pr
+from .project_discovery import (
+    RepoProjectConfig,
+    resolve_affected_repo_projects,
+    resolve_repo_root,
+)
 from .prompt_sanitization import sanitize_provider_prompt
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
@@ -288,14 +293,7 @@ def _strip_owned_artifact_patch_sections(
 
 def _resolve_repo_root(project_dir: Path) -> Path:
     """Resolve the git repo root that contains ``project_dir``."""
-    current = project_dir.resolve()
-    while True:
-        if (current / ".git").exists():
-            return current
-        parent = current.parent
-        if parent == current:
-            return project_dir.resolve()
-        current = parent
+    return resolve_repo_root(project_dir)
 
 
 def _resolve_local_dependencies_from_uv_lock(project_dir: Path, repo_root: Path) -> tuple[LocalDependency, ...]:
@@ -386,9 +384,9 @@ def _container_project_root(boundary: ProjectBoundary) -> Path:
     return container_root / boundary.scope_root
 
 
-def _container_execution_dir(boundary: ProjectBoundary, *, cross_project: bool) -> Path:
+def _container_execution_dir(boundary: ProjectBoundary) -> Path:
     """Return the container cwd for provider execution."""
-    if cross_project or boundary.scope_root == Path("."):
+    if boundary.scope_root == Path("."):
         return Path("/workspace")
     return _container_project_root(boundary)
 
@@ -400,11 +398,29 @@ def _worktree_project_root(worktree_path: Path, boundary: ProjectBoundary) -> Pa
     return worktree_path / boundary.scope_root
 
 
-def _worktree_execution_dir(worktree_path: Path, boundary: ProjectBoundary, *, cross_project: bool) -> Path:
+def _worktree_execution_dir(worktree_path: Path, boundary: ProjectBoundary) -> Path:
     """Return the host cwd for provider execution."""
-    if cross_project or boundary.scope_root == Path("."):
+    if boundary.scope_root == Path("."):
         return worktree_path
     return _worktree_project_root(worktree_path, boundary)
+
+
+def _parse_changed_paths_from_name_status(output: str) -> set[str]:
+    """Return repo-relative paths mentioned by ``git diff --name-status`` output."""
+    changed_paths: set[str] = set()
+    for line in output.splitlines():
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split("\t") if part.strip()]
+        if len(parts) < 2:
+            continue
+        changed_paths.update(parts[1:])
+    return changed_paths
+
+
+def _format_repo_project_scope(scope_root: Path) -> str:
+    """Format a repo-relative project root for display."""
+    return "." if scope_root == Path(".") else scope_root.as_posix()
 
 
 def _worktree_path_for_project_path(config: Config, worktree_path: Path, project_path: Path) -> Path:
@@ -446,9 +462,22 @@ def _find_out_of_scope_paths(
     config: Config,
     files_to_stage: set[str],
     *,
+    task: Task | None = None,
     strict_scope: bool = False,
+    repo_root: Path | None = None,
+    declared_project_roots: tuple[Path, ...] = (),
 ) -> list[str]:
     """Return sorted repo-relative paths that violate the current project scope."""
+    if task is not None and _task_is_cross_project(task):
+        return list(
+            resolve_affected_repo_projects(
+                config,
+                files_to_stage,
+                repo_root=repo_root,
+                declared_project_roots=declared_project_roots,
+            ).unknown_paths
+        )
+
     boundary = _project_boundary(config)
     allowed_roots = (
         boundary.strict_project_rooted_paths
@@ -2160,6 +2189,94 @@ def _run_review_verify_command(
         logger.warning(warning_message)
         console.print(f"[yellow]Warning: {warning_message}[/yellow]")
     return _format_review_verify_result(verify_command, result)
+
+
+def _format_review_verify_skip(project: RepoProjectConfig, reason: str) -> str:
+    """Format an explicit skipped verification entry for a discovered project."""
+    scope = _format_repo_project_scope(project.scope_root)
+    return "\n".join(
+        [
+            f"### {scope}",
+            "",
+            f"- Working directory: `{scope}`",
+            "- Status: skipped",
+            f"- Reason: {reason}",
+        ]
+    )
+
+
+def _run_review_verify_commands_for_projects(
+    *,
+    config: Config,
+    task: Task,
+    worktree_git: Git,
+    worktree_path: Path,
+    timeout_seconds: int,
+) -> str | None:
+    """Run autonomous review verification from each affected project root."""
+    if not _task_is_cross_project(task):
+        verify_command = config.verify_command if isinstance(config.verify_command, str) else ""
+        if not verify_command.strip():
+            return None
+        return _run_review_verify_command(
+            verify_command.strip(),
+            cwd=_worktree_project_root(worktree_path, _project_boundary(config)),
+            timeout_seconds=timeout_seconds,
+        )
+
+    default_branch = worktree_git.default_branch()
+    changed_paths = _parse_changed_paths_from_name_status(
+        worktree_git.get_diff_name_status(f"{default_branch}...HEAD", check=True)
+    )
+    if not changed_paths:
+        return None
+
+    affected = resolve_affected_repo_projects(
+        config,
+        changed_paths,
+        repo_root=worktree_path,
+    )
+    if not affected.projects and not affected.unknown_paths:
+        return None
+
+    sections: list[str] = ["## verify_command result", ""]
+    for project in affected.projects:
+        scope = _format_repo_project_scope(project.scope_root)
+        if not project.verify_command:
+            sections.extend(
+                [
+                    _format_review_verify_skip(
+                        project,
+                        "no verify_command configured for this affected project",
+                    ),
+                    "",
+                ]
+            )
+            continue
+
+        result = _run_review_verify_command(
+            project.verify_command,
+            cwd=worktree_path if project.scope_root == Path(".") else worktree_path / project.scope_root,
+            timeout_seconds=timeout_seconds,
+        )
+        result_lines = result.splitlines()
+        if result_lines[:2] == ["## verify_command result", ""]:
+            result_lines = result_lines[2:]
+        sections.extend([f"### {scope}", "", f"- Working directory: `{scope}`", *result_lines, ""])
+
+    if affected.unknown_paths:
+        sections.extend(
+            [
+                "### unknown paths",
+                "",
+                "- Status: skipped",
+                "- Reason: affected paths fell outside all discovered project roots",
+                f"- Paths: {', '.join(affected.unknown_paths)}",
+                "",
+            ]
+        )
+
+    return "\n".join(sections).rstrip()
 
 
 def _default_code_task_commit_subject(task_slug: str | None, task_db_id: str | None) -> str:
@@ -4783,9 +4900,16 @@ def _complete_code_task(
         if (
             files_to_stage
             and getattr(config, "enforce_project_scope", True)
-            and not _task_is_cross_project(task)
         ):
-            out_of_scope_paths = _find_out_of_scope_paths(config, files_to_stage)
+            worktree_repo_root = getattr(worktree_git, "repo_dir", None)
+            if not isinstance(worktree_repo_root, Path):
+                worktree_repo_root = None
+            out_of_scope_paths = _find_out_of_scope_paths(
+                config,
+                files_to_stage,
+                task=task,
+                repo_root=worktree_repo_root,
+            )
             if out_of_scope_paths:
                 failure_message = (
                     "Project scope violation: refusing to commit out-of-scope paths:\n"
@@ -5639,8 +5763,7 @@ def _run_inner(
     summary_dir = summary_path.parent
     summary_dir.mkdir(parents=True, exist_ok=True)
     boundary = _project_boundary(config)
-    cross_project = _task_is_cross_project(task)
-    provider_cwd = _worktree_execution_dir(worktree_path, boundary, cross_project=cross_project)
+    provider_cwd = _worktree_execution_dir(worktree_path, boundary)
 
     # Create summary directory structure in worktree
     worktree_summary_dir = _worktree_path_for_project_path(config, worktree_path, summary_dir)
@@ -5679,7 +5802,7 @@ def _run_inner(
     _copy_learnings_to_worktree(config, worktree_path)
 
     task_config.provider_cwd = provider_cwd
-    task_config.docker_workdir = str(_container_execution_dir(boundary, cross_project=cross_project))
+    task_config.docker_workdir = str(_container_execution_dir(boundary))
     task_config.docker_volumes = _build_runtime_docker_volumes(config)
 
     if not config.use_docker:
@@ -6055,11 +6178,11 @@ def _run_non_code_task(
         console.print(f"Creating worktree: {worktree_path}")
         if git:
             git._run("worktree", "add", "--detach", str(worktree_path), base_ref)
+        worktree_git = Git(worktree_path)
 
     # Create report directory structure in worktree
         boundary = _project_boundary(config)
-        cross_project = _task_is_cross_project(task)
-        provider_cwd = _worktree_execution_dir(worktree_path, boundary, cross_project=cross_project)
+        provider_cwd = _worktree_execution_dir(worktree_path, boundary)
         worktree_report_dir = _worktree_path_for_project_path(config, worktree_path, report_path.parent)
         worktree_report_dir.mkdir(parents=True, exist_ok=True)
         worktree_report_path = _worktree_path_for_project_path(config, worktree_path, report_path)
@@ -6082,7 +6205,7 @@ def _run_non_code_task(
             _copy_learnings_to_worktree(config, worktree_path)
 
         config.provider_cwd = provider_cwd
-        config.docker_workdir = str(_container_execution_dir(boundary, cross_project=cross_project))
+        config.docker_workdir = str(_container_execution_dir(boundary))
         config.docker_volumes = _build_runtime_docker_volumes(config)
 
         if not config.use_docker:
@@ -6111,12 +6234,7 @@ def _run_non_code_task(
             )
         else:
             review_verify_result = None
-            verify_command = (
-                config.verify_command
-                if isinstance(config.verify_command, str) and config.verify_command.strip()
-                else None
-            )
-            if task.task_type == "review" and verify_command is not None:
+            if task.task_type == "review":
                 review_verify_timeout_seconds = getattr(
                     config,
                     "review_verify_timeout_seconds",
@@ -6124,9 +6242,11 @@ def _run_non_code_task(
                 )
                 if not isinstance(review_verify_timeout_seconds, int) or review_verify_timeout_seconds < 1:
                     review_verify_timeout_seconds = REVIEW_VERIFY_TIMEOUT_SECONDS
-                review_verify_result = _run_review_verify_command(
-                    verify_command,
-                    cwd=provider_cwd,
+                review_verify_result = _run_review_verify_commands_for_projects(
+                    config=config,
+                    task=task,
+                    worktree_git=worktree_git,
+                    worktree_path=worktree_path,
                     timeout_seconds=review_verify_timeout_seconds,
                 )
             prompt = build_prompt(

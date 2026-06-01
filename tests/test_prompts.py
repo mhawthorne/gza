@@ -1146,6 +1146,44 @@ class TestVerifyCommandInjection:
         assert "Verification policy for this code task:" in result
         assert "uv run pytest tests/" in result
 
+    def test_cross_project_prompt_lists_per_project_verify_commands(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement shared change", task_type="implement")
+        task.tags = ("cross-project",)
+        store.update(task)
+
+        project_dir = tmp_path / "services" / "foo"
+        sibling_dir = tmp_path / "libs" / "bar"
+        skipped_dir = tmp_path / "apps" / "baz"
+        project_dir.mkdir(parents=True)
+        sibling_dir.mkdir(parents=True)
+        skipped_dir.mkdir(parents=True)
+        (project_dir / "gza.yaml").write_text(
+            "project_name: foo\nverify_command: ./bin/foo-verify\ninner_verify_command: ./bin/foo-quick\n"
+        )
+        (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+        (skipped_dir / "gza.yaml").write_text("project_name: baz\n")
+
+        config = Config(
+            project_dir=project_dir,
+            project_name="foo",
+            verify_command="./bin/foo-verify",
+            inner_verify_command="./bin/foo-quick",
+        )
+        config._project_boundary_cache = type(
+            "Boundary",
+            (),
+            {"repo_root": tmp_path, "scope_root": Path("services/foo"), "local_dependencies": ()},
+        )()
+
+        result = PromptBuilder().build(task, config, store)
+
+        assert "Cross-project verification policy:" in result
+        assert "Project `services/foo` final verify: `./bin/foo-verify`" in result
+        assert "Project `libs/bar` final verify: `./bin/bar-verify`" in result
+        assert "Project `apps/baz` has no `verify_command`" in result
+
     def test_verify_command_not_injected_when_empty(self, tmp_path: Path):
         """Test that no verification instruction is added when verify_command is empty."""
         db_path = tmp_path / "test.db"

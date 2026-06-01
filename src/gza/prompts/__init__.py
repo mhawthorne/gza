@@ -9,6 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from gza.project_discovery import discover_repo_project_configs
+
 if TYPE_CHECKING:
     from gza.config import Config
     from gza.db import SqliteTaskStore, Task
@@ -36,12 +38,36 @@ def _get_optional_verify_command(config: Config, field_name: str) -> str:
     return value
 
 
-def _code_task_verify_instructions(config: Config) -> str:
+def _cross_project_verify_instructions(task: Task, config: Config) -> str:
+    """Build additional verification guidance for cross-project code tasks."""
+    tags = tuple(getattr(task, "tags", ()) or ())
+    if "cross-project" not in tags:
+        return ""
+
+    lines = [
+        "Cross-project verification policy:",
+        "- `cross-project` widens allowed change scope; it does not change the primary execution root.",
+        "- If you modify multiple project roots, run each affected project's configured verification from that project's own root before finishing.",
+        "- If an affected project has no `verify_command`, explicitly note that it was skipped; do not assume that project passed.",
+    ]
+    for project in discover_repo_project_configs(config):
+        scope = "." if project.scope_root == Path(".") else project.scope_root.as_posix()
+        if project.verify_command:
+            line = f"- Project `{scope}` final verify: `{project.verify_command}`"
+            if project.inner_verify_command:
+                line += f" (inner-loop: `{project.inner_verify_command}`)"
+        else:
+            line = f"- Project `{scope}` has no `verify_command`; affected changes there must be reported as skipped verification."
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _code_task_verify_instructions(task: Task, config: Config) -> str:
     """Build the code-task verification policy block for prompts."""
     final_command = _get_optional_verify_command(config, "verify_command")
     inner_command = _get_optional_verify_command(config, "inner_verify_command")
     if not final_command:
-        return ""
+        return _cross_project_verify_instructions(task, config)
 
     lines = [
         "Verification policy for this code task:",
@@ -58,6 +84,9 @@ def _code_task_verify_instructions(config: Config) -> str:
             "- If the final verify fails, fix the failures and rerun it. Do not rerun previously successful heavy phases unless your later edits require it.",
         ]
     )
+    cross_project = _cross_project_verify_instructions(task, config)
+    if cross_project:
+        lines.extend(["", cross_project])
     return "\n".join(lines)
 
 
@@ -177,7 +206,7 @@ class PromptBuilder:
                     learnings_check=learnings_check
                 )
 
-            verify_instructions = _code_task_verify_instructions(config)
+            verify_instructions = _code_task_verify_instructions(task, config)
             if verify_instructions:
                 base_prompt += f"\n\n{verify_instructions}"
         elif task.task_type == "improve":
@@ -198,7 +227,7 @@ class PromptBuilder:
                     learnings_check=learnings_check
                 )
 
-            verify_instructions = _code_task_verify_instructions(config)
+            verify_instructions = _code_task_verify_instructions(task, config)
             if verify_instructions:
                 base_prompt += f"\n\n{verify_instructions}"
         elif task.task_type == "fix":
@@ -219,11 +248,11 @@ class PromptBuilder:
                     learnings_check=learnings_check
                 )
 
-            verify_instructions = _code_task_verify_instructions(config)
+            verify_instructions = _code_task_verify_instructions(task, config)
             if verify_instructions:
                 base_prompt += f"\n\n{verify_instructions}"
         elif task.task_type == "rebase":
-            verify_instructions = _code_task_verify_instructions(config)
+            verify_instructions = _code_task_verify_instructions(task, config)
             if verify_instructions:
                 base_prompt += f"\n\n{verify_instructions}"
         elif task.task_type in ("internal", "learn"):

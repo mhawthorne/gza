@@ -73,6 +73,7 @@ def _setup_monorepo(tmp_path: Path, *, enforce_project_scope: bool = True) -> tu
         "worktree_dir: .gza-test-worktrees\n"
         "db_path: .gza/gza.db\n"
     )
+    (sibling_dir / "gza.yaml").write_text("project_name: bar\nproject_prefix: bar\n")
 
     subprocess.run(["git", "add", "."], cwd=repo_root, check=True, capture_output=True, text=True)
     subprocess.run(["git", "commit", "-m", "initial"], cwd=repo_root, check=True, capture_output=True, text=True)
@@ -174,7 +175,7 @@ def test_monorepo_project_boundary_flow(tmp_path: Path) -> None:
     assert retried.status == "completed"
     assert retried.branch is not None
     assert git.count_commits_ahead(retried.branch, "main") == 1
-    assert not marker_path.read_text().endswith("/services/foo")
+    assert marker_path.read_text().endswith("/services/foo")
 
 
 @pytest.mark.functional

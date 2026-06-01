@@ -10,8 +10,8 @@ import pytest
 
 from gza.advance_engine import (
     ADVANCE_RULES,
-    _resolve_and_persist_post_merge_rebase_state,
     WORKER_CONSUMING_ACTIONS,
+    _resolve_and_persist_post_merge_rebase_state,
     classify_advance_action,
     evaluate_advance_rules,
     failed_recovery_decision_to_action,
@@ -141,6 +141,7 @@ def _set_subdir_project_boundary(config: Config, tmp_path: Path) -> None:
     repo_root = tmp_path
     project_dir = tmp_path / "services" / "foo"
     project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
     config.project_dir = project_dir
     config.enforce_project_scope = True
     setattr(
@@ -160,6 +161,7 @@ def _set_subdir_project_boundary_with_dependency(config: Config, tmp_path: Path)
     repo_root = tmp_path
     project_dir = tmp_path / "services" / "foo"
     project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
     dependency_path = tmp_path / "dre"
     dependency_path.mkdir(parents=True, exist_ok=True)
     config.project_dir = project_dir
@@ -1571,6 +1573,9 @@ def test_cross_project_tag_allows_out_of_scope_change_to_advance(tmp_path: Path)
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     _set_subdir_project_boundary(config, tmp_path)
+    sibling_project_dir = tmp_path / "dre" / "web"
+    sibling_project_dir.mkdir(parents=True, exist_ok=True)
+    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nverify_command: ./bin/web-verify\n")
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -1591,6 +1596,99 @@ def test_cross_project_tag_allows_out_of_scope_change_to_advance(tmp_path: Path)
 
     assert action["type"] == "create_review"
     assert action.get("needs_attention_reason") is None
+
+
+def test_cross_project_tag_still_parks_unknown_paths_outside_discovered_roots(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+    sibling_project_dir = tmp_path / "dre" / "web"
+    sibling_project_dir.mkdir(parents=True, exist_ok=True)
+    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nverify_command: ./bin/web-verify\n")
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/cross-project-unknown",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    impl.tags = ("cross-project",)
+    store.update(impl)
+
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={
+            "main...feat/cross-project-unknown": "M\tservices/foo/app.py\nM\tmisc/tools.py\n",
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "project-scope-violation"
+    assert action["out_of_scope_paths"] == ("misc/tools.py",)
+    assert "outside all discovered project roots" in action["description"]
+
+
+def test_cross_project_tag_branch_declared_project_root_advances_without_checkout_config(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/cross-project-branch-local-root",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    impl.tags = ("cross-project",)
+    store.update(impl)
+
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={
+            "main...feat/cross-project-branch-local-root": (
+                "M\tservices/foo/app.py\n"
+                "A\tlibs/new/gza.yaml\n"
+                "A\tlibs/new/src/file.py\n"
+            ),
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_review"
+    assert action.get("needs_attention_reason") is None
+
+
+def test_cross_project_tag_branch_local_path_without_declared_root_still_parks(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/cross-project-missing-branch-root",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    impl.tags = ("cross-project",)
+    store.update(impl)
+
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={
+            "main...feat/cross-project-missing-branch-root": (
+                "M\tservices/foo/app.py\n"
+                "A\tlibs/new/src/file.py\n"
+            ),
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "project-scope-violation"
+    assert action["out_of_scope_paths"] == ("libs/new/src/file.py",)
 
 
 def test_strict_scope_diff_exception_parks_for_human(tmp_path: Path) -> None:

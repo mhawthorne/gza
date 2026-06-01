@@ -27,19 +27,19 @@ from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
-    ProjectBoundary,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
     SUMMARY_DIR,
-    RunInvocationContext,
     WIP_DIR,
+    ProjectBoundary,
+    RunInvocationContext,
     _build_code_task_commit_subject,
     _build_context_from_chain,
-    _build_timeout_resume_context,
     _build_review_improve_lineage_context,
+    _build_timeout_resume_context,
     _check_dependency_merge_precondition,
     _complete_code_task,
-    _compute_tree_fingerprint,
     _compute_slug_override,
+    _compute_tree_fingerprint,
     _copy_learnings_to_worktree,
     _create_and_run_review_task,
     _ensure_work_pr_for_completed_code_task,
@@ -49,19 +49,21 @@ from gza.runner import (
     _format_review_verify_result,
     _get_task_output,
     _post_complete_code_task,
-    _restore_wip_changes,
     _resolve_code_task_branch_name,
     _resolve_task_timeout_budget,
+    _restore_wip_changes,
     _run_inner,
     _run_non_code_task,
     _run_result_to_stats,
     _run_review_verify_command,
+    _run_review_verify_commands_for_projects,
     _save_wip_changes,
     _select_worktree_base_ref,
     _setup_code_task_worktree,
     _slug_exists,
     _snapshot_task_db_to_worktree,
     _stage_worktree_agent_resources,
+    _write_timeout_resume_checkpoint,
     backup_database,
     build_prompt,
     generate_slug,
@@ -72,7 +74,6 @@ from gza.runner import (
     run,
     write_execution_provenance_event,
     write_log_entry,
-    _write_timeout_resume_checkpoint,
     write_worker_start_event,
 )
 from gza.worktree_roots import managed_worktree_root_paths
@@ -1607,6 +1608,117 @@ class TestReviewContextFromChain:
         assert result == _format_review_verify_result("printf 'all good\\n'", completed)
         mock_warning.assert_not_called()
         mock_print.assert_not_called()
+
+    def test_run_review_verify_commands_for_cross_project_runs_each_affected_project(self, tmp_path: Path):
+        project_dir = tmp_path / "services" / "foo"
+        sibling_dir = tmp_path / "libs" / "bar"
+        skipped_dir = tmp_path / "apps" / "baz"
+        worktree_path = tmp_path / "worktree"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        worktree_sibling_dir = worktree_path / "libs" / "bar"
+        worktree_skipped_dir = worktree_path / "apps" / "baz"
+        project_dir.mkdir(parents=True)
+        sibling_dir.mkdir(parents=True)
+        skipped_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        worktree_sibling_dir.mkdir(parents=True)
+        worktree_skipped_dir.mkdir(parents=True)
+        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+        (skipped_dir / "gza.yaml").write_text("project_name: baz\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (worktree_sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+        (worktree_skipped_dir / "gza.yaml").write_text("project_name: baz\n")
+
+        config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
+        task.tags = ("cross-project",)
+
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = (
+            "M\tservices/foo/app.py\n"
+            "M\tlibs/bar/lib.py\n"
+            "M\tapps/baz/view.py\n"
+            "M\tmisc/tool.py\n"
+        )
+        with patch(
+            "gza.runner._run_review_verify_command",
+            side_effect=[
+                "## verify_command result\n\n- Command: `./bin/foo-verify`\n- Status: passed",
+                "## verify_command result\n\n- Command: `./bin/bar-verify`\n- Status: failed",
+            ],
+        ) as mock_verify:
+            result = _run_review_verify_commands_for_projects(
+                config=config,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=120,
+            )
+
+        assert result is not None
+        assert "### services/foo" in result
+        assert "### libs/bar" in result
+        assert "### apps/baz" in result
+        assert "no verify_command configured for this affected project" in result
+        assert "outside all discovered project roots" in result
+        verify_calls = mock_verify.call_args_list
+        assert len(verify_calls) == 2
+        assert verify_calls[0].kwargs["cwd"] == worktree_path / "services" / "foo"
+        assert verify_calls[1].kwargs["cwd"] == worktree_path / "libs" / "bar"
+
+    def test_run_review_verify_commands_for_cross_project_uses_branch_local_verify_commands(self, tmp_path: Path):
+        repo_root = tmp_path / "repo"
+        worktree_path = tmp_path / "worktree"
+        project_dir = repo_root / "services" / "foo"
+        sibling_dir = repo_root / "libs" / "bar"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        worktree_sibling_dir = worktree_path / "libs" / "bar"
+        project_dir.mkdir(parents=True)
+        sibling_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        worktree_sibling_dir.mkdir(parents=True)
+        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify-old\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (worktree_sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify-new\n")
+
+        config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
+        task.tags = ("cross-project",)
+
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/gza.yaml\nM\tlibs/bar/lib.py\n"
+
+        with patch(
+            "gza.runner._run_review_verify_command",
+            return_value="## verify_command result\n\n- Command: `./bin/bar-verify-new`\n- Status: passed",
+        ) as mock_verify:
+            result = _run_review_verify_commands_for_projects(
+                config=config,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=120,
+            )
+
+        assert result is not None
+        assert "### libs/bar" in result
+        mock_verify.assert_called_once()
+        assert mock_verify.call_args.args[0] == "./bin/bar-verify-new"
+        assert mock_verify.call_args.kwargs["cwd"] == worktree_path / "libs" / "bar"
 
     def test_review_context_includes_changed_files_diffstat_and_diff(self, tmp_path: Path):
         """Review context should include changed files, diffstat, and inline diff."""

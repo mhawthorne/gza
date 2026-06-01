@@ -82,11 +82,12 @@ For each task, `evaluate_advance_rules()` returns an action from `src/gza/advanc
 
 ### Strict project scope
 
-Before advance queues rebase, review, improve, or merge work for a code-changing branch, it checks the branch diff against the task's strict project scope. This uses the existing project-boundary machinery, but for this verdict only the configured project subdirectory is writable: declared in-repo dependency paths are treated as out of scope unless the task is explicitly tagged `cross-project`.
+Before advance queues rebase, review, improve, or merge work for a code-changing branch, it checks the branch diff against the task's strict project scope. This uses the existing project-boundary machinery, but for this verdict only the configured project subdirectory is writable unless the task is explicitly tagged `cross-project`. Cross-project tasks still fail closed if the branch touches paths outside all discovered project roots or any new roots declared by changed branch-local `gza.yaml` files.
 
 | Condition | Action |
 |-----------|--------|
 | Branch diff includes any path outside the strict project scope AND task is not tagged `cross-project` | `needs_discussion` — park for human review immediately, list the offending paths, and tell the operator to tag `cross-project` and re-advance if intended or fix the branch |
+| Branch diff for a tagged `cross-project` task includes any path outside all discovered project roots and branch-declared `gza.yaml` roots | `needs_discussion` — park for human review immediately, list the offending paths, and tell the operator to fix the branch or add missing project configs so the affected roots are discoverable |
 | Branch diff cannot be inspected reliably for the strict-scope check | `needs_discussion` — fail closed, say that strict project scope could not be verified, and stop all automation until the operator fixes the ref/diff problem or tags `cross-project` if the wider scope is intended |
 
 ### 4. Merge conflicts

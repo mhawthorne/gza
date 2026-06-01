@@ -821,6 +821,11 @@ def test_complete_code_task_fails_on_out_of_scope_paths(tmp_path: Path) -> None:
     config.log_path = config.project_dir / ".gza" / "logs"
     config.log_path.mkdir(parents=True, exist_ok=True)
     config.enforce_project_scope = True
+    config._project_boundary_cache = ProjectBoundary(
+        repo_root=tmp_path,
+        scope_root=Path("services/foo"),
+        local_dependencies=(),
+    )
 
     log_file = config.log_path / "scope.log"
     worktree_summary_path = tmp_path / "worktree-summary.md"
@@ -871,9 +876,22 @@ def test_complete_code_task_allows_out_of_scope_paths_for_cross_project_tag(tmp_
     config = Mock(spec=Config)
     config.project_dir = tmp_path / "services" / "foo"
     config.project_dir.mkdir(parents=True)
+    (config.project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    sibling_project_dir = tmp_path / "services" / "bar"
+    sibling_project_dir.mkdir(parents=True)
+    (sibling_project_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
     config.log_path = config.project_dir / ".gza" / "logs"
     config.log_path.mkdir(parents=True, exist_ok=True)
     config.enforce_project_scope = True
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        ),
+    )
 
     log_file = config.log_path / "cross-project.log"
     worktree_summary_path = tmp_path / "worktree-summary.md"
@@ -888,11 +906,7 @@ def test_complete_code_task_allows_out_of_scope_paths_for_cross_project_tag(tmp_
 
     with patch("gza.runner._project_boundary") as mock_boundary, \
          patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
-        mock_boundary.return_value = ProjectBoundary(
-            repo_root=tmp_path,
-            scope_root=Path("services/foo"),
-            local_dependencies=(),
-        )
+        mock_boundary.return_value = config._project_boundary_cache
         rc = _complete_code_task(
             task,
             config,
@@ -911,6 +925,144 @@ def test_complete_code_task_allows_out_of_scope_paths_for_cross_project_tag(tmp_
     assert rc == 0
     worktree_git.add.assert_called_once_with("services/bar/file.py")
     assert worktree_git.commit.call_count == 1
+
+
+def test_complete_code_task_cross_project_fails_on_unknown_project_path(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = store.add("Cross-project task", task_type="implement")
+    task.slug = "20260427-cross-project-unknown"
+    task.status = "in_progress"
+    task.tags = ("cross-project",)
+    store.update(task)
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path / "services" / "foo"
+    config.project_dir.mkdir(parents=True)
+    (config.project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    sibling_project_dir = tmp_path / "services" / "bar"
+    sibling_project_dir.mkdir(parents=True)
+    (sibling_project_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+    config.log_path = config.project_dir / ".gza" / "logs"
+    config.log_path.mkdir(parents=True, exist_ok=True)
+    config.enforce_project_scope = True
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        ),
+    )
+    config._project_boundary_cache = ProjectBoundary(
+        repo_root=tmp_path,
+        scope_root=Path("services/foo"),
+        local_dependencies=(),
+    )
+
+    log_file = config.log_path / "cross-project-unknown.log"
+    worktree_summary_path = tmp_path / "worktree-summary.md"
+    worktree_summary_path.write_text("# Summary\n")
+    summary_path = config.project_dir / ".gza" / "summaries" / "cross-project-unknown.md"
+
+    worktree_git = Mock()
+    worktree_git.status_porcelain.return_value = {("M", "misc/file.py")}
+
+    with patch("gza.runner._project_boundary") as mock_boundary:
+        mock_boundary.return_value = config._project_boundary_cache
+        rc = _complete_code_task(
+            task,
+            config,
+            store,
+            worktree_git,
+            log_file,
+            "feature/cross-project-unknown",
+            TaskStats(duration_seconds=1.0, num_steps_computed=1, cost_usd=0.0),
+            0,
+            pre_run_status=set(),
+            worktree_summary_path=worktree_summary_path,
+            summary_path=summary_path,
+            summary_dir=summary_path.parent,
+        )
+
+    assert rc == 0
+    worktree_git.add.assert_not_called()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert refreshed.failure_reason == "PROJECT_SCOPE_VIOLATION"
+
+
+def test_complete_code_task_cross_project_allows_branch_local_new_project_config(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = store.add("Cross-project task", task_type="implement")
+    task.slug = "20260427-cross-project-branch-local"
+    task.status = "in_progress"
+    task.tags = ("cross-project",)
+    store.update(task)
+
+    repo_root = tmp_path / "repo"
+    worktree_root = tmp_path / "worktree"
+    config = Mock(spec=Config)
+    config.project_dir = repo_root / "services" / "foo"
+    config.project_dir.mkdir(parents=True)
+    (config.project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (worktree_root / "services" / "foo").mkdir(parents=True)
+    (worktree_root / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (worktree_root / "libs" / "new").mkdir(parents=True)
+    (worktree_root / "libs" / "new" / "gza.yaml").write_text("project_name: new\nverify_command: ./bin/new-verify\n")
+    config.log_path = config.project_dir / ".gza" / "logs"
+    config.log_path.mkdir(parents=True, exist_ok=True)
+    config.enforce_project_scope = True
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        ),
+    )
+
+    log_file = config.log_path / "cross-project-branch-local.log"
+    worktree_summary_path = tmp_path / "worktree-summary.md"
+    worktree_summary_path.write_text("# Summary\n")
+    summary_path = config.project_dir / ".gza" / "summaries" / "cross-project-branch-local.md"
+
+    worktree_git = Mock()
+    worktree_git.repo_dir = worktree_root
+    worktree_git.status_porcelain.return_value = {
+        ("A", "libs/new/gza.yaml"),
+        ("A", "libs/new/src/file.py"),
+    }
+    worktree_git.default_branch.return_value = "main"
+    worktree_git.get_diff_numstat.return_value = "1\t0\tlibs/new/src/file.py\n"
+    worktree_git._run.return_value = Mock(stdout="", returncode=0, stderr="")
+
+    with patch("gza.runner._project_boundary") as mock_boundary, \
+         patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+        mock_boundary.return_value = config._project_boundary_cache
+        rc = _complete_code_task(
+            task,
+            config,
+            store,
+            worktree_git,
+            log_file,
+            "feature/cross-project-branch-local",
+            TaskStats(duration_seconds=1.0, num_steps_computed=1, cost_usd=0.0),
+            0,
+            pre_run_status=set(),
+            worktree_summary_path=worktree_summary_path,
+            summary_path=summary_path,
+            summary_dir=summary_path.parent,
+        )
+
+    assert rc == 0
+    worktree_git.add.assert_any_call("libs/new/gza.yaml")
+    worktree_git.add.assert_any_call("libs/new/src/file.py")
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
 
 def test_run_marks_failed_when_extraction_precheck_fails(tmp_path: Path) -> None:
     db_path = tmp_path / "test.db"

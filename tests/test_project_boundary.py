@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from gza.config import Config
+from gza.project_discovery import infer_declared_repo_project_roots, resolve_affected_repo_projects
 from gza.runner import (
     LocalDependency,
     ProjectBoundary,
@@ -181,3 +182,107 @@ def test_build_runtime_docker_volumes_adds_readonly_out_of_repo_mounts(tmp_path:
         "/host/data:/data:ro",
         f"{out_of_repo_dep.resolve()}:{out_of_repo_dep.resolve()}:ro",
     ]
+
+
+def test_resolve_affected_repo_projects_matches_known_roots_and_reports_unknown_paths(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    project_dir = repo_root / "services" / "foo"
+    sibling_dir = repo_root / "libs" / "bar"
+    project_dir.mkdir(parents=True)
+    sibling_dir.mkdir(parents=True)
+    (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+
+    config = Config(project_dir=project_dir, project_name="foo")
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        ),
+    )
+
+    affected = resolve_affected_repo_projects(
+        config,
+        {
+            "services/foo/src/app.py",
+            "libs/bar/src/lib.py",
+            "misc/script.py",
+        },
+    )
+
+    assert [project.scope_root.as_posix() for project in affected.projects] == ["services/foo", "libs/bar"]
+    assert affected.unknown_paths == ("misc/script.py",)
+
+
+def test_resolve_affected_repo_projects_can_discover_branch_local_project_configs(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    worktree_root = tmp_path / "worktree"
+    project_dir = repo_root / "services" / "foo"
+    worktree_project_dir = worktree_root / "services" / "foo"
+    worktree_new_project_dir = worktree_root / "libs" / "new"
+    project_dir.mkdir(parents=True)
+    worktree_project_dir.mkdir(parents=True)
+    worktree_new_project_dir.mkdir(parents=True)
+    (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (worktree_new_project_dir / "gza.yaml").write_text("project_name: new\nverify_command: ./bin/new-verify\n")
+
+    config = Config(project_dir=project_dir, project_name="foo")
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        ),
+    )
+
+    affected = resolve_affected_repo_projects(
+        config,
+        {
+            "libs/new/gza.yaml",
+            "libs/new/src/file.py",
+        },
+        repo_root=worktree_root,
+    )
+
+    assert [project.scope_root.as_posix() for project in affected.projects] == ["libs/new"]
+    assert affected.projects[0].verify_command == "./bin/new-verify"
+    assert affected.unknown_paths == ()
+
+
+def test_resolve_affected_repo_projects_allows_branch_declared_project_roots_without_checkout_config(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    project_dir = repo_root / "services" / "foo"
+    project_dir.mkdir(parents=True)
+    (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+
+    config = Config(project_dir=project_dir, project_name="foo")
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        ),
+    )
+
+    changed_paths = {
+        "libs/new/gza.yaml",
+        "libs/new/src/file.py",
+    }
+    affected = resolve_affected_repo_projects(
+        config,
+        changed_paths,
+        declared_project_roots=infer_declared_repo_project_roots(changed_paths),
+    )
+
+    assert affected.projects == ()
+    assert affected.unknown_paths == ()

@@ -16,6 +16,7 @@ from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key, task_ow
 from gza.git import ResolvedMergeSourceRef
 from gza.lineage import walk_ancestors, walk_based_on_descendants
 from gza.merge_state import resolve_task_merge_state_for_target
+from gza.project_discovery import infer_declared_repo_project_roots
 from gza.query import (
     get_code_changing_descendants_for_root,
     get_reviews_for_root,
@@ -764,6 +765,25 @@ def _parse_changed_paths_from_name_status(name_status_output: str) -> set[str]:
     return changed_paths
 
 
+def _parse_declared_project_roots_from_name_status(name_status_output: str) -> tuple[Path, ...]:
+    """Infer branch-declared project roots from non-deleted config paths in the diff."""
+    if not isinstance(name_status_output, str):
+        return ()
+    config_paths: set[str] = set()
+    for line in name_status_output.splitlines():
+        parts = [part.strip() for part in line.split("\t") if part.strip()]
+        if len(parts) < 2:
+            continue
+        status = parts[0]
+        if status.startswith("D"):
+            continue
+        candidate_paths = parts[1:]
+        if status.startswith(("R", "C")) and len(candidate_paths) >= 2:
+            candidate_paths = [candidate_paths[-1]]
+        config_paths.update(candidate_paths)
+    return infer_declared_repo_project_roots(config_paths)
+
+
 def _resolve_strict_scope_inspection(
     config: Any,
     git: Any,
@@ -774,8 +794,6 @@ def _resolve_strict_scope_inspection(
 ) -> StrictScopeInspection:
     """Return out-of-scope branch paths that should park automation for humans."""
     if not getattr(config, "enforce_project_scope", False):
-        return StrictScopeInspection()
-    if _task_is_cross_project(task):
         return StrictScopeInspection()
     if task.task_type not in {"task", "implement", "improve", "fix", "rebase"}:
         return StrictScopeInspection()
@@ -802,12 +820,15 @@ def _resolve_strict_scope_inspection(
         changed_paths,
         boundary=_project_boundary(config),
     )
+    declared_project_roots = _parse_declared_project_roots_from_name_status(name_status_output)
     return StrictScopeInspection(
         violation_paths=tuple(
             _find_out_of_scope_paths(
                 config,
                 filtered_paths,
+                task=task,
                 strict_scope=True,
+                declared_project_roots=declared_project_roots,
             )
         )
     )
@@ -816,13 +837,19 @@ def _resolve_strict_scope_inspection(
 def _strict_scope_violation_action(ctx: AdvanceContext) -> dict[str, Any]:
     violation_paths = tuple(getattr(ctx, "strict_scope_violation_paths", ()))
     paths = ", ".join(violation_paths)
+    description = (
+        "SKIP: cross-project branch includes paths outside all discovered project roots: "
+        f"{paths}. Fix the branch or add project configs so the affected roots are discoverable."
+        if _task_is_cross_project(ctx.task)
+        else (
+            "SKIP: branch includes out-of-scope paths outside the strict project scope: "
+            f"{paths}. Tag `{CROSS_PROJECT_TAG}` and re-advance if intended, or fix the branch."
+        )
+    )
     return with_needs_attention(
         {
             "type": "needs_discussion",
-            "description": (
-                "SKIP: branch includes out-of-scope paths outside the strict project scope: "
-                f"{paths}. Tag `{CROSS_PROJECT_TAG}` and re-advance if intended, or fix the branch."
-            ),
+            "description": description,
             "failure_reason": PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
             "out_of_scope_paths": violation_paths,
         },

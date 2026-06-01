@@ -109,7 +109,7 @@ Use `/gza-task-review` when the autonomous review/improve loop needs a human-gui
 
 **Key behaviors:**
 - Starts from a full prefixed task ID (for example, `gza-1234`) and resolves review/improve tasks back to the implementation branch
-- Runs both the normal code review and the configured `verify_command` from `gza.yaml` on every review iteration
+- Runs both the normal code review and the configured `verify_command` from `gza.yaml` on every review iteration; tagged `cross-project` branches verify once per affected discovered project root
 - Folds verify failures, including timed-out review verify runs, into the canonical `## Blockers` section as clearly labeled `verify_command failure` items
 - Preserves the structured review contract that `/gza-task-improve` and follow-up automation already consume
 - Requires a prepared implementation checkout/worktree or caller-supplied authoritative diff; it does not tell agents to switch branches manually
