@@ -1,7 +1,11 @@
 from pathlib import Path
 
 from gza.config import Config
-from gza.project_discovery import infer_declared_repo_project_roots, resolve_affected_repo_projects
+from gza.project_discovery import (
+    infer_declared_repo_project_roots,
+    parse_name_status_project_paths,
+    resolve_affected_repo_projects,
+)
 from gza.runner import (
     LocalDependency,
     ProjectBoundary,
@@ -51,6 +55,35 @@ def test_resolve_local_dependencies_from_uv_lock_classifies_paths(tmp_path: Path
             resolved_path=out_of_repo_dep.resolve(),
             repo_relative_path=None,
         ),
+    )
+
+
+def test_parse_name_status_project_paths_tracks_changed_paths_and_declared_roots() -> None:
+    parsed = parse_name_status_project_paths(
+        "R100\tlibs/old/gza.yaml\tlibs/new/gza.yaml\n"
+        "R100\tlibs/old/src/file.py\tlibs/new/src/file.py\n"
+        "C100\tlibs/template/gza.yaml\tlibs/copied/gza.yaml\n"
+        "C100\tlibs/template/src/file.py\tlibs/copied/src/file.py\n"
+        "D\tapps/removed/gza.yaml\n"
+        "M\tservices/foo/gza.yaml\n"
+        "A\tservices/foo/src/file.py\n"
+    )
+
+    assert set(parsed.changed_paths) == {
+        "apps/removed/gza.yaml",
+        "libs/old/gza.yaml",
+        "libs/old/src/file.py",
+        "libs/copied/gza.yaml",
+        "libs/copied/src/file.py",
+        "libs/new/gza.yaml",
+        "libs/new/src/file.py",
+        "services/foo/gza.yaml",
+        "services/foo/src/file.py",
+    }
+    assert parsed.declared_project_roots == (
+        Path("libs/copied"),
+        Path("libs/new"),
+        Path("services/foo"),
     )
 
 

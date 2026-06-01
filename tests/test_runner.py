@@ -1720,6 +1720,76 @@ class TestReviewContextFromChain:
         assert mock_verify.call_args.args[0] == "./bin/bar-verify-new"
         assert mock_verify.call_args.kwargs["cwd"] == worktree_path / "libs" / "bar"
 
+    def test_run_review_verify_commands_for_cross_project_includes_rename_source_and_destination_projects(
+        self, tmp_path: Path
+    ):
+        repo_root = tmp_path / "repo"
+        worktree_path = tmp_path / "worktree"
+        project_dir = repo_root / "services" / "foo"
+        copied_dir = worktree_path / "libs" / "copied"
+        old_dir = worktree_path / "libs" / "old"
+        renamed_dir = worktree_path / "libs" / "renamed"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        project_dir.mkdir(parents=True)
+        copied_dir.mkdir(parents=True)
+        old_dir.mkdir(parents=True)
+        renamed_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (copied_dir / "gza.yaml").write_text("project_name: copied\nverify_command: ./bin/copied-verify\n")
+        (old_dir / "gza.yaml").write_text("project_name: old\nverify_command: ./bin/old-verify\n")
+        (renamed_dir / "gza.yaml").write_text("project_name: renamed\nverify_command: ./bin/renamed-verify\n")
+
+        config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
+        task.tags = ("cross-project",)
+
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = (
+            "M\tservices/foo/app.py\n"
+            "R100\tlibs/old/src/file.py\tlibs/renamed/src/file.py\n"
+            "C100\tlibs/template/gza.yaml\tlibs/copied/gza.yaml\n"
+            "C100\tlibs/template/src/file.py\tlibs/copied/src/file.py\n"
+            "D\tapps/removed/gza.yaml\n"
+        )
+
+        with patch(
+            "gza.runner._run_review_verify_command",
+            side_effect=[
+                "## verify_command result\n\n- Command: `./bin/foo-verify`\n- Status: passed",
+                "## verify_command result\n\n- Command: `./bin/copied-verify`\n- Status: passed",
+                "## verify_command result\n\n- Command: `./bin/old-verify`\n- Status: passed",
+                "## verify_command result\n\n- Command: `./bin/renamed-verify`\n- Status: passed",
+            ],
+        ) as mock_verify:
+            result = _run_review_verify_commands_for_projects(
+                config=config,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=120,
+            )
+
+        assert result is not None
+        assert "### services/foo" in result
+        assert "### libs/copied" in result
+        assert "### libs/old" in result
+        assert "### libs/renamed" in result
+        assert "apps/removed/gza.yaml" in result
+        verify_calls = mock_verify.call_args_list
+        assert len(verify_calls) == 4
+        assert verify_calls[0].kwargs["cwd"] == worktree_path / "services" / "foo"
+        assert verify_calls[1].kwargs["cwd"] == worktree_path / "libs" / "copied"
+        assert verify_calls[2].kwargs["cwd"] == worktree_path / "libs" / "old"
+        assert verify_calls[3].kwargs["cwd"] == worktree_path / "libs" / "renamed"
+
     def test_review_context_includes_changed_files_diffstat_and_diff(self, tmp_path: Path):
         """Review context should include changed files, diffstat, and inline diff."""
         db_path = tmp_path / "test.db"

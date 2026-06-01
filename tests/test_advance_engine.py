@@ -1661,6 +1661,104 @@ def test_cross_project_tag_branch_declared_project_root_advances_without_checkou
     assert action.get("needs_attention_reason") is None
 
 
+def test_cross_project_tag_rename_declared_project_root_still_parks_for_unknown_source_root(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/cross-project-rename-root",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    impl.tags = ("cross-project",)
+    store.update(impl)
+
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={
+            "main...feat/cross-project-rename-root": (
+                "M\tservices/foo/app.py\n"
+                "R100\tlibs/old/gza.yaml\tlibs/renamed/gza.yaml\n"
+                "R100\tlibs/old/src/file.py\tlibs/renamed/src/file.py\n"
+            ),
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "project-scope-violation"
+    assert action["out_of_scope_paths"] == ("libs/old/gza.yaml", "libs/old/src/file.py")
+
+
+def test_cross_project_tag_copy_declared_project_root_advances_without_checkout_config(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/cross-project-copy-root",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    impl.tags = ("cross-project",)
+    store.update(impl)
+
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={
+            "main...feat/cross-project-copy-root": (
+                "M\tservices/foo/app.py\n"
+                "C100\tlibs/template/gza.yaml\tlibs/copied/gza.yaml\n"
+                "C100\tlibs/template/src/file.py\tlibs/copied/src/file.py\n"
+            ),
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_review"
+    assert action.get("needs_attention_reason") is None
+
+
+def test_cross_project_tag_deleted_project_root_still_parks_without_declared_root(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/cross-project-deleted-root",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    impl.tags = ("cross-project",)
+    store.update(impl)
+
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={
+            "main...feat/cross-project-deleted-root": (
+                "M\tservices/foo/app.py\n"
+                "D\tlibs/removed/gza.yaml\n"
+                "D\tlibs/removed/src/file.py\n"
+            ),
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "project-scope-violation"
+    assert action["out_of_scope_paths"] == ("libs/removed/gza.yaml", "libs/removed/src/file.py")
+
+
 def test_cross_project_tag_branch_local_path_without_declared_root_still_parks(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)

@@ -81,6 +81,7 @@ from .log_paths import TaskLogPaths, ops_log_path_for, resolve_ops_log_path, res
 from .pr_ops import build_task_pr_content, ensure_task_pr, sync_task_branch_if_live_pr
 from .project_discovery import (
     RepoProjectConfig,
+    parse_name_status_project_paths,
     resolve_affected_repo_projects,
     resolve_repo_root,
 )
@@ -403,19 +404,6 @@ def _worktree_execution_dir(worktree_path: Path, boundary: ProjectBoundary) -> P
     if boundary.scope_root == Path("."):
         return worktree_path
     return _worktree_project_root(worktree_path, boundary)
-
-
-def _parse_changed_paths_from_name_status(output: str) -> set[str]:
-    """Return repo-relative paths mentioned by ``git diff --name-status`` output."""
-    changed_paths: set[str] = set()
-    for line in output.splitlines():
-        if not line:
-            continue
-        parts = [part.strip() for part in line.split("\t") if part.strip()]
-        if len(parts) < 2:
-            continue
-        changed_paths.update(parts[1:])
-    return changed_paths
 
 
 def _format_repo_project_scope(scope_root: Path) -> str:
@@ -2225,16 +2213,17 @@ def _run_review_verify_commands_for_projects(
         )
 
     default_branch = worktree_git.default_branch()
-    changed_paths = _parse_changed_paths_from_name_status(
+    parsed_name_status = parse_name_status_project_paths(
         worktree_git.get_diff_name_status(f"{default_branch}...HEAD", check=True)
     )
-    if not changed_paths:
+    if not parsed_name_status.changed_paths:
         return None
 
     affected = resolve_affected_repo_projects(
         config,
-        changed_paths,
+        parsed_name_status.changed_paths,
         repo_root=worktree_path,
+        declared_project_roots=parsed_name_status.declared_project_roots,
     )
     if not affected.projects and not affected.unknown_paths:
         return None

@@ -35,6 +35,14 @@ class AffectedRepoProjects:
     unknown_paths: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ParsedNameStatusProjectPaths:
+    """Parsed repo-relative paths and declared project roots from name-status output."""
+
+    changed_paths: tuple[str, ...]
+    declared_project_roots: tuple[Path, ...]
+
+
 def infer_declared_repo_project_roots(
     changed_paths: Iterable[str],
 ) -> tuple[Path, ...]:
@@ -54,6 +62,39 @@ def infer_declared_repo_project_roots(
                 root.as_posix(),
             ),
         )
+    )
+
+
+def parse_name_status_project_paths(name_status_output: str) -> ParsedNameStatusProjectPaths:
+    """Parse changed repo paths and branch-declared project roots from name-status output."""
+    if not isinstance(name_status_output, str):
+        return ParsedNameStatusProjectPaths(changed_paths=(), declared_project_roots=())
+
+    changed_paths: set[str] = set()
+    declared_root_candidates: set[str] = set()
+    for line in name_status_output.splitlines():
+        parts = [part.strip() for part in line.split("\t") if part.strip()]
+        if len(parts) < 2:
+            continue
+        status = parts[0]
+        candidate_paths = parts[1:]
+        changed_path_candidates = candidate_paths
+        if status.startswith("R") and len(candidate_paths) >= 2:
+            changed_path_candidates = candidate_paths[:2]
+        elif status.startswith("C") and len(candidate_paths) >= 2:
+            changed_path_candidates = [candidate_paths[-1]]
+        changed_paths.update(changed_path_candidates)
+
+        if status.startswith("D"):
+            continue
+        if status.startswith(("R", "C")) and len(candidate_paths) >= 2:
+            declared_root_candidates.add(candidate_paths[-1])
+            continue
+        declared_root_candidates.update(candidate_paths)
+
+    return ParsedNameStatusProjectPaths(
+        changed_paths=tuple(sorted(changed_paths)),
+        declared_project_roots=infer_declared_repo_project_roots(declared_root_candidates),
     )
 
 

@@ -16,7 +16,7 @@ from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key, task_ow
 from gza.git import ResolvedMergeSourceRef
 from gza.lineage import walk_ancestors, walk_based_on_descendants
 from gza.merge_state import resolve_task_merge_state_for_target
-from gza.project_discovery import infer_declared_repo_project_roots
+from gza.project_discovery import parse_name_status_project_paths
 from gza.query import (
     get_code_changing_descendants_for_root,
     get_reviews_for_root,
@@ -752,38 +752,6 @@ def _rebase_did_not_unblock_merge_action(ctx: AdvanceContext) -> dict[str, Any]:
     )
 
 
-def _parse_changed_paths_from_name_status(name_status_output: str) -> set[str]:
-    """Extract touched repo-relative paths from git diff --name-status output."""
-    if not isinstance(name_status_output, str):
-        return set()
-    changed_paths: set[str] = set()
-    for line in name_status_output.splitlines():
-        parts = [part.strip() for part in line.split("\t") if part.strip()]
-        if len(parts) < 2:
-            continue
-        changed_paths.update(parts[1:])
-    return changed_paths
-
-
-def _parse_declared_project_roots_from_name_status(name_status_output: str) -> tuple[Path, ...]:
-    """Infer branch-declared project roots from non-deleted config paths in the diff."""
-    if not isinstance(name_status_output, str):
-        return ()
-    config_paths: set[str] = set()
-    for line in name_status_output.splitlines():
-        parts = [part.strip() for part in line.split("\t") if part.strip()]
-        if len(parts) < 2:
-            continue
-        status = parts[0]
-        if status.startswith("D"):
-            continue
-        candidate_paths = parts[1:]
-        if status.startswith(("R", "C")) and len(candidate_paths) >= 2:
-            candidate_paths = [candidate_paths[-1]]
-        config_paths.update(candidate_paths)
-    return infer_declared_repo_project_roots(config_paths)
-
-
 def _resolve_strict_scope_inspection(
     config: Any,
     git: Any,
@@ -812,15 +780,14 @@ def _resolve_strict_scope_inspection(
         )
         return StrictScopeInspection(inspection_error=detail)
 
-    changed_paths = _parse_changed_paths_from_name_status(name_status_output or "")
-    if not changed_paths:
+    parsed_name_status = parse_name_status_project_paths(name_status_output or "")
+    if not parsed_name_status.changed_paths:
         return StrictScopeInspection()
 
     filtered_paths = _filter_owned_artifact_paths(
-        changed_paths,
+        parsed_name_status.changed_paths,
         boundary=_project_boundary(config),
     )
-    declared_project_roots = _parse_declared_project_roots_from_name_status(name_status_output)
     return StrictScopeInspection(
         violation_paths=tuple(
             _find_out_of_scope_paths(
@@ -828,7 +795,7 @@ def _resolve_strict_scope_inspection(
                 filtered_paths,
                 task=task,
                 strict_scope=True,
-                declared_project_roots=declared_project_roots,
+                declared_project_roots=parsed_name_status.declared_project_roots,
             )
         )
     )
