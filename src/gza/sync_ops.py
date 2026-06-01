@@ -321,12 +321,16 @@ def reconcile_branch_merge_truth(
     target_branch: str,
     include_diff_stats: bool,
     remote_target_ref: str | None = None,
+    preserve_recorded_merged: bool = True,
 ) -> list[BranchSyncResult]:
     """Compute branch-scoped merge truth and optional diff stats without persistence.
 
     Missing local branches do not imply merged. Reconciliation requires explicit
     target-branch proof from a surviving branch ref, typically the local feature
     branch or a fetched ``origin/<feature>`` ref for canonical default-branch syncs.
+    A lagging remote proof target must not revoke an already-recorded merged state
+    unless the source branch itself has disappeared and no surviving ref can prove
+    merge truth.
     """
     results: list[BranchSyncResult] = []
 
@@ -388,7 +392,8 @@ def reconcile_branch_merge_truth(
         elif reconcile_ref is None:
             desired_merge_status = "unmerged"
         else:
-            desired_merge_status = "unmerged"
+            if not preserve_recorded_merged or desired_merge_status != "merged":
+                desired_merge_status = "unmerged"
             if include_diff_stats:
                 try:
                     diff_output = git.get_diff_numstat(f"{target_branch}...{reconcile_ref}")

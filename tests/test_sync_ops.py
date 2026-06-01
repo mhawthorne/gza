@@ -128,6 +128,33 @@ def test_reconcile_branch_merge_truth_missing_local_branch_without_remote_proof_
     git.is_merged.assert_not_called()
 
 
+def test_reconcile_branch_merge_truth_preserves_recorded_merge_when_remote_target_lags(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/local-merged-remote-lag")
+    task.merge_status = "merged"
+    task.merged_at = datetime.now(UTC)
+    store.update(task)
+    cohort = BranchCohort(branch=task.branch, tasks=(task,))
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        remote_target_ref="origin/main",
+        include_diff_stats=True,
+    )
+
+    assert results[0].merge_status == "merged"
+    assert "marked merged" not in results[0].actions
+    assert results[0].diff_files_changed == 1
+    git.is_merged.assert_called_once_with("feature/local-merged-remote-lag", into="origin/main")
+
+
 def test_reconcile_task_branch_merge_truth_persists_branch_state(tmp_path):
     store = SqliteTaskStore(tmp_path / "test.db")
     task = _completed_branch_task(store, "Task", "feature/scoped-sync")
@@ -286,6 +313,51 @@ def test_reconcile_task_branch_merge_truth_remote_proof_does_not_accept_stale_lo
     assert unit.base_sha == "base-origin-proof"
 
 
+def test_reconcile_task_branch_merge_truth_persisted_local_proof_does_not_downgrade_merged(
+    tmp_path,
+):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/local-proof-sticky-merged")
+    assert task.id is not None
+    task.merge_status = "merged"
+    task.merged_at = datetime.now(UTC)
+    store.update(task)
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/local-proof-sticky-merged": "head-local-proof",
+        "main": "base-local-proof",
+    }.get(ref)
+
+    result = reconcile_task_branch_merge_truth(
+        store,
+        git,
+        task.id,
+        target_branch="main",
+        include_diff_stats=True,
+        persist=True,
+    )
+
+    assert result.merge_status == "merged"
+    assert "marked merged" not in result.actions
+    git.is_merged.assert_called_once_with("feature/local-proof-sticky-merged", into="main")
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+    assert refreshed.merged_at is not None
+
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    assert unit.state == "merged"
+    assert unit.merged_at == refreshed.merged_at
+    assert unit.head_sha == "head-local-proof"
+    assert unit.base_sha == "base-local-proof"
+
+
 def test_sync_branch_cohorts_normalizes_same_branch_rows(tmp_path):
     store = SqliteTaskStore(tmp_path / "test.db")
     parent = _completed_branch_task(store, "Parent task", "feature/shared")
@@ -403,6 +475,39 @@ def test_sync_branch_cohorts_marks_merged_when_origin_default_ref_proves_remote_
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.merge_status == "merged"
+
+
+def test_sync_branch_cohorts_does_not_downgrade_merged_when_origin_default_ref_lags(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task with local-only merge", "feature/local-only-merge")
+    task.merge_status = "merged"
+    task.merged_at = datetime.now(UTC)
+    store.update(task)
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.ref_exists.return_value = True
+    git.branch_exists.return_value = True
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+    git.is_merged.return_value = False
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        [BranchCohort(branch="feature/local-only-merge", tasks=(task,))],
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=True,
+    )
+
+    assert partial is False
+    assert results[0].merge_status == "merged"
+    assert "marked merged" not in results[0].actions
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+    assert refreshed.merged_at is not None
 
 
 def test_sync_branch_cohorts_persists_merge_units(tmp_path):

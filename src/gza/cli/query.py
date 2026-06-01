@@ -2067,6 +2067,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
                 build_branch_cohorts_for_tasks(store, branch_candidates),
                 target_branch=target_branch,
                 include_diff_stats=True,
+                preserve_recorded_merged=False,
             )
             first_live_error = next(
                 (
@@ -2167,21 +2168,23 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
         return 0
 
     limit = None if getattr(args, "limit", 5) == 0 else getattr(args, "limit", 5)
-    merge_unit_ids_list: list[str] = []
-    for task in selected_tasks:
-        if task.id is None:
-            continue
-        resolved_unit = store.resolve_merge_unit_for_task(task.id)
-        if resolved_unit is not None:
-            merge_unit_ids_list.append(resolved_unit.id)
-    merge_unit_ids = tuple(dict.fromkeys(merge_unit_ids_list))
+    merge_unit_ids: tuple[str, ...] | None = None
+    if not live_target:
+        merge_unit_ids_list: list[str] = []
+        for task in selected_tasks:
+            if task.id is None:
+                continue
+            resolved_unit = store.resolve_merge_unit_for_task(task.id)
+            if resolved_unit is not None:
+                merge_unit_ids_list.append(resolved_unit.id)
+        merge_unit_ids = tuple(dict.fromkeys(merge_unit_ids_list))
     projection = _TaskProjectionSpec(
         preset=_TaskProjectionPreset.UNMERGED_DEFAULT,
         fields=projection_fields,
     )
     query = _TaskQueryPresets.unmerged(
         branch_owner_ids=owner_ids,
-        merge_unit_ids=merge_unit_ids or None,
+        merge_unit_ids=merge_unit_ids,
         task_ids=tuple(task.id for task in selected_tasks if task.id is not None),
         limit=limit,
         mode=view_mode,
