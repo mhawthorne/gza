@@ -578,6 +578,24 @@ gza work [task_id...] [options]
 | `--tag TAG` | Only pick pending tasks matching tag filters when no task IDs are specified (repeatable) |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
 
+`uv run gza work` starts pending tasks only. It does not run failed-task recovery (`resume` / `retry` / manual-review parking) and it does not progress review/rebase/merge lifecycle work for already-started lineages. If recovery candidates exist, `work` leaves them untouched and starts from the pending lane anyway.
+
+### work / advance / watch operating surface
+
+Use this matrix when deciding "what will this command actually touch?"
+
+| Command | Starts new pending tasks? | Runs failed-task recovery? | Runs review / merge lifecycle? | Continuous loop? |
+|--------|----------------------------|----------------------------|--------------------------------|------------------|
+| `uv run gza work` | Yes. Pending lane only. | No. | No. | No. |
+| `uv run gza advance` | No by default. Yes with `--new` after lifecycle/recovery planning. | Yes. Shared bounded `resume` / `retry` / manual-review decisions. | Yes. Review, improve, rebase, merge, held-plan follow-up, and related lifecycle work. | No. |
+| `uv run gza watch` | Yes. Maintains the configured batch from the pending lane. | Yes. Uses the same bounded recovery policy as `advance`. | Yes. Reuses the same lifecycle planner and follow-on actions. | Yes. |
+
+Two operator-facing queue surfaces show these sets separately:
+
+- `uv run gza next` and `uv run gza queue` show the recovery lane and pending lane as distinct sections.
+- Recovery lane entries belong to `advance` / `watch`, not `work`.
+- Pending lane entries belong to `work` / `watch`.
+
 ### add
 
 Add a new task.
@@ -1360,8 +1378,12 @@ List upcoming pending tasks.
 gza next [options]
 ```
 
-Shows pending tasks that are ready to run (dependencies satisfied). Tasks blocked by dependencies are listed separately.
-Use `--tag TAG` (repeatable) to scope the list to matching tags.
+`gza next` now renders two distinct sections:
+
+- Recovery lane: visible failed-task recovery and manual-attention lineages that `uv run gza advance` / `uv run gza watch` act on ahead of ordinary pending pickup.
+- Pending lane: pending tasks that `uv run gza work` / `uv run gza watch` can start, with blocked dependencies separated as before.
+
+Use `--tag TAG` (repeatable) to scope both sections to matching tags.
 
 ### queue
 
@@ -1380,7 +1402,7 @@ gza queue clear <task_id>
 |--------|-------------|
 | `task_id` | Full prefixed task ID to reorder (for example `gza-1234`) |
 | `position` | 1-based explicit queue position for `queue move` |
-| `--tag TAG` | Only list pending tasks matching tag filters (repeatable; same scoped pickup order used by `gza watch --tag TAG`) |
+| `--tag TAG` | Only list recovery and pending lanes matching tag filters (repeatable; the pending lane uses the same scoped pickup order as `uv run gza watch --tag TAG`) |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
 | `-n, --limit N` | Show first N runnable tasks (default: 10; blocked tasks are always shown; use `0`, `-1`, or `--all` for all runnable tasks) |
 | `--all` | Show all runnable tasks (blocked tasks are always shown) |
@@ -1394,9 +1416,14 @@ Use `gza queue next <task_id>` to make a task the next ordered item, or `gza que
 When `queue move`, `queue next`, or `queue clear` include `--tag` filters, explicit ordering is shared across all tasks matching that tag scope, even when some tasks have additional unrelated tags.
 Those commands fail closed when the target task does not match the provided tag scope (`all` semantics by default, `any` with `--any-tag`) and do not mutate queue ordering in that case.
 When no tag scope is provided, queue-position edits keep existing exact tag-set bucket behavior.
-`gza queue` shows runnable pending tasks first, then pending tasks blocked by unsatisfied direct dependencies at the bottom. Internal tasks remain excluded.
+`gza queue` also renders two distinct sections:
+
+- Recovery lane first, showing failed-task recovery or manual-attention lineages that belong to `uv run gza advance` / `uv run gza watch`.
+- Pending lane second, showing the actual queue ordering that `uv run gza work` / `uv run gza watch` use for new pending starts.
+
+Within the pending lane, runnable pending tasks appear first and pending tasks blocked by unsatisfied direct dependencies appear at the bottom. Internal tasks remain excluded.
 By default, `gza queue` shows the first 10 runnable tasks plus all blocked tasks. Use `-n 0`, `-n -1`, or `--all` to show all runnable tasks too.
-To treat a tag as a release slice, assign tasks with `uv run gza add --tag release-1.2 ...` and inspect them with `uv run gza queue --tag release-1.2`. That command is the canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order, with currently blocked tasks shown separately at the bottom.
+To treat a tag as a release slice, assign tasks with `uv run gza add --tag release-1.2 ...` and inspect them with `uv run gza queue --tag release-1.2`. That command is the canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order for the pending lane, with any same-scope recovery lane entries shown separately above it.
 Internally, queue-style task listing is routed through the unified task query layer so queue, next, and API consumers can share the same filter/order semantics.
 
 ### implement
@@ -1494,6 +1521,8 @@ uv run gza advance [task_id] [options]
 | `--type TYPE` | Only advance tasks of this type (`plan` or `implement`) |
 | `--squash-threshold N` | Squash-merge branches with N or more commits (0 disables) |
 
+`uv run gza advance` is the explicit non-looping lifecycle command. It evaluates recovery and existing lineage lifecycle work first. It does not start fresh pending work unless you opt into `--new`, and when `--new` is present the pending lane only fills whatever `--batch` capacity remains after recovery/lifecycle actions.
+
 `--unimplemented` stays restricted to `plan` and `explore` lineages and only lists completed
 source rows that still need an implementation path. Completed `explore` roots with an active
 pending or in-progress `plan`/`implement` descendant are intentionally suppressed here; find that
@@ -1562,8 +1591,10 @@ need to break out promptly from a long or blocked watch pass.
 | `--show-skipped` | With `--restart-failed`, include skipped failed tasks in the dry-run recovery report and live watch logs |
 | `--quiet` | Write events to `.gza/watch.log` only |
 | `--[no-]auto-restart-on-drift` | When installed `gza` code changes while watch is running, re-exec at the next drained batch boundary to load the new code (default: enabled) |
-| `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG` to preview the same scoped pickup order |
+| `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
+
+`uv run gza watch` combines the two surfaces above: it runs recovery decisions, review/rebase/merge lifecycle work, and pending-lane pickup in one loop. Recovery and pending are still distinct sets even when watch is driving both.
 
 When `main_checkout_isolate: true`, watch preflights a dedicated detached checkout reset to the default-branch tip and executes merge attempts there. If the isolated merge succeeds, watch then fast-forwards the real default-branch ref to that detached merge commit and syncs any attached default-branch checkout back to a clean state before marking the task merged. If the initial refresh fails because that checkout is stale or conflicted, watch rebuilds it once from scratch before giving up on merge actions for that watch pass. The integration checkout does not directly check out the shared default-branch ref, so an operator checkout already on that branch stays clean. Conflict rebases still run on task branches via standard rebase tasks.
 

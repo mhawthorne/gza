@@ -174,6 +174,24 @@ def _setup_task_with_worktree_metadata(
     return task, worktree_path
 
 
+def _create_failed_recovery_candidate(
+    store,
+    *,
+    prompt: str = "Failed task",
+    task_type: str = "implement",
+    failure_reason: str = "MAX_TURNS",
+    session_id: str | None = "sess-1",
+) -> Task:
+    task = store.add(prompt, task_type=task_type)
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = failure_reason
+    task.session_id = session_id
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+    return task
+
+
 def _first_nonempty_output_line(output: str) -> str:
     return next(line for line in output.splitlines() if line.strip())
 
@@ -2409,6 +2427,34 @@ class TestNextCommand:
         assert "Second pending task" in result.stdout
         assert "Completed task" not in result.stdout
 
+    def test_next_shows_recovery_lane_before_pending_lane(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        failed = _create_failed_recovery_candidate(store, prompt="Resume me")
+        pending = store.add("Pending work")
+
+        result = run_gza("next", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Recovery lane:" in result.stdout
+        assert "Pending lane:" in result.stdout
+        assert f"resume {failed.id}" in " ".join(result.stdout.split())
+        recovery_idx = result.stdout.index("Recovery lane:")
+        pending_header_idx = result.stdout.index("Pending lane:")
+        pending_task_idx = result.stdout.index("Pending work")
+        assert recovery_idx < pending_header_idx < pending_task_idx
+
+    def test_next_pending_lane_header_is_preview_only_not_lane_owner(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Pending work")
+
+        result = run_gza("next", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Pending lane: `gza next` preview only. `gza work` / `watch` start from this lane." in result.stdout
+        assert "Pending lane: `gza next` / `watch`." not in result.stdout
+
     def test_next_with_no_pending_tasks(self, tmp_path: Path):
         """Next command handles no pending tasks."""
         setup_db_with_tasks(tmp_path, [
@@ -2546,6 +2592,20 @@ class TestQueueCommand:
         assert "Task 11" not in result.stdout
         assert "Task 12" not in result.stdout
         assert "2 more runnable tasks" in result.stdout
+
+    def test_queue_shows_recovery_lane_separately_from_pending_lane(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        failed = _create_failed_recovery_candidate(store, prompt="Retry me", task_type="plan", session_id=None, failure_reason="INFRASTRUCTURE_ERROR")
+        store.add("Pending queue task")
+
+        result = run_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Recovery lane:" in result.stdout
+        assert "Pending lane:" in result.stdout
+        assert f"retry {failed.id}" in " ".join(result.stdout.split())
+        assert "Pending queue task" in result.stdout
 
     def test_queue_lists_pending_in_urgent_then_fifo_order(self, tmp_path: Path):
         setup_config(tmp_path)

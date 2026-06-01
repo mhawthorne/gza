@@ -139,6 +139,26 @@ class TestHelpOutput:
         assert "from each resolved root" in result.stdout
         assert "Expand lineage N levels for each matching task" not in result.stdout
 
+    def test_queue_and_lifecycle_help_make_command_scope_explicit(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+
+        next_help = run_gza("next", "--help", "--project", str(tmp_path))
+        queue_help = run_gza("queue", "--help", "--project", str(tmp_path))
+        work_help = run_gza("work", "--help", "--project", str(tmp_path))
+        advance_help = run_gza("advance", "--help", "--project", str(tmp_path))
+        watch_help = run_gza("watch", "--help", "--project", str(tmp_path))
+
+        assert next_help.returncode == 0
+        assert "recovery lane and pending lane separately" in next_help.stdout
+        assert queue_help.returncode == 0
+        assert "Preview recovery vs pending lanes separately" in queue_help.stdout
+        assert work_help.returncode == 0
+        assert "does not run recovery or review/merge lifecycle work" in work_help.stdout
+        assert advance_help.returncode == 0
+        assert "use --new to also start pending tasks" in advance_help.stdout
+        assert watch_help.returncode == 0
+        assert "run recovery, lifecycle, and pending pickup" in watch_help.stdout
+
     def test_history_and_search_help_list_negative_query_filters(self, tmp_path):
         """Query help should advertise the explicit negative filter flags."""
         setup_config(tmp_path)
@@ -555,7 +575,7 @@ class TestHelpOutput:
         assert "If GitHub is unavailable, lookup fails, or no live PR exists, fix preserves the normal auto-review flow." in docs_text
 
     def test_watch_and_queue_tag_help_point_to_same_scoped_pickup_preview(self, tmp_path):
-        """Help/docs should make `queue --tag` the preview for `watch --tag`."""
+        """Help/docs should describe queue tag scope as two lanes, with pending as watch's pickup order."""
         setup_config(tmp_path)
 
         watch_help = run_gza("watch", "--help", "--project", str(tmp_path))
@@ -567,11 +587,12 @@ class TestHelpOutput:
         queue_text = " ".join(queue_help.stdout.split())
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
-        assert "use 'uv run gza queue --tag TAG' to preview scoped pickup order" in watch_text
-        assert "same scoped pickup order used by 'uv run gza watch --tag TAG'" in queue_text
+        assert "use 'uv run gza queue --tag TAG' to preview matching recovery candidates plus pending pickup order" in watch_text
+        assert "pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'" in queue_text
         assert "use 'gza queue --tag TAG' to preview scoped pickup order" not in watch_text
         assert "same scoped pickup order used by 'gza watch --tag TAG'" not in queue_text
-        assert "use `uv run gza queue --tag TAG` to preview the same scoped pickup order" in docs_text
+        assert "Only list recovery and pending lanes matching tag filters" in docs_text
+        assert "use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order" in docs_text
         assert "canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order" in docs_text
 
     def test_watch_help_mentions_restart_failed_flags(self, tmp_path):

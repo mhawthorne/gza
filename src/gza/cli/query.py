@@ -104,12 +104,15 @@ from ._common import (
 from ._queue_render import (
     QueueRenderRow as _QueueRenderRow,
     build_blocked_count_summary as _build_blocked_count_summary,
+    build_queue_summary as _build_queue_summary,
     print_queue_rows as _print_queue_rows,
     queue_render_widths as _queue_render_widths,
 )
+from ._recovery_lane import RecoveryLaneEntry, collect_recovery_lane_entries
 from .advance_engine import (
     classify_advance_action,
     determine_next_action,
+    format_needs_attention_entry_for_display,
     format_needs_attention_lifecycle,
     resolve_advance_context,
     resolve_subject_task,
@@ -542,8 +545,42 @@ def _is_branch_target_live(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "into_current", False) or getattr(args, "target", None))
 
 
+def _format_recovery_lane_detail(entry: RecoveryLaneEntry) -> str:
+    if entry.attention_action is not None:
+        return format_needs_attention_entry_for_display(entry.task, action=entry.attention_action)
+    decision = entry.decision
+    return (
+        f"{decision.action:<6} {entry.task.id} [{entry.task.task_type}] "
+        f"{shorten_prompt(entry.task.prompt, prompt_available_width(prefix=32, suffix=0))} "
+        f"via {decision.launch_mode} reason={decision.reason_code} "
+        f"attempt={decision.attempt_index}/{decision.attempt_limit}"
+    )
+
+
+def _print_recovery_lane_section(entries: list[RecoveryLaneEntry]) -> None:
+    console.print(
+        _build_queue_summary(
+            "Recovery lane: `advance` / `watch` only. Evaluated ahead of pending pickup."
+        )
+    )
+    if not entries:
+        console.print("No recovery candidates")
+        return
+    for entry in entries:
+        console.print(_format_recovery_lane_detail(entry))
+
+
+def _print_pending_lane_header(*, preview_label: str) -> None:
+    console.print()
+    console.print(
+        _build_queue_summary(
+            f"Pending lane: `{preview_label}` preview only. `gza work` / `watch` start from this lane."
+        )
+    )
+
+
 def cmd_next(args: argparse.Namespace) -> int:
-    """List upcoming pending tasks in order."""
+    """List recovery candidates and upcoming pending tasks in their distinct lanes."""
     config = Config.load(args.project_dir)
     store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
@@ -553,6 +590,12 @@ def cmd_next(args: argparse.Namespace) -> int:
         print(f"Error: {exc}")
         return 1
 
+    recovery_entries = collect_recovery_lane_entries(
+        store,
+        tags=tag_filters,
+        any_tag=any_tag,
+        max_recovery_attempts=config.max_resume_attempts,
+    )
     queue_rows = [
         row
         for row in service.run(
@@ -567,7 +610,7 @@ def cmd_next(args: argparse.Namespace) -> int:
     registry = WorkerRegistry(config.workers_path)
     orphaned = _get_orphaned_tasks(registry, store)
 
-    if not queue_rows:
+    if not queue_rows and not recovery_entries:
         if tag_filters:
             console.print(f"No pending tasks matching tags: {', '.join(tag_filters)}")
         else:
@@ -575,6 +618,9 @@ def cmd_next(args: argparse.Namespace) -> int:
         if orphaned:
             _print_orphaned_warning(orphaned)
         return 0
+
+    _print_recovery_lane_section(recovery_entries)
+    _print_pending_lane_header(preview_label="gza next")
 
     # Filter blocked tasks unless --all is specified
     show_all = bool(getattr(args, "all", False))

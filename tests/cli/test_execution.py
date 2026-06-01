@@ -2271,6 +2271,50 @@ class TestWorkCommandMultiTask:
         # Verify no argument parsing errors
         assert "unrecognized arguments" not in result.stderr
 
+    def test_work_notes_recovery_candidates_it_will_not_touch(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed recovery candidate")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "MAX_TURNS"
+        failed.session_id = "sess-1"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        store.add("Pending task 1")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[],
+            count=1,
+            force=False,
+            resume=False,
+            create_pr=False,
+            tags=None,
+            any_tag=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.run", return_value=0),
+        ):
+            rc = cmd_run(args)
+
+        output = capsys.readouterr().out
+        assert rc == 0
+        assert "recovery candidate is waiting on `gza advance` / `gza watch`" in output
+        assert "`gza work` only starts pending tasks" in output
+
     def test_work_validates_all_task_ids_before_execution(self, tmp_path: Path):
         """Work command validates all task IDs before starting execution."""
 

@@ -93,6 +93,7 @@ from ._common import (
     run_with_recovery,
     set_task_urgency,
 )
+from ._recovery_lane import collect_recovery_lane_entries
 from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
     WORKER_CONSUMING_ACTIONS,
@@ -580,6 +581,19 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         task_id_for_registration = args.task_ids[0]
     else:
+        recovery_entries = collect_recovery_lane_entries(
+            store,
+            tags=selected_tags,
+            any_tag=any_tag,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        if recovery_entries:
+            plural = "candidate is" if len(recovery_entries) == 1 else "candidates are"
+            print(
+                f"Note: {len(recovery_entries)} recovery {plural} waiting on `gza advance` / `gza watch`; "
+                "`gza work` only starts pending tasks."
+            )
+            print()
         # For loop mode, we'll register with the first task we're about to run
         next_task = store.get_next_pending(tags=selected_tags, any_tag=any_tag)
         if next_task:

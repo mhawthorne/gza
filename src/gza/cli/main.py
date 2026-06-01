@@ -170,7 +170,11 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # work command
-    work_parser = subparsers.add_parser("work", help="Run the next pending task or specific tasks")
+    work_parser = subparsers.add_parser(
+        "work",
+        help="Start pending tasks only; does not run recovery or review/merge lifecycle work",
+        description="Start pending tasks only; does not run recovery or review/merge lifecycle work.",
+    )
     work_parser.add_argument(
         "task_ids",
         nargs="*",
@@ -290,19 +294,23 @@ def main() -> int:
     add_common_args(attach_parser)
 
     # next command
-    next_parser = subparsers.add_parser("next", help="List upcoming pending tasks")
+    next_parser = subparsers.add_parser(
+        "next",
+        help="Show the recovery lane and pending lane separately so operators can see what runs next",
+        description="Show the recovery lane and pending lane separately so operators can see what runs next.",
+    )
     add_common_args(next_parser)
     next_parser.add_argument(
         "--all",
         action="store_true",
-        help="Show all pending tasks including blocked ones",
+        help="Show all pending tasks including blocked ones in the pending lane section",
     )
     next_parser.add_argument(
         "--tag",
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only show pending tasks matching tag filters (repeatable)",
+        help="Only show recovery and pending lanes matching tag filters (repeatable)",
     )
     next_parser.add_argument(
         "--any-tag",
@@ -607,7 +615,8 @@ def main() -> int:
     # advance command
     advance_parser = subparsers.add_parser(
         "advance",
-        help="Intelligently progress unmerged tasks through their lifecycle",
+        help="Run recovery plus review/merge lifecycle work; use --new to also start pending tasks",
+        description="Run recovery plus review/merge lifecycle work; use --new to also start pending tasks.",
     )
     add_common_args(advance_parser)
     advance_parser.add_argument(
@@ -691,7 +700,7 @@ def main() -> int:
     advance_parser.add_argument(
         "--new",
         action="store_true",
-        help="Start new pending tasks to fill remaining --batch slots (requires --batch)",
+        help="Start new pending tasks after lifecycle/recovery work fills remaining --batch slots (requires --batch)",
     )
     advance_parser.add_argument(
         "--type",
@@ -715,7 +724,8 @@ def main() -> int:
     # watch command
     watch_parser = subparsers.add_parser(
         "watch",
-        help="Continuously maintain a target number of running workers",
+        help="Continuously run recovery, lifecycle, and pending pickup to maintain a worker batch",
+        description="Continuously run recovery, lifecycle, and pending pickup to maintain a worker batch.",
     )
     add_common_args(watch_parser)
     watch_parser.add_argument(
@@ -805,7 +815,7 @@ def main() -> int:
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview scoped pickup order",
+        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview matching recovery candidates plus pending pickup order",
     )
     watch_parser.add_argument(
         "--any-tag",
@@ -817,7 +827,8 @@ def main() -> int:
     # queue command
     queue_parser = subparsers.add_parser(
         "queue",
-        help="List pending queue tasks in pickup order and manage urgent bump flags",
+        help="Preview recovery vs pending lanes separately and manage pending-lane ordering",
+        description="Preview recovery vs pending lanes separately and manage pending-lane ordering.",
     )
     add_common_args(queue_parser)
     queue_parser.set_defaults(limit=10, all=False)
@@ -826,7 +837,7 @@ def main() -> int:
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only list pending tasks matching tag filters (repeatable); same scoped pickup order used by 'uv run gza watch --tag TAG'",
+        help="Only list recovery and pending lanes matching tag filters (repeatable); pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'",
     )
     queue_parser.add_argument(
         "--any-tag",

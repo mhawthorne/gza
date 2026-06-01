@@ -207,6 +207,26 @@ def test_configuration_docs_describe_unimplemented_lineage_guidance() -> None:
     assert "It may surface a newer pending" not in config_content
 
 
+def test_configuration_docs_describe_recovery_vs_pending_operating_surface() -> None:
+    """Operator docs should make queue/work/advance/watch lane ownership explicit."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    config_content = (docs_root / "configuration.md").read_text()
+
+    required_snippets = [
+        "### work / advance / watch operating surface",
+        "| `uv run gza work` | Yes. Pending lane only. | No. | No. | No. |",
+        "| `uv run gza advance` | No by default. Yes with `--new` after lifecycle/recovery planning. |",
+        "| `uv run gza watch` | Yes. Maintains the configured batch from the pending lane. |",
+        "Recovery lane entries belong to `advance` / `watch`, not `work`.",
+        "Pending lane entries belong to `work` / `watch`.",
+        "`gza next` now renders two distinct sections:",
+        "`gza queue` also renders two distinct sections:",
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in config_content
+
+
 def test_configuration_docs_describe_sync_as_broader_explicit_reconciliation_surface() -> None:
     """Canonical docs should keep `uv run gza sync` as the broader explicit branch and PR maintenance surface."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"
@@ -541,7 +561,9 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "The same manual-only warning path also applies when an older failed task is blocked by a newer failed recovery descendant" in iterate_section
     assert "`uv run gza watch --restart-failed --dry-run` is the recovery inspection surface" in watch_section
     assert "Plain `uv run gza watch` and `uv run gza watch --restart-failed` both use the same bounded shared recovery policy" in watch_section
-    assert "use `uv run gza queue --tag TAG` to preview the same scoped pickup order" in watch_section
+    assert "use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order" in watch_section
+    assert "Only list recovery and pending lanes matching tag filters" in config_content
+    assert "Only list pending tasks matching tag filters" not in config_content
 
     assert "\ngza advance [task_id] [options]\n" not in advance_section
     assert "\ngza iterate <impl_task_id> [options]\n" not in iterate_section

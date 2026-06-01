@@ -61,6 +61,7 @@ from ._queue_render import (
     print_queue_rows,
     queue_render_widths,
 )
+from ._recovery_lane import RecoveryLaneEntry, collect_recovery_lane_entries
 from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
     classify_advance_action,
@@ -998,6 +999,20 @@ def _emit_recovery_dry_run_report(
     max_recovery_attempts: int,
     show_skipped: bool = False,
 ) -> _RecoveryReport:
+    entries = collect_recovery_lane_entries(
+        store,
+        tags=tags,
+        any_tag=any_tag,
+        max_recovery_attempts=max_recovery_attempts,
+    )
+    scope = ",".join(tags) if tags else "*"
+    print(f"Failed recovery plan (tags={scope}, mode=restart-failed)")
+    print()
+    actionable = resume = retry = 0
+    attention_rows: list[tuple[DbTask, dict[str, object]]] = []
+    skipped = 0
+    hidden_skipped = 0
+    visible_task_ids = {entry.task.id for entry in entries if entry.task.id is not None}
     failed_rows = [
         row
         for row in _query_owner_rows(
@@ -1019,19 +1034,20 @@ def _emit_recovery_dry_run_report(
             task_id_numeric_key(row.owner_task.id),
         )
     )
-    scope = ",".join(tags) if tags else "*"
-    print(f"Failed recovery plan (tags={scope}, mode=restart-failed)")
-    print()
-    actionable = resume = retry = 0
-    attention_rows: list[tuple[DbTask, dict[str, object]]] = []
-    skipped = 0
-    hidden_skipped = 0
+    visible_entry_by_task_id = {entry.task.id: entry for entry in entries if entry.task.id is not None}
     for row in failed_rows:
         task = row.recovery_leaf_task
         assert task is not None
         if task.id is None:
             continue
-        decision = decide_failed_task_recovery(store, task, max_recovery_attempts=max_recovery_attempts)
+        visible_entry = visible_entry_by_task_id.get(task.id)
+        if visible_entry is not None:
+            decision = visible_entry.decision
+            if visible_entry.attention_action is not None:
+                attention_rows.append((task, visible_entry.attention_action))
+                continue
+        else:
+            decision = decide_failed_task_recovery(store, task, max_recovery_attempts=max_recovery_attempts)
         if decision.action in {"resume", "retry"}:
             launch = decision.launch_mode
             print(
@@ -1044,14 +1060,7 @@ def _emit_recovery_dry_run_report(
             if decision.action == "retry":
                 retry += 1
             continue
-        attention_action = _failed_recovery_attention_action(
-            store=store,
-            task=task,
-            decision=decision,
-            max_recovery_attempts=max_recovery_attempts,
-        )
-        if attention_action is not None:
-            attention_rows.append((task, attention_action))
+        if task.id in visible_task_ids:
             continue
         skipped += 1
         if show_skipped:
@@ -2465,6 +2474,12 @@ def cmd_queue(args: argparse.Namespace) -> int:
             print(f"{message} (task is not currently runnable; ordering will apply once runnable)")
         return 0
 
+    recovery_entries = collect_recovery_lane_entries(
+        store,
+        tags=normalized_tag_filters,
+        any_tag=any_tag,
+        max_recovery_attempts=config.max_resume_attempts,
+    )
     queue_rows = [
         row
         for row in service.run(
@@ -2474,7 +2489,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     ]
     runnable_pending = [row.task for row in queue_rows if not bool(row.values.get("blocked"))]
     blocked_pending = [row.task for row in queue_rows if bool(row.values.get("blocked"))]
-    if not runnable_pending and not blocked_pending:
+    if not runnable_pending and not blocked_pending and not recovery_entries:
         if tag_filters:
             print(f"No pending tasks matching tags: {', '.join(tag_filters)}")
         else:
@@ -2504,6 +2519,26 @@ def cmd_queue(args: argparse.Namespace) -> int:
     )
     widths = queue_render_widths(rendered_rows)
 
+    console.print(
+        build_queue_summary(
+            "Recovery lane: `advance` / `watch` only. Evaluated ahead of pending pickup."
+        )
+    )
+    if recovery_entries:
+        for entry in recovery_entries:
+            console.print(_format_queue_recovery_lane_detail(entry))
+    else:
+        console.print("No recovery candidates")
+
+    console.print()
+    console.print(
+        build_queue_summary(
+            "Pending lane: `gza queue` preview only. `gza work` / `watch` start from this lane."
+        )
+    )
+    if not runnable_pending and not blocked_pending:
+        console.print("No pending tasks")
+        return 0
     print_queue_rows(
         console,
         [row for row in rendered_rows if not row.blocked],
@@ -2524,3 +2559,15 @@ def cmd_queue(args: argparse.Namespace) -> int:
     )
 
     return 0
+
+
+def _format_queue_recovery_lane_detail(entry: RecoveryLaneEntry) -> str:
+    if entry.attention_action is not None:
+        return format_needs_attention_entry_for_display(entry.task, action=entry.attention_action)
+    decision = entry.decision
+    return (
+        f"{decision.action:<6} {entry.task.id} [{entry.task.task_type}] "
+        f"{shorten_prompt(entry.task.prompt, prompt_available_width(prefix=32, suffix=0))} "
+        f"via {decision.launch_mode} reason={decision.reason_code} "
+        f"attempt={decision.attempt_index}/{decision.attempt_limit}"
+    )
