@@ -1435,6 +1435,8 @@ class TestIterateBackgroundForceDispatch:
         captured_cmd: list[str] | None = None
         mock_proc = MagicMock()
         mock_proc.pid = 6262
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
 
         def capture_popen(cmd, **_kwargs):
             nonlocal captured_cmd
@@ -1461,6 +1463,7 @@ class TestIterateBackgroundForceDispatch:
                 "gza.cli.execution._prepare_task_for_immediate_execution",
                 side_effect=lambda _c, prepared_task, **_k: prepared_task,
             ),
+            patch("gza.cli.execution.Git", return_value=mock_git),
             patch("gza.cli._common.subprocess.Popen", side_effect=capture_popen),
         ):
             rc = main()

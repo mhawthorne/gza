@@ -121,7 +121,7 @@ def _foreground_command_invocation(command: str) -> RunInvocationContext:
 
 @dataclass(frozen=True)
 class _IterateBackgroundPreflightContext:
-    """Prepared git context for completed-task iterate background preflight."""
+    """Prepared git context for iterate background preflight."""
 
     git_runtime: Git
     target_branch: str
@@ -2661,7 +2661,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     def _prepare_iterate_background_preflight_context(
         iterate_task: DbTask,
     ) -> tuple[_IterateBackgroundPreflightContext | None, int | None]:
-        if iterate_task.status != "completed":
+        if iterate_task.status == "pending":
             return None, None
         try:
             git_runtime: Any = Git(config.project_dir)
@@ -2745,6 +2745,37 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         iterate_task: DbTask,
         preflight_context: _IterateBackgroundPreflightContext | None,
     ) -> int | None:
+        if iterate_task.status != "pending" and preflight_context is not None:
+            resolved_merge_state = _resolve_iterate_merge_state_for_current_target(
+                store=store,
+                impl_task=iterate_task,
+                git_runtime=preflight_context.git_runtime,
+                target_branch=preflight_context.target_branch,
+            )
+            if resolved_merge_state == "merged":
+                try:
+                    _reconcile_iterate_already_merged(
+                        store=store,
+                        impl_task=iterate_task,
+                        git_runtime=preflight_context.git_runtime,
+                        target_branch=preflight_context.target_branch,
+                    )
+                except Exception as exc:
+                    task_label = iterate_task.id or "<unknown>"
+                    print_phase1_message(
+                        args,
+                        f"Error: failed to reconcile already-merged implementation {task_label}: {exc}",
+                    )
+                    return 1
+            if resolved_from_failed_ancestor and resolved_merge_state == "merged":
+                print(
+                    "No remaining iterate action: "
+                    f"failed implementation {requested_impl_task.id} was fully recovered by merged descendant {iterate_task.id}."
+                )
+                return 0
+            if resolved_merge_state == "merged":
+                print(f"No remaining iterate action: implementation {iterate_task.id} is already merged.")
+                return 0
         try:
             initial_action = _warn_manual_background_iterate_override_if_needed(
                 iterate_task,
@@ -2759,39 +2790,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             return 1
         if iterate_task.status != "completed":
             return None
-        if preflight_context is None:
-            return None
-
-        resolved_merge_state = _resolve_iterate_merge_state_for_current_target(
-            store=store,
-            impl_task=iterate_task,
-            git_runtime=preflight_context.git_runtime,
-            target_branch=preflight_context.target_branch,
-        )
-        if resolved_merge_state == "merged":
-            try:
-                _reconcile_iterate_already_merged(
-                    store=store,
-                    impl_task=iterate_task,
-                    git_runtime=preflight_context.git_runtime,
-                    target_branch=preflight_context.target_branch,
-                )
-            except Exception as exc:
-                task_label = iterate_task.id or "<unknown>"
-                print_phase1_message(
-                    args,
-                    f"Error: failed to reconcile already-merged implementation {task_label}: {exc}",
-                )
-                return 1
-        if resolved_from_failed_ancestor and resolved_merge_state == "merged":
-            print(
-                "No remaining iterate action: "
-                f"failed implementation {requested_impl_task.id} was fully recovered by merged descendant {iterate_task.id}."
-            )
-            return 0
-        if resolved_merge_state == "merged":
-            print(f"No remaining iterate action: implementation {iterate_task.id} is already merged.")
-            return 0
+        assert preflight_context is not None
         if initial_action is None:
             try:
                 initial_action = determine_next_action(

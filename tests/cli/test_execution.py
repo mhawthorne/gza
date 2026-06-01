@@ -9993,6 +9993,141 @@ class TestIterateCommand:
         assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
         assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 
+    def test_background_iterate_failed_retry_reconciles_already_merged_noop_before_spawn(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Failed implementation", task_type="implement")
+        assert impl.id is not None
+        impl.status = "failed"
+        impl.failure_reason = "MAX_STEPS"
+        impl.branch = "feature/failed-merged"
+        impl.has_commits = True
+        impl.completed_at = datetime.now(UTC)
+        impl.merge_status = "unmerged"
+        store.update(impl)
+        store._default_merge_target_cache = "main"  # noqa: SLF001 - test fixture for merge-unit backfill
+
+        config = Config.load(tmp_path)
+        config.max_resume_attempts = 1
+        config.require_review_before_merge = True
+        config.advance_create_reviews = True
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.default_branch.return_value = "main"
+        mock_git.resolve_merge_source_ref.return_value = f"origin/{impl.branch}"
+        mock_git.branch_exists.return_value = False
+        mock_git.ref_exists.return_value = True
+        mock_git.is_merged.return_value = True
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=True,
+            auto_iterate=False,
+            background=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        refreshed = store.get(impl.id)
+        unit = store.resolve_merge_unit_for_task(impl.id)
+
+        assert result == 0
+        spawn_background.assert_not_called()
+        assert store.get_based_on_children(impl.id) == []
+        assert refreshed is not None
+        assert refreshed.merge_status == "merged"
+        assert unit is not None
+        assert unit.state == "merged"
+        assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+
+    def test_background_iterate_failed_retry_git_preflight_failure_surfaces_before_spawn(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Failed implementation", task_type="implement")
+        assert impl.id is not None
+        impl.status = "failed"
+        impl.failure_reason = "MAX_STEPS"
+        impl.branch = "feature/failed-preflight"
+        impl.has_commits = True
+        impl.completed_at = datetime.now(UTC)
+        impl.merge_status = "unmerged"
+        store.update(impl)
+
+        config = Config.load(tmp_path)
+        config.max_resume_attempts = 1
+        config.require_review_before_merge = True
+        config.advance_create_reviews = True
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=True,
+            auto_iterate=False,
+            background=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", side_effect=RuntimeError("git init boom")),
+            patch(
+                "gza.cli.execution._spawn_background_iterate",
+                side_effect=AssertionError("background iterate should not spawn"),
+            ),
+        ):
+            result = cmd_iterate(args)
+
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert (
+            f"Error: failed to initialize iterate background preflight for task {impl.id}: git init boom"
+            in captured.err
+        )
+        assert "could not evaluate iterate background preflight" not in captured.err
+        assert store.get_based_on_children(impl.id) == []
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert not any(path.is_file() for path in logs_dir.rglob("*"))
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
+
     def test_background_iterate_merge_with_followups_spawns_worker_instead_of_noop(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
