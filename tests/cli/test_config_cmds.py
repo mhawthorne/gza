@@ -156,6 +156,85 @@ class TestValidateCommand:
         assert "docker_volumes[0]" in result.stdout
         assert "unknown mode 'xyz'" in result.stdout
 
+    def test_validate_accepts_inner_verify_and_task_timeout_overrides(self, tmp_path: Path):
+        """Validate accepts inner verify and timeout override fields across scopes."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "verify_command: ./bin/tests\n"
+            "inner_verify_command: ./bin/tests --quick\n"
+            "task_types:\n"
+            "  implement:\n"
+            "    timeout_minutes: 30\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      implement:\n"
+            "        timeout_minutes: 45\n"
+        )
+
+        result = run_gza("validate", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "valid" in result.stdout.lower()
+
+    def test_validate_rejects_inverted_code_task_timeout_scaling_thresholds(self, tmp_path: Path):
+        """Validate rejects large diff thresholds below the medium threshold."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "code_task_diff_timeout_medium_threshold: 800\n"
+            "code_task_diff_timeout_large_threshold: 500\n"
+        )
+
+        result = run_gza("validate", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "code_task_diff_timeout_large_threshold" in result.stdout
+
+    @pytest.mark.parametrize(
+        ("config_body", "expected_error"),
+        [
+            (
+                "project_name: test\ncode_task_diff_timeout_large_threshold: 300\n",
+                "'code_task_diff_timeout_large_threshold' must be greater than or equal to "
+                "'code_task_diff_timeout_medium_threshold'",
+            ),
+            (
+                "project_name: test\ncode_task_diff_timeout_medium_threshold: 1500\n",
+                "'code_task_diff_timeout_large_threshold' must be greater than or equal to "
+                "'code_task_diff_timeout_medium_threshold'",
+            ),
+            (
+                "project_name: test\ncode_task_diff_timeout_large_minutes: 20\n",
+                "'code_task_diff_timeout_large_minutes' must be greater than or equal to "
+                "'code_task_diff_timeout_medium_minutes'",
+            ),
+            (
+                "project_name: test\ncode_task_diff_timeout_medium_minutes: 60\n",
+                "'code_task_diff_timeout_large_minutes' must be greater than or equal to "
+                "'code_task_diff_timeout_medium_minutes'",
+            ),
+            (
+                "project_name: test\ncode_task_diff_timeout_medium_threshold: true\n",
+                "'code_task_diff_timeout_medium_threshold' must be an integer",
+            ),
+        ],
+    )
+    def test_validate_rejects_invalid_resolved_code_task_timeout_scaling(
+        self,
+        tmp_path: Path,
+        config_body: str,
+        expected_error: str,
+    ) -> None:
+        """Validate rejects resolved timeout scaling inversions and strict-int violations."""
+        (tmp_path / "gza.yaml").write_text(config_body)
+
+        result = run_gza("validate", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert expected_error in result.stdout
+
 
 class TestProjectPrefixValidation:
     """Tests for project_prefix config field validation."""
@@ -596,6 +675,27 @@ class TestLocalConfigOverrides:
         assert payload["local_overrides_active"] is True
         assert payload["local_override_file"] == "gza.local.yaml"
 
+    def test_config_command_includes_verify_profiles_and_timeout_scaling(self, tmp_path: Path):
+        """`gza config --json` should expose inner/final verify commands and timeout scaling fields."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "verify_command: ./bin/tests\n"
+            "inner_verify_command: ./bin/tests --quick\n"
+            "code_task_diff_timeout_medium_threshold: 500\n"
+            "code_task_diff_timeout_large_threshold: 1500\n"
+        )
+
+        result = run_gza("config", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        effective = payload["effective"]
+        assert effective["verify_command"] == "./bin/tests"
+        assert effective["inner_verify_command"] == "./bin/tests --quick"
+        assert effective["code_task_diff_timeout_medium_threshold"] == 500
+        assert effective["code_task_diff_timeout_large_threshold"] == 1500
+
     def test_config_command_projects_source_for_branch_strategy_preset(self, tmp_path: Path):
         """gza config should attribute normalized branch_strategy fields to configured source."""
 
@@ -997,7 +1097,6 @@ class TestLocalConfigOverrides:
             ("log_dir", "log_dir: nope\n"),
             ("branch_strategy", "branch_strategy: simple\n"),
             ("branch_mode", "branch_mode: single\n"),
-            ("verify_command", "verify_command: uv run pytest\n"),
             ("unknown_key", "unknown_key: value\n"),
         ],
     )
@@ -1014,6 +1113,23 @@ class TestLocalConfigOverrides:
             match=rf"Invalid user config key '{re.escape(key)}' in ~/.gza/config.yaml",
         ):
             Config.load(tmp_path)
+
+    def test_user_config_allows_verify_profiles(self, tmp_path: Path):
+        """User config may provide shared verify_command and inner_verify_command defaults."""
+        from gza.config import Config
+
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(
+            home_dir,
+            "verify_command: ./bin/tests\n"
+            "inner_verify_command: ./bin/tests --quick\n",
+        )
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+
+        config = Config.load(tmp_path)
+
+        assert config.verify_command == "./bin/tests"
+        assert config.inner_verify_command == "./bin/tests --quick"
 
     def test_validate_fails_for_invalid_user_config(self, tmp_path: Path):
         """gza validate should fail when the user config contains disallowed keys."""
@@ -1531,6 +1647,25 @@ class TestInitCommand:
         assert result.returncode == 1
         assert "Invalid user config in ~/.gza/config.yaml" in result.stdout
         assert "'db_path' must be a string" in result.stdout
+        assert (tmp_path / "gza.yaml").exists() is False
+        assert (tmp_path / "gza.local.yaml.example").exists() is False
+
+    def test_init_rejects_invalid_resolved_timeout_scaling_in_user_config_before_writing_project_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Init should reject one-sided resolved timeout scaling inversions from user config."""
+        home_dir, env = self._home_env(tmp_path)
+        write_user_config(home_dir, "code_task_diff_timeout_medium_threshold: 1500\n")
+
+        result = run_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
+
+        assert result.returncode == 1
+        assert "Invalid user config in ~/.gza/config.yaml" in result.stdout
+        assert (
+            "'code_task_diff_timeout_large_threshold' must be greater than or equal to "
+            "'code_task_diff_timeout_medium_threshold'"
+        ) in result.stdout
         assert (tmp_path / "gza.yaml").exists() is False
         assert (tmp_path / "gza.local.yaml.example").exists() is False
 
@@ -3348,6 +3483,58 @@ class TestWatchConfigValidation:
         config = Config.load(tmp_path)
         assert config.review_verify_timeout_seconds == 240
         assert config.recommend_rebase_behind_commits == 0
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            (
+                "code_task_diff_timeout_large_threshold",
+                "300",
+                "'code_task_diff_timeout_large_threshold' must be greater than or equal to "
+                "'code_task_diff_timeout_medium_threshold'",
+            ),
+            (
+                "code_task_diff_timeout_medium_threshold",
+                "1500",
+                "'code_task_diff_timeout_large_threshold' must be greater than or equal to "
+                "'code_task_diff_timeout_medium_threshold'",
+            ),
+            (
+                "code_task_diff_timeout_large_minutes",
+                "20",
+                "'code_task_diff_timeout_large_minutes' must be greater than or equal to "
+                "'code_task_diff_timeout_medium_minutes'",
+            ),
+            (
+                "code_task_diff_timeout_medium_minutes",
+                "60",
+                "'code_task_diff_timeout_large_minutes' must be greater than or equal to "
+                "'code_task_diff_timeout_medium_minutes'",
+            ),
+            (
+                "code_task_diff_timeout_medium_threshold",
+                "true",
+                "'code_task_diff_timeout_medium_threshold' must be an integer",
+            ),
+        ],
+    )
+    def test_code_task_timeout_scaling_invalid_values_fail(
+        self,
+        tmp_path: Path,
+        field: str,
+        value: str,
+        message: str,
+    ) -> None:
+        """Config.load and validate reject invalid resolved code-task timeout scaling values."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, f"{field}: {value}\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert message in errors
+
+        with pytest.raises(ConfigError, match=re.escape(message)):
+            Config.load(tmp_path)
 
     @pytest.mark.parametrize(
         ("field", "value", "message"),

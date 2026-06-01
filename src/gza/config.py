@@ -9,6 +9,7 @@ import sys
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 import yaml
 
@@ -46,6 +47,7 @@ DEFAULT_DB_FILE = f".{APP_NAME}/{APP_NAME}.db"
 DEFAULT_LOG_DIR = f".{APP_NAME}/logs"
 DEFAULT_WORKERS_DIR = f".{APP_NAME}/workers"
 DEFAULT_TIMEOUT_MINUTES = 10
+DEFAULT_INNER_VERIFY_COMMAND = ""
 DEFAULT_USE_DOCKER = True
 DEFAULT_ENFORCE_PROJECT_SCOPE = True
 DEFAULT_BRANCH_MODE = "multi"  # "single" or "multi"
@@ -87,6 +89,11 @@ DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD = 500
 DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
 DEFAULT_REVIEW_CONTEXT_FILE_LIMIT = 12
 DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS = 120
+DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_THRESHOLD = 400
+DEFAULT_CODE_TASK_DIFF_TIMEOUT_LARGE_THRESHOLD = 1200
+DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_MINUTES = 30
+DEFAULT_CODE_TASK_DIFF_TIMEOUT_LARGE_MINUTES = 45
+DEFAULT_CODE_TASK_DIFF_TIMEOUT_CAP_MINUTES = 45
 DEFAULT_RECOMMEND_REBASE_BEHIND_COMMITS = 1
 DEFAULT_LEARNINGS_WINDOW = 25
 DEFAULT_LEARNINGS_INTERVAL = 5
@@ -97,11 +104,14 @@ VALID_CONFIG_FIELDS = {
     "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps",
     "max_turns", "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
     "reasoning_effort", "defaults", "task_types", "providers", "branch_strategy", "chat_text_display_length",
-    "verify_command",
+    "verify_command", "inner_verify_command",
     "advance_create_reviews", "require_review_before_merge", "pr_integration", "advance_mode", "max_resume_attempts",
     "max_review_cycles", "max_noop_improve_cycles", "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
     "review_diff_medium_threshold", "review_context_file_limit", "review_verify_timeout_seconds",
+    "code_task_diff_timeout_medium_threshold", "code_task_diff_timeout_large_threshold",
+    "code_task_diff_timeout_medium_minutes", "code_task_diff_timeout_large_minutes",
+    "code_task_diff_timeout_cap_minutes",
     "recommend_rebase_behind_commits", "tmux", "learnings_window",
     "learnings_interval", "learnings_max_items", "theme", "colors",
 }
@@ -135,6 +145,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
             "reasoning_effort": None,
             "max_steps": None,
             "max_turns": None,
+            "timeout_minutes": None,
         },
     },
     "providers": {
@@ -147,6 +158,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
                     "reasoning_effort": None,
                     "max_steps": None,
                     "max_turns": None,
+                    "timeout_minutes": None,
                 },
             },
         },
@@ -164,6 +176,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     },
     "chat_text_display_length": None,
     "verify_command": None,
+    "inner_verify_command": None,
     "advance_create_reviews": None,
     "require_review_before_merge": None,
     "pr_integration": None,
@@ -190,6 +203,11 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
     "review_verify_timeout_seconds": None,
+    "code_task_diff_timeout_medium_threshold": None,
+    "code_task_diff_timeout_large_threshold": None,
+    "code_task_diff_timeout_medium_minutes": None,
+    "code_task_diff_timeout_large_minutes": None,
+    "code_task_diff_timeout_cap_minutes": None,
     "recommend_rebase_behind_commits": None,
     "theme": None,
     "colors": {
@@ -226,6 +244,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
             "reasoning_effort": None,
             "max_steps": None,
             "max_turns": None,
+            "timeout_minutes": None,
         },
     },
     "providers": {
@@ -238,6 +257,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
                     "reasoning_effort": None,
                     "max_steps": None,
                     "max_turns": None,
+                    "timeout_minutes": None,
                 },
             },
         },
@@ -254,6 +274,8 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
         "terminal_size": None,
     },
     "chat_text_display_length": None,
+    "verify_command": None,
+    "inner_verify_command": None,
     "advance_create_reviews": None,
     "require_review_before_merge": None,
     "pr_integration": None,
@@ -280,6 +302,11 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
     "review_verify_timeout_seconds": None,
+    "code_task_diff_timeout_medium_threshold": None,
+    "code_task_diff_timeout_large_threshold": None,
+    "code_task_diff_timeout_medium_minutes": None,
+    "code_task_diff_timeout_large_minutes": None,
+    "code_task_diff_timeout_cap_minutes": None,
     "recommend_rebase_behind_commits": None,
     "learnings_window": None,
     "learnings_interval": None,
@@ -345,6 +372,15 @@ def _detect_model_provider_family(model: str) -> str | None:
     return None
 
 
+def _validate_optional_string_field(value: object, field_name: str, *, default: str = "") -> str:
+    """Return a string config field or raise when an explicit value has the wrong type."""
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ConfigError(f"'{field_name}' must be a string")
+    return value
+
+
 def _is_model_compatible_with_provider(provider: str, model: str | None) -> bool:
     """Return True if model appears compatible with provider."""
     if not model or not isinstance(model, str):
@@ -373,6 +409,110 @@ def _load_strict_int_field(data: dict, field_name: str, default: int) -> int:
     if not _is_strict_int(value):
         raise ConfigError(f"'{field_name}' must be an integer")
     return value
+
+
+def _validate_optional_positive_int_field(
+    value: object,
+    field_name: str,
+    *,
+    errors: list[str] | None = None,
+) -> int | None:
+    """Validate an optional positive integer field with shared load/validate errors."""
+
+    def _record_error(message: str) -> None:
+        if errors is None:
+            raise ConfigError(message)
+        errors.append(message)
+
+    if value is None:
+        return None
+    if not _is_strict_int(value):
+        _record_error(f"'{field_name}' must be an integer")
+        return None
+    validated_value = cast(int, value)
+    if validated_value <= 0:
+        _record_error(f"'{field_name}' must be positive")
+        return None
+    return validated_value
+
+
+def _code_task_timeout_scaling_order_errors(
+    *,
+    medium_threshold: int,
+    large_threshold: int,
+    medium_minutes: int,
+    large_minutes: int,
+) -> list[str]:
+    """Return ordering errors for resolved code-task timeout scaling values."""
+    errors: list[str] = []
+    if large_threshold < medium_threshold:
+        errors.append(
+            "'code_task_diff_timeout_large_threshold' must be greater than or equal to "
+            "'code_task_diff_timeout_medium_threshold'"
+        )
+    if large_minutes < medium_minutes:
+        errors.append(
+            "'code_task_diff_timeout_large_minutes' must be greater than or equal to "
+            "'code_task_diff_timeout_medium_minutes'"
+        )
+    return errors
+
+
+def _resolve_code_task_timeout_scaling_fields(
+    data: dict,
+    *,
+    errors: list[str] | None = None,
+) -> tuple[int, int, int, int, int] | None:
+    """Resolve and validate code-task timeout scaling fields.
+
+    When ``errors`` is provided, validation issues are appended there and
+    ``None`` is returned. Otherwise the first issue raises ``ConfigError``.
+    """
+
+    def _record_error(message: str) -> None:
+        if errors is None:
+            raise ConfigError(message)
+        errors.append(message)
+
+    values: dict[str, int] = {}
+    for key, default in (
+        ("code_task_diff_timeout_medium_threshold", DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_THRESHOLD),
+        ("code_task_diff_timeout_large_threshold", DEFAULT_CODE_TASK_DIFF_TIMEOUT_LARGE_THRESHOLD),
+        ("code_task_diff_timeout_medium_minutes", DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_MINUTES),
+        ("code_task_diff_timeout_large_minutes", DEFAULT_CODE_TASK_DIFF_TIMEOUT_LARGE_MINUTES),
+        ("code_task_diff_timeout_cap_minutes", DEFAULT_CODE_TASK_DIFF_TIMEOUT_CAP_MINUTES),
+    ):
+        value = data.get(key, default)
+        if not _is_strict_int(value):
+            _record_error(f"'{key}' must be an integer")
+            continue
+        if value <= 0:
+            _record_error(f"'{key}' must be positive")
+            continue
+        values[key] = value
+
+    if len(values) != 5:
+        return None
+
+    order_errors = _code_task_timeout_scaling_order_errors(
+        medium_threshold=values["code_task_diff_timeout_medium_threshold"],
+        large_threshold=values["code_task_diff_timeout_large_threshold"],
+        medium_minutes=values["code_task_diff_timeout_medium_minutes"],
+        large_minutes=values["code_task_diff_timeout_large_minutes"],
+    )
+    if order_errors:
+        if errors is None:
+            raise ConfigError(order_errors[0])
+        errors.extend(order_errors)
+        return None
+
+    return (
+        values["code_task_diff_timeout_medium_threshold"],
+        values["code_task_diff_timeout_large_threshold"],
+        values["code_task_diff_timeout_medium_minutes"],
+        values["code_task_diff_timeout_large_minutes"],
+        values["code_task_diff_timeout_cap_minutes"],
+    )
 
 
 def _read_yaml_dict(path: Path) -> dict:
@@ -633,6 +773,7 @@ class TaskTypeConfig:
     reasoning_effort: str | None = None
     max_steps: int | None = None
     max_turns: int | None = None
+    timeout_minutes: int | None = None
 
 
 @dataclass
@@ -738,6 +879,7 @@ class Config:
     chat_text_display_length: int = DEFAULT_CHAT_TEXT_DISPLAY_LENGTH  # 0 = unlimited
     docker_setup_command: str = ""  # Pre-warm command run synchronously before provider CLI starts
     verify_command: str = ""  # Command to run before finishing (e.g., mypy + pytest)
+    inner_verify_command: str = DEFAULT_INNER_VERIFY_COMMAND
     advance_create_reviews: bool = DEFAULT_ADVANCE_CREATE_REVIEWS
     require_review_before_merge: bool = DEFAULT_REQUIRE_REVIEW_BEFORE_MERGE
     pr_integration: bool = DEFAULT_PR_INTEGRATION
@@ -755,6 +897,11 @@ class Config:
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
     review_verify_timeout_seconds: int = DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS
+    code_task_diff_timeout_medium_threshold: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_THRESHOLD
+    code_task_diff_timeout_large_threshold: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_LARGE_THRESHOLD
+    code_task_diff_timeout_medium_minutes: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_MINUTES
+    code_task_diff_timeout_large_minutes: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_LARGE_MINUTES
+    code_task_diff_timeout_cap_minutes: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_CAP_MINUTES
     recommend_rebase_behind_commits: int = DEFAULT_RECOMMEND_REBASE_BEHIND_COMMITS  # Deprecated compatibility key; ignored.
     learnings_window: int = DEFAULT_LEARNINGS_WINDOW
     learnings_interval: int = DEFAULT_LEARNINGS_INTERVAL
@@ -923,6 +1070,33 @@ class Config:
             The max_turns to use for this task type
         """
         return self.get_max_steps_for_task(task_type, self.provider)
+
+    def get_timeout_minutes_for_task(self, task_type: str, provider: str) -> int:
+        """Get timeout_minutes for task type within provider/task-type scope.
+
+        Precedence:
+        1. providers.<provider>.task_types.<task_type>.timeout_minutes
+        2. task_types.<task_type>.timeout_minutes
+        3. timeout_minutes
+        4. default (10)
+        """
+        provider_config = self.providers.get(provider)
+        if provider_config:
+            provider_task_type = provider_config.task_types.get(task_type)
+            if provider_task_type and provider_task_type.timeout_minutes is not None:
+                return provider_task_type.timeout_minutes
+
+        legacy_task_type = self.task_types.get(task_type)
+        if legacy_task_type and legacy_task_type.timeout_minutes is not None:
+            return legacy_task_type.timeout_minutes
+
+        if self.timeout_minutes is not None:
+            return self.timeout_minutes
+        return DEFAULT_TIMEOUT_MINUTES
+
+    def get_timeout_minutes_for_task_type(self, task_type: str) -> int:
+        """Get timeout_minutes for a task type using the configured default provider."""
+        return self.get_timeout_minutes_for_task(task_type, self.provider)
 
     @property
     def worktree_path(self) -> Path:
@@ -1162,7 +1336,11 @@ class Config:
         defaults = data.get("defaults", {})
 
         use_docker = data.get("use_docker", DEFAULT_USE_DOCKER)
-        timeout_minutes = data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES)
+        timeout_minutes = _validate_optional_positive_int_field(
+            data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES),
+            "timeout_minutes",
+        )
+        assert timeout_minutes is not None
         branch_mode = data.get("branch_mode", DEFAULT_BRANCH_MODE)
 
         # Compatibility aliases resolve by layer first; defaults.* only wins within the same layer.
@@ -1239,6 +1417,12 @@ class Config:
             reasoning_effort = ""
         elif not isinstance(reasoning_effort, str):
             raise ConfigError("'reasoning_effort' must be a string")
+        verify_command = _validate_optional_string_field(data.get("verify_command"), "verify_command")
+        inner_verify_command = _validate_optional_string_field(
+            data.get("inner_verify_command"),
+            "inner_verify_command",
+            default=DEFAULT_INNER_VERIFY_COMMAND,
+        )
 
         docker_volumes = data.get("docker_volumes", [])
         enforce_project_scope = data.get("enforce_project_scope", DEFAULT_ENFORCE_PROJECT_SCOPE)
@@ -1263,11 +1447,16 @@ class Config:
         if "task_types" in data and isinstance(data["task_types"], dict):
             for task_type, config_data in data["task_types"].items():
                 if isinstance(config_data, dict):
+                    task_type_timeout_minutes = _validate_optional_positive_int_field(
+                        config_data.get("timeout_minutes"),
+                        f"task_types.{task_type}.timeout_minutes",
+                    )
                     task_types[task_type] = TaskTypeConfig(
                         model=config_data.get("model"),
                         reasoning_effort=config_data.get("reasoning_effort"),
                         max_steps=config_data.get("max_steps"),
-                        max_turns=config_data.get("max_turns")
+                        max_turns=config_data.get("max_turns"),
+                        timeout_minutes=task_type_timeout_minutes,
                     )
 
         # Parse provider-scoped configuration
@@ -1319,6 +1508,10 @@ class Config:
                             )
                         provider_task_max_turns = task_type_config_data.get("max_turns")
                         provider_task_max_steps = task_type_config_data.get("max_steps")
+                        provider_task_timeout_minutes = _validate_optional_positive_int_field(
+                            task_type_config_data.get("timeout_minutes"),
+                            f"providers.{provider_name}.task_types.{task_type}.timeout_minutes",
+                        )
                         if provider_task_max_steps is not None:
                             if not isinstance(provider_task_max_steps, int):
                                 raise ConfigError(
@@ -1342,6 +1535,7 @@ class Config:
                             reasoning_effort=provider_task_reasoning_effort,
                             max_steps=provider_task_max_steps,
                             max_turns=provider_task_max_turns,
+                            timeout_minutes=provider_task_timeout_minutes,
                         )
 
                 providers[provider_name] = ProviderConfig(
@@ -1737,6 +1931,16 @@ class Config:
         if review_verify_timeout_seconds < 1:
             raise ConfigError("'review_verify_timeout_seconds' must be positive")
 
+        resolved_code_task_timeout_scaling = _resolve_code_task_timeout_scaling_fields(data)
+        assert resolved_code_task_timeout_scaling is not None
+        (
+            code_task_diff_timeout_medium_threshold,
+            code_task_diff_timeout_large_threshold,
+            code_task_diff_timeout_medium_minutes,
+            code_task_diff_timeout_large_minutes,
+            code_task_diff_timeout_cap_minutes,
+        ) = resolved_code_task_timeout_scaling
+
         recommend_rebase_behind_commits = _load_strict_int_field(
             data,
             "recommend_rebase_behind_commits",
@@ -1869,7 +2073,8 @@ class Config:
             providers=providers,
             branch_strategy=branch_strategy,
             chat_text_display_length=chat_text_display_length,
-            verify_command=data.get("verify_command", ""),
+            verify_command=verify_command,
+            inner_verify_command=inner_verify_command,
             advance_create_reviews=advance_create_reviews,
             require_review_before_merge=require_review_before_merge,
             pr_integration=pr_integration,
@@ -1887,6 +2092,11 @@ class Config:
             review_diff_medium_threshold=review_diff_medium_threshold,
             review_context_file_limit=review_context_file_limit,
             review_verify_timeout_seconds=review_verify_timeout_seconds,
+            code_task_diff_timeout_medium_threshold=code_task_diff_timeout_medium_threshold,
+            code_task_diff_timeout_large_threshold=code_task_diff_timeout_large_threshold,
+            code_task_diff_timeout_medium_minutes=code_task_diff_timeout_medium_minutes,
+            code_task_diff_timeout_large_minutes=code_task_diff_timeout_large_minutes,
+            code_task_diff_timeout_cap_minutes=code_task_diff_timeout_cap_minutes,
             recommend_rebase_behind_commits=recommend_rebase_behind_commits,
             learnings_window=learnings_window,
             learnings_interval=learnings_interval,
@@ -2076,10 +2286,11 @@ class Config:
                             )
 
         if "timeout_minutes" in data:
-            if not isinstance(data["timeout_minutes"], int):
-                errors.append("'timeout_minutes' must be an integer")
-            elif data["timeout_minutes"] <= 0:
-                errors.append("'timeout_minutes' must be positive")
+            _validate_optional_positive_int_field(
+                data["timeout_minutes"],
+                "timeout_minutes",
+                errors=errors,
+            )
 
         if "branch_mode" in data:
             if not isinstance(data["branch_mode"], str):
@@ -2227,6 +2438,8 @@ class Config:
 
         if "verify_command" in data and not isinstance(data["verify_command"], str):
             errors.append("'verify_command' must be a string")
+        if "inner_verify_command" in data and not isinstance(data["inner_verify_command"], str):
+            errors.append("'inner_verify_command' must be a string")
 
         if "interactive_worktree_dir" in data and not isinstance(data["interactive_worktree_dir"], str):
             errors.append("'interactive_worktree_dir' must be a string")
@@ -2257,6 +2470,8 @@ class Config:
             elif data["review_verify_timeout_seconds"] <= 0:
                 errors.append("'review_verify_timeout_seconds' must be positive")
 
+        _resolve_code_task_timeout_scaling_fields(data, errors=errors)
+
         if "recommend_rebase_behind_commits" in data:
             if not isinstance(data["recommend_rebase_behind_commits"], int):
                 errors.append("'recommend_rebase_behind_commits' must be an integer")
@@ -2271,7 +2486,6 @@ class Config:
             errors.append(
                 "'review_diff_medium_threshold' must be greater than or equal to 'review_diff_small_threshold'"
             )
-
         if "advance_create_reviews" in data and not isinstance(data["advance_create_reviews"], bool):
             errors.append("'advance_create_reviews' must be a boolean (true/false)")
 
@@ -2349,8 +2563,14 @@ class Config:
                                 errors.append(f"'task_types.{task_type}.max_steps' must be an integer")
                             elif config["max_steps"] <= 0:
                                 errors.append(f"'task_types.{task_type}.max_steps' must be positive")
+                        if "timeout_minutes" in config:
+                            _validate_optional_positive_int_field(
+                                config["timeout_minutes"],
+                                f"task_types.{task_type}.timeout_minutes",
+                                errors=errors,
+                            )
                         # Warn about unknown keys
-                        valid_task_type_keys = {"model", "reasoning_effort", "max_steps", "max_turns"}
+                        valid_task_type_keys = {"model", "reasoning_effort", "max_steps", "max_turns", "timeout_minutes"}
                         for key in config.keys():
                             if key not in valid_task_type_keys:
                                 warnings.append(f"Unknown field in 'task_types.{task_type}': '{key}'")
@@ -2483,7 +2703,19 @@ class Config:
                                         errors.append(
                                             f"'providers.{provider_name}.task_types.{task_type}.max_steps' must be positive"
                                         )
-                                valid_provider_task_type_keys = {"model", "reasoning_effort", "max_steps", "max_turns"}
+                                if "timeout_minutes" in task_type_config:
+                                    _validate_optional_positive_int_field(
+                                        task_type_config["timeout_minutes"],
+                                        f"providers.{provider_name}.task_types.{task_type}.timeout_minutes",
+                                        errors=errors,
+                                    )
+                                valid_provider_task_type_keys = {
+                                    "model",
+                                    "reasoning_effort",
+                                    "max_steps",
+                                    "max_turns",
+                                    "timeout_minutes",
+                                }
                                 for key in task_type_config.keys():
                                     if key not in valid_provider_task_type_keys:
                                         warnings.append(

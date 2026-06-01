@@ -22,6 +22,45 @@ def _load_template(name: str) -> str:
     return (_TEMPLATE_DIR / name).read_text()
 
 
+def _get_optional_verify_command(config: Config, field_name: str) -> str:
+    """Return a configured verify command or raise on invalid prompt inputs."""
+    config_dict = getattr(config, "__dict__", {})
+    if isinstance(config_dict, dict):
+        value = config_dict.get(field_name, "")
+    else:
+        value = getattr(config, field_name, "")
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise TypeError(f"config.{field_name} must be a string")
+    return value
+
+
+def _code_task_verify_instructions(config: Config) -> str:
+    """Build the code-task verification policy block for prompts."""
+    final_command = _get_optional_verify_command(config, "verify_command")
+    inner_command = _get_optional_verify_command(config, "inner_verify_command")
+    if not final_command:
+        return ""
+
+    lines = [
+        "Verification policy for this code task:",
+        "- During editing, use fast verification instead of rerunning the full final suite after every change.",
+    ]
+    if inner_command:
+        lines.append(f"- Preferred inner-loop verify command: `{inner_command}`")
+    else:
+        lines.append("- No inner-loop command is configured; use targeted tests/lint/type checks for the files you changed.")
+    lines.extend(
+        [
+            f"- Required final verify command: `{final_command}`",
+            "- Run the full final verify command once after your last code change.",
+            "- If the final verify fails, fix the failures and rerun it. Do not rerun previously successful heavy phases unless your later edits require it.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 class PromptBuilder:
     """Builds prompts for gza tasks using template files.
 
@@ -138,11 +177,9 @@ class PromptBuilder:
                     learnings_check=learnings_check
                 )
 
-            if config.verify_command:
-                base_prompt += (
-                    f"\n\nBefore finishing, run the following verification command"
-                    f" and fix any errors: `{config.verify_command}`"
-                )
+            verify_instructions = _code_task_verify_instructions(config)
+            if verify_instructions:
+                base_prompt += f"\n\n{verify_instructions}"
         elif task.task_type == "improve":
             base_prompt += "\n\n" + _load_template("improve.txt")
             learnings_check = (
@@ -161,11 +198,9 @@ class PromptBuilder:
                     learnings_check=learnings_check
                 )
 
-            if config.verify_command:
-                base_prompt += (
-                    f"\n\nBefore finishing, run the following verification command"
-                    f" and fix any errors: `{config.verify_command}`"
-                )
+            verify_instructions = _code_task_verify_instructions(config)
+            if verify_instructions:
+                base_prompt += f"\n\n{verify_instructions}"
         elif task.task_type == "fix":
             base_prompt += "\n\n" + _load_template("fix.txt")
             learnings_check = (
@@ -184,15 +219,13 @@ class PromptBuilder:
                     learnings_check=learnings_check
                 )
 
-            if config.verify_command:
-                base_prompt += (
-                    f"\n\nBefore finishing, run the following verification command"
-                    f" and fix any errors: `{config.verify_command}`"
-                )
+            verify_instructions = _code_task_verify_instructions(config)
+            if verify_instructions:
+                base_prompt += f"\n\n{verify_instructions}"
         elif task.task_type == "rebase":
-            # Rebase tasks get no extra instructions — the task prompt already
-            # contains the rebase command. No verify_command, no summary file.
-            pass
+            verify_instructions = _code_task_verify_instructions(config)
+            if verify_instructions:
+                base_prompt += f"\n\n{verify_instructions}"
         elif task.task_type in ("internal", "learn"):
             if report_path:
                 base_prompt += "\n\n" + _load_template("internal.txt").format(
@@ -209,6 +242,7 @@ class PromptBuilder:
         task_id: str | None = None,
         task_slug: str | None = None,
         report_path: Path | None = None,
+        resume_context: str | None = None,
     ) -> str:
         """Build the resume verification prompt.
 
@@ -219,6 +253,9 @@ class PromptBuilder:
         the current output artifact contract.
         """
         prompt = _load_template("resume.txt")
+
+        if resume_context:
+            prompt += f"\n\n{resume_context}"
 
         if report_path is None:
             return prompt

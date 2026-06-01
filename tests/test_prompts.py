@@ -4,6 +4,8 @@ import re
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
+
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.prompts import PromptBuilder
@@ -185,7 +187,7 @@ class TestPromptBuilderBuild:
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
-        config.verify_command = None
+        config.verify_command = ""
 
         summary_path = tmp_path / ".gza" / "summaries" / "improve-comments-only.md"
         result = PromptBuilder().build(improve_task, config, store, summary_path=summary_path)
@@ -252,7 +254,7 @@ class TestPromptBuilderBuild:
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
-        config.verify_command = None
+        config.verify_command = ""
 
         summary_path = tmp_path / ".gza" / "summaries" / "improve-timeout-only.md"
         result = PromptBuilder().build(improve_task, config, store, summary_path=summary_path)
@@ -300,7 +302,7 @@ class TestPromptBuilderBuild:
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
-        config.verify_command = None
+        config.verify_command = ""
 
         summary_path = tmp_path / ".gza" / "summaries" / "improve-code-blocker.md"
         result = PromptBuilder().build(improve_task, config, store, summary_path=summary_path)
@@ -348,7 +350,7 @@ class TestPromptBuilderBuild:
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
-        config.verify_command = None
+        config.verify_command = ""
 
         summary_path = tmp_path / ".gza" / "summaries" / "improve-structured-code-timeout.md"
         result = PromptBuilder().build(improve_task, config, store, summary_path=summary_path)
@@ -372,7 +374,8 @@ class TestPromptBuilderBuild:
         assert "This is a `fix` rescue task for a stuck implementation workflow." in result
         assert "## Blocker Closure Ledger (Machine Readable)" in result
         assert "fix_result: repaired_pending_review | needs_user | blocked_external | diagnosed_no_change" in result
-        assert "Before finishing, run the following verification command" in result
+        assert "Verification policy for this code task:" in result
+        assert "Run the full final verify command once after your last code change." in result
         assert "uv run pytest tests/ -q" in result
 
     def test_build_task_type_with_summary_includes_learnings_check_when_file_exists(self, tmp_path: Path):
@@ -779,6 +782,13 @@ class TestPromptBuilderResumePrompt:
         result2 = builder.resume_prompt()
         assert result1 == result2
 
+    def test_resume_prompt_appends_timeout_resume_context(self):
+        """Resume prompts should include structured timeout guidance when provided."""
+        context = "## Timeout Resume Context\n\n- Last known command: `./bin/tests`"
+        result = PromptBuilder().resume_prompt(resume_context=context)
+        assert "Timeout Resume Context" in result
+        assert "`./bin/tests`" in result
+
 
 class TestPromptBuilderPrDescription:
     """Tests for PromptBuilder.pr_description_prompt()."""
@@ -974,6 +984,19 @@ class TestVerifyCommandConfig:
         assert not is_valid
         assert any("verify_command" in e for e in errors)
 
+    def test_verify_command_load_rejects_non_string(self, tmp_path: Path):
+        """Config.load should reject malformed final verify commands at runtime."""
+        from gza.config import Config, ConfigError
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "verify_command: 42\n"
+        )
+
+        with pytest.raises(ConfigError, match="'verify_command' must be a string"):
+            Config.load(tmp_path)
+
     def test_verify_command_not_unknown_field(self, tmp_path: Path):
         """Test that verify_command is not treated as an unknown field."""
         from gza.config import Config
@@ -987,6 +1010,33 @@ class TestVerifyCommandConfig:
         is_valid, errors, warnings = Config.validate(tmp_path)
         assert is_valid
         assert not any("verify_command" in w for w in warnings)
+
+    def test_inner_verify_command_loaded_from_yaml(self, tmp_path: Path):
+        """Test that inner_verify_command is loaded from gza.yaml."""
+        from gza.config import Config
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "inner_verify_command: './bin/tests --quick'\n"
+        )
+
+        config = Config.load(tmp_path)
+        assert config.inner_verify_command == "./bin/tests --quick"
+
+    def test_inner_verify_command_load_rejects_non_string(self, tmp_path: Path):
+        """Config.load should reject malformed inner verify commands at runtime."""
+        from gza.config import Config, ConfigError
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "inner_verify_command:\n"
+            "  - bad\n"
+        )
+
+        with pytest.raises(ConfigError, match="'inner_verify_command' must be a string"):
+            Config.load(tmp_path)
 
 
 class TestReviewDiffThresholdConfig:
@@ -1056,10 +1106,12 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run mypy src/ && uv run pytest tests/ -x -q"
+        config.inner_verify_command = "./bin/tests --quick"
 
         result = PromptBuilder().build(task, config, store)
 
-        assert "Before finishing, run the following verification command" in result
+        assert "Verification policy for this code task:" in result
+        assert "Preferred inner-loop verify command" in result
         assert "uv run mypy src/ && uv run pytest tests/ -x -q" in result
 
     def test_verify_command_injected_for_implement_type(self, tmp_path: Path):
@@ -1071,10 +1123,11 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/ -x -q"
+        config.inner_verify_command = ""
 
         result = PromptBuilder().build(task, config, store)
 
-        assert "Before finishing, run the following verification command" in result
+        assert "Verification policy for this code task:" in result
         assert "uv run pytest tests/ -x -q" in result
 
     def test_verify_command_injected_for_improve_type(self, tmp_path: Path):
@@ -1086,10 +1139,11 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/"
+        config.inner_verify_command = ""
 
         result = PromptBuilder().build(task, config, store)
 
-        assert "Before finishing, run the following verification command" in result
+        assert "Verification policy for this code task:" in result
         assert "uv run pytest tests/" in result
 
     def test_verify_command_not_injected_when_empty(self, tmp_path: Path):
@@ -1101,10 +1155,11 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = ""
+        config.inner_verify_command = ""
 
         result = PromptBuilder().build(task, config, store)
 
-        assert "Before finishing, run the following verification command" not in result
+        assert "Verification policy for this code task:" not in result
 
     def test_verify_command_not_injected_for_explore_type(self, tmp_path: Path):
         """Test that verify_command is NOT injected for explore tasks."""
@@ -1115,11 +1170,12 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/"
+        config.inner_verify_command = ""
 
         report_path = tmp_path / "report.md"
         result = PromptBuilder().build(task, config, store, report_path=report_path)
 
-        assert "Before finishing, run the following verification command" not in result
+        assert "Verification policy for this code task:" not in result
 
     def test_verify_command_not_injected_for_plan_type(self, tmp_path: Path):
         """Test that verify_command is NOT injected for plan tasks."""
@@ -1130,11 +1186,12 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/"
+        config.inner_verify_command = ""
 
         report_path = tmp_path / "report.md"
         result = PromptBuilder().build(task, config, store, report_path=report_path)
 
-        assert "Before finishing, run the following verification command" not in result
+        assert "Verification policy for this code task:" not in result
 
     def test_verify_command_not_injected_for_review_type(self, tmp_path: Path):
         """Test that verify_command is NOT injected for review tasks."""
@@ -1145,11 +1202,12 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/"
+        config.inner_verify_command = ""
 
         report_path = tmp_path / "report.md"
         result = PromptBuilder().build(task, config, store, report_path=report_path)
 
-        assert "Before finishing, run the following verification command" not in result
+        assert "Verification policy for this code task:" not in result
 
     def test_verify_command_appears_in_backticks(self, tmp_path: Path):
         """Test that the verify_command is wrapped in backticks in the prompt."""
@@ -1160,7 +1218,39 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "make test"
+        config.inner_verify_command = ""
 
         result = PromptBuilder().build(task, config, store)
 
         assert "`make test`" in result
+
+    def test_inner_verify_command_is_injected_when_configured(self, tmp_path: Path):
+        """Configured inner verify commands should appear in code-task prompts."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "./bin/tests"
+        config.inner_verify_command = "./bin/tests --quick -- tests/test_runner.py::test_case"
+
+        result = PromptBuilder().build(task, config, store)
+
+        assert "Preferred inner-loop verify command" in result
+        assert "./bin/tests --quick -- tests/test_runner.py::test_case" in result
+        assert "Required final verify command: `./bin/tests`" in result
+
+    def test_prompt_builder_rejects_non_string_inner_verify_command(self, tmp_path: Path):
+        """Prompt construction must not silently treat malformed inner verify config as unset."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "./bin/tests"
+        config.inner_verify_command = ["bad"]
+
+        with pytest.raises(TypeError, match=r"config\.inner_verify_command must be a string"):
+            PromptBuilder().build(task, config, store)

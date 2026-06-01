@@ -34,24 +34,29 @@ from gza.runner import (
     WIP_DIR,
     _build_code_task_commit_subject,
     _build_context_from_chain,
+    _build_timeout_resume_context,
     _build_review_improve_lineage_context,
     _check_dependency_merge_precondition,
     _complete_code_task,
+    _compute_tree_fingerprint,
     _compute_slug_override,
     _copy_learnings_to_worktree,
     _create_and_run_review_task,
     _ensure_work_pr_for_completed_code_task,
     _extract_review_verdict,
+    _extract_verify_phase_checkpoints,
     _format_review_verify_failure,
     _format_review_verify_result,
     _get_task_output,
     _post_complete_code_task,
     _restore_wip_changes,
     _resolve_code_task_branch_name,
+    _resolve_task_timeout_budget,
     _run_inner,
     _run_non_code_task,
     _run_result_to_stats,
     _run_review_verify_command,
+    _save_wip_changes,
     _select_worktree_base_ref,
     _setup_code_task_worktree,
     _slug_exists,
@@ -67,6 +72,7 @@ from gza.runner import (
     run,
     write_execution_provenance_event,
     write_log_entry,
+    _write_timeout_resume_checkpoint,
     write_worker_start_event,
 )
 from gza.worktree_roots import managed_worktree_root_paths
@@ -558,6 +564,658 @@ class TestBuildPrompt:
 
         assert "learnings.md" not in prompt
         assert "Complete this task: Implement feature X" in prompt
+
+
+class TestTimeoutBudgeting:
+    """Tests for task-aware timeout budget resolution."""
+
+    def _init_repo(self, tmp_path: Path) -> Git:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+        )
+        tracked = repo_dir / "tracked.txt"
+        tracked.write_text("base\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=repo_dir, check=True, capture_output=True)
+        return Git(repo_dir)
+
+    def _init_scoped_repo(self, tmp_path: Path) -> tuple[Path, Path, Git]:
+        repo_dir = tmp_path / "repo"
+        project_dir = repo_dir / "services" / "foo"
+        scoped_file = project_dir / "src" / "app.py"
+        out_of_scope_file = repo_dir / "services" / "bar" / "other.py"
+        scoped_file.parent.mkdir(parents=True)
+        out_of_scope_file.parent.mkdir(parents=True)
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+        )
+        scoped_file.write_text("base\n")
+        out_of_scope_file.write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=repo_dir, check=True, capture_output=True)
+        return repo_dir, project_dir, Git(repo_dir)
+
+    def test_resolve_task_timeout_budget_scales_medium_code_diff(self, tmp_path: Path):
+        task = Task(id="gza-1", prompt="Implement feature", status="pending", task_type="implement")
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.timeout_minutes = 10
+        config.get_timeout_minutes_for_task.return_value = 10
+        config.code_task_diff_timeout_medium_threshold = 400
+        config.code_task_diff_timeout_large_threshold = 1200
+        config.code_task_diff_timeout_medium_minutes = 30
+        config.code_task_diff_timeout_large_minutes = 45
+        config.code_task_diff_timeout_cap_minutes = 45
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("."),
+            local_dependencies=(),
+        )
+
+        git = Mock(spec=Git)
+        git.get_diff_numstat_checked.return_value = "250\t200\tsrc/feature.py\n"
+
+        budget = _resolve_task_timeout_budget(
+            task=task,
+            config=config,
+            provider="claude",
+            git=git,
+            branch_name="feature/test",
+            default_branch="main",
+        )
+
+        assert budget.minutes == 30
+        assert budget.diff_lines == 450
+        assert budget.diff_files == 1
+        assert "scaled from base 10m" in budget.reason
+        git.get_diff_numstat_checked.assert_called_once_with("main...feature/test", ())
+
+    def test_resolve_task_timeout_budget_warns_when_diff_probe_returns_nonzero(self, tmp_path: Path) -> None:
+        task = Task(id="gza-1", prompt="Implement feature", status="pending", task_type="implement")
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.timeout_minutes = 10
+        config.get_timeout_minutes_for_task.return_value = 10
+        config.code_task_diff_timeout_medium_threshold = 400
+        config.code_task_diff_timeout_large_threshold = 1200
+        config.code_task_diff_timeout_medium_minutes = 30
+        config.code_task_diff_timeout_large_minutes = 45
+        config.code_task_diff_timeout_cap_minutes = 45
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("."),
+            local_dependencies=(),
+        )
+        git = self._init_repo(tmp_path)
+        task_logger = Mock()
+        original_run = git._run
+
+        def failing_diff_numstat(*args: str, check: bool = True, stdin: bytes | None = None):
+            if args[:2] == ("diff", "--numstat"):
+                return subprocess.CompletedProcess(["git", *args], 128, "", "bad revision")
+            return original_run(*args, check=check, stdin=stdin)
+
+        with patch.object(git, "_run", side_effect=failing_diff_numstat):
+            budget = _resolve_task_timeout_budget(
+                task=task,
+                config=config,
+                provider="claude",
+                git=git,
+                branch_name="feature/test",
+                default_branch="main",
+                task_logger=task_logger,
+            )
+
+        assert budget.minutes == 10
+        assert budget.reason == "base timeout for task type 'implement' (diff inspection unavailable)"
+        task_logger.warning.assert_called_once()
+        assert "below scaling thresholds" not in budget.reason
+
+    def test_resolve_task_timeout_budget_ignores_out_of_scope_diff_for_subdir_project(self, tmp_path: Path) -> None:
+        repo_dir, project_dir, git = self._init_scoped_repo(tmp_path)
+        task = Task(id="gza-1", prompt="Implement feature", status="pending", task_type="implement")
+        config = Config(project_dir=project_dir, project_name="foo")
+        subprocess.run(["git", "checkout", "-b", "feature/test"], cwd=repo_dir, check=True, capture_output=True)
+        (project_dir / "src" / "app.py").write_text("base\nsmall\n")
+        (repo_dir / "services" / "bar" / "other.py").write_text(
+            "".join(f"line {i}\n" for i in range(1300))
+        )
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "feature"], cwd=repo_dir, check=True, capture_output=True)
+
+        budget = _resolve_task_timeout_budget(
+            task=task,
+            config=config,
+            provider="claude",
+            git=git,
+            branch_name="feature/test",
+            default_branch="main",
+        )
+
+        assert budget.minutes == 10
+        assert budget.diff_lines == 1
+        assert budget.diff_files == 1
+        assert budget.reason == "base timeout for task type 'implement'; below scaling thresholds"
+
+    def test_resolve_task_timeout_budget_scales_large_in_scope_diff_for_subdir_project(self, tmp_path: Path) -> None:
+        repo_dir, project_dir, git = self._init_scoped_repo(tmp_path)
+        task = Task(id="gza-1", prompt="Implement feature", status="pending", task_type="implement")
+        config = Config(project_dir=project_dir, project_name="foo")
+        subprocess.run(["git", "checkout", "-b", "feature/test"], cwd=repo_dir, check=True, capture_output=True)
+        (project_dir / "src" / "app.py").write_text("".join(f"line {i}\n" for i in range(500)))
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "feature"], cwd=repo_dir, check=True, capture_output=True)
+
+        budget = _resolve_task_timeout_budget(
+            task=task,
+            config=config,
+            provider="claude",
+            git=git,
+            branch_name="feature/test",
+            default_branch="main",
+        )
+
+        assert budget.minutes == 30
+        assert budget.diff_lines == 501
+        assert budget.diff_files == 1
+        assert budget.reason == "medium reviewable diff (501 changed lines across 1 files); scaled from base 10m"
+
+    def test_resolve_task_timeout_budget_hard_caps_code_task_base_override(self, tmp_path: Path) -> None:
+        task = Task(id="gza-1", prompt="Implement feature", status="pending", task_type="implement")
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.timeout_minutes = 10
+        config.get_timeout_minutes_for_task.return_value = 60
+        config.code_task_diff_timeout_medium_threshold = 400
+        config.code_task_diff_timeout_large_threshold = 1200
+        config.code_task_diff_timeout_medium_minutes = 30
+        config.code_task_diff_timeout_large_minutes = 45
+        config.code_task_diff_timeout_cap_minutes = 45
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("."),
+            local_dependencies=(),
+        )
+        git = Mock(spec=Git)
+        git.get_diff_numstat_checked.return_value = ""
+
+        budget = _resolve_task_timeout_budget(
+            task=task,
+            config=config,
+            provider="codex",
+            git=git,
+            branch_name="feature/test",
+            default_branch="main",
+        )
+
+        assert budget.minutes == 45
+        assert budget.reason == (
+            "base timeout for task type 'implement'; below scaling thresholds; "
+            "hard-capped at 45m from 60m"
+        )
+
+    def test_timeout_resume_context_reuses_codex_command_execution_phase_on_exact_tree_match(
+        self, tmp_path: Path
+    ) -> None:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        git = self._init_repo(tmp_path)
+        fingerprint = _compute_tree_fingerprint(git)
+        log_file = tmp_path / "task.log"
+        log_file.write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "./bin/tests",
+                        "aggregated_output": (
+                            "ruff ok\n"
+                            "gza-verify phase=passed name=ruff duration_seconds=1.0 "
+                            f"tree_fingerprint={fingerprint}\n"
+                        ),
+                        "exit_code": 0,
+                    },
+                }
+            )
+            + "\n"
+        )
+        ops_log = ops_log_path_for(log_file)
+        ops_log.write_text("")
+
+        _write_timeout_resume_checkpoint(
+            config=config,
+            task_id="gza-1",
+            log_file=log_file,
+            worktree_git=git,
+            wip_state="commit+diff",
+        )
+
+        context = _build_timeout_resume_context(
+            config=config,
+            checkpoint_task_id="gza-1",
+            worktree_git=git,
+        )
+
+        assert context is not None
+        assert "Last known command: `./bin/tests`" in context
+        assert "Saved WIP state: commit+diff" in context
+        assert "Reusable successful verify phases" in context
+        assert "ruff" in context
+
+    def test_timeout_resume_context_invalidates_real_bin_tests_phase_after_later_edit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        git = self._init_repo(tmp_path)
+        tracked = git.repo_dir / "tracked.txt"
+        task = Task(
+            id="gza-1",
+            slug="20260601-gza-1",
+            prompt="Implement feature",
+            status="running",
+            task_type="implement",
+        )
+
+        tracked.write_text("before-timeout\n")
+        assert git.status_porcelain() == {("M", "tracked.txt")}
+        phase_fingerprint = _compute_tree_fingerprint(git)
+
+        log_file = tmp_path / "task.log"
+        log_file.write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "./bin/tests",
+                        "exit_code": 124,
+                    },
+                }
+            )
+            + "\n"
+        )
+        ops_log = ops_log_path_for(log_file)
+        ops_log.write_text(
+            json.dumps(
+                {
+                    "type": "gza",
+                    "source": "provider",
+                    "subtype": "process_output",
+                    "timestamp": "2026-06-01T00:00:00Z",
+                    "message": (
+                        "gza-verify phase=passed name=ruff duration_seconds=1.0 "
+                        f"tree_fingerprint={phase_fingerprint}"
+                    ),
+                }
+            )
+            + "\n"
+        )
+
+        wip_state = _save_wip_changes(task, git, config, "feature/test")
+        assert wip_state == "commit+diff"
+
+        _write_timeout_resume_checkpoint(
+            config=config,
+            task_id="gza-1",
+            log_file=log_file,
+            worktree_git=git,
+            wip_state=wip_state,
+            pre_save_tree_fingerprint=phase_fingerprint,
+        )
+
+        tracked.write_text("after-timeout\n")
+        assert git.status_porcelain() == {("M", "tracked.txt")}
+
+        context = _build_timeout_resume_context(
+            config=config,
+            checkpoint_task_id="gza-1",
+            worktree_git=git,
+        )
+
+        assert context is not None
+        assert "No reusable verify checkpoints are valid for the current tree fingerprint." in context
+        assert "Reusable successful verify phases" not in context
+
+    def test_timeout_resume_context_reuses_phase_after_wip_commit_without_later_edit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        git = self._init_repo(tmp_path)
+        tracked = git.repo_dir / "tracked.txt"
+        task = Task(
+            id="gza-1",
+            slug="20260601-gza-1",
+            prompt="Implement feature",
+            status="running",
+            task_type="implement",
+        )
+
+        tracked.write_text("before-timeout\n")
+        assert git.status_porcelain() == {("M", "tracked.txt")}
+        phase_fingerprint = _compute_tree_fingerprint(git)
+
+        log_file = tmp_path / "task.log"
+        log_file.write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "./bin/tests",
+                        "exit_code": 124,
+                    },
+                }
+            )
+            + "\n"
+        )
+        ops_log = ops_log_path_for(log_file)
+        ops_log.write_text(
+            json.dumps(
+                {
+                    "type": "gza",
+                    "source": "provider",
+                    "subtype": "process_output",
+                    "timestamp": "2026-06-01T00:00:00Z",
+                    "message": (
+                        "gza-verify phase=passed name=ruff duration_seconds=1.0 "
+                        f"tree_fingerprint={phase_fingerprint}"
+                    ),
+                }
+            )
+            + "\n"
+        )
+
+        wip_state = _save_wip_changes(task, git, config, "feature/test")
+        assert wip_state == "commit+diff"
+        assert git.status_porcelain() == set()
+
+        _write_timeout_resume_checkpoint(
+            config=config,
+            task_id="gza-1",
+            log_file=log_file,
+            worktree_git=git,
+            wip_state=wip_state,
+            pre_save_tree_fingerprint=phase_fingerprint,
+        )
+
+        context = _build_timeout_resume_context(
+            config=config,
+            checkpoint_task_id="gza-1",
+            worktree_git=git,
+        )
+
+        assert context is not None
+        assert "Reusable successful verify phases for the current tree fingerprint: ruff" in context
+        assert "No reusable verify checkpoints are valid for the current tree fingerprint." not in context
+
+    def test_timeout_resume_context_ignores_legacy_phase_without_tree_fingerprint(self, tmp_path: Path) -> None:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        git = self._init_repo(tmp_path)
+        log_file = tmp_path / "task.log"
+        log_file.write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "./bin/tests",
+                        "exit_code": 124,
+                    },
+                }
+            )
+            + "\n"
+        )
+        ops_log = ops_log_path_for(log_file)
+        ops_log.write_text(
+            json.dumps(
+                {
+                    "type": "gza",
+                    "source": "provider",
+                    "subtype": "process_output",
+                    "timestamp": "2026-06-01T00:00:00Z",
+                    "message": "gza-verify phase=passed name=ruff duration_seconds=1.0",
+                }
+            )
+            + "\n"
+        )
+
+        _write_timeout_resume_checkpoint(
+            config=config,
+            task_id="gza-1",
+            log_file=log_file,
+            worktree_git=git,
+            wip_state="commit+diff",
+        )
+
+        context = _build_timeout_resume_context(
+            config=config,
+            checkpoint_task_id="gza-1",
+            worktree_git=git,
+        )
+
+        assert context is not None
+        assert "No reusable verify checkpoints are valid for the current tree fingerprint." in context
+
+    def test_extract_verify_phase_checkpoints_ignores_phase_without_tree_fingerprint(
+        self, tmp_path: Path
+    ) -> None:
+        log_file = tmp_path / "task.log"
+        log_file.write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "./bin/tests --quick",
+                        "aggregated_output": (
+                            "gza-verify phase=start name=ruff\n"
+                            "gza-verify phase=passed name=ruff duration_seconds=0.0\n"
+                        ),
+                        "exit_code": 0,
+                    },
+                }
+            )
+            + "\n"
+        )
+        ops_log = ops_log_path_for(log_file)
+        ops_log.write_text("")
+
+        checkpoints = _extract_verify_phase_checkpoints(log_file, ops_log)
+
+        assert checkpoints == []
+
+    def test_timeout_resume_context_disables_reuse_when_tree_fingerprinting_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        git = self._init_repo(tmp_path)
+        fingerprint = _compute_tree_fingerprint(git)
+        assert isinstance(fingerprint, str)
+        log_file = tmp_path / "task.log"
+        log_file.write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "./bin/tests",
+                        "exit_code": 124,
+                    },
+                }
+            )
+            + "\n"
+        )
+        ops_log = ops_log_path_for(log_file)
+        ops_log.write_text(
+            json.dumps(
+                {
+                    "type": "gza",
+                    "source": "provider",
+                    "subtype": "process_output",
+                    "timestamp": "2026-06-01T00:00:00Z",
+                    "message": (
+                        "gza-verify phase=passed name=ruff duration_seconds=1.0 "
+                        f"tree_fingerprint={fingerprint}"
+                    ),
+                }
+            )
+            + "\n"
+        )
+        original_run = git._run
+
+        def failing_tree_probe(*args: str, check: bool = True, stdin: bytes | None = None):
+            if args and args[0] in {"diff", "ls-files"}:
+                return subprocess.CompletedProcess(["git", *args], 128, "", "gitdir unavailable")
+            return original_run(*args, check=check, stdin=stdin)
+
+        with patch.object(git, "_run", side_effect=failing_tree_probe):
+            _write_timeout_resume_checkpoint(
+                config=config,
+                task_id="gza-1",
+                log_file=log_file,
+                worktree_git=git,
+                wip_state="commit+diff",
+            )
+            context = _build_timeout_resume_context(
+                config=config,
+                checkpoint_task_id="gza-1",
+                worktree_git=git,
+            )
+
+        assert context is not None
+        assert "Reusable successful verify phases" not in context
+        assert (
+            "No reusable verify checkpoints are valid because exact-tree fingerprinting failed "
+            "for the current worktree."
+        ) in context
+
+    def test_timeout_resume_context_does_not_offer_provider_wrapper_as_next_command(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        git = self._init_repo(tmp_path)
+        log_file = tmp_path / "task.log"
+        log_file.write_text(
+            json.dumps(
+                {
+                    "type": "message",
+                    "content": "provider timed out before any command_execution item was emitted",
+                }
+            )
+            + "\n"
+        )
+        ops_log = ops_log_path_for(log_file)
+        ops_log.write_text(
+            json.dumps(
+                {
+                    "event": "provider_exec_start",
+                    "command": "timeout 45m codex exec resume session-123",
+                }
+            )
+            + "\n"
+        )
+
+        _write_timeout_resume_checkpoint(
+            config=config,
+            task_id="gza-1",
+            log_file=log_file,
+            worktree_git=git,
+            wip_state="commit+diff",
+        )
+
+        context = _build_timeout_resume_context(
+            config=config,
+            checkpoint_task_id="gza-1",
+            worktree_git=git,
+        )
+
+        assert context is not None
+        assert "Last known command:" not in context
+        assert "First command to run next: timeout 45m codex exec resume session-123" not in context
+        assert "Provider wrapper at timeout: `timeout 45m codex exec resume session-123`" in context
+        assert (
+            "First command to run next: unknown; inspect the current worktree and verification state, "
+            "then continue from the interrupted step without relaunching the provider wrapper."
+        ) in context
+
+    def test_timeout_resume_context_warns_when_checkpoint_json_is_malformed(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        git = self._init_repo(tmp_path)
+        checkpoint_path = tmp_path / ".gza" / "checkpoints" / "gza-1.json"
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_path.write_text("{not-json", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING):
+            context = _build_timeout_resume_context(
+                config=config,
+                checkpoint_task_id="gza-1",
+                worktree_git=git,
+            )
+
+        assert context is not None
+        assert "Timeout checkpoint context was unavailable" in context
+        assert "No reusable verify phases should be trusted from the interrupted run." in context
+        assert "Reusable successful verify phases" not in context
+        assert "failed to parse checkpoint file" in context
+        assert "timeout resume checkpoint exists but could not be reused" in caplog.text
+
+    def test_timeout_resume_context_warns_when_checkpoint_json_is_not_a_mapping(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        git = self._init_repo(tmp_path)
+        checkpoint_path = tmp_path / ".gza" / "checkpoints" / "gza-1.json"
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_path.write_text('["not", "a", "mapping"]', encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING):
+            context = _build_timeout_resume_context(
+                config=config,
+                checkpoint_task_id="gza-1",
+                worktree_git=git,
+            )
+
+        assert context is not None
+        assert "Timeout checkpoint context was unavailable" in context
+        assert "No reusable verify phases should be trusted from the interrupted run." in context
+        assert "Reusable successful verify phases" not in context
+        assert "did not contain a JSON object" in context
+        assert "timeout resume checkpoint exists but could not be reused" in caplog.text
 
 
 class TestWorkerLifecycleLogging:
@@ -4709,6 +5367,67 @@ class TestFailureReasonGroundTruth:
         assert decision.launch_mode == "iterate"
         assert decision.reason_code == "TIMEOUT"
 
+    def test_run_uses_loaded_legacy_task_type_timeout_for_provider_handoff(self, tmp_path: Path):
+        """A valid task_types.<type>.timeout_minutes should reach provider.run unchanged."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "provider: claude\n"
+            "timeout_minutes: 10\n"
+            "task_types:\n"
+            "  implement:\n"
+            "    timeout_minutes: 25\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore.from_config(config)
+        task = store.add(prompt="Implement feature", task_type="implement")
+        task.slug = "20260601-implement-timeout-handoff"
+        store.update(task)
+
+        captured_timeout: dict[str, int] = {}
+
+        def provider_run(run_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_timeout["minutes"] = run_config.timeout_minutes
+            log_file.write_text("agent command output\n")
+            return RunResult(
+                exit_code=1,
+                duration_seconds=1.0,
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.check_credentials.return_value = True
+        mock_provider.verify_credentials.return_value = True
+        mock_provider.run.side_effect = provider_run
+
+        mock_main_git = Mock()
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.worktree_list.return_value = []
+        mock_main_git.worktree_add.return_value = config.worktree_path / task.slug
+        mock_main_git.branch_exists.return_value = False
+        mock_main_git.count_commits_ahead.return_value = 0
+        mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+        mock_worktree_git = Mock()
+        mock_worktree_git.status_porcelain.return_value = set()
+        mock_worktree_git.has_changes.return_value = False
+        mock_worktree_git.default_branch.return_value = "main"
+        mock_worktree_git.count_commits_ahead.return_value = 0
+        mock_worktree_git.get_diff_numstat.return_value = ""
+
+        with (
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
+            patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner.task_footer"),
+        ):
+            exit_status = run(config, task_id=task.id)
+
+        assert exit_status == 0
+        assert captured_timeout["minutes"] == 25
+
     def test_code_task_uses_max_steps_ground_truth_over_log_markers(self, tmp_path: Path):
         """Provider max_steps should persist MAX_STEPS even if logs contain markers."""
         exit_code, store, task, _ = self._run_code_task_failure(
@@ -4817,6 +5536,71 @@ class TestFailureReasonGroundTruth:
         assert decision.action == "resume"
         assert decision.launch_mode == "iterate"
         assert decision.reason_code == "TIMEOUT"
+
+    def test_code_task_timeout_still_records_failure_when_checkpoint_persistence_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        task.slug = "20260601-implement-timeout-checkpoint-write-warning"
+        store.update(task)
+
+        config = self._make_config(tmp_path, db_path)
+
+        def provider_run(_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            log_file.write_text("agent command output\n[GZA_FAILURE:TEST_FAILURE]\n")
+            return RunResult(
+                exit_code=124,
+                duration_seconds=12.0,
+                session_id="timeout-checkpoint-fail-session",
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.check_credentials.return_value = True
+        mock_provider.verify_credentials.return_value = True
+        mock_provider.run.side_effect = provider_run
+
+        mock_main_git = Mock()
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.worktree_list.return_value = []
+        mock_main_git.worktree_add.return_value = config.worktree_path / task.slug
+        mock_main_git.branch_exists.return_value = False
+        mock_main_git.count_commits_ahead.return_value = 0
+        mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+        mock_worktree_git = Mock()
+        mock_worktree_git.status_porcelain.return_value = set()
+        mock_worktree_git.has_changes.return_value = False
+        mock_worktree_git.default_branch.return_value = "main"
+        mock_worktree_git.count_commits_ahead.return_value = 0
+        mock_worktree_git.get_diff_numstat.return_value = ""
+
+        with (
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
+            patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner._write_timeout_resume_checkpoint", side_effect=OSError("disk full")),
+        ):
+            exit_status = run(config, task_id=task.id)
+
+        assert exit_status == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "TIMEOUT"
+        assert failed.log_file is not None
+        log_contents = ops_log_path_for(tmp_path / failed.log_file).read_text()
+        assert "Outcome: failed (timeout after 15m)" in log_contents
+        assert "failed to persist timeout resume checkpoint" in log_contents
+        assert "disk full" in log_contents
 
     @pytest.mark.parametrize("marker", ["MAX_STEPS", "MAX_TURNS", "TIMEOUT"])
     def test_code_task_success_ignores_contaminated_structured_markers(self, tmp_path: Path, marker: str):
@@ -12385,6 +13169,104 @@ class TestProviderPromptSanitization:
         assert len(captured_prompts) == 1
         assert "paused" in captured_prompts[0].lower()
         assert "interrupted" not in captured_prompts[0].lower()
+
+    def test_improve_resume_prompt_surfaces_checkpoint_unavailable_warning(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        based_on = store.add(prompt="Implement feature X", task_type="implement")
+        based_on.slug = "20260212-implement-feature-x"
+        based_on.branch = "gza/20260212-implement-feature-x"
+        based_on.failure_reason = "TIMEOUT"
+        store.update(based_on)
+
+        checkpoint_path = tmp_path / ".gza" / "checkpoints" / f"{based_on.id}.json"
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_path.write_text("{broken-json", encoding="utf-8")
+
+        task = store.add(prompt="Improve feature X", task_type="improve", based_on=based_on.id)
+        task.slug = "20260213-improve-feature-x"
+        task.branch = "gza/20260213-improve-feature-x"
+        task.session_id = "resume-improve-session"
+        store.mark_failed(task, log_file="logs/improve.log", stats=None)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.db_path = db_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.workers_path = tmp_path / ".gza" / "workers"
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.max_turns = 50
+        config.timeout_minutes = 60
+        config.branch_mode = "multi"
+        config.project_name = "test"
+        config.branch_strategy = Mock()
+        config.branch_strategy.pattern = "{project}/{task_id}"
+        config.branch_strategy.default_type = "feature"
+        config.get_provider_for_task.return_value = "claude"
+        config.get_model_for_task.return_value = None
+        config.get_max_steps_for_task.return_value = 50
+        config.learnings_interval = 0
+        config.learnings_window = 25
+
+        captured_prompts: list[str] = []
+
+        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_prompts.append(prompt)
+            summary_dir = work_dir / ".gza" / "summaries"
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            (summary_dir / f"{task.slug}.md").write_text("# Summary\n\nCompleted.")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=5.0,
+                num_turns_reported=2,
+                cost_usd=0.02,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        with patch("gza.runner.get_provider") as mock_get_provider, patch("gza.runner.Git") as mock_git_class, patch("gza.runner.load_dotenv"):
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_provider.run = mock_provider_run
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(returncode=0)
+            mock_git.branch_exists.return_value = True
+            mock_git.worktree_add = Mock()
+            mock_git.worktree_list.return_value = []
+
+            mock_worktree_git = Mock()
+            mock_worktree_git.has_changes.return_value = True
+            mock_worktree_git.status_porcelain.side_effect = [set(), {("M", "changed.py")}]
+            mock_worktree_git.add = Mock()
+            mock_worktree_git.commit = Mock()
+            mock_worktree_git.get_diff_numstat.return_value = ""
+            mock_log_result = Mock()
+            mock_log_result.stdout = "WIP: gza task interrupted"
+            mock_worktree_git._run.return_value = mock_log_result
+
+            mock_git_class.side_effect = [mock_git, mock_worktree_git]
+
+            worktree_path = config.worktree_path / task.slug
+            worktree_path.mkdir(parents=True, exist_ok=True)
+
+            result = run(config, task_id=task.id, resume=True)
+
+        assert result == 0
+        assert len(captured_prompts) == 1
+        assert "Timeout checkpoint context was unavailable" in captured_prompts[0]
+        assert "No reusable verify phases" in captured_prompts[0]
+        assert "failed to parse checkpoint file" in captured_prompts[0]
+        assert "Reusable successful verify phases" not in captured_prompts[0]
 
     def test_run_resume_without_session_id_uses_same_branch_retry_guidance(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         db_path = tmp_path / "test.db"

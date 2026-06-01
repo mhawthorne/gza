@@ -1477,6 +1477,17 @@ class TestGetDiffNumstat:
 
         assert result == ""
 
+    def test_get_diff_numstat_checked_raises_on_error(self, tmp_path: Path):
+        """get_diff_numstat_checked raises instead of collapsing git probe failures."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=128, stdout="", stderr="bad revision")
+            with pytest.raises(GitError, match="bad revision"):
+                git.get_diff_numstat_checked("main...feature")
+
 
 class TestStatusPorcelain:
     """Tests for status_porcelain method."""

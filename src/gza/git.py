@@ -527,12 +527,39 @@ class Git:
         Returns:
             The diff --numstat output as a string (machine-readable)
         """
+        result = self.get_diff_numstat_result(revision_range, paths)
+        if result.returncode != 0:
+            return ""
+        stdout = result.stdout if isinstance(result.stdout, str) else ""
+        return stdout.strip()
+
+    def get_diff_numstat_result(
+        self,
+        revision_range: str,
+        paths: tuple[str, ...] | list[str] = (),
+    ) -> subprocess.CompletedProcess:
+        """Run ``git diff --numstat`` and return the raw subprocess result."""
         args = ["diff", "--numstat", "--find-renames", "--find-copies", "--find-copies-harder", revision_range]
         if paths:
             args.append("--")
             args.extend(paths)
-        result = self._run(*args, check=False)
-        return result.stdout.strip()
+        return self._run(*args, check=False)
+
+    def get_diff_numstat_checked(
+        self,
+        revision_range: str,
+        paths: tuple[str, ...] | list[str] = (),
+    ) -> str:
+        """Return ``git diff --numstat`` output or raise ``GitError`` on failure."""
+        result = self.get_diff_numstat_result(revision_range, paths)
+        if result.returncode != 0:
+            error_output = result.stderr or result.stdout
+            raise GitError(
+                f"git diff --numstat --find-renames --find-copies --find-copies-harder "
+                f"{revision_range} failed:\n{error_output}"
+            )
+        stdout = result.stdout if isinstance(result.stdout, str) else ""
+        return stdout.strip()
 
     def get_diff_stat(self, revision_range: str) -> str:
         """Get diff --stat output for a revision range.

@@ -76,10 +76,11 @@ If changes were stashed in Step 1, run `git stash pop` to restore them before fi
 
 ### Step 7: Final verification
 
-Before declaring success, determine the project `verify_command` by running `uv run gza config` and reading the `verify_command` value. If config loading fails, fall back to reading `verify_command` directly from `gza.yaml`.
+Before declaring success, determine the project `verify_command` by running `uv run gza config` and reading the `verify_command` value. Also note `inner_verify_command` if present. If config loading fails, fall back to reading the values directly from `gza.yaml`.
 
-- Run the configured `verify_command` from the project root or worktree root after the rebase is fully complete and after any stashed changes have been restored.
-- Fix any failures you surface in your own context and do not declare success until verification passes.
+- If you need quick feedback while fixing verification fallout, use `inner_verify_command` when configured, or otherwise use targeted tests for the files you touched.
+- Run the configured full `verify_command` from the project root or worktree root after the rebase is fully complete, after any stashed changes have been restored, and after the last planned code change.
+- Fix any failures you surface in your own context and do not declare success until the full verification passes.
 - If no `verify_command` is configured, say so explicitly before finishing.
 
 ### Step 8: Final summary

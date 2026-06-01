@@ -1314,6 +1314,11 @@ def _config_to_effective_dict(config: Config) -> dict:
         "docker_volumes": config.docker_volumes,
         "docker_setup_command": config.docker_setup_command,
         "timeout_minutes": config.timeout_minutes,
+        "code_task_diff_timeout_medium_threshold": config.code_task_diff_timeout_medium_threshold,
+        "code_task_diff_timeout_large_threshold": config.code_task_diff_timeout_large_threshold,
+        "code_task_diff_timeout_medium_minutes": config.code_task_diff_timeout_medium_minutes,
+        "code_task_diff_timeout_large_minutes": config.code_task_diff_timeout_large_minutes,
+        "code_task_diff_timeout_cap_minutes": config.code_task_diff_timeout_cap_minutes,
         "branch_mode": config.branch_mode,
         "max_steps": config.max_steps,
         "max_turns": config.max_turns,
@@ -1337,6 +1342,7 @@ def _config_to_effective_dict(config: Config) -> dict:
         "reasoning_effort": config.reasoning_effort,
         "chat_text_display_length": config.chat_text_display_length,
         "verify_command": config.verify_command,
+        "inner_verify_command": config.inner_verify_command,
         "claude": {
             "fetch_auth_token_from_keychain": config.claude.fetch_auth_token_from_keychain,
             "args": config.claude.args,
@@ -1347,6 +1353,7 @@ def _config_to_effective_dict(config: Config) -> dict:
                 "reasoning_effort": task_cfg.reasoning_effort,
                 "max_steps": task_cfg.max_steps,
                 "max_turns": task_cfg.max_turns,
+                "timeout_minutes": task_cfg.timeout_minutes,
             }
             for task_type, task_cfg in config.task_types.items()
         },
@@ -1360,6 +1367,7 @@ def _config_to_effective_dict(config: Config) -> dict:
                         "reasoning_effort": task_cfg.reasoning_effort,
                         "max_steps": task_cfg.max_steps,
                         "max_turns": task_cfg.max_turns,
+                        "timeout_minutes": task_cfg.timeout_minutes,
                     }
                     for task_type, task_cfg in provider_cfg.task_types.items()
                 },

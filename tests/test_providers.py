@@ -5135,6 +5135,49 @@ class TestProviderScopedConfig:
         assert config.get_max_turns_for_task("review", "codex") == 35
         assert config.get_max_turns_for_task("task", "codex") == 60
 
+    def test_timeout_minutes_getter_applies_provider_and_task_type_precedence(self, tmp_path):
+        """Timeout getter should prefer provider/task-type override, then task-type, then global."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "timeout_minutes: 10\n"
+            "task_types:\n"
+            "  review:\n"
+            "    timeout_minutes: 25\n"
+            "providers:\n"
+            "  claude:\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        timeout_minutes: 40\n"
+        )
+
+        config = Config.load(tmp_path)
+
+        assert config.get_timeout_minutes_for_task("review", "claude") == 40
+        assert config.get_timeout_minutes_for_task("review", "codex") == 25
+        assert config.get_timeout_minutes_for_task("implement", "claude") == 10
+
+    @pytest.mark.parametrize(
+        ("timeout_value", "expected_error"),
+        [
+            ('"45"', "'task_types.implement.timeout_minutes' must be an integer"),
+            ("0", "'task_types.implement.timeout_minutes' must be positive"),
+        ],
+    )
+    def test_load_rejects_invalid_legacy_task_type_timeout_minutes(self, tmp_path, timeout_value, expected_error):
+        """Config.load should fail closed for invalid task_types.<type>.timeout_minutes."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test\n"
+            "timeout_minutes: 10\n"
+            "task_types:\n"
+            "  implement:\n"
+            f"    timeout_minutes: {timeout_value}\n"
+        )
+
+        with pytest.raises(ConfigError, match=re.escape(expected_error)):
+            Config.load(tmp_path)
+
     def test_validate_rejects_non_string_reasoning_effort_fields(self, tmp_path):
         """Validate should reject non-string reasoning_effort values across config scopes."""
         config_path = tmp_path / "gza.yaml"

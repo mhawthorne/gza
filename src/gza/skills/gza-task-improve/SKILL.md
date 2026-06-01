@@ -70,6 +70,7 @@ print(json.dumps({
         for c in unresolved_comments
     ],
     'verify_command': config.verify_command,
+    'inner_verify_command': config.inner_verify_command,
 }, default=str))
 "
 ```
@@ -110,19 +111,22 @@ For each feedback item (must-fix items from the review plus every unresolved com
 
 Focus on must-fix items and unresolved comments first. Only address review suggestions if the user asks. Comments are always first-class feedback, not optional — resolve each one explicitly.
 
-### Step 5: Run verify command
+### Step 5: Verify with fast inner checks during edits, then run the final gate once
 
-If the task has a `verify_command` configured:
+During Step 4, if the task has an `inner_verify_command` configured, use it for fast edit-loop feedback after meaningful fix batches. If no `inner_verify_command` is configured, use targeted tests for the files you changed.
+
+After the last planned feedback fix is in place, inspect the final verification command:
 
 ```bash
 uv run gza config | grep verify_command
 ```
 
-Run the verify command and fix any errors, up to 3 iterations (same as gza-test-and-fix):
+Then run the full `verify_command` once as the completion gate and fix any errors, up to 3 iterations:
 
-1. Run the verify command
+1. Run the full `verify_command`
 2. If errors, fix them in files on the branch
-3. Repeat until clean or 3 iterations
+3. Rerun the full `verify_command` only after those fixes
+4. Stop after 3 full-gate iterations if it still fails
 
 ### Step 6: Commit changes
 

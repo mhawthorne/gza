@@ -56,6 +56,7 @@ print(json.dumps({
     'impl_prompt': impl.prompt if impl else None,
     'impl_tags': list(impl.tags) if impl else [],
     'verify_command': config.verify_command,
+    'inner_verify_command': config.inner_verify_command,
     'reviews': [
         {'id': r.id, 'report_file': r.report_file, 'output_content': r.output_content, 'completed_at': str(r.completed_at)}
         for r in reviews
@@ -112,9 +113,11 @@ Then re-run verify. Do **not** edit or stage `.claude/skills/` by hand — it is
 
 If every blocker classifies as `already_addressed`, **do not make changes**. Skip to Step 7 with `fix_result: diagnosed_no_change`.
 
-### Step 5: Run verify
+### Step 5: Use fast checks while editing, then run the final gate
 
-If `verify_command` is configured, run it and time the full wall-clock duration with a monotonic clock. Record `verify.duration_seconds` whenever the command actually runs. Fix verification fallout only in files you already touched in Step 4 — do not broaden scope. Retry up to 3 iterations. If still failing, stop and report to the user with `fix_result: needs_user`.
+If `inner_verify_command` is configured, you may use it during Step 4 after a blocker-specific fix batch. Otherwise use targeted tests for touched files. Do not keep relaunching the full suite after each individual blocker edit.
+
+After the last planned change, if `verify_command` is configured, run it once and time the full wall-clock duration with a monotonic clock. Record `verify.duration_seconds` whenever the full command actually runs. Fix verification fallout only in files you already touched in Step 4 — do not broaden scope. Retry the full gate up to 3 iterations. If still failing, stop and report to the user with `fix_result: needs_user`.
 
 ### Step 6: Commit and push (only if changes were made)
 

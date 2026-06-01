@@ -53,6 +53,13 @@ def test_advance_create_reviews_registry_description_matches_manual_refresh_sema
     assert "manual attention" in advance_reviews_spec.description
 
 
+def test_code_task_diff_timeout_cap_registry_description_matches_hard_cap_docs() -> None:
+    """Config metadata should describe the cap as a hard maximum, not an override bypass."""
+    cap_spec = next(spec for spec in CONFIG_KEY_REGISTRY if spec.key == "code_task_diff_timeout_cap_minutes")
+    assert "Hard maximum" in cap_spec.description
+    assert "explicit task-type overrides can still be higher" not in cap_spec.description
+
+
 def test_config_load_parses_pr_integration_false(tmp_path) -> None:
     """Explicit project opt-out should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(

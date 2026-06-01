@@ -11,9 +11,10 @@ import subprocess
 import sys
 import time
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
 
@@ -37,7 +38,13 @@ from .console import (
     task_footer,
     task_header,
 )
-from .db import SqliteTaskStore, Task, TaskStats, extract_failure_reason as _extract_failure_reason, task_id_numeric_key
+from .db import (
+    SqliteTaskStore,
+    Task,
+    TaskStats,
+    extract_failure_reason as _extract_failure_reason,
+    task_id_numeric_key,
+)
 from .dependency_preconditions import get_unmerged_dependency_precondition
 from .extractions import (
     MANIFEST_FILENAME,
@@ -54,7 +61,14 @@ from .failure_reasons import (
     mark_task_failed_from_cause as _mark_task_failed,
     resolve_failure_reason as _resolve_failure_reason,
 )
-from .git import Git, GitApplyResult, GitError, cleanup_worktree_for_branch, is_rebase_in_progress, parse_diff_numstat
+from .git import (
+    Git,
+    GitApplyResult,
+    GitError,
+    cleanup_worktree_for_branch,
+    is_rebase_in_progress,
+    parse_diff_numstat,
+)
 from .github import GitHub, GitHubError, is_github_repo_unsupported_error
 from .improve_diff import (
     ImproveDiffBaseline,
@@ -131,6 +145,16 @@ class ResolvedRunFailure:
     reason: str
     status: str
     outcome_message: str
+
+
+@dataclass(frozen=True)
+class ResolvedTimeoutBudget:
+    """Resolved runtime budget for a task execution attempt."""
+
+    minutes: int
+    reason: str
+    diff_lines: int | None = None
+    diff_files: int | None = None
 
 
 @dataclass(frozen=True)
@@ -437,6 +461,20 @@ def _find_out_of_scope_paths(
         if not _path_is_under_any_scope(path, allowed_roots):
             violations.append(path_str)
     return violations
+
+
+def _reviewable_diff_scope_paths(task: Task, config: Config) -> tuple[str, ...]:
+    """Return repo-relative path roots that define the reviewable diff scope."""
+    if _task_is_cross_project(task):
+        return ()
+
+    allowed_roots = _project_boundary(config).project_rooted_paths
+    if Path(".") in allowed_roots:
+        return ()
+
+    return tuple(
+        sorted(_normalize_repo_relative_path(path.as_posix()) for path in allowed_roots)
+    )
 
 
 def _interrupt_signal_name() -> str | None:
@@ -1432,6 +1470,128 @@ def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | Non
     model = task.model if task.model else config.get_model_for_task(task.task_type, provider)
     max_steps = config.get_max_steps_for_task(task.task_type, provider)
     return model, provider, max_steps
+
+
+_CODE_TASK_TIMEOUT_SCALING_TYPES = frozenset({"implement", "improve", "fix", "rebase"})
+
+
+def _resolve_task_timeout_budget(
+    *,
+    task: Task,
+    config: Config,
+    provider: str,
+    git: Git | None = None,
+    branch_name: str | None = None,
+    default_branch: str | None = None,
+    task_logger: "TaskExecutionLogger | None" = None,
+) -> ResolvedTimeoutBudget:
+    """Resolve the effective runtime budget for one task attempt."""
+    def _int_config(value: object, default: int) -> int:
+        return value if isinstance(value, int) else default
+
+    def _cap_budget(
+        minutes: int,
+        reason: str,
+        *,
+        diff_lines: int | None = None,
+        diff_files: int | None = None,
+    ) -> ResolvedTimeoutBudget:
+        capped_minutes = min(minutes, cap_minutes)
+        if capped_minutes < minutes:
+            reason = f"{reason}; hard-capped at {cap_minutes}m from {minutes}m"
+        return ResolvedTimeoutBudget(
+            minutes=capped_minutes,
+            reason=reason,
+            diff_lines=diff_lines,
+            diff_files=diff_files,
+        )
+
+    base_minutes = _int_config(
+        config.get_timeout_minutes_for_task(task.task_type, provider),
+        _int_config(getattr(config, "timeout_minutes", None), 10),
+    )
+    if task.task_type not in _CODE_TASK_TIMEOUT_SCALING_TYPES:
+        return ResolvedTimeoutBudget(
+            minutes=base_minutes,
+            reason=f"base timeout for task type '{task.task_type}'",
+        )
+
+    cap_minutes = _int_config(
+        getattr(config, "code_task_diff_timeout_cap_minutes", None),
+        45,
+    )
+    if git is None or branch_name is None or default_branch is None:
+        return _cap_budget(
+            base_minutes,
+            f"base timeout for task type '{task.task_type}'; diff inspection unavailable",
+        )
+
+    revision_range = f"{default_branch}...{branch_name}"
+    diff_scope_paths = _reviewable_diff_scope_paths(task, config)
+    try:
+        numstat_output = git.get_diff_numstat_checked(revision_range, diff_scope_paths)
+        if not isinstance(numstat_output, str):
+            numstat_output = ""
+        diff_files, diff_added, diff_removed = parse_diff_numstat(numstat_output)
+    except GitError as exc:
+        warning = (
+            f"Warning: failed to inspect reviewable diff for timeout scaling on {task.task_type} "
+            f"task {task.id}: {exc}. Using base timeout."
+        )
+        if task_logger is not None:
+            task_logger.warning(warning)
+        else:
+            logger.warning(warning)
+        return _cap_budget(
+            base_minutes,
+            f"base timeout for task type '{task.task_type}' (diff inspection unavailable)",
+        )
+
+    diff_lines = diff_added + diff_removed
+    diff_minutes = base_minutes
+    diff_reason = "below scaling thresholds"
+
+    large_threshold = _int_config(
+        getattr(config, "code_task_diff_timeout_large_threshold", None),
+        1200,
+    )
+    medium_threshold = _int_config(
+        getattr(config, "code_task_diff_timeout_medium_threshold", None),
+        400,
+    )
+    large_minutes = _int_config(
+        getattr(config, "code_task_diff_timeout_large_minutes", None),
+        45,
+    )
+    medium_minutes = _int_config(
+        getattr(config, "code_task_diff_timeout_medium_minutes", None),
+        30,
+    )
+    if diff_lines >= large_threshold:
+        diff_minutes = large_minutes
+        diff_reason = (
+            f"large reviewable diff ({diff_lines} changed lines across {diff_files} files)"
+        )
+    elif diff_lines >= medium_threshold:
+        diff_minutes = medium_minutes
+        diff_reason = (
+            f"medium reviewable diff ({diff_lines} changed lines across {diff_files} files)"
+        )
+
+    if diff_minutes > base_minutes:
+        return _cap_budget(
+            diff_minutes,
+            f"{diff_reason}; scaled from base {base_minutes}m",
+            diff_lines=diff_lines,
+            diff_files=diff_files,
+        )
+
+    return _cap_budget(
+        base_minutes,
+        f"base timeout for task type '{task.task_type}'; {diff_reason}",
+        diff_lines=diff_lines,
+        diff_files=diff_files,
+    )
 
 
 DEFAULT_REPORT_DIR = f".{APP_NAME}/explorations"
@@ -2683,12 +2843,444 @@ def _run_result_to_stats(result: RunResult) -> TaskStats:
     )
 
 
+def _checkpoint_dir(config: Config) -> Path:
+    """Return the directory used for timeout resume checkpoints."""
+    path = config.project_dir / f".{APP_NAME}" / "checkpoints"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _checkpoint_path(config: Config, task_id: str) -> Path:
+    """Return the timeout resume checkpoint path for a task id."""
+    return _checkpoint_dir(config) / f"{task_id}.json"
+
+
+def _checked_git_probe_output(git: Git, *args: str) -> str:
+    """Return git probe stdout or raise when the probe does not complete safely."""
+    result = git._run(*args, check=False)
+    if result.returncode != 0:
+        error_output = result.stderr if isinstance(result.stderr, str) else ""
+        if not error_output:
+            error_output = result.stdout if isinstance(result.stdout, str) else ""
+        raise GitError(f"git {' '.join(args)} failed:\n{error_output}")
+    return result.stdout if isinstance(result.stdout, str) else ""
+
+
+def _compute_tree_fingerprint(git: Git) -> str | None:
+    """Compute a conservative tree fingerprint for checkpoint reuse decisions."""
+    head_sha = git.rev_parse_if_exists("HEAD")
+    if not isinstance(head_sha, str) or not head_sha:
+        head_sha = "missing-head"
+
+    try:
+        staged_diff = _checked_git_probe_output(
+            git,
+            "diff",
+            "--cached",
+            "--binary",
+            "--no-ext-diff",
+            "--submodule=diff",
+        )
+        unstaged_diff = _checked_git_probe_output(
+            git,
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--submodule=diff",
+        )
+        raw_untracked = _checked_git_probe_output(
+            git,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        )
+    except GitError as exc:
+        logger.warning(
+            "Warning: failed to compute exact tree fingerprint for timeout resume checkpoints: %s",
+            exc,
+        )
+        return None
+
+    untracked_entries: list[str] = []
+    untracked_paths = sorted(path for path in raw_untracked.split("\0") if path)
+    for relative_path in untracked_paths:
+        untracked_path = git.repo_dir / relative_path
+        try:
+            digest = sha256(untracked_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            logger.warning(
+                "Warning: failed to read untracked file '%s' for timeout resume fingerprinting: %s",
+                relative_path,
+                exc,
+            )
+            return None
+        untracked_entries.append(f"{relative_path}\0{digest}")
+
+    payload = "\n".join(
+        [
+            f"head={head_sha}",
+            "staged_diff:",
+            staged_diff,
+            "unstaged_diff:",
+            unstaged_diff,
+            "untracked_files:",
+            "\n".join(untracked_entries),
+        ]
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_jsonl_entries(path: Path) -> list[dict[str, Any]]:
+    """Load dict entries from a JSONL file, skipping invalid lines."""
+    entries: list[dict[str, Any]] = []
+    try:
+        with open(path) as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
+    except OSError:
+        return []
+    return entries
+
+
+def _extract_last_command_context(log_file: Path) -> dict[str, Any] | None:
+    """Extract the last runnable agent shell command from conversation logs."""
+    last_command: dict[str, Any] | None = None
+    for entry in _load_jsonl_entries(log_file):
+        event_type = entry.get("type")
+        if event_type == "item.started":
+            item = entry.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "command_execution":
+                command = item.get("command")
+                if isinstance(command, str) and command.strip():
+                    last_command = {"command": command.strip(), "status": "running"}
+        elif event_type == "item.completed":
+            item = entry.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "command_execution":
+                command = item.get("command")
+                if isinstance(command, str) and command.strip():
+                    last_command = {
+                        "command": command.strip(),
+                        "status": "completed",
+                        "exit_code": item.get("exit_code"),
+                    }
+        elif event_type == "tool_call":
+            tool_name = entry.get("tool_name")
+            tool_input = entry.get("tool_input") or {}
+            if tool_name == "Bash" and isinstance(tool_input, dict):
+                command = tool_input.get("command")
+                if isinstance(command, str) and command.strip():
+                    last_command = {"command": command.strip(), "status": "started"}
+
+    return last_command
+
+
+def _extract_provider_exec_breadcrumb(log_file: Path) -> dict[str, Any] | None:
+    """Extract the outer provider wrapper command as a non-runnable breadcrumb."""
+    ops_log = ops_log_path_for(log_file)
+    for entry in reversed(_load_jsonl_entries(ops_log)):
+        if entry.get("event") == "provider_exec_start":
+            command = entry.get("command")
+            if isinstance(command, str) and command.strip():
+                return {"command": command.strip(), "status": "provider_exec_start"}
+    return None
+
+
+_VERIFY_PHASE_RESULT_RE = re.compile(
+    r"^gza-verify phase=(?P<status>passed|failed) name=(?P<name>[A-Za-z0-9_.-]+) duration_seconds=(?P<duration>[0-9.]+)"
+    r"(?: tree_fingerprint=(?P<tree_fingerprint>[0-9a-f]{64}))?$"
+)
+
+
+def _iter_command_output_lines(log_file: Path, ops_log_file: Path) -> Iterator[tuple[str, Any]]:
+    """Yield command-output lines from provider logs and fallback ops logs."""
+    for entry in _load_jsonl_entries(log_file):
+        event_type = entry.get("type")
+        if event_type == "item.completed":
+            item = entry.get("item") or {}
+            if not isinstance(item, dict) or item.get("type") != "command_execution":
+                continue
+            item_output = item.get("aggregated_output")
+            if not isinstance(item_output, str):
+                item_output = item.get("output")
+            if not isinstance(item_output, str):
+                continue
+            for line in item_output.splitlines():
+                stripped = line.strip()
+                if stripped:
+                    yield stripped, entry.get("timestamp")
+            continue
+
+        if event_type not in {"tool_output", "tool_error"}:
+            continue
+        payload = entry.get("payload")
+        tool_output: Any = None
+        if isinstance(payload, dict):
+            tool_output = payload.get("output")
+        if not isinstance(tool_output, str):
+            tool_output = entry.get("output")
+        if not isinstance(tool_output, str):
+            tool_output = entry.get("content")
+        if not isinstance(tool_output, str):
+            continue
+        for line in tool_output.splitlines():
+            stripped = line.strip()
+            if stripped:
+                yield stripped, entry.get("timestamp")
+
+    for entry in _load_jsonl_entries(ops_log_file):
+        if entry.get("source") != "provider" or entry.get("subtype") != "process_output":
+            continue
+        message = entry.get("provider_output") or entry.get("message")
+        if not isinstance(message, str):
+            continue
+        stripped = message.strip()
+        if stripped:
+            yield stripped, entry.get("timestamp")
+
+
+def _extract_verify_phase_checkpoints(log_file: Path, ops_log_file: Path) -> list[dict[str, Any]]:
+    """Extract successful verify phase checkpoints from provider and ops output."""
+    checkpoints: list[dict[str, Any]] = []
+    for message, timestamp in _iter_command_output_lines(log_file, ops_log_file):
+        match = _VERIFY_PHASE_RESULT_RE.match(message)
+        if not match:
+            continue
+        if match.group("status") != "passed":
+            continue
+        phase_fingerprint = match.group("tree_fingerprint")
+        if not phase_fingerprint:
+            continue
+        checkpoints.append(
+            {
+                "phase": match.group("name"),
+                "status": "passed",
+                "duration_seconds": float(match.group("duration")),
+                "completed_at": timestamp,
+                "tree_fingerprint": phase_fingerprint,
+            }
+        )
+    return checkpoints
+
+
+def _apply_timeout_resume_fingerprint_aliases(
+    *,
+    verify_phases: list[dict[str, Any]],
+    pre_save_tree_fingerprint: str | None,
+    resume_tree_fingerprint: str,
+    wip_state: str,
+) -> list[dict[str, Any]]:
+    """Translate exact-tree checkpoints onto the saved WIP commit tree when safe."""
+    if (
+        pre_save_tree_fingerprint is None
+        or pre_save_tree_fingerprint == resume_tree_fingerprint
+        or wip_state not in {"commit", "commit+diff"}
+    ):
+        return verify_phases
+
+    aliased_phases: list[dict[str, Any]] = []
+    for phase in verify_phases:
+        if not isinstance(phase, dict):
+            continue
+        updated_phase = dict(phase)
+        if updated_phase.get("tree_fingerprint") == pre_save_tree_fingerprint:
+            updated_phase["resume_tree_fingerprint"] = resume_tree_fingerprint
+        aliased_phases.append(updated_phase)
+    return aliased_phases
+
+
+def _write_timeout_resume_checkpoint(
+    *,
+    config: Config,
+    task_id: str,
+    log_file: Path,
+    worktree_git: Git,
+    wip_state: str,
+    pre_save_tree_fingerprint: str | None = None,
+) -> None:
+    """Persist timeout resume context for later resume prompts."""
+    tree_fingerprint = _compute_tree_fingerprint(worktree_git)
+    verify_phases = _apply_timeout_resume_fingerprint_aliases(
+        verify_phases=_extract_verify_phase_checkpoints(log_file, ops_log_path_for(log_file)),
+        pre_save_tree_fingerprint=pre_save_tree_fingerprint,
+        resume_tree_fingerprint=tree_fingerprint or "",
+        wip_state=wip_state,
+    )
+    payload = {
+        "task_id": task_id,
+        "updated_at": _ops_timestamp(),
+        "tree_fingerprint": tree_fingerprint,
+        "tree_fingerprint_available": tree_fingerprint is not None,
+        "conversation_log_file": str(log_file),
+        "ops_log_file": str(ops_log_path_for(log_file)),
+        "last_command": _extract_last_command_context(log_file),
+        "provider_exec_breadcrumb": _extract_provider_exec_breadcrumb(log_file),
+        "verify_phases": verify_phases,
+        "wip_state": wip_state,
+    }
+    _checkpoint_path(config, task_id).write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _persist_timeout_resume_checkpoint(
+    *,
+    config: Config,
+    task_id: str,
+    log_file: Path,
+    worktree_git: Git,
+    wip_state: str,
+    task_logger: TaskExecutionLogger,
+    pre_save_tree_fingerprint: str | None = None,
+) -> None:
+    """Write timeout resume context without blocking canonical failure recording."""
+    try:
+        _write_timeout_resume_checkpoint(
+            config=config,
+            task_id=task_id,
+            log_file=log_file,
+            worktree_git=worktree_git,
+            wip_state=wip_state,
+            pre_save_tree_fingerprint=pre_save_tree_fingerprint,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        warning = (
+            "Warning: failed to persist timeout resume checkpoint; "
+            f"continuing with TIMEOUT failure recording: {exc}"
+        )
+        logger.warning(warning)
+        task_logger.warning(
+            warning,
+            extra={
+                "event": "timeout_resume_checkpoint_write_failed",
+                "task_id": task_id,
+                "error_type": type(exc).__name__,
+            },
+        )
+
+
+def _build_timeout_resume_context(
+    *,
+    config: Config,
+    checkpoint_task_id: str | None,
+    worktree_git: Git,
+) -> str | None:
+    """Build timeout-aware resume guidance when a reusable checkpoint exists."""
+    if checkpoint_task_id is None:
+        return None
+    checkpoint_file = _checkpoint_path(config, checkpoint_task_id)
+    if not checkpoint_file.exists():
+        return None
+
+    def checkpoint_unavailable_context(reason: str) -> str:
+        warning = (
+            "Warning: timeout resume checkpoint exists but could not be reused; "
+            f"continuing without reusable verify phases: {reason}"
+        )
+        logger.warning(warning)
+        return "\n".join(
+            [
+                "## Timeout Resume Context",
+                "",
+                "- Timeout checkpoint context was unavailable from the interrupted run.",
+                f"- Reason: {reason}",
+                "- No reusable verify phases should be trusted from the interrupted run.",
+                "- First command to run next: inspect the current worktree, rerun targeted or inner verification as needed, and only rerun the full final verify command once the tree is ready.",
+                "- Any new edit invalidates prior verify checkpoints for affected phases.",
+            ]
+        )
+
+    try:
+        payload = json.loads(checkpoint_file.read_text())
+    except OSError as exc:
+        return checkpoint_unavailable_context(
+            f"failed to read checkpoint file `{checkpoint_file}`: {exc}"
+        )
+    except json.JSONDecodeError as exc:
+        return checkpoint_unavailable_context(
+            f"failed to parse checkpoint file `{checkpoint_file}` as JSON: {exc}"
+        )
+    if not isinstance(payload, dict):
+        return checkpoint_unavailable_context(
+            f"checkpoint file `{checkpoint_file}` did not contain a JSON object"
+        )
+
+    current_fingerprint = _compute_tree_fingerprint(worktree_git)
+    reusable_phases: list[dict[str, Any]] = []
+    verify_phases = payload.get("verify_phases")
+    current_fingerprint_available = isinstance(current_fingerprint, str) and bool(current_fingerprint)
+    if current_fingerprint_available and isinstance(verify_phases, list):
+        reusable_phases = [
+            phase
+            for phase in verify_phases
+            if isinstance(phase, dict)
+            and (
+                phase.get("tree_fingerprint") == current_fingerprint
+                or phase.get("resume_tree_fingerprint") == current_fingerprint
+            )
+        ]
+
+    lines = ["## Timeout Resume Context", ""]
+    last_command = payload.get("last_command")
+    if isinstance(last_command, dict) and isinstance(last_command.get("command"), str):
+        command_status = last_command.get("status") or "unknown"
+        exit_code = last_command.get("exit_code")
+        exit_detail = f", exit={exit_code}" if exit_code is not None else ""
+        lines.append(
+            f"- Last known command: `{last_command['command']}` (status: {command_status}{exit_detail})"
+        )
+    provider_exec_breadcrumb = payload.get("provider_exec_breadcrumb")
+    if isinstance(provider_exec_breadcrumb, dict) and isinstance(provider_exec_breadcrumb.get("command"), str):
+        lines.append(
+            "- Provider wrapper at timeout: "
+            f"`{provider_exec_breadcrumb['command']}` "
+            "(breadcrumb only; do not rerun it inside the resumed agent session)"
+        )
+
+    wip_state = payload.get("wip_state")
+    if isinstance(wip_state, str):
+        lines.append(f"- Saved WIP state: {wip_state}")
+
+    if reusable_phases:
+        phase_names = ", ".join(str(phase.get("phase")) for phase in reusable_phases if phase.get("phase"))
+        lines.append(
+            f"- Reusable successful verify phases for the current tree fingerprint: {phase_names}"
+        )
+        lines.append("- If you do not edit the tree before resuming verification, treat those phases as already passed.")
+    elif not current_fingerprint_available:
+        lines.append(
+            "- No reusable verify checkpoints are valid because exact-tree fingerprinting failed for the current worktree."
+        )
+    else:
+        lines.append("- No reusable verify checkpoints are valid for the current tree fingerprint.")
+
+    next_command = None
+    if reusable_phases:
+        next_command = "continue from the first unfinished verification phase or rerun the final verify command if only the last phase was interrupted"
+    elif isinstance(last_command, dict) and isinstance(last_command.get("command"), str):
+        next_command = last_command["command"]
+    if next_command:
+        lines.append(f"- First command to run next: {next_command}")
+    else:
+        lines.append(
+            "- First command to run next: unknown; inspect the current worktree and verification state, then continue from the interrupted step without relaunching the provider wrapper."
+        )
+    lines.append("- Any new edit invalidates prior verify checkpoints for affected phases.")
+    return "\n".join(lines)
+
+
 def _save_wip_changes(
     task: Task,
     worktree_git: Git,
     config: Config,
     branch_name: str,
-) -> None:
+) -> str:
     """Save WIP changes when task fails or is interrupted.
 
     This does two things:
@@ -2703,7 +3295,7 @@ def _save_wip_changes(
     """
     # Check if there are any changes to save
     if not worktree_git.has_changes("."):
-        return
+        return "none"
 
     # Create WIP directory
     wip_dir = config.project_dir / WIP_DIR
@@ -2719,9 +3311,11 @@ def _save_wip_changes(
     diff = worktree_git._run("diff", "--cached", check=False).stdout
 
     # Save diff to backup file
+    saved_diff = False
     if task.slug and diff:
         wip_file = wip_dir / f"{task.slug}.diff"
         wip_file.write_text(diff)
+        saved_diff = True
         console.print(f"[yellow]Saved WIP diff to: {wip_file.relative_to(config.project_dir)}[/yellow]")
 
     # Commit changes with --no-verify
@@ -2733,9 +3327,11 @@ def _save_wip_changes(
             f"{WIP_INTERRUPTED_COMMIT_SUBJECT}\n\nTask ID: {task.slug}",
         )
         console.print(f"[yellow]Saved WIP commit on branch: {branch_name}[/yellow]")
+        return "commit+diff" if saved_diff else "commit"
     except GitError as e:
         # If commit fails, that's okay - we have the diff backup
         console.print(f"[yellow]Warning: Could not create WIP commit: {e}[/yellow]")
+        return "diff" if saved_diff else "none"
 
 
 def _restore_wip_changes(
@@ -3792,6 +4388,7 @@ def run(
     task_config.reasoning_effort = config.get_reasoning_effort_for_task(task.task_type, effective_provider) or ""
     task_config.max_steps = effective_max_steps
     task_config.max_turns = effective_max_steps
+    task_config.timeout_minutes = config.get_timeout_minutes_for_task(task.task_type, effective_provider)
 
     # Get the provider for this task
     provider = get_provider(task_config)
@@ -5144,13 +5741,48 @@ def _run_inner(
 
     # Run provider in the worktree
     if resume:
-        prompt = PromptBuilder().resume_prompt()
+        timeout_resume_context = None
+        checkpoint_task_id: str | None = None
+        if task.based_on:
+            based_on_task = store.get(task.based_on)
+            if based_on_task is not None and based_on_task.failure_reason == "TIMEOUT":
+                checkpoint_task_id = based_on_task.id
+        elif task.failure_reason == "TIMEOUT":
+            checkpoint_task_id = task.id
+        if checkpoint_task_id is not None and task.id is not None:
+            timeout_resume_context = _build_timeout_resume_context(
+                config=config,
+                checkpoint_task_id=checkpoint_task_id,
+                worktree_git=worktree_git,
+            )
+        prompt = PromptBuilder().resume_prompt(resume_context=timeout_resume_context)
     else:
-        prompt = build_prompt(task, config, store, report_path=None, summary_path=prompt_summary_path, git=git)
+        prompt = build_prompt(task, task_config, store, report_path=None, summary_path=prompt_summary_path, git=git)
 
     # Snapshot worktree state before provider runs so we can selectively stage only new changes
     pre_run_status = worktree_git.status_porcelain()
     task_logger = TaskExecutionLogger(resolve_ops_log_path(config, log_file), echo=True)
+    timeout_budget = _resolve_task_timeout_budget(
+        task=task,
+        config=config,
+        provider=task_config.provider,
+        git=worktree_git,
+        branch_name=branch_name,
+        default_branch=default_branch,
+        task_logger=task_logger,
+    )
+    task_config.timeout_minutes = timeout_budget.minutes
+    timeout_message = f"Resolved timeout budget: {timeout_budget.minutes}m ({timeout_budget.reason})"
+    task_logger.phase(
+        timeout_message,
+        extra={
+            "event": "resolved_timeout_budget",
+            "timeout_minutes": timeout_budget.minutes,
+            "reason_detail": timeout_budget.reason,
+            "diff_lines": timeout_budget.diff_lines,
+            "diff_files": timeout_budget.diff_files,
+        },
+    )
     improve_diff_baseline: ImproveDiffBaseline | None = None
     rebase_diff_baseline: RebaseDiffBaseline | None = None
     if task.task_type == "rebase":
@@ -5210,7 +5842,7 @@ def _run_inner(
 
         resolved_failure = _resolve_run_failure(
             provider_name=provider.name,
-            timeout_minutes=config.timeout_minutes,
+            timeout_minutes=task_config.timeout_minutes,
             step_limit=task_config.max_steps,
             turn_limit=task_config.max_turns,
             error_type=result.error_type,
@@ -5221,7 +5853,20 @@ def _run_inner(
 
         if resolved_failure is not None:
             # Save WIP changes before marking failed
-            _save_wip_changes(task, worktree_git, config, branch_name)
+            pre_save_tree_fingerprint = None
+            if resolved_failure.reason == "TIMEOUT" and task.id is not None:
+                pre_save_tree_fingerprint = _compute_tree_fingerprint(worktree_git)
+            wip_state = _save_wip_changes(task, worktree_git, config, branch_name)
+            if resolved_failure.reason == "TIMEOUT" and task.id is not None:
+                _persist_timeout_resume_checkpoint(
+                    config=config,
+                    task_id=task.id,
+                    log_file=log_file,
+                    worktree_git=worktree_git,
+                    wip_state=wip_state,
+                    task_logger=task_logger,
+                    pre_save_tree_fingerprint=pre_save_tree_fingerprint,
+                )
             _record_run_failure(
                 task=task,
                 config=config,
@@ -5442,6 +6087,20 @@ def _run_non_code_task(
 
         if not config.use_docker:
             _create_local_dep_symlinks(config, worktree_path)
+
+        task_logger = TaskExecutionLogger(resolve_ops_log_path(config, log_file), echo=True)
+        timeout_message = (
+            f"Resolved timeout budget: {config.timeout_minutes}m "
+            f"(base timeout for task type '{task.task_type}')"
+        )
+        task_logger.phase(
+            timeout_message,
+            extra={
+                "event": "resolved_timeout_budget",
+                "timeout_minutes": config.timeout_minutes,
+                "reason_detail": f"base timeout for task type '{task.task_type}'",
+            },
+        )
 
         # Run provider in the worktree
         if resume:

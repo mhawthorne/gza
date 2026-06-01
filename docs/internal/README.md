@@ -28,6 +28,7 @@ Linked from `AGENTS.md` so these are reachable in one hop instead of by grep.
 - [release-notes-generator.md](release-notes-generator.md) — how release notes are produced.
 - [profiling.md](profiling.md) — profiling gza with py-spy.
 - [skills.md](skills.md) — internal skill authoring/usage notes.
+- [timeout-budgeting.md](timeout-budgeting.md) — deterministic code-task timeout scaling and verify-profile rationale.
 
 ## Known issues / gotchas
 

@@ -33,6 +33,7 @@ Gza reads configuration from three YAML layers:
 | `docker_setup_command` | String | `""` | Pre-warm hook run synchronously in Docker before provider CLI starts |
 | `docker_volumes` | List | `[]` | Custom Docker volume mounts (e.g., `["/host:/container:ro"]`) |
 | `timeout_minutes` | Integer | `10` | Maximum time per task in minutes |
+| `inner_verify_command` | String | `""` | Optional fast verification command for code-task edit loops; `verify_command` remains the final gate |
 | `branch_mode` | String | `multi` | Branch strategy: `single` or `multi` |
 | `max_steps` | Integer | `50` | Maximum conversation steps per task (preferred) |
 | `max_turns` | Integer | `50` | Legacy alias for `max_steps` |
@@ -51,6 +52,11 @@ Gza reads configuration from three YAML layers:
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
 | `review_verify_timeout_seconds` | Integer | `120` | Timeout for autonomous review `verify_command` runs |
+| `code_task_diff_timeout_medium_threshold` | Integer | `400` | Reviewable diff-size threshold where code tasks move from the base timeout to the medium scaled timeout |
+| `code_task_diff_timeout_large_threshold` | Integer | `1200` | Reviewable diff-size threshold where code tasks move from the base timeout to the large scaled timeout; must be `>= code_task_diff_timeout_medium_threshold` after defaults and overrides are merged |
+| `code_task_diff_timeout_medium_minutes` | Integer | `30` | Timeout budget used for medium-sized code diffs |
+| `code_task_diff_timeout_large_minutes` | Integer | `45` | Timeout budget used for large code diffs; must be `>= code_task_diff_timeout_medium_minutes` after defaults and overrides are merged |
+| `code_task_diff_timeout_cap_minutes` | Integer | `45` | Hard maximum applied to code-task budgets after base timeout resolution and diff-size scaling |
 | `pr_integration` | Boolean | `true` | Enable GitHub PR discovery/comment/create flows; set `false` to skip all `gh`-backed PR operations for the project |
 | `recommend_rebase_behind_commits` | Integer | `1` | Deprecated compatibility key; accepted but ignored by current lifecycle planning |
 | `max_noop_improve_cycles` | Integer | `2` | Cap for consecutive no-op improves before lifecycle automation stops for discussion |
@@ -89,10 +95,10 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `require_review_before_merge`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `colors`
+`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `require_review_before_merge`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `colors`
 
 Disallowed keys:
-`project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`, `verify_command`
+`project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`
 
 Shared DB example:
 
@@ -120,6 +126,7 @@ Example:
 # gza.local.yaml
 use_docker: false
 timeout_minutes: 30
+inner_verify_command: ./bin/tests --quick
 docker_volumes:
   - ~/datasets:/datasets:ro
 providers:
@@ -128,6 +135,10 @@ providers:
       review:
         model: claude-haiku-4-5
         reasoning_effort: low
+  codex:
+    task_types:
+      implement:
+        timeout_minutes: 45
 ```
 
 Inspect effective values and source attribution:
@@ -417,6 +428,34 @@ Max steps selection:
 4. `task_types.<task_type>.max_turns` (legacy fallback)
 5. `max_steps` / `defaults.max_steps`
 6. `max_turns` / `defaults.max_turns` (legacy fallback)
+
+Timeout selection:
+1. `providers.<effective_provider>.task_types.<task_type>.timeout_minutes`
+2. `task_types.<task_type>.timeout_minutes`
+3. `timeout_minutes`
+4. Hardcoded default (`10`)
+
+For `implement`, `improve`, `fix`, and `rebase`, the resolved base timeout can then be scaled up by reviewable diff size:
+
+- If the diff reaches `code_task_diff_timeout_medium_threshold`, use at least `code_task_diff_timeout_medium_minutes`.
+- If the diff reaches `code_task_diff_timeout_large_threshold`, use at least `code_task_diff_timeout_large_minutes`.
+- After base timeout resolution and any diff-size scaling, cap the final code-task budget at `code_task_diff_timeout_cap_minutes`, even if a task-type or provider override is higher.
+- The large threshold/minutes checks are enforced on the resolved config, even when only one side is set in `gza.yaml`, `~/.gza/config.yaml`, or `gza.local.yaml`.
+- If Gza cannot compute the reviewable diff safely, it falls back to the normal resolved timeout and logs that fallback.
+
+### Verification Profiles
+
+Code tasks support two verification tiers:
+
+```yaml
+verify_command: ./bin/tests
+inner_verify_command: ./bin/tests --quick
+```
+
+- `verify_command` remains the required final gate before a code task reports success.
+- `inner_verify_command` is optional and is intended for fast edit-loop checks during implementation.
+- When `inner_verify_command` is unset, agents should prefer targeted tests during editing and still run `verify_command` once after the last code change.
+- Autonomous review verification is separate and remains bounded by `review_verify_timeout_seconds`.
 
 ---
 
@@ -834,6 +873,7 @@ providers.*.task_types.*.max_steps
 providers.*.task_types.*.max_turns
 providers.*.task_types.*.model
 providers.*.task_types.*.reasoning_effort
+providers.*.task_types.*.timeout_minutes
 review_context_file_limit
 review_verify_timeout_seconds
 recommend_rebase_behind_commits
@@ -844,6 +884,7 @@ task_types.*.max_steps
 task_types.*.max_turns
 task_types.*.model
 task_types.*.reasoning_effort
+task_types.*.timeout_minutes
 tasks_file
 theme
 timeout_minutes
@@ -854,6 +895,12 @@ tmux.max_idle_timeout
 tmux.terminal_size
 use_docker
 verify_command
+inner_verify_command
+code_task_diff_timeout_medium_threshold
+code_task_diff_timeout_large_threshold
+code_task_diff_timeout_medium_minutes
+code_task_diff_timeout_large_minutes
+code_task_diff_timeout_cap_minutes
 watch.batch
 watch.failure_backoff_initial
 watch.failure_backoff_max
@@ -1820,6 +1867,10 @@ docker_setup_command: "uv sync"
 timeout_minutes: 15
 max_turns: 80
 review_verify_timeout_seconds: 180
+verify_command: ./bin/tests
+inner_verify_command: ./bin/tests --quick
+code_task_diff_timeout_medium_threshold: 500
+code_task_diff_timeout_large_threshold: 1500
 max_noop_improve_cycles: 2
 work_count: 3
 
@@ -1842,6 +1893,13 @@ task_types:
     max_turns: 20
   review:
     max_turns: 15
+  implement:
+    timeout_minutes: 30
+providers:
+  codex:
+    task_types:
+      implement:
+        timeout_minutes: 45
 ```
 
 ---
@@ -1925,6 +1983,17 @@ Or per-task-type:
 task_types:
   implement:
     timeout_minutes: 45
+```
+
+For large code tasks, prefer leaving the base timeout modest and tuning the diff-size scaling knobs instead:
+
+```yaml
+timeout_minutes: 15
+code_task_diff_timeout_medium_threshold: 500
+code_task_diff_timeout_medium_minutes: 30
+code_task_diff_timeout_large_threshold: 1500
+code_task_diff_timeout_large_minutes: 45
+code_task_diff_timeout_cap_minutes: 45
 ```
 
 ### Task won't stop

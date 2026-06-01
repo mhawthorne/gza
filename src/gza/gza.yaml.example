@@ -40,6 +40,21 @@ project_name: my-project
 # Maximum time per task in minutes
 # timeout_minutes: 10
 
+# Optional fast verification command for code-task edit loops.
+# verify_command remains the required final gate.
+# inner_verify_command: ./bin/tests --quick
+
+# Optional diff-size scaling for implement/improve/fix/rebase tasks.
+# If the reviewable diff reaches the medium threshold, use at least the
+# medium timeout. If it reaches the large threshold, use at least the large
+# timeout. The final code-task budget cannot exceed
+# code_task_diff_timeout_cap_minutes, even if a base override is higher.
+# code_task_diff_timeout_medium_threshold: 400
+# code_task_diff_timeout_large_threshold: 1200
+# code_task_diff_timeout_medium_minutes: 30
+# code_task_diff_timeout_large_minutes: 45
+# code_task_diff_timeout_cap_minutes: 45
+
 # Maximum execution steps per task
 # max_steps: 50
 

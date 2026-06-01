@@ -73,6 +73,27 @@ same interpreter `uv run` would launch — but without the per-invocation
 lockfile revalidation that `uv run` performs. Skipping that step removes a
 real chunk of the per-test budget and a common source of flakes.
 
+The same principle applies to repo verification scripts: once the project
+environment already exists, prefer invoking `.venv/bin` tools directly over
+paying repeated `uv run` startup costs inside every phase.
+
+## Fast inner loop, full final gate
+
+Code-task verification has two distinct jobs:
+
+- The inner loop should be fast and high-signal so agents can keep making
+  progress without burning the whole wall-clock budget on repeated heavy
+  suite launches.
+- The final gate should stay strict. A code task is not complete until the
+  configured full `verify_command` passes after the last code change.
+
+In practice:
+
+- Use `inner_verify_command` or targeted tests while editing.
+- Run the full `verify_command` once after the last planned edit.
+- If the full gate fails, fix the failures and rerun it. Do not keep
+  relaunching the full suite after every intermediate edit.
+
 ## Gitignored derived artifacts are not review blockers
 
 `.claude/skills/` is installed per-worktree by `gza skills-install` from the
