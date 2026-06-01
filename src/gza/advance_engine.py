@@ -2126,7 +2126,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="conflict_rebase_completed_but_still_blocked",
-        matches=lambda ctx: not ctx.can_merge and ctx.latest_completed_rebase is not None,
+        matches=lambda ctx: (
+            not ctx.can_merge
+            and ctx.latest_completed_rebase is not None
+            and _branch_contains_target_tip(ctx)
+        ),
         action=_rebase_did_not_unblock_merge_action,
     ),
     AdvanceRule(

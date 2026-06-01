@@ -2952,7 +2952,15 @@ def test_rebase_failure_circuit_breaker_resets_after_completed_rebase(tmp_path: 
     _add_failed_rebase_attempts(store, impl, hours=(10, 11, 12))
     _add_completed_rebase(store, impl, when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC))
 
-    git = _FakeGit(can_merge=False)
+    git = _FakeGit(
+        can_merge=False,
+        existing_refs={"origin/feature/rebase-breaker-reset-rebase"},
+        ref_shas={
+            "origin/feature/rebase-breaker-reset-rebase": "branch-tip",
+            "main": "target-tip",
+        },
+        ancestor_pairs={("main", "origin/feature/rebase-breaker-reset-rebase"): True},
+    )
     ctx = resolve_advance_context(config, store, git, impl, "main")
     assert ctx.rebase_failure_streak is None
 
@@ -3049,12 +3057,65 @@ def test_completed_rebase_that_still_blocks_merge_needs_attention(tmp_path: Path
     rebase.has_commits = True
     store.update(rebase)
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=False), impl, "main")
+    git = _FakeGit(
+        can_merge=False,
+        existing_refs={"origin/feature/rebase-still-blocked"},
+        ref_shas={
+            "origin/feature/rebase-still-blocked": "branch-tip",
+            "main": "target-tip",
+        },
+        ancestor_pairs={("main", "origin/feature/rebase-still-blocked"): True},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "rebase-did-not-unblock-merge"
     assert classify_advance_action(action) == "needs_attention"
     assert action["subject_task_id"] == impl.id
+
+
+def test_stale_completed_rebase_falls_through_to_needs_rebase(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/stale-completed-rebase",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 10, 0, tzinfo=UTC))
+    _add_completed_rebase(store, impl, when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+
+    git = _FakeGit(
+        can_merge=False,
+        existing_refs={"origin/feature/stale-completed-rebase"},
+        ref_shas={
+            "origin/feature/stale-completed-rebase": "branch-tip",
+            "main": "new-target-tip",
+        },
+        ancestor_pairs={("main", "origin/feature/stale-completed-rebase"): False},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    assert ctx.merge_source_ref == "origin/feature/stale-completed-rebase"
+    assert ctx.post_merge_rebase_state is not None
+    assert ctx.post_merge_rebase_state.branch_tip_sha == "branch-tip"
+    assert ctx.post_merge_rebase_state.target_tip_sha == "new-target-tip"
+    assert ctx.post_merge_rebase_state.target_is_ancestor_of_branch is False
+    assert ctx.post_merge_rebase_state.reason is None
+    assert ctx.post_merge_rebase_state.warning is None
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_rebase"
+    assert action.get("needs_attention_reason") != "rebase-did-not-unblock-merge"
 
 
 def test_orphan_rebase_descendant_skips_when_canonical_target_merge_unit_is_merged(

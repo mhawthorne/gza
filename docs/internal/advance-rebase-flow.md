@@ -11,8 +11,8 @@ When `gza advance` encounters a completed task whose branch has merge conflicts 
    - `failed` with no later successful same-branch rebase/recovery, no later approved/cleared review, and no local post-resolution proof (`merge unit merged`, branch tip equals target tip, or branch contains the current target tip) → `needs_discussion` (manual intervention required)
    - `failed` 3 times on the same branch with no intervening successful rebase, review, or completed code change → `needs_discussion` with reason `rebase-failure-circuit-breaker` (stop creating fresh rebase tasks and surface manual intervention)
    - rebase planning against a rebase descendant first resolves the canonical rebase target; if that target merge unit is already `merged`, or the descendant no longer attaches to any merge unit at all, advance skips instead of queueing another rebase against an orphan branch
-   - `completed` and conflicts still remain → `needs_discussion` with reason `rebase-did-not-unblock-merge` (manual decision required before another rebase)
-   - no rebase child and the branch does not already contain the target tip → create a new rebase task (`needs_rebase` action)
+   - `completed`, conflicts still remain, and the branch already contains the current target tip → `needs_discussion` with reason `rebase-did-not-unblock-merge` (a fresh rebase is already proved futile)
+   - no rebase child, or only a stale completed rebase, and the branch does not already contain the target tip → create a new rebase task (`needs_rebase` action)
    - no rebase child but the branch already contains the target tip and the lineage is still incomplete → `needs_discussion` (surface the incomplete lineage instead of spawning a guaranteed no-op rebase)
    - mergeable branches continue through the normal review/merge rules even if the branch is behind target or earlier local verify ran slowly
 

@@ -12813,7 +12813,7 @@ class TestLineageOwnerParity:
         assert result == 0
         one_line_output = captured.out
         assert self._one_line_row_id(one_line_output) == impl.id
-        assert "completed rebase did not unblock merge; manual decision required" in one_line_output
+        assert "rebase --resolve (conflicts detected)" in one_line_output
         assert f"{dropped_one.id} (dropped)" not in one_line_output
         assert f"{dropped_two.id} (dropped)" not in one_line_output
 
