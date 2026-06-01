@@ -2545,6 +2545,46 @@ def test_failed_rebase_clears_and_marks_merged_when_branch_tip_equals_target_tip
     assert all(row.owner_task.id != impl.id for row in rows)
 
 
+def test_already_merged_branch_persists_merged_when_tip_is_ancestor_not_equal_target_tip(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/ancestor-merged-not-equal-tip",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    git = _FakeGit(
+        can_merge=False,
+        is_merged_by_ref={("origin/feat/ancestor-merged-not-equal-tip", "main"): True},
+        existing_refs={"origin/feat/ancestor-merged-not-equal-tip"},
+        ref_shas={
+            "origin/feat/ancestor-merged-not-equal-tip": "branch-sha",
+            "main": "target-sha",
+        },
+        ancestor_pairs={("main", "origin/feat/ancestor-merged-not-equal-tip"): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: already merged into target branch"
+    refreshed = store.get(impl.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=False),
+        config=config,
+        git=_FakeGit(can_merge=False),
+        target_branch="main",
+    )
+    assert all(row.owner_task.id != impl.id for row in rows)
+
+
 def test_post_merge_rebase_state_does_not_persist_merged_for_in_progress_implement(
     tmp_path: Path,
 ) -> None:
@@ -2640,6 +2680,35 @@ def test_failed_rebase_clears_when_branch_contains_current_target_tip(
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
     assert refreshed_unit is not None
     assert refreshed_unit.state == "unmerged"
+
+
+def test_unmerged_branch_does_not_persist_merged_from_live_check(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/still-unmerged",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            is_merged_by_ref={("origin/feat/still-unmerged", "main"): False},
+            existing_refs={"origin/feat/still-unmerged"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "create_review"
+    refreshed = store.get(impl.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
 
 
 def test_already_rebased_incomplete_lineage_returns_needs_attention_instead_of_rebase(

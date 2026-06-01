@@ -461,8 +461,16 @@ def _resolve_and_persist_post_merge_rebase_state(
         merge_source=merge_source,
     )
     if (
-        state.reason == "branch-tip-equals-target-tip"
-        and state.already_merged
+        (
+            (state.reason == "branch-tip-equals-target-tip" and state.already_merged)
+            or resolve_task_merge_state_for_target(
+                store=store,
+                task=task,
+                git=git,
+                target_branch=target_branch,
+            )
+            == "merged"
+        )
         and task.id is not None
         and task.status == "completed"
         and task.has_commits
