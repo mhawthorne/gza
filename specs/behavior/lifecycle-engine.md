@@ -225,31 +225,44 @@ Every stop-for-human action MUST carry one machine-readable **reason code** from
 closed set (overview escalation table). Automation MAY branch on the code; adding a code
 is a spec change. The accompanying human message is free text.
 
-| Reason code | State | Trigger (rule) |
-|-------------|-------|----------------|
-| `plan-held` | AwaitingHuman | §1 plan completed, `auto_implement` off |
-| `explore-dangling` | needs_discussion | §1 explore with no follow-up |
-| `scope-out-of-scope` | ScopeParked | §3 diff touches paths outside scope |
-| `scope-unverifiable` | needs_discussion | §3 diff could not be inspected |
+| Reason code | State | Trigger (rule §) |
+|-------------|-------|------------------|
+| `explore-needs-follow-up-decision` | needs_discussion | §1 completed explore, no plan/implement follow-up |
+| `project-scope-violation` | ScopeParked | §3 diff touches paths outside scope, not tagged `cross-project` |
+| `project-scope-unverified` | needs_discussion | §3 diff could not be inspected (fail closed) |
+| `merge-source-needs-manual-resolution` † | HumanParked | §4 host-side merge-source divergence needs manual resolution |
 | `rebase-failed-needs-manual-resolution` | HumanParked | §4 rebase failed, no landing proof |
 | `rebase-did-not-unblock-merge` | HumanParked | §4 rebase completed, still conflicts |
 | `rebase-failure-circuit-breaker` | HumanParked | §4 repeated rebase failures, no progress |
-| `rebase-moot-incomplete-lineage` | needs_discussion | §4 branch has target tip, lineage unresolved |
-| `review-refresh-blocked` | needs_discussion | §5 stale-after-rebase, auto-review off |
-| `review-inconsistent-followups` | needs_discussion | §6 `APPROVED_WITH_FOLLOWUPS`, zero parsed |
+| `branch-already-rebased-lineage-incomplete` | needs_discussion | §4 branch contains target tip, lineage unresolved |
+| `stale-review-needs-manual-refresh` | needs_discussion | §5 rebase invalidated review, `advance_create_reviews` off |
+| `closing-review-needs-manual-refresh` † | needs_discussion | §6/§8 closing-review requirement, manual refresh |
 | `verify-blocked-no-code-issues` | needs_discussion | §6 reviews fail only on verify timeout |
-| `review-max-cycles-reached` | max_cycles_reached | §6 cycles ≥ `max_review_cycles` |
-| `duplicate-blocker-no-progress` | needs_discussion | §6 same blocker repeats across cycles |
-| `improve-no-op` | needs_discussion | §6 no-op improves ≥ bound |
-| `review-verdict-unknown` | needs_discussion | §6 verdict unclassifiable |
-| `recovery-retry-limit-reached` | HumanParked | §7 recovery attempts exhausted |
-| `recovery-manual-review-required` | HumanParked | §7 terminal manual recovery situation |
+| `verify-noop-improve-branch-tip-unavailable` † | needs_discussion | §6 no-op-improve check: branch tip unavailable |
+| `verify-noop-improve-diff-probe-unavailable` † | needs_discussion | §6 no-op-improve check: diff probe unavailable |
+| `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound |
+| `duplicate-blocker-no-progress` | needs_discussion | §6 same primary blocker repeats across cycles |
+| `review-max-cycles-reached` | max_cycles_reached | §6 review→improve cycles ≥ `max_review_cycles` |
+| `review-verdict-needs-manual-attention` | needs_discussion | §6 verdict unclassifiable, or `APPROVED_WITH_FOLLOWUPS` with zero parsed follow-ups |
+| `automatic-recovery-disabled` | HumanParked | §7 recovery attempt budget = 0 |
+| `retry-limit-reached` | HumanParked | §7 recovery attempts exhausted *or* terminal manual-review situation (one slug covers both — see F2) |
 | `recovery-ambiguous` | HumanParked | §7 recovery situation ambiguous |
+| `manual-failure-reason` † | HumanParked | §7 failure flagged for manual handling |
+| `newer-recovery-descendant-needs-attention` † | HumanParked | §7 newer unresolved recovery descendant |
 
-*Implementation note (non-normative): the code today emits some of these as shorter
-strings (e.g. `retry-limit-reached`, `manual-review-required`). Reconciling the emitted
-strings to this canonical set is a conformance task; until then, treat the table as the
-target vocabulary.*
+**†** Names a behavior whose *producing rule* is not yet written in §1–§8. Adding the code
+reconciles the vocabulary; specifying the rule that emits it is a tracked follow-up gap.
+
+The held-plan `awaiting_human` action (§1) does **not** currently carry a reason code. If
+reason codes are contract for every stop (they are), that is a gap to close — either emit a
+`plan-held` code or document the exception.
+
+*Status: reconciled to the strings the engine actually emits as of the 2026-06-02
+behavior-check (`reviews/20260602003648-behavior-check.md`), spec-follows-code. Two items
+remain open as **code/spec decisions, not spec edits**: (1) **F2** — `retry-limit-reached`
+collapses the distinct retry-exhausted and manual-review-required cases, yet `watch` still
+branches on a `manual-review-required` slug the engine never emits; (2) the **†** rows need
+their producing rules specified in §1–§8.*
 
 ## Ratified decisions
 
