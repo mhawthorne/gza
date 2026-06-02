@@ -96,7 +96,7 @@ from .query import _resolve_incomplete_owner_task
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
 _WATCH_PARKED_LINEAGE_POLICY: Literal["skip"] = "skip"
-_WATCH_PARKED_NEEDS_ATTENTION_REASONS = frozenset({"retry-limit-reached", "manual-review-required"})
+_WATCH_PARKED_NEEDS_ATTENTION_REASONS = frozenset({"retry-limit-reached"})
 T = TypeVar("T")
 
 
@@ -161,7 +161,7 @@ def _watch_needs_attention_message(task: DbTask, action: dict) -> str:
 
 
 def _watch_parked_lineage_action(row: LineageOwnerRow) -> dict[str, Any] | None:
-    """Return the row's already-parked manual-review action when watch should not respawn work."""
+    """Return the row's already-parked recovery action when watch should not respawn work."""
     action = row.next_action
     if action is None:
         return None

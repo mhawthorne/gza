@@ -6303,7 +6303,7 @@ def test_watch_cycle_execution_attention_uses_impl_owner_for_plan_owned_rebase_r
         action={
             "type": "manual_review_required",
             "description": "SKIP: worker needs manual review",
-            "needs_attention_reason": "manual-review-required",
+            "needs_attention_reason": "retry-limit-reached",
         }
     )
 

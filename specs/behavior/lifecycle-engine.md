@@ -250,7 +250,7 @@ is a spec change. The accompanying human message is free text.
 | `review-verdict-needs-manual-attention` | needs_discussion | §6 verdict unclassifiable, or `APPROVED_WITH_FOLLOWUPS` with zero parsed follow-ups |
 | `review-needs-manual-creation` | needs_discussion | §8 implementation-owned lineage requires review, no review exists, `advance_create_reviews` off |
 | `automatic-recovery-disabled` | HumanParked | §7 recovery attempt budget = 0 |
-| `retry-limit-reached` | HumanParked | §7 recovery attempts exhausted *or* terminal manual-review situation (one slug covers both — see F2) |
+| `retry-limit-reached` | HumanParked | §7 recovery attempts exhausted or terminal manual-review recovery stop |
 | `recovery-ambiguous` | HumanParked | §7 recovery situation ambiguous |
 | `manual-failure-reason` † | HumanParked | §7 failure flagged for manual handling |
 | `newer-recovery-descendant-needs-attention` † | HumanParked | §7 newer unresolved recovery descendant |
@@ -261,16 +261,16 @@ reconciles the vocabulary; specifying the rule that emits it is a tracked follow
 
 Primary lifecycle code MUST attach `needs_attention_reason` explicitly via
 `with_needs_attention(...)` or the equivalent execution-time needs-attention result.
-`needs-discussion`, `max-improve-attempts-reached`, and `manual-review-required` remain
-accepted legacy compatibility fallback slugs, but new rules MUST NOT rely on bare
-action-type fallback to produce them.
+`needs-discussion` and `max-improve-attempts-reached` remain accepted legacy compatibility
+fallback slugs, but new rules MUST NOT rely on bare action-type fallback to produce them.
+`manual-review-required` is not a recovery parked reason code; recovery paths use
+`retry-limit-reached`, while any operator-facing manual-review distinction is carried by
+the parked state, action type, or human message.
 
 *Status: reconciled to the strings the engine actually emits as of the 2026-06-02
-behavior-check (`reviews/20260602003648-behavior-check.md`), spec-follows-code. Two items
-remain open as **code/spec decisions, not spec edits**: (1) **F2** — `retry-limit-reached`
-collapses the distinct retry-exhausted and manual-review-required cases, yet `watch` still
-branches on a `manual-review-required` compatibility slug the engine rarely emits; (2) the
-**†** rows need their producing rules specified in §1–§8.*
+behavior-check (`reviews/20260602003648-behavior-check.md`), spec-follows-code. Remaining
+open work is limited to the **†** rows whose producing rules still need to be specified in
+§1–§8.*
 
 ## Ratified decisions
 
