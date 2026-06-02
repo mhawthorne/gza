@@ -796,7 +796,7 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=True,
         dest="auto_restart_on_drift",
-        help="Re-exec watch at a drained batch boundary when the installed gza code changes (default: enabled)",
+        help="Re-exec watch on the next pass boundary when the installed gza code changes (default: enabled)",
     )
     watch_parser.add_argument(
         "-y", "--yes",

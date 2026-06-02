@@ -7191,7 +7191,7 @@ def test_installed_gza_package_fingerprint_changes_only_when_python_source_chang
 
 
 def test_watch_warns_once_per_installed_package_drift(tmp_path: Path) -> None:
-    """Watch should advertise deferred automatic re-exec once per new drift fingerprint."""
+    """Watch should advertise next-pass automatic re-exec once per new drift fingerprint."""
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
@@ -7224,7 +7224,7 @@ def test_watch_warns_once_per_installed_package_drift(tmp_path: Path) -> None:
     assert len(warning_lines) == 2
     assert all(
         line.endswith(
-            "WARNING   installed gza changed since watch started -- watch will re-exec after the current batch drains"
+            "WARNING   installed gza changed since watch started -- watch will re-exec on the next watch pass to load new code"
         )
         for line in warning_lines
     )
@@ -7267,6 +7267,46 @@ def test_watch_drift_state_does_not_request_reexec_when_fingerprint_is_unchanged
         dry_run=False,
         stop_requested=False,
         cycle_result=_CycleResult(False, 0, 0),
+        drift_state=drift_state,
+    ) is False
+
+
+def test_watch_requests_reexec_on_pending_drift_even_with_running_and_pending_work() -> None:
+    """Pending drift should restart watch at the next pass boundary regardless of queue state."""
+    drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
+    drift_state.pending_restart_fingerprint = "changed-1"
+
+    assert _should_reexec_watch(
+        auto_restart_on_drift=True,
+        dry_run=False,
+        stop_requested=False,
+        cycle_result=_CycleResult(False, 3, 7),
+        drift_state=drift_state,
+    ) is True
+
+
+@pytest.mark.parametrize(
+    ("auto_restart_on_drift", "dry_run", "stop_requested"),
+    [
+        (False, False, False),
+        (True, True, False),
+        (True, False, True),
+    ],
+)
+def test_watch_reexec_guards_still_suppress_pending_drift(
+    auto_restart_on_drift: bool,
+    dry_run: bool,
+    stop_requested: bool,
+) -> None:
+    """Guard rails should still block re-exec even when drift is pending."""
+    drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
+    drift_state.pending_restart_fingerprint = "changed-1"
+
+    assert _should_reexec_watch(
+        auto_restart_on_drift=auto_restart_on_drift,
+        dry_run=dry_run,
+        stop_requested=stop_requested,
+        cycle_result=_CycleResult(False, 3, 7),
         drift_state=drift_state,
     ) is False
 
@@ -7411,7 +7451,7 @@ def test_cmd_watch_first_start_preserves_confirmation_prompt(tmp_path: Path) -> 
 
 
 def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None:
-    """Watch should re-exec itself once drift is detected and no workers are left running."""
+    """Watch should re-exec itself on the first pass boundary where drift is detected."""
     setup_config(tmp_path)
 
     args = argparse.Namespace(
@@ -7433,17 +7473,10 @@ def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None
         auto_restart_on_drift=True,
     )
 
-    cycle_results = iter(
-        [
-            _CycleResult(False, 1, 1),
-            _CycleResult(False, 0, 0),
-        ]
-    )
-
     def run_cycle_with_drift(**kwargs) -> _CycleResult:
         drift_state = kwargs["installed_package_drift"]
         drift_state.pending_restart_fingerprint = "updated"
-        return next(cycle_results)
+        return _CycleResult(False, 1, 1)
 
     with (
         patch("gza.cli.watch._run_cycle", side_effect=run_cycle_with_drift) as run_cycle,
@@ -7460,7 +7493,7 @@ def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None
             cmd_watch(args)
 
     assert excinfo.value.code == 0
-    assert run_cycle.call_count == 2
+    assert run_cycle.call_count == 1
     execv.assert_called_once()
     assert execv.call_args.args == (
         sys.executable,
@@ -7491,8 +7524,8 @@ def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None
     )
 
 
-def test_cmd_watch_defers_reexec_until_batch_drains(tmp_path: Path) -> None:
-    """Drift should not force a mid-batch re-exec while workers are still running."""
+def test_cmd_watch_reexecs_on_next_pass_even_when_work_is_still_running(tmp_path: Path) -> None:
+    """Detached workers should not block watch from restarting to pick up drifted code."""
     setup_config(tmp_path)
 
     args = argparse.Namespace(
@@ -7514,17 +7547,10 @@ def test_cmd_watch_defers_reexec_until_batch_drains(tmp_path: Path) -> None:
         auto_restart_on_drift=True,
     )
 
-    cycle_results = iter(
-        [
-            _CycleResult(False, 1, 0),
-            _CycleResult(False, 0, 0),
-        ]
-    )
-
     def run_cycle_with_drift(**kwargs) -> _CycleResult:
         drift_state = kwargs["installed_package_drift"]
         drift_state.pending_restart_fingerprint = "updated"
-        return next(cycle_results)
+        return _CycleResult(False, 1, 2)
 
     with (
         patch("gza.cli.watch._run_cycle", side_effect=run_cycle_with_drift),
@@ -7540,7 +7566,7 @@ def test_cmd_watch_defers_reexec_until_batch_drains(tmp_path: Path) -> None:
         with pytest.raises(SystemExit):
             cmd_watch(args)
 
-    assert sleep_interruptibly.call_count == 1
+    sleep_interruptibly.assert_not_called()
     execv.assert_called_once()
 
 

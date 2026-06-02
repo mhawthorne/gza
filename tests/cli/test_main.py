@@ -634,6 +634,27 @@ class TestHelpOutput:
         assert "--show-skipped" in failed_tasks_docs
         assert "`--max-resume-attempts` controls that shared policy as a toggle" in failed_tasks_docs
 
+    def test_watch_help_and_docs_describe_next_pass_drift_restart(self, tmp_path):
+        """watch help/docs should describe next-pass drift restart without drain gating."""
+        setup_config(tmp_path)
+        help_result = run_gza("watch", "--help", "--project", str(tmp_path))
+        assert help_result.returncode == 0
+
+        help_text = " ".join(help_result.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+        internal_docs_text = " ".join(Path("docs/internal/advance-workflow.md").read_text().split())
+
+        assert "Re-exec watch on the next pass boundary when the installed gza code changes" in help_text
+        assert "drained batch boundary" not in help_text
+
+        assert "re-exec at the next watch-pass boundary to load the new code without waiting for running or pending work to drain" in docs_text
+        assert "Detached workers keep running, and the replacement watch process reconciles them after it auto-resumes" in docs_text
+        assert "current batch drains and no worker remains running" not in docs_text
+
+        assert "re-exec itself on the next watch-pass boundary without waiting for running or pending work to drain" in internal_docs_text
+        assert "detached workers stay alive and the replacement process reconciles them after it auto-resumes" in internal_docs_text
+        assert "current batch drains and no worker remains running" not in internal_docs_text
+
     def test_watch_help_and_docs_distinguish_max_idle_from_no_activity_timeout(self, tmp_path):
         """watch help/docs should distinguish loop idle exit from silent-worker reconciliation."""
         setup_config(tmp_path)

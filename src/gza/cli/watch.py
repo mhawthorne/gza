@@ -568,7 +568,7 @@ def _warn_if_installed_gza_changed(
     if auto_restart_on_drift:
         message = (
             "installed gza changed since watch started -- watch will re-exec "
-            "after the current batch drains"
+            "on the next watch pass to load new code"
         )
     else:
         message = "installed gza changed since watch started -- restart watch to pick up new code"
@@ -590,7 +590,7 @@ def _should_reexec_watch(
         return False
     if drift_state.pending_restart_fingerprint is None:
         return False
-    return cycle_result.running == 0
+    return True
 
 
 def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
