@@ -347,7 +347,8 @@ def _watch_iterate_impl_target(
                 ),
                 guarded_pending_task_id=guarded_pending_task_id,
             )
-        if task.id is not None and task.id not in {impl_task.id, review_task.id}:
+        anchor_impl = impl_task if task.id == review_task.id else _resolve_watch_iterate_impl_for_task(store, task)
+        if anchor_impl is None or anchor_impl.id != impl_task.id:
             return _watch_iterate_result(
                 action_type=action_type,
                 status="skip",

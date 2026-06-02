@@ -6767,6 +6767,103 @@ def test_watch_cycle_run_review_routes_impl_chain_through_iterate(tmp_path: Path
     )
 
 
+@pytest.mark.parametrize("anchor_type", ["improve", "rebase"])
+def test_watch_cycle_run_review_allows_later_same_lineage_anchor(tmp_path: Path, anchor_type: str) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/run-review-later-anchor"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+    store.get_or_create_merge_unit_for_task(impl)
+
+    review = store.add("Pending review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+
+    improve = store.add(
+        "Completed improve",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime.now(UTC)
+    improve.branch = impl.branch
+    improve.has_commits = True
+    store.update(improve)
+    store.get_or_create_merge_unit_for_task(improve)
+
+    anchor = improve
+    members: tuple[DbTask, ...] = (impl, review, improve)
+    if anchor_type == "rebase":
+        rebase = store.add(
+            "Completed rebase",
+            task_type="rebase",
+            based_on=improve.id,
+            same_branch=True,
+        )
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.completed_at = datetime.now(UTC)
+        rebase.branch = impl.branch
+        rebase.has_commits = True
+        rebase.changed_diff = True
+        store.update(rebase)
+        store.get_or_create_merge_unit_for_task(rebase)
+        anchor = rebase
+        members = (impl, review, improve, rebase)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+    row = LineageOwnerRow(
+        owner_task=impl,
+        members=members,
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="test",
+        unresolved_tasks=(review,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=anchor,
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._query_owner_rows", return_value=[row]),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "run_review", "review_task": review}),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
+    log_lines = log_path.read_text().splitlines()
+    assert any(line.split(maxsplit=2)[1] == "START" and f"{impl.id} iterate" in line for line in log_lines)
+    assert not any("resolves to" in line and "not completed task" in line for line in log_lines)
+
+
 def test_watch_cycle_improve_routes_impl_chain_through_iterate_without_creating_child(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
