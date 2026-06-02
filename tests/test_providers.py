@@ -6120,7 +6120,7 @@ class TestPreflightLogging:
     def test_codex_provider_spec_examples_match_shared_headless_exec_contract(self):
         """Spec examples should stay aligned with the shared Codex headless exec argv."""
         repo_root = Path(__file__).resolve().parents[1]
-        spec_text = (repo_root / "specs" / "codex-provider.md").read_text()
+        spec_text = (repo_root / "specs" / "features" / "codex-provider.md").read_text()
         expected_cli = f"`codex {' '.join(build_headless_exec_args('<workdir>'))}`"
 
         assert expected_cli in spec_text
