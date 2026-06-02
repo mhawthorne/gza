@@ -2901,6 +2901,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 target_branch,
                 merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
             ).already_merged,
+            config=config,
+            git=git,
             spawn_iterate_worker=lambda task_obj, _kind, *, prepared_task=None, prepared_phase=None, prepared_action_type=None: _spawn_background_iterate_worker(
                 argparse.Namespace(
                     no_docker=getattr(args, 'no_docker', False),

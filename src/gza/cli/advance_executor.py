@@ -2,17 +2,33 @@
 
 from __future__ import annotations
 
+import logging
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from ..db import SqliteTaskStore, Task as DbTask
+from ..git import Git, GitError
 from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_attention_reason
+from ..runner import (
+    _create_detached_review_worktree,
+    _format_review_verify_result,
+    _project_boundary,
+    _resolve_review_verify_base_sha,
+    _run_review_verify_command,
+    _run_review_verify_commands_for_projects,
+    _task_is_cross_project,
+    _worktree_execution_dir,
+)
 from ._common import _create_improve_task, _create_retry_task, resolve_improve_action
 from .advance_engine import (
     classify_advance_action,
     failed_recovery_decision_to_attention_action,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CreateReviewActionResult(Protocol):
@@ -57,6 +73,8 @@ class AdvanceActionExecutionContext:
     create_retry_task: Callable[[DbTask], DbTask] | None = None
     create_targeted_rebase_task: Callable[[DbTask, str], DbTask] | None = None
     reconcile_diverged_branch: Callable[[DbTask], BranchDivergenceReconcileResult] | None = None
+    config: Any | None = None
+    git: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -100,10 +118,24 @@ class AdvanceExecutionNeedsAttention:
     action: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class NoopVerifyThenReviewOutcome:
+    """Shared execution outcome for verify-then-rereview no-op recovery."""
+
+    status: Literal["create_review", "needs_attention", "skip", "error"]
+    message: str
+    verify_markdown: str | None = None
+    review_task: DbTask | None = None
+
+
+_NOOP_REVERIFY_RECOVERABLE_EXCEPTIONS = (GitError, OSError, RuntimeError, ValueError)
+
+
 _WORKER_ACTIONS = frozenset(
     {
         "create_review",
         "run_review",
+        "verify_noop_improve_then_review",
         "improve",
         "run_improve",
         "resume",
@@ -113,6 +145,198 @@ _WORKER_ACTIONS = frozenset(
         "reconcile_branch_divergence",
     }
 )
+
+
+def _build_noop_verify_attention_result(
+    *,
+    action_type: str,
+    description: str,
+    verify_result: Any,
+) -> AdvanceActionExecutionResult:
+    detail = verify_result.failure or verify_result.exit_status
+    return AdvanceActionExecutionResult(
+        action_type=action_type,
+        status="skip",
+        message=f"SKIP: {description}. Fresh verify_command {verify_result.status} ({detail}).",
+        attention_type="needs_discussion",
+        attention_reason="improve-no-op",
+    )
+
+
+def run_noop_improve_verify_then_review(
+    *,
+    task: DbTask,
+    action: dict[str, Any],
+    context: AdvanceActionExecutionContext,
+) -> NoopVerifyThenReviewOutcome:
+    """Shared no-op improve escape hatch: fresh verify on tip, then create a new review."""
+    description = str(action.get("description", "Re-run verify_command before re-review"))
+
+    review_task = action.get("review_task")
+    if not isinstance(review_task, DbTask) or review_task.id is None or task.id is None:
+        return NoopVerifyThenReviewOutcome(status="skip", message="missing verify/review inputs")
+    if context.config is None or context.git is None:
+        return NoopVerifyThenReviewOutcome(status="error", message="missing verify execution context")
+    verify_git = context.git
+
+    verify_command = getattr(context.config, "verify_command", None)
+    if (
+        not _task_is_cross_project(task)
+        and (not isinstance(verify_command, str) or not verify_command.strip())
+    ):
+        return NoopVerifyThenReviewOutcome(
+            status="needs_attention",
+            message=f"SKIP: {description}. verify_command is unavailable.",
+        )
+    if not task.branch:
+        return NoopVerifyThenReviewOutcome(
+            status="needs_attention",
+            message=f"SKIP: {description}. implementation branch is unavailable.",
+        )
+
+    worktree_label = task.slug or task.id or "review-verify"
+    worktree_path = Path(context.config.worktree_path) / f"{worktree_label}-noop-review-verify"
+    timeout_seconds = getattr(context.config, "review_verify_timeout_seconds", 120)
+    if not isinstance(timeout_seconds, int) or timeout_seconds < 1:
+        timeout_seconds = 120
+
+    def _append_cleanup_failure(message: str, cleanup_failure: str | None) -> str:
+        if cleanup_failure is None:
+            return message
+        return f"{message} Cleanup also failed: {cleanup_failure}."
+
+    def _cleanup_worktree() -> str | None:
+        try:
+            remove_result = verify_git.worktree_remove(worktree_path, force=True)
+        except _NOOP_REVERIFY_RECOVERABLE_EXCEPTIONS as exc:
+            logger.warning("Failed to remove noop review verify worktree %s", worktree_path, exc_info=True)
+            if worktree_path.exists():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+            return str(exc)
+        if getattr(remove_result, "returncode", 0) not in (0, None):
+            logger.warning(
+                "git worktree remove failed for noop review verify worktree %s: %s",
+                worktree_path,
+                getattr(remove_result, "stderr", "") or getattr(remove_result, "stdout", "") or remove_result.returncode,
+            )
+            if worktree_path.exists():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+            if worktree_path.exists():
+                return (
+                    getattr(remove_result, "stderr", "") or getattr(remove_result, "stdout", "") or f"return code {remove_result.returncode}"
+                ).strip()
+            return None
+        if worktree_path.exists():
+            shutil.rmtree(worktree_path, ignore_errors=True)
+        if worktree_path.exists():
+            return f"{worktree_path} still exists after cleanup"
+        return None
+
+    verify_result = None
+    verify_markdown = None
+    reviewed_head_sha: str | None = None
+    reviewed_base_sha: str | None = None
+    lifecycle_failure: Exception | None = None
+    try:
+        default_branch = verify_git.default_branch()
+        reviewed_base_sha = _resolve_review_verify_base_sha(verify_git, default_branch)
+        _create_detached_review_worktree(verify_git, worktree_path, task.branch)
+        worktree_git = Git(worktree_path)
+        reviewed_head_sha = worktree_git.rev_parse_if_exists("HEAD")
+        if reviewed_head_sha is not None:
+            if _task_is_cross_project(task):
+                cross_project_verify = _run_review_verify_commands_for_projects(
+                    config=context.config,
+                    task=task,
+                    worktree_git=worktree_git,
+                    worktree_path=worktree_path,
+                    timeout_seconds=timeout_seconds,
+                    reviewed_branch=task.branch,
+                    reviewed_head_sha=reviewed_head_sha,
+                    reviewed_base_sha=reviewed_base_sha,
+                )
+                if cross_project_verify is not None:
+                    verify_result = cross_project_verify.aggregate_result
+                    verify_markdown = cross_project_verify.markdown
+            elif isinstance(verify_command, str) and verify_command.strip():
+                provider_cwd = _worktree_execution_dir(
+                    worktree_path,
+                    _project_boundary(context.config),
+                )
+                verify_result = _run_review_verify_command(
+                    verify_command,
+                    cwd=provider_cwd,
+                    reviewed_branch=task.branch,
+                    reviewed_head_sha=reviewed_head_sha,
+                    reviewed_base_sha=reviewed_base_sha,
+                    timeout_seconds=timeout_seconds,
+                )
+                verify_markdown = _format_review_verify_result(verify_result)
+    except _NOOP_REVERIFY_RECOVERABLE_EXCEPTIONS as exc:
+        lifecycle_failure = exc
+    cleanup_failure = _cleanup_worktree()
+
+    if lifecycle_failure is not None:
+        return NoopVerifyThenReviewOutcome(
+            status="needs_attention",
+            message=_append_cleanup_failure(
+                f"SKIP: {description}. unable to prepare or run fresh verify_command: {lifecycle_failure}.",
+                cleanup_failure,
+            ),
+        )
+    if reviewed_head_sha is None:
+        return NoopVerifyThenReviewOutcome(
+            status="needs_attention",
+            message=_append_cleanup_failure(
+                f"SKIP: {description}. unable to resolve review worktree HEAD before verify_command ran.",
+                cleanup_failure,
+            ),
+        )
+    if verify_result is None or verify_markdown is None:
+        return NoopVerifyThenReviewOutcome(
+            status="needs_attention",
+            message=_append_cleanup_failure(
+                f"SKIP: {description}. verify_command is unavailable.",
+                cleanup_failure,
+            ),
+        )
+    if cleanup_failure is not None:
+        return NoopVerifyThenReviewOutcome(
+            status="needs_attention",
+            message=(
+                f"SKIP: {description}. fresh verify_command completed but temporary review worktree cleanup failed: "
+                f"{cleanup_failure}."
+            ),
+            verify_markdown=verify_markdown,
+        )
+
+    if verify_result.status != "passed":
+        detail = verify_result.failure or verify_result.exit_status
+        return NoopVerifyThenReviewOutcome(
+            status="needs_attention",
+            message=f"SKIP: {description}. Fresh verify_command {verify_result.status} ({detail}).",
+            verify_markdown=verify_markdown,
+        )
+
+    create_result = context.prepare_create_review(task)
+    if create_result.status == "skip":
+        return NoopVerifyThenReviewOutcome(status="skip", message=create_result.message, verify_markdown=verify_markdown)
+    new_review = create_result.review_task
+    if new_review is None or new_review.id is None:
+        return NoopVerifyThenReviewOutcome(
+            status="error",
+            message="review creation returned no task after fresh verify",
+            verify_markdown=verify_markdown,
+        )
+    return NoopVerifyThenReviewOutcome(
+        status="create_review",
+        message=(
+            f"Fresh verify passed for {task.branch} at {verify_result.reviewed_head_sha}; "
+            f"created review {new_review.id} to re-grade current tip"
+        ),
+        verify_markdown=verify_markdown,
+        review_task=new_review,
+    )
 
 
 def build_improve_needs_attention_result(
@@ -258,7 +482,9 @@ def _spawn_result(
     )
 
 
-_ITERATE_ROUTABLE_ACTIONS = frozenset({"create_review", "run_review", "improve", "run_improve"})
+ITERATE_ROUTABLE_ACTIONS = frozenset(
+    {"create_review", "run_review", "verify_noop_improve_then_review", "improve", "run_improve"}
+)
 
 
 def _startup_preparation_failed_result(
@@ -325,7 +551,7 @@ def _maybe_route_action_through_iterate(
     action_type: str,
     context: AdvanceActionExecutionContext,
 ) -> AdvanceActionExecutionResult | None:
-    if action_type not in _ITERATE_ROUTABLE_ACTIONS or context.prefer_iterate_for_action is None:
+    if action_type not in ITERATE_ROUTABLE_ACTIONS or context.prefer_iterate_for_action is None:
         return None
 
     preferred = context.prefer_iterate_for_action(task, action)
@@ -488,6 +714,55 @@ def execute_advance_action(
             worker_label="review",
             created_task=prepared_review_task,
         )
+
+    if action_type == "verify_noop_improve_then_review":
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=str(action.get("description", "Re-run verify_command before re-review")),
+                worker_consuming=True,
+                work_done=True,
+            )
+        outcome = run_noop_improve_verify_then_review(task=task, action=action, context=context)
+        if outcome.status == "needs_attention":
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message=outcome.message,
+                attention_type="needs_discussion",
+                attention_reason="improve-no-op",
+            )
+        if outcome.status == "skip":
+            return AdvanceActionExecutionResult(action_type=action_type, status="skip", message=outcome.message)
+        if outcome.status == "error":
+            return AdvanceActionExecutionResult(action_type=action_type, status="error", message=outcome.message)
+        new_review = outcome.review_task
+        assert new_review is not None and new_review.id is not None
+
+        prepared_review_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=new_review,
+            worker_label="review",
+            rollback_on_failure=True,
+        )
+        if prepared_review_task is None:
+            assert prepare_error is not None
+            return prepare_error
+        assert prepared_review_task.id is not None
+
+        rc = context.spawn_worker(prepared_review_task, "review")
+        result = _spawn_result(
+            action_type=action_type,
+            rc=rc,
+            handled_task_id=prepared_review_task.id,
+            worker_label="review",
+            created_task=prepared_review_task,
+        )
+        result.success_message = outcome.message
+        result.message = outcome.verify_markdown or outcome.message
+        return result
 
     if action_type == "improve":
         review_task = action.get("review_task")
@@ -929,30 +1204,30 @@ def execute_advance_action(
                 message="missing branch reconciliation helper",
             )
 
-        outcome = context.reconcile_diverged_branch(task)
-        if outcome.status == "reconciled":
+        reconcile_outcome = context.reconcile_diverged_branch(task)
+        if reconcile_outcome.status == "reconciled":
             return AdvanceActionExecutionResult(
                 action_type=action_type,
                 status="success",
-                message=outcome.message,
+                message=reconcile_outcome.message,
                 work_done=True,
             )
-        if outcome.status == "error":
+        if reconcile_outcome.status == "error":
             return AdvanceActionExecutionResult(
                 action_type=action_type,
                 status="error",
-                message=outcome.message,
+                message=reconcile_outcome.message,
             )
-        if outcome.status == "needs_attention":
+        if reconcile_outcome.status == "needs_attention":
             return AdvanceActionExecutionResult(
                 action_type=action_type,
                 status="skip",
-                message=outcome.message,
+                message=reconcile_outcome.message,
                 attention_type="needs_discussion",
-                attention_reason=outcome.attention_reason or "reconcile-needs-manual-resolution",
+                attention_reason=reconcile_outcome.attention_reason or "reconcile-needs-manual-resolution",
             )
 
-        rebase_target = outcome.rebase_target or f"origin/{task.branch}"
+        rebase_target = reconcile_outcome.rebase_target or f"origin/{task.branch}"
         capacity_blocked = _worker_capacity_blocked_result(
             action_type=action_type,
             context=context,

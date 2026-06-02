@@ -30,7 +30,9 @@ from gza.runner import (
     REVIEW_IMPROVE_LINEAGE_LIMIT,
     SUMMARY_DIR,
     WIP_DIR,
+    CrossProjectReviewVerifyResult,
     ProjectBoundary,
+    ReviewVerifyResult,
     RunInvocationContext,
     _build_code_task_commit_subject,
     _build_context_from_chain,
@@ -1495,12 +1497,13 @@ class TestReviewContextFromChain:
             cwd=tmp_path,
         )
 
-        assert "## verify_command result" in result
-        assert "- Command: `printf 'lint failed\\n' && exit 7`" in result
-        assert "- Status: failed" in result
-        assert "- Exit status: 7" in result
-        assert "Failing output (trimmed):" in result
-        assert "lint failed" in result
+        rendered = _format_review_verify_result(result)
+        assert result.command == "printf 'lint failed\\n' && exit 7"
+        assert result.status == "failed"
+        assert result.exit_status == "7"
+        assert "## verify_command result" in rendered
+        assert "Failing output (trimmed):" in rendered
+        assert "lint failed" in rendered
 
     def test_format_review_verify_failure_labels_timeout(self):
         """Timeout formatter should preserve failure status and timeout evidence."""
@@ -1534,12 +1537,12 @@ class TestReviewContextFromChain:
                 timeout_seconds=120,
             )
 
-        assert "## verify_command result" in result
-        assert "- Status: failed" in result
-        assert "- Exit status: timed out" in result
-        assert "verify_command timed out after 120s" in result
-        assert "partial pytest output" in result
-        assert "still running" in result
+        rendered = _format_review_verify_result(result)
+        assert result.status == "failed"
+        assert result.exit_status == "timed out"
+        assert "verify_command timed out after 120s" in rendered
+        assert "partial pytest output" in rendered
+        assert "still running" in rendered
 
     def test_run_review_verify_command_reports_custom_timeout(self, tmp_path: Path):
         """Timeout wording should reflect the configured autonomous review timeout."""
@@ -1558,7 +1561,7 @@ class TestReviewContextFromChain:
                 timeout_seconds=240,
             )
 
-        assert "verify_command timed out after 240s" in result
+        assert "verify_command timed out after 240s" in _format_review_verify_result(result)
 
     def test_run_review_verify_command_warns_when_near_timeout_budget(self, tmp_path: Path):
         """Completed review verify runs should warn operators before they start timing out."""
@@ -1579,7 +1582,9 @@ class TestReviewContextFromChain:
                 timeout_seconds=10,
             )
 
-        assert result == _format_review_verify_result("printf 'all good\\n'", completed)
+        rendered = _format_review_verify_result(result)
+        assert "- Status: passed" in rendered
+        assert "- Exit status: 0" in rendered
         mock_warning.assert_called_once()
         warning_message = mock_warning.call_args.args[0]
         assert "verify_command used 8.3s of 10s budget" in warning_message
@@ -1605,7 +1610,10 @@ class TestReviewContextFromChain:
                 timeout_seconds=10,
             )
 
-        assert result == _format_review_verify_result("printf 'all good\\n'", completed)
+        rendered = _format_review_verify_result(result)
+        assert result.status == "passed"
+        assert "- Status: passed" in rendered
+        assert "- Exit status: 0" in rendered
         mock_warning.assert_not_called()
         mock_print.assert_not_called()
 
@@ -1650,28 +1658,263 @@ class TestReviewContextFromChain:
         with patch(
             "gza.runner._run_review_verify_command",
             side_effect=[
-                "## verify_command result\n\n- Command: `./bin/foo-verify`\n- Status: passed",
-                "## verify_command result\n\n- Command: `./bin/bar-verify`\n- Status: failed",
+                ReviewVerifyResult(
+                    command="./bin/foo-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ),
+                ReviewVerifyResult(
+                    command="./bin/bar-verify",
+                    status="failed",
+                    exit_status="7",
+                    captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    failure="verify failed",
+                    output="bar failed",
+                ),
             ],
         ) as mock_verify:
-            result = _run_review_verify_commands_for_projects(
+            outcome = _run_review_verify_commands_for_projects(
                 config=config,
                 task=task,
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
             )
 
-        assert result is not None
-        assert "### services/foo" in result
-        assert "### libs/bar" in result
-        assert "### apps/baz" in result
-        assert "no verify_command configured for this affected project" in result
-        assert "outside all discovered project roots" in result
+        assert outcome is not None
+        assert "### services/foo" in outcome.markdown
+        assert "### libs/bar" in outcome.markdown
+        assert "### apps/baz" in outcome.markdown
+        assert "no verify_command configured for this affected project" in outcome.markdown
+        assert "outside all discovered project roots" in outcome.markdown
+        assert outcome.aggregate_result.status == "failed"
+        assert outcome.aggregate_result.exit_status == "1 passed, 1 failed, 0 unavailable, 2 skipped"
+        assert outcome.aggregate_result.reviewed_branch == "feature/cross-project"
+        assert outcome.aggregate_result.reviewed_head_sha == "deadbeef"
+        assert outcome.aggregate_result.reviewed_base_sha == "cafebabe"
         verify_calls = mock_verify.call_args_list
         assert len(verify_calls) == 2
         assert verify_calls[0].kwargs["cwd"] == worktree_path / "services" / "foo"
         assert verify_calls[1].kwargs["cwd"] == worktree_path / "libs" / "bar"
+        assert verify_calls[0].kwargs["reviewed_branch"] == "feature/cross-project"
+        assert verify_calls[0].kwargs["reviewed_head_sha"] == "deadbeef"
+        assert verify_calls[0].kwargs["reviewed_base_sha"] == "cafebabe"
+
+    def test_run_review_verify_commands_for_cross_project_prioritizes_failed_over_unavailable(
+        self, tmp_path: Path
+    ):
+        project_dir = tmp_path / "services" / "foo"
+        sibling_dir = tmp_path / "libs" / "bar"
+        unavailable_dir = tmp_path / "apps" / "baz"
+        worktree_path = tmp_path / "worktree"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        worktree_sibling_dir = worktree_path / "libs" / "bar"
+        worktree_unavailable_dir = worktree_path / "apps" / "baz"
+        project_dir.mkdir(parents=True)
+        sibling_dir.mkdir(parents=True)
+        unavailable_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        worktree_sibling_dir.mkdir(parents=True)
+        worktree_unavailable_dir.mkdir(parents=True)
+        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+        (unavailable_dir / "gza.yaml").write_text("project_name: baz\nverify_command: ./bin/baz-verify\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (worktree_sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+        (worktree_unavailable_dir / "gza.yaml").write_text("project_name: baz\nverify_command: ./bin/baz-verify\n")
+
+        config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
+        task.tags = ("cross-project",)
+
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = (
+            "M\tservices/foo/app.py\n"
+            "M\tlibs/bar/lib.py\n"
+            "M\tapps/baz/view.py\n"
+        )
+
+        with patch(
+            "gza.runner._run_review_verify_command",
+            side_effect=[
+                ReviewVerifyResult(
+                    command="./bin/foo-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ),
+                ReviewVerifyResult(
+                    command="./bin/bar-verify",
+                    status="failed",
+                    exit_status="7",
+                    captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    failure="verify failed",
+                    output="bar failed",
+                ),
+                ReviewVerifyResult(
+                    command="./bin/baz-verify",
+                    status="unavailable",
+                    exit_status="launch failed",
+                    captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    failure="failed to launch verify_command: [Errno 2] No such file or directory",
+                    output="failed to launch verify_command: [Errno 2] No such file or directory",
+                ),
+            ],
+        ) as mock_verify:
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=120,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        assert outcome is not None
+        assert outcome.aggregate_result.status == "failed"
+        assert outcome.aggregate_result.exit_status == "1 passed, 1 failed, 1 unavailable"
+        assert outcome.aggregate_result.failure == "one or more affected projects failed review verification"
+        verify_calls = mock_verify.call_args_list
+        assert verify_calls[1].kwargs["reviewed_branch"] == "feature/cross-project"
+        assert verify_calls[1].kwargs["reviewed_head_sha"] == "deadbeef"
+        assert verify_calls[1].kwargs["reviewed_base_sha"] == "cafebabe"
+
+    def test_run_review_verify_commands_for_cross_project_marks_missing_verify_command_as_unavailable(
+        self, tmp_path: Path
+    ):
+        project_dir = tmp_path / "services" / "foo"
+        skipped_dir = tmp_path / "apps" / "baz"
+        worktree_path = tmp_path / "worktree"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        worktree_skipped_dir = worktree_path / "apps" / "baz"
+        project_dir.mkdir(parents=True)
+        skipped_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        worktree_skipped_dir.mkdir(parents=True)
+        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (skipped_dir / "gza.yaml").write_text("project_name: baz\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (worktree_skipped_dir / "gza.yaml").write_text("project_name: baz\n")
+
+        config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
+        task.tags = ("cross-project",)
+
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = (
+            "M\tservices/foo/app.py\n"
+            "M\tapps/baz/view.py\n"
+        )
+
+        with patch(
+            "gza.runner._run_review_verify_command",
+            return_value=ReviewVerifyResult(
+                command="./bin/foo-verify",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            ),
+        ):
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=120,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        assert outcome is not None
+        assert "- Status: unavailable" in outcome.markdown
+        assert "- Captured at: 2026-01-01T00:00:00+00:00" in outcome.markdown
+        assert "- Reviewed branch: `feature/cross-project`" in outcome.markdown
+        assert "- Reviewed head: `deadbeef`" in outcome.markdown
+        assert "- Reviewed base/default SHA: `cafebabe`" in outcome.markdown
+        assert "### apps/baz" in outcome.markdown
+        assert "no verify_command configured for this affected project" in outcome.markdown
+        assert outcome.aggregate_result.status == "unavailable"
+        assert outcome.aggregate_result.exit_status == "1 passed, 0 failed, 0 unavailable, 1 skipped"
+        assert outcome.aggregate_result.failure == "one or more affected projects could not run review verification"
+
+    def test_run_review_verify_commands_for_cross_project_marks_unknown_paths_as_unavailable(
+        self, tmp_path: Path
+    ):
+        project_dir = tmp_path / "services" / "foo"
+        worktree_path = tmp_path / "worktree"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        project_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+
+        config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
+        task.tags = ("cross-project",)
+
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = (
+            "M\tservices/foo/app.py\n"
+            "M\tmisc/tool.py\n"
+        )
+
+        with patch(
+            "gza.runner._run_review_verify_command",
+            return_value=ReviewVerifyResult(
+                command="./bin/foo-verify",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            ),
+        ):
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=120,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        assert outcome is not None
+        assert "- Status: unavailable" in outcome.markdown
+        assert "- Captured at: 2026-01-01T00:00:00+00:00" in outcome.markdown
+        assert "- Reviewed branch: `feature/cross-project`" in outcome.markdown
+        assert "- Reviewed head: `deadbeef`" in outcome.markdown
+        assert "- Reviewed base/default SHA: `cafebabe`" in outcome.markdown
+        assert "### unknown paths" in outcome.markdown
+        assert "outside all discovered project roots" in outcome.markdown
+        assert "- Paths: misc/tool.py" in outcome.markdown
+        assert outcome.aggregate_result.status == "unavailable"
+        assert outcome.aggregate_result.exit_status == "1 passed, 0 failed, 0 unavailable, 1 skipped"
+        assert outcome.aggregate_result.failure == "one or more affected projects could not run review verification"
 
     def test_run_review_verify_commands_for_cross_project_uses_branch_local_verify_commands(self, tmp_path: Path):
         repo_root = tmp_path / "repo"
@@ -1704,9 +1947,14 @@ class TestReviewContextFromChain:
 
         with patch(
             "gza.runner._run_review_verify_command",
-            return_value="## verify_command result\n\n- Command: `./bin/bar-verify-new`\n- Status: passed",
+            return_value=ReviewVerifyResult(
+                command="./bin/bar-verify-new",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            ),
         ) as mock_verify:
-            result = _run_review_verify_commands_for_projects(
+            outcome = _run_review_verify_commands_for_projects(
                 config=config,
                 task=task,
                 worktree_git=worktree_git,
@@ -1714,11 +1962,62 @@ class TestReviewContextFromChain:
                 timeout_seconds=120,
             )
 
-        assert result is not None
-        assert "### libs/bar" in result
+        assert outcome is not None
+        assert "### libs/bar" in outcome.markdown
         mock_verify.assert_called_once()
         assert mock_verify.call_args.args[0] == "./bin/bar-verify-new"
         assert mock_verify.call_args.kwargs["cwd"] == worktree_path / "libs" / "bar"
+
+    def test_run_review_verify_commands_for_cross_project_discovers_branch_local_project_root(
+        self, tmp_path: Path
+    ):
+        repo_root = tmp_path / "repo"
+        worktree_path = tmp_path / "worktree"
+        project_dir = repo_root / "services" / "foo"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        worktree_branch_local_dir = worktree_path / "dre" / "web"
+        project_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        worktree_branch_local_dir.mkdir(parents=True)
+        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (worktree_branch_local_dir / "gza.yaml").write_text("project_name: dre-web\nverify_command: ./bin/web-verify\n")
+
+        config = Config(project_dir=project_dir, project_name="foo", verify_command="")
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
+        task.tags = ("cross-project",)
+
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "A\tdre/web/gza.yaml\nM\tdre/web/src/app.tsx\n"
+
+        with patch(
+            "gza.runner._run_review_verify_command",
+            return_value=ReviewVerifyResult(
+                command="./bin/web-verify",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            ),
+        ) as mock_verify:
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=120,
+            )
+
+        assert outcome is not None
+        assert "### dre/web" in outcome.markdown
+        mock_verify.assert_called_once()
+        assert mock_verify.call_args.args[0] == "./bin/web-verify"
+        assert mock_verify.call_args.kwargs["cwd"] == worktree_path / "dre" / "web"
 
     def test_run_review_verify_commands_for_cross_project_includes_rename_source_and_destination_projects(
         self, tmp_path: Path
@@ -1763,13 +2062,33 @@ class TestReviewContextFromChain:
         with patch(
             "gza.runner._run_review_verify_command",
             side_effect=[
-                "## verify_command result\n\n- Command: `./bin/foo-verify`\n- Status: passed",
-                "## verify_command result\n\n- Command: `./bin/copied-verify`\n- Status: passed",
-                "## verify_command result\n\n- Command: `./bin/old-verify`\n- Status: passed",
-                "## verify_command result\n\n- Command: `./bin/renamed-verify`\n- Status: passed",
+                ReviewVerifyResult(
+                    command="./bin/foo-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ),
+                ReviewVerifyResult(
+                    command="./bin/copied-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ),
+                ReviewVerifyResult(
+                    command="./bin/old-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ),
+                ReviewVerifyResult(
+                    command="./bin/renamed-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ),
             ],
         ) as mock_verify:
-            result = _run_review_verify_commands_for_projects(
+            outcome = _run_review_verify_commands_for_projects(
                 config=config,
                 task=task,
                 worktree_git=worktree_git,
@@ -1777,12 +2096,12 @@ class TestReviewContextFromChain:
                 timeout_seconds=120,
             )
 
-        assert result is not None
-        assert "### services/foo" in result
-        assert "### libs/copied" in result
-        assert "### libs/old" in result
-        assert "### libs/renamed" in result
-        assert "apps/removed/gza.yaml" in result
+        assert outcome is not None
+        assert "### services/foo" in outcome.markdown
+        assert "### libs/copied" in outcome.markdown
+        assert "### libs/old" in outcome.markdown
+        assert "### libs/renamed" in outcome.markdown
+        assert "apps/removed/gza.yaml" in outcome.markdown
         verify_calls = mock_verify.call_args_list
         assert len(verify_calls) == 4
         assert verify_calls[0].kwargs["cwd"] == worktree_path / "services" / "foo"
@@ -12981,7 +13300,8 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
-        with patch("gza.runner.post_review_to_pr"):
+        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner.post_review_to_pr"):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
@@ -12990,8 +13310,560 @@ class TestProviderPromptSanitization:
         assert "## verify_command result" in prompt
         assert "- Status: failed" in prompt
         assert "- Exit status: 7" in prompt
+        assert "- Reviewed head: `deadbeef`" in prompt
         assert "lint failed" in prompt
         assert "## Original request:" in prompt
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.review_verify_status == "failed"
+        assert refreshed.review_verify_exit_status == "7"
+        assert refreshed.review_verify_head_sha == "deadbeef"
+        assert refreshed.review_verify_branch == impl.branch
+
+    def test_cross_project_review_persists_failed_aggregate_verify_state(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        impl.status = "completed"
+        impl.slug = "20260212-implement-feature-x"
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        task = store.add(prompt="Review feature X", task_type="review", depends_on=impl.id)
+        task.slug = "20260213-review-feature-x"
+        task.tags = ("cross-project",)
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        config.model = None
+        config.max_steps = 10
+        config.timeout_minutes = 10
+        config.verify_command = ""
+        config.review_verify_timeout_seconds = 120
+
+        captured_prompts: list[str] = []
+
+        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_prompts.append(prompt)
+            report_dir = work_dir / ".gza" / "reviews"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=0)
+        git.get_diff_numstat.return_value = ""
+        git.get_diff.return_value = ""
+        git.get_diff_stat.return_value = ""
+
+        aggregate = ReviewVerifyResult(
+            command="(per-project verify_command)",
+            status="failed",
+            exit_status="1 passed, 1 failed, 0 unavailable",
+            captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="deadbeef",
+            reviewed_base_sha="cafebabe",
+            failure="one or more affected projects failed review verification",
+        )
+        cross_project_verify = CrossProjectReviewVerifyResult(
+            markdown=(
+                "## verify_command result\n\n"
+                "### services/foo\n\n"
+                "- Working directory: `services/foo`\n"
+                "- Command: `./bin/foo-verify`\n"
+                "- Status: passed\n"
+                "- Exit status: 0\n\n"
+                "### libs/bar\n\n"
+                "- Working directory: `libs/bar`\n"
+                "- Command: `./bin/bar-verify`\n"
+                "- Status: failed\n"
+                "- Exit status: 7\n"
+                "- Reviewed branch: `gza/20260212-implement-feature-x`\n"
+                "- Reviewed head: `deadbeef`\n"
+                "- Reviewed base/default SHA: `cafebabe`\n"
+                "- Failure: verify failed\n\n"
+                "Failing output (trimmed):\n"
+                "```text\nbar failed\n```"
+            ),
+            aggregate_result=aggregate,
+            project_results=(),
+        )
+
+        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"), \
+             patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify) as mock_cross_project_verify, \
+             patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        assert exit_code == 0
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]
+        assert "### libs/bar" in prompt
+        assert "- Status: failed" in prompt
+        assert "bar failed" in prompt
+        mock_cross_project_verify.assert_called_once()
+        assert mock_cross_project_verify.call_args.kwargs["reviewed_branch"] == impl.branch
+        assert mock_cross_project_verify.call_args.kwargs["reviewed_head_sha"] == "deadbeef"
+        assert mock_cross_project_verify.call_args.kwargs["reviewed_base_sha"] == "cafebabe"
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.review_verify_status == "failed"
+        assert refreshed.review_verify_exit_status == "1 passed, 1 failed, 0 unavailable"
+        assert refreshed.review_verify_head_sha == "deadbeef"
+        assert refreshed.review_verify_base_sha == "cafebabe"
+        assert refreshed.review_verify_branch == impl.branch
+
+    def test_cross_project_review_persists_unavailable_aggregate_verify_state(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        impl.status = "completed"
+        impl.slug = "20260212-implement-feature-x"
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        task = store.add(prompt="Review feature X", task_type="review", depends_on=impl.id)
+        task.slug = "20260213-review-feature-x"
+        task.tags = ("cross-project",)
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        config.model = None
+        config.max_steps = 10
+        config.timeout_minutes = 10
+        config.verify_command = ""
+        config.review_verify_timeout_seconds = 120
+
+        captured_prompts: list[str] = []
+
+        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_prompts.append(prompt)
+            report_dir = work_dir / ".gza" / "reviews"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=0)
+        git.get_diff_numstat.return_value = ""
+        git.get_diff.return_value = ""
+        git.get_diff_stat.return_value = ""
+
+        aggregate = ReviewVerifyResult(
+            command="(per-project verify_command)",
+            status="unavailable",
+            exit_status="1 passed, 0 failed, 1 unavailable",
+            captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="deadbeef",
+            reviewed_base_sha="cafebabe",
+            failure="one or more affected projects could not run review verification",
+        )
+        cross_project_verify = CrossProjectReviewVerifyResult(
+            markdown=(
+                "## verify_command result\n\n"
+                "### services/foo\n\n"
+                "- Working directory: `services/foo`\n"
+                "- Command: `./bin/foo-verify`\n"
+                "- Status: passed\n"
+                "- Exit status: 0\n\n"
+                "### libs/bar\n\n"
+                "- Working directory: `libs/bar`\n"
+                "- Command: `./bin/bar-verify`\n"
+                "- Status: unavailable\n"
+                "- Exit status: launch failed\n"
+                "- Reviewed branch: `gza/20260212-implement-feature-x`\n"
+                "- Reviewed head: `deadbeef`\n"
+                "- Reviewed base/default SHA: `cafebabe`\n"
+                "- Failure: failed to launch verify_command: [Errno 2] No such file or directory\n\n"
+                "Failing output (trimmed):\n"
+                "```text\nfailed to launch verify_command: [Errno 2] No such file or directory\n```"
+            ),
+            aggregate_result=aggregate,
+            project_results=(),
+        )
+
+        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"), \
+             patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify), \
+             patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        assert exit_code == 0
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]
+        assert "### libs/bar" in prompt
+        assert "- Status: unavailable" in prompt
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.review_verify_status == "unavailable"
+        assert refreshed.review_verify_exit_status == "1 passed, 0 failed, 1 unavailable"
+        assert refreshed.review_verify_head_sha == "deadbeef"
+        assert refreshed.review_verify_base_sha == "cafebabe"
+        assert refreshed.review_verify_branch == impl.branch
+
+    def test_cross_project_review_persists_failed_aggregate_when_other_project_is_unavailable(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        impl.status = "completed"
+        impl.slug = "20260212-implement-feature-x"
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        task = store.add(prompt="Review feature X", task_type="review", depends_on=impl.id)
+        task.slug = "20260213-review-feature-x"
+        task.tags = ("cross-project",)
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        config.model = None
+        config.max_steps = 10
+        config.timeout_minutes = 10
+        config.verify_command = ""
+        config.review_verify_timeout_seconds = 120
+
+        captured_prompts: list[str] = []
+
+        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_prompts.append(prompt)
+            report_dir = work_dir / ".gza" / "reviews"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=0)
+        git.get_diff_numstat.return_value = ""
+        git.get_diff.return_value = ""
+        git.get_diff_stat.return_value = ""
+
+        aggregate = ReviewVerifyResult(
+            command="(per-project verify_command)",
+            status="failed",
+            exit_status="1 passed, 1 failed, 1 unavailable",
+            captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="deadbeef",
+            reviewed_base_sha="cafebabe",
+            failure="one or more affected projects failed review verification",
+        )
+        cross_project_verify = CrossProjectReviewVerifyResult(
+            markdown=(
+                "## verify_command result\n\n"
+                "### services/foo\n\n"
+                "- Working directory: `services/foo`\n"
+                "- Command: `./bin/foo-verify`\n"
+                "- Status: passed\n"
+                "- Exit status: 0\n\n"
+                "### libs/bar\n\n"
+                "- Working directory: `libs/bar`\n"
+                "- Command: `./bin/bar-verify`\n"
+                "- Status: failed\n"
+                "- Exit status: 7\n"
+                "- Reviewed branch: `gza/20260212-implement-feature-x`\n"
+                "- Reviewed head: `deadbeef`\n"
+                "- Reviewed base/default SHA: `cafebabe`\n"
+                "- Failure: verify failed\n\n"
+                "Failing output (trimmed):\n"
+                "```text\nbar failed\n```\n\n"
+                "### apps/baz\n\n"
+                "- Working directory: `apps/baz`\n"
+                "- Command: `./bin/baz-verify`\n"
+                "- Status: unavailable\n"
+                "- Exit status: launch failed\n"
+                "- Reviewed branch: `gza/20260212-implement-feature-x`\n"
+                "- Reviewed head: `deadbeef`\n"
+                "- Reviewed base/default SHA: `cafebabe`\n"
+                "- Failure: failed to launch verify_command: [Errno 2] No such file or directory\n\n"
+                "Failing output (trimmed):\n"
+                "```text\nfailed to launch verify_command: [Errno 2] No such file or directory\n```"
+            ),
+            aggregate_result=aggregate,
+            project_results=(),
+        )
+
+        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"), \
+             patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify), \
+             patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        assert exit_code == 0
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]
+        assert "### libs/bar" in prompt
+        assert "### apps/baz" in prompt
+        assert "- Status: failed" in prompt
+        assert "- Status: unavailable" in prompt
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.review_verify_status == "failed"
+        assert refreshed.review_verify_exit_status == "1 passed, 1 failed, 1 unavailable"
+        assert refreshed.review_verify_failure == "one or more affected projects failed review verification"
+        assert refreshed.review_verify_head_sha == "deadbeef"
+        assert refreshed.review_verify_base_sha == "cafebabe"
+        assert refreshed.review_verify_branch == impl.branch
+
+    def test_cross_project_review_persists_unavailable_aggregate_when_project_has_no_verify_command(
+        self, tmp_path: Path
+    ):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        impl.status = "completed"
+        impl.slug = "20260212-implement-feature-x"
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        task = store.add(prompt="Review feature X", task_type="review", depends_on=impl.id)
+        task.slug = "20260213-review-feature-x"
+        task.tags = ("cross-project",)
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        config.model = None
+        config.max_steps = 10
+        config.timeout_minutes = 10
+        config.verify_command = ""
+        config.review_verify_timeout_seconds = 120
+
+        captured_prompts: list[str] = []
+
+        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_prompts.append(prompt)
+            report_dir = work_dir / ".gza" / "reviews"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=0)
+        git.get_diff_numstat.return_value = ""
+        git.get_diff.return_value = ""
+        git.get_diff_stat.return_value = ""
+
+        aggregate = ReviewVerifyResult(
+            command="(per-project verify_command)",
+            status="unavailable",
+            exit_status="1 passed, 0 failed, 0 unavailable, 1 skipped",
+            captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="deadbeef",
+            reviewed_base_sha="cafebabe",
+            failure="one or more affected projects could not run review verification",
+        )
+        cross_project_verify = CrossProjectReviewVerifyResult(
+            markdown=(
+                "## verify_command result\n\n"
+                "### services/foo\n\n"
+                "- Working directory: `services/foo`\n"
+                "- Command: `./bin/foo-verify`\n"
+                "- Status: passed\n"
+                "- Exit status: 0\n\n"
+                "### apps/baz\n\n"
+                "- Working directory: `apps/baz`\n"
+                "- Status: skipped\n"
+                "- Reason: no verify_command configured for this affected project"
+            ),
+            aggregate_result=aggregate,
+            project_results=(),
+        )
+
+        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"), \
+             patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify), \
+             patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        assert exit_code == 0
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]
+        assert "### apps/baz" in prompt
+        assert "- Status: skipped" in prompt
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.review_verify_status == "unavailable"
+        assert refreshed.review_verify_exit_status == "1 passed, 0 failed, 0 unavailable, 1 skipped"
+        assert refreshed.review_verify_failure == "one or more affected projects could not run review verification"
+
+    def test_cross_project_review_persists_unavailable_aggregate_when_unknown_paths_are_skipped(
+        self, tmp_path: Path
+    ):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        impl.status = "completed"
+        impl.slug = "20260212-implement-feature-x"
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        task = store.add(prompt="Review feature X", task_type="review", depends_on=impl.id)
+        task.slug = "20260213-review-feature-x"
+        task.tags = ("cross-project",)
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        config.model = None
+        config.max_steps = 10
+        config.timeout_minutes = 10
+        config.verify_command = ""
+        config.review_verify_timeout_seconds = 120
+
+        captured_prompts: list[str] = []
+
+        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            captured_prompts.append(prompt)
+            report_dir = work_dir / ".gza" / "reviews"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=0)
+        git.get_diff_numstat.return_value = ""
+        git.get_diff.return_value = ""
+        git.get_diff_stat.return_value = ""
+
+        aggregate = ReviewVerifyResult(
+            command="(per-project verify_command)",
+            status="unavailable",
+            exit_status="1 passed, 0 failed, 0 unavailable, 1 skipped",
+            captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="deadbeef",
+            reviewed_base_sha="cafebabe",
+            failure="one or more affected projects could not run review verification",
+        )
+        cross_project_verify = CrossProjectReviewVerifyResult(
+            markdown=(
+                "## verify_command result\n\n"
+                "### services/foo\n\n"
+                "- Working directory: `services/foo`\n"
+                "- Command: `./bin/foo-verify`\n"
+                "- Status: passed\n"
+                "- Exit status: 0\n\n"
+                "### unknown paths\n\n"
+                "- Status: skipped\n"
+                "- Reason: affected paths fell outside all discovered project roots\n"
+                "- Paths: misc/tool.py"
+            ),
+            aggregate_result=aggregate,
+            project_results=(),
+        )
+
+        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"), \
+             patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify), \
+             patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        assert exit_code == 0
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]
+        assert "### unknown paths" in prompt
+        assert "- Status: skipped" in prompt
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.review_verify_status == "unavailable"
+        assert refreshed.review_verify_exit_status == "1 passed, 0 failed, 0 unavailable, 1 skipped"
+        assert refreshed.review_verify_failure == "one or more affected projects could not run review verification"
 
     def test_fresh_review_prompt_still_runs_provider_after_verify_timeout(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -13055,7 +13927,8 @@ class TestProviderPromptSanitization:
                 output="partial pytest output\n",
                 stderr="still running\n",
             ),
-        ), patch("gza.runner.post_review_to_pr"):
+        ), patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+           patch("gza.runner.post_review_to_pr"):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
@@ -13064,6 +13937,7 @@ class TestProviderPromptSanitization:
         assert "## verify_command result" in prompt
         assert "- Status: failed" in prompt
         assert "- Exit status: timed out" in prompt
+        assert "- Reviewed head: `deadbeef`" in prompt
         assert "verify_command timed out after 240s" in prompt
         assert "partial pytest output" in prompt
         assert "still running" in prompt

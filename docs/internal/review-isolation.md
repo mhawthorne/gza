@@ -13,7 +13,10 @@ Review tasks run in isolated git worktrees that only contain git-tracked files.
     - If neither source exists, both sections are intentionally omitted and reviewers should state `No plan or request provided.`
    - `## verify_command result` when `verify_command` is configured for the project
      - The host runner executes the literal command once per autonomous review iteration in the review worktree.
-     - The prompt includes pass/fail status, exit status, and trimmed failing output when non-zero.
+     - For `cross-project` reviews, the host runner fans out to each affected project root discovered from the review worktree diff and renders an aggregate status/provenance block first, then one section per affected project.
+     - The prompt includes pass/fail/unavailable status, exit status, captured-at time, reviewed branch/head provenance, and trimmed failing output when non-zero, even when every affected project is skipped or unknown.
+     - Cross-project reviews persist an aggregate review-verify status that reflects the worst affected-project outcome: `failed` when any affected project verify fails, `unavailable` when any affected project cannot run or is skipped because it has no runnable project root/`verify_command`, and `passed` only when every affected project can run and every runnable affected project verify passes.
+     - The reviewed head SHA is captured from the detached review worktree immediately before `verify_command` runs, and that provenance is also persisted on the review task so later lifecycle rules can tell whether the verify evidence still matches the current implementation tip.
      - Hung review verification is bounded to 120 seconds; timeouts are converted into a failed `## verify_command result` section with timeout evidence and any partial output captured so the review still runs.
      - Reviews must keep doing the normal code review in the same iteration; verify failure is additional blocker evidence, not a short-circuit.
    - Implementation diff context for `main...{impl_branch}` (small/full/excerpted depending on size thresholds)

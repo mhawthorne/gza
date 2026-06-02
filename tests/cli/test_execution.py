@@ -12553,6 +12553,223 @@ class TestIterateCommand:
         children = store.get_based_on_children(review.id)
         assert len(children) == 1
 
+    def test_iterate_verify_noop_improve_then_review_runs_fresh_review_instead_of_improve(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        stale_review = store.add("Stale review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        stale_review.status = "completed"
+        stale_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        stale_review.completed_at = datetime.now(UTC)
+        store.update(stale_review)
+
+        fresh_review = store.add("Fresh review", task_type="review", depends_on=impl.id, based_on=impl.id)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        def fake_run_foreground(config, task_id, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task.id == fresh_review.id
+            task.status = "completed"
+            task.output_content = "**Verdict: APPROVED**"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={
+                    "type": "verify_noop_improve_then_review",
+                    "description": "Re-run verify_command before re-review",
+                    "review_task": stale_review,
+                },
+            ),
+            patch(
+                "gza.cli.run_noop_improve_verify_then_review",
+                return_value=SimpleNamespace(
+                    status="create_review",
+                    message=f"Fresh verify passed for {impl.branch} at deadbeef; created review {fresh_review.id} to re-grade current tip",
+                    verify_markdown="## verify_command result\n\nPassed\n",
+                    review_task=fresh_review,
+                ),
+            ) as rerun_verify,
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        rerun_verify.assert_called_once()
+        run_fg.assert_called_once()
+        assert run_fg.call_args.kwargs["task_id"] == fresh_review.id
+        assert "Iteration 1/1: verify_noop_improve_then_review" in output
+        assert f"Fresh verify passed; running review {fresh_review.id}" in output
+        improves = [task for task in store.get_all() if task.task_type == "improve" and task.based_on == impl.id]
+        assert improves == []
+
+    def test_iterate_verify_noop_improve_then_review_parks_on_reverify_setup_failure(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        stale_review = store.add("Stale review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        stale_review.status = "completed"
+        stale_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        stale_review.completed_at = datetime.now(UTC)
+        store.update(stale_review)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={
+                    "type": "verify_noop_improve_then_review",
+                    "description": "Re-run verify_command before re-review",
+                    "review_task": stale_review,
+                },
+            ),
+            patch(
+                "gza.cli.run_noop_improve_verify_then_review",
+                return_value=SimpleNamespace(
+                    status="needs_attention",
+                    message="SKIP: Re-run verify_command before re-review. unable to prepare or run fresh verify_command: cannot create detached worktree.",
+                    verify_markdown=None,
+                    review_task=None,
+                ),
+            ) as rerun_verify,
+            patch("gza.cli._run_foreground") as run_fg,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        rerun_verify.assert_called_once()
+        run_fg.assert_not_called()
+        assert "Iteration 1/1: verify_noop_improve_then_review" in output
+        assert "unable to prepare or run fresh verify_command: cannot create detached worktree" in output
+        assert "Iterate complete: BLOCKED (needs_discussion)" in output
+
+    def test_iterate_cross_project_verify_noop_improve_then_review_parks_on_unavailable_aggregate(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        impl.tags = ("cross-project",)
+        store.update(impl)
+
+        stale_review = store.add("Stale review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        stale_review.status = "completed"
+        stale_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        stale_review.completed_at = datetime.now(UTC)
+        store.update(stale_review)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={
+                    "type": "verify_noop_improve_then_review",
+                    "description": "Re-run verify_command before re-review",
+                    "review_task": stale_review,
+                },
+            ),
+            patch(
+                "gza.cli.run_noop_improve_verify_then_review",
+                return_value=SimpleNamespace(
+                    status="needs_attention",
+                    message=(
+                        "SKIP: Re-run verify_command before re-review. "
+                        "Fresh verify_command unavailable (one or more affected projects could not run review verification)."
+                    ),
+                    verify_markdown="## verify_command result\n\n### dre/web\n\n- Status: skipped\n",
+                    review_task=None,
+                ),
+            ) as rerun_verify,
+            patch("gza.cli._run_foreground") as run_fg,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        rerun_verify.assert_called_once()
+        run_fg.assert_not_called()
+        assert "Iteration 1/1: verify_noop_improve_then_review" in output
+        assert "could not run review verification" in output
+        assert "Iterate complete: BLOCKED (needs_discussion)" in output
+
     def test_iterate_improve_resume_passes_resume_true_to_run_foreground(self, tmp_path: Path):
         """When iterate picks 'resume' for an improve, _run_foreground must be called with resume=True.
 

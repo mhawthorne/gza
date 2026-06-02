@@ -409,6 +409,14 @@ class Task:
     changed_diff: bool | None = None  # Same-branch lifecycle diff-change signal for rebase/improve; NULL = legacy/unknown
     review_cleared_at: datetime | None = None  # When review state was cleared by an improve task (v14)
     review_score: int | None = None  # Derived deterministic score for completed review tasks (v33)
+    review_verify_command: str | None = None  # Command used for review-time verify provenance
+    review_verify_status: str | None = None  # passed, failed, unavailable
+    review_verify_exit_status: str | None = None  # numeric exit, timed out, launch failed, unresolved head, etc.
+    review_verify_failure: str | None = None  # Compact failure metadata for unavailable/failed verify runs
+    review_verify_captured_at: datetime | None = None  # When review verify evidence was captured
+    review_verify_head_sha: str | None = None  # Reviewed implementation HEAD at verify time
+    review_verify_base_sha: str | None = None  # Resolved default/base branch SHA at verify time
+    review_verify_branch: str | None = None  # Implementation branch/ref the review verified
     log_schema_version: int = 1  # 1=legacy logs, 2=message-step logs
     execution_mode: str | None = None  # worker_background, worker_foreground, foreground_inline, foreground_attach_resume, manual, skill_inline
 
@@ -686,8 +694,20 @@ MIGRATION_V45_TO_V46 = """
 ALTER TABLE tasks ADD COLUMN trigger_source TEXT;
 """
 
+# Migration from v46 to v47: persisted review verify provenance
+MIGRATION_V46_TO_V47 = """
+ALTER TABLE tasks ADD COLUMN review_verify_command TEXT;
+ALTER TABLE tasks ADD COLUMN review_verify_status TEXT;
+ALTER TABLE tasks ADD COLUMN review_verify_exit_status TEXT;
+ALTER TABLE tasks ADD COLUMN review_verify_failure TEXT;
+ALTER TABLE tasks ADD COLUMN review_verify_captured_at TEXT;
+ALTER TABLE tasks ADD COLUMN review_verify_head_sha TEXT;
+ALTER TABLE tasks ADD COLUMN review_verify_base_sha TEXT;
+ALTER TABLE tasks ADD COLUMN review_verify_branch TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 46
+SCHEMA_VERSION = 47
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -978,6 +998,14 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 changed_diff INTEGER,
                 review_cleared_at TEXT,
                 review_score INTEGER,
+                review_verify_command TEXT,
+                review_verify_status TEXT,
+                review_verify_exit_status TEXT,
+                review_verify_failure TEXT,
+                review_verify_captured_at TEXT,
+                review_verify_head_sha TEXT,
+                review_verify_base_sha TEXT,
+                review_verify_branch TEXT,
                 log_schema_version INTEGER DEFAULT 1,
                 execution_mode TEXT,
                 base_branch TEXT,
@@ -1070,7 +1098,10 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "pr_state", "pr_last_synced_at", "sync_last_synced_at", "model", "provider", "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
             "merge_status", "merged_at", "failure_reason", "completion_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
             "changed_diff",
-            "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch", "recovery_origin",
+            "review_cleared_at", "review_score",
+            "review_verify_command", "review_verify_status", "review_verify_exit_status", "review_verify_failure",
+            "review_verify_captured_at", "review_verify_head_sha", "review_verify_base_sha", "review_verify_branch",
+            "log_schema_version", "execution_mode", "base_branch", "recovery_origin",
             "trigger_source",
         )
         task_defaults: dict[str, str] = {
@@ -1112,7 +1143,10 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 "group", depends_on, spec, create_review, auto_implement, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
                 pr_state, pr_last_synced_at, sync_last_synced_at, model, provider, provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
                 merge_status, merged_at, failure_reason, completion_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
-                changed_diff, review_cleared_at, review_score, log_schema_version, execution_mode, base_branch, recovery_origin,
+                changed_diff, review_cleared_at, review_score,
+                review_verify_command, review_verify_status, review_verify_exit_status, review_verify_failure,
+                review_verify_captured_at, review_verify_head_sha, review_verify_base_sha, review_verify_branch,
+                log_schema_version, execution_mode, base_branch, recovery_origin,
                 trigger_source
             )
             SELECT
@@ -1365,11 +1399,12 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "diff_lines_removed",
     "review_cleared_at",
     "review_score",
+    "review_verify_captured_at",
     "log_schema_version",
     "base_branch",
 )
 
-_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset({40, 41, 42, 43, 44, 45, 46})
+_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset({40, 41, 42, 43, 44, 45, 46, 47})
 
 
 def _missing_required_columns(conn: sqlite3.Connection, table: str, required_columns: tuple[str, ...]) -> list[str]:
@@ -1457,6 +1492,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         41: ("tasks", "recovery_origin"),
         45: ("tasks", "auto_implement"),
         46: ("tasks", "trigger_source"),
+        47: ("tasks", "review_verify_branch"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -1533,6 +1569,14 @@ def _ensure_required_auto_migration_artifacts(
         (43, "tasks", "changed_diff", "ALTER TABLE tasks ADD COLUMN changed_diff INTEGER"),
         (45, "tasks", "auto_implement", "ALTER TABLE tasks ADD COLUMN auto_implement INTEGER DEFAULT 1"),
         (46, "tasks", "trigger_source", "ALTER TABLE tasks ADD COLUMN trigger_source TEXT"),
+        (47, "tasks", "review_verify_command", "ALTER TABLE tasks ADD COLUMN review_verify_command TEXT"),
+        (47, "tasks", "review_verify_status", "ALTER TABLE tasks ADD COLUMN review_verify_status TEXT"),
+        (47, "tasks", "review_verify_exit_status", "ALTER TABLE tasks ADD COLUMN review_verify_exit_status TEXT"),
+        (47, "tasks", "review_verify_failure", "ALTER TABLE tasks ADD COLUMN review_verify_failure TEXT"),
+        (47, "tasks", "review_verify_captured_at", "ALTER TABLE tasks ADD COLUMN review_verify_captured_at TEXT"),
+        (47, "tasks", "review_verify_head_sha", "ALTER TABLE tasks ADD COLUMN review_verify_head_sha TEXT"),
+        (47, "tasks", "review_verify_base_sha", "ALTER TABLE tasks ADD COLUMN review_verify_base_sha TEXT"),
+        (47, "tasks", "review_verify_branch", "ALTER TABLE tasks ADD COLUMN review_verify_branch TEXT"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -1654,14 +1698,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     model TEXT,
     provider TEXT,
     provider_is_explicit INTEGER DEFAULT 0,
-                urgent INTEGER DEFAULT 0,
-                urgent_bumped_at TEXT,
-                queue_position INTEGER,
-                recovery_origin TEXT,
-                trigger_source TEXT,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                merge_status TEXT,
+    urgent INTEGER DEFAULT 0,
+    urgent_bumped_at TEXT,
+    queue_position INTEGER,
+    recovery_origin TEXT,
+    trigger_source TEXT,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    merge_status TEXT,
     merged_at TEXT,
     failure_reason TEXT,
     completion_reason TEXT,
@@ -1672,6 +1716,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     changed_diff INTEGER,
     review_cleared_at TEXT,
     review_score INTEGER,
+    review_verify_command TEXT,
+    review_verify_status TEXT,
+    review_verify_exit_status TEXT,
+    review_verify_failure TEXT,
+    review_verify_captured_at TEXT,
+    review_verify_head_sha TEXT,
+    review_verify_base_sha TEXT,
+    review_verify_branch TEXT,
     log_schema_version INTEGER DEFAULT 1,
     execution_mode TEXT,
     base_branch TEXT,
@@ -2089,6 +2141,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (44, MIGRATION_V43_TO_V44),
     (45, MIGRATION_V44_TO_V45),
     (46, MIGRATION_V45_TO_V46),
+    (47, MIGRATION_V46_TO_V47),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -2528,6 +2581,11 @@ class SqliteTaskStore:
                 "Query-only DB open detected missing optional column tasks.trigger_source; "
                 "task trigger provenance will be unavailable."
             )
+        if not self._query_only_has_column("tasks", "review_verify_branch"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing optional review verify provenance columns; "
+                "stale review verify detection will be unavailable."
+            )
         if not self.supports_merge_units():
             self._startup_warnings.append(
                 "Query-only DB open detected missing optional merge-unit tables; "
@@ -2785,6 +2843,16 @@ class SqliteTaskStore:
             changed_diff=bool(row["changed_diff"]) if "changed_diff" in keys and row["changed_diff"] is not None else None,
             review_cleared_at=_parse_db_timestamp(row["review_cleared_at"]) if "review_cleared_at" in keys else None,
             review_score=row["review_score"] if "review_score" in keys else None,
+            review_verify_command=row["review_verify_command"] if "review_verify_command" in keys else None,
+            review_verify_status=row["review_verify_status"] if "review_verify_status" in keys else None,
+            review_verify_exit_status=row["review_verify_exit_status"] if "review_verify_exit_status" in keys else None,
+            review_verify_failure=row["review_verify_failure"] if "review_verify_failure" in keys else None,
+            review_verify_captured_at=(
+                _parse_db_timestamp(row["review_verify_captured_at"]) if "review_verify_captured_at" in keys else None
+            ),
+            review_verify_head_sha=row["review_verify_head_sha"] if "review_verify_head_sha" in keys else None,
+            review_verify_base_sha=row["review_verify_base_sha"] if "review_verify_base_sha" in keys else None,
+            review_verify_branch=row["review_verify_branch"] if "review_verify_branch" in keys else None,
             log_schema_version=(
                 row["log_schema_version"]
                 if "log_schema_version" in keys and row["log_schema_version"] is not None
@@ -3136,6 +3204,14 @@ class SqliteTaskStore:
                     changed_diff = ?,
                     review_cleared_at = ?,
                     review_score = ?,
+                    review_verify_command = ?,
+                    review_verify_status = ?,
+                    review_verify_exit_status = ?,
+                    review_verify_failure = ?,
+                    review_verify_captured_at = ?,
+                    review_verify_head_sha = ?,
+                    review_verify_base_sha = ?,
+                    review_verify_branch = ?,
                     log_schema_version = ?,
                     execution_mode = ?
                 WHERE project_id = ? AND id = ?
@@ -3196,6 +3272,14 @@ class SqliteTaskStore:
                     1 if task.changed_diff else (0 if task.changed_diff is False else None),
                     _format_db_timestamp(task.review_cleared_at),
                     task.review_score,
+                    task.review_verify_command,
+                    task.review_verify_status,
+                    task.review_verify_exit_status,
+                    task.review_verify_failure,
+                    _format_db_timestamp(task.review_verify_captured_at),
+                    task.review_verify_head_sha,
+                    task.review_verify_base_sha,
+                    task.review_verify_branch,
                     task.log_schema_version,
                     task.execution_mode,
                     self._project_id,
@@ -6108,7 +6192,10 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "pr_last_synced_at", "sync_last_synced_at", "model", "provider",
         "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
         "merge_status", "merged_at", "failure_reason", "completion_reason", "skip_learnings", "diff_files_changed", "diff_lines_added",
-        "diff_lines_removed", "changed_diff", "review_cleared_at", "review_score", "log_schema_version", "execution_mode", "base_branch",
+        "diff_lines_removed", "changed_diff", "review_cleared_at", "review_score",
+        "review_verify_command", "review_verify_status", "review_verify_exit_status", "review_verify_failure",
+        "review_verify_captured_at", "review_verify_head_sha", "review_verify_base_sha", "review_verify_branch",
+        "log_schema_version", "execution_mode", "base_branch",
         "recovery_origin", "trigger_source",
     )
     task_import_columns_sql = ", ".join(f'"{c}"' if c == "group" else c for c in task_import_columns)
@@ -6122,6 +6209,14 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "changed_diff": "NULL",
         "recovery_origin": "NULL",
         "trigger_source": "NULL",
+        "review_verify_command": "NULL",
+        "review_verify_status": "NULL",
+        "review_verify_exit_status": "NULL",
+        "review_verify_failure": "NULL",
+        "review_verify_captured_at": "NULL",
+        "review_verify_head_sha": "NULL",
+        "review_verify_base_sha": "NULL",
+        "review_verify_branch": "NULL",
     }
     project_id, project_prefix = _project_identity_from_config(config)
 
@@ -6701,6 +6796,14 @@ def _task_to_dict(task: "Task") -> dict:
         "changed_diff": task.changed_diff,
         "review_cleared_at": _format_db_timestamp(task.review_cleared_at),
         "review_score": task.review_score,
+        "review_verify_command": task.review_verify_command,
+        "review_verify_status": task.review_verify_status,
+        "review_verify_exit_status": task.review_verify_exit_status,
+        "review_verify_failure": task.review_verify_failure,
+        "review_verify_captured_at": _format_db_timestamp(task.review_verify_captured_at),
+        "review_verify_head_sha": task.review_verify_head_sha,
+        "review_verify_base_sha": task.review_verify_base_sha,
+        "review_verify_branch": task.review_verify_branch,
         "log_schema_version": task.log_schema_version,
         "execution_mode": task.execution_mode,
     }

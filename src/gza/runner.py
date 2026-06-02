@@ -2073,6 +2073,41 @@ def _decode_subprocess_output(output: str | bytes | None) -> str:
     return output
 
 
+@dataclass(frozen=True)
+class ReviewVerifyResult:
+    """Structured review verify result with branch-tip provenance."""
+
+    command: str
+    status: str
+    exit_status: str
+    captured_at: datetime
+    reviewed_branch: str | None = None
+    reviewed_head_sha: str | None = None
+    reviewed_base_sha: str | None = None
+    failure: str | None = None
+    output: str | None = None
+
+
+@dataclass(frozen=True)
+class ProjectReviewVerifyResult:
+    """Per-project verification outcome for cross-project review runs."""
+
+    project: RepoProjectConfig | None
+    scope: str
+    working_directory: str
+    result: ReviewVerifyResult | None = None
+    skip_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CrossProjectReviewVerifyResult:
+    """Rendered cross-project review verification plus aggregate persistence state."""
+
+    markdown: str
+    aggregate_result: ReviewVerifyResult
+    project_results: tuple[ProjectReviewVerifyResult, ...]
+
+
 def _combine_review_verify_output(*parts: str | bytes | None) -> str:
     """Combine stdout/stderr fragments for review verify reporting."""
     return "\n".join(
@@ -2082,48 +2117,116 @@ def _combine_review_verify_output(*parts: str | bytes | None) -> str:
     ).strip()
 
 
+def _make_review_verify_result(
+    command: str,
+    *,
+    status: str,
+    exit_status: str,
+    captured_at: datetime,
+    reviewed_branch: str | None = None,
+    reviewed_head_sha: str | None = None,
+    reviewed_base_sha: str | None = None,
+    failure: str | None = None,
+    output: str | bytes | None = None,
+) -> ReviewVerifyResult:
+    """Build a structured review verify result."""
+    return ReviewVerifyResult(
+        command=command,
+        status=status,
+        exit_status=exit_status,
+        captured_at=captured_at,
+        reviewed_branch=reviewed_branch,
+        reviewed_head_sha=reviewed_head_sha,
+        reviewed_base_sha=reviewed_base_sha,
+        failure=failure,
+        output=_combine_review_verify_output(output),
+    )
+
+
 def _format_review_verify_failure(
     command: str,
     *,
     exit_status: str,
     failure: str,
     output: str | bytes | None = None,
+    reviewed_branch: str | None = None,
+    reviewed_head_sha: str | None = None,
+    reviewed_base_sha: str | None = None,
+    captured_at: datetime | None = None,
 ) -> str:
-    """Format timeout/launch verify failures as prompt context."""
-    trimmed_output = _truncate_to_word_boundary(
-        _combine_review_verify_output(output) or failure,
-        REVIEW_VERIFY_OUTPUT_MAX_CHARS,
-    )
-    return "\n".join(
-        [
-            "## verify_command result",
-            "",
-            f"- Command: `{command}`",
-            "- Status: failed",
-            f"- Exit status: {exit_status}",
-            f"- Failure: {failure}",
-            "",
-            "Failing output (trimmed):",
-            "```text",
-            trimmed_output,
-            "```",
-        ]
+    """Compatibility wrapper for tests and legacy callers that expect markdown."""
+    return _format_review_verify_result(
+        _make_review_verify_result(
+            command,
+            status="failed" if exit_status != "launch failed" else "unavailable",
+            exit_status=exit_status,
+            captured_at=captured_at or datetime.now(UTC),
+            reviewed_branch=reviewed_branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha=reviewed_base_sha,
+            failure=failure,
+            output=output,
+        )
     )
 
 
-def _format_review_verify_result(command: str, result: subprocess.CompletedProcess[str]) -> str:
+def _persist_review_verify_result(task: Task, result: ReviewVerifyResult | None) -> None:
+    """Copy structured review verify provenance onto a persisted task row."""
+    if result is None:
+        task.review_verify_command = None
+        task.review_verify_status = None
+        task.review_verify_exit_status = None
+        task.review_verify_failure = None
+        task.review_verify_captured_at = None
+        task.review_verify_head_sha = None
+        task.review_verify_base_sha = None
+        task.review_verify_branch = None
+        return
+
+    task.review_verify_command = result.command
+    task.review_verify_status = result.status
+    task.review_verify_exit_status = result.exit_status
+    task.review_verify_failure = result.failure
+    task.review_verify_captured_at = result.captured_at
+    task.review_verify_head_sha = result.reviewed_head_sha
+    task.review_verify_base_sha = result.reviewed_base_sha
+    task.review_verify_branch = result.reviewed_branch
+
+
+def _format_review_verify_result(
+    result: ReviewVerifyResult | str,
+    completed: subprocess.CompletedProcess[str] | None = None,
+) -> str:
     """Format a review-iteration verify result as prompt context."""
-    status = "passed" if result.returncode == 0 else "failed"
+    if isinstance(result, str):
+        if completed is None:
+            raise TypeError("completed result is required when formatting from command + CompletedProcess")
+        result = _make_review_verify_result(
+            result,
+            status="passed" if completed.returncode == 0 else "failed",
+            exit_status=str(completed.returncode),
+            captured_at=datetime.now(UTC),
+            output=_combine_review_verify_output(completed.stdout, completed.stderr),
+        )
     lines = [
         "## verify_command result",
         "",
-        f"- Command: `{command}`",
-        f"- Status: {status}",
-        f"- Exit status: {result.returncode}",
+        f"- Command: `{result.command}`",
+        f"- Status: {result.status}",
+        f"- Exit status: {result.exit_status}",
+        f"- Captured at: {result.captured_at.isoformat()}",
     ]
-    if result.returncode != 0:
+    if result.reviewed_branch:
+        lines.append(f"- Reviewed branch: `{result.reviewed_branch}`")
+    if result.reviewed_head_sha:
+        lines.append(f"- Reviewed head: `{result.reviewed_head_sha}`")
+    if result.reviewed_base_sha:
+        lines.append(f"- Reviewed base/default SHA: `{result.reviewed_base_sha}`")
+    if result.failure:
+        lines.append(f"- Failure: {result.failure}")
+    if result.status != "passed":
         trimmed_output = _truncate_to_word_boundary(
-            _combine_review_verify_output(result.stdout, result.stderr) or "(no failing output captured)",
+            result.output or result.failure or "(no failing output captured)",
             REVIEW_VERIFY_OUTPUT_MAX_CHARS,
         )
         lines.extend(
@@ -2142,9 +2245,13 @@ def _run_review_verify_command(
     verify_command: str,
     *,
     cwd: Path,
+    reviewed_branch: str | None = None,
+    reviewed_head_sha: str | None = None,
+    reviewed_base_sha: str | None = None,
     timeout_seconds: int = REVIEW_VERIFY_TIMEOUT_SECONDS,
-) -> str:
+) -> ReviewVerifyResult:
     """Run the configured verify command for an autonomous review iteration."""
+    captured_at = datetime.now(UTC)
     started_at = time.monotonic()
     try:
         result = subprocess.run(
@@ -2156,16 +2263,26 @@ def _run_review_verify_command(
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired as exc:
-        return _format_review_verify_failure(
+        return _make_review_verify_result(
             verify_command,
+            status="failed",
             exit_status="timed out",
+            captured_at=captured_at,
+            reviewed_branch=reviewed_branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha=reviewed_base_sha,
             failure=f"verify_command timed out after {timeout_seconds}s",
             output=_combine_review_verify_output(exc.stdout, exc.stderr),
         )
     except OSError as exc:
-        return _format_review_verify_failure(
+        return _make_review_verify_result(
             verify_command,
+            status="unavailable",
             exit_status="launch failed",
+            captured_at=captured_at,
+            reviewed_branch=reviewed_branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha=reviewed_base_sha,
             failure=f"failed to launch verify_command: {exc}",
         )
     elapsed = time.monotonic() - started_at
@@ -2176,7 +2293,16 @@ def _run_review_verify_command(
         )
         logger.warning(warning_message)
         console.print(f"[yellow]Warning: {warning_message}[/yellow]")
-    return _format_review_verify_result(verify_command, result)
+    return _make_review_verify_result(
+        verify_command,
+        status="passed" if result.returncode == 0 else "failed",
+        exit_status=str(result.returncode),
+        captured_at=captured_at,
+        reviewed_branch=reviewed_branch,
+        reviewed_head_sha=reviewed_head_sha,
+        reviewed_base_sha=reviewed_base_sha,
+        output=_combine_review_verify_output(result.stdout, result.stderr),
+    )
 
 
 def _format_review_verify_skip(project: RepoProjectConfig, reason: str) -> str:
@@ -2193,6 +2319,70 @@ def _format_review_verify_skip(project: RepoProjectConfig, reason: str) -> str:
     )
 
 
+def _strip_review_verify_heading(markdown: str) -> list[str]:
+    """Return verify markdown without the top-level section header."""
+    lines = markdown.splitlines()
+    if lines[:2] == ["## verify_command result", ""]:
+        return lines[2:]
+    return lines
+
+
+def _aggregate_cross_project_review_verify_result(
+    *,
+    command: str,
+    captured_at: datetime,
+    reviewed_branch: str | None,
+    reviewed_head_sha: str | None,
+    reviewed_base_sha: str | None,
+    project_results: list[ProjectReviewVerifyResult],
+) -> ReviewVerifyResult:
+    """Summarize per-project review verification into one persisted aggregate result."""
+    runnable_results = [entry.result for entry in project_results if entry.result is not None]
+    passed_count = sum(1 for result in runnable_results if result.status == "passed")
+    failed_count = sum(1 for result in runnable_results if result.status == "failed")
+    unavailable_count = sum(1 for result in runnable_results if result.status == "unavailable")
+    skipped_count = sum(1 for entry in project_results if entry.result is None)
+    cannot_run_count = unavailable_count + skipped_count
+
+    if failed_count > 0:
+        status = "failed"
+    elif cannot_run_count > 0:
+        status = "unavailable"
+    elif passed_count > 0:
+        status = "passed"
+    else:
+        status = "unavailable"
+
+    summary_parts = [
+        f"{passed_count} passed",
+        f"{failed_count} failed",
+        f"{unavailable_count} unavailable",
+    ]
+    if skipped_count > 0:
+        summary_parts.append(f"{skipped_count} skipped")
+    exit_status = ", ".join(summary_parts)
+
+    failure: str | None = None
+    if status != "passed":
+        if failed_count > 0:
+            failure = "one or more affected projects failed review verification"
+        elif cannot_run_count > 0:
+            failure = "one or more affected projects could not run review verification"
+        else:
+            failure = "no affected project had a runnable verify_command"
+
+    return _make_review_verify_result(
+        command,
+        status=status,
+        exit_status=exit_status,
+        captured_at=captured_at,
+        reviewed_branch=reviewed_branch,
+        reviewed_head_sha=reviewed_head_sha,
+        reviewed_base_sha=reviewed_base_sha,
+        failure=failure,
+    )
+
+
 def _run_review_verify_commands_for_projects(
     *,
     config: Config,
@@ -2200,16 +2390,35 @@ def _run_review_verify_commands_for_projects(
     worktree_git: Git,
     worktree_path: Path,
     timeout_seconds: int,
-) -> str | None:
+    reviewed_branch: str | None = None,
+    reviewed_head_sha: str | None = None,
+    reviewed_base_sha: str | None = None,
+) -> CrossProjectReviewVerifyResult | None:
     """Run autonomous review verification from each affected project root."""
     if not _task_is_cross_project(task):
         verify_command = config.verify_command if isinstance(config.verify_command, str) else ""
         if not verify_command.strip():
             return None
-        return _run_review_verify_command(
+        result = _run_review_verify_command(
             verify_command.strip(),
             cwd=_worktree_project_root(worktree_path, _project_boundary(config)),
+            reviewed_branch=reviewed_branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha=reviewed_base_sha,
             timeout_seconds=timeout_seconds,
+        )
+        scope = _format_repo_project_scope(_project_boundary(config).scope_root)
+        return CrossProjectReviewVerifyResult(
+            markdown=_format_review_verify_result(result),
+            aggregate_result=result,
+            project_results=(
+                ProjectReviewVerifyResult(
+                    project=None,
+                    scope=scope,
+                    working_directory=scope,
+                    result=result,
+                ),
+            )
         )
 
     default_branch = worktree_git.default_branch()
@@ -2228,11 +2437,20 @@ def _run_review_verify_commands_for_projects(
     if not affected.projects and not affected.unknown_paths:
         return None
 
-    sections: list[str] = ["## verify_command result", ""]
+    project_results: list[ProjectReviewVerifyResult] = []
+    section_entries: list[str] = []
     for project in affected.projects:
         scope = _format_repo_project_scope(project.scope_root)
         if not project.verify_command:
-            sections.extend(
+            project_results.append(
+                ProjectReviewVerifyResult(
+                    project=project,
+                    scope=scope,
+                    working_directory=scope,
+                    skip_reason="no verify_command configured for this affected project",
+                )
+            )
+            section_entries.extend(
                 [
                     _format_review_verify_skip(
                         project,
@@ -2246,15 +2464,32 @@ def _run_review_verify_commands_for_projects(
         result = _run_review_verify_command(
             project.verify_command,
             cwd=worktree_path if project.scope_root == Path(".") else worktree_path / project.scope_root,
+            reviewed_branch=reviewed_branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha=reviewed_base_sha,
             timeout_seconds=timeout_seconds,
         )
-        result_lines = result.splitlines()
-        if result_lines[:2] == ["## verify_command result", ""]:
-            result_lines = result_lines[2:]
-        sections.extend([f"### {scope}", "", f"- Working directory: `{scope}`", *result_lines, ""])
+        project_results.append(
+            ProjectReviewVerifyResult(
+                project=project,
+                scope=scope,
+                working_directory=scope,
+                result=result,
+            )
+        )
+        result_lines = _strip_review_verify_heading(_format_review_verify_result(result))
+        section_entries.extend([f"### {scope}", "", f"- Working directory: `{scope}`", *result_lines, ""])
 
     if affected.unknown_paths:
-        sections.extend(
+        project_results.append(
+            ProjectReviewVerifyResult(
+                project=None,
+                scope="unknown paths",
+                working_directory="unknown paths",
+                skip_reason="affected paths fell outside all discovered project roots",
+            )
+        )
+        section_entries.extend(
             [
                 "### unknown paths",
                 "",
@@ -2265,7 +2500,22 @@ def _run_review_verify_commands_for_projects(
             ]
         )
 
-    return "\n".join(sections).rstrip()
+    aggregate_result = _aggregate_cross_project_review_verify_result(
+        command="(per-project verify_command)",
+        captured_at=datetime.now(UTC),
+        reviewed_branch=reviewed_branch,
+        reviewed_head_sha=reviewed_head_sha,
+        reviewed_base_sha=reviewed_base_sha,
+        project_results=project_results,
+    )
+    sections: list[str] = _format_review_verify_result(aggregate_result).splitlines()
+    sections.extend(["", "Per affected project:", ""])
+    sections.extend(section_entries)
+    return CrossProjectReviewVerifyResult(
+        markdown="\n".join(sections).rstrip(),
+        aggregate_result=aggregate_result,
+        project_results=tuple(project_results),
+    )
 
 
 def _default_code_task_commit_subject(task_slug: str | None, task_db_id: str | None) -> str:
@@ -2275,6 +2525,45 @@ def _default_code_task_commit_subject(task_slug: str | None, task_db_id: str | N
     if task_db_id is not None:
         return f"Task {task_db_id}"
     return "gza task"
+
+
+def _resolve_review_base_ref(
+    task: Task,
+    store: SqliteTaskStore,
+    git: Git | None,
+    default_branch: str,
+) -> tuple[str, str | None]:
+    """Return the detached review checkout ref and reviewed implementation branch when available."""
+    if task.task_type == "review" and task.depends_on:
+        dep_task = store.get(task.depends_on)
+        if dep_task and dep_task.branch and dep_task.status == "completed":
+            return dep_task.branch, dep_task.branch
+
+    base_ref = f"origin/{default_branch}"
+    if git:
+        git_result = git._run("rev-parse", "--verify", base_ref, check=False)
+        if git_result.returncode != 0:
+            base_ref = default_branch
+    return base_ref, None
+
+
+def _create_detached_review_worktree(git: Git | None, worktree_path: Path, base_ref: str) -> None:
+    """Create a detached review worktree from the requested ref."""
+    if worktree_path.exists() and git:
+        git.worktree_remove(worktree_path, force=True)
+    if git:
+        git._run("worktree", "add", "--detach", str(worktree_path), base_ref)
+
+
+def _resolve_review_verify_base_sha(git: Git | None, default_branch: str) -> str | None:
+    """Resolve the default/base branch SHA used as review context when available."""
+    if git is None:
+        return None
+    for ref in (default_branch, f"origin/{default_branch}"):
+        sha = git.rev_parse_if_exists(ref)
+        if isinstance(sha, str) and sha:
+            return sha
+    return None
 
 
 def _build_code_task_commit_subject(task_prompt: str, worktree_summary_path: Path, fallback_subject: str | None = None) -> str:
@@ -6145,28 +6434,14 @@ def _run_non_code_task(
         if worktree_path.exists() and git:
             git.worktree_remove(worktree_path, force=True)
 
-        # For review tasks with depends_on, check if we should run on the implementation branch
-        base_ref = None
-        if task.task_type == "review" and task.depends_on:
-            dep_task = store.get(task.depends_on)
-            if dep_task and dep_task.branch and dep_task.status == "completed":
-                # Run review on the implementation branch
-                base_ref = dep_task.branch
-                console.print(f"Running review on implementation branch: [blue]{base_ref}[/blue]")
-
-        # Default to origin/default_branch or local default_branch
-        if not base_ref:
-            base_ref = f"origin/{default_branch}"
-            if git:
-                git_result = git._run("rev-parse", "--verify", base_ref, check=False)
-                if git_result.returncode != 0:
-                    base_ref = default_branch  # Fall back to local branch
+        base_ref, reviewed_branch = _resolve_review_base_ref(task, store, git, default_branch)
+        if reviewed_branch:
+            console.print(f"Running review on implementation branch: [blue]{reviewed_branch}[/blue]")
 
         # Create worktree without creating a new branch (use --detach to check out HEAD)
         # This creates a worktree in detached HEAD state based on the specified ref
         console.print(f"Creating worktree: {worktree_path}")
-        if git:
-            git._run("worktree", "add", "--detach", str(worktree_path), base_ref)
+        _create_detached_review_worktree(git, worktree_path, base_ref)
         worktree_git = Git(worktree_path)
 
     # Create report directory structure in worktree
@@ -6222,8 +6497,13 @@ def _run_non_code_task(
                 report_path=prompt_report_path,
             )
         else:
-            review_verify_result = None
-            if task.task_type == "review":
+            review_verify_result: ReviewVerifyResult | None = None
+            review_verify_markdown: str | None = None
+            verify_command = config.verify_command if isinstance(config.verify_command, str) else ""
+            should_run_review_verify = task.task_type == "review" and (
+                _task_is_cross_project(task) or verify_command.strip()
+            )
+            if should_run_review_verify:
                 review_verify_timeout_seconds = getattr(
                     config,
                     "review_verify_timeout_seconds",
@@ -6231,20 +6511,55 @@ def _run_non_code_task(
                 )
                 if not isinstance(review_verify_timeout_seconds, int) or review_verify_timeout_seconds < 1:
                     review_verify_timeout_seconds = REVIEW_VERIFY_TIMEOUT_SECONDS
-                review_verify_result = _run_review_verify_commands_for_projects(
-                    config=config,
-                    task=task,
-                    worktree_git=worktree_git,
-                    worktree_path=worktree_path,
-                    timeout_seconds=review_verify_timeout_seconds,
-                )
+                reviewed_head_sha = worktree_git.rev_parse_if_exists("HEAD")
+                reviewed_base_sha = _resolve_review_verify_base_sha(git, default_branch)
+                if reviewed_head_sha is None:
+                    review_verify_result = _make_review_verify_result(
+                        verify_command.strip() or "(review verify unavailable)",
+                        status="unavailable",
+                        exit_status="unresolved head",
+                        captured_at=datetime.now(UTC),
+                        reviewed_branch=reviewed_branch,
+                        reviewed_head_sha=None,
+                        reviewed_base_sha=reviewed_base_sha,
+                        failure="unable to resolve review worktree HEAD before verify_command ran",
+                    )
+                    review_verify_markdown = _format_review_verify_result(review_verify_result)
+                else:
+                    if _task_is_cross_project(task):
+                        cross_project_verify = _run_review_verify_commands_for_projects(
+                            config=config,
+                            task=task,
+                            worktree_git=worktree_git,
+                            worktree_path=worktree_path,
+                            timeout_seconds=review_verify_timeout_seconds,
+                            reviewed_branch=reviewed_branch,
+                            reviewed_head_sha=reviewed_head_sha,
+                            reviewed_base_sha=reviewed_base_sha,
+                        )
+                        if cross_project_verify is not None:
+                            review_verify_markdown = cross_project_verify.markdown
+                            review_verify_result = cross_project_verify.aggregate_result
+                    elif verify_command.strip():
+                        review_verify_result = _run_review_verify_command(
+                            verify_command.strip(),
+                            cwd=provider_cwd,
+                            reviewed_branch=reviewed_branch,
+                            reviewed_head_sha=reviewed_head_sha,
+                            reviewed_base_sha=reviewed_base_sha,
+                            timeout_seconds=review_verify_timeout_seconds,
+                        )
+                        review_verify_markdown = _format_review_verify_result(review_verify_result)
+                if review_verify_result is not None:
+                    _persist_review_verify_result(task, review_verify_result)
+                    store.update(task)
             prompt = build_prompt(
                 task,
                 config,
                 store,
                 report_path=prompt_report_path,
                 git=git,
-                review_verify_result=review_verify_result,
+                review_verify_result=review_verify_markdown,
             )
 
         def _on_session_id_non_code(session_id: str) -> None:

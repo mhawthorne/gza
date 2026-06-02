@@ -45,6 +45,7 @@ from gza.cli.watch import (
 )
 from gza.config import Config
 from gza.git import GitError
+from gza.lineage_query import LineageOwnerRow
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.workers import WorkerMetadata, WorkerRegistry
 
@@ -6441,6 +6442,82 @@ def test_watch_cycle_create_review_routes_impl_chain_through_iterate(tmp_path: P
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == impl.id
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and f"{impl.id} iterate" in line
+        for line in log_path.read_text().splitlines()
+    )
+
+
+def test_watch_cycle_verify_noop_improve_then_review_routes_impl_chain_through_iterate(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/noop-reverify-watch"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Completed review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+    row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl, review),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="test",
+        unresolved_tasks=(review,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=review,
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._query_owner_rows", return_value=[row]),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={
+                "type": "verify_noop_improve_then_review",
+                "description": "Re-run verify_command before re-review",
+                "review_task": review,
+            },
+        ),
+        patch(
+            "gza.cli.advance_executor.run_noop_improve_verify_then_review",
+            side_effect=AssertionError("watch parent should not run reverify directly"),
+        ),
         patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,

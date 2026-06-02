@@ -134,6 +134,34 @@ class TestTaskChaining:
         assert retrieved.create_pr is True
         assert retrieved.same_branch is True
 
+
+def test_review_verify_metadata_round_trips(tmp_path: Path) -> None:
+    db_path = tmp_path / "test.db"
+    store = SqliteTaskStore(db_path)
+
+    review = store.add("Review feature", task_type="review")
+    assert review.id is not None
+    review.review_verify_command = "uv run pytest tests/ -q"
+    review.review_verify_status = "failed"
+    review.review_verify_exit_status = "7"
+    review.review_verify_failure = "mypy failed"
+    review.review_verify_captured_at = datetime(2026, 6, 1, 19, 0, tzinfo=UTC)
+    review.review_verify_head_sha = "deadbeef"
+    review.review_verify_base_sha = "cafebabe"
+    review.review_verify_branch = "feature/review-verify"
+    store.update(review)
+
+    refreshed = store.get(review.id)
+    assert refreshed is not None
+    assert refreshed.review_verify_command == "uv run pytest tests/ -q"
+    assert refreshed.review_verify_status == "failed"
+    assert refreshed.review_verify_exit_status == "7"
+    assert refreshed.review_verify_failure == "mypy failed"
+    assert refreshed.review_verify_captured_at == datetime(2026, 6, 1, 19, 0, tzinfo=UTC)
+    assert refreshed.review_verify_head_sha == "deadbeef"
+    assert refreshed.review_verify_base_sha == "cafebabe"
+    assert refreshed.review_verify_branch == "feature/review-verify"
+
     def test_depends_on_relationship(self, tmp_path: Path):
         """Test that depends_on creates correct relationships."""
         db_path = tmp_path / "test.db"
@@ -6345,7 +6373,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -6357,7 +6385,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.

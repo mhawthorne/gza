@@ -16,7 +16,10 @@ from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key, task_ow
 from gza.git import ResolvedMergeSourceRef
 from gza.lineage import walk_ancestors, walk_based_on_descendants
 from gza.merge_state import resolve_task_merge_state_for_target
-from gza.project_discovery import parse_name_status_project_paths
+from gza.project_discovery import (
+    parse_name_status_project_paths,
+    resolve_affected_repo_projects,
+)
 from gza.query import (
     get_code_changing_descendants_for_root,
     get_reviews_for_root,
@@ -62,6 +65,7 @@ WORKER_CONSUMING_ACTIONS = frozenset(
         "create_implement",
         "create_review",
         "run_review",
+        "verify_noop_improve_then_review",
         "improve",
         "run_improve",
         "resume",
@@ -109,6 +113,23 @@ class RebaseFailureStreak:
 
 
 @dataclass(frozen=True)
+class BranchTipResolution:
+    """Resolved current-branch tip proof for no-op reverify decisions."""
+
+    sha: str | None
+    failure: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewVerifyAvailability:
+    """Whether lifecycle can safely attempt review verification for this task."""
+
+    available: bool
+    failure: str | None = None
+    revision_range: str | None = None
+
+
+@dataclass(frozen=True)
 class AdvanceContext:
     """Resolved task state used by advance rules."""
 
@@ -119,6 +140,7 @@ class AdvanceContext:
 
     requires_review: bool
     create_reviews: bool
+    verify_command_available: bool
     max_review_cycles: int
     max_noop_improve_cycles: int
     max_resume_attempts: int
@@ -149,6 +171,11 @@ class AdvanceContext:
     active_review: DbTask | None = None
     latest_completed_review: DbTask | None = None
     latest_completed_code_change: DbTask | None = None
+    current_branch_head_sha: str | None = None
+    current_branch_head_resolution_failure: str | None = None
+    verify_command_unavailable_failure: str | None = None
+    verify_command_unavailable_revision_range: str | None = None
+    latest_review_verify_provenance_state: str | None = None
     review_cleared: bool = False
     review_verdict: str | None = None
     review_report: ParsedReviewReport | None = None
@@ -524,6 +551,69 @@ def _count_consecutive_noop_improves(improve_tasks: list[DbTask]) -> tuple[DbTas
     return latest_noop_improve, consecutive_noops
 
 
+def _resolve_branch_tip(git: Any, branch: str | None) -> BranchTipResolution:
+    """Resolve the current implementation tip SHA with explicit probe failure details."""
+    if not branch:
+        return BranchTipResolution(None)
+
+    def _normalize_sha(value: Any) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    resolve_fresh = getattr(git, "resolve_fresh_merge_source_ref", None)
+    if callable(resolve_fresh):
+        try:
+            fresh_ref = resolve_fresh(branch)
+        except Exception as exc:
+            failure = f"unable to resolve freshest branch ref for '{branch}': {exc}"
+            _LOG.warning("Failed to resolve freshest merge source ref for %s", branch, exc_info=True)
+            return BranchTipResolution(None, failure)
+        if fresh_ref:
+            rev_parse = getattr(git, "rev_parse_if_exists", None)
+            if callable(rev_parse):
+                try:
+                    return BranchTipResolution(_normalize_sha(rev_parse(fresh_ref)))
+                except Exception as exc:
+                    failure = f"unable to resolve branch tip SHA from '{fresh_ref}': {exc}"
+                    _LOG.warning("Failed to resolve branch tip SHA from %s", fresh_ref, exc_info=True)
+                    return BranchTipResolution(None, failure)
+    rev_parse = getattr(git, "rev_parse_if_exists", None)
+    if callable(rev_parse):
+        try:
+            return BranchTipResolution(_normalize_sha(rev_parse(branch)))
+        except Exception as exc:
+            failure = f"unable to resolve branch tip SHA from '{branch}': {exc}"
+            _LOG.warning("Failed to resolve branch tip SHA from %s", branch, exc_info=True)
+            return BranchTipResolution(None, failure)
+    return BranchTipResolution(None)
+
+
+def _resolve_branch_tip_sha(git: Any, branch: str | None) -> str | None:
+    """Backward-compatible branch-tip convenience wrapper."""
+    return _resolve_branch_tip(git, branch).sha
+
+
+def _review_verify_provenance_state(review_task: DbTask | None, current_head_sha: str | None) -> str | None:
+    """Classify whether stored review verify evidence matches the current branch tip."""
+    if review_task is None:
+        return None
+    if not review_task.review_verify_head_sha:
+        return "missing"
+    if not current_head_sha:
+        return "unknown"
+    if review_task.review_verify_head_sha == current_head_sha:
+        return "current"
+    return "stale"
+
+
+def _latest_review_is_verify_blocked_only(ctx: AdvanceContext) -> bool:
+    latest_review_blocker_summary = getattr(ctx, "latest_review_blocker_summary", None)
+    return (
+        ctx.review_verdict == "CHANGES_REQUESTED"
+        and latest_review_blocker_summary is not None
+        and latest_review_blocker_summary.is_verify_blocked_only
+    )
+
+
 def _normalize_blocker_title(title: str) -> str:
     normalized = re.sub(r"`+", "", title).strip().lower()
     normalized = re.sub(r"^#+\s*", "", normalized)
@@ -719,6 +809,99 @@ def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]
     )
 
 
+def _noop_improve_branch_tip_unavailable_action(ctx: AdvanceContext) -> dict[str, Any]:
+    latest_noop_id = _task_id(ctx.latest_noop_improve)
+    detail = ctx.current_branch_head_resolution_failure or (
+        f"unable to prove the current branch tip for '{ctx.task.branch}'"
+        if ctx.task.branch
+        else "implementation branch is unavailable"
+    )
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                f"SKIP: {ctx.consecutive_noop_improves} consecutive no-op improves reached "
+                f"(latest {latest_noop_id}); latest review is blocked only by verify_command, "
+                f"but lifecycle cannot prove the current branch tip. {detail}."
+            ),
+        },
+        reason="verify-noop-improve-branch-tip-unavailable",
+        subject_task_id=ctx.task.id,
+    )
+
+
+def _noop_improve_verify_probe_unavailable_action(ctx: AdvanceContext) -> dict[str, Any]:
+    latest_noop_id = _task_id(ctx.latest_noop_improve)
+    revision_range = getattr(ctx, "verify_command_unavailable_revision_range", None) or "unknown revision range"
+    detail = getattr(ctx, "verify_command_unavailable_failure", None) or "unknown diff inspection failure"
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                f"SKIP: {ctx.consecutive_noop_improves} consecutive no-op improves reached "
+                f"(latest {latest_noop_id}); latest review is blocked only by verify_command, "
+                "but lifecycle could not prove cross-project review verification availability. "
+                f"Diff inspection `{revision_range}` failed: {detail}."
+            ),
+            "verify_command_availability_error": detail,
+            "verify_command_availability_revision_range": revision_range,
+        },
+        reason="verify-noop-improve-diff-probe-unavailable",
+        subject_task_id=ctx.task.id,
+    )
+
+
+def _noop_improve_limit_action(ctx: AdvanceContext) -> dict[str, Any]:
+    """Choose between parking a no-op loop and re-verifying the current branch tip."""
+    verify_command_available = getattr(ctx, "verify_command_available", False)
+    verify_command_unavailable_failure = getattr(ctx, "verify_command_unavailable_failure", None)
+    current_branch_head_sha = getattr(ctx, "current_branch_head_sha", None)
+    current_branch_head_resolution_failure = getattr(
+        ctx,
+        "current_branch_head_resolution_failure",
+        None,
+    )
+    latest_review_verify_provenance_state = getattr(
+        ctx,
+        "latest_review_verify_provenance_state",
+        None,
+    )
+    if (
+        ctx.noop_improve_allowed
+        or not ctx.create_reviews
+        or not _latest_review_is_verify_blocked_only(ctx)
+        or ctx.latest_completed_review is None
+    ):
+        return _noop_improve_needs_discussion_action(ctx)
+    if verify_command_unavailable_failure is not None:
+        return _noop_improve_verify_probe_unavailable_action(ctx)
+    if not verify_command_available:
+        return _noop_improve_needs_discussion_action(ctx)
+    if current_branch_head_resolution_failure is not None or current_branch_head_sha is None:
+        return _noop_improve_branch_tip_unavailable_action(ctx)
+
+    stale_note = ""
+    if latest_review_verify_provenance_state == "stale":
+        stale_note = "; latest review verify evidence is stale vs current branch tip"
+    elif latest_review_verify_provenance_state == "current":
+        stale_note = "; latest review verify evidence matches the current branch tip"
+
+    action: dict[str, Any] = {
+        "type": "verify_noop_improve_then_review",
+        "description": (
+            "Re-run verify_command on the current implementation tip before parking the no-op improve loop"
+            f"{stale_note}"
+        ),
+        "review_task": ctx.latest_completed_review,
+        "implementation_task": ctx.task,
+        "verify_provenance_state": latest_review_verify_provenance_state,
+        "current_branch_head_sha": current_branch_head_sha,
+    }
+    if ctx.latest_noop_improve is not None:
+        action["latest_noop_improve"] = ctx.latest_noop_improve
+    return action
+
+
 def _duplicate_blocker_needs_attention_action(ctx: AdvanceContext) -> dict[str, Any]:
     assert ctx.duplicate_blocker_streak is not None
     streak = ctx.duplicate_blocker_streak
@@ -798,6 +981,60 @@ def _resolve_strict_scope_inspection(
                 declared_project_roots=parsed_name_status.declared_project_roots,
             )
         )
+    )
+
+
+def _review_verify_available_for_task(
+    config: Any,
+    git: Any,
+    task: DbTask,
+    *,
+    target_branch: str,
+) -> ReviewVerifyAvailability:
+    """Return whether lifecycle can attempt review verification for this task."""
+    verify_command = getattr(config, "verify_command", None)
+    if not _task_is_cross_project(task):
+        return ReviewVerifyAvailability(
+            available=bool(isinstance(verify_command, str) and verify_command.strip())
+        )
+
+    if not task.branch:
+        return ReviewVerifyAvailability(available=False)
+
+    revision_range = f"{target_branch}...{task.branch}"
+    try:
+        name_status_output = git.get_diff_name_status(revision_range, check=True)
+    except Exception as exc:
+        detail = " ".join(str(exc).split())
+        _LOG.warning(
+            "Failed to inspect branch diff for cross-project review verification availability (%s): %s",
+            revision_range,
+            detail,
+        )
+        return ReviewVerifyAvailability(
+            available=False,
+            failure=detail,
+            revision_range=revision_range,
+        )
+
+    parsed_name_status = parse_name_status_project_paths(name_status_output or "")
+    if not parsed_name_status.changed_paths:
+        return ReviewVerifyAvailability(available=False)
+
+    affected = resolve_affected_repo_projects(
+        config,
+        parsed_name_status.changed_paths,
+        repo_root=_project_boundary(config).repo_root,
+        declared_project_roots=parsed_name_status.declared_project_roots,
+    )
+    if affected.projects or affected.unknown_paths:
+        return ReviewVerifyAvailability(available=True)
+
+    # Host-checkout project discovery can miss branch-local gza.yaml additions or edits.
+    # Emit the reverify action whenever the branch diff itself proves there is affected
+    # cross-project surface and let the detached review worktree perform final discovery.
+    return ReviewVerifyAvailability(
+        available=bool(parsed_name_status.declared_project_roots or parsed_name_status.changed_paths)
     )
 
 
@@ -1662,6 +1899,10 @@ def resolve_advance_context(
 
     effective_max_resume = max_resume_attempts if max_resume_attempts is not None else config.max_resume_attempts
     effective_max_noop_improves = int(getattr(config, "max_noop_improve_cycles", 2))
+    verify_command_available = bool(
+        isinstance(getattr(config, "verify_command", None), str)
+        and getattr(config, "verify_command", "").strip()
+    )
 
     failed_recovery_decision: FailedRecoveryDecision | None = None
     failed_recovery_attention_reason: str | None = None
@@ -1717,6 +1958,7 @@ def resolve_advance_context(
             has_branch=bool(task.branch),
             requires_review=config.require_review_before_merge,
             create_reviews=config.advance_create_reviews,
+            verify_command_available=verify_command_available,
             max_review_cycles=config.max_review_cycles,
             max_noop_improve_cycles=effective_max_noop_improves,
             max_resume_attempts=effective_max_resume,
@@ -1741,6 +1983,7 @@ def resolve_advance_context(
             has_branch=False,
             requires_review=config.require_review_before_merge,
             create_reviews=config.advance_create_reviews,
+            verify_command_available=verify_command_available,
             max_review_cycles=config.max_review_cycles,
             max_noop_improve_cycles=effective_max_noop_improves,
             max_resume_attempts=effective_max_resume,
@@ -1781,6 +2024,12 @@ def resolve_advance_context(
         git=git,
         target_branch=target_branch,
     )
+    branch_tip_resolution = (
+        BranchTipResolution(None)
+        if post_merge_rebase_state.already_merged or merge_state == "merged"
+        else _resolve_branch_tip(git, task.branch)
+    )
+    current_branch_head_sha = branch_tip_resolution.sha
     strict_scope_inspection = _resolve_strict_scope_inspection(
         config,
         git,
@@ -1788,6 +2037,13 @@ def resolve_advance_context(
         merge_source_ref=merge_source.ref,
         target_branch=target_branch,
     )
+    verify_availability = _review_verify_available_for_task(
+        config,
+        git,
+        review_root_task,
+        target_branch=target_branch,
+    )
+    verify_command_available = verify_availability.available
     can_merge = (
         post_merge_rebase_state.already_merged
         or merge_state == "merged"
@@ -1869,6 +2125,10 @@ def resolve_advance_context(
         latest_completed_code_change=latest_completed_code_change,
         review_cleared_at=task.review_cleared_at,
     )
+    latest_review_verify_provenance_state = _review_verify_provenance_state(
+        latest_completed_review,
+        current_branch_head_sha,
+    )
 
     return AdvanceContext(
         store=store,
@@ -1877,6 +2137,7 @@ def resolve_advance_context(
         has_branch=True,
         requires_review=config.require_review_before_merge,
         create_reviews=config.advance_create_reviews,
+        verify_command_available=verify_command_available,
         max_review_cycles=config.max_review_cycles,
         max_noop_improve_cycles=effective_max_noop_improves,
         max_resume_attempts=effective_max_resume,
@@ -1906,6 +2167,11 @@ def resolve_advance_context(
         active_review=active_review,
         latest_completed_review=latest_completed_review,
         latest_completed_code_change=latest_completed_code_change,
+        current_branch_head_sha=current_branch_head_sha,
+        current_branch_head_resolution_failure=branch_tip_resolution.failure,
+        verify_command_unavailable_failure=verify_availability.failure,
+        verify_command_unavailable_revision_range=verify_availability.revision_range,
+        latest_review_verify_provenance_state=latest_review_verify_provenance_state,
         review_cleared=review_cleared,
         review_verdict=review_verdict,
         review_report=review_report,
@@ -2255,7 +2521,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         and ctx.noop_improve_trigger == "comments"
         and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
         and not ctx.noop_improve_allowed,
-        action=_noop_improve_needs_discussion_action,
+        action=_noop_improve_limit_action,
     ),
     AdvanceRule(
         name="fresh_comments_create_improve",
@@ -2299,25 +2565,14 @@ ADVANCE_RULES: list[AdvanceRule] = [
         },
     ),
     AdvanceRule(
-        name="review_verify_blocked_no_code_issues",
+        name="review_noop_improve_limit",
         matches=lambda ctx: (not ctx.review_cleared)
         and ctx.review_verdict == "CHANGES_REQUESTED"
-        and len(ctx.recent_verify_timeout_only_reviews) >= VERIFY_BLOCKED_REVIEW_THRESHOLD
+        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
         and ctx.active_improve_running is None
-        and ctx.active_improve_pending is None,
-        action=lambda ctx: with_needs_attention(
-            {
-                "type": "needs_discussion",
-                "description": (
-                    f"SKIP: last {VERIFY_BLOCKED_REVIEW_THRESHOLD} review cycles only blocked on "
-                    "verify_command timeout; code may be correct but cannot be verified. "
-                    "Investigate test performance or verify_timeout config."
-                ),
-                "review_task": ctx.latest_completed_review,
-            },
-            reason="verify-blocked-no-code-issues",
-            subject_task_id=ctx.task.id,
-        ),
+        and ctx.active_improve_pending is None
+        and not ctx.noop_improve_allowed,
+        action=_noop_improve_limit_action,
     ),
     AdvanceRule(
         name="review_wait_improve",
@@ -2342,12 +2597,25 @@ ADVANCE_RULES: list[AdvanceRule] = [
         },
     ),
     AdvanceRule(
-        name="review_noop_improve_limit",
+        name="review_verify_blocked_no_code_issues",
         matches=lambda ctx: (not ctx.review_cleared)
         and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
-        and not ctx.noop_improve_allowed,
-        action=_noop_improve_needs_discussion_action,
+        and len(ctx.recent_verify_timeout_only_reviews) >= VERIFY_BLOCKED_REVIEW_THRESHOLD
+        and ctx.active_improve_running is None
+        and ctx.active_improve_pending is None,
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": (
+                    f"SKIP: last {VERIFY_BLOCKED_REVIEW_THRESHOLD} review cycles only blocked on "
+                    "verify_command timeout; code may be correct but cannot be verified. "
+                    "Investigate test performance or verify_timeout config."
+                ),
+                "review_task": ctx.latest_completed_review,
+            },
+            reason="verify-blocked-no-code-issues",
+            subject_task_id=ctx.task.id,
+        ),
     ),
     AdvanceRule(
         name="review_duplicate_blocker_no_progress",

@@ -72,6 +72,7 @@ from .advance_engine import (
     resolve_subject_task,
 )
 from .advance_executor import (
+    ITERATE_ROUTABLE_ACTIONS,
     AdvanceActionExecutionContext,
     AdvanceActionExecutionResult,
     build_improve_needs_attention_result,
@@ -94,7 +95,6 @@ from .query import _resolve_incomplete_owner_task
 
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
-_WATCH_ITERATE_ROUTED_ACTIONS = frozenset({"create_review", "run_review", "improve", "run_improve"})
 _WATCH_PARKED_LINEAGE_POLICY: Literal["skip"] = "skip"
 _WATCH_PARKED_NEEDS_ATTENTION_REASONS = frozenset({"retry-limit-reached", "manual-review-required"})
 T = TypeVar("T")
@@ -308,7 +308,7 @@ def _watch_iterate_impl_target(
     max_recovery_attempts: int,
 ) -> DbTask | AdvanceActionExecutionResult | None:
     action_type = str(action.get("type", "skip"))
-    if action_type not in _WATCH_ITERATE_ROUTED_ACTIONS:
+    if action_type not in ITERATE_ROUTABLE_ACTIONS:
         return None
 
     guarded_pending_task_id: str | None = None
@@ -318,7 +318,7 @@ def _watch_iterate_impl_target(
         impl_task = _resolve_watch_iterate_impl_for_task(store, task)
         if impl_task is None or impl_task.id is None:
             return None
-    elif action_type == "run_review":
+    elif action_type in {"run_review", "verify_noop_improve_then_review"}:
         review_task = action.get("review_task")
         if not isinstance(review_task, DbTask) or review_task.id is None:
             return _watch_iterate_result(
@@ -347,7 +347,7 @@ def _watch_iterate_impl_target(
                 ),
                 guarded_pending_task_id=guarded_pending_task_id,
             )
-        if task.id is not None and impl_task.id != task.id:
+        if task.id is not None and task.id not in {impl_task.id, review_task.id}:
             return _watch_iterate_result(
                 action_type=action_type,
                 status="skip",
@@ -1395,6 +1395,8 @@ def _run_cycle(
                 target_branch,
                 merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
             ).already_merged,
+            config=config,
+            git=git,
             spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_worker_with_failure_log(
                 quiet=quiet,
                 log=log,
