@@ -121,6 +121,7 @@ def test_watch_attention_uses_declared_subject_for_held_plan(tmp_path: Path) -> 
     row = rows[0]
     assert row.next_action is not None
     assert row.next_action["type"] == "awaiting_human"
+    assert row.next_action["needs_attention_reason"] == "awaiting-human-review"
 
     subject_task = _resolve_watch_attention_display_task(store, row)
     assert subject_task.id == plan.id
@@ -128,6 +129,47 @@ def test_watch_attention_uses_declared_subject_for_held_plan(tmp_path: Path) -> 
     message = _watch_needs_attention_message(subject_task, row.next_action)
     assert plan.id in message
     assert impl.id not in message
+
+
+def test_watch_cycle_surfaces_manual_review_creation_as_attention(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "advance_create_reviews: false\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 18, 10, 0, tzinfo=UTC)
+    impl.branch = "feature/manual-review-creation"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    lines = log_path.read_text().splitlines()
+    attention_lines = [line for line in lines if "ATTENTION" in line]
+    assert len(attention_lines) == 1
+    assert "reason=review-needs-manual-creation" in attention_lines[0]
+    assert "run gza review manually" in attention_lines[0]
+    assert not any("SKIP: no review exists and advance_create_reviews=false" in line for line in lines)
 
 
 def _setup_watch_owner_with_failed_rebase(tmp_path: Path, *, failure_reason: str):

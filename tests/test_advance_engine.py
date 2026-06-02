@@ -669,7 +669,30 @@ def test_completed_held_plan_awaits_human_review(tmp_path: Path) -> None:
         "to create implementation, or drop it if you decided not to implement."
     )
     assert classify_advance_action(action) == "needs_attention"
+    assert action["needs_attention_reason"] == "awaiting-human-review"
     assert action["subject_task_id"] == plan.id
+
+
+def test_completed_impl_without_review_and_auto_review_disabled_needs_manual_creation_attention(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.advance_create_reviews = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/manual-review-creation",
+        when=datetime(2026, 5, 18, 10, 0, tzinfo=UTC),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["description"] == "SKIP: no review exists and advance_create_reviews=false (run gza review manually)"
+    assert action["needs_attention_reason"] == "review-needs-manual-creation"
+    assert action["subject_task_id"] == impl.id
+    assert classify_advance_action(action) == "needs_attention"
 
 
 def test_pending_branchless_plan_without_implement_descendant_uses_no_branch_skip(tmp_path: Path) -> None:
@@ -4804,7 +4827,7 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
             "needs_attention_reason": "closing-review-invariant",
         },
         requires_review=True,
-        create_reviews=True,
+        create_reviews=False,
     )
 
     names_with_needs_attention: set[str] = set()
@@ -4835,6 +4858,7 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         "review_duplicate_blocker_no_progress",
         "review_max_cycles",
         "review_unknown_verdict",
+        "implement_needs_manual_review",
     }
 
 

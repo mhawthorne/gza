@@ -81,7 +81,7 @@ configuration, not a spec violation.
   keeps `awaiting_human` rare: the plan stage is not a routine human checkpoint — the
   review-before-merge gate is (P-overview-4).
 - A completed `plan` explicitly held for review (`auto_implement` off) MUST go to
-  `awaiting_human`.
+  `awaiting_human` with parked reason `awaiting-human-review`.
 - A completed `explore` with no plan/implement follow-up MUST go to `needs_discussion`
   (decide: drop or spawn follow-up). The engine MUST NOT silently leave it pending (P5,
   no-orphans).
@@ -215,7 +215,9 @@ failure *and* actionable merge/review work remains eligible for the latter.
   invalidating that state → `merge`.
 - A non-implementation unit, or a unit that does not require review → `merge`.
 - An implementation unit with no review and `require_review_before_merge` on →
-  `create_review` (never merge unreviewed). With it off → `merge`.
+  `create_review` when `advance_create_reviews` is on, otherwise `needs_discussion` with
+  reason `review-needs-manual-creation` (never merge unreviewed). With
+  `require_review_before_merge` off → `merge`.
 - Merge executes against the canonical local target (P4), respects
   `merge_squash_threshold`, and MUST NOT push the target branch as a side effect.
 
@@ -227,10 +229,12 @@ is a spec change. The accompanying human message is free text.
 
 | Reason code | State | Trigger (rule §) |
 |-------------|-------|------------------|
+| `awaiting-human-review` | awaiting_human | §1 completed held plan, no implement follow-up |
 | `explore-needs-follow-up-decision` | needs_discussion | §1 completed explore, no plan/implement follow-up |
 | `project-scope-violation` | ScopeParked | §3 diff touches paths outside scope, not tagged `cross-project` |
 | `project-scope-unverified` | needs_discussion | §3 diff could not be inspected (fail closed) |
 | `merge-source-needs-manual-resolution` † | HumanParked | §4 host-side merge-source divergence needs manual resolution |
+| `reconcile-needs-manual-resolution` † | HumanParked | §4 execution-time reconcile outcome needs manual resolution |
 | `rebase-failed-needs-manual-resolution` | HumanParked | §4 rebase failed, no landing proof |
 | `rebase-did-not-unblock-merge` | HumanParked | §4 rebase completed, still conflicts |
 | `rebase-failure-circuit-breaker` | HumanParked | §4 repeated rebase failures, no progress |
@@ -244,25 +248,29 @@ is a spec change. The accompanying human message is free text.
 | `duplicate-blocker-no-progress` | needs_discussion | §6 same primary blocker repeats across cycles |
 | `review-max-cycles-reached` | max_cycles_reached | §6 review→improve cycles ≥ `max_review_cycles` |
 | `review-verdict-needs-manual-attention` | needs_discussion | §6 verdict unclassifiable, or `APPROVED_WITH_FOLLOWUPS` with zero parsed follow-ups |
+| `review-needs-manual-creation` | needs_discussion | §8 implementation-owned lineage requires review, no review exists, `advance_create_reviews` off |
 | `automatic-recovery-disabled` | HumanParked | §7 recovery attempt budget = 0 |
 | `retry-limit-reached` | HumanParked | §7 recovery attempts exhausted *or* terminal manual-review situation (one slug covers both — see F2) |
 | `recovery-ambiguous` | HumanParked | §7 recovery situation ambiguous |
 | `manual-failure-reason` † | HumanParked | §7 failure flagged for manual handling |
 | `newer-recovery-descendant-needs-attention` † | HumanParked | §7 newer unresolved recovery descendant |
+| `no-descendant-on-the-impl-branch` † | needs_discussion | projected lineage attention: no descendant remains on the implementation branch |
 
 **†** Names a behavior whose *producing rule* is not yet written in §1–§8. Adding the code
 reconciles the vocabulary; specifying the rule that emits it is a tracked follow-up gap.
 
-The held-plan `awaiting_human` action (§1) does **not** currently carry a reason code. If
-reason codes are contract for every stop (they are), that is a gap to close — either emit a
-`plan-held` code or document the exception.
+Primary lifecycle code MUST attach `needs_attention_reason` explicitly via
+`with_needs_attention(...)` or the equivalent execution-time needs-attention result.
+`needs-discussion`, `max-improve-attempts-reached`, and `manual-review-required` remain
+accepted legacy compatibility fallback slugs, but new rules MUST NOT rely on bare
+action-type fallback to produce them.
 
 *Status: reconciled to the strings the engine actually emits as of the 2026-06-02
 behavior-check (`reviews/20260602003648-behavior-check.md`), spec-follows-code. Two items
 remain open as **code/spec decisions, not spec edits**: (1) **F2** — `retry-limit-reached`
 collapses the distinct retry-exhausted and manual-review-required cases, yet `watch` still
-branches on a `manual-review-required` slug the engine never emits; (2) the **†** rows need
-their producing rules specified in §1–§8.*
+branches on a `manual-review-required` compatibility slug the engine rarely emits; (2) the
+**†** rows need their producing rules specified in §1–§8.*
 
 ## Ratified decisions
 

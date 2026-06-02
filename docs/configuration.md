@@ -1165,7 +1165,7 @@ gza incomplete [options]
 
 Use `gza incomplete` for unresolved lineage triage. Use the more specific command surfaces when you want one domain only:
 
-Projected `next_action` values come from the shared live lifecycle planner. Cleanly mergeable branches continue to the normal review or merge actions even when they are behind the target branch. Completed held plan tasks surface `awaiting_human` until you run `uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --no-hold-for-review` (preferred; `--auto-implement` also works). Needs-attention rows now carry an explicit subject task, so `gza incomplete` roots attention rows at the plan/explore/implementation the operator should inspect instead of inferring that identity from lineage ownership alone. If older or malformed action data is missing that subject, the shared resolver falls back conservatively and emits a warning instead of silently re-inferring identity.
+Projected `next_action` values come from the shared live lifecycle planner. Cleanly mergeable branches continue to the normal review or merge actions even when they are behind the target branch. Completed held plan tasks surface `awaiting_human` until you run `uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --no-hold-for-review` (preferred; `--auto-implement` also works). Those held-plan rows now carry `reason=awaiting-human-review`. Needs-attention rows now carry an explicit subject task, so `gza incomplete` roots attention rows at the plan/explore/implementation the operator should inspect instead of inferring that identity from lineage ownership alone. If older or malformed action data is missing that subject, the shared resolver falls back conservatively and emits a warning instead of silently re-inferring identity.
 
 `uv run gza incomplete --list-fields` prints the unresolved-lineage projection set. `uv run gza incomplete --blocked-by-dropped --list-fields` prints the blocked-dropped task projection set.
 
@@ -1534,7 +1534,7 @@ Only completed plan rows are directly runnable with `uv run gza implement <id>`;
 for listed explore rows.
 
 When the shared advance/recovery engine decides a task must be skipped for human intervention, `uv run gza advance` prints a dedicated `Needs attention` section. Each entry includes the task id, task type, short prompt, a stable `reason=...` policy slug, and the underlying skip text. This section is shown in the normal pre-confirmation preview and in `--dry-run` output, including when there is otherwise no actionable work to advance.
-Held completed plans use `next_action = awaiting_human` with guidance to review the plan and then either run `uv run gza implement <plan-id>` for a one-off approval or `uv run gza edit <plan-id> --no-hold-for-review` to restore the normal automatic follow-up path (`--auto-implement` remains a compatibility alias).
+Held completed plans use `next_action = awaiting_human` with `reason=awaiting-human-review`, plus guidance to review the plan and then either run `uv run gza implement <plan-id>` for a one-off approval or `uv run gza edit <plan-id> --no-hold-for-review` to restore the normal automatic follow-up path (`--auto-implement` remains a compatibility alias).
 
 ### iterate
 

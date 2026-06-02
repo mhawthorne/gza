@@ -515,8 +515,48 @@ def test_query_lineage_owner_rows_surfaces_held_completed_plan_as_awaiting_human
     assert row.owner_task.id == plan.id
     assert row.next_action is not None
     assert row.next_action["type"] == "awaiting_human"
+    assert row.next_action["needs_attention_reason"] == "awaiting-human-review"
     assert row.next_action["subject_task_id"] == plan.id
     assert f"uv run gza implement {plan.id}" in row.next_action["description"]
+
+
+def test_query_lineage_owner_rows_surfaces_manual_review_creation_attention(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "advance_create_reviews: false\n")
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement background jobs", task_type="implement")
+    assert impl.id is not None
+    _set_completed(
+        impl,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        branch="feature/manual-review-creation",
+        has_commits=True,
+    )
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == impl.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "needs_discussion"
+    assert row.next_action["needs_attention_reason"] == "review-needs-manual-creation"
+    assert row.next_action["subject_task_id"] == impl.id
+    assert "run gza review manually" in row.next_action["description"]
 
 
 def test_query_lineage_owner_rows_prefers_impl_branch_over_orphan_rebase_owner(tmp_path: Path) -> None:

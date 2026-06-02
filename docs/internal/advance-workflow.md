@@ -63,7 +63,7 @@ For each task, `evaluate_advance_rules()` returns an action from `src/gza/advanc
 
 | Condition | Action |
 |-----------|--------|
-| Completed held plan with no implement child (`auto_implement = false`) | `awaiting_human` — review the plan, then run `uv run gza implement <id>` or re-enable automatic follow-up |
+| Completed held plan with no implement child (`auto_implement = false`) | `awaiting_human` — review the plan, then run `uv run gza implement <id>` or re-enable automatic follow-up (`reason=awaiting-human-review`) |
 | Plan with no implement child | `create_implement` — create and run implement task |
 | Plan with existing implement child | `skip` |
 
@@ -176,7 +176,8 @@ Merge-unit members inherit the review state and review requirement of the action
 
 | Condition | Action |
 |-----------|--------|
-| `require_review_before_merge=true` | `create_review` |
+| `require_review_before_merge=true` and `advance_create_reviews=true` | `create_review` |
+| `require_review_before_merge=true` and `advance_create_reviews=false` | `needs_discussion` with `reason=review-needs-manual-creation` |
 | `require_review_before_merge=false` | `merge` |
 
 ### 9. Failed task recovery
@@ -239,7 +240,7 @@ These actions create background workers and count toward the batch limit. The so
 | `skip` | No action needed or possible |
 | `wait_review` | Review in progress, wait for it |
 | `wait_improve` | Improve in progress, wait for it |
-| `awaiting_human` | Plan is intentionally held for manual review before implementation follow-up |
+| `awaiting_human` | Plan is intentionally held for manual review before implementation follow-up (`reason=awaiting-human-review`) |
 | `needs_discussion` | Requires manual intervention (shown in attention summary) |
 | `max_cycles_reached` | Review iteration limit exceeded (shown in attention summary) |
 

@@ -1831,6 +1831,15 @@ def _closing_review_invariant_action(ctx: AdvanceContext) -> dict[str, Any]:
             if review_root_task is not None and review_root_task.id is not None
             else ctx.task.id
         )
+        if ctx.latest_completed_review is None:
+            return with_needs_attention(
+                {
+                    "type": "needs_discussion",
+                    "description": "SKIP: no review exists and advance_create_reviews=false (run gza review manually)",
+                },
+                reason="review-needs-manual-creation",
+                subject_task_id=subject_task_id,
+            )
         return with_needs_attention(
             {
                 "type": "needs_discussion",
@@ -2220,14 +2229,17 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and not ctx.has_non_dropped_implement_descendant
             and not ctx.auto_implement_enabled
         ),
-        action=lambda ctx: {
-            "type": "awaiting_human",
-            "description": (
-                f"Awaiting human review: review the plan, then run 'uv run gza implement {ctx.task.id}' "
-                "to create implementation, or drop it if you decided not to implement."
-            ),
-            "subject_task_id": ctx.task.id,
-        },
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "awaiting_human",
+                "description": (
+                    f"Awaiting human review: review the plan, then run 'uv run gza implement {ctx.task.id}' "
+                    "to create implementation, or drop it if you decided not to implement."
+                ),
+            },
+            reason="awaiting-human-review",
+            subject_task_id=ctx.task.id,
+        ),
     ),
     AdvanceRule(
         name="plan_needs_implement",
@@ -2680,10 +2692,14 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="implement_needs_manual_review",
         matches=lambda ctx: ctx.requires_review and not ctx.create_reviews,
-        action=lambda ctx: {
-            "type": "skip",
-            "description": "SKIP: no review exists and advance_create_reviews=false (run gza review manually)",
-        },
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": "SKIP: no review exists and advance_create_reviews=false (run gza review manually)",
+            },
+            reason="review-needs-manual-creation",
+            subject_task_id=ctx.task.id,
+        ),
     ),
     AdvanceRule(
         name="implement_no_review_required",
