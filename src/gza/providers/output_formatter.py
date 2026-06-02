@@ -6,6 +6,7 @@ from rich.console import Console
 from rich.markup import escape as rich_escape
 
 from ..colors import TaskStreamColors
+from ..console import build_console
 
 
 def format_runtime(seconds: int) -> str:
@@ -39,7 +40,7 @@ class StreamOutputFormatter:
     def __init__(self, console: Console | None = None, styles: TaskStreamColors | None = None):
         from ..colors import TASK_STREAM_COLORS, build_rich_theme
         self.styles = styles or TASK_STREAM_COLORS
-        self.console = console or Console(theme=build_rich_theme())
+        self.console = console or build_console(theme=build_rich_theme())
 
     def print_step_header(
         self,

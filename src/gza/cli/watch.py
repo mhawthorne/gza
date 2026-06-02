@@ -110,6 +110,8 @@ T = TypeVar("T")
 
 def _render_watch_stdout(line: str) -> Text:
     """Return watch stdout content with themed task IDs highlighted."""
+    # TODO(gza-4221): if watch stdout gains more themed spans, keep routing
+    # them through Rich Text on the shared console so `no_color` stays global.
     rendered = Text(line)
     for match in _WATCH_TASK_ID_TOKEN_RE.finditer(line):
         rendered.stylize(_colors.TASK_COLORS.task_id, match.start(), match.end())

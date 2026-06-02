@@ -16,7 +16,7 @@ from rich.text import Text
 import gza.colors as _colors
 
 from ..config import Config
-from ..console import console, format_duration, shorten_prompt, truncate
+from ..console import build_console, console, format_duration, shorten_prompt, truncate
 from ..db import SqliteTaskStore, Task as DbTask
 from ..providers.log_renderers import UnknownLogProviderError, get_log_renderer
 from ..providers.log_rendering import RenderStats
@@ -46,7 +46,7 @@ def _status_color(status: str) -> str:
 def _themed_console() -> Console:
     """Build a throwaway Console with the active Rich theme for rendering."""
     from ..colors import build_rich_theme
-    return Console(theme=build_rich_theme(), highlight=True)
+    return build_console(theme=build_rich_theme(), highlight=True)
 
 
 def _scan_log(log_path: Path, n: int, provider: str | None, configured_model: str | None = None) -> tuple[list[str], RenderStats]:

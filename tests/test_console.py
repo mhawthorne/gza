@@ -6,10 +6,13 @@ from rich.console import Console
 
 from gza.console import (
     _recommend_next_steps,
+    build_console,
+    colors_disabled,
     error_message,
     format_duration,
     get_terminal_width,
     info_line,
+    set_config_no_color,
     stats_line,
     task_footer,
     task_header,
@@ -218,6 +221,16 @@ def test_info_line(monkeypatch):
     rendered = output.getvalue()
     assert "Status" in rendered
     assert "running" in rendered
+
+
+def test_build_console_respects_shared_no_color_flag():
+    set_config_no_color(True)
+    try:
+        test_console = build_console()
+        assert colors_disabled() is True
+        assert test_console.no_color is True
+    finally:
+        set_config_no_color(False)
 
 
 # --- task_footer ---

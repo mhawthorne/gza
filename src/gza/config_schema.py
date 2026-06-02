@@ -98,6 +98,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("main_checkout_isolate", "bool", False, "Stage watch-time merges in a detached integration checkout before advancing the real default branch on success."),
     ConfigKeySpec("merge_squash_threshold", "int", 0, "Auto-squash threshold for merge operations."),
     ConfigKeySpec("model", "str", "", "Legacy global model fallback."),
+    ConfigKeySpec(
+        "no_color",
+        "bool",
+        False,
+        "Disable all Rich color/theming on TTYs; `NO_COLOR` still disables color regardless of this setting.",
+    ),
     ConfigKeySpec("reasoning_effort", "str", "", "Legacy global reasoning effort fallback (Codex)."),
     ConfigKeySpec(
         "project_id",

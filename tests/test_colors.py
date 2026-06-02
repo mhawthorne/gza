@@ -166,6 +166,7 @@ def test_ps_status_colors_keys() -> None:
 
 def test_stream_formatter_uses_themed_singleton() -> None:
     import gza.colors as c
+    from gza.console import set_config_no_color
     from gza.providers.output_formatter import StreamOutputFormatter
 
     try:
@@ -174,7 +175,32 @@ def test_stream_formatter_uses_themed_singleton() -> None:
         assert formatter.styles is c.TASK_STREAM_COLORS
         assert formatter.styles.step_header == c.TASK_STREAM_COLORS.step_header
     finally:
+        set_config_no_color(False)
         c.set_theme(None)
+
+
+def test_stream_formatter_respects_no_color_policy() -> None:
+    from gza.console import set_config_no_color
+    from gza.providers.output_formatter import StreamOutputFormatter
+
+    try:
+        set_config_no_color(True)
+        formatter = StreamOutputFormatter()
+        assert formatter.console.no_color is True
+    finally:
+        set_config_no_color(False)
+
+
+def test_tv_themed_console_respects_no_color_policy() -> None:
+    from gza.cli.tv import _themed_console
+    from gza.console import set_config_no_color
+
+    try:
+        set_config_no_color(True)
+        console = _themed_console()
+        assert console.no_color is True
+    finally:
+        set_config_no_color(False)
 
 
 def test_build_rich_theme_returns_none_when_empty() -> None:
@@ -734,3 +760,19 @@ class TestConfigThemeIntegration:
         )
         Config.load(tmp_path)
         assert c.TASK_COLORS.task_id == "#deadbe"
+
+    def test_config_with_no_color_stored_on_config_object(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
+        from gza.config import Config
+
+        cfg_file = tmp_path / "gza.yaml"
+        cfg_file.write_text("project_name: test\nno_color: true\n")
+        cfg = Config.load(tmp_path)
+        assert cfg.no_color is True
+
+    def test_config_with_invalid_no_color_raises(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
+        from gza.config import Config, ConfigError
+
+        cfg_file = tmp_path / "gza.yaml"
+        cfg_file.write_text("project_name: test\nno_color: nope\n")
+        with pytest.raises(ConfigError, match="no_color"):
+            Config.load(tmp_path)

@@ -18,7 +18,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
-from rich.console import Console
 from rich.markup import escape as rich_escape
 
 import gza.colors as _colors
@@ -27,6 +26,7 @@ from ..colors import PS_STATUS_COLORS, SHOW_COLORS_DICT
 from ..config import Config
 from ..console import (
     MAX_PROMPT_DISPLAY,
+    build_console,
     console,
     prompt_available_width,
     shorten_prompt,
@@ -121,7 +121,7 @@ from .advance_engine import (
 _LINEAGE_REL_LABELS = _QUERY_LINEAGE_REL_LABELS
 _QueryDateField = Literal["created", "completed", "effective"]
 _PresentationMode = Literal["flat", "blocks", "grouped", "lineage", "tree", "one_line", "json", "rich"]
-_stderr_console = Console(highlight=False, stderr=True)
+_stderr_console = build_console(highlight=False, stderr=True)
 _HISTORY_PROJECTION_FIELDS: tuple[str, ...] = _projection_fields(
     _TaskProjectionSpec(preset=_TaskProjectionPreset.HISTORY_DEFAULT),
     scope="tasks",

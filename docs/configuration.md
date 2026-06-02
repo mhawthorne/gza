@@ -65,7 +65,8 @@ Gza reads configuration from three YAML layers:
 | `watch` | Dict | `{batch: 5, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, restart_failed_batch: 1}` | Defaults for `gza watch` loop behavior |
 | `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
 | `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
-| `theme` | String | *(none)* | Built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. Override with `gza.local.yaml`. |
+| `theme` | String | `minimal` | Built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. Override with `gza.local.yaml`. |
+| `no_color` | Boolean | `false` | Disable all color/theming, even on a TTY. Equivalent to persistent `NO_COLOR=1`; effective behavior is `no_color OR NO_COLOR`. |
 | `colors` | Dict | `{}` | Ad-hoc map of `field_name: rich_color_string` applied on top of `theme` (highest priority). Allowed in `gza.local.yaml`. |
 
 ### Project Scope Enforcement
@@ -97,7 +98,7 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `require_review_before_merge`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `colors`
+`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `require_review_before_merge`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`
@@ -170,6 +171,14 @@ Set a theme in `gza.yaml` or `gza.local.yaml`:
 ```yaml
 theme: default_dark
 ```
+
+Disable all color persistently:
+
+```yaml
+no_color: true
+```
+
+`NO_COLOR` remains supported and wins whenever it is set. Effective behavior is a logical OR: if either `no_color: true` or `NO_COLOR` is present, Gza emits plain text with no ANSI color codes.
 
 #### Ad-hoc color overrides
 

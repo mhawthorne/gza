@@ -59,6 +59,7 @@ DEFAULT_PROVIDER = "claude"  # "claude", "codex", or "gemini"
 KNOWN_PROVIDERS = ("claude", "codex", "gemini")
 DEFAULT_CHAT_TEXT_DISPLAY_LENGTH = 0  # 0 means unlimited (show all)
 DEFAULT_BRANCH_STRATEGY = "monorepo"  # Default branch naming strategy
+DEFAULT_NO_COLOR = False
 DEFAULT_CLAUDE_ARGS = [
     "--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash",
 ]
@@ -113,7 +114,7 @@ VALID_CONFIG_FIELDS = {
     "code_task_diff_timeout_medium_minutes", "code_task_diff_timeout_large_minutes",
     "code_task_diff_timeout_cap_minutes",
     "recommend_rebase_behind_commits", "tmux", "learnings_window",
-    "learnings_interval", "learnings_max_items", "theme", "colors",
+    "learnings_interval", "learnings_max_items", "theme", "colors", "no_color",
 }
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "db_path": None,
@@ -210,6 +211,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "code_task_diff_timeout_cap_minutes": None,
     "recommend_rebase_behind_commits": None,
     "theme": None,
+    "no_color": None,
     "colors": {
         "*": None,
     },
@@ -312,6 +314,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "learnings_interval": None,
     "learnings_max_items": None,
     "theme": None,
+    "no_color": None,
     "colors": {
         "*": None,
     },
@@ -908,6 +911,7 @@ class Config:
     learnings_max_items: int = DEFAULT_LEARNINGS_MAX_ITEMS
     tmux: TmuxConfig = field(default_factory=TmuxConfig)  # Tmux session configuration
     theme: str | None = "minimal"  # Named color theme (default: 'minimal')
+    no_color: bool = DEFAULT_NO_COLOR
     colors: dict[str, str] = field(default_factory=dict)  # Ad-hoc per-field color overrides
     source_map: dict[str, str] = field(default_factory=dict)  # Key source attribution (base/user/local/env)
     user_config_file: Path | None = None
@@ -2041,9 +2045,18 @@ class Config:
                 raise ConfigError("'colors' keys and values must both be strings")
             colors[k] = v
 
+        no_color = data.get("no_color", DEFAULT_NO_COLOR)
+        if not isinstance(no_color, bool):
+            raise ConfigError("'no_color' must be a boolean")
+
+        from .console import set_config_no_color as _set_config_no_color  # noqa: PLC0415
+
         # Apply theme to module-level color singletons so all subsequent code
         # sees the correct themed values when accessing gza.colors.*.
         _set_theme(theme_name, colors)
+        # Config no_color and NO_COLOR are a logical OR. Consoles consult the
+        # environment directly, so only the config bit needs to be persisted here.
+        _set_config_no_color(no_color)
 
         return cls(
             project_dir=project_dir,
@@ -2103,6 +2116,7 @@ class Config:
             learnings_max_items=learnings_max_items,
             tmux=tmux_config,
             theme=theme_name,
+            no_color=no_color,
             colors=colors,
             source_map=source_map,
             user_config_file=user_config_path,

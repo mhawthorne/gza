@@ -1,8 +1,10 @@
 """Rich console output helpers for gza."""
 
+import os
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+from weakref import WeakKeyDictionary, WeakSet
 
 from rich.console import Console
 
@@ -33,12 +35,53 @@ __all__ = [
     "MAX_PR_BODY_LENGTH",
 ]
 
+_REGISTERED_CONSOLES: WeakSet[Console] = WeakSet()
+_REGISTERED_COLOR_SYSTEMS: WeakKeyDictionary[Console, Any] = WeakKeyDictionary()
+_CONFIG_NO_COLOR = False
+
+
+def _env_disables_color() -> bool:
+    """Return True when the standard NO_COLOR environment variable is set."""
+    return "NO_COLOR" in os.environ
+
+
+def colors_disabled() -> bool:
+    """Return whether colorized Rich output must be disabled."""
+    return _CONFIG_NO_COLOR or _env_disables_color()
+
+
+def _register_console(console_obj: Console) -> Console:
+    """Track console instances so config changes can update them in place."""
+    _REGISTERED_CONSOLES.add(console_obj)
+    _REGISTERED_COLOR_SYSTEMS[console_obj] = getattr(console_obj, "_color_system", None)
+    return console_obj
+
+
+def build_console(**kwargs) -> Console:
+    """Build a Console that honors the shared no-color policy."""
+    kwargs.setdefault("no_color", colors_disabled())
+    return _register_console(Console(**kwargs))
+
+
+def set_config_no_color(enabled: bool) -> None:
+    """Persist the config no-color flag and update existing consoles."""
+    global _CONFIG_NO_COLOR
+    _CONFIG_NO_COLOR = enabled
+    disabled = colors_disabled()
+    for console_obj in list(_REGISTERED_CONSOLES):
+        console_obj.no_color = disabled
+        if disabled:
+            console_obj._color_system = None
+        else:
+            console_obj._color_system = _REGISTERED_COLOR_SYSTEMS.get(console_obj, None)
+
+
 # Shared console instance for all output. ``highlight=False`` disables Rich's
 # default ReprHighlighter so numbers, paths, strings etc. aren't implicitly
 # bolded/colored — every style in this module is explicit via markup. The
 # provider stream console is separate and keeps highlighting enabled because
 # it renders arbitrary provider output we don't control.
-console = Console(highlight=False)
+console = build_console(highlight=False)
 
 # Display truncation constants
 MAX_PROMPT_DISPLAY_SHORT = 50
