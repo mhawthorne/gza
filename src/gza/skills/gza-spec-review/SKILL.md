@@ -12,12 +12,12 @@ Run an interactive quality gate for a specific spec file before implementation s
 
 ## Inputs
 
-- Required: path to a spec file (e.g. `specs/foo.md`)
+- Required: path to a feature spec file (e.g. `specs/features/foo.md`)
 
 If the user did not provide a spec path, ask for it before proceeding.
 
 Normalize spec paths:
-- If input is just a filename like `foo.md`, expand to `specs/foo.md`
+- If input is just a filename like `foo.md`, expand to `specs/features/foo.md`
 - If the file does not exist, stop and report the error
 
 ## Process

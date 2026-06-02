@@ -8,7 +8,10 @@ public: true
 
 # Spec Review Skill
 
-Review specification documents in `specs/` for accuracy against the current implementation.
+Review **feature specs** in `specs/features/` for accuracy against the current
+implementation. Behavior specs in `specs/behavior/` are out of scope here — those are
+prescriptive requirements checked in the opposite direction by `gza-behavior-check`, not
+descriptive specs to flag as outdated.
 
 ## When to Use
 
@@ -31,7 +34,7 @@ When in doubt, flag it with a note that it "may be aspirational."
 ### Step 1: Discover specs
 
 ```bash
-ls specs/
+ls specs/features/
 ```
 
 ### Step 2: For each spec, verify against implementation
@@ -76,8 +79,8 @@ For each spec, assign one of:
 When unsure if a spec is aspirational or outdated:
 
 ```bash
-git log --oneline -1 specs/<file>.md
-git blame specs/<file>.md | head -5
+git log --oneline -1 specs/features/<file>.md
+git blame specs/features/<file>.md | head -5
 ```
 
 - **Recent specs** (last few weeks) are more likely aspirational

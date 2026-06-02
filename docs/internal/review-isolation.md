@@ -48,7 +48,7 @@ needed; the three-dot operator already does it.
 
 **Review never reasons about origin or remote freshness.** Keeping local trunk current is a separate
 concern — the sync layer's job, at defined boundaries (see
-[`specs/distributed-sync-engine.md`](../../specs/distributed-sync-engine.md)) — not review's. By the
+[`specs/features/distributed-sync-engine.md`](../../specs/features/distributed-sync-engine.md)) — not review's. By the
 time review runs, it simply diffs against whatever local trunk is. Do not add origin fallbacks, a
 local-vs-origin "pick latest" heuristic, or path/project filtering to the review base.
 
