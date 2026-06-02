@@ -43,6 +43,7 @@ from gza.cli.watch import (
     _WatchLog,
     cmd_watch,
 )
+from gza.cli.advance_executor import AdvanceActionExecutionResult
 from gza.config import Config
 from gza.git import GitError
 from gza.lineage_query import LineageOwnerRow
@@ -7036,6 +7037,75 @@ def test_watch_cycle_dedupes_wait_review_skip_across_cycles(tmp_path: Path) -> N
     text = log_path.read_text()
     assert text.count("SKIP") == 1
     assert text.count("ATTENTION") == 0
+
+
+def test_watch_cycle_escalates_recurring_guarded_pending_skip_to_attention(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A repeated guarded pending skip should surface as attention on the second pass."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Completed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/guarded-pending-skip"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    pending_review = store.add("Pending review", task_type="review", depends_on=impl.id)
+    assert pending_review.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=False)
+    exec_result = AdvanceActionExecutionResult(
+        action_type="run_review",
+        status="skip",
+        message=(
+            f"review task {pending_review.id} resolves to {impl.id}, "
+            f"not completed task {impl.id}-other"
+        ),
+        guarded_pending_task_id=pending_review.id,
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.determine_next_action", return_value={"type": "run_review", "review_task": pending_review}),
+        patch("gza.cli.watch.execute_advance_action", return_value=exec_result),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("guarded pending task should stay suppressed")),
+    ):
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+        first_pass = log_path.read_text()
+        assert "ATTENTION" not in first_pass
+        assert "Needs attention (1 task):" not in first_pass
+        assert "SKIP" in first_pass
+
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+
+    text = log_path.read_text()
+    stdout = capsys.readouterr().out
+    attention_lines = [line for line in text.splitlines() if "ATTENTION" in line]
+    assert len(attention_lines) == 1
+    assert (
+        f'{pending_review.id} review "Pending review" reason=guarded-pending-skip '
+        f'{exec_result.message}; will not run automatically'
+    ) in attention_lines[0]
+    assert "Needs attention (1 task):" in text
+    assert "Summary:" not in text
+    assert (
+        text.count(
+            f'{pending_review.id} review "Pending review" reason=guarded-pending-skip '
+            f'{exec_result.message}; will not run automatically'
+        )
+        == 2
+    )
+    assert "Needs attention (1 task):" in stdout
+    assert text.count("SKIP") == 1
 
 
 def test_watch_log_inserts_blank_line_between_cycles(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

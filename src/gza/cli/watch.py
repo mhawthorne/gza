@@ -70,6 +70,7 @@ from .advance_engine import (
     format_needs_attention_entry_for_display,
     get_needs_attention_reason,
     resolve_subject_task,
+    with_needs_attention,
 )
 from .advance_executor import (
     ITERATE_ROUTABLE_ACTIONS,
@@ -158,6 +159,45 @@ def _watch_skip_message(task: DbTask, action: dict) -> str:
 
 def _watch_needs_attention_message(task: DbTask, action: dict) -> str:
     return format_needs_attention_entry_for_display(task, action=action)
+
+
+def _build_guarded_pending_skip_attention(
+    pending_task: DbTask,
+    *,
+    guard_message: str,
+) -> dict[str, Any]:
+    return with_needs_attention(
+        {
+            "type": "skip",
+            "description": f"SKIP: {guard_message}; will not run automatically",
+        },
+        reason="guarded-pending-skip",
+        subject_task_id=pending_task.id,
+    )
+
+
+def _maybe_emit_recurring_guarded_pending_skip_attention(
+    *,
+    store: SqliteTaskStore,
+    log: "_WatchLog",
+    guarded_pending_task_id: str | None,
+    guard_message: str,
+) -> None:
+    if guarded_pending_task_id is None:
+        return
+    pending_task = store.get(str(guarded_pending_task_id))
+    if pending_task is None or pending_task.id is None:
+        return
+    attention = _build_guarded_pending_skip_attention(
+        pending_task,
+        guard_message=guard_message,
+    )
+    attention_key = f"guarded-pending-skip:{pending_task.id}"
+    attention_message = _watch_needs_attention_message(pending_task, attention)
+    if log._sticky_attention_prev_cycle.get(attention_key) == attention_message:
+        log.emit_attention(attention_key=attention_key, message=attention_message)
+        return
+    log._sticky_attention_this_cycle[attention_key] = attention_message
 
 
 def _watch_parked_lineage_action(row: LineageOwnerRow) -> dict[str, Any] | None:
@@ -689,6 +729,7 @@ class _WatchLog:
         self._skip_keys_this_cycle: set[str] = set()
         self._sticky_attention_prev_cycle: dict[str, str] = {}
         self._sticky_attention_this_cycle: dict[str, str] = {}
+        self._visible_attention_this_cycle: dict[str, str] = {}
 
     def begin_cycle(self) -> None:
         if self._has_emitted_cycle:
@@ -698,6 +739,7 @@ class _WatchLog:
                 print(flush=True)
         self._skip_keys_this_cycle.clear()
         self._sticky_attention_this_cycle.clear()
+        self._visible_attention_this_cycle.clear()
         self._has_emitted_cycle = True
 
     def end_cycle(self) -> None:
@@ -709,7 +751,11 @@ class _WatchLog:
         if previous_message == message:
             return
         self._sticky_attention_this_cycle[attention_key] = message
+        self._visible_attention_this_cycle[attention_key] = message
         self.emit("ATTENTION", message)
+
+    def visible_attention_messages(self) -> tuple[str, ...]:
+        return tuple(self._visible_attention_this_cycle.values())
 
     def emit(self, event: str, message: str, *, dedupe_key: str | None = None) -> None:
         if event == "SKIP" and dedupe_key is not None:
@@ -990,6 +1036,16 @@ def _collect_unhandled_failures(
             )
         )
     return failures
+
+
+def _emit_cycle_attention_summary(log: _WatchLog) -> None:
+    messages = log.visible_attention_messages()
+    if not messages:
+        return
+    plural = "s" if len(messages) != 1 else ""
+    lines = [f"{NEEDS_ATTENTION_LABEL} ({len(messages)} task{plural}):"]
+    lines.extend(f"  {message}" for message in messages)
+    log.emit("INFO", "\n".join(lines))
 
 
 def _emit_recovery_dry_run_report(
@@ -1615,6 +1671,12 @@ def _run_cycle(
                 message = exec_result.message
                 if action_type == "improve" and display_task.id is not None:
                     message = f"{display_task.id}: {message}"
+                _maybe_emit_recurring_guarded_pending_skip_attention(
+                    store=store,
+                    log=log,
+                    guarded_pending_task_id=guarded_pending_task_id,
+                    guard_message=exec_result.message,
+                )
                 attention = resolve_execution_needs_attention(task, exec_result)
                 if attention is not None and display_task.id is not None:
                     attention_task = getattr(attention, "task", display_task)
@@ -2083,6 +2145,7 @@ def _run_cycle(
             log.emit("START", f"{task.id} {task_type} \"{started_prompt}\"")
 
     pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
+    _emit_cycle_attention_summary(log)
     log.end_cycle()
     return _CycleResult(
         work_done=work_done,
