@@ -73,7 +73,7 @@ Use `/gza-docs-review` to audit gza's documentation before a release or after ad
 - Discovers all docs under `docs/`, `README.md`, and related root files
 - Verifies CLI docs against actual `--help` output to catch missing commands, wrong flags, or deprecated features
 - Checks internal consistency: working links, consistent terminology, current examples
-- Also reviews `specs/` directory for outdated or aspirational specs (flags issues without auto-updating)
+- Also reviews `specs/features/` directory for outdated or aspirational feature specs (flags issues without auto-updating)
 - Writes findings to `reviews/<timestamp>-docs-review.md`
 
 **Output sections:**

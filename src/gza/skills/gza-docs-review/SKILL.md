@@ -196,9 +196,11 @@ Based on patterns across projects, commonly missing items:
 
 ---
 
-## Part 2: Spec Review
+## Part 2: Feature Spec Review
 
-Review specification documents in `specs/` for accuracy against the current implementation.
+Review **feature specs** in `specs/features/` for accuracy against the current
+implementation. (Behavior specs in `specs/behavior/` are prescriptive requirements checked
+separately by `gza-behavior-check`; do not review them here.)
 
 ### Important: Aspirational vs Outdated
 
@@ -212,7 +214,7 @@ When in doubt, flag it with a note that it "may be aspirational."
 ### Step 1: Discover specs
 
 ```bash
-ls specs/
+ls specs/features/
 ```
 
 ### Step 2: Review each spec
