@@ -74,6 +74,22 @@ def test_agents_document_pytest_hang_triage_rules() -> None:
         assert snippet in agents_content
 
 
+def test_behavior_specs_cross_link_watch_supervisor_boundary() -> None:
+    """Behavior-spec index and engine overview should keep the supervisor boundary explicit."""
+    repo_root = Path(__file__).resolve().parents[1]
+    behavior_readme = (repo_root / "specs" / "behavior" / "README.md").read_text()
+    overview = (repo_root / "specs" / "behavior" / "00-overview.md").read_text()
+    engine = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    supervisor = (repo_root / "specs" / "behavior" / "watch-supervisor.md").read_text()
+
+    assert "[watch-supervisor.md](watch-supervisor.md)" in behavior_readme
+    assert "slot accounting, detached-worker adoption, drift restart, and pass ordering live" in overview
+    assert 'The pass-ordering invariant "land fresh code first" is owned by' in overview
+    assert "Cycle cadence, slot accounting, detached-worker adoption, and watch-process restart are" in engine
+    assert "## Boundary with the engine" in supervisor
+    assert "Installed-code drift triggers re-exec at the next" in supervisor
+
+
 def test_practices_document_gitignored_derived_artifacts_as_non_blockers() -> None:
     """Internal practices should forbid review blockers on gitignored installed artifacts."""
     repo_root = Path(__file__).resolve().parents[1]

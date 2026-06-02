@@ -19,6 +19,13 @@ This document specifies that lifecycle as a state machine. It is the answer to:
 - When does a merge happen?
 - **When must a human get involved, and how do they clear it?**
 
+It does **not** specify the long-running runtime loop that drives those decisions. Cycle
+cadence, slot accounting, detached-worker adoption, drift restart, and pass ordering live
+in [watch-supervisor.md](watch-supervisor.md). Read this overview plus
+[lifecycle-engine.md](lifecycle-engine.md) for the pure per-work-unit decision function;
+read [watch-supervisor.md](watch-supervisor.md) for the operational contract that drives
+those decisions continuously.
+
 ## Vocabulary (the data model, abstractly)
 
 The contract is defined over these concepts, independent of how they are stored.
@@ -116,9 +123,7 @@ These hold across the whole machine; the detailed rules in
    state — it MUST NOT loop forever and MUST NOT silently give up. The *existence and
    enforcement* of each bound is invariant; the specific bound *values* are tunable
    policy knobs, not contract (see [lifecycle-engine.md](lifecycle-engine.md)).
-3. **Land fresh code first.** Within a pass, merges execute before new workers spawn, so
-   later work rebases onto the freshest target.
-4. **Review is the universal pre-merge checkpoint** (policy `require_review_before_merge`,
+3. **Review is the universal pre-merge checkpoint** (policy `require_review_before_merge`,
    default on). When on, an implementation work unit MUST have a current, valid review
    *whose verdict permits merge* before it can merge. The **verdict is the gate**:
    `CHANGES_REQUESTED` blocks; `APPROVED` and `APPROVED_WITH_FOLLOWUPS` permit merge — the
@@ -126,14 +131,18 @@ These hold across the whole machine; the detailed rules in
    non-blocking later work. When a verdict carries follow-ups, those follow-ups MUST be
    durably recorded as tracked work *before* the merge completes, so nothing is lost.
    This is the one human-or-agent quality gate the whole pipeline is built around.
-5. **The local target branch is canonical.** Merge-ness MUST be proven against the local
+4. **The local target branch is canonical.** Merge-ness MUST be proven against the local
    target branch, never against `origin/<target>`. The engine MUST NOT push the target
    branch as a side effect of merging.
-6. **Never destroy work to make progress.** The engine MUST NOT delete branches and MUST
+5. **Never destroy work to make progress.** The engine MUST NOT delete branches and MUST
    NOT discard a human's uncommitted work. Branch cleanup is an operator concern.
-7. **No orphans left pending.** Work that can never progress (moot, superseded, orphaned)
+6. **No orphans left pending.** Work that can never progress (moot, superseded, orphaned)
    MUST be surfaced for an explicit drop decision, not left silently pending — pending
    work gets run.
+
+The pass-ordering invariant "land fresh code first" is owned by
+[watch-supervisor.md](watch-supervisor.md), because it constrains the supervisor's cycle
+execution order rather than the engine's per-work-unit decision function.
 
 ## Human-escalation table
 

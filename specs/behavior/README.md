@@ -67,13 +67,13 @@ Additional rules for authors:
 |-----|-------|--------|
 | [00-overview.md](00-overview.md) | The lifecycle state machine: states, transition diagram, and the consolidated human-escalation table. | Draft — invariants + 5 decisions ratified 2026-06-01 |
 | [lifecycle-engine.md](lifecycle-engine.md) | The prescriptive transition rules the engine evaluates each pass (plan → implement → review → improve → rebase → merge). | Draft — 5 decisions ratified 2026-06-01 |
+| [watch-supervisor.md](watch-supervisor.md) | The prescriptive runtime/supervisor contract for `gza watch`: cycle order, slot accounting, detached-worker adoption, drift re-exec, scope, and stop/backoff rules. | Draft — north-star runtime contract pending conformance pass |
 
 ### Planned (not yet written)
 
 These follow the same template once the lifecycle engine above is settled:
 
 - CLI interface contract (the observable command surface and its guarantees)
-- Concurrency & watch loop (batching, worker accounting, drift/restart)
 - Recovery & failure (resume vs retry vs give-up policy)
 - Merge units & lineage (the ownership model that defines a "unit of work")
 </content>

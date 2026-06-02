@@ -9,6 +9,8 @@
 > *Implementation note (non-normative): today this logic lives in the shared rule
 > evaluator behind `gza advance`, and is reused by `gza iterate` and `gza watch`. The
 > rules below are the intended behavior; the code is the thing measured against them.*
+> Cycle cadence, slot accounting, detached-worker adoption, and watch-process restart are
+> intentionally out of scope here; see [watch-supervisor.md](watch-supervisor.md).
 
 ## How the engine decides
 
@@ -79,7 +81,7 @@ configuration, not a spec violation.
 - `auto_implement` defaults **on**. A completed `plan` with no implement child MUST create
   and run its `implement` unless holding was explicitly chosen at plan-creation time. This
   keeps `awaiting_human` rare: the plan stage is not a routine human checkpoint — the
-  review-before-merge gate is (P-overview-4).
+  review-before-merge gate is (P-overview-3).
 - A completed `plan` explicitly held for review (`auto_implement` off) MUST go to
   `awaiting_human` with parked reason `awaiting-human-review`.
 - A completed `explore` with no plan/implement follow-up MUST go to `needs_discussion`
@@ -162,7 +164,7 @@ When a current review exists for the implementation lineage:
 - Verdict `APPROVED_WITH_FOLLOWUPS` with ≥1 parsed follow-up, review still valid →
   `merge_with_followups` (create/reuse follow-up implement tasks, then merge). The
   follow-up tasks MUST be durably recorded *before* the merge completes (overview
-  invariant 4); the merge MUST NOT proceed if its follow-ups could not be persisted.
+  invariant 3); the merge MUST NOT proceed if its follow-ups could not be persisted.
 - Verdict `APPROVED_WITH_FOLLOWUPS` with **zero** parsed follow-ups → `needs_discussion`
   (P3: self-contradictory output; do not guess).
 - Verdict `CHANGES_REQUESTED`:
@@ -277,9 +279,9 @@ open work is limited to the **†** rows whose producing rules still need to be 
 Settled 2026-06-01 (previously open questions). These are now contract; the rationale is
 kept for future readers.
 
-1. **`APPROVED_WITH_FOLLOWUPS` merges, then files follow-ups** (§6, invariant 4). The
+1. **`APPROVED_WITH_FOLLOWUPS` merges, then files follow-ups** (§6, invariant 3). The
    verdict *is* the gate; the reviewer chose the non-blocking door. No behavior change —
-   invariant 4's wording was sharpened, with a new MUST that follow-ups are persisted
+   invariant 3's wording was sharpened, with a new MUST that follow-ups are persisted
    before the merge completes. Best serves minimizing human involvement.
 2. **`auto_implement` defaults on** (§1). Holding is a manual opt-in at plan creation; the
    plan stage is not a routine human checkpoint. *Forward-looking:* an automatic

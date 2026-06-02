@@ -1,0 +1,204 @@
+# Watch supervisor — runtime contract
+
+> **Status: Draft.** This document is the prescriptive contract for the runtime loop that
+> drives the lifecycle engine. It is written as the intended north-star behavior for
+> `gza watch`; code may still lag parts of it pending conformance work.
+>
+> Read [00-overview.md](00-overview.md) for the lifecycle state machine and
+> [lifecycle-engine.md](lifecycle-engine.md) for the pure per-work-unit decision
+> function. This document owns the *loop that drives those decisions*: cycle cadence,
+> worker accounting, restart/adoption, and process-level ordering.
+
+## What this models
+
+gza has two distinct layers that MUST NOT be conflated:
+
+- The **lifecycle engine** decides, for one unresolved work unit, what the next action is
+  (`merge`, `create_review`, `needs_rebase`, `wait`, `needs_discussion`, and so on).
+- The **watch supervisor** decides when to run those decisions, how many workers may run
+  at once, what order cycle phases execute in, and how a long-running watch process
+  survives interruption, restart, and installed-code drift.
+
+This document answers questions the engine spec intentionally does not:
+
+- What is one watch cycle?
+- How is available concurrency computed?
+- When MUST watch wait instead of spawning?
+- How does a restarted watch adopt already-running detached workers?
+- When does watch re-exec itself to load new code?
+- When does watch stop, back off, or require a human?
+
+## Principles this layer must satisfy
+
+- **S1 — The supervisor drives; the engine decides.** The supervisor MUST reuse the
+  shared lifecycle/recovery decision machinery. It MUST NOT fork command-specific
+  transition rules for `watch`.
+- **S2 — Process-level idempotency.** Re-running or restarting `watch` with no external
+  state change MUST NOT double-spawn workers, duplicate recovery, or double-merge work.
+- **S3 — Interruptible and restart-safe.** `watch` MUST be safe to stop and restart at any
+  cycle boundary. Detached workers MUST continue independently, and the next `watch`
+  process MUST adopt them instead of respawning equivalent work.
+- **S4 — Land fresh code first.** Within a cycle, direct landing work MUST execute before
+  new worker spawns, so later worker starts evaluate against the freshest landed target.
+- **S5 — Scope is explicit.** When tag filters are active, watch MUST act only on
+  in-scope work: merges, recovery, new starts, queue pickup, and operator summaries.
+- **S6 — Bounded operator-visible degradation.** Repeated failures, backoff, drift
+  restart, idle exit, and human-needed parked states MUST surface explicit operator
+  signals. Watch MUST NOT silently stall.
+
+## Core invariants
+
+### 1. One cycle has a fixed order
+
+Each watch cycle MUST execute these phases in order:
+
+1. **Reconcile runtime state.** Reap or reconcile stale in-progress state, then discover
+   live detached workers and live in-progress tasks.
+2. **Compute capacity.** Derive current `running` and `slots`.
+3. **Evaluate direct lifecycle work first.** Execute merge-ready and other direct
+   non-worker actions before spawning any new workers (S4).
+4. **Spend slots on worker-consuming actions.** Use remaining capacity for recovery and
+   lifecycle worker starts selected by the shared engine.
+5. **Observe outcomes.** Emit operator-visible events for starts, merges, waits, skips,
+   parked states, recovery decisions, and failures.
+6. **Decide the next boundary.** Stop, back off, re-exec, idle-exit, or sleep until the
+   next poll interval.
+
+The supervisor MUST NOT reorder these phases in a way that can cause older target-branch
+state to win over already-mergeable fresh code.
+
+### 2. Cadence and sleep are policy, but cycle boundaries are real
+
+- `watch.poll` / `--poll` define the steady-state delay between completed cycles.
+- The supervisor MUST sleep only *between* cycles, never in the middle of a partially
+  evaluated cycle.
+- `watch.max_idle` / `--max-idle` bound consecutive idle supervisor time. When reached,
+  watch MUST exit cleanly rather than spin forever doing no work.
+- `watch.max_iterations` / `--max-iterations` are **not** a supervisor loop bound. They
+  bound iterate workers launched for implementation chains. Watch MUST pass that budget to
+  those workers, but MUST NOT treat it as "run only N watch cycles."
+
+### 3. Concurrency uses live-slot accounting
+
+The batch limit means "maintain at most N concurrent detached worker processes," not
+"spawn N workers per cycle."
+
+- `running` MUST count live detached workers, including detached-session workers that
+  outlive the current watch process.
+- Live-worker accounting MUST consider both the worker registry and persisted in-progress
+  task state. Either source alone is insufficient after crashes or restarts.
+- Stale or dead worker state MUST be reconciled before capacity is computed.
+- `slots` MUST equal `max(0, batch - running)`.
+- Only worker-consuming actions spend a slot. Direct actions such as merge,
+  merge-with-followups, scope evaluation, re-exec decisions, and attention emission MUST
+  NOT consume slots.
+- One detached iterate chain occupies one slot for as long as its worker process remains
+  live, even though that worker may drive several engine steps internally.
+
+### 4. In-progress work causes wait, not respawn
+
+This is the process-level expression of overview invariant 1.
+
+- If the needed work for a lineage already exists as `pending` or `in_progress`, watch
+  MUST wait/adopt that work rather than create another child for the same step.
+- If a worker is already live for the implementation lineage an iterate start would own,
+  watch MUST NOT start a second iterate worker for that lineage.
+- Re-running watch after a crash, operator restart, or code re-exec MUST NOT treat
+  detached workers as lost merely because the old parent process exited.
+
+### 5. Restarted watch adopts live workers
+
+Watch workers are detached on purpose. A restarted supervisor MUST adopt them.
+
+- On startup and on each cycle, watch MUST reconcile in-progress state and collect live
+  running state from detached-worker metadata plus persisted task state.
+- If a live worker is still driving a task or lineage that remains in scope, the
+  supervisor MUST treat that work as already running and reduce available slots
+  accordingly.
+- Adoption MUST happen before any new worker selection for the cycle.
+- Watch MUST NOT require a "drain everything, then restart" gate to stay correct.
+
+### 6. Installed-code drift triggers re-exec at the next cycle boundary
+
+When the installed `gza` package fingerprint changes while watch is running:
+
+- Watch MUST detect the drift and mark a pending self-restart.
+- With automatic drift restart enabled, watch MUST re-exec at the **next cycle
+  boundary**, regardless of current running-worker count, pending-work count, or whether
+  the queue is idle.
+- The contract MUST NOT require a drain-first or "only when no workers are active" gate.
+- Detached workers survive supervisor process re-exec; the restarted watch MUST adopt
+  them under invariant 5.
+- When automatic drift restart is disabled, watch MUST still surface the drift to the
+  operator and MUST NOT pretend the old process loaded the new code.
+
+### 7. Failure backoff is bounded and visible
+
+- Newly observed failures that the shared recovery policy does not auto-resume/retry MUST
+  increment the watch failure streak.
+- The sleep before starting more work MUST use the configured exponential backoff policy
+  (`watch.failure_backoff_initial`, `watch.failure_backoff_max`).
+- When `watch.failure_halt_after` is reached, watch MUST stop for human intervention
+  instead of continuing to launch more work.
+- A nonzero failure streak and each backoff/halt decision MUST be operator-visible.
+- Watch MUST reuse the shared bounded recovery policy; it MUST NOT invent a different
+  resume/retry/manual boundary from `advance` or `iterate`.
+
+### 8. Tag scope is a hard boundary
+
+- `watch --tag ...` MUST only act on work that matches the requested scope.
+- Out-of-scope work MUST NOT consume watch slots, be merged, be resumed/retried, or be
+  selected from the pending queue by that watch process.
+- Scope banners, wake summaries, and attention output SHOULD make the active scope
+  explicit so operators can tell when watch is intentionally ignoring other work.
+
+### 9. Stop signals stop the supervisor, not the detached workers
+
+- On `SIGINT` or `SIGTERM`, watch MUST stop the supervisor loop cleanly at the next safe
+  boundary and return a signal-derived exit status.
+- Watch MUST NOT kill detached child workers merely because the supervisor is stopping.
+- A second interrupt MAY short-circuit a long sleep or long pass so the operator can
+  regain control promptly, but it MUST NOT convert normal shutdown into "kill every
+  worker."
+
+## What watch does not do
+
+These are exclusions in the contract, not omissions in the current implementation.
+
+- Watch MUST NOT define its own lifecycle transition rules; that belongs to
+  [lifecycle-engine.md](lifecycle-engine.md).
+- Watch MUST NOT create task goals or budget policy beyond the queued and lineage-derived
+  work already in scope.
+- Watch MUST NOT require daemonization, PID files, or an internal multi-threaded worker
+  pool to satisfy this contract. Detached external workers are sufficient.
+- Watch MUST NOT rely on an internal parallel executor pool; its concurrency model is
+  detached worker processes plus supervisor polling.
+- Watch MUST NOT kill, reset, or discard code work solely to make the loop progress.
+- Watch MUST NOT widen scope past explicit tag filters.
+
+## Policy knobs this layer owns
+
+The existence of these knobs is contract; their values are operator policy.
+
+| Knob | Governs |
+|------|---------|
+| `watch.batch` | Maximum concurrent detached worker processes the supervisor maintains |
+| `watch.poll` | Delay between completed cycles |
+| `watch.max_idle` | Consecutive idle loop time before clean exit |
+| `watch.max_iterations` | Iterate-worker loop cap for implementation chains launched by watch |
+| `watch.failure_backoff_initial` / `watch.failure_backoff_max` | Exponential cooldown after non-auto-resumable failures |
+| `watch.failure_halt_after` | Failure streak threshold that stops watch for human intervention |
+| `watch.no_activity_timeout` | Reconciliation threshold for deciding a live in-progress worker has gone silent and must be failed/reconciled |
+| `--tag` / `--any-tag` | Supervisor execution scope |
+| `--[no-]auto-restart-on-drift` | Whether installed-code drift triggers automatic re-exec at the next cycle boundary |
+
+## Boundary with the engine
+
+- The engine spec owns **what next action a work unit needs**.
+- This supervisor spec owns **when that action runs, whether it consumes a slot, and
+  whether the current watch process waits, restarts, or exits**.
+
+Any rule that depends on cycle order, slot accounting, detached-process adoption, or
+watch-process restart belongs here even if it influences lifecycle outcomes. Any rule that
+depends only on the state of one work unit belongs in
+[lifecycle-engine.md](lifecycle-engine.md).
