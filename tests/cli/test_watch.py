@@ -1,6 +1,8 @@
 """Tests for `gza watch` scheduler behavior."""
 
 import argparse
+import io
+import re
 import signal
 import subprocess
 import sys
@@ -10,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from rich.console import Console
 
 from gza.cli.git_ops import (
     _execute_merge_action,
@@ -44,6 +47,7 @@ from gza.cli.watch import (
     cmd_watch,
 )
 from gza.cli.advance_executor import AdvanceActionExecutionResult
+import gza.colors as colors
 from gza.config import Config
 from gza.git import GitError
 from gza.lineage_query import LineageOwnerRow
@@ -2560,6 +2564,36 @@ def test_watch_log_aligns_multiline_messages(tmp_path: Path) -> None:
         "                   live workers:\n"
         "                   - gza-42\n"
     )
+
+
+def test_watch_log_stdout_themes_task_ids_but_file_stays_plain(tmp_path: Path) -> None:
+    """watch.log should stay plain while stdout highlights task IDs via the shared theme."""
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=False)
+    output = io.StringIO()
+    themed_console = Console(file=output, force_terminal=True, color_system="truecolor", highlight=False)
+
+    try:
+        # Import-order regression guard: watch may already hold module globals before theme load.
+        import gza.cli.watch as watch_module
+
+        colors.set_theme(None, {"task_id": "bold red"})
+        with (
+            patch.object(watch_module, "console", themed_console),
+            patch.object(watch_module, "_format_hms", return_value="18:08:47"),
+        ):
+            log.emit("START", "gza-4216 rebase")
+
+        plain_log = log_path.read_text()
+        stdout = output.getvalue()
+        stripped_stdout = re.sub(r"\x1b\[[0-9;]*m", "", stdout)
+
+        assert plain_log == "18:08:47 START     gza-4216 rebase\n"
+        assert "\x1b[" not in plain_log
+        assert stripped_stdout == plain_log
+        assert "\x1b[1;31mgza-4216\x1b[0m" in stdout
+    finally:
+        colors.set_theme(None)
 
 
 def test_watch_cycle_logs_tag_scoped_pending_count_in_wake_line(tmp_path: Path) -> None:

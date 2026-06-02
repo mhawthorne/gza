@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import io
 import os
+import re
 import signal
 import sys
 import time
@@ -14,7 +15,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
 
-from .. import lineage
+from rich.text import Text
+
+from .. import colors as _colors, lineage
 from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
 from ..config import Config
 from ..console import console, prompt_available_width, shorten_prompt
@@ -39,6 +42,7 @@ from ..task_query import (
 )
 from ..workers import WorkerRegistry
 from ._common import (
+    _TASK_ID_RE,
     _create_rebase_task,
     _create_resume_task,
     _create_retry_task,
@@ -98,7 +102,18 @@ _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
 _WATCH_PARKED_LINEAGE_POLICY: Literal["skip"] = "skip"
 _WATCH_PARKED_NEEDS_ATTENTION_REASONS = frozenset({"retry-limit-reached"})
+_WATCH_TASK_ID_TOKEN_RE = re.compile(
+    rf"(?<![a-z0-9]){_TASK_ID_RE.pattern.removeprefix('^').removesuffix('$')}(?![a-z0-9])"
+)
 T = TypeVar("T")
+
+
+def _render_watch_stdout(line: str) -> Text:
+    """Return watch stdout content with themed task IDs highlighted."""
+    rendered = Text(line)
+    for match in _WATCH_TASK_ID_TOKEN_RE.finditer(line):
+        rendered.stylize(_colors.TASK_COLORS.task_id, match.start(), match.end())
+    return rendered
 
 
 def _resolve_watch_iterate_impl_for_task(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
@@ -736,7 +751,7 @@ class _WatchLog:
             with open(self.path, "a") as f:
                 f.write("\n")
             if not self.quiet:
-                print(flush=True)
+                console.print()
         self._skip_keys_this_cycle.clear()
         self._sticky_attention_this_cycle.clear()
         self._visible_attention_this_cycle.clear()
@@ -772,7 +787,7 @@ class _WatchLog:
         with open(self.path, "a") as f:
             f.write(line + "\n")
         if not self.quiet:
-            print(line, flush=True)
+            console.print(_render_watch_stdout(line), soft_wrap=True, highlight=False)
 
 
 def _emit_transition_events(
