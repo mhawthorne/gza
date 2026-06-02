@@ -23,7 +23,7 @@ from rich.markup import escape as rich_escape
 
 import gza.colors as _colors
 
-from ..colors import PS_STATUS_COLORS, SHOW_COLORS_DICT, pink
+from ..colors import PS_STATUS_COLORS, SHOW_COLORS_DICT
 from ..config import Config
 from ..console import (
     MAX_PROMPT_DISPLAY,
@@ -2343,13 +2343,16 @@ def _print_ps_output(
 
     # Color scheme for ps output — defined in gza.colors.
     STATUS_COLORS = PS_STATUS_COLORS
+    task_id_color = _colors.TASK_COLORS.task_id
+    task_prompt_color = _colors.TASK_COLORS.prompt
+    header_color = _colors.TASK_COLORS.header
 
     header = (
         f"{'TASK ID':<10} {'TYPE':<10} "
         f"{'STATUS':<16} {'PID':<8} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
     )
-    console.print(f"[bold]{header}[/bold]", soft_wrap=True)
-    console.print("[bold]" + "─" * 106 + "[/bold]", soft_wrap=True)
+    console.print(f"[{header_color}]{header}[/{header_color}]", soft_wrap=True)
+    console.print(f"[{header_color}]" + "─" * 106 + f"[/{header_color}]", soft_wrap=True)
 
     for row in rows:
         task_id_display = f"{row['task_id']}" if row["task_id"] is not None else ""
@@ -2362,9 +2365,9 @@ def _print_ps_output(
         task_display = row['task'].replace('[', '\\[') if row['task'] else ''
 
         console.print(
-            f"[cyan]{task_id_display:<10}[/cyan] {row['type']:<10} "
+            f"[{task_id_color}]{task_id_display:<10}[/{task_id_color}] {row['type']:<10} "
             f"[{sc}]{status:<16}[/{sc}] {row['pid']:<8} {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
-            f"[{pink}]{task_display}[/{pink}]",
+            f"[{task_prompt_color}]{task_display}[/{task_prompt_color}]",
             soft_wrap=True,
         )
 

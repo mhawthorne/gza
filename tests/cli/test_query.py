@@ -14,6 +14,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+import gza.colors as colors
 from gza.cli import _queue_render as queue_render_cli, query as query_cli, watch as watch_cli
 from gza.config import Config
 from gza.console import truncate
@@ -5751,6 +5752,67 @@ class TestPsCommand:
 
         # Cleanup
         registry.remove("w-test-ps")
+
+    def test_print_ps_output_uses_themed_task_id_color(self, tmp_path: Path) -> None:
+        """PS rows should render task IDs with the shared themed task-id color."""
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Theme-aware ps row")
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-theme",
+                pid=99998,
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(UTC).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        recording_console = _RecordingConsole()
+        args = argparse.Namespace(quiet=False, json=False)
+
+        try:
+            colors.set_theme(None, {
+                "task_id": "#123456",
+                "prompt": "#654321",
+                "header": "bold #abcdef",
+            })
+            expected_header_color = colors.TASK_COLORS.header
+            expected_task_id_color = colors.TASK_COLORS.task_id
+            expected_prompt_color = colors.TASK_COLORS.prompt
+            with patch.object(query_cli, "console", recording_console):
+                query_cli._print_ps_output(args, registry, store)
+        finally:
+            colors.set_theme(None)
+            registry.remove("w-test-ps-theme")
+
+        assert len(recording_console.outputs) == 3
+        header, separator, row = recording_console.outputs
+        assert header == (
+            f"[{expected_header_color}]"
+            f"{'TASK ID':<10} {'TYPE':<10} {'STATUS':<16} {'PID':<8} "
+            f"{'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
+            f"[/{expected_header_color}]"
+        )
+        assert separator == f"[{expected_header_color}]" + "─" * 106 + f"[/{expected_header_color}]"
+        assert (
+            f"[{expected_task_id_color}]{task.id:<10}[/{expected_task_id_color}]"
+            in row
+        )
+        assert (
+            f"[{expected_prompt_color}]Theme-aware ps row[/{expected_prompt_color}]"
+            in row
+        )
+        assert "[cyan]" not in row
 
     def test_ps_reconciles_db_and_worker_with_source_both(self, tmp_path: Path):
         """PS dedupes by task_id and marks row source as both."""
