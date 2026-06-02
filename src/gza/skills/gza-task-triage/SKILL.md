@@ -60,7 +60,7 @@ Map `next_action` (the `type` field) and `next_action_reason` to a classificatio
 | `needs_discussion` | `rebase-failed-needs-manual-resolution` | **failed rebase — check if target merged** |
 | `needs_discussion` | `merge-source-needs-manual-resolution` | **manual merge-source conflict** |
 | `max_cycles_reached` | `review-max-cycles-reached` | **review/improve churn — hand off to `/gza-task-fix`** |
-| `needs_discussion` | `retry-limit-reached` / `recovery-ambiguous` / `manual-review-required` | **needs human code review** |
+| `needs_discussion` | `automatic-recovery-disabled` / `retry-limit-reached` / `recovery-ambiguous` / `manual-failure-reason` / `newer-recovery-descendant-needs-attention` | **failed-task recovery needs human review** |
 | `resume` | various | **infra failure (timeout, worker died) — recommend `gza resume`** but DO NOT run it |
 | `skip` (other) | varies | **unknown — show context and let the user decide** |
 
@@ -105,7 +105,7 @@ Action recipes by classification:
 - **manual rebase resolution** (`needs_rebase`): recommend the user run `uv run gza rebase --resolve <task-id>` themselves. Do not run it from this skill.
 - **failed rebase** (`needs_discussion / rebase-failed-needs-manual-resolution`): in Step 3 you already checked the target. If target is merged, treat as "moot — propose drop" of the failed rebase. Otherwise recommend manual resolution and surface the conflict details from `gza log` if helpful.
 - **review/improve churn** (`max_cycles_reached`): recommend `/gza-task-fix <implementation-task-id>` — the slash command, not a Bash invocation. Surface the latest review's blockers section from `review_verdict` so the user has context.
-- **needs human code review**: surface the verdict and stop. Don't recommend a command.
+- **failed-task recovery needs human review**: surface the recovery reason and stop. Treat any `manual-review-required` wording as a legacy/non-recovery alias only; the current recovery slugs are `automatic-recovery-disabled`, `retry-limit-reached`, `recovery-ambiguous`, `manual-failure-reason`, and `newer-recovery-descendant-needs-attention`. Don't recommend a command.
 - **infra failure** (`resume`): explicitly say "this looks like infra (TIMEOUT/WORKER_DIED) — `uv run gza resume <id>` is the user-driven path". Do not run it.
 - **unknown**: print raw fields and ask the user how to proceed.
 
