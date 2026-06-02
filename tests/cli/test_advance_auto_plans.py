@@ -110,6 +110,26 @@ def test_advance_creates_implement_for_completed_plan(tmp_path: Path, capsys) ->
     assert spawn_calls == [impl_tasks[0].id]
 
 
+def test_advance_create_implement_inherits_review_scope_from_completed_plan(tmp_path: Path, capsys) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    plan = _create_completed_plan(store, "Design auth slice")
+    plan.review_scope = "slice F-A1 + F-A2: only review the classifier and persistence slice"
+    store.update(plan)
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops._spawn_background_worker", return_value=0),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path))
+
+    assert rc == 0
+    assert "Created implement task" in capsys.readouterr().out
+    impl_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+    assert len(impl_tasks) == 1
+    assert impl_tasks[0].review_scope == plan.review_scope
+
+
 def test_advance_create_implement_startup_failure_rolls_back_child_and_skips_spawn(
     tmp_path: Path,
     capsys,

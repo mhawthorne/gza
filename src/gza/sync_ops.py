@@ -10,6 +10,7 @@ from typing import Any, Literal, cast
 from .db import DB_UNSET, MergeUnit, SqliteTaskStore, Task, task_owns_merge_status
 from .git import Git, GitError, parse_diff_numstat, resolve_ref_if_possible
 from .github import GitHub, GitHubError, PullRequestDetails, is_github_repo_unsupported_error
+from .merge_state import classify_proven_merged_state
 
 _UNSET = object()
 DEFAULT_SYNC_CACHE_SECONDS = 300
@@ -348,6 +349,7 @@ def reconcile_branch_merge_truth(
 
         owner_tasks = cohort.merge_status_owner_tasks
         desired_merge_status = owner_tasks[0].merge_status if owner_tasks else code_tasks[0].merge_status
+        proof_target_ref = remote_target_ref or target_branch
         try:
             local_branch_exists = git.branch_exists(cohort.branch)
             reconcile_ref = cohort.branch if local_branch_exists else _remote_branch_ref_for_reconcile(
@@ -358,7 +360,6 @@ def reconcile_branch_merge_truth(
             if reconcile_ref is None:
                 target_merged = None
             else:
-                proof_target_ref = remote_target_ref or target_branch
                 target_merged = git.is_merged(reconcile_ref, into=proof_target_ref)
         except GitError as exc:
             result.errors.append(str(exc))
@@ -386,9 +387,15 @@ def reconcile_branch_merge_truth(
                     "preserving any stored base_sha"
                 )
 
-        if target_merged is True:
-            desired_merge_status = "merged"
-            _mark_merged(result)
+        if target_merged is True and reconcile_ref is not None:
+            desired_merge_status = classify_proven_merged_state(
+                git=git,
+                source_ref=reconcile_ref,
+                target_branch=proof_target_ref,
+                on_warning=result.warnings.append,
+            )
+            if desired_merge_status == "merged":
+                _mark_merged(result)
         elif reconcile_ref is None:
             desired_merge_status = "unmerged"
         else:

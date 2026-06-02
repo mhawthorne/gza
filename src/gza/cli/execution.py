@@ -43,6 +43,7 @@ from ..extractions import (
 )
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git
+from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..merge_state import resolve_task_merge_state_for_target
@@ -66,6 +67,7 @@ from ._common import (
     _REUSE_WORKER_OWNER_OUTER,
     DuplicateReviewError,
     _allow_pr_required_retry,
+    _create_implementation_task_from_source,
     _create_improve_task,
     _create_or_reuse_followup_tasks,
     _create_rebase_task,
@@ -73,6 +75,7 @@ from ._common import (
     _create_retry_task,
     _create_review_task,
     _prepare_task_for_immediate_execution,
+    _resolved_review_scope_metadata,
     _run_as_worker,
     _run_foreground,
     _spawn_background_iterate_worker,
@@ -176,6 +179,38 @@ def _resolve_iterate_merge_state_for_current_target(
         git=git_runtime,
         target_branch=target_branch,
     )
+
+
+def _format_iterate_terminal_merge_state_message(
+    *,
+    requested_impl_task: DbTask,
+    iterate_task: DbTask,
+    resolved_from_failed_ancestor: bool,
+    merge_state: str | None,
+) -> str | None:
+    """Return the operator-facing noop message for terminal iterate merge states."""
+    if not merge_state_is_terminal_for_lifecycle(merge_state):
+        return None
+
+    if merge_state == "empty":
+        if resolved_from_failed_ancestor:
+            return (
+                "No remaining iterate action: "
+                f"failed implementation {requested_impl_task.id} was fully recovered by descendant "
+                f"{iterate_task.id} with no remaining commits to land."
+            )
+        return (
+            "No remaining iterate action: "
+            f"implementation {iterate_task.id} has no remaining commits to land."
+        )
+
+    if resolved_from_failed_ancestor:
+        return (
+            "No remaining iterate action: "
+            f"failed implementation {requested_impl_task.id} was fully recovered by merged descendant "
+            f"{iterate_task.id}."
+        )
+    return f"No remaining iterate action: implementation {iterate_task.id} is already merged."
 
 
 def _reconcile_iterate_already_merged(
@@ -814,12 +849,15 @@ def cmd_implement(args: argparse.Namespace) -> int:
     model = args.model if hasattr(args, 'model') and args.model else None
     provider = args.provider if hasattr(args, 'provider') and args.provider else None
     skip_learnings = args.skip_learnings if hasattr(args, 'skip_learnings') and args.skip_learnings else False
+    review_scope = args.review_scope if hasattr(args, "review_scope") and args.review_scope else None
 
-    impl_task = store.add(
-        prompt,
-        task_type="implement",
-        depends_on=plan_task.id,
+    impl_task = _create_implementation_task_from_source(
+        store,
+        plan_task,
+        prompt=prompt,
+        trigger_source="manual",
         tags=tags,
+        review_scope=review_scope,
         create_review=create_review,
         create_pr=create_pr,
         same_branch=same_branch,
@@ -827,7 +865,6 @@ def cmd_implement(args: argparse.Namespace) -> int:
         model=model,
         provider=provider,
         skip_learnings=skip_learnings,
-        trigger_source="manual",
     )
     assert impl_task.id is not None
 
@@ -1165,6 +1202,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     create_pr = bool(getattr(args, "create_pr", False))
     same_branch = args.same_branch if hasattr(args, 'same_branch') and args.same_branch else False
     spec = args.spec if hasattr(args, 'spec') and args.spec else None
+    review_scope = args.review_scope if hasattr(args, 'review_scope') and args.review_scope else None
     branch_type = args.branch_type if hasattr(args, 'branch_type') and args.branch_type else None
     model = args.model if hasattr(args, 'model') and args.model else None
     provider = args.provider if hasattr(args, 'provider') and args.provider else None
@@ -1186,6 +1224,9 @@ def cmd_add(args: argparse.Namespace) -> int:
 
     if hold_for_review and task_type != "plan":
         print("Error: --hold-for-review is only valid with --type plan")
+        return 1
+    if review_scope and task_type != "implement":
+        print("Error: --review-scope is only valid for implement tasks")
         return 1
 
     # Validation: --based-on must reference an existing task
@@ -1228,6 +1269,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             tags=tags,
             depends_on=depends_on,
             create_review=create_review,
+            review_scope=review_scope,
             auto_implement=not hold_for_review,
             create_pr=create_pr,
             same_branch=same_branch,
@@ -1255,6 +1297,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             tags=tags,
             depends_on=depends_on,
             create_review=create_review,
+            review_scope=review_scope,
             auto_implement=not hold_for_review,
             create_pr=create_pr,
             same_branch=same_branch,
@@ -1281,6 +1324,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             tags=tags,
             depends_on=depends_on,
             create_review=create_review,
+            review_scope=review_scope,
             auto_implement=not hold_for_review,
             create_pr=create_pr,
             same_branch=same_branch,
@@ -2239,6 +2283,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
         based_on=impl_task.id,
         depends_on=review_id,
         same_branch=True,
+        review_scope=_resolved_review_scope_metadata(impl_task),
         create_review=create_review,
         tags=impl_task.tags,
         model=args.model if hasattr(args, "model") and args.model else None,
@@ -2783,14 +2828,14 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                         f"Error: failed to reconcile already-merged implementation {task_label}: {exc}",
                     )
                     return 1
-            if resolved_from_failed_ancestor and resolved_merge_state == "merged":
-                print(
-                    "No remaining iterate action: "
-                    f"failed implementation {requested_impl_task.id} was fully recovered by merged descendant {iterate_task.id}."
-                )
-                return 0
-            if resolved_merge_state == "merged":
-                print(f"No remaining iterate action: implementation {iterate_task.id} is already merged.")
+            terminal_message = _format_iterate_terminal_merge_state_message(
+                requested_impl_task=requested_impl_task,
+                iterate_task=iterate_task,
+                resolved_from_failed_ancestor=resolved_from_failed_ancestor,
+                merge_state=resolved_merge_state,
+            )
+            if terminal_message is not None:
+                print(terminal_message)
                 return 0
         try:
             initial_action = _warn_manual_background_iterate_override_if_needed(
@@ -3332,15 +3377,14 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             task_label = impl_task.id or "<unknown>"
             print(f"Error: failed to reconcile already-merged implementation {task_label}: {exc}")
             return 1
-    if resolved_from_failed_ancestor and resolved_merge_state == "merged":
-        print(
-            "No remaining iterate action: "
-            f"failed implementation {requested_impl_task.id} was fully recovered by merged descendant {impl_task.id}."
-        )
-        return 0
-
-    if resolved_merge_state == "merged":
-        print(f"No remaining iterate action: implementation {impl_task.id} is already merged.")
+    terminal_message = _format_iterate_terminal_merge_state_message(
+        requested_impl_task=requested_impl_task,
+        iterate_task=impl_task,
+        resolved_from_failed_ancestor=resolved_from_failed_ancestor,
+        merge_state=resolved_merge_state,
+    )
+    if terminal_message is not None:
+        print(terminal_message)
         return 0
 
     if prepared_start is not None and impl_task.status == "pending" and prepared_start.task.id == impl_task.id:

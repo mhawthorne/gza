@@ -4695,6 +4695,45 @@ def test_watch_cycle_creates_implement_from_completed_plan_with_iterate_mode(tmp
     assert created_impl.depends_on == plan.id
 
 
+def test_watch_create_implement_inherits_review_scope_from_completed_plan(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    plan = store.add("Plan scoped slice", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    plan.review_scope = "slice F-A1 + F-A2: only review the classifier and persistence slice"
+    store.update(plan)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=7,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    created_impl = spawn_iterate.call_args.args[2]
+    assert created_impl.depends_on == plan.id
+    assert created_impl.review_scope == plan.review_scope
+
+
 @pytest.mark.parametrize(
     ("action_type", "child_type", "action_key"),
     [("run_review", "review", "review_task"), ("run_improve", "improve", "improve_task")],

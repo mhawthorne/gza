@@ -1027,6 +1027,19 @@ class Git:
         args.append(branch)
         self._run(*args)
 
+    def count_commits_ahead_checked(self, branch: str, base: str) -> int | None:
+        """Count how many commits a branch is ahead of base.
+
+        Returns ``None`` when git cannot prove the count.
+        """
+        result = self._run("rev-list", "--count", f"{base}..{branch}", check=False)
+        if result.returncode != 0:
+            return None
+        try:
+            return int(result.stdout.strip())
+        except ValueError:
+            return None
+
     def count_commits_ahead(self, branch: str, base: str) -> int:
         """Count how many commits a branch is ahead of base.
 
@@ -1037,10 +1050,10 @@ class Git:
         Returns:
             Number of commits that branch is ahead of base
         """
-        result = self._run("rev-list", "--count", f"{base}..{branch}", check=False)
-        if result.returncode != 0:
+        result = self.count_commits_ahead_checked(branch, base)
+        if result is None:
             return 0
-        return int(result.stdout.strip())
+        return result
 
     def count_commits_behind(self, source_ref: str, target_ref: str) -> int | None:
         """Count commits reachable from ``target_ref`` and not ``source_ref``."""

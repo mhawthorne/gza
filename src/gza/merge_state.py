@@ -2,10 +2,38 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
+from numbers import Integral
 from typing import Any
 
 from .db import SqliteTaskStore, Task as DbTask
 from .git import ResolvedMergeSourceRef
+
+logger = logging.getLogger(__name__)
+
+
+def classify_proven_merged_state(
+    *,
+    git: Any,
+    source_ref: str,
+    target_branch: str,
+    on_warning: Callable[[str], None] | None = None,
+) -> str:
+    """Classify a proved-merged source as ``merged`` or zero-commit ``empty``."""
+    current_target_state = "merged"
+    count_commits_ahead_checked = getattr(git, "count_commits_ahead_checked", None)
+    if callable(count_commits_ahead_checked):
+        ahead_count = count_commits_ahead_checked(source_ref, target_branch)
+        if isinstance(ahead_count, Integral) and ahead_count <= 0:
+            current_target_state = "empty"
+        elif ahead_count is None and on_warning is not None:
+            on_warning(
+                f"Could not prove whether merged source {source_ref!r} is empty against "
+                f"{target_branch!r}; keeping merge state at 'merged' instead of "
+                "classifying 'empty'"
+            )
+    return current_target_state
 
 
 def resolve_task_merge_source(git: Any, branch: str) -> ResolvedMergeSourceRef:
@@ -60,24 +88,38 @@ def resolve_task_merge_state_for_target(
     ref is already merged even if persistence is stale.
     """
     resolved_merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
-    source_merge_ref = resolve_task_merge_source(git, task.branch).ref if task.branch else None
-    current_target_proves_merge = (
-        source_merge_ref is not None and git.is_merged(source_merge_ref, target_branch) is True
-    )
+    merge_source = resolve_task_merge_source(git, task.branch) if task.branch else ResolvedMergeSourceRef(None)
+    source_merge_ref = merge_source.ref
+    if merge_source.warning:
+        logger.warning(
+            "Could not resolve freshest merge source for branch %r against %r: %s",
+            task.branch,
+            target_branch,
+            merge_source.warning,
+        )
+
+    current_target_state: str | None = None
+    if source_merge_ref is not None and git.is_merged(source_merge_ref, target_branch) is True:
+        current_target_state = classify_proven_merged_state(
+            git=git,
+            source_ref=source_merge_ref,
+            target_branch=target_branch,
+            on_warning=logger.warning,
+        )
 
     if resolved_merge_unit is not None:
         if resolved_merge_unit.state == "merged" and resolved_merge_unit.target_branch == target_branch:
-            return "merged"
+            return current_target_state or "merged"
         if resolved_merge_unit.state == "merged":
-            if current_target_proves_merge:
-                return "merged"
+            if current_target_state is not None:
+                return current_target_state
             return None
-        if current_target_proves_merge:
-            return "merged"
+        if current_target_state is not None:
+            return current_target_state
         return resolved_merge_unit.state
 
-    if current_target_proves_merge:
-        return "merged"
+    if current_target_state is not None:
+        return current_target_state
 
     if task.merge_status == "merged":
         if not task.branch:

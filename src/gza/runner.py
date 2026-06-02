@@ -95,6 +95,7 @@ from .rebase_diff import (
     compute_rebase_changed_diff,
 )
 from .rebase_publish import publish_rebased_branch
+from .review_scope import resolve_review_scope_for_impl
 from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
 from .review_verdict import (
     compute_review_score,
@@ -2993,18 +2994,40 @@ def _build_context_from_chain(
 
                 # Inject ask context: plan output for plan-driven work, else full original request.
                 plan_task = get_plan_for_task(store, impl_task)
+                resolved_scope = resolve_review_scope_for_impl(store, impl_task)
+                review_scope_text = (task.review_scope or "").strip() or (
+                    resolved_scope.summary if resolved_scope is not None else None
+                )
+
+                if review_scope_text:
+                    context_parts.append("\n## Review scope:\n")
+                    context_parts.append(f"Implementation task: {impl_task.id}")
+                    context_parts.append(
+                        "This is the only gradeable ask for this review. Treat sibling or deferred slices as out of scope unless the current diff breaks an explicit integration contract described here."
+                    )
+                    context_parts.append("")
+                    context_parts.append(review_scope_text)
+                    if resolved_scope is not None and resolved_scope.out_of_scope_context:
+                        context_parts.append("")
+                        context_parts.append("Out-of-scope sibling context:")
+                        context_parts.append(resolved_scope.out_of_scope_context)
 
                 if plan_task:
                     plan_content = _get_task_output(plan_task, project_dir)
+                    plan_header = (
+                        "\n## Original plan context (out of scope except for the review scope):\n"
+                        if review_scope_text
+                        else "\n## Original plan:\n"
+                    )
                     if plan_content:
-                        context_parts.append("\n## Original plan:\n")
+                        context_parts.append(plan_header)
                         context_parts.append(plan_content)
                     else:
                         context_parts.append(
-                            "\n## Original plan:\n"
+                            plan_header +
                             f"(plan task {plan_task.id} exists but content unavailable on this machine - flag as blocker)"
                         )
-                elif impl_task.prompt:
+                elif impl_task.prompt and not review_scope_text:
                     context_parts.append("\n## Original request:\n")
                     context_parts.append(impl_task.prompt)
 

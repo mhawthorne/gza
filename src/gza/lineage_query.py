@@ -9,7 +9,10 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from .db import MergeUnit, SqliteTaskStore, Task as DbTask, task_id_numeric_key
-from .lifecycle_completion import task_is_complete_for_lifecycle
+from .lifecycle_completion import (
+    merge_state_is_terminal_for_lifecycle,
+    task_is_complete_for_lifecycle,
+)
 from .source_followup import (
     SourceFollowupState,
     collect_non_dropped_implement_source_ids,
@@ -217,7 +220,9 @@ def _task_is_effectively_merged(
     *,
     merge_units_by_task_id: Mapping[str, MergeUnit],
 ) -> bool:
-    return _task_effective_merge_state(task, merge_units_by_task_id=merge_units_by_task_id) == "merged"
+    return merge_state_is_terminal_for_lifecycle(
+        _task_effective_merge_state(task, merge_units_by_task_id=merge_units_by_task_id)
+    )
 
 
 def _matches_status_filters(
@@ -244,7 +249,12 @@ def _matches_merge_chain_state(
         merge_state == "unmerged" or (task.status == "unmerged" and merge_unit is None and merge_state != "merged")
     ):
         return True
-    if "needs_merge" in merge_states and task.status == "completed" and task.has_commits and merge_state != "merged":
+    if (
+        "needs_merge" in merge_states
+        and task.status == "completed"
+        and task.has_commits
+        and merge_state not in {"merged", "empty"}
+    ):
         return True
     return False
 
@@ -627,7 +637,7 @@ def _has_merged_descendant(
             if child.id in merge_units_by_member
             else child.merge_status
         )
-        if merge_state == "merged":
+        if merge_state_is_terminal_for_lifecycle(merge_state):
             return True
         queue.extend(indexes.based_on_children.get(child.id, ()))
     return False
@@ -806,7 +816,7 @@ def query_lineage_owner_rows(
             recovery_completed_by_failed_id=recovery_completed_by_failed_id,
         )
         owner_merge_unit = _resolve_owner_merge_unit(owner, merge_units_by_member=merge_units_by_member)
-        if owner_merge_unit is not None and owner_merge_unit.state == "merged":
+        if owner_merge_unit is not None and merge_state_is_terminal_for_lifecycle(owner_merge_unit.state):
             continue
         if target_branch and owner_merge_unit is not None and owner_merge_unit.target_branch != target_branch:
             continue

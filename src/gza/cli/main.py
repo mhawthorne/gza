@@ -1464,6 +1464,11 @@ def main() -> int:
         help="Path to spec file for task context",
     )
     add_parser.add_argument(
+        "--review-scope",
+        metavar="TEXT",
+        help="Authoritative gradeable review scope for a direct implement task",
+    )
+    add_parser.add_argument(
         "--prompt-file",
         metavar="FILE",
         help="Read prompt from file (for non-interactive use)",
@@ -1995,6 +2000,11 @@ def main() -> int:
         "--branch-type",
         metavar="TYPE",
         help="Set branch type hint for branch naming (e.g., fix, feature, chore)",
+    )
+    implement_parser.add_argument(
+        "--review-scope",
+        metavar="TEXT",
+        help="Authoritative gradeable review scope for the new implementation task",
     )
     implement_parser.add_argument(
         "--model",

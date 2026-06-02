@@ -6,6 +6,7 @@ from typing import Literal
 
 from .db import SqliteTaskStore, Task
 from .prompts import PromptBuilder
+from .review_scope import resolve_review_scope_for_impl
 from .review_verdict import ReviewFinding
 from .task_slug import (
     extract_task_id_suffix,
@@ -129,12 +130,14 @@ def create_review_task(
         review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
     inherited_tags = impl_task.tags or (() if impl_task.group is None else (impl_task.group,))
 
+    resolved_scope = resolve_review_scope_for_impl(store, impl_task)
     review_task = store.add(
         prompt=review_prompt,
         task_type="review",
         depends_on=impl_task.id,
         tags=inherited_tags,
         based_on=impl_task.id,
+        review_scope=resolved_scope.summary if resolved_scope is not None else None,
         model=model,
         provider=provider,
         trigger_source=trigger_source,
@@ -238,12 +241,14 @@ def create_or_reuse_followup_task(
         impl_task.id,
         finding,
     )
+    resolved_scope = resolve_review_scope_for_impl(store, impl_task)
     inherited_tags = impl_task.tags or (() if impl_task.group is None else (impl_task.group,))
     created = store.add(
         prompt=prompt,
         task_type="implement",
         based_on=review_task.id,
         depends_on=impl_task.id,
+        review_scope=resolved_scope.summary if resolved_scope is not None else None,
         tags=inherited_tags,
         trigger_source=trigger_source,
     )

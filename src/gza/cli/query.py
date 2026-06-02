@@ -43,6 +43,7 @@ from ..db import (
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git, GitError, active_worktree_path_for_branch
 from ..github import GitHub
+from ..lifecycle_completion import TERMINAL_MERGE_STATES
 from ..lineage import walk_based_on_descendants
 from ..lineage_query import filter_display_unresolved_tasks_for_incomplete
 from ..pr_ops import lookup_task_pr
@@ -2087,7 +2088,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
             live_unmerged_branches = {
                 result.branch
                 for result in live_results
-                if result.skipped_reason is None and result.merge_status != "merged"
+                if result.skipped_reason is None and result.merge_status not in TERMINAL_MERGE_STATES
             }
             live_branch_states = {
                 result.branch: result.merge_status

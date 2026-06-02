@@ -73,6 +73,7 @@ from ..sync_ops import (
 from ..worktree_roots import managed_worktree_root_paths
 from ._common import (
     DuplicateReviewError,
+    _create_implementation_task_from_source,
     _create_or_reuse_followup_tasks,
     _create_rebase_task,
     _create_resume_task,
@@ -2855,12 +2856,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
             )
 
         def _create_implement_from_task(parent_task: DbTask) -> DbTask:
-            assert parent_task.id is not None
-            return store.add(
+            return _create_implementation_task_from_source(
+                store,
+                parent_task,
                 prompt=_unimplemented_implement_prompt(parent_task),
-                task_type="implement",
-                depends_on=parent_task.id,
-                tags=parent_task.tags,
                 trigger_source="manual",
             )
 

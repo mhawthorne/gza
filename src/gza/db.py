@@ -379,6 +379,7 @@ class Task:
     tags: tuple[str, ...] = ()  # Canonical multi-valued task labels
     depends_on: str | None = None  # Task ID this task depends on (string)
     spec: str | None = None  # Path to spec file for context
+    review_scope: str | None = None  # Gradeable review scope for this task's implementation slice
     create_review: bool = False  # Auto-create review task on completion
     auto_implement: bool | None = None  # Plan-only lifecycle flag; None/NULL means enabled for legacy rows
     create_pr: bool = False  # Auto-create/reuse PR on successful code-task completion
@@ -694,7 +695,7 @@ MIGRATION_V45_TO_V46 = """
 ALTER TABLE tasks ADD COLUMN trigger_source TEXT;
 """
 
-# Migration from v46 to v47: persisted review verify provenance
+# Migration from v46 to v47: review verify provenance plus explicit review scope metadata
 MIGRATION_V46_TO_V47 = """
 ALTER TABLE tasks ADD COLUMN review_verify_command TEXT;
 ALTER TABLE tasks ADD COLUMN review_verify_status TEXT;
@@ -704,6 +705,7 @@ ALTER TABLE tasks ADD COLUMN review_verify_captured_at TEXT;
 ALTER TABLE tasks ADD COLUMN review_verify_head_sha TEXT;
 ALTER TABLE tasks ADD COLUMN review_verify_base_sha TEXT;
 ALTER TABLE tasks ADD COLUMN review_verify_branch TEXT;
+ALTER TABLE tasks ADD COLUMN review_scope TEXT;
 """
 
 # Schema version for migrations
@@ -966,6 +968,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 "group" TEXT,
                 depends_on TEXT,
                 spec TEXT,
+                review_scope TEXT,
                 create_review INTEGER DEFAULT 0,
                 auto_implement INTEGER DEFAULT 1,
                 create_pr INTEGER DEFAULT 0,
@@ -1094,7 +1097,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "id", "prompt", "status", "task_type", "slug", "branch", "log_file", "report_file", "based_on", "has_commits",
             "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns", "num_turns_reported", "num_turns_computed",
             "attach_count", "attach_duration_seconds", "cost_usd", "created_at", "started_at", "running_pid", "completed_at",
-            "group", "depends_on", "spec", "create_review", "auto_implement", "create_pr", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
+            "group", "depends_on", "spec", "review_scope", "create_review", "auto_implement", "create_pr", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
             "pr_state", "pr_last_synced_at", "sync_last_synced_at", "model", "provider", "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
             "merge_status", "merged_at", "failure_reason", "completion_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
             "changed_diff",
@@ -1140,7 +1143,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 project_id, id, prompt, status, task_type, slug, branch, log_file, report_file, based_on, has_commits,
                 duration_seconds, num_steps_reported, num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                 attach_count, attach_duration_seconds, cost_usd, created_at, started_at, running_pid, completed_at,
-                "group", depends_on, spec, create_review, auto_implement, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
+                "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
                 pr_state, pr_last_synced_at, sync_last_synced_at, model, provider, provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
                 merge_status, merged_at, failure_reason, completion_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
                 changed_diff, review_cleared_at, review_score,
@@ -1492,7 +1495,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         41: ("tasks", "recovery_origin"),
         45: ("tasks", "auto_implement"),
         46: ("tasks", "trigger_source"),
-        47: ("tasks", "review_verify_branch"),
+        47: ("tasks", "review_scope"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -1577,6 +1580,7 @@ def _ensure_required_auto_migration_artifacts(
         (47, "tasks", "review_verify_head_sha", "ALTER TABLE tasks ADD COLUMN review_verify_head_sha TEXT"),
         (47, "tasks", "review_verify_base_sha", "ALTER TABLE tasks ADD COLUMN review_verify_base_sha TEXT"),
         (47, "tasks", "review_verify_branch", "ALTER TABLE tasks ADD COLUMN review_verify_branch TEXT"),
+        (47, "tasks", "review_scope", "ALTER TABLE tasks ADD COLUMN review_scope TEXT"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -1685,6 +1689,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     depends_on TEXT,
     spec TEXT,
     create_review INTEGER DEFAULT 0,
+    review_scope TEXT,
     auto_implement INTEGER DEFAULT 1,
     create_pr INTEGER DEFAULT 0,
     same_branch INTEGER DEFAULT 0,
@@ -2586,6 +2591,11 @@ class SqliteTaskStore:
                 "Query-only DB open detected missing optional review verify provenance columns; "
                 "stale review verify detection will be unavailable."
             )
+        if not self._query_only_has_column("tasks", "review_scope"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing optional column tasks.review_scope; "
+                "slice-aware review scoping will fall back to prompt parsing."
+            )
         if not self.supports_merge_units():
             self._startup_warnings.append(
                 "Query-only DB open detected missing optional merge-unit tables; "
@@ -2813,6 +2823,7 @@ class SqliteTaskStore:
             tags=tags,
             depends_on=row["depends_on"],
             spec=row["spec"],
+            review_scope=row["review_scope"] if "review_scope" in keys else None,
             create_review=bool(row["create_review"]) if row["create_review"] is not None else False,
             auto_implement=bool(row["auto_implement"]) if "auto_implement" in keys and row["auto_implement"] is not None else None,
             create_pr=bool(row["create_pr"]) if "create_pr" in keys and row["create_pr"] is not None else False,
@@ -3009,6 +3020,7 @@ class SqliteTaskStore:
         tags: Iterable[str] | None = None,
         depends_on: str | None = None,
         spec: str | None = None,
+        review_scope: str | None = None,
         create_review: bool = False,
         auto_implement: bool = True,
         create_pr: bool = False,
@@ -3036,8 +3048,8 @@ class SqliteTaskStore:
             new_id = self._next_id(conn)
             conn.execute(
                 """
-                INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, create_review, auto_implement, create_pr, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, recovery_origin, trigger_source, urgent, skip_learnings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, recovery_origin, trigger_source, urgent, skip_learnings)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._project_id,
@@ -3049,6 +3061,7 @@ class SqliteTaskStore:
                     persisted_group,
                     depends_on,
                     spec,
+                    review_scope,
                     1 if create_review else 0,
                     1 if auto_implement else 0,
                     1 if create_pr else 0,
@@ -3174,6 +3187,7 @@ class SqliteTaskStore:
                     "group" = ?,
                     depends_on = ?,
                     spec = ?,
+                    review_scope = ?,
                     create_review = ?,
                     auto_implement = ?,
                     create_pr = ?,
@@ -3242,6 +3256,7 @@ class SqliteTaskStore:
                     persisted_group,
                     task.depends_on,
                     task.spec,
+                    task.review_scope,
                     1 if task.create_review else 0,
                     None if task.auto_implement is None else (1 if task.auto_implement else 0),
                     1 if task.create_pr else 0,
@@ -6031,6 +6046,7 @@ def add_task_interactive(
     task_type: str = "task",
     based_on: str | None = None,
     spec: str | None = None,
+    review_scope: str | None = None,
     group: str | None = None,
     tags: Iterable[str] | None = None,
     depends_on: str | None = None,
@@ -6088,6 +6104,7 @@ def add_task_interactive(
                 tags=tags,
                 depends_on=depends_on,
                 spec=spec,
+                review_scope=review_scope,
                 create_review=create_review,
                 auto_implement=auto_implement,
                 create_pr=create_pr,
@@ -6185,7 +6202,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "id", "prompt", "status", "task_type", "slug", "branch", "log_file", "report_file", "based_on",
         "has_commits", "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns",
         "num_turns_reported", "num_turns_computed", "attach_count", "attach_duration_seconds", "cost_usd",
-        "created_at", "started_at", "running_pid", "completed_at", "group", "depends_on", "spec", "create_review",
+        "created_at", "started_at", "running_pid", "completed_at", "group", "depends_on", "spec", "review_scope", "create_review",
         "auto_implement",
         "create_pr",
         "same_branch", "task_type_hint", "output_content", "session_id", "pr_number", "pr_state",
@@ -6217,6 +6234,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "review_verify_head_sha": "NULL",
         "review_verify_base_sha": "NULL",
         "review_verify_branch": "NULL",
+        "review_scope": "NULL",
     }
     project_id, project_prefix = _project_identity_from_config(config)
 
@@ -6769,6 +6787,7 @@ def _task_to_dict(task: "Task") -> dict:
         "tags": list(task.tags),
         "depends_on": task.depends_on,
         "spec": task.spec,
+        "review_scope": task.review_scope,
         "create_review": task.create_review,
         "auto_implement": task.auto_implement,
         "create_pr": task.create_pr,

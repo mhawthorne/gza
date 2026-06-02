@@ -10,6 +10,7 @@
 - Owner-keyed lineage rows are the canonical read model for unresolved branch ownership boundaries. Command surfaces should display or execute from the owner row and use `lifecycle_action_task` / `recovery_action_task` / `recovery_leaf_task` only as concrete execution details.
 - Do not introduce parallel task model modules (for example, a second `Task` dataclass in another module).
 - Task data now enters the system through the canonical CLI/config flows backed by `gza.db`; do not reintroduce retired importer-specific entry points.
+- `Task.review_scope` is task metadata on the canonical model, not a second ask/task model. It records the gradeable review boundary for sliced implementation work while the linked plan or request remains the broader context source.
 
 ## Read vs. Write Boundary
 
@@ -28,6 +29,8 @@ gza tracks branch merge state across four different axes. They answer different 
 4. `Strict ancestry` answers only whether one commit is reachable from another in the commit graph. `Git.is_ancestor()` is a thin wrapper around `git merge-base --is-ancestor` (`src/gza/git.py:676`). After a squash merge, a landed branch commonly fails this test. In gza, `resolve_post_merge_rebase_state()` uses ancestry only as proof that a stale failed-rebase blocker can be cleared because the implementation branch already contains the target tip (positive-proof branch at `src/gza/advance_engine.py:374-384`); it is not a substitute for merge lifecycle state.
 
 The expected squash-merge shape is therefore: `merge_unit.state == "merged"`, branch ref still exists, and `is_ancestor(branch, main) == false`. That combination is normal, not a corruption signal.
+
+An `empty` merge-unit state is the other terminal lifecycle outcome for code-bearing branches: it means the branch has no remaining net commits to land against its target, so lifecycle queries should treat it as moot/complete and exclude it from `needs_merge`.
 
 Guidance for future callers:
 

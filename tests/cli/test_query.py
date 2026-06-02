@@ -57,6 +57,7 @@ class _FastUnmergedGit:
         self._branches: set[str] = set()
         self._refs: set[str] = set()
         self._merged: dict[tuple[str, str | None], bool] = {}
+        self._ahead_counts: dict[tuple[str, str], int | None] = {}
         self._can_merge: dict[tuple[str, str | None], bool] = {}
         self._numstat = "1\t0\tfeature.txt\n"
         self._fetch_error: GitError | None = None
@@ -79,6 +80,9 @@ class _FastUnmergedGit:
 
     def count_commits_ahead(self, branch: str, target: str) -> int:
         return 1
+
+    def count_commits_ahead_checked(self, branch: str, target: str) -> int | None:
+        return self._ahead_counts.get((branch, target), 1)
 
     def get_diff_stat_parsed(self, revision_range: str) -> tuple[int, int, int]:
         return (1, 1, 0)
@@ -9482,6 +9486,79 @@ class TestUnmergedImprovedDisplay:
         unit = store.resolve_merge_unit_for_task(task.id)
         assert unit is not None
         assert unit.state == "unmerged"
+
+    def test_unmerged_default_refresh_persists_empty_branch_and_hides_it(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Default unmerged refresh should persist zero-commit merged branches as empty."""
+        store, task, git = _setup_unmerged_env_fast(
+            tmp_path,
+            task_prompt="Empty merge-unit task",
+            branch="feature/empty-merge-unit",
+        )
+        git._merged[(task.branch, "main")] = True
+        git._ahead_counts[(task.branch, "main")] = 0
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target=None,
+            fetch=False,
+            limit=5,
+            json=False,
+            fields=None,
+            list_fields=False,
+        )
+
+        result = query_cli.cmd_unmerged(args, git=git)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert "No unmerged tasks" in captured.out
+        assert "Empty merge-unit task" not in captured.out
+
+        assert task.id is not None
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.merge_status is None
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == "empty"
+
+    def test_unmerged_live_target_hides_zero_commit_empty_branch(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Live-target unmerged should treat zero-commit merged branches as terminal."""
+        _store, task, git = _setup_unmerged_env_fast(
+            tmp_path,
+            task_prompt="Live empty branch task",
+            branch="feature/live-empty-merge-unit",
+        )
+        git._current_branch = "integration"
+        git._merged[(task.branch, "integration")] = True
+        git._ahead_counts[(task.branch, "integration")] = 0
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=False,
+            target="integration",
+            fetch=False,
+            limit=5,
+            json=False,
+            fields=None,
+            list_fields=False,
+        )
+
+        result = query_cli.cmd_unmerged(args, git=git)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert "No unmerged tasks" in captured.out
+        assert "Live empty branch task" not in captured.out
 
     def test_unmerged_shows_diff_stats(self, tmp_path: Path):
         """Unmerged output shows diff stats (files, LOC added/removed)."""

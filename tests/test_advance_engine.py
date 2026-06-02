@@ -41,6 +41,7 @@ class _FakeGit:
         ancestor_pairs: dict[tuple[str, str], bool] | None = None,
         merge_source_result: tuple[str | None, str | None] | None = None,
         legacy_merge_source_ref: str | None = None,
+        ahead_count: int | None = None,
         behind_count: int | None = None,
         behind_count_error: Exception | None = None,
         name_status_by_range: dict[str, str] | None = None,
@@ -57,6 +58,7 @@ class _FakeGit:
         self._ancestor_pairs = ancestor_pairs or {}
         self._merge_source_result = merge_source_result
         self._legacy_merge_source_ref = legacy_merge_source_ref
+        self._ahead_count = ahead_count
         self._behind_count = behind_count
         self._behind_count_error = behind_count_error
         self._name_status_by_range = name_status_by_range or {}
@@ -124,6 +126,9 @@ class _FakeGit:
         if self._behind_count_error is not None:
             raise self._behind_count_error
         return self._behind_count
+
+    def count_commits_ahead_checked(self, source_ref: str, target_ref: str) -> int | None:
+        return self._ahead_count
 
     def get_diff_name_status(
         self,
@@ -3268,6 +3273,42 @@ def test_already_merged_branch_persists_merged_when_tip_is_ancestor_not_equal_ta
     refreshed = store.get(impl.id)
     assert refreshed is not None
     assert refreshed.merge_status == "merged"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=False),
+        config=config,
+        git=_FakeGit(can_merge=False),
+        target_branch="main",
+    )
+    assert all(row.owner_task.id != impl.id for row in rows)
+
+
+def test_empty_branch_persists_empty_and_skips_merge_actions(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/empty-terminal",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    git = _FakeGit(
+        can_merge=False,
+        is_merged_by_ref={("origin/feat/empty-terminal", "main"): True},
+        existing_refs={"origin/feat/empty-terminal"},
+        ahead_count=0,
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: no remaining commits to merge into target branch"
+    refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "empty"
 
     rows = query_lineage_owner_rows(
         store,

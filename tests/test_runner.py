@@ -24,6 +24,7 @@ from gza.providers.base import PreflightCheckResult
 from gza.rebase_diff import RebaseDiffBaseline
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
+from gza.cli import _create_improve_task, _create_rebase_task
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
@@ -1392,6 +1393,260 @@ class TestReviewContextFromChain:
         assert f"plan task {plan_task.id} exists but content unavailable" in context
         assert "flag as blocker" in context
         assert "## Original request:" not in context
+
+    def test_review_context_uses_structured_review_scope_and_reframes_plan_as_context(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan migration", task_type="plan")
+        plan_task.output_content = "# Plan\n1. Whole plan.\n2. More slices."
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt="Implement task gza-1",
+            task_type="implement",
+            based_on=plan_task.id,
+            review_scope="slice F-A1 + F-A2: implement only the classifier and persistence surfaces",
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=None)
+
+        assert "## Review scope:" in context
+        assert f"Implementation task: {impl_task.id}" in context
+        assert "only gradeable ask" in context
+        assert "slice F-A1 + F-A2" in context
+        assert "## Original plan context (out of scope except for the review scope):" in context
+        assert "## Original plan:\n" not in context
+        assert "## Original request:" not in context
+
+    def test_review_context_derives_legacy_slice_scope_from_prompt(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan migration", task_type="plan")
+        plan_task.output_content = "# Plan\n1. Full slice stack."
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt=(
+                "Implement plan gza-4065, slice F-A1 + F-A2: introduce a first-class `empty` merge-unit state.\n\n"
+                "## Scope\n"
+                "1. Add the shared classifier.\n"
+                "2. Persist and present `empty`.\n\n"
+                "## Acceptance\n"
+                "- Add tests.\n\n"
+                "## Out of scope\n"
+                "- F-A3\n"
+                "- F-B1\n"
+            ),
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=None)
+
+        assert "## Review scope:" in context
+        assert "Slice F-A1 + F-A2" in context
+        assert "Add the shared classifier." in context
+        assert "Out-of-scope sibling context:" in context
+        assert "- F-A3" in context
+        assert "- F-B1" in context
+
+    def test_review_context_preserves_slice_scope_for_followup_implementation_reviews(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan migration", task_type="plan")
+        plan_task.output_content = "# Plan\n1. Full slice stack."
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt=(
+                "Implement plan gza-4065, slice F-A1 + F-A2: introduce a first-class `empty` merge-unit state.\n\n"
+                "## Scope\n"
+                "1. Add the shared classifier.\n"
+                "2. Persist and present `empty`.\n\n"
+                "## Acceptance\n"
+                "- Add tests.\n\n"
+                "## Out of scope\n"
+                "- F-A3\n"
+                "- F-B1\n"
+            ),
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        store.update(review_task)
+
+        followup_finding = ReviewFinding(
+            id="F1",
+            severity="FOLLOWUP",
+            title="Keep slice boundary",
+            body="Preserve the scoped review boundary across improve loops.",
+            evidence=None,
+            impact=None,
+            fix_or_followup="carry slice scope into follow-up implementation tasks",
+            tests=None,
+        )
+        followup_task, created_now = create_or_reuse_followup_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=followup_finding,
+            trigger_source="manual",
+        )
+        assert created_now is True
+        followup_task.status = "completed"
+        store.update(followup_task)
+
+        followup_review = store.add(
+            prompt="Review follow-up implementation",
+            task_type="review",
+            depends_on=followup_task.id,
+        )
+
+        context = _build_context_from_chain(followup_review, store, tmp_path, git=None)
+
+        assert "## Review scope:" in context
+        assert "Slice F-A1 + F-A2" in context
+        assert "Add the shared classifier." in context
+        assert "## Original plan context (out of scope except for the review scope):" in context
+        assert "## Original plan:\n" not in context
+        assert "## Original request:" not in context
+
+    def test_review_context_preserves_slice_scope_for_improve_reviews(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan migration", task_type="plan")
+        plan_task.output_content = "# Plan\n1. Full slice stack."
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt=(
+                "Implement plan gza-4065, slice F-A1 + F-A2: introduce a first-class `empty` merge-unit state.\n\n"
+                "## Scope\n"
+                "1. Add the shared classifier.\n"
+                "2. Persist and present `empty`.\n\n"
+                "## Acceptance\n"
+                "- Add tests.\n\n"
+                "## Out of scope\n"
+                "- F-A3\n"
+                "- F-B1\n"
+            ),
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        prior_review = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        prior_review.status = "completed"
+        prior_review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(prior_review)
+
+        improve_task = _create_improve_task(
+            store,
+            impl_task,
+            prior_review,
+            trigger_source="manual",
+        )
+        improve_task.status = "completed"
+        store.update(improve_task)
+
+        improve_review = store.add(
+            prompt="Review improve implementation",
+            task_type="review",
+            depends_on=improve_task.id,
+            review_scope=improve_task.review_scope,
+        )
+
+        context = _build_context_from_chain(improve_review, store, tmp_path, git=None)
+
+        assert "## Review scope:" in context
+        assert "## Original plan context (out of scope except for the review scope):" in context
+        assert "## Original plan:\n" not in context
+        assert "Slice F-A1 + F-A2" in context
+
+    def test_review_context_preserves_slice_scope_for_rebase_reviews(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan migration", task_type="plan")
+        plan_task.output_content = "# Plan\n1. Full slice stack."
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt=(
+                "Implement plan gza-4065, slice F-A1 + F-A2: introduce a first-class `empty` merge-unit state.\n\n"
+                "## Scope\n"
+                "1. Add the shared classifier.\n"
+                "2. Persist and present `empty`.\n\n"
+                "## Acceptance\n"
+                "- Add tests.\n\n"
+                "## Out of scope\n"
+                "- F-A3\n"
+                "- F-B1\n"
+            ),
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260602-empty-state"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        rebase_task = _create_rebase_task(
+            store,
+            impl_task.id,
+            impl_task.branch,
+            "main",
+            trigger_source="manual",
+        )
+        rebase_task.status = "completed"
+        store.update(rebase_task)
+
+        rebase_review = store.add(
+            prompt="Review rebased implementation",
+            task_type="review",
+            depends_on=rebase_task.id,
+            review_scope=rebase_task.review_scope,
+        )
+
+        context = _build_context_from_chain(rebase_review, store, tmp_path, git=None)
+
+        assert "## Review scope:" in context
+        assert "## Original plan context (out of scope except for the review scope):" in context
+        assert "## Original plan:\n" not in context
+        assert "Slice F-A1 + F-A2" in context
 
     def test_review_context_includes_full_original_request_for_prompt_driven_impl(self, tmp_path: Path):
         """Prompt-driven reviews include full implementation prompt as original request."""

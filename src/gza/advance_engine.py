@@ -14,6 +14,7 @@ from gza.branch_resolution import resolve_rebase_target_task
 from gza.console import prompt_available_width, shorten_prompt
 from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key, task_owns_merge_status
 from gza.git import ResolvedMergeSourceRef
+from gza.lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from gza.lineage import walk_ancestors, walk_based_on_descendants
 from gza.merge_state import resolve_task_merge_state_for_target
 from gza.project_discovery import (
@@ -270,7 +271,7 @@ def resolve_post_merge_rebase_state(
         else None
     )
     merge_unit_state = merge_unit.state if merge_unit is not None else None
-    if merge_unit_state == "merged":
+    if merge_state_is_terminal_for_lifecycle(merge_unit_state):
         return PostMergeRebaseState(
             merge_unit_state=merge_unit_state,
             branch_tip_sha=None,
@@ -279,7 +280,7 @@ def resolve_post_merge_rebase_state(
             branch_equals_target=False,
             already_merged=True,
             rebase_resolution_proved=True,
-            reason="merge-unit-merged",
+            reason=f"merge-unit-{merge_unit_state}",
         )
 
     if (
@@ -488,16 +489,16 @@ def _resolve_and_persist_post_merge_rebase_state(
         target_branch,
         merge_source=merge_source,
     )
+    resolved_merge_state = resolve_task_merge_state_for_target(
+        store=store,
+        task=task,
+        git=git,
+        target_branch=target_branch,
+    )
     if (
         (
             (state.reason == "branch-tip-equals-target-tip" and state.already_merged)
-            or resolve_task_merge_state_for_target(
-                store=store,
-                task=task,
-                git=git,
-                target_branch=target_branch,
-            )
-            == "merged"
+            or merge_state_is_terminal_for_lifecycle(resolved_merge_state)
         )
         and task.id is not None
         and task.status == "completed"
@@ -505,10 +506,15 @@ def _resolve_and_persist_post_merge_rebase_state(
         and task_owns_merge_status(task)
     ):
         merge_unit = store.resolve_merge_unit_for_task(task.id)
+        if merge_unit is None and bool(task.branch):
+            merge_unit = store.get_or_create_merge_unit_for_task(task)
         if merge_unit is not None:
+            persisted_state = "merged"
+            if resolved_merge_state is not None and merge_state_is_terminal_for_lifecycle(resolved_merge_state):
+                persisted_state = resolved_merge_state
             store.set_merge_unit_state(
                 merge_unit.id,
-                "merged",
+                persisted_state,
                 merged_by_task_id=task.id,
             )
         else:
@@ -768,7 +774,15 @@ def _no_branch_description(ctx: AdvanceContext) -> str:
 def _target_already_merged_description(ctx: AdvanceContext) -> str:
     state = ctx.post_merge_rebase_state
     reason = state.reason if state is not None else None
+    if reason == "merge-unit-empty":
+        return "SKIP: target implementation has no remaining commits to merge (merge-unit-empty)"
     return f"SKIP: target implementation already merged ({reason or 'post-merge proof'})"
+
+
+def _merge_terminal_description(ctx: AdvanceContext) -> str:
+    if getattr(ctx, "merge_state", None) == "empty":
+        return "SKIP: no remaining commits to merge into target branch"
+    return "SKIP: already merged into target branch"
 
 
 def _rebase_target_missing_merge_unit_description(ctx: AdvanceContext) -> str:
@@ -2035,7 +2049,7 @@ def resolve_advance_context(
     )
     branch_tip_resolution = (
         BranchTipResolution(None)
-        if post_merge_rebase_state.already_merged or merge_state == "merged"
+        if post_merge_rebase_state.already_merged or merge_state_is_terminal_for_lifecycle(merge_state)
         else _resolve_branch_tip(git, task.branch)
     )
     current_branch_head_sha = branch_tip_resolution.sha
@@ -2055,7 +2069,7 @@ def resolve_advance_context(
     verify_command_available = verify_availability.available
     can_merge = (
         post_merge_rebase_state.already_merged
-        or merge_state == "merged"
+        or merge_state_is_terminal_for_lifecycle(merge_state)
         or (bool(merge_source.ref) and git.can_merge(merge_source.ref, target_branch))
     )
     rebase_root_task = review_root_task if review_root_task.task_type == "implement" else task
@@ -2327,8 +2341,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="already_merged",
-        matches=lambda ctx: ctx.merge_state == "merged",
-        action=lambda ctx: {"type": "skip", "description": "SKIP: already merged into target branch"},
+        matches=lambda ctx: merge_state_is_terminal_for_lifecycle(ctx.merge_state),
+        action=lambda ctx: {"type": "skip", "description": _merge_terminal_description(ctx)},
     ),
     AdvanceRule(
         name="strict_project_scope_unverified",

@@ -223,6 +223,42 @@ def test_reconcile_task_branch_merge_truth_marks_merged_and_preserves_unit_proje
     assert unit.base_sha == "base-sync-merged"
 
 
+def test_reconcile_task_branch_merge_truth_persists_empty_for_zero_commit_merged_branch(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/scoped-empty")
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = True
+    git.count_commits_ahead_checked.return_value = 0
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/scoped-empty": "head-sync-empty",
+        "main": "base-sync-empty",
+    }.get(ref)
+
+    result = reconcile_task_branch_merge_truth(
+        store,
+        git,
+        task.id,
+        target_branch="main",
+        include_diff_stats=True,
+        persist=True,
+    )
+
+    assert result.merge_status == "empty"
+    assert "marked merged" not in result.actions
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status is None
+    assert refreshed.merged_at is None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    assert unit.state == "empty"
+    assert unit.merged_at is None
+    assert unit.head_sha == "head-sync-empty"
+    assert unit.base_sha == "base-sync-empty"
+
+
 def test_reconcile_task_branch_merge_truth_uses_remote_target_ref_for_merge_proof_but_persists_canonical_target(
     tmp_path,
 ):

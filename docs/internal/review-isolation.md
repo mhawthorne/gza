@@ -7,10 +7,13 @@ Review tasks run in isolated git worktrees that only contain git-tracked files.
 1. **Host runner** queries the main database via `store.get()`
 2. **Host runner** calls `build_prompt()` which includes:
    - Spec file content (if the implementation task has a `spec` field)
-   - Ask context from exactly one source when available:
-    - `## Original plan:` when a linked plan exists
-    - `## Original request:` fallback when no linked plan exists
-    - If neither source exists, both sections are intentionally omitted and reviewers should state `No plan or request provided.`
+   - Ask context:
+    - `## Review scope:` when the implementation declares a gradeable review scope (structured `Task.review_scope` first, conservative prompt parsing fallback for legacy sliced tasks)
+    - `## Original plan context (out of scope except for the review scope):` as read-only boundary/interface context when a scoped review is plan-backed
+    - Otherwise exactly one canonical whole-task ask section:
+      - `## Original plan:` when a linked plan exists
+      - `## Original request:` fallback when no linked plan exists
+    - If neither source exists, ask sections are intentionally omitted and reviewers should state `No plan or request provided.`
    - `## verify_command result` when `verify_command` is configured for the project
      - The host runner executes the literal command once per autonomous review iteration in the review worktree.
      - For `cross-project` reviews, the host runner fans out to each affected project root discovered from the review worktree diff and renders an aggregate status/provenance block first, then one section per affected project.
@@ -29,6 +32,10 @@ Review tasks run in isolated git worktrees that only contain git-tracked files.
 4. **Claude** receives all context baked into the prompt
 
 Database lookups happen on the host before the worktree is even created. The worktree isolation doesn't affect prompt building.
+
+## Scoped reviews
+
+When `## Review scope:` is present, that section is the only gradeable ask. The accompanying original-plan-context section exists only to explain slice boundaries, sibling ownership, and integration contracts. Missing sibling-slice work is not a blocker unless the current diff breaks an explicit contract described in the scoped ask or context.
 
 Current review context logic lives in `_build_context_from_chain()` and `_build_review_diff_context()` in `src/gza/runner.py`.
 

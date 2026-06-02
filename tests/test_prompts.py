@@ -16,7 +16,9 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "Open-state citation:",
     "Class-of-issue enumeration:",
     "Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.",
-    "Treat unexplained deviations from the provided plan or request as BLOCKER.",
+    "Treat unexplained deviations from the provided review scope, plan, or request as BLOCKER.",
+    "If `## Review scope:` is present, grade ask-adherence against that section only.",
+    "Do not raise blockers solely because deferred sibling slices from the original plan are not implemented;",
     "Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.",
     "Treat misleading output (UI/prompt/context contradictions) as BLOCKER when it can cause incorrect operator or agent decisions.",
     "If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.",
@@ -33,7 +35,7 @@ REVIEW_SUMMARY_CHECKLIST_ITEMS = [
     "Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?",
     "Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?",
     "Did I check for misleading output (contradictory UI/prompt/context signals)?",
-    "Was an `## Original plan:` or `## Original request:` section provided, and did I verify ask-adherence (plan decisions reflected in the diff, or request coverage) while calling out intentional deviations? If neither was provided, did I state \"No plan or request provided.\"?",
+    "Was a `## Review scope:` section provided, and if so did I grade ask-adherence against that scope while treating sibling slices as non-blocking unless they break an explicit contract? Otherwise, was an `## Original plan:` or `## Original request:` section provided, and did I verify ask-adherence against it while calling out intentional deviations? If neither was provided, did I state \"No plan or request provided.\"?",
     "Did I require targeted regression tests that match each failure mode (not generic \"add tests\")?",
     "If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?",
 ]
@@ -484,12 +486,13 @@ class TestPromptBuilderBuild:
         assert "misleading output" in result
         assert "targeted regression tests" in result
         assert "config, CLI, or operator-facing behavior changed" in result
+        assert "## Review scope:" in result
         assert "## Original plan:" in result
         assert "## Original request:" in result
         assert "provided diff is authoritative" in result
         assert "read unchanged source files" in result
         assert "No plan or request provided." in result
-        assert "unexplained deviations from the provided plan or request" in result
+        assert "unexplained deviations from the provided review scope, plan, or request" in result
         assert "Reserve BLOCKER for:" in result
         assert "lookup table" in result
         assert "classifier" in result
@@ -561,7 +564,7 @@ class TestPromptBuilderBuild:
             in content
         )
         assert (
-            "<Treat unexplained deviations from the provided plan or request as BLOCKER.>"
+            "<Treat unexplained deviations from the provided review scope, plan, or request as BLOCKER.>"
             in content
         )
         assert (
@@ -583,12 +586,10 @@ class TestPromptBuilderBuild:
         )
         content = skill_path.read_text()
 
+        assert "Pass the authoritative diff context (`## Implementation diff context`)" in content
+        assert "`## Review scope:` section when available" in content
         assert (
-            "Pass the authoritative diff context (`## Implementation diff context`), canonical ask context section (exactly one of `## Original plan:` or `## Original request:` when available), and the PR number (if `--pr` was used and a PR was found) to the subagent."
-            in content
-        )
-        assert (
-            "Review the diff against the provided canonical ask context (`## Original plan:` or `## Original request:`) when present."
+            "If `## Review scope:` is present, grade ask-adherence against that section only"
             in content
         )
         assert (
@@ -639,7 +640,7 @@ class TestPromptBuilderBuild:
         content = skill_path.read_text()
 
         assert (
-            "Review the diff against the provided ask context (`## Original plan:` or `## Original request:`)."
+            "If `## Review scope:` is present, grade ask-adherence against that section only"
             in content
         )
         assert "- Task prompt: `<impl_prompt>`" not in content
@@ -656,9 +657,10 @@ class TestPromptBuilderBuild:
         )
         content = skill_path.read_text()
 
-        assert "Capture one canonical ask section before spawning the reviewer:" in content
+        assert "Capture canonical ask context before spawning the reviewer:" in content
+        assert "If the caller already provided a `## Review scope:` section, pass it through unchanged" in content
         assert (
-            "If the caller already provided exactly one canonical ask section (`## Original plan:` or `## Original request:`), pass that section through unchanged."
+            "Otherwise, if the caller already provided exactly one canonical ask section (`## Original plan:` or `## Original request:`), pass that section through unchanged."
             in content
         )
         assert (

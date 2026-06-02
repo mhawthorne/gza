@@ -630,6 +630,7 @@ gza add [prompt] [options]
 | `--pr` | Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable |
 | `--same-branch` | Continue on depends_on task's branch |
 | `--spec FILE` | Path to spec file for context |
+| `--review-scope TEXT` | For direct implement tasks, set the authoritative gradeable review boundary |
 | `--prompt-file FILE` | Read prompt from file (for non-interactive use) |
 | `--model MODEL` | Override model for this task (e.g., `claude-3-5-haiku-latest`) |
 | `--provider PROVIDER` | Override provider for this task (`claude`, `codex`, or `gemini`) |
@@ -1454,6 +1455,7 @@ gza implement <plan_task_id> [prompt] [options]
 | `--tag TAG` | Add task tag (repeatable) |
 | `--same-branch` | Continue on depends_on task's branch instead of creating new |
 | `--branch-type TYPE` | Set branch type hint for branch naming |
+| `--review-scope TEXT` | Set the authoritative gradeable review boundary for the new implementation task |
 | `--model MODEL` | Override model for this task |
 | `--provider PROVIDER` | Override provider for this task |
 | `--no-learnings` | Skip injecting learnings context |
@@ -1561,11 +1563,11 @@ uv run gza iterate <impl_task_id> [options]
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--force` | Skip dependency merge precondition checks when iterate starts workers |
 
-If `impl_task_id` names a failed implementation whose recovery-only lineage already ends in a completed retry/resume descendant, iterate plans from that completed descendant instead of surfacing a stale `recovery child already completed` skip. If that descendant is already merged, iterate reports that no remaining lifecycle action is needed. Directly iterating an implementation whose `merge_status` is already `merged` also exits early with the same no-op outcome instead of resurfacing historical failed review/improve/rebase side-quests.
+If `impl_task_id` names a failed implementation whose recovery-only lineage already ends in a completed retry/resume descendant, iterate plans from that completed descendant instead of surfacing a stale `recovery child already completed` skip. If that descendant is already merged or has no remaining commits to land (`empty` merge state), iterate reports that no remaining lifecycle action is needed. Directly iterating an implementation whose current-target merge state is already terminal also exits early with the same no-op outcome instead of resurfacing historical failed review/improve/rebase side-quests.
 
 When a human runs `uv run gza iterate` against a failed implementation or failed improve chain that has already hit the automatic max-resume cap, iterate now prints a warning to stderr and proceeds with the manual resume. The same manual-only warning path also applies when an older failed task is blocked by a newer failed recovery descendant: iterate warns, reroutes the resume through that newer failed descendant, and still leaves scheduler- or worker-launched `--auto-iterate` runs blocked on the shared `newer-recovery-descendant-needs-attention` stop. These warnings are emitted before either foreground execution or `--background` worker handoff returns. If iterate cannot evaluate the completed-task `--background` preflight at all, it emits a degraded-check warning to `stderr` before detaching instead of failing silently, including for `--auto-iterate`.
 
-Before `--background` detaches, iterate now also evaluates the current lifecycle decision for completed implementations. If the decision is a true no-worker outcome (for example already merged, plain `merge` readiness, max review cycles reached, waiting on existing work, or another shared skip/needs-attention outcome), iterate prints that decision synchronously to the caller and exits without creating a worker row. `merge_with_followups` is not treated as a no-op here: background iterate still detaches into the normal iterate worker so the shared follow-up task materialization path runs before the implementation becomes merge-ready.
+Before `--background` detaches, iterate now also evaluates the current lifecycle decision for completed implementations. If the decision is a true no-worker outcome (for example already merged, no remaining commits to land, plain `merge` readiness, max review cycles reached, waiting on existing work, or another shared skip/needs-attention outcome), iterate prints that decision synchronously to the caller and exits without creating a worker row. `merge_with_followups` is not treated as a no-op here: background iterate still detaches into the normal iterate worker so the shared follow-up task materialization path runs before the implementation becomes merge-ready.
 
 If that manual resume completes successfully, operator-facing lifecycle readouts move forward from the completed resume descendant instead of leaving the capped failed row as the active unit of work. The older failed row remains in task history, but shared lineage/lifecycle surfaces treat it as recovered: owner-row listings continue from the descendant, and `uv run gza show` on the older failed row renders `Lifecycle: recovered, ...` based on the descendant's next action or terminal state.
 

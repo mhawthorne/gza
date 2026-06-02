@@ -114,6 +114,7 @@ class TestTaskChaining:
             group="test-group",
             depends_on=None,
             spec="specs/test.md",
+            review_scope="slice F-A1 + F-A2: only the classifier slice",
             create_review=True,
             create_pr=True,
             same_branch=True,
@@ -130,6 +131,7 @@ class TestTaskChaining:
         assert retrieved is not None
         assert retrieved.group == "test-group"
         assert retrieved.spec == "specs/test.md"
+        assert retrieved.review_scope == "slice F-A1 + F-A2: only the classifier slice"
         assert retrieved.create_review is True
         assert retrieved.create_pr is True
         assert retrieved.same_branch is True
@@ -8117,6 +8119,44 @@ class TestSharedDbIsolationAndImportGating:
         assert [row.id for row in history] == [task.id]
         assert history[0].trigger_source is None
         assert any("tasks.trigger_source" in warning for warning in query_store.startup_warnings())
+
+    def test_query_only_open_pre_v47_db_missing_review_scope_reads_with_null(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should read v46 snapshots without forcing the v47 review_scope migration."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add(
+            "Task before v47 review_scope",
+            task_type="implement",
+            review_scope="slice F-A1 + F-A2: authoritative metadata",
+        )
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        _drop_tasks_column(db_path, "review_scope")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 46")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            reloaded = query_store.get(task.id)
+            history = query_store.get_history(limit=None)
+        finally:
+            db_path.chmod(0o644)
+
+        assert reloaded is not None
+        assert reloaded.prompt == "Task before v47 review_scope"
+        assert reloaded.review_scope is None
+        assert [row.id for row in history] == [task.id]
+        assert history[0].review_scope is None
+        assert any("tasks.review_scope" in warning for warning in query_store.startup_warnings())
 
     def test_query_only_open_pre_v43_db_missing_changed_diff_reads_with_null(
         self, tmp_path: Path

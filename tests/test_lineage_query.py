@@ -1126,3 +1126,94 @@ def test_query_lineage_owner_rows_projects_merge_for_approved_behind_branch(tmp_
     assert row.next_action is not None
     assert row.next_action["type"] == "merge"
     assert row.lineage_status == "actionable"
+
+
+def test_query_lineage_owner_rows_needs_merge_excludes_empty_merge_units(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    empty_task = store.add("Completed empty implement", task_type="implement")
+    store.mark_completed(empty_task, has_commits=True, branch="feature/empty-needs-merge")
+    assert empty_task.id is not None
+
+    empty_unit = store.resolve_merge_unit_for_task(empty_task.id)
+    assert empty_unit is not None
+    store.set_merge_unit_state(empty_unit.id, "empty")
+
+    merge_task = store.add("Completed real implement", task_type="implement")
+    store.mark_completed(merge_task, has_commits=True, branch="feature/real-needs-merge")
+    assert merge_task.id is not None
+
+    merge_unit = store.resolve_merge_unit_for_task(merge_task.id)
+    assert merge_unit is not None
+    store.set_merge_unit_state(merge_unit.id, "unmerged")
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            statuses=("completed",),
+            merge_chain_state=("needs_merge",),
+            include_skipped=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    owner_ids = {row.owner_task.id for row in rows if row.owner_task.id is not None}
+    assert empty_task.id not in owner_ids
+    assert merge_task.id in owner_ids
+
+
+def test_query_lineage_owner_rows_hides_empty_owner_with_failed_same_branch_descendants(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Completed empty implement", task_type="implement")
+    assert impl.id is not None
+    _set_completed(
+        impl,
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+        branch="feature/empty-owner-descendants",
+        has_commits=True,
+    )
+    store.update(impl)
+
+    impl_unit = store.get_or_create_merge_unit_for_task(impl)
+    assert impl_unit is not None
+    store.set_merge_unit_state(impl_unit.id, "empty")
+
+    review = store.add("Failed review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = "failed"
+    review.completed_at = datetime(2026, 5, 16, 10, 0, tzinfo=UTC)
+    review.branch = impl.branch
+    review.failure_reason = "REVIEW_CHANGES_REQUESTED"
+    store.update(review)
+    store.attach_task_to_merge_unit(review.id, impl_unit.id, "review")
+
+    improve = store.add("Failed improve", task_type="improve", based_on=review.id, same_branch=True)
+    assert improve.id is not None
+    improve.status = "failed"
+    improve.completed_at = datetime(2026, 5, 16, 11, 0, tzinfo=UTC)
+    improve.branch = impl.branch
+    improve.has_commits = True
+    improve.failure_reason = "MAX_TURNS"
+    store.update(improve)
+    store.attach_task_to_merge_unit(improve.id, impl_unit.id, "improve")
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    assert rows == ()

@@ -294,6 +294,37 @@ class TestCreateReviewTask:
         assert call_kwargs["depends_on"] == "gza-12"
         assert call_kwargs["based_on"] == "gza-12"
 
+    def test_review_inherits_review_scope_from_implementation(self):
+        store = self._mock_store()
+        task = _task(id="gza-12", review_scope="slice F-A1 + F-A2: only review the classifier slice")
+
+        create_review_task(store, task, trigger_source="manual", prompt_mode="auto")
+
+        assert store.add.call_args[1]["review_scope"] == task.review_scope
+
+    def test_review_resolves_scope_from_legacy_sliced_implementation_prompt(self):
+        store = self._mock_store()
+        task = _task(
+            id="gza-12",
+            review_scope=None,
+            prompt=(
+                "Implement plan gza-4065, slice F-A1 + F-A2: preserve the scoped classifier path.\n\n"
+                "## Scope\n"
+                "1. Add the classifier.\n"
+                "2. Persist the review boundary.\n\n"
+                "## Out of scope\n"
+                "- F-A3\n"
+            ),
+        )
+
+        create_review_task(store, task, trigger_source="manual", prompt_mode="auto")
+
+        assert store.add.call_args[1]["review_scope"] == (
+            "Slice F-A1 + F-A2: preserve the scoped classifier path.\n\n"
+            "1. Add the classifier.\n"
+            "2. Persist the review boundary."
+        )
+
     def test_attaches_review_to_implementation_merge_unit(self):
         store = self._mock_store()
         impl = _task(id="gza-12")
@@ -418,7 +449,12 @@ class TestFollowupTasks:
     def test_create_or_reuse_followup_task_creates_when_missing(self):
         store = MagicMock()
         review_task = _task(id="gza-200", task_type="review")
-        impl_task = _task(id="gza-101", task_type="implement", group="grp-a")
+        impl_task = _task(
+            id="gza-101",
+            task_type="implement",
+            group="grp-a",
+            review_scope="slice F-A1 + F-A2: preserve scoped review boundaries",
+        )
         finding = ReviewFinding(
             id="F2",
             severity="FOLLOWUP",
@@ -455,4 +491,51 @@ class TestFollowupTasks:
         assert kwargs["task_type"] == "implement"
         assert kwargs["based_on"] == "gza-200"
         assert kwargs["depends_on"] == "gza-101"
+        assert kwargs["review_scope"] == impl_task.review_scope
         assert kwargs["tags"] == ("grp-a",)
+
+    def test_create_or_reuse_followup_task_resolves_legacy_prompt_scope_when_field_missing(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(
+            id="gza-101",
+            task_type="implement",
+            prompt=(
+                "Implement plan gza-4065, slice F-A1 + F-A2: introduce the scoped classifier path.\n\n"
+                "## Scope\n"
+                "1. Add the classifier.\n"
+                "2. Persist the review boundary.\n\n"
+                "## Out of scope\n"
+                "- F-A3\n"
+            ),
+        )
+        finding = ReviewFinding(
+            id="F3",
+            severity="FOLLOWUP",
+            title="Title",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="carry scope through follow-ups",
+            tests=None,
+        )
+        created_task = _task(id="gza-403", task_type="implement")
+        store.get_based_on_children.return_value = []
+        store.add.return_value = created_task
+
+        created, created_now = create_or_reuse_followup_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            trigger_source="manual",
+        )
+
+        assert created is created_task
+        assert created_now is True
+        assert (
+            store.add.call_args.kwargs["review_scope"]
+            == "Slice F-A1 + F-A2: introduce the scoped classifier path.\n\n"
+            "1. Add the classifier.\n"
+            "2. Persist the review boundary."
+        )

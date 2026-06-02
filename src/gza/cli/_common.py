@@ -47,6 +47,7 @@ from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..prompts import PromptBuilder
 from ..recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
+from ..review_scope import extract_review_scope_from_prompt
 from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
     create_or_reuse_followup_task,
@@ -1424,6 +1425,7 @@ def _create_rebase_task(
     Used by both ``gza rebase --background`` and ``gza advance`` so that
     rebases always go through the standard runner.
     """
+    parent_task = store.get(parent_task_id)
     return store.add(
         prompt=(
             f"Rebase branch '{branch}' onto the local branch '{target_branch}' and resolve "
@@ -1436,6 +1438,11 @@ def _create_rebase_task(
         task_type="rebase",
         based_on=parent_task_id,
         same_branch=True,
+        review_scope=(
+            _resolved_review_scope_metadata(parent_task)
+            if parent_task is not None
+            else None
+        ),
         skip_learnings=True,
         trigger_source=trigger_source,
     )
@@ -1824,6 +1831,7 @@ def _create_improve_task(
         based_on=based_on_id,
         same_branch=True,
         tags=impl_task.tags,
+        review_scope=_resolved_review_scope_metadata(impl_task),
         create_review=create_review,
         create_pr=create_pr,
         model=model,
@@ -1950,6 +1958,52 @@ def _format_lineage(
     return "\n".join(lines)
 
 
+def _resolved_review_scope_metadata(task: DbTask) -> str | None:
+    """Resolve the authoritative review scope carried by a source task."""
+    if task.review_scope:
+        normalized = task.review_scope.strip()
+        if normalized:
+            return normalized
+    return extract_review_scope_from_prompt(task.prompt)
+
+
+def _create_implementation_task_from_source(
+    store: SqliteTaskStore,
+    source_task: DbTask,
+    *,
+    prompt: str,
+    trigger_source: str,
+    tags: tuple[str, ...] | list[str] | None = None,
+    review_scope: str | None = None,
+    create_review: bool = False,
+    create_pr: bool = False,
+    same_branch: bool = False,
+    task_type_hint: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+    provider_is_explicit: bool | None = None,
+    skip_learnings: bool = False,
+) -> DbTask:
+    """Create an implementation task using shared review-scope inheritance rules."""
+    assert source_task.id is not None
+    return store.add(
+        prompt=prompt,
+        task_type="implement",
+        depends_on=source_task.id,
+        tags=source_task.tags if tags is None else tags,
+        review_scope=review_scope if review_scope is not None else _resolved_review_scope_metadata(source_task),
+        create_review=create_review,
+        create_pr=create_pr,
+        same_branch=same_branch,
+        task_type_hint=task_type_hint,
+        model=model,
+        provider=provider,
+        provider_is_explicit=provider_is_explicit,
+        skip_learnings=skip_learnings,
+        trigger_source=trigger_source,
+    )
+
+
 def _create_resume_task(
     store: SqliteTaskStore,
     original_task: DbTask,
@@ -1977,6 +2031,7 @@ def _create_resume_task(
         task_type=original_task.task_type,
         tags=original_task.tags,
         spec=original_task.spec,
+        review_scope=original_task.review_scope,
         depends_on=original_task.depends_on,
         create_review=original_task.create_review,
         create_pr=original_task.create_pr,
@@ -2028,6 +2083,7 @@ def _create_retry_task(
         task_type=original_task.task_type,
         tags=original_task.tags,
         spec=original_task.spec,
+        review_scope=original_task.review_scope,
         depends_on=original_task.depends_on,
         create_review=original_task.create_review,
         create_pr=original_task.create_pr,

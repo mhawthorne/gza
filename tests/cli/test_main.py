@@ -519,6 +519,24 @@ class TestHelpOutput:
             assert flag in normalized_help
             assert flag in docs_text
 
+    def test_review_scope_help_and_docs_are_aligned_for_add_and_implement(self, tmp_path):
+        """`--review-scope` should be documented anywhere CLI help exposes it."""
+        setup_config(tmp_path)
+
+        expected = "authoritative gradeable review"
+
+        for command, section in (("add", "add"), ("implement", "implement")):
+            help_result = run_gza(command, "--help", "--project", str(tmp_path))
+            assert help_result.returncode == 0
+
+            normalized_help = " ".join(help_result.stdout.split()).lower()
+            docs_text = _normalized_markdown_section(Path("docs/configuration.md"), section).lower()
+
+            assert "--review-scope" in help_result.stdout
+            assert "--review-scope" in docs_text
+            assert expected in normalized_help
+            assert expected in docs_text
+
     def test_sync_help_and_docs_describe_explicit_branch_and_pr_reconciliation(self, tmp_path):
         """`sync --help` and docs should keep sync as the broader explicit maintenance surface."""
         setup_config(tmp_path)
