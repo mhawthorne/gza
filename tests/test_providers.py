@@ -6104,15 +6104,23 @@ class TestCodexFullConversationSimulation:
 
         assert result.session_id == "thread_abc"
 
-    def test_reports_unknown_live_item_types(self, tmp_path, capsys):
-        """Unknown Codex live items should be surfaced, not silently dropped."""
+    def test_renders_todo_list_live_items_and_keeps_agent_messages(self, tmp_path, capsys):
+        """Known Codex todo_list items should render as TodoWrite activity."""
         provider = CodexProvider()
         log_file = tmp_path / "test.log"
 
         json_lines = [
             json.dumps({"type": "thread.started", "thread_id": "thread_unknown"}) + "\n",
             json.dumps({"type": "turn.started"}) + "\n",
-            json.dumps({"type": "item.completed", "item": {"type": "todo_list", "items": []}}) + "\n",
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "todo_list",
+                        "items": [{"text": "Inspect logs", "completed": False}],
+                    },
+                }
+            ) + "\n",
             json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}) + "\n",
         ]
 
@@ -6130,8 +6138,126 @@ class TestCodexFullConversationSimulation:
             )
 
         out = capsys.readouterr().out
-        assert "Unhandled Codex item type: todo_list" in out
+        assert "TodoWrite 1 todos (pending: 1, in_progress: 0, completed: 0)" in out
+        assert "Inspect logs" in out
         assert "done" in out
+
+    def test_persists_codex_tool_activity_items_as_sanitized_substeps(self, tmp_path):
+        """Codex tool-activity items should become structured substeps instead of unknowns."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "thread.started", "thread_id": "thread_tools"}) + "\n",
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "file_change",
+                        "changes": [
+                            {"path": "src/gza/providers/codex.py", "kind": "update"},
+                            {"path": "tests/test_providers.py", "kind": "add"},
+                        ],
+                        "status": "completed",
+                    },
+                }
+            ) + "\n",
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "web_search",
+                        "query": "codex file_change handler",
+                        "action": {"type": "other"},
+                    },
+                }
+            ) + "\n",
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "todo_list",
+                        "items": [
+                            {"text": "Inspect logs", "completed": False},
+                            {"text": "Add tests", "completed": True},
+                        ],
+                    },
+                }
+            ) + "\n",
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "collab_tool_call",
+                        "tool": "spawn_agent",
+                        "sender_thread_id": "thread_tools",
+                        "receiver_thread_ids": ["thread_worker_1", "thread_worker_2"],
+                        "prompt": (
+                            "Investigate Codex log item handling and summarize the gaps for the "
+                            "main thread without leaking the full worker prompt body."
+                        ),
+                    },
+                }
+            ) + "\n",
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "filesystem",
+                        "tool": "read_file",
+                        "arguments": {"path": "src/gza/providers/codex.py", "offset": 0, "limit": 50},
+                        "result": {"ok": True, "bytes": 1024},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        steps = result._accumulated_data["run_step_events"]
+        assert len(steps) == 2
+        assert steps[0]["summary"] == "Pre-message tool activity"
+        assert steps[1]["message_text"] == "done"
+
+        substeps = steps[0]["substeps"]
+        assert [substep["type"] for substep in substeps] == [
+            "tool_call",
+            "tool_call",
+            "tool_call",
+            "tool_call",
+            "tool_call",
+            "tool_call",
+            "tool_output",
+        ]
+        assert substeps[0]["payload"]["tool_name"] == "edit"
+        assert substeps[0]["payload"]["tool_input"]["detail"] == "src/gza/providers/codex.py (update)"
+        assert substeps[1]["payload"]["tool_input"]["detail"] == "tests/test_providers.py (add)"
+        assert substeps[2]["payload"]["tool_name"] == "web_search"
+        assert substeps[2]["payload"]["tool_input"]["detail"] == "codex file_change handler"
+        assert substeps[3]["payload"]["tool_name"] == "TodoWrite"
+        assert substeps[3]["payload"]["tool_input"]["todos"][1]["text"] == "Add tests"
+        assert substeps[4]["payload"]["tool_name"] == "spawn_agent"
+        assert substeps[4]["payload"]["tool_input"]["detail"].startswith("thread_worker_1 +1 prompt=")
+        assert "full worker prompt body" not in substeps[4]["payload"]["tool_input"]["detail"]
+        assert substeps[5]["payload"]["tool_name"] == "mcp:filesystem/read_file"
+        assert substeps[5]["payload"]["tool_input"]["arguments_preview"].startswith("{\"limit\": 50")
+        assert substeps[6]["payload"]["output"].startswith("{\"bytes\": 1024")
 
     def test_reports_top_level_live_error_message(self, tmp_path, capsys):
         """Known Codex live error events should keep provider error text."""

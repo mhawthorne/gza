@@ -49,8 +49,17 @@ def test_codex_renderer_accumulates_tv_tokens_from_usage_fixture() -> None:
     assert stats.input_tokens == 24
     assert stats.output_tokens == 8
     assert "Session started (thread: thread_123)" in joined
+    assert "-> edit src/gza/providers/codex.py (update)" in joined
+    assert "-> web_search codex item.completed file_change logs" in joined
+    assert "-> TodoWrite 2 todos (pending: 1, in_progress: 0, completed: 1)" in joined
+    assert "○ Inspect logs" in joined
+    assert "● Add regression tests" in joined
+    assert "-> spawn_agent thread_worker_1 +1 prompt=Investigate Codex log item handling" in joined
+    assert "-> mcp:filesystem/read_file {\"limit\": 50, \"offset\": 0, \"path\": \"src/gza/providers/codex.py\"}" in joined
     assert "I found the root cause." in joined
     assert "Selected model is at capacity. Try again shortly." in joined
+    assert '"receiver_thread_ids"' not in joined
+    assert "entire worker prompt body" not in joined
 
 
 def test_codex_renderer_suppresses_item_updated_events() -> None:

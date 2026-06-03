@@ -28,6 +28,7 @@ from .base import (
 from .log_rendering import (
     RenderedLines,
     RenderStats,
+    compact_json,
     configured_model_from_gza_info,
     error_lines,
     generic_log_summary,
@@ -73,11 +74,16 @@ CODEX_LIVE_EVENT_HANDLERS: dict[str, str] = {
 CODEX_LIVE_KNOWN_EVENT_TYPES = frozenset(CODEX_LIVE_EVENT_HANDLERS)
 CODEX_ITEM_REGISTRY: dict[str, dict[str, object]] = {
     "agent_message": {"render": "_render_item_agent_message", "live": "_handle_live_item_agent_message"},
+    "collab_tool_call": {"render": "_render_item_collab_tool_call", "live": "_handle_live_item_collab_tool_call"},
     "command_execution": {
         "render": "_render_item_command_execution",
         "live": "_handle_live_item_command_execution",
     },
+    "file_change": {"render": "_render_item_file_change", "live": "_handle_live_item_file_change"},
+    "mcp_tool_call": {"render": "_render_item_mcp_tool_call", "live": "_handle_live_item_mcp_tool_call"},
     "reasoning": {"render": "_render_item_reasoning", "live": "_handle_live_item_reasoning"},
+    "todo_list": {"render": "_render_item_todo_list", "live": "_handle_live_item_todo_list"},
+    "web_search": {"render": "_render_item_web_search", "live": "_handle_live_item_web_search"},
 }
 CODEX_RENDER_ITEM_HANDLERS: dict[str, str] = {
     item_type: str(handler_name)
@@ -95,6 +101,116 @@ CODEX_RENDER_KNOWN_ITEM_TYPES = frozenset(
 CODEX_LIVE_KNOWN_ITEM_TYPES = frozenset(
     CODEX_LIVE_ITEM_HANDLERS
 )
+_CODEX_FILE_CHANGE_LIMIT = 5
+_CODEX_TODO_LIMIT = 5
+
+
+def _codex_tool_log_line(label: str, detail: str = "") -> str:
+    suffix = f" {rich_escape(detail)}" if detail else ""
+    return f"[green]\\[tool: {rich_escape(label)}][/green]{suffix}"
+
+
+def _codex_tool_tv_line(label: str, detail: str = "") -> str:
+    return f"-> {label}{f' {detail}' if detail else ''}"
+
+
+def _codex_more_line(remaining: int) -> str | None:
+    if remaining <= 0:
+        return None
+    noun = "item" if remaining == 1 else "items"
+    return f"... (+{remaining} more {noun})"
+
+
+def _codex_normalize_todo_status(todo: dict[str, Any]) -> str:
+    status = todo.get("status")
+    if isinstance(status, str) and status in {"pending", "in_progress", "completed"}:
+        return status
+    completed = todo.get("completed")
+    if isinstance(completed, bool):
+        return "completed" if completed else "pending"
+    return "pending"
+
+
+def _codex_todo_summary(todos: list[dict[str, Any]]) -> str:
+    if not todos:
+        return "0 todos"
+    pending = sum(1 for todo in todos if _codex_normalize_todo_status(todo) == "pending")
+    in_progress = sum(1 for todo in todos if _codex_normalize_todo_status(todo) == "in_progress")
+    completed = sum(1 for todo in todos if _codex_normalize_todo_status(todo) == "completed")
+    return (
+        f"{len(todos)} todos "
+        f"(pending: {pending}, in_progress: {in_progress}, completed: {completed})"
+    )
+
+
+def _codex_todo_lines(todos: list[dict[str, Any]], *, tv: bool) -> list[str]:
+    status_icons = {"pending": "○", "in_progress": "◐", "completed": "●"}
+    lines: list[str] = []
+    for todo in todos[:_CODEX_TODO_LIMIT]:
+        status = _codex_normalize_todo_status(todo)
+        text = truncate_text(str(todo.get("text") or todo.get("content") or "").strip(), 80)
+        if not text:
+            continue
+        line = f"  {status_icons.get(status, '○')} {text}"
+        lines.append(line if tv else rich_escape(line))
+    more_line = _codex_more_line(len(todos) - min(len(todos), _CODEX_TODO_LIMIT))
+    if more_line:
+        lines.append(more_line if tv else rich_escape(more_line))
+    return lines
+
+
+def _codex_receiver_summary(receiver_thread_ids: object) -> str:
+    if not isinstance(receiver_thread_ids, list):
+        return "unknown"
+    receivers = [str(receiver).strip() for receiver in receiver_thread_ids if str(receiver).strip()]
+    if not receivers:
+        return "unknown"
+    summary = receivers[0]
+    if len(receivers) > 1:
+        summary += f" +{len(receivers) - 1}"
+    return summary
+
+
+def _codex_file_change_lines(changes: list[dict[str, Any]], *, tv: bool) -> list[str]:
+    lines: list[str] = []
+    for change in changes[:_CODEX_FILE_CHANGE_LIMIT]:
+        path = str(change.get("path") or "").strip()
+        kind = str(change.get("kind") or "update").strip() or "update"
+        if not path:
+            continue
+        detail = f"{path} ({kind})"
+        lines.append(_codex_tool_tv_line("edit", detail) if tv else _codex_tool_log_line("edit", detail))
+    more_line = _codex_more_line(len(changes) - min(len(changes), _CODEX_FILE_CHANGE_LIMIT))
+    if more_line:
+        lines.append(more_line if tv else rich_escape(more_line))
+    return lines
+
+
+def _codex_web_search_detail(item: dict[str, Any]) -> str:
+    query = str(item.get("query") or "").strip()
+    return truncate_text(query, 100) if query else "search"
+
+
+def _codex_collab_tool_detail(item: dict[str, Any]) -> str:
+    receiver = _codex_receiver_summary(item.get("receiver_thread_ids"))
+    prompt = truncate_text(str(item.get("prompt") or "").strip(), 80)
+    detail = f"{receiver}"
+    if prompt:
+        detail += f" prompt={prompt}"
+    return detail
+
+
+def _codex_mcp_tool_name(item: dict[str, Any]) -> str:
+    server = str(item.get("server") or "unknown").strip() or "unknown"
+    tool = str(item.get("tool") or "unknown").strip() or "unknown"
+    return f"mcp:{server}/{tool}"
+
+
+def _codex_mcp_detail(item: dict[str, Any]) -> str:
+    arguments = item.get("arguments")
+    if arguments in (None, "", {}, []):
+        return ""
+    return compact_json(arguments, max_chars=100)
 
 
 def _unknown_live_type_message(provider: str, surface: str, type_name: object) -> str:
@@ -418,6 +534,45 @@ class CodexLogRenderer:
             else:
                 lines.append(rendered_output)
         return RenderedLines(log_lines=lines)
+
+    def _render_item_file_change(self, entry: dict[str, Any], *, item: dict[str, Any], tv: bool) -> RenderedLines:
+        changes = item.get("changes")
+        if not isinstance(changes, list):
+            return self._render_unknown(entry, tv=tv)
+        dict_changes = [change for change in changes if isinstance(change, dict)]
+        if not dict_changes:
+            return self._render_unknown(entry, tv=tv)
+        lines = _codex_file_change_lines(dict_changes, tv=tv)
+        return RenderedLines(tv_lines=lines if tv else [], log_lines=lines if not tv else [])
+
+    def _render_item_web_search(self, entry: dict[str, Any], *, item: dict[str, Any], tv: bool) -> RenderedLines:
+        detail = _codex_web_search_detail(item)
+        line = _codex_tool_tv_line("web_search", detail) if tv else _codex_tool_log_line("web_search", detail)
+        return RenderedLines(tv_lines=[line] if tv else [], log_lines=[line] if not tv else [])
+
+    def _render_item_todo_list(self, entry: dict[str, Any], *, item: dict[str, Any], tv: bool) -> RenderedLines:
+        raw_items = item.get("items")
+        if not isinstance(raw_items, list):
+            return self._render_unknown(entry, tv=tv)
+        todos = [todo for todo in raw_items if isinstance(todo, dict)]
+        summary = _codex_todo_summary(todos)
+        lines = [
+            _codex_tool_tv_line("TodoWrite", summary) if tv else _codex_tool_log_line("TodoWrite", summary),
+            *_codex_todo_lines(todos, tv=tv),
+        ]
+        return RenderedLines(tv_lines=lines if tv else [], log_lines=lines if not tv else [])
+
+    def _render_item_collab_tool_call(self, entry: dict[str, Any], *, item: dict[str, Any], tv: bool) -> RenderedLines:
+        tool = str(item.get("tool") or "collab_tool_call").strip() or "collab_tool_call"
+        detail = _codex_collab_tool_detail(item)
+        line = _codex_tool_tv_line(tool, detail) if tv else _codex_tool_log_line(tool, detail)
+        return RenderedLines(tv_lines=[line] if tv else [], log_lines=[line] if not tv else [])
+
+    def _render_item_mcp_tool_call(self, entry: dict[str, Any], *, item: dict[str, Any], tv: bool) -> RenderedLines:
+        tool_name = _codex_mcp_tool_name(item)
+        detail = _codex_mcp_detail(item)
+        line = _codex_tool_tv_line(tool_name, detail) if tv else _codex_tool_log_line(tool_name, detail)
+        return RenderedLines(tv_lines=[line] if tv else [], log_lines=[line] if not tv else [])
 
     def _render_item_reasoning(self, entry: dict[str, Any], *, item: dict[str, Any], tv: bool) -> RenderedLines:
         _ = entry, tv
@@ -1248,6 +1403,48 @@ class CodexProvider(Provider):
             ops_log_file=ops_log_file,
         )
 
+    def _ensure_live_step_for_tool_activity(
+        self,
+        *,
+        data: dict[str, Any],
+        max_steps: int,
+        on_step_count: Callable[[int], None] | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        current_step = data.get("_current_step_event")
+        legacy_turn_id = _current_codex_turn_id(data)
+        if current_step is None:
+            current_step = _start_codex_step(
+                data,
+                None,
+                legacy_turn_id,
+                legacy_event_id=_allocate_codex_legacy_event_id(data, legacy_turn_id),
+                summary="Pre-message tool activity",
+                on_step_count=on_step_count,
+            )
+            _maybe_mark_codex_max_steps_exceeded(data, max_steps)
+        return current_step, legacy_turn_id
+
+    def _append_live_substep(
+        self,
+        *,
+        current_step: dict[str, Any],
+        legacy_turn_id: str | None,
+        data: dict[str, Any],
+        substep_type: str,
+        call_id: object = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        current_step["substeps"].append(
+            {
+                "type": substep_type,
+                "source": "provider",
+                "call_id": call_id,
+                "payload": payload or {},
+                "legacy_turn_id": legacy_turn_id,
+                "legacy_event_id": _allocate_codex_legacy_event_id(data, legacy_turn_id),
+            }
+        )
+
     def _handle_live_item_command_execution(
         self,
         *,
@@ -1265,47 +1462,36 @@ class CodexProvider(Provider):
         command = item.get("command", "")
         aggregated_output = item.get("aggregated_output", "")
         data["approx_input_chars"] = data.get("approx_input_chars", 0) + len(command) + len(aggregated_output)
-        current_step = data.get("_current_step_event")
-        legacy_turn_id = _current_codex_turn_id(data)
-        if current_step is None:
-            current_step = _start_codex_step(
-                data,
-                None,
-                legacy_turn_id,
-                legacy_event_id=_allocate_codex_legacy_event_id(data, legacy_turn_id),
-                summary="Pre-message tool activity",
-                on_step_count=on_step_count,
-            )
-            _maybe_mark_codex_max_steps_exceeded(data, max_steps)
+        current_step, legacy_turn_id = self._ensure_live_step_for_tool_activity(
+            data=data,
+            max_steps=max_steps,
+            on_step_count=on_step_count,
+        )
         call_id = item.get("id")
         retry_of_call_id = item.get("retry_of_call_id") or item.get("retry_of")
 
         if retry_of_call_id:
-            current_step["substeps"].append(
-                {
-                    "type": "tool_retry",
-                    "source": "provider",
-                    "call_id": call_id,
-                    "payload": {"retry_of_call_id": retry_of_call_id},
-                    "legacy_turn_id": legacy_turn_id,
-                    "legacy_event_id": _allocate_codex_legacy_event_id(data, legacy_turn_id),
-                }
+            self._append_live_substep(
+                current_step=current_step,
+                legacy_turn_id=legacy_turn_id,
+                data=data,
+                substep_type="tool_retry",
+                call_id=call_id,
+                payload={"retry_of_call_id": retry_of_call_id},
             )
 
-        current_step["substeps"].append(
-            {
-                "type": "tool_call",
-                "source": "provider",
-                "call_id": call_id,
-                "payload": {
-                    "tool_name": "Bash",
-                    "command": command,
-                    "tool_input": {"command": command},
-                    "retry_of_call_id": retry_of_call_id,
-                },
-                "legacy_turn_id": legacy_turn_id,
-                "legacy_event_id": _allocate_codex_legacy_event_id(data, legacy_turn_id),
-            }
+        self._append_live_substep(
+            current_step=current_step,
+            legacy_turn_id=legacy_turn_id,
+            data=data,
+            substep_type="tool_call",
+            call_id=call_id,
+            payload={
+                "tool_name": "Bash",
+                "command": command,
+                "tool_input": {"command": command},
+                "retry_of_call_id": retry_of_call_id,
+            },
         )
         exit_code = item.get("exit_code")
         if not isinstance(exit_code, int):
@@ -1313,31 +1499,229 @@ class CodexProvider(Provider):
             exit_code = maybe_exit if isinstance(maybe_exit, int) else None
         if isinstance(exit_code, int):
             substep_type = "tool_output" if exit_code == 0 else "tool_error"
-            current_step["substeps"].append(
-                {
-                    "type": substep_type,
-                    "source": "provider",
-                    "call_id": call_id,
-                    "payload": {
-                        "exit_code": exit_code,
-                        "output": aggregated_output,
-                    },
-                    "legacy_turn_id": legacy_turn_id,
-                    "legacy_event_id": _allocate_codex_legacy_event_id(data, legacy_turn_id),
-                }
+            self._append_live_substep(
+                current_step=current_step,
+                legacy_turn_id=legacy_turn_id,
+                data=data,
+                substep_type=substep_type,
+                call_id=call_id,
+                payload={
+                    "exit_code": exit_code,
+                    "output": aggregated_output,
+                },
             )
         elif aggregated_output:
-            current_step["substeps"].append(
-                {
-                    "type": "tool_output",
-                    "source": "provider",
-                    "call_id": call_id,
-                    "payload": {"output": aggregated_output},
-                    "legacy_turn_id": legacy_turn_id,
-                    "legacy_event_id": _allocate_codex_legacy_event_id(data, legacy_turn_id),
-                }
+            self._append_live_substep(
+                current_step=current_step,
+                legacy_turn_id=legacy_turn_id,
+                data=data,
+                substep_type="tool_output",
+                call_id=call_id,
+                payload={"output": aggregated_output},
             )
         formatter.print_tool_event("Bash", truncate_text(command, 80))
+
+    def _handle_live_item_file_change(
+        self,
+        *,
+        item: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+    ) -> None:
+        _ = model, chat_text_display_length, log_handle, ops_log_file
+        raw_changes = item.get("changes")
+        if not isinstance(raw_changes, list):
+            return
+        changes = [change for change in raw_changes if isinstance(change, dict)]
+        if not changes:
+            return
+        current_step, legacy_turn_id = self._ensure_live_step_for_tool_activity(
+            data=data,
+            max_steps=max_steps,
+            on_step_count=on_step_count,
+        )
+        for change in changes:
+            path = str(change.get("path") or "").strip()
+            kind = str(change.get("kind") or "update").strip() or "update"
+            if not path:
+                continue
+            detail = f"{path} ({kind})"
+            data["approx_output_chars"] = data.get("approx_output_chars", 0) + len(detail)
+            self._append_live_substep(
+                current_step=current_step,
+                legacy_turn_id=legacy_turn_id,
+                data=data,
+                substep_type="tool_call",
+                payload={
+                    "tool_name": "edit",
+                    "tool_input": {"detail": detail, "file_path": path, "kind": kind},
+                    "changes": [{"path": path, "kind": kind}],
+                },
+            )
+        for line in _codex_file_change_lines(changes, tv=True):
+            formatter.print_tool_event("edit", line.removeprefix("-> edit ").strip() if line.startswith("-> edit ") else line)
+
+    def _handle_live_item_web_search(
+        self,
+        *,
+        item: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+    ) -> None:
+        _ = model, chat_text_display_length, log_handle, ops_log_file
+        detail = _codex_web_search_detail(item)
+        current_step, legacy_turn_id = self._ensure_live_step_for_tool_activity(
+            data=data,
+            max_steps=max_steps,
+            on_step_count=on_step_count,
+        )
+        data["approx_input_chars"] = data.get("approx_input_chars", 0) + len(detail)
+        self._append_live_substep(
+            current_step=current_step,
+            legacy_turn_id=legacy_turn_id,
+            data=data,
+            substep_type="tool_call",
+            payload={"tool_name": "web_search", "tool_input": {"query": detail, "detail": detail}},
+        )
+        formatter.print_tool_event("web_search", detail)
+
+    def _handle_live_item_todo_list(
+        self,
+        *,
+        item: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+    ) -> None:
+        _ = model, chat_text_display_length, log_handle, ops_log_file
+        raw_items = item.get("items")
+        if not isinstance(raw_items, list):
+            return
+        todos = [todo for todo in raw_items if isinstance(todo, dict)]
+        current_step, legacy_turn_id = self._ensure_live_step_for_tool_activity(
+            data=data,
+            max_steps=max_steps,
+            on_step_count=on_step_count,
+        )
+        summary = _codex_todo_summary(todos)
+        data["approx_output_chars"] = data.get("approx_output_chars", 0) + len(summary)
+        self._append_live_substep(
+            current_step=current_step,
+            legacy_turn_id=legacy_turn_id,
+            data=data,
+            substep_type="tool_call",
+            payload={"tool_name": "TodoWrite", "tool_input": {"todos": todos}},
+        )
+        formatter.print_tool_event("TodoWrite", summary)
+        for todo in todos[:_CODEX_TODO_LIMIT]:
+            text = truncate_text(str(todo.get("text") or todo.get("content") or "").strip(), 60)
+            if text:
+                formatter.print_todo(_codex_normalize_todo_status(todo), text)
+        more_line = _codex_more_line(len(todos) - min(len(todos), _CODEX_TODO_LIMIT))
+        if more_line:
+            formatter.print_tool_event("TodoWrite", more_line, prefix="  ")
+
+    def _handle_live_item_collab_tool_call(
+        self,
+        *,
+        item: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+    ) -> None:
+        _ = model, chat_text_display_length, log_handle, ops_log_file
+        tool = str(item.get("tool") or "collab_tool_call").strip() or "collab_tool_call"
+        detail = _codex_collab_tool_detail(item)
+        current_step, legacy_turn_id = self._ensure_live_step_for_tool_activity(
+            data=data,
+            max_steps=max_steps,
+            on_step_count=on_step_count,
+        )
+        data["approx_input_chars"] = data.get("approx_input_chars", 0) + len(detail)
+        self._append_live_substep(
+            current_step=current_step,
+            legacy_turn_id=legacy_turn_id,
+            data=data,
+            substep_type="tool_call",
+            payload={
+                "tool_name": tool,
+                "tool_input": {
+                    "detail": detail,
+                    "receiver_thread_ids": item.get("receiver_thread_ids"),
+                    "prompt_preview": truncate_text(str(item.get("prompt") or "").strip(), 80),
+                },
+            },
+        )
+        formatter.print_tool_event(tool, detail)
+
+    def _handle_live_item_mcp_tool_call(
+        self,
+        *,
+        item: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+    ) -> None:
+        _ = model, chat_text_display_length, log_handle, ops_log_file
+        tool_name = _codex_mcp_tool_name(item)
+        detail = _codex_mcp_detail(item)
+        current_step, legacy_turn_id = self._ensure_live_step_for_tool_activity(
+            data=data,
+            max_steps=max_steps,
+            on_step_count=on_step_count,
+        )
+        data["approx_input_chars"] = data.get("approx_input_chars", 0) + len(detail)
+        self._append_live_substep(
+            current_step=current_step,
+            legacy_turn_id=legacy_turn_id,
+            data=data,
+            substep_type="tool_call",
+            payload={"tool_name": tool_name, "tool_input": {"detail": detail, "arguments_preview": detail}},
+        )
+        if item.get("error") not in (None, "", {}, []):
+            self._append_live_substep(
+                current_step=current_step,
+                legacy_turn_id=legacy_turn_id,
+                data=data,
+                substep_type="tool_error",
+                payload={"error": compact_json(item.get("error"), max_chars=120)},
+            )
+        elif item.get("result") not in (None, "", {}, []):
+            self._append_live_substep(
+                current_step=current_step,
+                legacy_turn_id=legacy_turn_id,
+                data=data,
+                substep_type="tool_output",
+                payload={"output": compact_json(item.get("result"), max_chars=120)},
+            )
+        formatter.print_tool_event(tool_name, detail)
 
     def _handle_live_item_agent_message(
         self,

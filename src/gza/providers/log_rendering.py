@@ -160,6 +160,7 @@ def text_to_lines(text: str, *, max_lines: int = 6, max_chars: int = 200) -> lis
 
 def summarize_tool_detail(tool_name: str, tool_input: dict[str, Any]) -> str:
     """Build a compact one-line tool summary for timeline and TV rendering."""
+    detail = str(tool_input.get("detail", "")).strip()
     if tool_name == "Bash":
         cmd = str(tool_input.get("command", ""))
         return truncate(strip_shell_wrapper(cmd), 100) if cmd else "Bash"
@@ -179,11 +180,14 @@ def summarize_tool_detail(tool_name: str, tool_input: dict[str, Any]) -> str:
         if isinstance(todos, list):
             return f"TodoWrite {len(todos)} todos"
         return "TodoWrite"
+    if detail:
+        return f"{tool_name} {detail}".strip()
     return tool_name
 
 
 def tool_one_liner(name: str, inp: dict[str, Any]) -> str:
     """Compact tool-use summary for TV."""
+    detail = str(inp.get("detail", "")).strip()
     if name == "Bash":
         cmd = str(inp.get("command", ""))
         return f"$ {truncate(strip_shell_wrapper(cmd), 120)}" if cmd else "$ (bash)"
@@ -200,6 +204,8 @@ def tool_one_liner(name: str, inp: dict[str, Any]) -> str:
         todos = inp.get("todos", [])
         if isinstance(todos, list):
             return f"TodoWrite {len(todos)} todos"
+    if detail:
+        return f"{name} {detail}".strip()
     return name
 
 
