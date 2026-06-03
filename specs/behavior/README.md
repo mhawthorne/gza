@@ -69,12 +69,12 @@ Additional rules for authors:
 | [lifecycle-engine.md](lifecycle-engine.md) | The prescriptive transition rules the engine evaluates each pass (plan → implement → review → improve → rebase → merge). | Draft — 5 decisions ratified 2026-06-01 |
 | [watch-supervisor.md](watch-supervisor.md) | The prescriptive runtime/supervisor contract for `gza watch`: cycle order, slot accounting, detached-worker adoption, drift re-exec, scope, and stop/backoff rules. | Draft — north-star runtime contract pending conformance pass |
 | [worktree-reclaim.md](worktree-reclaim.md) | The prescriptive contract for how a code work unit acquires its isolated worktree at task start, and when an existing worktree may be reclaimed vs. must fail for a human. | Draft — core model settled (clean→reclaim, dirty→fail), governed by `worktree_auto_reclaim_clean` |
+| [lineage.md](lineage.md) | The task graph (`based_on`/`depends_on`) and its canonical operations — dependency satisfaction across retry chains, owner/merge-unit resolution, latest-node resolution, recovery-target attachment — plus the merge-unit ownership model. The substrate the other behavior specs query. | Draft — initial, pending conformance pass; 4 open questions |
 
 ### Planned (not yet written)
 
 These follow the same template once the lifecycle engine above is settled:
 
 - CLI interface contract (the observable command surface and its guarantees)
-- Recovery & failure (resume vs retry vs give-up policy)
-- Merge units & lineage (the ownership model that defines a "unit of work")
-</content>
+- Recovery & failure (resume vs retry vs give-up policy — the *policy* layer above the
+  recovery-target and dependency-satisfaction *mechanics* now in [lineage.md](lineage.md))
