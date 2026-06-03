@@ -76,6 +76,22 @@ chmod +x /tmp/gza-shims/gza
 export PATH="/tmp/gza-shims:/workspace/bin:$PATH"
 """
 
+_PROVIDER_CONFIG_ERROR_TYPES = frozenset(
+    {
+        "authentication_error",
+        "invalid_request",
+        "invalid_request_error",
+        "not_found_error",
+        "permission_error",
+    }
+)
+_PROVIDER_CONFIG_ERROR_MESSAGE_SNIPPETS = (
+    "not supported",
+    "not found",
+    "does not exist",
+    "invalid model",
+)
+
 
 @dataclass
 class DockerConfig:
@@ -85,6 +101,25 @@ class DockerConfig:
     cli_command: str
     config_dir: str | None  # e.g., ".claude" or ".gemini", None to skip mount
     env_vars: list[str]  # e.g., ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+
+
+def classify_provider_api_error(*, status: int | None, error_type: str | None, message: str | None) -> str | None:
+    """Classify a provider API error into a shared internal error_type token."""
+    if status == 429 or (isinstance(status, int) and status >= 500):
+        return "provider_unavailable"
+
+    normalized_error_type = error_type.strip().lower() if isinstance(error_type, str) else None
+    normalized_message = message.strip().lower() if isinstance(message, str) else None
+
+    if status in {400, 401, 403, 404}:
+        return "config_error"
+    if normalized_error_type in _PROVIDER_CONFIG_ERROR_TYPES:
+        return "config_error"
+    if normalized_message and any(
+        snippet in normalized_message for snippet in _PROVIDER_CONFIG_ERROR_MESSAGE_SNIPPETS
+    ):
+        return "config_error"
+    return None
 
 
 @dataclass(frozen=True)

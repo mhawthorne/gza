@@ -87,5 +87,5 @@ class TestPreflightLiveCodex:
         assert result.status == "FAIL"
         assert any(
             token in result.detail.lower()
-            for token in ("model", "unknown", "invalid", "not found")
+            for token in ("model", "unknown", "invalid", "not found", "not supported")
         ), result.detail

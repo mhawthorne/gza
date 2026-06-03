@@ -842,7 +842,10 @@ gza validate
 Run a live provider/model sanity check before queueing real work. `gza preflight`
 loads config, resolves the provider/model pairs real tasks would use, runs the
 provider credential preflight, then sends a trivial prompt and reports a PASS/FAIL
-table. The command exits non-zero if any resolved pair fails.
+table. The command exits non-zero if any resolved pair fails. When the live
+round-trip is rejected by the provider, the failure detail prefers the provider's
+model/config error text over the startup command breadcrumb so operators see the
+actionable rejection reason.
 
 ```bash
 gza preflight

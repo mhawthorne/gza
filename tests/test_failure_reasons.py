@@ -108,6 +108,51 @@ def test_resolve_failure_reason_uses_reported_steps_when_computed_is_below_limit
     assert reason == "MAX_STEPS"
 
 
+def test_resolve_failure_reason_maps_provider_error_types() -> None:
+    assert resolve_failure_reason(error_type="config_error", exit_code=1, log_file=None) == "CONFIG_ERROR"
+    assert (
+        resolve_failure_reason(
+            error_type="provider_unavailable",
+            exit_code=1,
+            log_file=None,
+        ) == "PROVIDER_UNAVAILABLE"
+    )
+
+
+def test_resolve_failure_reason_log_fallback_preserves_config_error(tmp_path: Path) -> None:
+    log_file = tmp_path / "task.log"
+    log_file.write_text("provider failed\n[GZA_FAILURE:CONFIG_ERROR]\n", encoding="utf-8")
+
+    assert (
+        resolve_failure_reason(
+            error_type=None,
+            exit_code=1,
+            log_file=log_file,
+            fallback_to_log=True,
+        )
+        == "CONFIG_ERROR"
+    )
+
+
+def test_resolve_failure_reason_log_fallback_filters_provider_unavailable(tmp_path: Path) -> None:
+    log_file = tmp_path / "task.log"
+    log_file.write_text(
+        "provider failed\n[GZA_FAILURE:PROVIDER_UNAVAILABLE]\n",
+        encoding="utf-8",
+    )
+
+    # Provider unavailability remains runner-owned on the fallback path.
+    assert (
+        resolve_failure_reason(
+            error_type=None,
+            exit_code=1,
+            log_file=log_file,
+            fallback_to_log=True,
+        )
+        == "UNKNOWN"
+    )
+
+
 def test_production_failure_reason_persistence_uses_shared_helper() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     source_root = repo_root / "src" / "gza"

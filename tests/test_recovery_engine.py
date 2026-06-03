@@ -505,6 +505,13 @@ def test_classify_failure_reason_config_error_is_manual() -> None:
     assert classify_failure_reason("CONFIG_ERROR") == "manual"
 
 
+def test_recovery_engine_config_error_skips(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="CONFIG_ERROR")
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "manual_failure_reason"
+
+
 def test_recovery_engine_provider_empty_turn_is_retryable(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, task_type="plan", reason="PROVIDER_EMPTY_TURN", session_id=None)
 

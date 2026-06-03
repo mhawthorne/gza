@@ -30,6 +30,7 @@ from gza.providers.base import (
     _get_file_sha256,
     _get_image_created_time,
     build_docker_cmd,
+    classify_provider_api_error,
     ensure_docker_image,
     is_docker_running,
     verify_docker_credentials,
@@ -98,6 +99,33 @@ class TestGetProvider:
         )
         with pytest.raises(ValueError, match="Unknown provider: unknown"):
             get_provider(config)
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type", "message", "expected"),
+    [
+        (400, "server_error", None, "config_error"),
+        (None, "invalid_request_error", None, "config_error"),
+        (None, None, "This model is not supported for this account", "config_error"),
+        (429, "invalid_request_error", "invalid model", "provider_unavailable"),
+        (503, "invalid_request_error", "model is not supported", "provider_unavailable"),
+        (None, None, None, None),
+        (418, "server_error", "unexpected", None),
+    ],
+)
+def test_classify_provider_api_error(
+    status: int | None,
+    error_type: str | None,
+    message: str | None,
+    expected: str | None,
+) -> None:
+    assert (
+        classify_provider_api_error(
+            status=status,
+            error_type=error_type,
+            message=message,
+        ) == expected
+    )
 
 
 class TestDockerConfig:
@@ -4495,6 +4523,51 @@ class TestCodexOutputParsing:
 
         assert result.num_steps_computed == 3
         assert result.error_type == "max_steps"
+
+    def test_classifies_provider_config_error_from_error_event(self, tmp_path):
+        """Codex error events should surface provider config errors on RunResult."""
+        import json
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "error",
+                "message": json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "The 'gpt-5.4-codex' model is not supported.",
+                        },
+                    }
+                ),
+            }) + "\n",
+            json.dumps({
+                "type": "turn.failed",
+                "error": {
+                    "message": "The 'gpt-5.4-codex' model is not supported.",
+                },
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 1
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.error_type == "config_error"
 
     def test_new_turn_tool_substep_does_not_attach_to_previous_step(self, tmp_path):
         """Tool items before the next message should attach to the new turn's step."""

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from statistics import median
-from typing import Any
+from typing import Any, cast
 
 from rich.table import Table
 
@@ -76,6 +76,14 @@ class CheckResult:
     status: str
     detail: str
     duration_s: float
+
+
+@dataclass(frozen=True)
+class _PreflightLogRecord:
+    order: int
+    timestamp: datetime | None
+    payload: dict[str, Any] | None
+    raw_text: str
 
 
 def _display_provider_model(provider: str | None, model: str | None, *, no_plan: bool = False) -> str:
@@ -1394,40 +1402,121 @@ def _truncate_preflight_detail(message: str) -> str:
     return f"{compact[: _PREFLIGHT_DETAIL_MAX_LEN - 3]}..."
 
 
-def _iter_preflight_log_lines(path: Path) -> list[str]:
+def _parse_preflight_record_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _iter_preflight_log_records(path: Path, *, start_order: int = 0) -> list[_PreflightLogRecord]:
     if not path.exists():
         return []
-    lines: list[str] = []
+    records: list[_PreflightLogRecord] = []
     for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         stripped = raw_line.strip()
         if not stripped:
             continue
-        candidate = stripped
         try:
             payload = json.loads(stripped)
         except json.JSONDecodeError:
             payload = None
-        if isinstance(payload, dict):
-            for key in ("message", "provider_output", "error", "detail"):
-                value = payload.get(key)
-                if isinstance(value, str) and value.strip():
-                    candidate = value.strip()
-                    break
-        lines.append(candidate)
-    return lines
+        payload_dict = payload if isinstance(payload, dict) else None
+        records.append(
+            _PreflightLogRecord(
+                order=start_order + len(records),
+                timestamp=_parse_preflight_record_timestamp(payload_dict.get("timestamp")) if payload_dict else None,
+                payload=payload_dict,
+                raw_text=stripped,
+            )
+        )
+    return records
+
+
+def _decode_preflight_detail_payload(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return stripped
+    return parsed
+
+
+def _extract_preflight_detail_candidate(payload: object) -> tuple[int, str] | None:
+    decoded = _decode_preflight_detail_payload(payload)
+    if isinstance(decoded, dict):
+        decoded_dict = cast(dict[str, Any], decoded)
+        error = decoded_dict.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                detail = message.strip()
+                priority = 3 if _PREFLIGHT_ERROR_PATTERN.search(detail) else 2
+                return (priority, detail)
+            if error:
+                detail = json.dumps(error, sort_keys=True)
+                priority = 3 if _PREFLIGHT_ERROR_PATTERN.search(detail) else 2
+                return (priority, detail)
+        for key in ("detail", "provider_output", "message"):
+            candidate = _extract_preflight_detail_candidate(decoded_dict.get(key))
+            if candidate is not None:
+                return candidate
+        return None
+    if isinstance(decoded, str):
+        detail = decoded.strip()
+        if not detail:
+            return None
+        if detail.startswith("Running command:"):
+            return (0, detail)
+        priority = 3 if _PREFLIGHT_ERROR_PATTERN.search(detail) else 1
+        return (priority, detail)
+    return None
+
+
+def _preflight_record_sort_key(timestamp: datetime | None, order: int) -> tuple[int, datetime, int]:
+    return (1 if timestamp is not None else 0, timestamp or datetime.min.replace(tzinfo=UTC), order)
 
 
 def _extract_preflight_failure_detail(log_file: Path, result_error_type: str | None) -> str:
-    if result_error_type:
+    if result_error_type and result_error_type not in {"config_error", "provider_unavailable"}:
         return _truncate_preflight_detail(result_error_type)
 
-    lines = _iter_preflight_log_lines(log_file)
-    lines.extend(_iter_preflight_log_lines(log_file.with_name(f"{log_file.stem}.ops.jsonl")))
-    for line in reversed(lines):
-        if _PREFLIGHT_ERROR_PATTERN.search(line):
-            return _truncate_preflight_detail(line)
-    if lines:
-        return _truncate_preflight_detail(lines[-1])
+    records = _iter_preflight_log_records(log_file)
+    records.extend(
+        _iter_preflight_log_records(
+            log_file.with_name(f"{log_file.stem}.ops.jsonl"),
+            start_order=len(records),
+        )
+    )
+    best_detail: tuple[int, int, datetime, int, str] | None = None
+    fallback_detail: tuple[datetime | None, int, str] | None = None
+    for record in records:
+        candidate = _extract_preflight_detail_candidate(record.payload or record.raw_text)
+        if candidate is None:
+            continue
+        priority, detail = candidate
+        if priority <= 0:
+            if fallback_detail is None or _preflight_record_sort_key(
+                record.timestamp, record.order
+            ) > _preflight_record_sort_key(fallback_detail[0], fallback_detail[1]):
+                fallback_detail = (record.timestamp, record.order, detail)
+            continue
+        ranking = (priority, *_preflight_record_sort_key(record.timestamp, record.order), detail)
+        if best_detail is None or ranking > best_detail:
+            best_detail = ranking
+    if best_detail is not None:
+        return _truncate_preflight_detail(best_detail[4])
+    if fallback_detail is not None:
+        return _truncate_preflight_detail(fallback_detail[2])
     return "live round-trip failed"
 
 

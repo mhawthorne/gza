@@ -20,6 +20,7 @@ from .base import (
     Provider,
     RunResult,
     build_docker_cmd,
+    classify_provider_api_error,
     ensure_docker_image,
     verify_docker_credentials,
     write_ops_event,
@@ -375,6 +376,42 @@ def _codex_error_message(entry: dict[str, Any]) -> str:
     if error not in (None, "", [], {}):
         return str(error)
     return json.dumps(entry)
+
+
+def _codex_provider_error_type(event: dict[str, Any]) -> str | None:
+    """Extract a shared internal provider error type from a Codex error event."""
+    message_value = event.get("message")
+    payload = event
+    if isinstance(message_value, str):
+        try:
+            parsed_payload = json.loads(message_value)
+        except json.JSONDecodeError:
+            parsed_payload = None
+        if isinstance(parsed_payload, dict):
+            payload = parsed_payload
+
+    raw_status = payload.get("status")
+    status = raw_status if isinstance(raw_status, int) else None
+
+    error = payload.get("error")
+    error_type: str | None = None
+    error_message: str | None = None
+    if isinstance(error, dict):
+        raw_error_type = error.get("type")
+        if isinstance(raw_error_type, str):
+            error_type = raw_error_type
+        raw_error_message = error.get("message")
+        if isinstance(raw_error_message, str):
+            error_message = raw_error_message
+
+    if error_message is None and isinstance(message_value, str):
+        error_message = message_value
+
+    return classify_provider_api_error(
+        status=status,
+        error_type=error_type,
+        message=error_message,
+    )
 
 
 class CodexLogRenderer:
@@ -1163,6 +1200,10 @@ class CodexProvider(Provider):
             # Check if we exceeded max steps
             if accumulated.get("exceeded_max_steps"):
                 result.error_type = "max_steps"
+            elif result.error_type is None:
+                provider_error_type = accumulated.get("provider_error_type")
+                if isinstance(provider_error_type, str):
+                    result.error_type = provider_error_type
 
             # Store session ID for resume capability
             if "thread_id" in accumulated:
@@ -1264,8 +1305,11 @@ class CodexProvider(Provider):
         ensure_step_store: Callable[[dict[str, Any]], None],
         current_turn_id: Callable[[dict[str, Any]], str | None],
     ) -> None:
-        _ = data, model, max_steps, chat_text_display_length, log_handle, on_session_id, on_step_count, ops_log_file, ensure_step_store, current_turn_id
+        _ = model, max_steps, chat_text_display_length, log_handle, on_session_id, on_step_count, ops_log_file, ensure_step_store, current_turn_id
         formatter.print_error(f"Error: {_codex_error_message(event)}")
+        provider_error_type = _codex_provider_error_type(event)
+        if provider_error_type is not None and "provider_error_type" not in data:
+            data["provider_error_type"] = provider_error_type
 
     def _handle_live_turn_completed_event(
         self,

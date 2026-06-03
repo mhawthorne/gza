@@ -13,7 +13,12 @@ from unittest.mock import patch
 
 import pytest
 
-from gza.cli.config_cmds import CheckTarget, cmd_preflight, resolve_preflight_targets
+from gza.cli.config_cmds import (
+    CheckTarget,
+    _extract_preflight_failure_detail,
+    cmd_preflight,
+    resolve_preflight_targets,
+)
 from gza.config import Config, ProviderConfig, TaskTypeConfig
 from gza.providers.base import PreflightCheckResult, RunResult
 
@@ -376,6 +381,67 @@ class TestPreflightCommand:
         assert "Provider/model preflight (direct)" in output
         assert "1.2s" in output
         assert "1 passed, 0 failed" in output
+
+    def test_extract_preflight_failure_detail_prefers_logged_message_for_classified_provider_errors(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        log_file = tmp_path / "preflight.jsonl"
+        log_file.write_text(
+            '{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The model is not supported."}}\n',
+            encoding="utf-8",
+        )
+
+        detail = _extract_preflight_failure_detail(log_file, "config_error")
+
+        assert "model" in detail.lower()
+        assert "not supported" in detail.lower()
+
+    def test_extract_preflight_failure_detail_prefers_nested_provider_error_over_command_breadcrumb(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        log_file = tmp_path / "preflight.jsonl"
+        log_file.write_text(
+            (
+                '{"timestamp":"2026-06-03T10:00:02Z","type":"error","message":"{\\"status\\":400,\\"error\\":{\\"type\\":\\"invalid_request_error\\",\\"message\\":\\"Model gpt-5.4-codex is not supported.\\"}}"}\n'
+            ),
+            encoding="utf-8",
+        )
+        log_file.with_name("preflight.ops.jsonl").write_text(
+            (
+                '{"timestamp":"2026-06-03T10:00:01Z","type":"gza","stream":"ops","subtype":"command","event":"provider_exec_start","message":"Running command: timeout 2m codex exec -m gpt-5.4-codex"}\n'
+            ),
+            encoding="utf-8",
+        )
+
+        detail = _extract_preflight_failure_detail(log_file, "config_error")
+
+        assert "gpt-5.4-codex" in detail
+        assert "not supported" in detail.lower()
+        assert "running command" not in detail.lower()
+
+    def test_extract_preflight_failure_detail_uses_ops_process_output_when_it_has_provider_rejection(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        log_file = tmp_path / "preflight.jsonl"
+        log_file.with_name("preflight.ops.jsonl").write_text(
+            "\n".join(
+                (
+                    '{"timestamp":"2026-06-03T10:00:01Z","type":"gza","stream":"ops","subtype":"command","event":"provider_exec_start","message":"Running command: timeout 2m codex exec -m gpt-5.4-codex"}',
+                    '{"timestamp":"2026-06-03T10:00:03Z","type":"gza","stream":"ops","subtype":"process_output","provider_output":"Error: model gpt-5.4-codex not found"}',
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        detail = _extract_preflight_failure_detail(log_file, "config_error")
+
+        assert "model" in detail.lower()
+        assert "not found" in detail.lower()
+        assert "running command" not in detail.lower()
 
 
 class TestProjectPrefixValidation:

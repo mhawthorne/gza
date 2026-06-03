@@ -8,7 +8,6 @@ from .db import DB_UNSET, SqliteTaskStore, Task, TaskStats, extract_failure_reas
 TERMINATED_FAILURE_REASON = "TERMINATED"
 _RUNNER_OWNED_LOG_FALLBACK_REASONS = frozenset(
     {
-        "CONFIG_ERROR",
         "EXTRACTION_PRECHECK_FAILED",
         "GIT_ERROR",
         "INTERRUPTED",
@@ -85,6 +84,10 @@ def resolve_failure_reason(
         observed_steps_reported,
     ):
         return "MAX_STEPS"
+    if error_type == "config_error":
+        return "CONFIG_ERROR"
+    if error_type == "provider_unavailable":
+        return "PROVIDER_UNAVAILABLE"
     if fallback_to_log and log_file is not None:
         return _extract_log_fallback_failure_reason(log_file)
     return "UNKNOWN"
