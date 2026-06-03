@@ -2,7 +2,7 @@
 name: gza-task-triage
 description: Triage `gza incomplete` rows — classify each unresolved merge-unit lineage and recommend the right corrective action (drop moot leaves, escalate to fix, surface manual-resolve rebases, etc.). Never merges, retries, resumes, or deletes branches; never edits code.
 allowed-tools: Read, Bash(uv run gza show:*), Bash(uv run gza incomplete:*), Bash(uv run gza lineage:*), Bash(uv run gza log:*), Bash(uv run gza set-status:*), Bash(uv run python -c:*), Bash(git:*), AskUserQuestion
-version: 1.0.0
+version: 1.1.0
 public: true
 ---
 
@@ -31,13 +31,30 @@ If you find yourself wanting to do any of the above without explicit per-row con
 The skill accepts an optional task ID.
 
 - **With ID:** triage just that lineage. Resolve the merge-unit owner via `gza show <id>` and look at the row that owns it. If the ID is not currently in `gza incomplete`, run `gza show <id>` and report the lifecycle anyway — the user may want to triage a lineage they expect to surface.
-- **Without ID:** sweep the whole list. Run `uv run gza incomplete --json --last 0` and process every row.
+- **Without ID:** ask how far back to look before gathering rows. Default to a recent sweep, not an all-time backlog walk.
 
-In both modes, also fetch the structured rows so you can classify by `next_action`:
+For no-ID sweeps, start with AskUserQuestion and offer:
+- `Last 1 hour`
+- `Last 24 hours` (default/recommended)
+- `Last 7 days`
+- `All time`
+
+If the caller's intent is clearly recent (for example "what just failed?", "triage the latest watch output", "check today's attention rows"), proceed with `Last 24 hours` without asking a follow-up.
+
+Then gather the structured rows up front so later steps only spend tokens on in-window rows:
+
+- **With ID:** run `uv run gza incomplete --json --last 0` and filter to the merge-unit owner row that contains the requested task (check both `id` and `member_ids`). If no row matches, fall back to `uv run gza show <id>` and report the lineage state directly.
+- **Without ID, recent sweep:** prefer the built-in server-side date filter:
 
 ```bash
-uv run gza incomplete --json --last 0
+uv run gza incomplete --json --days 1 --date-field effective --last 0
 ```
+
+- **Without ID, custom window:** map the AskUserQuestion choice to:
+  - `Last 1 hour` → `uv run gza incomplete --json --days 1 --date-field effective --last 0`, then keep only rows whose `effective_at` is within the last hour.
+  - `Last 24 hours` → `uv run gza incomplete --json --days 1 --date-field effective --last 0`
+  - `Last 7 days` → `uv run gza incomplete --json --days 7 --date-field effective --last 0`
+  - `All time` → `uv run gza incomplete --json --last 0`
 
 The JSON rows include:
 - `id` — the merge-unit owner ID (this is the row that surfaces)
@@ -46,8 +63,9 @@ The JSON rows include:
 - `unresolved_ids` — leaves blocking resolution
 - `review_verdict` — last review verdict text (when present)
 - `lineage_root_id`, `branch_owner_id`, `branch_merge_state`
+- `effective_at` — use this as the default recency timestamp. It is the row's latest state-transition timestamp when `completed_at` exists, otherwise `created_at`, so it tracks when the unresolved row most recently entered its current actionable state better than raw creation time.
 
-If the user passed a task ID, filter to the row whose `id` matches the merge-unit owner that contains it (check both `id` and `member_ids`).
+Do the recency filtering in this step, before any `gza show` follow-up work. The entire point is to avoid spending later classification or verification effort on stale rows outside the selected window.
 
 ### Step 2: Classify each row
 

@@ -382,6 +382,49 @@ def test_summary_docs_and_skill_use_dedicated_triage_surfaces() -> None:
     assert "Keep failed history, unmerged work, unimplemented follow-up, and queue state on their dedicated surfaces." in skill_content
 
 
+def test_task_triage_skill_defaults_no_id_sweeps_to_recent_effective_window() -> None:
+    """No-ID triage sweeps should ask for a recent window and avoid default all-time backlog scans."""
+    repo_root = Path(__file__).resolve().parents[1]
+    skill_content = (
+        repo_root / "src" / "gza" / "skills" / "gza-task-triage" / "SKILL.md"
+    ).read_text()
+
+    required_snippets = [
+        "Without ID:** ask how far back to look before gathering rows. Default to a recent sweep, not an all-time backlog walk.",
+        "AskUserQuestion and offer:",
+        "`Last 1 hour`",
+        "`Last 24 hours` (default/recommended)",
+        "`Last 7 days`",
+        "`All time`",
+        'If the caller\'s intent is clearly recent',
+        "uv run gza incomplete --json --days 1 --date-field effective --last 0",
+        "`effective_at` — use this as the default recency timestamp.",
+        "Do the recency filtering in this step, before any `gza show` follow-up work.",
+    ]
+    for snippet in required_snippets:
+        assert snippet in skill_content
+
+    assert "- **Without ID:** sweep the whole list. Run `uv run gza incomplete --json --last 0` and process every row." not in skill_content
+
+
+def test_task_triage_skill_keeps_explicit_id_path_outside_recency_window() -> None:
+    """Explicit-ID triage should still bypass recency filtering and inspect the requested lineage."""
+    repo_root = Path(__file__).resolve().parents[1]
+    skill_content = (
+        repo_root / "src" / "gza" / "skills" / "gza-task-triage" / "SKILL.md"
+    ).read_text()
+
+    assert (
+        "- **With ID:** triage just that lineage. Resolve the merge-unit owner via `gza show <id>` and look at the row that owns it."
+        in skill_content
+    )
+    assert (
+        "- **With ID:** run `uv run gza incomplete --json --last 0` and filter to the merge-unit owner row that contains the requested task"
+        in skill_content
+    )
+    assert "If no row matches, fall back to `uv run gza show <id>` and report the lineage state directly." in skill_content
+
+
 def test_gza_rebase_docs_match_final_verify_contract() -> None:
     """Operator docs should describe the rebase skill's final verify_command contract."""
     repo_root = Path(__file__).resolve().parents[1]
