@@ -3227,12 +3227,10 @@ def test_failed_rebase_clears_and_marks_merged_when_branch_tip_equals_target_tip
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "skip"
-    assert action["description"] == (
-        "SKIP: target implementation already merged (branch-tip-equals-target-tip)"
-    )
+    assert action["description"] == "SKIP: moot/no work (empty branch)"
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
     assert refreshed_unit is not None
-    assert refreshed_unit.state == "merged"
+    assert refreshed_unit.state == "empty"
 
     rows = query_lineage_owner_rows(
         store,
@@ -3305,10 +3303,12 @@ def test_empty_branch_persists_empty_and_skips_merge_actions(
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "skip"
-    assert action["description"] == "SKIP: no remaining commits to merge into target branch"
+    assert action["description"] == "SKIP: moot/no work (empty branch)"
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
     assert refreshed_unit is not None
     assert refreshed_unit.state == "empty"
+    assert refreshed_unit.merged_at is None
+    assert refreshed_unit.merged_by_task_id is None
 
     rows = query_lineage_owner_rows(
         store,
@@ -3953,6 +3953,37 @@ def test_already_merged_branch_prefers_fresh_remote_over_stale_legacy_local_ref(
 
     assert action["type"] == "skip"
     assert action["description"] == "SKIP: already merged into target branch"
+
+
+def test_empty_branch_skips_with_moot_no_work_text(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement empty branch", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 4, 0, tzinfo=UTC)
+    impl.branch = "feat/empty-branch"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            ref_shas={
+                "feat/empty-branch": "same-sha",
+                "main": "same-sha",
+            },
+        ),
+        impl,
+        "main",
+        persist_post_merge_rebase_state=False,
+    )
+
+    assert action["type"] == "skip"
+    assert action["description"] == "SKIP: moot/no work (empty branch)"
 
 
 def test_failed_rebase_is_superseded_by_later_completed_same_branch_rebase(

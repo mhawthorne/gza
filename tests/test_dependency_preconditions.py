@@ -1,6 +1,10 @@
 from pathlib import Path
 
-from gza.dependency_preconditions import get_unmerged_dependency_precondition
+from gza import dependency_preconditions as dependency_preconditions_module
+from gza.dependency_preconditions import (
+    empty_prereq_satisfies_dependency,
+    get_unmerged_dependency_precondition,
+)
 from gza.db import SqliteTaskStore
 
 
@@ -22,18 +26,43 @@ def test_dependency_precondition_reads_merge_unit_state(tmp_path: Path) -> None:
     assert get_unmerged_dependency_precondition(store, downstream) is None
 
 
-def test_dependency_precondition_treats_empty_merge_unit_as_satisfied(tmp_path: Path) -> None:
+def test_dependency_precondition_blocks_when_unit_is_empty_by_default(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
 
     dependency = store.add("Dependency", task_type="implement")
     store.mark_completed(dependency, has_commits=True, branch="feature/dependency-empty")
     assert dependency.id is not None
-
     unit = store.resolve_merge_unit_for_task(dependency.id)
     assert unit is not None
     store.set_merge_unit_state(unit.id, "empty")
 
     downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
+
+    assert callable(empty_prereq_satisfies_dependency)
+    assert get_unmerged_dependency_precondition(store, downstream).id == dependency.id
+
+
+def test_dependency_precondition_empty_policy_can_satisfy_dependency(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    dependency = store.add("Dependency", task_type="implement")
+    store.mark_completed(dependency, has_commits=True, branch="feature/dependency-empty-toggle")
+    assert dependency.id is not None
+    unit = store.resolve_merge_unit_for_task(dependency.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "empty")
+
+    downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
+
+    assert get_unmerged_dependency_precondition(store, downstream).id == dependency.id
+
+    monkeypatch.setattr(
+        dependency_preconditions_module,
+        "empty_prereq_satisfies_dependency",
+        lambda _store, _prereq, _dependent: True,
+    )
 
     assert get_unmerged_dependency_precondition(store, downstream) is None
 
@@ -73,4 +102,3 @@ def test_dependency_precondition_blocks_when_unit_is_blocked_even_if_legacy_row_
     downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
 
     assert get_unmerged_dependency_precondition(store, downstream).id == dependency.id
-

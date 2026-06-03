@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from gza import dependency_preconditions as dependency_preconditions_module
 from gza.db import (
     DB_UNSET,
     SCHEMA_VERSION,
@@ -2734,6 +2735,53 @@ class TestMergeStatus:
         assert unmerged_impl.merge_status == "unmerged"
         assert unmerged_impl.merged_at is None
 
+    def test_set_merge_unit_state_empty_clears_provenance_and_hides_actionable_listing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/empty-state")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        store.set_merge_unit_state(impl_unit.id, "merged")
+        store.set_merge_unit_state(impl_unit.id, "empty")
+
+        empty_unit = store.get_merge_unit(impl_unit.id)
+        assert empty_unit is not None
+        assert empty_unit.state == "empty"
+        assert empty_unit.merged_at is None
+        assert empty_unit.merged_by_task_id is None
+        assert store.get_unmerged_merge_units() == []
+
+        empty_impl = store.get(impl.id)
+        assert empty_impl is not None
+        assert empty_impl.merge_status is None
+        assert empty_impl.merged_at is None
+
+    def test_set_merge_unit_state_rejects_explicit_provenance_for_non_merged_states(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/non-merged-provenance")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        with pytest.raises(ValueError, match="cannot retain merged_by_task_id provenance"):
+            store.set_merge_unit_state(impl_unit.id, "empty", merged_by_task_id=impl.id)
+
+        with pytest.raises(ValueError, match="cannot retain merged_at provenance"):
+            store.set_merge_unit_state(impl_unit.id, "blocked", merged_at=datetime.now(UTC))
+
     def test_set_merge_unit_state_sets_merged_state_and_provenance_together(self, tmp_path: Path) -> None:
         """Merged writes should stamp owner provenance and merged_at in one state change."""
         db_path = tmp_path / "test.db"
@@ -2942,6 +2990,36 @@ class TestMergeStatus:
         assert repaired_second.state == "unmerged"
         assert repaired_second.merged_at is None
         assert repaired_second.merged_by_task_id is None
+
+    def test_store_open_repairs_inconsistent_empty_merge_unit_provenance(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Repair empty provenance", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/open-repair-empty")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        now_iso = datetime.now(UTC).isoformat()
+        with store._connect() as conn:
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET state = 'empty',
+                    merged_at = ?,
+                    merged_by_task_id = ?
+                WHERE project_id = ? AND id = ?
+                """,
+                (now_iso, impl.id, store._project_id, impl_unit.id),
+            )
+
+        reopened = SqliteTaskStore(db_path)
+        repaired_unit = reopened.get_merge_unit(impl_unit.id)
+        assert repaired_unit is not None
+        assert repaired_unit.state == "empty"
+        assert repaired_unit.merged_at is None
+        assert repaired_unit.merged_by_task_id is None
 
     def test_same_branch_improve_reuses_related_merged_unit(self, tmp_path: Path) -> None:
         """A same-lineage same-branch improve task should reopen the existing unit."""
@@ -4710,6 +4788,23 @@ class TestRetryChainDependencyResolution:
         assert result is not None
         return result
 
+    def _complete_implement_with_branch(
+        self,
+        store: SqliteTaskStore,
+        task: Task,
+        *,
+        branch: str,
+        merge_state: str = "empty",
+    ) -> Task:
+        store.mark_completed(task, has_commits=True, branch=branch)
+        assert task.id is not None
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, merge_state)
+        result = store.get(task.id)
+        assert result is not None
+        return result
+
     # --- is_task_blocked ---
 
     def test_no_dependency_not_blocked(self, tmp_path: Path):
@@ -4867,6 +4962,51 @@ class TestRetryChainDependencyResolution:
         next_task = store.get_next_pending()
         assert next_task is not None
         assert next_task.id == downstream.id
+
+    def test_completed_empty_implement_dependency_blocks_by_default(self, tmp_path: Path):
+        """Completed empty implement prerequisites must not satisfy pickup by default."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dep", task_type="implement")
+        self._complete_implement_with_branch(store, dep, branch="feature/dep-empty-default")
+        downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
+
+        assert store.resolve_dependency_completion(downstream) is not None
+        assert store.get_next_pending() is None
+        assert store.get_pending_pickup() == []
+
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(downstream)
+        assert is_blocked is True
+        assert blocking_id == dep.id
+        assert blocking_status == "completed"
+
+        assert store.count_blocked_tasks() == 1
+
+    def test_completed_empty_implement_dependency_unblocks_when_policy_enabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Toggling the empty-prereq policy must flip pickup and blocked semantics together."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dep", task_type="implement")
+        self._complete_implement_with_branch(store, dep, branch="feature/dep-empty-toggle")
+        downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
+
+        monkeypatch.setattr(
+            dependency_preconditions_module,
+            "empty_prereq_satisfies_dependency",
+            lambda _store, _prereq, _dependent: True,
+        )
+
+        next_task = store.get_next_pending()
+        assert next_task is not None
+        assert next_task.id == downstream.id
+        assert [task.id for task in store.get_pending_pickup()] == [downstream.id]
+
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(downstream)
+        assert is_blocked is False
+        assert blocking_id is None
+        assert blocking_status is None
+
+        assert store.count_blocked_tasks() == 0
 
     # --- count_blocked_tasks ---
 

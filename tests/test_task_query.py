@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gza import dependency_preconditions as dependency_preconditions_module
 from gza.cli.advance_engine import determine_next_action
 from gza.config import Config
 from gza.db import SqliteTaskStore
@@ -511,6 +512,22 @@ def test_merge_chain_unmerged_hides_legacy_unmerged_status_when_unit_is_merged(t
 
     prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
     assert "legacy unmerged status with merged unit" not in prompts
+
+
+def test_branch_merge_state_projects_empty_for_moot_merge_unit(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    task = store.add("empty merge unit", task_type="implement")
+    store.mark_completed(task, has_commits=True, branch="feature/empty-projection")
+    assert task.id is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "empty")
+
+    service = TaskQueryService(store)
+    result = service.run(TaskQueryPresets.search("empty merge unit", limit=None))
+
+    assert len(result.rows) == 1
+    assert result.rows[0].values["branch_merge_state"] == "empty"
 
 
 def test_projection_fields_override_applies_to_task_and_lineage_json(tmp_path: Path) -> None:
@@ -1045,6 +1062,70 @@ def test_dependency_state_blocked_by_dropped_dep_filters_pending_only(tmp_path: 
     assert blocked_pending.id in ids
     assert blocked_pending_dropped.id not in ids
     assert blocked_resolved.id not in ids
+
+
+def test_dependency_state_completed_empty_prereq_is_blocked_by_default(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    dep = store.add("Empty dependency", task_type="implement")
+    store.mark_completed(dep, has_commits=True, branch="feature/query-empty-default")
+    assert dep.id is not None
+    unit = store.resolve_merge_unit_for_task(dep.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "empty")
+
+    blocked = store.add("Blocked downstream", task_type="implement", depends_on=dep.id)
+    ready = store.add("Ready task", task_type="task")
+
+    service = TaskQueryService(store)
+    blocked_result = service.run(
+        TaskQuery(scope="tasks", statuses=("pending",), dependency_state=("blocked",), limit=None)
+    )
+    unblocked_result = service.run(
+        TaskQuery(scope="tasks", statuses=("pending",), dependency_state=("unblocked",), limit=None)
+    )
+
+    blocked_ids = [row.task.id for row in blocked_result.rows if hasattr(row, "task")]
+    unblocked_ids = [row.task.id for row in unblocked_result.rows if hasattr(row, "task")]
+
+    assert blocked.id in blocked_ids
+    assert blocked.id not in unblocked_ids
+    assert ready.id in unblocked_ids
+
+
+def test_dependency_state_completed_empty_prereq_unblocks_when_policy_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+
+    dep = store.add("Empty dependency", task_type="implement")
+    store.mark_completed(dep, has_commits=True, branch="feature/query-empty-toggle")
+    assert dep.id is not None
+    unit = store.resolve_merge_unit_for_task(dep.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "empty")
+
+    downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
+
+    monkeypatch.setattr(
+        dependency_preconditions_module,
+        "empty_prereq_satisfies_dependency",
+        lambda _store, _prereq, _dependent: True,
+    )
+
+    service = TaskQueryService(store)
+    blocked_result = service.run(
+        TaskQuery(scope="tasks", statuses=("pending",), dependency_state=("blocked",), limit=None)
+    )
+    unblocked_result = service.run(
+        TaskQuery(scope="tasks", statuses=("pending",), dependency_state=("unblocked",), limit=None)
+    )
+
+    blocked_ids = [row.task.id for row in blocked_result.rows if hasattr(row, "task")]
+    unblocked_ids = [row.task.id for row in unblocked_result.rows if hasattr(row, "task")]
+
+    assert downstream.id not in blocked_ids
+    assert downstream.id in unblocked_ids
 
 
 def test_search_negative_scalar_filters_apply_after_positive_filters(tmp_path: Path) -> None:

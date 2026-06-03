@@ -249,6 +249,8 @@ def _matches_merge_chain_state(
         merge_state == "unmerged" or (task.status == "unmerged" and merge_unit is None and merge_state != "merged")
     ):
         return True
+    if "empty" in merge_states and merge_state == "empty":
+        return True
     if (
         "needs_merge" in merge_states
         and task.status == "completed"

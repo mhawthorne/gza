@@ -1001,6 +1001,8 @@ class TaskQueryService:
             return True
         if "needs_merge" in merge_states and owner_state == "needs_merge":
             return True
+        if "empty" in merge_states and owner_state == "empty":
+            return True
 
         root = _resolve_lineage_root(self._store, task)
         shared_descendant = _is_shared_branch_descendant_query(task, root)

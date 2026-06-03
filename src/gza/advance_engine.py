@@ -512,11 +512,14 @@ def _resolve_and_persist_post_merge_rebase_state(
             persisted_state = "merged"
             if resolved_merge_state is not None and merge_state_is_terminal_for_lifecycle(resolved_merge_state):
                 persisted_state = resolved_merge_state
-            store.set_merge_unit_state(
-                merge_unit.id,
-                persisted_state,
-                merged_by_task_id=task.id,
-            )
+            if persisted_state == "merged":
+                store.set_merge_unit_state(
+                    merge_unit.id,
+                    persisted_state,
+                    merged_by_task_id=task.id,
+                )
+            else:
+                store.set_merge_unit_state(merge_unit.id, persisted_state)
         else:
             store.set_merge_status(task.id, "merged")
     return state
@@ -775,7 +778,7 @@ def _target_already_merged_description(ctx: AdvanceContext) -> str:
     state = ctx.post_merge_rebase_state
     reason = state.reason if state is not None else None
     if reason == "merge-unit-empty":
-        return "SKIP: target implementation has no remaining commits to merge (merge-unit-empty)"
+        return "SKIP: no remaining commits to merge into target branch"
     return f"SKIP: target implementation already merged ({reason or 'post-merge proof'})"
 
 
@@ -783,6 +786,10 @@ def _merge_terminal_description(ctx: AdvanceContext) -> str:
     if getattr(ctx, "merge_state", None) == "empty":
         return "SKIP: no remaining commits to merge into target branch"
     return "SKIP: already merged into target branch"
+
+
+def _empty_merge_state_description(_ctx: AdvanceContext) -> str:
+    return "SKIP: moot/no work (empty branch)"
 
 
 def _rebase_target_missing_merge_unit_description(ctx: AdvanceContext) -> str:
@@ -2321,6 +2328,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
             reason="merge-source-needs-manual-resolution",
             subject_task_id=ctx.task.id,
         ),
+    ),
+    AdvanceRule(
+        name="empty_branch",
+        matches=lambda ctx: ctx.merge_state == "empty",
+        action=lambda ctx: {"type": "skip", "description": _empty_merge_state_description(ctx)},
     ),
     AdvanceRule(
         name="target_already_merged",

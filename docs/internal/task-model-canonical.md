@@ -30,7 +30,7 @@ gza tracks branch merge state across four different axes. They answer different 
 
 The expected squash-merge shape is therefore: `merge_unit.state == "merged"`, branch ref still exists, and `is_ancestor(branch, main) == false`. That combination is normal, not a corruption signal.
 
-An `empty` merge-unit state is the other terminal lifecycle outcome for code-bearing branches: it means the branch has no remaining net commits to land against its target, so lifecycle queries should treat it as moot/complete and exclude it from `needs_merge`.
+An `empty` merge-unit state is the other terminal lifecycle outcome for code-bearing branches: it means the branch has no remaining net commits to land against its target, so lifecycle queries should treat it as moot/complete and exclude it from `needs_merge`. By default, though, an `empty` prerequisite does **not** satisfy a downstream merge-required `depends_on` edge; pending pickup and blocked-state surfaces must route that decision through the shared empty-prerequisite policy hook rather than treating every completed dependency as runnable.
 
 Guidance for future callers:
 

@@ -723,6 +723,28 @@ class Git:
             f"git merge-base --is-ancestor {ancestor} {descendant} failed:\n{error_output}"
         )
 
+    def is_on_first_parent_history(self, commit: str, target: str) -> bool:
+        """Return True when ``commit`` lies on ``target``'s first-parent mainline.
+
+        Distinguishes a branch tip that is a plain mainline ancestor (carried no
+        work of its own) from one that was merged in as a ``--no-ff`` side branch
+        (a second parent, off the first-parent line). Both look identical to
+        ``merge_base``/``count_commits_ahead`` once fully merged, so this is the
+        signal that tells a stale empty branch apart from a genuinely merged one.
+        """
+        resolved = self._run(
+            "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}", check=False
+        )
+        if resolved.returncode != 0:
+            return False
+        commit_sha = resolved.stdout.strip()
+        if not commit_sha:
+            return False
+        result = self._run("rev-list", "--first-parent", target, check=False)
+        if result.returncode != 0:
+            return False
+        return commit_sha in result.stdout.split()
+
     def get_commit_subject(self, commit_ref: str) -> str:
         """Get the subject line for a single committed revision."""
         result = self._run("show", "-s", "--format=%s", commit_ref, check=False)

@@ -620,6 +620,19 @@ class TestQueryIncomplete:
 
         assert query_incomplete(store, HistoryFilter(limit=None)) == []
 
+    def test_empty_merge_unit_is_hidden_from_incomplete(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("empty root", task_type="implement")
+        store.mark_completed(root, has_commits=True, branch="feature/empty-root")
+        assert root.id is not None
+
+        unit = store.resolve_merge_unit_for_task(root.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "empty")
+
+        assert query_incomplete(store, HistoryFilter(limit=None)) == []
+
     def test_failed_review_attached_to_merged_unit_is_suppressed(self, tmp_path: Path):
         store = self._store(tmp_path)
 

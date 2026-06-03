@@ -193,7 +193,7 @@ def merge_unit_legacy_state(state: str | None) -> str | None:
         return "merged"
     if state in {"unmerged", "blocked"}:
         return "unmerged"
-    if state == "stale":
+    if state in {"stale", "empty"}:
         return None
     return None
 
@@ -3351,25 +3351,14 @@ class SqliteTaskStore:
             normalized_tags = _normalize_tags((group,))
         with self._connect() as conn:
             query = """
-                WITH RECURSIVE successful_ancestors(id) AS (
-                    SELECT id FROM tasks WHERE project_id = ? AND status = 'completed'
-                    UNION ALL
-                    SELECT t2.based_on FROM tasks t2
-                    JOIN successful_ancestors sa ON t2.id = sa.id
-                    WHERE t2.project_id = ? AND t2.based_on IS NOT NULL
-                )
                 SELECT t.* FROM tasks t
                 WHERE t.project_id = ?
                 AND t.status = 'pending'
                 AND t.task_type != 'internal'
-                AND (
-                    t.depends_on IS NULL
-                    OR t.depends_on IN (SELECT id FROM successful_ancestors)
-                )
                 ORDER BY
                     {order_by}
                 """
-            params: list[str | int | None] = [self._project_id, self._project_id, self._project_id]
+            params: list[str | int | None] = [self._project_id]
             query = query.format(order_by=self._task_pickup_order_sql("t"))
             if normalized_tags:
                 if not self._query_only_supports_tags():
@@ -3377,24 +3366,29 @@ class SqliteTaskStore:
                 placeholders = ",".join("?" for _ in normalized_tags)
                 if any_tag:
                     query = query.replace(
-                        "AND (",
-                        f"AND EXISTS (SELECT 1 FROM task_tags tt WHERE tt.project_id = t.project_id AND tt.task_id = t.id AND tt.tag IN ({placeholders}))\nAND (",
+                        "ORDER BY",
+                        f"AND EXISTS (SELECT 1 FROM task_tags tt WHERE tt.project_id = t.project_id AND tt.task_id = t.id AND tt.tag IN ({placeholders}))\nORDER BY",
                         1,
                     )
                     params.extend(normalized_tags)
                 else:
                     query = query.replace(
-                        "AND (",
-                        f"AND (SELECT COUNT(DISTINCT tt.tag) FROM task_tags tt WHERE tt.project_id = t.project_id AND tt.task_id = t.id AND tt.tag IN ({placeholders})) = ?\nAND (",
+                        "ORDER BY",
+                        f"AND (SELECT COUNT(DISTINCT tt.tag) FROM task_tags tt WHERE tt.project_id = t.project_id AND tt.task_id = t.id AND tt.tag IN ({placeholders})) = ?\nORDER BY",
                         1,
                     )
                     params.extend(normalized_tags)
                     params.append(len(normalized_tags))
-            if limit is not None:
-                query += " LIMIT ?"
-                params.append(limit)
             cur = conn.execute(query, tuple(params))
-            return self._rows_to_tasks(conn, cur.fetchall())
+            candidates = self._rows_to_tasks(conn, cur.fetchall())
+
+        runnable: list[Task] = []
+        for task in candidates:
+            if not self.is_task_blocked(task)[0]:
+                runnable.append(task)
+                if limit is not None and len(runnable) >= limit:
+                    break
+        return runnable
 
     def try_mark_in_progress(self, task_id: str, pid: int) -> Task | None:
         """Compare-and-swap pending -> in_progress for a specific task.
@@ -4414,6 +4408,12 @@ class SqliteTaskStore:
         typed_merged_by_task_id = (
             cast("str | None", merged_by_task_id) if merged_by_task_id is not DB_UNSET else None
         )
+        typed_merged_at_arg = cast("datetime | None", merged_at) if merged_at is not DB_UNSET else None
+        if state != "merged":
+            if typed_merged_by_task_id is not None:
+                raise ValueError(f"state {state!r} cannot retain merged_by_task_id provenance")
+            if typed_merged_at_arg is not None:
+                raise ValueError(f"state {state!r} cannot retain merged_at provenance")
         if merged_by_task_id is not DB_UNSET and typed_merged_by_task_id is not None:
             if owner_task_id is None or typed_merged_by_task_id != owner_task_id:
                 raise ValueError(
@@ -4475,7 +4475,7 @@ class SqliteTaskStore:
         self.dual_write_legacy_merge_status(unit_id)
 
     def repair_inconsistent_unmerged_merge_units(self) -> int:
-        """Clear merged provenance left behind on still-unmerged merge units."""
+        """Clear merged provenance left behind on non-merged merge units."""
         if not self.supports_merge_units():
             return 0
         affected_unit_ids: list[str] = []
@@ -4487,7 +4487,7 @@ class SqliteTaskStore:
                 SELECT id
                 FROM merge_units
                 WHERE project_id = ?
-                  AND state = 'unmerged'
+                  AND state != 'merged'
                   AND (merged_at IS NOT NULL OR merged_by_task_id IS NOT NULL)
                 """,
                 (self._project_id,),
@@ -4501,7 +4501,7 @@ class SqliteTaskStore:
                         merged_by_task_id = NULL,
                         updated_at = ?
                     WHERE project_id = ?
-                      AND state = 'unmerged'
+                      AND state != 'merged'
                       AND (merged_at IS NOT NULL OR merged_by_task_id IS NOT NULL)
                     """,
                     (now, self._project_id),
@@ -5644,7 +5644,9 @@ class SqliteTaskStore:
         if dep is None:
             return (False, None, None)
 
-        if self.resolve_dependency_completion(task) is not None:
+        from .dependency_preconditions import dependency_is_ready
+
+        if dependency_is_ready(self, task):
             return (False, None, None)
 
         return (True, dep.id, dep.status)
@@ -5652,35 +5654,12 @@ class SqliteTaskStore:
     def count_blocked_tasks(self) -> int:
         """Count pending tasks that are blocked by dependencies.
 
-        A task is unblocked (and therefore not counted) if its dependency is
-        completed OR if the dependency is failed/dropped but a completed retry
-        exists anywhere in the based_on chain.
-
-        NOTE: This SQL intentionally mirrors the Python logic in is_task_blocked():
-        both treat only 'completed' (or failed/dropped with a successful retry)
-        as unblocking. If these semantics change, both sites must be updated
-        together.
+        A task is unblocked only when ``is_task_blocked()`` would also say it
+        is ready. This keeps queue pickup, blocked counts, and dependency-state
+        projections on one shared readiness path.
         """
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                WITH RECURSIVE successful_ancestors(id) AS (
-                    SELECT id FROM tasks WHERE project_id = ? AND status = 'completed'
-                    UNION ALL
-                    SELECT t2.based_on FROM tasks t2
-                    JOIN successful_ancestors sa ON t2.id = sa.id
-                    WHERE t2.project_id = ? AND t2.based_on IS NOT NULL
-                )
-                SELECT COUNT(*) as count FROM tasks t
-                WHERE t.project_id = ?
-                AND t.status = 'pending'
-                AND t.depends_on IS NOT NULL
-                AND t.depends_on NOT IN (SELECT id FROM successful_ancestors)
-                """,
-                (self._project_id, self._project_id, self._project_id),
-            )
-            row = cur.fetchone()
-            return row["count"] if row else 0
+        pending_with_dependencies = [task for task in self.get_pending(limit=None) if task.depends_on is not None]
+        return sum(1 for task in pending_with_dependencies if self.is_task_blocked(task)[0])
 
     # === Status transitions (TaskStore protocol) ===
 
