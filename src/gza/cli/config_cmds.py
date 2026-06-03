@@ -1,11 +1,13 @@
 """Configuration, stats, cleanup, init, and skills-install CLI commands."""
 
 import argparse
+import copy
 import json
 import logging
 import os
 import re
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -37,6 +39,8 @@ from ._common import get_review_verdict, get_store, resolve_id
 logger = logging.getLogger(__name__)
 
 _INIT_SHARED_DB_PATH = "~/.gza/gza.db"
+_PREFLIGHT_ERROR_PATTERN = re.compile(r"(error|model|invalid|unknown|not found)", re.IGNORECASE)
+_PREFLIGHT_DETAIL_MAX_LEN = 120
 
 
 def _percentile(sorted_vals: list[int], p: float) -> int:
@@ -58,6 +62,20 @@ class _ScoreRecord:
     implementer_model: str | None
     planner_provider: str | None
     planner_model: str | None
+
+
+@dataclass(frozen=True)
+class CheckTarget:
+    provider: str
+    model: str | None
+    sources: list[str]
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    status: str
+    detail: str
+    duration_s: float
 
 
 def _display_provider_model(provider: str | None, model: str | None, *, no_plan: bool = False) -> str:
@@ -1306,6 +1324,252 @@ def cmd_validate(args: argparse.Namespace) -> int:
         for error in errors:
             print(f"  - {error}")
         return 1
+
+
+def _preflight_target_label(task_type: str | None) -> str:
+    return f"task-type:{task_type}" if task_type else "default"
+
+
+def _default_preflight_model(config: Config, provider: str) -> str | None:
+    return config.get_model_for_task("", provider)
+
+
+def resolve_preflight_targets(
+    config: Config,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    task_type: str | None = None,
+) -> list[CheckTarget]:
+    """Resolve distinct provider/model pairs that preflight should exercise."""
+    if task_type is not None or provider is not None or model is not None:
+        if task_type is not None:
+            resolved_provider = provider or config.get_provider_for_task(task_type)
+            resolved_model = config.get_model_for_task(task_type, resolved_provider)
+            source = _preflight_target_label(task_type)
+        else:
+            resolved_provider = provider or config.provider
+            resolved_model = _default_preflight_model(config, resolved_provider)
+            source = "cli"
+        if model is not None:
+            resolved_model = model
+        return [CheckTarget(provider=resolved_provider, model=resolved_model, sources=[source])]
+
+    task_types = set(config.task_providers.keys()) | set(config.task_types.keys())
+    for provider_cfg in config.providers.values():
+        task_types.update(provider_cfg.task_types.keys())
+
+    targets: dict[tuple[str, str | None], CheckTarget] = {}
+
+    def add_target(target_provider: str, target_model: str | None, source: str) -> None:
+        key = (target_provider, target_model)
+        existing = targets.get(key)
+        if existing is None:
+            targets[key] = CheckTarget(
+                provider=target_provider,
+                model=target_model,
+                sources=[source],
+            )
+            return
+        if source not in existing.sources:
+            existing.sources.append(source)
+
+    add_target(config.provider, _default_preflight_model(config, config.provider), "default")
+    for resolved_task_type in sorted(task_types):
+        resolved_provider = config.get_provider_for_task(resolved_task_type)
+        resolved_model = config.get_model_for_task(resolved_task_type, resolved_provider)
+        add_target(
+            resolved_provider,
+            resolved_model,
+            _preflight_target_label(resolved_task_type),
+        )
+
+    return list(targets.values())
+
+
+def _truncate_preflight_detail(message: str) -> str:
+    compact = " ".join(message.split())
+    if len(compact) <= _PREFLIGHT_DETAIL_MAX_LEN:
+        return compact
+    return f"{compact[: _PREFLIGHT_DETAIL_MAX_LEN - 3]}..."
+
+
+def _iter_preflight_log_lines(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    lines: list[str] = []
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        candidate = stripped
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            for key in ("message", "provider_output", "error", "detail"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    candidate = value.strip()
+                    break
+        lines.append(candidate)
+    return lines
+
+
+def _extract_preflight_failure_detail(log_file: Path, result_error_type: str | None) -> str:
+    if result_error_type:
+        return _truncate_preflight_detail(result_error_type)
+
+    lines = _iter_preflight_log_lines(log_file)
+    lines.extend(_iter_preflight_log_lines(log_file.with_name(f"{log_file.stem}.ops.jsonl")))
+    for line in reversed(lines):
+        if _PREFLIGHT_ERROR_PATTERN.search(line):
+            return _truncate_preflight_detail(line)
+    if lines:
+        return _truncate_preflight_detail(lines[-1])
+    return "live round-trip failed"
+
+
+def _format_preflight_credential_failure(
+    target: CheckTarget,
+    *,
+    quick_check_ok: bool,
+    verify_message: str | None,
+    use_docker: bool,
+    provider_hint: str,
+) -> str:
+    if verify_message:
+        detail = verify_message
+    elif not quick_check_ok:
+        detail = f"no {target.provider} credentials; {provider_hint}"
+    else:
+        detail = f"{target.provider} credential preflight failed"
+
+    if use_docker:
+        detail = (
+            f"{detail} Docker runs need API-key env vars; OAuth/keychain credentials do not propagate into containers."
+        )
+    return _truncate_preflight_detail(detail)
+
+
+def run_preflight_target(
+    config: Config,
+    target: CheckTarget,
+    *,
+    use_docker: bool,
+    work_dir: Path,
+    log_file: Path,
+) -> CheckResult:
+    cfg = copy.copy(config)
+    cfg.provider = target.provider
+    cfg.model = target.model or ""
+    cfg.use_docker = use_docker
+    cfg.timeout_minutes = 2
+    cfg.max_steps = 3
+    cfg.max_turns = 3
+
+    from ..providers.base import get_provider
+
+    provider = get_provider(cfg)
+    quick_check_ok = provider.check_credentials()
+    verify_result = provider.verify_credentials(cfg, log_file=log_file)
+    if not quick_check_ok or not verify_result.ok:
+        return CheckResult(
+            status="FAIL",
+            detail=_format_preflight_credential_failure(
+                target,
+                quick_check_ok=quick_check_ok,
+                verify_message=verify_result.message,
+                use_docker=use_docker,
+                provider_hint=provider.credential_setup_hint,
+            ),
+            duration_s=0.0,
+        )
+
+    run_result = provider.run(
+        cfg,
+        "Reply with exactly the word: hello",
+        log_file,
+        work_dir,
+    )
+    if run_result.exit_code == 0:
+        return CheckResult(
+            status="PASS",
+            detail=f"{run_result.duration_seconds:.1f}s",
+            duration_s=run_result.duration_seconds,
+        )
+
+    return CheckResult(
+        status="FAIL",
+        detail=_extract_preflight_failure_detail(log_file, run_result.error_type),
+        duration_s=run_result.duration_seconds,
+    )
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    """Run a live provider/model sanity check against resolved config routes."""
+    try:
+        config = Config.load(args.project_dir)
+    except ConfigError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    use_docker = config.use_docker if args.preflight_docker is None else args.preflight_docker
+    targets = resolve_preflight_targets(
+        config,
+        provider=args.provider,
+        model=args.model,
+        task_type=args.task_type,
+    )
+    mode = "docker" if use_docker else "direct"
+    results: list[tuple[CheckTarget, CheckResult]] = []
+
+    with tempfile.TemporaryDirectory(prefix="gza-preflight-") as temp_dir:
+        temp_path = Path(temp_dir)
+        for index, target in enumerate(targets, start=1):
+            model_display = target.model or "(default)"
+            print(f"Checking {target.provider} / {model_display} ...")
+            result = run_preflight_target(
+                config,
+                target,
+                use_docker=use_docker,
+                work_dir=args.project_dir,
+                log_file=temp_path / f"preflight-{index}.jsonl",
+            )
+            results.append((target, result))
+
+    table = Table(title=f"Provider/model preflight ({mode})", title_justify="left", title_style="bold")
+    table.add_column("PROVIDER")
+    table.add_column("MODEL")
+    table.add_column("RESULT")
+    table.add_column("DETAIL")
+    table.add_column("USED BY")
+
+    passes = 0
+    fails = 0
+    for target, result in results:
+        if result.status == "PASS":
+            passes += 1
+            result_cell = f"[{_colors.green_success}]PASS[/{_colors.green_success}]"
+        else:
+            fails += 1
+            result_cell = f"[{_colors.red_error}]FAIL[/{_colors.red_error}]"
+        table.add_row(
+            target.provider,
+            target.model or "(default)",
+            result_cell,
+            result.detail,
+            ", ".join(target.sources),
+        )
+
+    console.print()
+    console.print(table)
+    summary_style = _colors.green_success if fails == 0 else _colors.red_error
+    noun = "failed" if fails == 1 else "failed"
+    console.print()
+    console.print(f"[{summary_style}]{passes} passed, {fails} {noun}[/{summary_style}]")
+    return 0 if fails == 0 else 1
 
 
 def _config_to_effective_dict(config: Config) -> dict:

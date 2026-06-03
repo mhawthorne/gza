@@ -1,6 +1,7 @@
 """Tests for configuration, setup, and admin CLI commands."""
 
 
+import argparse
 import json
 import os
 import re
@@ -12,7 +13,9 @@ from unittest.mock import patch
 
 import pytest
 
-from gza.config import Config
+from gza.cli.config_cmds import CheckTarget, cmd_preflight, resolve_preflight_targets
+from gza.config import Config, ProviderConfig, TaskTypeConfig
+from gza.providers.base import PreflightCheckResult, RunResult
 
 from .conftest import make_store, run_gza, setup_config
 
@@ -236,6 +239,143 @@ class TestValidateCommand:
 
         assert result.returncode == 1
         assert expected_error in result.stdout
+
+
+class TestPreflightTargetResolution:
+    def test_resolve_preflight_targets_dedupes_pairs_and_merges_sources(self, tmp_path: Path) -> None:
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="claude",
+            task_providers={"review": "codex", "improve": "codex"},
+            task_types={
+                "plan": TaskTypeConfig(model="claude-plan"),
+                "implement": TaskTypeConfig(),
+            },
+            providers={
+                "codex": ProviderConfig(
+                    model="o4-mini",
+                    task_types={
+                        "review": TaskTypeConfig(model="o4-review"),
+                        "improve": TaskTypeConfig(model="o4-review"),
+                    },
+                ),
+            },
+        )
+
+        targets = resolve_preflight_targets(config)
+        target_map = {(target.provider, target.model): target.sources for target in targets}
+
+        assert target_map == {
+            ("claude", None): ["default", "task-type:implement"],
+            ("claude", "claude-plan"): ["task-type:plan"],
+            ("codex", "o4-review"): ["task-type:improve", "task-type:review"],
+        }
+
+    def test_resolve_preflight_targets_cli_override_uses_explicit_pair(self, tmp_path: Path) -> None:
+        config = Config(project_dir=tmp_path, project_name="test", provider="claude")
+
+        targets = resolve_preflight_targets(config, provider="codex", model="o4-mini")
+
+        assert targets == [CheckTarget(provider="codex", model="o4-mini", sources=["cli"])]
+
+    def test_resolve_preflight_targets_task_type_override_re_resolves_model(self, tmp_path: Path) -> None:
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test",
+            provider="claude",
+            task_types={"review": TaskTypeConfig(model="legacy-review")},
+            providers={"codex": ProviderConfig(model="o4-mini")},
+        )
+
+        targets = resolve_preflight_targets(config, provider="codex", task_type="review")
+
+        assert targets == [
+            CheckTarget(provider="codex", model="o4-mini", sources=["task-type:review"])
+        ]
+class TestPreflightCommand:
+    def test_cmd_preflight_reporting_and_exit_code(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "provider: claude\n"
+            "task_providers:\n"
+            "  review: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      review:\n"
+            "        model: gpt-5.4-codex\n",
+            encoding="utf-8",
+        )
+
+        class FakeProvider:
+            credential_setup_hint = "set credentials"
+
+            def check_credentials(self) -> bool:
+                return True
+
+            def verify_credentials(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
+                return PreflightCheckResult.success()
+
+            def run(self, config: Config, prompt: str, log_file: Path, work_dir: Path, **_kwargs) -> RunResult:
+                if config.provider == "codex":
+                    return RunResult(exit_code=1, error_type="unknown model: gpt-5.4-codex")
+                return RunResult(exit_code=0, duration_seconds=1.8)
+
+        monkeypatch.setattr("gza.providers.base.get_provider", lambda _config: FakeProvider())
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            preflight_docker=None,
+            provider=None,
+            model=None,
+            task_type=None,
+        )
+
+        result = cmd_preflight(args)
+        output = capsys.readouterr().out
+
+        assert result == 1
+        assert "Checking claude / (default) ..." in output
+        assert "Checking codex / gpt-5.4-codex ..." in output
+        assert "Provider/model preflight (docker)" in output
+        assert "PASS" in output
+        assert "FAIL" in output
+        assert "unknown model: gpt-5.4-codex" in output
+        assert "1 passed, 1 failed" in output
+
+    def test_cmd_preflight_returns_zero_when_all_targets_pass(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: claude\n", encoding="utf-8")
+
+        class FakeProvider:
+            credential_setup_hint = "set credentials"
+
+            def check_credentials(self) -> bool:
+                return True
+
+            def verify_credentials(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
+                return PreflightCheckResult.success()
+
+            def run(self, config: Config, prompt: str, log_file: Path, work_dir: Path, **_kwargs) -> RunResult:
+                return RunResult(exit_code=0, duration_seconds=1.2)
+
+        monkeypatch.setattr("gza.providers.base.get_provider", lambda _config: FakeProvider())
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            preflight_docker=False,
+            provider=None,
+            model=None,
+            task_type=None,
+        )
+
+        result = cmd_preflight(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert "Provider/model preflight (direct)" in output
+        assert "1.2s" in output
+        assert "1 passed, 0 failed" in output
 
 
 class TestProjectPrefixValidation:

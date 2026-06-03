@@ -4,7 +4,13 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..config import Config, ConfigError, bootstrap_missing_shared_project_id, discover_project_dir
+from ..config import (
+    KNOWN_PROVIDERS,
+    Config,
+    ConfigError,
+    bootstrap_missing_shared_project_id,
+    discover_project_dir,
+)
 from ..db import (
     InvalidTaskIdError,
     ManualMigrationRequired,
@@ -36,6 +42,7 @@ from .config_cmds import (
     cmd_config_keys,
     cmd_init,
     cmd_learnings,
+    cmd_preflight,
     cmd_skills_install,
     cmd_stats,
     cmd_sync_report,
@@ -1189,6 +1196,40 @@ def main() -> int:
     # validate command
     validate_parser = subparsers.add_parser("validate", help="Validate gza.yaml configuration")
     add_common_args(validate_parser)
+
+    # preflight command
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help="Live sanity-check: send a trivial prompt to each resolved provider/model and report pass/fail",
+    )
+    preflight_parser.add_argument(
+        "--provider",
+        choices=KNOWN_PROVIDERS,
+        help="Only check this provider (uses the resolved model for the selected route unless --model is set)",
+    )
+    preflight_parser.add_argument(
+        "--model",
+        help="Override the resolved model for the selected route",
+    )
+    preflight_parser.add_argument(
+        "--task-type",
+        help="Only check the resolved provider/model pair for this task type",
+    )
+    preflight_docker_group = preflight_parser.add_mutually_exclusive_group()
+    preflight_docker_group.add_argument(
+        "--docker",
+        dest="preflight_docker",
+        action="store_true",
+        help="Force Docker execution for the live preflight",
+    )
+    preflight_docker_group.add_argument(
+        "--no-docker",
+        dest="preflight_docker",
+        action="store_false",
+        help="Force direct execution for the live preflight",
+    )
+    preflight_parser.set_defaults(preflight_docker=None, func=cmd_preflight)
+    add_common_args(preflight_parser)
 
     # config command
     config_parser = subparsers.add_parser("config", help="Show effective config with source attribution")
@@ -2580,6 +2621,8 @@ def main() -> int:
             return cmd_stats(args)
         elif args.command == "validate":
             return cmd_validate(args)
+        elif args.command == "preflight":
+            return cmd_preflight(args)
         elif args.command == "config":
             if getattr(args, "config_action", None) == "keys":
                 return cmd_config_keys(args)

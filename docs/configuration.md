@@ -837,6 +837,26 @@ Validate configuration.
 gza validate
 ```
 
+### preflight
+
+Run a live provider/model sanity check before queueing real work. `gza preflight`
+loads config, resolves the provider/model pairs real tasks would use, runs the
+provider credential preflight, then sends a trivial prompt and reports a PASS/FAIL
+table. The command exits non-zero if any resolved pair fails.
+
+```bash
+gza preflight
+gza preflight --task-type review
+gza preflight --provider codex --model o4-mini
+gza preflight --docker
+gza preflight --no-docker
+```
+
+By default the execution path follows `use_docker` from config. Use `--docker`
+or `--no-docker` to override that for the check. Docker preflights require API
+keys in the container environment; OAuth or keychain-backed credentials do not
+propagate into containers.
+
 ### config
 
 Show effective configuration and source attribution (`base`, `local`, `env`, `default`).
