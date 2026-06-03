@@ -91,6 +91,7 @@ from .prompt_sanitization import sanitize_provider_prompt
 from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .providers.base import PreflightCheckResult
+from .providers.log_renderers import UnknownLogProviderError, get_log_renderer
 from .rebase_diff import (
     RebaseDiffBaseline,
     capture_rebase_diff_baseline,
@@ -3310,6 +3311,97 @@ def _run_result_to_stats(result: RunResult) -> TaskStats:
     )
 
 
+def _load_transcript_stats(
+    log_file: Path,
+    *,
+    provider_name: str,
+    configured_model: str | None,
+) -> TaskStats | None:
+    """Replay a provider transcript through the shared log renderer for stats."""
+    provider = provider_name.strip().lower()
+    try:
+        renderer = get_log_renderer(provider, configured_model=configured_model, verbose=False)
+    except UnknownLogProviderError:
+        return None
+
+    saw_entries = False
+    for entry in _load_jsonl_entries(log_file):
+        saw_entries = True
+        renderer.handle_log(entry, live=False)
+
+    if not saw_entries:
+        return None
+
+    rendered = renderer.stats
+    if (
+        rendered.step_count <= 0
+        and rendered.input_tokens <= 0
+        and rendered.output_tokens <= 0
+        and rendered.cost_usd <= 0.0
+    ):
+        return None
+
+    return TaskStats(
+        num_steps_computed=rendered.step_count or None,
+        num_steps_reported=rendered.step_count or None,
+        cost_usd=rendered.cost_usd or None,
+        input_tokens=rendered.input_tokens or None,
+        output_tokens=rendered.output_tokens or None,
+    )
+
+
+def _apply_transcript_stats_fallback(
+    result: RunResult,
+    *,
+    log_file: Path,
+    provider_name: str,
+    configured_model: str | None,
+    prefer_transcript_usage: bool = False,
+) -> bool:
+    """Hydrate missing or partial run stats from the provider transcript."""
+    transcript_stats = _load_transcript_stats(
+        log_file,
+        provider_name=provider_name,
+        configured_model=configured_model,
+    )
+    if transcript_stats is None:
+        return False
+
+    updated = False
+
+    transcript_steps = transcript_stats.num_steps_computed or transcript_stats.num_steps_reported or 0
+    result_steps = result.num_steps_computed or result.num_steps_reported or 0
+    if transcript_steps > result_steps:
+        result.num_steps_computed = transcript_steps
+        result.num_steps_reported = transcript_steps
+        updated = True
+
+    transcript_input = transcript_stats.input_tokens or 0
+    transcript_output = transcript_stats.output_tokens or 0
+    transcript_total = transcript_input + transcript_output
+    result_input = result.input_tokens or 0
+    result_output = result.output_tokens or 0
+    result_total = result_input + result_output
+
+    should_replace_usage = transcript_total > 0 and (
+        prefer_transcript_usage
+        or result_total <= 0
+        or result.tokens_estimated
+        or result.cost_estimated
+        or transcript_total > result_total
+        or (result.cost_usd or 0.0) <= 0.0
+    )
+    if should_replace_usage:
+        result.input_tokens = transcript_stats.input_tokens
+        result.output_tokens = transcript_stats.output_tokens
+        result.cost_usd = transcript_stats.cost_usd
+        result.tokens_estimated = False
+        result.cost_estimated = False
+        updated = True
+
+    return updated
+
+
 def _checkpoint_dir(config: Config) -> Path:
     """Return the directory used for timeout resume checkpoints."""
     path = config.project_dir / f".{APP_NAME}" / "checkpoints"
@@ -6319,6 +6411,13 @@ def _run_inner(
             worktree_path,
             provider_run_kwargs=provider_run_kwargs,
         )
+        _apply_transcript_stats_fallback(
+            result,
+            log_file=log_file,
+            provider_name=provider.name,
+            configured_model=task_config.model or None,
+            prefer_transcript_usage=result.exit_code == 124,
+        )
 
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
@@ -6692,6 +6791,13 @@ def _run_non_code_task(
                 log_file,
                 worktree_path,
                 provider_run_kwargs=provider_run_kwargs,
+            )
+            _apply_transcript_stats_fallback(
+                result,
+                log_file=log_file,
+                provider_name=provider.name,
+                configured_model=config.model or None,
+                prefer_transcript_usage=result.exit_code == 124,
             )
         except KeyboardInterrupt:
             failure_reason = _resolve_failure_reason(

@@ -42,6 +42,10 @@ Timeout resume guidance may summarize successful verify phases, but those
 checkpoints are reusable only for the exact saved tree state that resume
 will restore.
 
+Timed-out runs also persist best-effort token and cost stats from streamed
+provider transcript usage when the outer timeout wrapper kills the process
+before a final provider summary is emitted.
+
 - Phase fingerprints are recorded against the tree state that produced each
   successful verify phase.
 - When timeout handling saves WIP as a commit, resume checkpoint persistence

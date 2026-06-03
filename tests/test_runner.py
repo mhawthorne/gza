@@ -35,6 +35,7 @@ from gza.runner import (
     ProjectBoundary,
     ReviewVerifyResult,
     RunInvocationContext,
+    _apply_transcript_stats_fallback,
     _build_code_task_commit_subject,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
@@ -5251,6 +5252,54 @@ class TestMaxStepsHandling:
         assert stats.tokens_estimated is True
         assert stats.cost_estimated is True
 
+    def test_apply_transcript_stats_fallback_prefers_transcript_usage_for_timeout(self, tmp_path: Path):
+        """Timeout runs should recover usage and steps from the provider transcript."""
+        log_file = tmp_path / "timeout.log"
+        log_file.write_text(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg_usage_1",
+                        "usage": {
+                            "input_tokens": 10,
+                            "cache_creation_input_tokens": 2,
+                            "cache_read_input_tokens": 3,
+                            "output_tokens": 5,
+                        },
+                        "content": [{"type": "text", "text": "Investigating timeout fallback."}],
+                    },
+                }
+            )
+            + "\n"
+        )
+        result = RunResult(
+            exit_code=124,
+            num_steps_computed=0,
+            input_tokens=0,
+            output_tokens=1,
+            cost_usd=0.0,
+            tokens_estimated=True,
+            cost_estimated=True,
+        )
+
+        updated = _apply_transcript_stats_fallback(
+            result,
+            log_file=log_file,
+            provider_name="claude",
+            configured_model=None,
+            prefer_transcript_usage=True,
+        )
+
+        assert updated is True
+        assert result.num_steps_computed == 1
+        assert result.num_steps_reported == 1
+        assert result.input_tokens == 15
+        assert result.output_tokens == 5
+        assert result.cost_usd and result.cost_usd > 0.0
+        assert result.tokens_estimated is False
+        assert result.cost_estimated is False
+
     def test_non_code_task_marks_max_steps_failure_reason(self, tmp_path: Path):
         """Provider max_steps errors should be stored as MAX_STEPS."""
         db_path = tmp_path / "test.db"
@@ -6292,6 +6341,97 @@ class TestFailureReasonGroundTruth:
         assert decision.action == "resume"
         assert decision.launch_mode == "iterate"
         assert decision.reason_code == "TIMEOUT"
+
+    def test_code_task_timeout_persists_usage_recovered_from_transcript(self, tmp_path: Path) -> None:
+        """Timed-out code tasks should persist transcript usage instead of near-zero live stats."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        task.slug = "20260603-implement-timeout-transcript-usage"
+        store.update(task)
+
+        config = self._make_config(tmp_path, db_path)
+
+        def provider_run(
+            _config,
+            _prompt,
+            log_file,
+            _work_dir,
+            resume_session_id=None,
+            on_session_id=None,
+            on_step_count=None,
+        ):
+            _ = resume_session_id, on_session_id, on_step_count
+            log_file.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg_usage_timeout",
+                            "usage": {
+                                "input_tokens": 10,
+                                "cache_creation_input_tokens": 2,
+                                "cache_read_input_tokens": 3,
+                                "output_tokens": 5,
+                            },
+                            "content": [{"type": "text", "text": "Investigating timeout fallback."}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+            return RunResult(
+                exit_code=124,
+                duration_seconds=12.0,
+                num_steps_computed=0,
+                input_tokens=0,
+                output_tokens=1,
+                cost_usd=0.0,
+                session_id="timeout-usage-session",
+                error_type=None,
+            )
+
+        mock_provider = Mock()
+        mock_provider.name = "claude"
+        mock_provider.check_credentials.return_value = True
+        mock_provider.verify_credentials.return_value = True
+        mock_provider.run.side_effect = provider_run
+
+        mock_main_git = Mock()
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.worktree_list.return_value = []
+        mock_main_git.worktree_add.return_value = config.worktree_path / task.slug
+        mock_main_git.branch_exists.return_value = False
+        mock_main_git.count_commits_ahead.return_value = 0
+        mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+        mock_worktree_git = Mock()
+        mock_worktree_git.status_porcelain.return_value = set()
+        mock_worktree_git.has_changes.return_value = False
+        mock_worktree_git.default_branch.return_value = "main"
+        mock_worktree_git.count_commits_ahead.return_value = 0
+        mock_worktree_git.get_diff_numstat.return_value = ""
+
+        with (
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
+            patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner.task_footer"),
+        ):
+            exit_status = run(config, task_id=task.id)
+
+        assert exit_status == 0
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "TIMEOUT"
+        assert failed.num_steps_computed == 1
+        assert failed.input_tokens == 15
+        assert failed.output_tokens == 5
+        assert failed.cost_usd is not None and failed.cost_usd > 0.0
 
     def test_code_task_timeout_still_records_failure_when_checkpoint_persistence_fails(
         self,
