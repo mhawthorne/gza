@@ -170,8 +170,7 @@ def test_list_failed_tasks_for_recovery_filters_failed_impl_when_landed_work_is_
     failed = store.add("Failed implementation", task_type="implement")
     assert failed.id is not None
     failed.status = "failed"
-    failed.failure_reason = "MAX_TURNS"
-    failed.session_id = "sess-failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
     failed.branch = "feature/landed-work"
     failed.completed_at = datetime.now(UTC)
     store.update(failed)
@@ -240,8 +239,7 @@ def test_list_failed_tasks_for_recovery_emits_one_warning_when_branch_reachabili
     first = store.add("Failed implementation A", task_type="implement")
     assert first.id is not None
     first.status = "failed"
-    first.failure_reason = "MAX_TURNS"
-    first.session_id = "sess-a"
+    first.failure_reason = "INFRASTRUCTURE_ERROR"
     first.branch = "feature/a"
     first.completed_at = datetime.now(UTC)
     store.update(first)
@@ -249,8 +247,7 @@ def test_list_failed_tasks_for_recovery_emits_one_warning_when_branch_reachabili
     second = store.add("Failed implementation B", task_type="implement")
     assert second.id is not None
     second.status = "failed"
-    second.failure_reason = "MAX_TURNS"
-    second.session_id = "sess-b"
+    second.failure_reason = "INFRASTRUCTURE_ERROR"
     second.branch = "feature/b"
     second.completed_at = datetime.now(UTC)
     store.update(second)
@@ -301,8 +298,7 @@ def test_list_failed_tasks_for_recovery_raises_when_project_default_merge_target
     failed = store.add("Failed implementation", task_type="implement")
     assert failed.id is not None
     failed.status = "failed"
-    failed.failure_reason = "MAX_TURNS"
-    failed.session_id = "sess-failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
     failed.branch = "feature/unresolved-default"
     failed.completed_at = datetime.now(UTC)
     store.update(failed)
@@ -380,6 +376,32 @@ def test_list_failed_tasks_for_recovery_keeps_failed_descendant_under_merged_man
 
     assert is_chain_resolved_by_recovery(store, failed_descendant) is False
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed_descendant.id]
+
+
+def test_recovery_engine_timeout_implement_with_stale_merged_metadata_still_chooses_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch, merged_branches={"feature/stale-timeout"})
+
+    failed = store.add("Failed timeout implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "TIMEOUT"
+    failed.session_id = "sess-timeout"
+    failed.branch = "feature/stale-timeout"
+    failed.completed_at = datetime.now(UTC)
+    failed.merge_status = "merged"
+    failed.has_commits = True
+    store.update(failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+
+    assert decision.action == "resume"
+    assert decision.reason_code == "TIMEOUT"
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
 
 def test_list_failed_tasks_for_recovery_keeps_failed_fix_under_merged_cross_type_follow_up_root(

@@ -1037,6 +1037,48 @@ def test_query_lineage_owner_rows_planning_keeps_completed_and_failed_live_tasks
     assert rows_by_owner[failed_impl.id].next_action["type"] == "resume"
 
 
+def test_query_lineage_owner_rows_failed_timeout_no_review_prefers_resume_over_merge(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    failed_impl = store.add("Failed timeout implement", task_type="implement")
+    assert failed_impl.id is not None
+    failed_impl.status = "failed"
+    failed_impl.failure_reason = "TIMEOUT"
+    failed_impl.session_id = "sess-timeout"
+    failed_impl.completed_at = datetime(2026, 5, 12, 10, 0, tzinfo=UTC)
+    failed_impl.branch = "feature/failed-timeout-no-review"
+    failed_impl.has_commits = True
+    failed_impl.merge_status = "unmerged"
+    store.update(failed_impl)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+    git.resolve_fresh_merge_source.return_value = ("origin/feature/failed-timeout-no-review", None)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    rows_by_owner = {row.owner_task.id: row for row in rows if row.owner_task.id is not None}
+    row = rows_by_owner[failed_impl.id]
+    assert row.recovery_action_task is not None
+    assert row.recovery_action_task.id == failed_impl.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "resume"
+
+
 def test_query_lineage_owner_rows_mergeable_behind_branch_projects_normal_action(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

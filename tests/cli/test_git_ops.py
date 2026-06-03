@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from gza.cli.git_ops import (
+    _execute_merge_action,
     _reconcile_diverged_branch_with_origin,
     SquashBranchReconcileResult,
     _build_auto_merge_args,
@@ -170,6 +171,51 @@ def test_run_task_backed_rebase_refreshes_merge_unit_provenance(tmp_path) -> Non
     assert refreshed_unit is not None
     assert refreshed_unit.head_sha == "head-new"
     assert refreshed_unit.base_sha == "base-new"
+
+
+def test_execute_merge_action_mark_merged_rejects_failed_owner_without_marking_unit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "TIMEOUT"
+    failed.completed_at = datetime.now(UTC)
+    failed.branch = "feature/failed-owner-mark-merged"
+    failed.has_commits = True
+    failed.merge_status = "unmerged"
+    store.update(failed)
+
+    merge_git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=True),
+    )
+    git = SimpleNamespace(repo_dir=tmp_path)
+
+    result = _execute_merge_action(
+        config,
+        store,
+        git,
+        failed,
+        {"type": "merge", "description": "Merge"},
+        target_branch="main",
+        current_branch="main",
+        merge_git=merge_git,
+        merge_current_branch="main",
+        already_merged_behavior="mark_merged",
+    )
+
+    assert result.rc == 1
+    output = capsys.readouterr().out
+    assert f"Error: Task {failed.id} is not completed or unmerged (execution status: failed)" in output
+    refreshed = store.resolve_merge_unit_for_task(failed.id)
+    assert refreshed is not None
+    assert refreshed.state == "unmerged"
 
 
 def test_run_task_backed_rebase_surfaces_resolution_warnings_and_preserves_existing_merge_unit_provenance(

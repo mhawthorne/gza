@@ -53,6 +53,10 @@ These restate the core invariants for this layer; no rule below may contradict t
   `origin/<target>` and MUST NOT push the target branch.
 - **P5 — Minimize human stops.** Every stop-for-human MUST be a deliberate, named choice
   with a clearing path (overview escalation table), not an accident of missing logic.
+- **P6 — Merge requires successful execution evidence.** A work unit MUST NOT be selected
+  for merge, or marked merged by any merge execution path, unless the task that currently
+  represents the code being landed has execution status `completed` or legacy-compatible
+  `unmerged`.
 
 ## Policy knobs
 
@@ -210,6 +214,13 @@ Failed tasks are evaluated by the same ordered engine, through one shared recove
   same lineage, branch reachable from target) MUST be omitted silently — there is nothing
   to recover.
 
+For a failed `implement` with timeout-style failure and a resumable `session_id`, the
+engine MUST prefer the shared recovery decision (`resume`, bounded retry, or manual stop)
+before any merge-style suppression. The "already landed" exception only applies when the
+work landed by an independent valid path, such as a completed recovery descendant or a
+different merged lineage member. The same failed implementation task being marked merged
+must never satisfy that exception on its own.
+
 Recovery and lifecycle progress are independent: a unit that carries both a recovered
 failure *and* actionable merge/review work remains eligible for the latter.
 
@@ -222,8 +233,15 @@ failure *and* actionable merge/review work remains eligible for the latter.
   `create_review` when `advance_create_reviews` is on, otherwise `needs_discussion` with
   reason `review-needs-manual-creation` (never merge unreviewed). With
   `require_review_before_merge` off → `merge`.
+- A failed implementation task is never mergeable. Timeout-style failed implementations
+  with a resumable `session_id` MUST stay in recovery until that recovery resolves to a
+  valid completed representative, exhausts its bounded policy, or is parked for manual
+  intervention.
 - Merge executes against the canonical local target (P4), respects
-  `merge_squash_threshold`, and MUST NOT push the target branch as a side effect.
+  `merge_squash_threshold`, and MUST NOT push the target branch as a side effect. Direct
+  mark-merged paths and post-promotion bookkeeping are part of the same precondition: they
+  MUST reject merge representatives whose execution status is not `completed` or
+  `unmerged`.
 
 ## Parked reason codes
 

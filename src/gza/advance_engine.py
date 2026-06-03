@@ -73,6 +73,7 @@ WORKER_CONSUMING_ACTIONS = frozenset(
         "retry",
     }
 )
+MERGEABLE_EXECUTION_STATUSES = frozenset({"completed", "unmerged"})
 VERIFY_BLOCKED_REVIEW_THRESHOLD = 2
 _LOG = logging.getLogger(__name__)
 
@@ -1825,6 +1826,11 @@ def _is_implementation_owned_lineage(ctx: AdvanceContext) -> bool:
     return (ctx.review_root_task or ctx.task).task_type == "implement"
 
 
+def execution_status_allows_merge(ctx: AdvanceContext) -> bool:
+    """Return whether the current planning task has merge-eligible execution status."""
+    return ctx.task.status in MERGEABLE_EXECUTION_STATUSES
+
+
 def has_valid_review_for_merge(ctx: AdvanceContext) -> bool:
     """Return whether current review evidence is fresh enough to allow auto-merge."""
     if not _is_implementation_owned_lineage(ctx):
@@ -2610,7 +2616,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_approved_with_followups",
-        matches=lambda ctx: has_valid_review_for_merge(ctx)
+        matches=lambda ctx: execution_status_allows_merge(ctx)
+        and has_valid_review_for_merge(ctx)
         and (not ctx.review_cleared)
         and ctx.latest_completed_review is not None
         and ctx.review_verdict == "APPROVED_WITH_FOLLOWUPS"
@@ -2624,7 +2631,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_approved",
-        matches=lambda ctx: has_valid_review_for_merge(ctx)
+        matches=lambda ctx: execution_status_allows_merge(ctx)
+        and has_valid_review_for_merge(ctx)
         and (not ctx.review_cleared)
         and ctx.latest_completed_review is not None
         and ctx.review_verdict == "APPROVED",
@@ -2734,12 +2742,15 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="reviews_all_cleared",
-        matches=lambda ctx: has_valid_review_for_merge(ctx) and ctx.review_cleared and ctx.latest_completed_review is not None,
+        matches=lambda ctx: execution_status_allows_merge(ctx)
+        and has_valid_review_for_merge(ctx)
+        and ctx.review_cleared
+        and ctx.latest_completed_review is not None,
         action=lambda ctx: {"type": "merge", "description": "Merge (previous review addressed)"},
     ),
     AdvanceRule(
         name="non_implement_no_review",
-        matches=lambda ctx: not _is_implementation_owned_lineage(ctx),
+        matches=lambda ctx: execution_status_allows_merge(ctx) and not _is_implementation_owned_lineage(ctx),
         action=lambda ctx: {"type": "merge", "description": "Merge task (no review yet)"},
     ),
     AdvanceRule(
@@ -2761,7 +2772,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="implement_no_review_required",
-        matches=lambda ctx: not ctx.requires_review,
+        matches=lambda ctx: execution_status_allows_merge(ctx) and not ctx.requires_review,
         action=lambda ctx: {"type": "merge", "description": "Merge task (no review yet)"},
     ),
 ]

@@ -3206,6 +3206,37 @@ def test_failed_rebase_clears_when_merge_unit_is_merged(tmp_path: Path) -> None:
     assert git.is_ancestor_calls == []
 
 
+def test_failed_timeout_implement_no_review_stays_in_recovery_not_merge(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = store.add("Failed timeout implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "failed"
+    impl.failure_reason = "TIMEOUT"
+    impl.session_id = "sess-timeout"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feature/failed-timeout"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            can_merge_by_ref={("origin/feature/failed-timeout", "main"): True},
+            existing_refs={"origin/feature/failed-timeout"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "resume"
+
+
 def test_failed_rebase_clears_and_marks_merged_when_branch_tip_equals_target_tip(
     tmp_path: Path,
 ) -> None:

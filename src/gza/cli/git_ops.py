@@ -118,6 +118,18 @@ class _ResolvedMergeSubject:
     merge_source_warning: str | None
 
 
+def _merge_execution_status_error(
+    merge_subject_id: str,
+    execution_task: DbTask,
+) -> str | None:
+    if execution_task.status in {"completed", "unmerged"}:
+        return None
+    return (
+        f"Task {merge_subject_id} is not completed or unmerged "
+        f"(execution status: {execution_task.status})"
+    )
+
+
 @dataclass(frozen=True)
 class SquashBranchReconcileResult:
     status: str
@@ -1053,11 +1065,9 @@ def _merge_single_task(
     merge_unit_id = resolved.merge_unit_id
 
     # Validate task state
-    if execution_task.status not in ("completed", "unmerged"):
-        print(
-            f"Error: Task {merge_subject.id} is not completed or unmerged "
-            f"(execution status: {execution_task.status})"
-        )
+    status_error = _merge_execution_status_error(merge_subject.id, execution_task)
+    if status_error is not None:
+        print(f"Error: {status_error}")
         return _MergeSingleTaskResult(rc=1)
 
     if resolved.merge_source_warning:
@@ -2491,6 +2501,16 @@ def _execute_merge_action(
     resolved_subject = _resolve_merge_subject(store, execution_git, task.id or "", target_branch=target_branch) if task.id else None
     merge_subject = resolved_subject.merge_subject if resolved_subject is not None else task
     assert merge_subject.id is not None
+
+    if resolved_subject is not None:
+        status_error = _merge_execution_status_error(merge_subject.id, resolved_subject.execution_task)
+        if status_error is not None:
+            print(f"Error: {status_error}")
+            return _MergeActionResult(
+                rc=1,
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+            )
 
     if execution_branch != target_branch:
         print(

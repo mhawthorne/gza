@@ -40,6 +40,7 @@ _TIMEOUT_STYLE_REASONS = frozenset({"MAX_STEPS", "MAX_TURNS", "TIMEOUT", "TERMIN
 _UNRESOLVED_RECOVERY_TERMINAL_STATUSES = frozenset({"failed", "dropped"})
 _UNRESOLVED_RECOVERY_ATTENTION_REASON = "newer-recovery-descendant-needs-attention"
 _MERGED_TARGET_RESOLUTION_TYPES = frozenset({"review", "improve", "rebase"})
+_MERGEABLE_EXECUTION_STATUSES = frozenset({"completed", "unmerged"})
 _DESCENDANT_SUPERSEDED_REASONS: tuple[tuple[str, str, str], ...] = (
     ("completed", "recovery_already_completed", "recovery descendant already completed"),
     ("in_progress", "recovery_already_running", "recovery descendant already in progress"),
@@ -256,6 +257,15 @@ def _task_merge_state_for_recovery(store: SqliteTaskStore, task: DbTask) -> str 
 
 def _task_is_complete_recovery_outcome(store: SqliteTaskStore, task: DbTask) -> bool:
     return task_is_complete_for_lifecycle(task, merge_state=_task_merge_state_for_recovery(store, task))
+
+
+def _is_resumable_timeout_implementation(task: DbTask) -> bool:
+    return (
+        task.task_type == "implement"
+        and task.status == "failed"
+        and task.session_id is not None
+        and classify_failure_reason(task.failure_reason or "UNKNOWN") == "timeout"
+    )
 
 
 def _build_recovery_chain_snapshot(store: SqliteTaskStore, task: DbTask) -> _RecoveryChainSnapshot:
@@ -557,8 +567,9 @@ def _is_resolved_by_landed_lineage(
     if task.id is None or task.status != "failed":
         return False
 
+    prefer_explicit_recovery = _is_resumable_timeout_implementation(task)
     target_branch: str | None = None
-    if task.branch:
+    if task.branch and not prefer_explicit_recovery:
         target_branch = _effective_merge_target_branch(store, merge_context=merge_context)
 
     if merge_context.git is not None and target_branch is not None and task.branch:
@@ -606,6 +617,8 @@ def _is_resolved_by_landed_lineage(
         if merge_state != "merged":
             continue
         if lineage_task.id == independent_follow_up_root_id:
+            continue
+        if lineage_task.status not in _MERGEABLE_EXECUTION_STATUSES:
             continue
         if branch_keys & _task_lineage_branch_keys(store, lineage_task):
             return True
@@ -760,7 +773,9 @@ def decide_failed_task_recovery(
             attempt_limit=attempt_limit,
         )
 
-    if is_resolved_by_merged_target(store, task):
+    expected_action = _expected_recovery_action(task, chain=chain)
+
+    if not _is_resumable_timeout_implementation(task) and is_resolved_by_merged_target(store, task):
         return _skip_decision(
             task_id=task_id,
             reason_code="resolved_by_merged_target",
@@ -815,7 +830,6 @@ def decide_failed_task_recovery(
             attempt_limit=attempt_limit,
         )
 
-    expected_action = _expected_recovery_action(task, chain=chain)
     if expected_action is None:
         return _skip_decision(
             task_id=task_id,

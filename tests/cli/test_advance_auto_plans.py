@@ -248,8 +248,7 @@ def test_advance_dry_run_warns_once_when_failed_task_branch_reachability_is_unav
     failed = store.add("Recover failed work", task_type="implement")
     assert failed.id is not None
     failed.status = "failed"
-    failed.failure_reason = "MAX_TURNS"
-    failed.session_id = "sess-failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
     failed.branch = "feature/recovery-warning"
     failed.completed_at = datetime.now(UTC)
     store.update(failed)
@@ -274,7 +273,7 @@ def test_advance_dry_run_warns_once_when_failed_task_branch_reachability_is_unav
     assert rc == 0
     assert "Would advance 1 task(s):" in captured.out
     assert str(failed.id) in captured.out
-    assert "Resume failed task (MAX_TURNS)" in captured.out
+    assert "Retry failed task (INFRASTRUCTURE_ERROR)" in captured.out
     assert captured.err.count("Warning: Failed-task recovery could not inspect repository branch reachability;") == 1
     assert "git branch reachability suppression is unavailable for this run" in captured.err
     assert "metadata-based same-lineage merged-task suppression may still apply" in captured.err
