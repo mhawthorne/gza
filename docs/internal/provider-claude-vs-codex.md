@@ -105,8 +105,9 @@ provider name.
 
 ### Codex (`src/gza/providers/codex.py:717-900+`)
 
-- Event types: `thread.started`, `turn.started`, `turn.completed`,
-  `item.completed`
+- Top-level event types handled via the shared registry include `error`,
+  `thread.started`, `turn.started`, `turn.failed`, `turn.completed`,
+  `item.started`, `item.updated`, and `item.completed`
 - Item types inside `item.completed`: `agent_message`, `collab_tool_call`,
   `command_execution`, `file_change`, `mcp_tool_call`, `reasoning`,
   `todo_list`, `web_search`
