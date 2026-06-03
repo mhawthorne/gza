@@ -1,21 +1,328 @@
+# Generated from CONFIG_KEY_REGISTRY via `uv run gza config example --local --write`.
 # Local machine-only overrides for gza.yaml.
 # This file should stay uncommitted (add gza.local.yaml to .gitignore).
+# Only settings allowed by LOCAL_OVERRIDE_ALLOWED_SCHEMA appear here.
+# Uncomment and modify any setting you want to override locally.
 
-# Examples:
-# use_docker: false
-# timeout_minutes: 30
-# provider: codex
-# task_providers:
-#   review: claude
-# model: o4-mini
-# reasoning_effort: medium
-# docker_volumes:
-#   - ~/datasets:/datasets:ro
+# --- Project ---
 
-# Nested sections are deep-merged over gza.yaml:
+# Enforce repo-subtree write boundaries at commit time; `cross-project` tagged tasks are exempt.
+# Default: true
+# enforce_project_scope: true
+
+# --- Execution ---
+
+# Docker image used for task execution.
+# Default: "{project_name}-gza"
+# docker_image: "{project_name}-gza"
+
+# Pre-warm command run synchronously inside Docker before provider CLI starts.
+# Default: ""
+# docker_setup_command: ""
+
+# Extra Docker volume mounts (`source:dest[:mode]`).
+# Default: []
+# docker_volumes: []
+
+# Optional fast inner-loop verification command for code tasks; `verify_command` remains the
+# required final gate.
+# Default: ""
+# inner_verify_command: ""
+
+# Base path for interactive worktree operations.
+# Default: ""
+# interactive_worktree_dir: ""
+
+# Global default step budget.
+# Default: 50
+# max_steps: 50
+
+# Deprecated global alias for `max_steps`.
+# Default: 50
+# max_turns: 50
+
+# Max runtime minutes before a task times out.
+# Default: 10
+# timeout_minutes: 10
+
+# Run providers in Docker.
+# Default: true
+# use_docker: true
+
+# Project verification command used before completion and during autonomous review cycles.
+# Default: ""
+# verify_command: ""
+
+# Default task count for each `gza work` run.
+# Default: 1
+# work_count: 1
+
+# --- Branching ---
+
+# Stage watch-time merges in a detached integration checkout before advancing the real default
+# branch on success.
+# Default: false
+# main_checkout_isolate: false
+
+# Auto-squash threshold for merge operations.
+# Default: 0
+# merge_squash_threshold: 0
+
+# Base directory for git worktrees.
+# Default: /tmp/gza-worktrees
+# worktree_dir: /tmp/gza-worktrees
+
+# --- Storage ---
+
+# Default retention window for `gza clean`.
+# Default: 30
+# cleanup_days: 30
+
+# SQLite database path.
+# Default: .gza/gza.db
+# Leave commented to use the default project-local DB path or an inherited user-level shared
+# default.
+# gza init activates this line when you explicitly choose local mode or a concrete shared DB path.
+# db_path: .gza/gza.db
+
+# --- Provider ---
+
+# Chat output truncation length (0 = unlimited).
+# Default: 0
+# chat_text_display_length: 0
+
+# claude:
+#   Claude CLI arguments.
+#   Default: ["--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash"]
+#   args:
+#     - --allowedTools
+#     - Read
+#     - Write
+#     - Edit
+#     - Glob
+#     - Grep
+#     - Bash
+#   Fetch Claude auth token from macOS keychain for Docker.
+#   Default: false
+#   fetch_auth_token_from_keychain: false
+
+# defaults:
+#   Default step budget for task execution.
+#   Default: 50
+#   max_steps: 50
+#   Deprecated legacy alias for defaults.max_steps.
+#   Default: 50
+#   max_turns: 50
+#   Legacy global default model fallback.
+#   Default: ""
+#   model: ""
+#   Legacy global default reasoning effort fallback (Codex).
+#   Default: ""
+#   reasoning_effort: ""
+
+# Legacy global model fallback.
+# Default: ""
+# model: ""
+
+# Default provider when task-specific routing is absent.
+# Default: claude
+# provider: claude
+
 # providers:
-#   claude:
+#   <provider>:
+#     Provider-scoped default model.
+#     Default: null
+#     model: null
+#     Provider-scoped default reasoning effort (Codex).
+#     Default: null
+#     reasoning_effort: null
 #     task_types:
-#       review:
-#         model: claude-haiku-4-5
-#         reasoning_effort: low
+#       <task_type>:
+#         Provider/task-type step budget override.
+#         Default: null
+#         max_steps: null
+#         Deprecated provider/task-type alias for max_steps.
+#         Default: null
+#         max_turns: null
+#         Provider/task-type model override.
+#         Default: null
+#         model: null
+#         Provider/task-type reasoning effort override (Codex).
+#         Default: null
+#         reasoning_effort: null
+#         Provider/task-type runtime budget override.
+#         Default: null
+#         timeout_minutes: null
+
+# Legacy global reasoning effort fallback (Codex).
+# Default: ""
+# reasoning_effort: ""
+
+# task_providers:
+#   Task-type to provider routing override.
+#   Default: null
+#   <task_type>: null
+
+# task_types:
+#   <task_type>:
+#     Legacy per-task-type step budget override.
+#     Default: null
+#     max_steps: null
+#     Deprecated legacy per-task-type alias for max_steps.
+#     Default: null
+#     max_turns: null
+#     Legacy per-task-type model override.
+#     Default: null
+#     model: null
+#     Legacy per-task-type reasoning effort override (Codex).
+#     Default: null
+#     reasoning_effort: null
+#     Legacy per-task-type runtime budget override.
+#     Default: null
+#     timeout_minutes: null
+
+# tmux:
+#   Seconds of quiescence before auto-accept in tmux.
+#   Default: 10.0
+#   auto_accept_timeout: 10.0
+#   Grace period after manual detach before auto-accept resumes.
+#   Default: 5.0
+#   detach_grace: 5.0
+#   Enable tmux-backed background sessions.
+#   Default: false
+#   enabled: false
+#   Max idle seconds before tmux session is considered stuck.
+#   Default: 300.0
+#   max_idle_timeout: 300.0
+#   Tmux terminal dimensions `[cols, rows]`.
+#   Default: [200, 50]
+#   terminal_size:
+#     - 200
+#     - 50
+
+# --- Lifecycle ---
+
+# Auto-create review tasks in lifecycle flows when review gating still requires them; manual
+# attention is required instead when review creation is disabled.
+# Default: true
+# advance_create_reviews: true
+
+# Default iteration budget for `gza iterate`.
+# Default: 3
+# iterate_max_iterations: 3
+
+# Max consecutive failed closing-review attempts before the lineage is parked as needs_attention;
+# 0 escalates on first failure.
+# Default: 3
+# max_failed_closing_review_retries: 3
+
+# Cap for consecutive no-op improves before lifecycle automation stops for discussion.
+# Default: 2
+# max_noop_improve_cycles: 2
+
+# Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed
+# bounded resume/retry policy used by advance, iterate improve recovery, and watch.
+# Default: 1
+# max_resume_attempts: 1
+
+# Cap for review/improve loops in lifecycle automation.
+# Default: 3
+# max_review_cycles: 3
+
+# Enable GitHub PR discovery, commenting, and auto-create flows. Set false to skip all gh-backed
+# PR operations for the project.
+# Default: true
+# pr_integration: true
+
+# Require a valid current review before lifecycle auto-merge.
+# Default: true
+# require_review_before_merge: true
+
+# watch:
+#   Default concurrent worker target for `gza watch`.
+#   Default: 5
+#   batch: 5
+#   Initial cooldown after a non-auto-resumable watch failure.
+#   Default: 60
+#   failure_backoff_initial: 60
+#   Maximum cooldown after consecutive non-auto-resumable watch failures.
+#   Default: 3600
+#   failure_backoff_max: 3600
+#   Exit `gza watch` after this many consecutive non-auto-resumable failures.
+#   Default: 10
+#   failure_halt_after: 10
+#   Idle timeout seconds for `gza watch` loop exit.
+#   Default: null
+#   max_idle: null
+#   Default review/improve loop cap in `gza watch`.
+#   Default: 10
+#   max_iterations: 10
+#   Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`.
+#   Default: 60
+#   no_activity_timeout: 60
+#   Polling interval seconds for `gza watch`.
+#   Default: 300
+#   poll: 300
+#   Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active.
+#   Default: 1
+#   restart_failed_batch: 1
+
+# --- Review ---
+
+# Deprecated compatibility key; accepted but ignored.
+# Default: 1
+# recommend_rebase_behind_commits: 1
+
+# Max changed files included in large review context excerpts.
+# Default: 12
+# review_context_file_limit: 12
+
+# Medium diff threshold for review prompt shaping.
+# Default: 2000
+# review_diff_medium_threshold: 2000
+
+# Small diff threshold for full inline review diffs.
+# Default: 500
+# review_diff_small_threshold: 500
+
+# Timeout in seconds for autonomous review verify_command runs.
+# Default: 120
+# review_verify_timeout_seconds: 120
+
+# --- Output ---
+
+# colors:
+#   Ad-hoc color override map keyed by output field.
+#   Default: null
+#   <field>: null
+
+# Disable all Rich color/theming on TTYs; `NO_COLOR` still disables color regardless of this
+# setting.
+# Default: false
+# no_color: false
+
+# Built-in color theme name.
+# Default: minimal
+# theme: minimal
+
+# --- Other ---
+
+# Hard maximum runtime budget for code tasks after base timeout resolution and diff-size scaling.
+# Default: 45
+# code_task_diff_timeout_cap_minutes: 45
+
+# Scaled timeout applied to code tasks at or above the large diff threshold.
+# Default: 45
+# code_task_diff_timeout_large_minutes: 45
+
+# Changed-line threshold where code tasks can receive the large scaled timeout.
+# Default: 1200
+# code_task_diff_timeout_large_threshold: 1200
+
+# Scaled timeout applied to code tasks at or above the medium diff threshold.
+# Default: 30
+# code_task_diff_timeout_medium_minutes: 30
+
+# Changed-line threshold where code tasks can receive the medium scaled timeout.
+# Default: 400
+# code_task_diff_timeout_medium_threshold: 400

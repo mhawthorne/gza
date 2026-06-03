@@ -152,6 +152,9 @@ gza config
 gza config --json
 gza config keys
 gza config keys --json
+gza config example
+gza config example --local
+gza config example --check
 ```
 
 ### Themes and Colors
@@ -853,6 +856,11 @@ gza config keys --json
 
 `gza config keys --json` prints a machine-readable payload:
 - `keys[]` entries with `key`, `type`, `required`, `default`, and `description`
+
+`gza config example` renders the generated commented `gza.yaml` example from the same
+`CONFIG_KEY_REGISTRY` that powers `gza config keys`, docs parity, and `gza init`.
+Use `--local` for the machine-local override flavor, `--output PATH` to write somewhere else,
+`--write` to regenerate the committed example artifact, and `--check` to fail on drift in CI.
 
 #### Discoverable Config Keys
 

@@ -17,6 +17,12 @@ from rich.table import Table
 
 from .. import colors as _colors
 from ..config import Config, ConfigError, _generate_project_id
+from ..config_examples import (
+    BranchStrategyRender,
+    ConfigExampleRenderOptions,
+    default_example_path,
+    render_config_example,
+)
 from ..config_schema import CONFIG_KEY_REGISTRY
 from ..console import console
 from ..db import SqliteTaskStore, Task, task_id_numeric_key
@@ -1566,6 +1572,41 @@ def cmd_config_keys(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config_example(args: argparse.Namespace) -> int:
+    """Render generated config example files from the config-key registry."""
+    local = bool(args.local)
+    rendered = render_config_example(local=local)
+
+    output_path: Path | None = None
+    if args.write:
+        output_path = default_example_path(local=local)
+    elif args.output is not None:
+        output_path = args.output
+
+    if args.check and output_path is None:
+        output_path = default_example_path(local=local)
+
+    if args.check:
+        assert output_path is not None
+        if not output_path.exists() or output_path.read_text(encoding="utf-8") != rendered:
+            print(f"Config example drift detected: {output_path}", file=sys.stderr)
+            print(
+                "Run `uv run gza config example --write` and "
+                "`uv run gza config example --local --write`, then commit the updated example files.",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+
+    if output_path is not None:
+        output_path.write_text(rendered, encoding="utf-8")
+        print(output_path)
+        return 0
+
+    print(rendered, end="")
+    return 0
+
+
 def _find_removable_workers(registry: WorkerRegistry, store: "SqliteTaskStore") -> "list[WorkerMetadata]":
     """Find worker files that can be safely removed.
 
@@ -2056,8 +2097,6 @@ def _clean_archive(config: Config, args: argparse.Namespace) -> int:
 
 def cmd_init(args: argparse.Namespace) -> int:
     """Generate a new gza.yaml configuration file with defaults."""
-    import importlib.resources
-
     from ..config import CONFIG_FILENAME, DEFAULT_DB_FILE, LOCAL_CONFIG_FILENAME
 
     # Derive project name from directory name
@@ -2069,9 +2108,6 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"Error: {CONFIG_FILENAME} already exists at {config_path}")
         print("Use --force to overwrite")
         return 1
-
-    # Read the example template from the package
-    template = importlib.resources.files("gza").joinpath("gza.yaml.example").read_text()
 
     # Check if running interactively (stdin is a TTY)
     is_interactive = sys.stdin.isatty()
@@ -2097,7 +2133,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     if is_interactive:
         # Prompt for branch strategy
         print("Branch naming strategy:")
-        print("  1. monorepo    - {project}/{task_id} (e.g., myproj/20260107-add-feature)")
+        print("  1. default     - {project}/{date}-{slug} (e.g., myproj/20260107-add-feature)")
         print("  2. conventional - {type}/{slug} (e.g., feature/add-feature, fix/login-bug)")
         print("  3. simple      - {slug} (e.g., add-feature)")
         print("  4. custom      - Define your own pattern")
@@ -2134,24 +2170,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         # Non-interactive mode: use default branch strategy after early DB validation.
         choice = "1"
 
-    # Replace project metadata placeholders
-    config_content = template.replace("project_name: my-project", f"project_name: {default_project_name}")
-    config_content = config_content.replace("# project_id: myproject01", f"project_id: {project_id}")
-
-    # Apply branch strategy based on user's choice
-    default_branch_line = "# branch_strategy: monorepo  # Default: {project}/{task_id}"
     if choice == "1":
-        pass  # Keep commented-out default from template
+        branch_strategy = BranchStrategyRender(mode="comment_default")
     elif choice == "2":
-        config_content = config_content.replace(
-            default_branch_line,
-            "branch_strategy: conventional  # {type}/{slug}",
-        )
+        branch_strategy = BranchStrategyRender(mode="preset", preset="conventional")
     elif choice == "3":
-        config_content = config_content.replace(
-            default_branch_line,
-            "branch_strategy: simple  # {slug}",
-        )
+        branch_strategy = BranchStrategyRender(mode="preset", preset="simple")
     else:  # custom
         print("\nCustom pattern variables:")
         print("  {project}  - Project name")
@@ -2167,8 +2191,11 @@ def cmd_init(args: argparse.Namespace) -> int:
             print("Pattern cannot be empty.")
 
         default_type = input("Default type [default=feature]: ").strip() or "feature"
-        custom_strategy = f'branch_strategy:\n  pattern: "{pattern}"\n  default_type: {default_type}'
-        config_content = config_content.replace(default_branch_line, custom_strategy)
+        branch_strategy = BranchStrategyRender(
+            mode="custom",
+            pattern=pattern,
+            default_type=default_type,
+        )
 
     if db_mode == "shared":
         if shared_db_path is not None:
@@ -2180,16 +2207,23 @@ def cmd_init(args: argparse.Namespace) -> int:
     else:
         db_path_value = DEFAULT_DB_FILE
 
-    if db_path_value is not None:
-        config_content = config_content.replace("# db_path: .gza/gza.db", f"db_path: {db_path_value}")
+    config_content = render_config_example(
+        options=ConfigExampleRenderOptions(
+            project_name=default_project_name,
+            project_name_enabled=True,
+            project_id=project_id,
+            project_id_enabled=True,
+            db_path=db_path_value,
+            branch_strategy=branch_strategy,
+        )
+    )
 
     config_path.write_text(config_content)
     print(f"✓ Created {config_path}")
 
     local_example_path = args.project_dir / f"{LOCAL_CONFIG_FILENAME}.example"
     if not local_example_path.exists() or args.force:
-        local_template = importlib.resources.files("gza").joinpath("gza.local.yaml.example").read_text()
-        local_example_path.write_text(local_template)
+        local_example_path.write_text(render_config_example(local=True), encoding="utf-8")
         print(f"✓ Created {local_example_path}")
 
     # Initialize the database (Config.load will now work since we have project_name)

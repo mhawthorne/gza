@@ -56,7 +56,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "Enable GitHub PR discovery, commenting, and auto-create flows. Set false to skip all gh-backed PR operations for the project.",
     ),
     ConfigKeySpec("branch_mode", "str", "multi", "Git branch mode: `single` or `multi`."),
-    ConfigKeySpec("branch_strategy", "str | object", "{project}/{date}-{slug}", "Branch naming strategy preset or object."),
+    ConfigKeySpec("branch_strategy", "str | object", "project_date_slug", "Branch naming strategy preset or object."),
     ConfigKeySpec("branch_strategy.default_type", "str", "feature", "Default type token for branch strategy patterns."),
     ConfigKeySpec("branch_strategy.pattern", "str", "{project}/{date}-{slug}", "Branch naming format pattern."),
     ConfigKeySpec("chat_text_display_length", "int", 0, "Chat output truncation length (0 = unlimited)."),

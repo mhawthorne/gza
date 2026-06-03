@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 import pytest
 
+from gza.config import Config
+
 from .conftest import make_store, run_gza, setup_config
 
 
@@ -1336,6 +1338,60 @@ class TestLocalConfigOverrides:
             == "Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed bounded resume/retry policy used by advance, iterate improve recovery, and watch."
         )
 
+    def test_config_example_stdout_matches_committed_full_example(self, tmp_path: Path):
+        """`gza config example` should render the committed full example artifact."""
+        result = run_gza("config", "example", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout == Path("src/gza/gza.yaml.example").read_text(encoding="utf-8")
+
+    def test_config_example_stdout_matches_committed_local_example(self, tmp_path: Path):
+        """`gza config example --local` should render the committed local-override artifact."""
+        result = run_gza("config", "example", "--local", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout == Path("src/gza/gza.local.yaml.example").read_text(encoding="utf-8")
+
+    def test_config_example_output_and_check_round_trip(self, tmp_path: Path):
+        """`config example` should support explicit write targets and drift checks."""
+        output_path = tmp_path / "rendered.yaml"
+
+        write_result = run_gza(
+            "config",
+            "example",
+            "--output",
+            str(output_path),
+            "--project",
+            str(tmp_path),
+        )
+        assert write_result.returncode == 0
+        assert output_path.read_text(encoding="utf-8") == Path("src/gza/gza.yaml.example").read_text(encoding="utf-8")
+
+        check_result = run_gza(
+            "config",
+            "example",
+            "--check",
+            "--output",
+            str(output_path),
+            "--project",
+            str(tmp_path),
+        )
+        assert check_result.returncode == 0
+
+        output_path.write_text("# drifted\n", encoding="utf-8")
+        drift_result = run_gza(
+            "config",
+            "example",
+            "--check",
+            "--output",
+            str(output_path),
+            "--project",
+            str(tmp_path),
+        )
+        assert drift_result.returncode == 1
+        assert "Config example drift detected" in drift_result.stderr
+        assert "uv run gza config example --write" in drift_result.stderr
+
 
 class TestInitCommand:
     """Tests for 'gza init' command."""
@@ -1414,9 +1470,12 @@ class TestInitCommand:
         assert project_id_match.group(1) == re.sub(r"[^a-z0-9]+", "", tmp_path.name.lower())[:64]
         assert self._active_db_path_line(content) == ".gza/gza.db"
         assert "# iterate_max_iterations: 3" in content
+        assert "# advance_mode: default" in content
+        assert "# tmux:" in content
         with patch.dict(os.environ, env, clear=False):
             assert Config.load(tmp_path).db_path == (tmp_path / ".gza" / "gza.db").resolve()
         assert (tmp_path / ".gza" / "gza.db").exists()
+        assert local_example_path.read_text(encoding="utf-8") == Path("src/gza/gza.local.yaml.example").read_text(encoding="utf-8")
 
     def test_init_derives_readable_project_id_from_project_name(self, tmp_path: Path):
         """Init should persist a readable project_id derived from project_name."""
@@ -1743,6 +1802,79 @@ class TestInitCommand:
         assert tmp_path.name in content
         assert local_example_path.exists()
         assert "# stale local example" not in local_example_path.read_text()
+
+    @pytest.mark.parametrize("stdin_input", ["1\n", "\n"])
+    def test_init_interactive_default_branch_strategy_matches_prompted_pattern(
+        self,
+        tmp_path: Path,
+        stdin_input: str,
+    ):
+        """Interactive init should load the default branch strategy advertised by option 1."""
+        _home_dir, env = self._home_env(tmp_path)
+
+        result = run_gza(
+            "init",
+            "--db",
+            "local",
+            "--project",
+            str(tmp_path),
+            stdin_input=stdin_input,
+            stdin_isatty=True,
+            env=env,
+        )
+
+        assert result.returncode == 0
+        assert "{project}/{date}-{slug}" in result.stdout
+        assert "monorepo" not in result.stdout
+        assert re.search(
+            r"^# branch_strategy:\s*project_date_slug\s*$",
+            (tmp_path / "gza.yaml").read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+
+        config = Config.load(tmp_path)
+        assert config.branch_strategy.pattern == "{project}/{date}-{slug}"
+        assert config.branch_strategy.default_type == "feature"
+
+    def test_init_interactive_conventional_branch_strategy_still_scaffolds_correctly(self, tmp_path: Path):
+        """Interactive init should activate the chosen preset branch strategy."""
+        _home_dir, env = self._home_env(tmp_path)
+
+        result = run_gza(
+            "init",
+            "--db",
+            "local",
+            "--project",
+            str(tmp_path),
+            stdin_input="2\n",
+            stdin_isatty=True,
+            env=env,
+        )
+
+        assert result.returncode == 0
+        content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
+        assert re.search(r"^branch_strategy:\s*conventional\s*$", content, re.MULTILINE)
+
+    def test_init_interactive_custom_branch_strategy_still_scaffolds_correctly(self, tmp_path: Path):
+        """Interactive init should render a custom branch_strategy block from the shared renderer."""
+        _home_dir, env = self._home_env(tmp_path)
+
+        result = run_gza(
+            "init",
+            "--db",
+            "local",
+            "--project",
+            str(tmp_path),
+            stdin_input="4\n{type}/{date}-{slug}\nfeat\n",
+            stdin_isatty=True,
+            env=env,
+        )
+
+        assert result.returncode == 0
+        content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
+        assert "branch_strategy:" in content
+        assert "default_type: feat" in content
+        assert 'pattern: "{type}/{date}-{slug}"' in content
 
 
 class TestCleanCommand:

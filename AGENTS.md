@@ -23,12 +23,13 @@ See `docs/` for detailed documentation:
 - [docs/skills.md](docs/skills.md) — skill usage and authoring
 - [docs/docker.md](docs/docker.md) — Docker setup, custom Dockerfiles, provider auth
 - [docs/internal/](docs/internal/README.md) — internal architecture, design notes & practices (index)
-
 ## Critical Rules
 
 **Task management**: When the user mentions "task", "add a task", or asks to track something for later, use `uv run gza add "..."`. NEVER edit `etc/todo.txt` or other files manually.
 
 **Default to filing a gza task**: When the user asks for a substantive code change (a feature, fix, or refactor), file it with `uv run gza add` rather than editing inline — do NOT start editing right away. Work in-line only when the user explicitly says to, or for trivial edits. If unsure which way they want it, ask before implementing.
+
+**Config example artifacts**: If you change any discoverable config key/default, regenerate `src/gza/gza.yaml.example` and `src/gza/gza.local.yaml.example` via `uv run gza config example --write` and `uv run gza config example --local --write`, then commit them.
 
 **Failed tasks**: Do NOT run `uv run gza retry ...` or `uv run gza resume ...` unless the user explicitly asks for that exact action.
 
@@ -43,7 +44,6 @@ See `docs/` for detailed documentation:
 **Test retry circuit breaker**: If the same test fails 3 times with the same error, stop and report instead of retrying.
 
 ## Pytest hangs
-
 - If `uv run pytest tests/` produces no new output for about 2 minutes, kill it and bisect by file or class. Do NOT wait it out; CPU usage is a poor liveness signal because an infinite loop also pegs a core.
 - When a test drives an iterate-style loop with the worker side mocked (for example `_run_foreground` patched to `MagicMock`), the mock must also mark the spawned task complete or the loop spins forever. See `test_iterate_failed_improve_non_attention_skip_does_not_emit_needs_attention` in `tests/cli/test_execution.py` for the canonical fix shape.
 

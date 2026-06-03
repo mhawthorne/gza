@@ -32,6 +32,7 @@ from ._common import (
 from .config_cmds import (
     cmd_clean,
     cmd_config,
+    cmd_config_example,
     cmd_config_keys,
     cmd_init,
     cmd_learnings,
@@ -1199,6 +1200,29 @@ def main() -> int:
         help="Output config key registry as JSON",
     )
     add_common_args(config_keys_parser)
+    config_example_parser = config_subparsers.add_parser("example", help="Render generated config example files")
+    config_example_group = config_example_parser.add_mutually_exclusive_group()
+    config_example_group.add_argument(
+        "--output",
+        type=Path,
+        help="Write rendered example to PATH instead of stdout",
+    )
+    config_example_group.add_argument(
+        "--write",
+        action="store_true",
+        help="Write to the committed example artifact path for this flavor",
+    )
+    config_example_parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Render the local-override example instead of the full project example",
+    )
+    config_example_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit non-zero if the generated example differs from the target file on disk",
+    )
+    add_common_args(config_example_parser)
     config_parser.add_argument(
         "--json",
         action="store_true",
@@ -2559,6 +2583,8 @@ def main() -> int:
         elif args.command == "config":
             if getattr(args, "config_action", None) == "keys":
                 return cmd_config_keys(args)
+            if getattr(args, "config_action", None) == "example":
+                return cmd_config_example(args)
             return cmd_config(args)
         elif args.command == "clean":
             return cmd_clean(args)
