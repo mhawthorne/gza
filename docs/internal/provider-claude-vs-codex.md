@@ -107,8 +107,12 @@ provider name.
 
 - Event types: `thread.started`, `turn.started`, `turn.completed`,
   `item.completed`
-- Item types inside `item.completed`: `agent_message`, `command_execution`,
-  `reasoning`
+- Item types inside `item.completed`: `agent_message`, `collab_tool_call`,
+  `command_execution`, `file_change`, `mcp_tool_call`, `reasoning`,
+  `todo_list`, `web_search`
+- Replay/live handler membership for both top-level events and nested
+  `item.completed` item types is derived from the shared Codex registries in
+  `codex.py`, with drift tests covering registry-to-dispatch alignment
 - Renderer: `CodexLogRenderer._handle()` at `log_renderers.py:120`
 - Step counting: per `agent_message` item (`codex.py:853-854`)
 - Token fields: `input_tokens`, `output_tokens`, `cached_input_tokens`
