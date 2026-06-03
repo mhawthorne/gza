@@ -25,6 +25,26 @@ project_name: my-project
 
 # --- Execution ---
 
+# Hard maximum runtime budget for code tasks after base timeout resolution and diff-size scaling.
+# Default: 45
+# code_task_diff_timeout_cap_minutes: 45
+
+# Scaled timeout applied to code tasks at or above the large diff threshold.
+# Default: 45
+# code_task_diff_timeout_large_minutes: 45
+
+# Changed-line threshold where code tasks can receive the large scaled timeout.
+# Default: 1200
+# code_task_diff_timeout_large_threshold: 1200
+
+# Scaled timeout applied to code tasks at or above the medium diff threshold.
+# Default: 30
+# code_task_diff_timeout_medium_minutes: 30
+
+# Changed-line threshold where code tasks can receive the medium scaled timeout.
+# Default: 400
+# code_task_diff_timeout_medium_threshold: 400
+
 # Docker image used for task execution.
 # Default: "{project_name}-gza"
 # docker_image: "{project_name}-gza"
@@ -363,25 +383,3 @@ project_name: my-project
 # Built-in color theme name.
 # Default: minimal
 # theme: minimal
-
-# --- Other ---
-
-# Hard maximum runtime budget for code tasks after base timeout resolution and diff-size scaling.
-# Default: 45
-# code_task_diff_timeout_cap_minutes: 45
-
-# Scaled timeout applied to code tasks at or above the large diff threshold.
-# Default: 45
-# code_task_diff_timeout_large_minutes: 45
-
-# Changed-line threshold where code tasks can receive the large scaled timeout.
-# Default: 1200
-# code_task_diff_timeout_large_threshold: 1200
-
-# Scaled timeout applied to code tasks at or above the medium diff threshold.
-# Default: 30
-# code_task_diff_timeout_medium_minutes: 30
-
-# Changed-line threshold where code tasks can receive the medium scaled timeout.
-# Default: 400
-# code_task_diff_timeout_medium_threshold: 400

@@ -50,3 +50,17 @@ def test_full_config_example_branch_strategy_default_is_valid_when_uncommented(t
     assert config.branch_strategy is not None
     assert config.branch_strategy.pattern == "{project}/{date}-{slug}"
     assert config.branch_strategy.default_type == "feature"
+
+
+def test_full_config_example_groups_code_task_diff_timeout_keys_under_execution() -> None:
+    rendered = render_config_example()
+
+    execution_start = rendered.index("# --- Execution ---")
+    branching_start = rendered.index("# --- Branching ---")
+    timeout_key = "# code_task_diff_timeout_medium_threshold: 400"
+
+    timeout_index = rendered.index(timeout_key)
+
+    assert execution_start < timeout_index < branching_start
+    _, other_header, other_section = rendered.partition("# --- Other ---")
+    assert not other_header or timeout_key not in other_section
