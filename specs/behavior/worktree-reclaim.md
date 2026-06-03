@@ -1,10 +1,9 @@
 # Worktree reclaim — workspace acquisition contract
 
-> **Status: Draft — under discussion.** This document is the prescriptive contract for how
-> a code work unit acquires its isolated workspace (git worktree) when it starts, and the
-> conditions under which an existing worktree may be reclaimed to make room. Parts of it
-> carry **Open questions** that are not yet settled; those are marked inline and MUST NOT
-> be treated as ratified contract.
+> **Status: Draft.** This document is the prescriptive contract for how a code work unit
+> acquires its isolated workspace (git worktree) when it starts, and the single condition
+> under which an existing worktree may be reclaimed to make room. The core model (reclaim a
+> clean worktree, never a dirty one) is settled; it is governed by one named policy knob.
 >
 > Read [00-overview.md](00-overview.md) for the lifecycle invariants this spec applies —
 > in particular invariant **"Never destroy work to make progress."** This document does
@@ -24,108 +23,146 @@ created or reclaimed.
 This document answers:
 
 - When a task needs a workspace for its branch and a worktree already exists, when may that
-  existing worktree be removed, and when MUST the task defer instead?
-- How does a work unit that is actively using a worktree protect it from concurrent
-  reclaim?
-- What happens to a human (or another agent) whose work would otherwise be discarded?
+  existing worktree be removed, and when MUST the task fail and surface the conflict to a
+  human instead?
+- What happens to a human (or another agent) whose uncommitted work would otherwise be
+  discarded?
 
 ## Governing invariant
 
 This contract is the local application of overview invariant
-**"Never destroy work to make progress"**: the engine MUST NOT delete branches and MUST NOT
-discard uncommitted work; cleanup is an operator concern. Workspace acquisition is the most
-common place that invariant is at risk, because making room for a new task is exactly a
-"make progress" pressure that can motivate deleting someone else's worktree.
+**"Never destroy work to make progress"**: the engine MUST NOT discard uncommitted or
+untracked work to make room for a starting task. Workspace acquisition is the most common
+place that invariant is at risk, because making room for a new task is exactly a "make
+progress" pressure that can motivate destroying an existing worktree.
+
+This spec exists because a real incident violated that invariant: a tag-scheduled rebase
+claimed a branch whose worktree held verified-but-uncommitted rescue edits, force-removed
+the worktree, and lost the work (see [the incident
+report](../../docs/incidents/2026-06-02-rescue-worktree-clobbered.md)). The contract below
+is the backstop that makes that outcome impossible regardless of *which* scheduler trigger
+comes to claim a branch.
 
 ## The reclaim gate
 
 When a code work unit starts and a worktree already exists for its branch (at the intended
-path or any other path), the runner MUST classify that worktree before touching it. The
-classification has three outcomes, evaluated in order:
+path or any other path), the runner MUST classify that worktree before touching it. There
+are exactly two outcomes:
 
 1. **Dirty — has uncommitted or untracked changes.**
-   The worktree MUST NOT be removed to make room for the starting task. The starting task
-   MUST defer and surface the conflict for a human, rather than reclaiming. A dirty
-   worktree is presumed to hold unsaved work whose value the system cannot judge; destroying
-   it is never an acceptable cost of starting a task. This holds regardless of *what* is in
-   the worktree or *who* put it there.
+   The worktree MUST NOT be removed. The starting task MUST **fail** and surface the
+   conflict for a human (see *Failure semantics*). A dirty worktree is presumed to hold
+   unsaved work whose value the system cannot judge; destroying it is never an acceptable
+   cost of starting a task. This holds regardless of *what* is in the worktree, *who* put it
+   there, or how the policy knob below is set. **Dirty → fail is an invariant, not a tunable
+   — there is no configuration that permits reclaiming a dirty worktree.**
 
-2. **Clean but claimed — a live work unit is using it.**
-   The worktree MUST NOT be reclaimed. The starting task MUST defer until the claim is
-   released. A worktree is "claimed" when a work unit has marked it in use (see *The claim
-   primitive*). Reclaiming a claimed-but-clean worktree would interrupt active work and is a
-   different shape of the same harm as discarding dirty work.
+2. **Clean — no uncommitted or untracked changes.**
+   The worktree holds no unsaved work; everything of value is committed on the branch and
+   safe. Whether the runner reclaims it automatically or fails for a human is governed by
+   the **`worktree_auto_reclaim_clean`** policy knob (below):
+   - knob **on** (default): the runner MUST reclaim the clean worktree automatically and
+     proceed. This is the leftover-from-a-finished-or-crashed-run case; escalating on every
+     such harmless leftover would force needless manual cleanup and violate the goal of
+     minimizing human involvement.
+   - knob **off**: the runner MUST fail and surface the conflict, exactly as for a dirty
+     worktree. An operator who wants full control over every existing worktree selects this.
 
-3. **Clean, unclaimed, and stale — genuinely abandoned.**
-   The worktree MAY be reclaimed automatically. This is the leftover-from-a-finished-or-
-   crashed-run case: no unsaved work, no live owner. Auto-reclaiming it is required so the
-   system does not accumulate dead worktrees or escalate to a human for every stale
-   leftover — escalating on abandoned workspaces would violate the goal of minimizing human
-   involvement.
+The asymmetry is deliberate and narrow: the *only* thing that can be auto-reclaimed is a
+**clean** worktree, and only when the knob permits it. Anything with unsaved work is off
+limits, always.
 
-The asymmetry is deliberate: the default answer to "may I remove this worktree?" is **no**,
-and it flips to **yes** only on positive evidence of abandonment (clean *and* unclaimed
-*and* stale). Absence of evidence is treated as "in use," not "free."
+> **Note — foreign worktrees (outside managed roots).** A worktree that lives outside the
+> directories gza manages for task workspaces is never reclaimed by this gate, clean or not.
+> A worktree a human created by hand in some other location is theirs; the runner MUST refuse
+> to remove it and fail instead. (The implementation already enforces this via a
+> permitted-roots check; see the implementation note.)
 
-## The claim primitive
+## Failure semantics
 
-A work unit actively using a worktree MUST be able to mark it claimed so that a concurrent
-task start classifies it as case 2 (defer) rather than case 3 (reclaim). Without such a
-mark, a clean worktree held by an active-but-idle session is indistinguishable from an
-abandoned one, and the reclaim gate cannot protect it.
+When the gate decides a starting task MUST fail (case 1, or case 2 with the knob off), the
+failure MUST be legible and actionable, not a silent stall:
 
-A claim MUST be releasable — on normal completion, on failure, and on a human's explicit
-request — so that a crashed owner does not lock a worktree forever. A claim whose owner is
-no longer live MUST NOT keep a worktree out of the reclaimable set indefinitely; staleness
-detection (below) is what reconciles a claim left behind by a dead owner.
+- The task MUST be marked **failed** with a dedicated reason that names the conflict (e.g.
+  a worktree-conflict reason code) and the offending worktree path — *not* left stuck
+  `in_progress` to be reconciled later by dead-process or stuck-timeout detection.
+- The failure MUST surface to the operator as a **needs-attention** item through the normal
+  watch attention path, so the operator sees "this task needs a worktree that already exists
+  — investigate" rather than an opaque crash.
+- The failure MUST NOT be auto-retried as if transient. An existing-worktree conflict only
+  clears when a human acts (commits, discards, relocates, or removes the other worktree);
+  retrying before then just fails again and burns the retry budget. It is terminal until the
+  human clears it.
 
-> **Open question — claim mechanism.** Whether a claim is recorded as a lockfile inside the
-> worktree, as a reserved tag / state on the owning task row, or as a live-process
-> registration is not yet settled. The requirement is the *behavior* (an active owner can
-> reserve a worktree; reservations are releasable and cannot outlive a dead owner), not the
-> storage.
+## Auditability
 
-## Staleness — distinguishing abandoned from active
-
-The hard case is a **clean** worktree with no obvious live owner: is it abandoned (case 3)
-or held by an active session that simply has not written to disk recently (case 2)? The
-contract requires positive evidence of abandonment before auto-reclaim, but does not yet
-fix the exact signal.
-
-> **Open question — staleness signal.** What positively proves a clean, unclaimed worktree
-> is abandoned (e.g. no live owning process, no recent git or filesystem activity within a
-> bound, owning task in a terminal state) is not yet settled. Until it is, the conservative
-> reading applies: when abandonment cannot be positively established, treat the worktree as
-> in use and defer.
+A reclaim is a destructive operation and MUST leave a record. Whenever the runner removes an
+existing worktree (case 2, knob on) or refuses to (case 1, or knob off), it MUST log enough
+to reconstruct the decision after the fact: the branch, the worktree path, whether it was
+clean or dirty, and the action taken (reclaimed / failed). The motivating incident was hard
+to diagnose precisely because the destructive removal emitted nothing; a reclaim that cannot
+be traced is itself a defect.
 
 ## Policy knob
 
-- **`worktree_reclaim_requires_human_when_dirty`** (default: **on** — hold for a human).
-  When on, a dirty worktree blocking a task start is escalated to a human rather than
-  reclaimed (case 1). This is a single, named, swappable policy point. The default is
-  conservative — never trade unsaved work for task progress — but it is a starting position,
-  not a goal: a future signal that proves dirty content is disposable could flip it.
+- **`worktree_auto_reclaim_clean`** (default: **on**).
+  Governs the **clean** case only (case 2). When **on**, a clean existing worktree blocking a
+  task start is reclaimed automatically. When **off**, any existing worktree — even a clean
+  one — makes the task fail for a human. This is a single, named, swappable policy point.
+  The default is **on** because a clean worktree has no unsaved work to lose, so auto-clearing
+  it is safe and avoids forcing manual cleanup of harmless leftovers.
+
+  Note that this knob does **not** govern the dirty case: a dirty worktree fails regardless.
+  There is deliberately no knob that flips dirty-reclaim on, because making "destroy unsaved
+  work" a one-line configuration is exactly the footgun the motivating incident exposed.
 
 ## Human-escalation
 
 | Trigger | How a human clears it | Automation that would remove the human |
 |---------|----------------------|----------------------------------------|
-| A starting task needs a worktree whose existing worktree is **dirty** (case 1). | Commit, discard, or relocate the changes, then re-run; or release the worktree. | A claim primitive plus a reliable staleness signal lets the system reclaim genuinely-abandoned clean worktrees automatically, leaving only true unsaved-work conflicts for a human. |
-| A starting task needs a worktree that is **claimed** by a live work unit (case 2). | None usually required — the starting task defers and proceeds once the claim releases. A human intervenes only if the claim is stuck (owner died without releasing). | Releasable claims that cannot outlive a dead owner remove the stuck-claim case entirely. |
+| A starting task needs a worktree whose existing worktree is **dirty** (case 1). | Commit, discard, or relocate the changes, then re-run; or remove the worktree. | None desired — by invariant this MUST involve the human; the value of unsaved work is theirs to judge. The automation already in place is the default-on auto-reclaim of *clean* worktrees, which keeps harmless leftovers from ever reaching this row. |
+| A starting task needs a worktree that already exists and is **clean**, with `worktree_auto_reclaim_clean` **off** (case 2, strict mode). | Remove the worktree, then re-run; or set the knob on. | Setting `worktree_auto_reclaim_clean` on (the default) removes this row entirely — clean leftovers are reclaimed automatically. |
 
-## Open questions (summary)
+## Open questions
 
-- **Claim mechanism** — lockfile vs. reserved task state vs. process registration.
-- **Staleness signal** — what positively proves a clean, unclaimed worktree is abandoned.
 - **Scope of "code work unit"** — whether detached/ephemeral worktrees (e.g. a review
   checkout that produces no branch commits) participate in the same gate or are exempt
   because they hold no reclaimable work.
+- **Self-resume on the task's own worktree** — when a task resumes and the existing worktree
+  is its *own*, a dirty tree is the task's own in-progress work. Case 1 currently fails it to
+  a human like any other dirty conflict; whether a resuming task should instead *adopt* its
+  own dirty worktree (rather than escalate) is not yet settled. Until it is, the conservative
+  reading applies: dirty → fail, even for self-resume.
+
+## Deliberately not required (yet)
+
+An earlier draft of this contract proposed a **claim primitive** (an active session marks a
+worktree "in use" so a concurrent task start defers rather than reclaims) and a **staleness
+signal** (positive proof that a clean, unclaimed worktree is abandoned before auto-reclaim).
+Both are intentionally **dropped** from the core contract in favor of the simpler clean/dirty
+gate.
+
+The accepted tradeoff: a worktree that is clean *at the instant of classification* but held
+by a live session (e.g. an operator editing a branch between commits while a scheduled task
+starts on it) MAY be reclaimed out from under that session. This is a recoverable
+interruption, **not** data loss — a clean tree has nothing uncommitted to lose, and committed
+work remains safe on the branch. The claim/staleness machinery existed only to close that
+non-destructive gap, at the cost of a whole lockfile/staleness subsystem. If that margin is
+ever wanted, it is an additive feature layered on top of this gate, not a change to it.
 
 ---
 
 *Implementation note (non-normative): at the time of writing, workspace acquisition happens
-in the task runner's code-task worktree setup, which force-removes any existing worktree for
-the branch before re-adding it. That force-removal bypasses the runner's own
-uncommitted-changes guard and is the conformance gap this spec exists to close. The runner
-is the single home for the reclaim gate because every caller — watch, manual `gza work`,
-inline runs, recovery — reaches worktree acquisition through it.*
+in the task runner's code-task worktree setup (`_setup_code_task_worktree` in `runner.py`),
+which calls `cleanup_worktree_for_branch(..., force=True)` and bare
+`git.worktree_remove(..., force=True)` to clear any existing worktree before re-adding. The
+`force=True` path bypasses the runner's own uncommitted-changes guard
+(`cleanup_worktree_for_branch` raises on a dirty worktree only when `force=False`), and three
+of the teardown call sites invoke `git.worktree_remove` directly, bypassing even the
+foreign-worktree permitted-roots check. There is more than one teardown site — at the time of
+writing, `runner.py` lines 2554, 5112, 5119, 6458, and 6816 — so the gate is NOT a single
+chokepoint today. Closing the conformance gap means routing **every** worktree teardown
+through one guarded reclaim helper that applies this gate (dirty → fail with a legible reason;
+clean → reclaim or fail per `worktree_auto_reclaim_clean`; foreign → refuse), rather than
+hardening any one call site. The runner is the right home because every caller — watch,
+manual `gza work`, inline runs, recovery — reaches worktree acquisition through it.*
