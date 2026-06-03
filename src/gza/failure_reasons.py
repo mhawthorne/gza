@@ -8,6 +8,7 @@ from .db import DB_UNSET, SqliteTaskStore, Task, TaskStats, extract_failure_reas
 TERMINATED_FAILURE_REASON = "TERMINATED"
 _RUNNER_OWNED_LOG_FALLBACK_REASONS = frozenset(
     {
+        "CONFIG_ERROR",
         "EXTRACTION_PRECHECK_FAILED",
         "GIT_ERROR",
         "INTERRUPTED",

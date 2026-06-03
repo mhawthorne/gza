@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _ACTIONABLE_TYPES = {"implement", "plan", "explore", "fix", "internal", "review", "improve", "rebase"}
 _MANUAL_ONLY_REASONS = {
+    "CONFIG_ERROR",
     "TEST_FAILURE",
     "GIT_ERROR",
     "PR_REQUIRED",
