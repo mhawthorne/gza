@@ -100,6 +100,21 @@ def calculate_cost(input_tokens: int, output_tokens: int, model: str = "") -> fl
     return round(cost, 4)
 
 
+def _codex_error_message(entry: dict[str, Any]) -> str:
+    """Extract the most useful user-facing error message from a Codex event."""
+    error = entry.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    message = entry.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    if error not in (None, "", [], {}):
+        return str(error)
+    return json.dumps(entry)
+
+
 class CodexLogRenderer:
     """Render Codex JSONL events for log replay/live and TV surfaces."""
 
@@ -145,10 +160,18 @@ class CodexLogRenderer:
         if event_type == "turn.started":
             self.suppressed_count += 1
             return RenderedLines()
+        if event_type == "turn.failed":
+            message = _codex_error_message(entry)
+            if tv:
+                return RenderedLines(tv_lines=tv_error_lines(message))
+            return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in error_lines(message)])
         if event_type == "turn.completed":
             self.suppressed_count += 1
             return RenderedLines()
         if event_type == "item.started":
+            self.suppressed_count += 1
+            return RenderedLines()
+        if event_type == "item.updated":
             self.suppressed_count += 1
             return RenderedLines()
         if event_type == "item.completed":
@@ -943,9 +966,10 @@ class CodexProvider(Provider):
                         data["estimate_input_chars_baseline"] = _as_nonnegative_int(data.get("approx_input_chars"))
                         data["estimate_output_chars_baseline"] = _as_nonnegative_int(data.get("approx_output_chars"))
 
+                elif event_type == "turn.failed":
+                    formatter.print_error(f"Error: {_codex_error_message(event)}")
                 elif isinstance(event_type, str) and "error" in event_type:
-                    message = event.get("message") or event.get("error") or json.dumps(event)
-                    formatter.print_error(f"Error: {message}")
+                    formatter.print_error(f"Error: {_codex_error_message(event)}")
 
             except json.JSONDecodeError:
                 # Non-JSON output, just display it

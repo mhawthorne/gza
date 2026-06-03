@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,7 @@ from gza.providers.base import (
     is_docker_running,
     verify_docker_credentials,
 )
+from gza.providers.claude import _claude_rate_limit_message
 from gza.providers.codex import build_headless_exec_args
 from gza.providers.gemini import calculate_cost
 from gza.providers.output_formatter import (
@@ -178,6 +180,29 @@ class TestDockerConfig:
             provider._run_docker(config, "prompt", tmp_path / "log.txt", tmp_path)
 
         mock_get_cfg.assert_called_once_with("myproj-gza-gemini")
+
+
+def test_claude_rate_limit_message_keeps_provider_utc_timestamp_stable(monkeypatch) -> None:
+    """Provider UTC reset times should not be reformatted into the host timezone."""
+    original_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    try:
+        message = _claude_rate_limit_message({
+            "rate_limit_info": {
+                "status": "denied",
+                "rateLimitType": "five_hour",
+                "resetsAt": "2026-06-03T11:00:00Z",
+            },
+        })
+    finally:
+        if original_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", original_tz)
+        time.tzset()
+
+    assert message == "Rate limit (five_hour); resets at 2026-06-03 11:00:00 UTC"
 
 
 class TestSharedHeadlessCommands:
@@ -1763,8 +1788,8 @@ class TestClaudeErrorTypeExtraction:
 class TestClaudeStepMapping:
     """Tests for Claude message-step/substep mapping."""
 
-    def test_maps_tool_use_and_tool_result_to_lifecycle_substeps(self, tmp_path):
-        """Claude content items should map to tool_call/tool_output/tool_error types."""
+    def test_maps_assistant_tool_use_and_user_tool_result_to_lifecycle_substeps(self, tmp_path):
+        """Claude tool results from real user events should map onto the active assistant step."""
         import json
 
         from gza.providers.claude import ClaudeProvider
@@ -1785,6 +1810,14 @@ class TestClaudeStepMapping:
                             "name": "Bash",
                             "input": {"command": "ls"},
                         },
+                        {"type": "text", "text": "done"},
+                    ],
+                },
+            }) + "\n",
+            json.dumps({
+                "type": "user",
+                "message": {
+                    "content": [
                         {
                             "type": "tool_result",
                             "tool_use_id": "tool_1",
@@ -1797,8 +1830,7 @@ class TestClaudeStepMapping:
                             "content": "failed",
                             "is_error": True,
                         },
-                        {"type": "text", "text": "done"},
-                    ],
+                    ]
                 },
             }) + "\n",
             json.dumps({"type": "result", "subtype": "success", "num_turns": 7, "total_cost_usd": 0.1}) + "\n",
@@ -1829,6 +1861,52 @@ class TestClaudeStepMapping:
         assert result.num_turns_reported == 7
         assert result.num_steps_computed == 1
         assert result.num_steps_reported == 1
+
+    def test_shows_claude_rate_limit_events_only_when_constrained(self, tmp_path, capsys):
+        """Routine Claude rate-limit telemetry should stay silent, constrained states should surface."""
+        import json
+
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "allowed",
+                    "rateLimitType": "five_hour",
+                    "resetsAt": "2026-06-03T10:00:00Z",
+                },
+            }) + "\n",
+            json.dumps({
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "denied",
+                    "rateLimitType": "five_hour",
+                    "resetsAt": "2026-06-03T11:00:00Z",
+                },
+            }) + "\n",
+            json.dumps({"type": "result", "subtype": "success", "num_turns": 0, "total_cost_usd": 0.0}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "Rate limit (five_hour); resets at 2026-06-03 11:00:00 UTC" in captured.out
+        assert "2026-06-03T10:00:00Z" not in captured.out
 
     def test_sets_zero_step_metrics_when_no_assistant_message(self, tmp_path):
         """Claude should persist explicit zero step metrics for runs with no step events."""
@@ -4096,6 +4174,40 @@ class TestCodexOutputParsing:
 
         captured = capsys.readouterr()
         assert "I will help you with that task." in captured.out
+
+    def test_routes_turn_failed_through_error_output_and_skips_item_updated(self, tmp_path, capsys):
+        """Codex turn.failed should surface clearly while item.updated stays suppressed."""
+        import json
+
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "item.updated", "item": {"id": "item_1", "type": "todo_list"}}) + "\n",
+            json.dumps({
+                "type": "turn.failed",
+                "error": {"message": "Selected model is at capacity. Try again shortly."},
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        captured = capsys.readouterr()
+        assert "Selected model is at capacity. Try again shortly." in captured.out
+        assert "item.updated" not in captured.out
 
     def test_tracks_computed_turns_from_agent_messages(self, tmp_path):
         """Should track computed turn count based on agent_message items."""

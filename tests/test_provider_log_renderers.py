@@ -33,10 +33,11 @@ def test_claude_renderer_renders_known_events_and_counts_suppression() -> None:
     assert renderer.stats.step_count == 1
     assert renderer.stats.input_tokens == 15
     assert renderer.stats.output_tokens == 5
-    assert renderer.suppressed_count == 2
+    assert renderer.suppressed_count == 3
     assert "Session initialized" in joined
     assert "Investigating failure." in joined
     assert "FAILED tests/test_cli.py::test_case - AssertionError" in joined
+    assert "Rate limit (five_hour); resets at 2026-06-03 11:00:00 UTC" in joined
     assert "[event:mystery]" in joined
 
 
@@ -50,7 +51,53 @@ def test_codex_renderer_accumulates_tv_tokens_from_usage_fixture() -> None:
     assert stats.output_tokens == 8
     assert "Session started (thread: thread_123)" in joined
     assert "I found the root cause." in joined
+    assert "Selected model is at capacity. Try again shortly." in joined
     assert '"type": "weird.codex"' in joined
+
+
+def test_codex_renderer_suppresses_item_updated_events() -> None:
+    renderer = get_log_renderer("codex")
+    entry = {
+        "type": "item.updated",
+        "item": {"id": "item_1", "type": "todo_list", "items": [{"status": "in_progress", "content": "Inspect logs"}]},
+    }
+
+    log_rendered = renderer.handle_log(entry, live=False)
+    tv_rendered = renderer.handle_tv(entry)
+
+    assert log_rendered.log_lines == []
+    assert tv_rendered.tv_lines == []
+    assert renderer.suppressed_count == 2
+
+
+def test_claude_renderer_suppresses_allowed_rate_limit_events_and_shows_constrained_ones() -> None:
+    renderer = get_log_renderer("claude")
+
+    allowed = renderer.handle_log(
+        {
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "rateLimitType": "five_hour",
+                "resetsAt": "2026-06-03T10:00:00Z",
+            },
+        },
+        live=False,
+    )
+    constrained = renderer.handle_tv(
+        {
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "denied",
+                "rateLimitType": "five_hour",
+                "resetsAt": "2026-06-03T11:00:00Z",
+            },
+        }
+    )
+
+    assert allowed.log_lines == []
+    assert constrained.tv_lines == ["Rate limit (five_hour); resets at 2026-06-03 11:00:00 UTC"]
+    assert renderer.suppressed_count == 1
 
 
 def test_codex_renderer_counts_distinct_usage_events_with_identical_token_values() -> None:
@@ -305,7 +352,7 @@ def test_live_log_printer_uses_provider_renderer_step_count() -> None:
 
     assert seen is True
     assert printer.renderer.stats.step_count == 1
-    assert printer.renderer.suppressed_count == 4
+    assert printer.renderer.suppressed_count == 5
 
 
 def test_codex_renderer_falls_back_for_empty_agent_message() -> None:

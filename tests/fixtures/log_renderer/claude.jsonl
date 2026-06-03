@@ -1,7 +1,9 @@
 {"type":"system","subtype":"init","model":"claude-sonnet-4"}
 {"type":"system","subtype":"metadata","session_id":"sess_hidden","workspace":"/tmp/demo"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":"2026-06-03T10:00:00Z"}}
 {"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":10,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":5},"content":[{"type":"text","text":"Investigating failure."},{"type":"tool_use","name":"Bash","input":{"command":"uv run pytest tests/test_cli.py -q"}}]}}
 {"type":"user","message":{"content":[{"type":"tool_result","content":"FAILED tests/test_cli.py::test_case - AssertionError","is_error":true}]}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"denied","rateLimitType":"five_hour","resetsAt":"2026-06-03T11:00:00Z"}}
 {"type":"assistant","message":{"id":"msg_2","content":[]}}
 {"type":"error","message":"provider exploded"}
 {"type":"mystery","message":"surprise payload","role":"assistant","alpha":1,"beta":2}

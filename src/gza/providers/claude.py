@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -51,6 +51,40 @@ if TYPE_CHECKING:
     from ..config import Config
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_iso_datetime(value: object) -> datetime | None:
+    """Parse an ISO-8601 timestamp with a permissive Z-suffix fallback."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _claude_rate_limit_message(entry: dict[str, Any]) -> str | None:
+    """Summarize non-routine Claude rate limit telemetry for operators."""
+    info = entry.get("rate_limit_info")
+    if not isinstance(info, dict):
+        return None
+    status = str(info.get("status") or "").strip().lower()
+    if status in {"", "allowed"}:
+        return None
+    rate_limit_type = str(info.get("rateLimitType") or "unknown").strip() or "unknown"
+    message = f"Rate limit ({rate_limit_type})"
+    if status != "denied":
+        message = f"{message}: {status}"
+    resets_at = _parse_iso_datetime(info.get("resetsAt"))
+    if resets_at is not None:
+        if resets_at.tzinfo is not None:
+            resets_at = resets_at.astimezone(UTC)
+            return f"{message}; resets at {resets_at.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        return f"{message}; resets at {resets_at.strftime('%Y-%m-%d %H:%M:%S')}"
+    raw_resets_at = info.get("resetsAt")
+    if raw_resets_at:
+        return f"{message}; resets at {raw_resets_at}"
+    return message
 
 
 def _format_tool_param(value: object) -> str:
@@ -147,6 +181,8 @@ class ClaudeLogRenderer:
             return self._render_assistant(entry, live=live, tv=tv)
         if event_type == "user":
             return self._render_user(entry, tv=tv)
+        if event_type == "rate_limit_event":
+            return self._render_rate_limit_event(entry, tv=tv)
         if event_type == "result":
             return self._render_result(entry, tv=tv)
         return self._render_unknown(entry, tv=tv)
@@ -371,6 +407,15 @@ class ClaudeLogRenderer:
         if result_text:
             return RenderedLines(log_lines=[f"[green]\\[result][/green] {rich_escape(result_text)}"])
         return RenderedLines()
+
+    def _render_rate_limit_event(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        message = _claude_rate_limit_message(entry)
+        if not message:
+            self.suppressed_count += 1
+            return RenderedLines()
+        if tv:
+            return RenderedLines(tv_lines=tv_error_lines(message))
+        return RenderedLines(log_lines=[f"[red]{rich_escape(message)}[/red]"])
 
     def _render_unknown(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         if tv:
@@ -1255,6 +1300,29 @@ class ClaudeProvider(Provider):
                 on_step_count(len(data["run_step_events"]))
             return event
 
+        def _append_tool_result_substep(data: dict, current_step: dict | None, content: dict[str, Any]) -> dict:
+            if current_step is None:
+                seen_msg_ids = data.get("seen_msg_ids", set())
+                turn_count = len(seen_msg_ids) if isinstance(seen_msg_ids, set) else 0
+                legacy_turn_id = f"T{turn_count}" if turn_count > 0 else None
+                current_step = _start_step(data, None, legacy_turn_id)
+            legacy_turn_id = current_step.get("legacy_turn_id")
+            is_error = bool(content.get("is_error"))
+            current_step["substeps"].append(
+                {
+                    "type": "tool_error" if is_error else "tool_output",
+                    "source": "provider",
+                    "call_id": content.get("tool_use_id") or content.get("id"),
+                    "payload": {
+                        "content": content.get("content"),
+                        "is_error": is_error,
+                    },
+                    "legacy_turn_id": legacy_turn_id,
+                    "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
+                }
+            )
+            return current_step
+
         def parse_claude_output(line: str, data: dict, log_handle=None) -> None:
             try:
                 event: dict[str, Any] = json.loads(line)
@@ -1422,21 +1490,7 @@ class ClaudeProvider(Provider):
                                     parts.append(f"{k}={_format_tool_param(v)}")
                                 formatter.print_tool_event(" ".join(parts))
                         elif content.get("type") == "tool_result":
-                            legacy_turn_id = current_step.get("legacy_turn_id")
-                            is_error = bool(content.get("is_error"))
-                            current_step["substeps"].append(
-                                {
-                                    "type": "tool_error" if is_error else "tool_output",
-                                    "source": "provider",
-                                    "call_id": content.get("tool_use_id") or content.get("id"),
-                                    "payload": {
-                                        "content": content.get("content"),
-                                        "is_error": is_error,
-                                    },
-                                    "legacy_turn_id": legacy_turn_id,
-                                    "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
-                                }
-                            )
+                            current_step = _append_tool_result_substep(data, current_step, content)
                         elif content.get("type") == "tool_retry":
                             legacy_turn_id = current_step.get("legacy_turn_id")
                             current_step["substeps"].append(
@@ -1467,6 +1521,23 @@ class ClaudeProvider(Provider):
                                     first_line = text.split("\n")[0]
                                     formatter.print_agent_message(truncate_text(first_line, chat_text_display_length))
 
+                elif event_type == "user":
+                    current_step = data.get("_current_step_event")
+                    for content in message_content_items(event):
+                        item_type = content.get("type")
+                        if item_type == "tool_result":
+                            current_step = _append_tool_result_substep(data, current_step, content)
+                            result_text = str(content.get("content", "") or "").strip()
+                            if result_text:
+                                if bool(content.get("is_error")):
+                                    formatter.print_error(result_text)
+                                else:
+                                    formatter.print_agent_message(result_text)
+                        elif item_type == "text":
+                            text = str(content.get("text", "") or "").strip()
+                            if text:
+                                formatter.print_agent_message(f"user: {text}")
+
                 elif event_type == "system":
                     subtype = event.get("subtype")
                     if subtype == "init":
@@ -1481,9 +1552,13 @@ class ClaudeProvider(Provider):
                     # Also capture session_id from result event if not already seen
                     session_id = event.get("session_id")
                     if session_id and "session_id" not in data:
-                        data["session_id"] = session_id
-                        if on_session_id:
-                            on_session_id(session_id)
+                            data["session_id"] = session_id
+                            if on_session_id:
+                                on_session_id(session_id)
+                elif event_type == "rate_limit_event":
+                    message = _claude_rate_limit_message(event)
+                    if message:
+                        formatter.print_error(message)
 
             except json.JSONDecodeError:
                 # Non-JSON output, just display it
