@@ -14674,6 +14674,13 @@ class TestProviderModelParityGate:
         assert model in ops_content
         assert provider in ops_content
 
+        ops_entries = [json.loads(line) for line in ops_content.splitlines() if line.strip()]
+        execution_entries = [e for e in ops_entries if e.get("subtype") == "execution"]
+        assert execution_entries, "ops log must contain an execution-subtype provenance entry"
+        exec_entry = execution_entries[0]
+        assert exec_entry.get("provider") == provider
+        assert exec_entry.get("command") == "work"
+
     @pytest.mark.parametrize(
         ("provider", "model"),
         [

@@ -1215,12 +1215,12 @@ def write_execution_provenance_event(
     ops_log_file: Path,
     *,
     invocation: "RunInvocationContext",
-    provider: "Provider",
+    provider: "Provider | str",
     interaction_mode: str,
     resumed: bool,
 ) -> None:
     """Write structured runner execution provenance before provider launch."""
-    provider_name = provider.name.lower()
+    provider_name = provider if isinstance(provider, str) else provider.name.lower()
     canonical_execution_mode = _task_execution_mode_from_invocation(invocation)
     worker_mode = canonical_execution_mode in {"worker_background", "worker_foreground"}
     message = (
@@ -1392,6 +1392,13 @@ def _mark_preflight_model_mismatch(
     write_log_entry(
         log_file,
         {"type": "gza", "subtype": "info", "message": f"Provider: {provider_name}, Model: {model}"},
+    )
+    write_execution_provenance_event(
+        log_file,
+        invocation=invocation,
+        provider=provider_name,
+        interaction_mode=invocation.interaction_mode,
+        resumed=resume,
     )
     write_log_entry(
         log_file,
