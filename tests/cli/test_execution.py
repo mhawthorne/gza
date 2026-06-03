@@ -1155,6 +1155,7 @@ class TestRetryCommand:
         assert new_task.same_branch is True
         assert new_task.task_type_hint == "feature"
         assert new_task.model == "gpt-5.3-codex"
+        assert new_task.model_is_explicit is True
         assert new_task.provider == "codex"
         assert new_task.provider_is_explicit is True
         assert new_task.based_on == task.id
@@ -1203,6 +1204,7 @@ class TestRetryCommand:
         original.status = "failed"
         original.branch = "feature/old"
         original.task_type_hint = "feature"
+        original.model_is_explicit = True
         original.provider_is_explicit = True
         store.update(original)
 
@@ -1214,6 +1216,7 @@ class TestRetryCommand:
         assert retry_task.tags == original.tags
         assert retry_task.spec == original.spec
         assert retry_task.model == original.model
+        assert retry_task.model_is_explicit is True
         assert retry_task.provider == original.provider
         assert retry_task.provider_is_explicit is True
         assert retry_task.same_branch is True
@@ -4558,6 +4561,7 @@ class TestImproveCommand:
         assert retry_task.based_on == failed_improve.id
         assert retry_task.create_review is False
         assert retry_task.model is None
+        assert retry_task.model_is_explicit is False
         assert retry_task.provider is None
         assert retry_task.provider_is_explicit is False
 
@@ -4619,6 +4623,7 @@ class TestImproveCommand:
         assert retry_task.based_on == failed_improve.id
         assert retry_task.create_review is True
         assert retry_task.model == "gpt-5.4"
+        assert retry_task.model_is_explicit is True
         assert retry_task.provider == "claude"
         assert retry_task.provider_is_explicit is True
 
@@ -16074,6 +16079,7 @@ class TestAddCommandWithModelAndProvider:
         task = next((t for t in tasks if t.prompt == "Test task with model"), None)
         assert task is not None
         assert task.model == "claude-3-5-haiku-latest"
+        assert task.model_is_explicit is True
 
     def test_add_with_provider_flag(self, tmp_path: Path):
         """Add command with --provider flag stores provider override."""
@@ -16116,6 +16122,7 @@ class TestAddCommandWithModelAndProvider:
         assert task is not None
         assert task.model == "claude-opus-4"
         assert task.provider == "claude"
+        assert task.model_is_explicit is True
         assert task.provider_is_explicit is True
 
     @pytest.mark.parametrize(
@@ -16166,6 +16173,7 @@ class TestAddCommandWithModelAndProvider:
         task = next((t for t in tasks if t.prompt == "Custom model task"), None)
         assert task is not None
         assert task.model == "my-custom-model-v2"
+        assert task.model_is_explicit is True
 
     def test_add_allows_provider_without_model(self, tmp_path: Path):
         """gza add with only --provider (no --model) must not trigger the parity gate."""
@@ -16184,6 +16192,45 @@ class TestAddCommandWithModelAndProvider:
 
 
 class TestRecoveryTaskScopeCloning:
+    def test_resume_task_preserves_model_explicitness(self, tmp_path: Path):
+        from gza.cli._common import _create_resume_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        original = store.add(
+            "Implement scoped slice",
+            task_type="implement",
+            model="claude-sonnet-4-6",
+            model_is_explicit=False,
+        )
+        original.status = "failed"
+        original.session_id = "session-123"
+        store.update(original)
+
+        resumed = _create_resume_task(store, original, trigger_source="manual")
+
+        assert resumed.model == original.model
+        assert resumed.model_is_explicit is False
+
+    def test_retry_task_preserves_model_explicitness(self, tmp_path: Path):
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        original = store.add(
+            "Implement scoped slice",
+            task_type="implement",
+            model="claude-sonnet-4-6",
+            model_is_explicit=False,
+        )
+        original.status = "failed"
+        store.update(original)
+
+        retried = _create_retry_task(store, original, trigger_source="manual")
+
+        assert retried.model == original.model
+        assert retried.model_is_explicit is False
+
     def test_resume_task_preserves_review_scope(self, tmp_path: Path):
         from gza.cli._common import _create_resume_task
 
@@ -16279,6 +16326,7 @@ class TestEditCommandWithModelAndProvider:
         task = store.get(task.id)
         assert task is not None
         assert task.model == "claude-3-5-haiku-latest"
+        assert task.model_is_explicit is True
 
     def test_edit_with_provider_flag(self, tmp_path: Path):
         """Edit command can set provider override."""
@@ -16349,12 +16397,38 @@ class TestGetEffectiveConfigForTask:
             prompt="Test task",
             task_type="review",
             model="task-model-override",
+            model_is_explicit=True,
         )
 
         model, provider, max_turns = get_effective_config_for_task(task, config)
         assert model == "task-model-override"
         assert provider == "claude"
         assert max_turns == config.max_turns
+
+    def test_non_explicit_task_model_falls_back_to_provider_scoped_config(self, tmp_path: Path):
+        """Persisted resolved model should not override the current provider-scoped model config."""
+        from gza.config import Config, ProviderConfig
+        from gza.db import Task
+        from gza.runner import get_effective_config_for_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.provider = "codex"
+        config.providers = {
+            "claude": ProviderConfig(model="claude-default"),
+            "codex": ProviderConfig(model="o4-mini"),
+        }
+
+        task = Task(
+            id=1,
+            prompt="Task created before provider switch",
+            model="claude-sonnet-4-6",
+            model_is_explicit=False,
+        )
+
+        model, provider, _ = get_effective_config_for_task(task, config)
+        assert provider == "codex"
+        assert model == "o4-mini"
 
     def test_provider_scoped_task_type_model_selected(self, tmp_path: Path):
         """Provider-scoped task type model takes priority over provider default."""

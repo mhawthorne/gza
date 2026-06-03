@@ -1516,7 +1516,7 @@ def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | Non
     3. Config default (config.provider, already env-merged in Config.load)
 
     Priority order for model selection:
-    1. Task-specific model (task.model)
+    1. Explicit task-specific model override (task.model when model_is_explicit)
     2. Provider-aware config resolution (Config.get_model_for_task)
 
     Priority order for max_steps selection:
@@ -1529,9 +1529,12 @@ def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | Non
     Returns:
         Tuple of (model, provider, max_steps) where model can be None
     """
-    provider_override = task.provider if task.provider_is_explicit and task.provider else None
+    provider_is_explicit = bool(getattr(task, "provider_is_explicit", False))
+    model_is_explicit = bool(getattr(task, "model_is_explicit", False))
+    provider_override = task.provider if provider_is_explicit and task.provider else None
     provider = provider_override if provider_override else config.get_provider_for_task(task.task_type)
-    model = task.model if task.model else config.get_model_for_task(task.task_type, provider)
+    model_override = task.model if model_is_explicit and task.model else None
+    model = model_override if model_override else config.get_model_for_task(task.task_type, provider)
     max_steps = config.get_max_steps_for_task(task.task_type, provider)
     return model, provider, max_steps
 
@@ -4839,7 +4842,9 @@ def run(
     # Persist resolved model/provider to the task DB row immediately so analytics
     # can track which configuration actually ran, even if it crashes before completion.
     # provider_is_explicit is intentionally left unchanged so resolved provider
-    # state does not become a sticky override for future executions.
+    # state does not become a sticky override for future executions. The same
+    # applies to model_is_explicit: resolved defaults are recorded for analytics
+    # only and must not become sticky model pins that can later violate parity.
     task.model = effective_model
     task.provider = effective_provider
     store.update(task)

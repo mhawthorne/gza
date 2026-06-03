@@ -1565,6 +1565,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     # Handle --model flag
     if hasattr(args, "model") and args.model is not None:
         task.model = args.model
+        task.model_is_explicit = True
         update_messages.append(f"✓ Set model override to '{args.model}' for task {task.id}")
         changed = True
 
@@ -2124,6 +2125,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
         task.create_review = create_review
         task.create_pr = create_pr
         task.model = model
+        task.model_is_explicit = model is not None
         task.provider = provider
         task.provider_is_explicit = provider is not None
         store.update(task)

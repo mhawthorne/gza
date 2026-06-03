@@ -14742,3 +14742,69 @@ class TestProviderModelParityGate:
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.failure_reason == "PROVIDER_UNAVAILABLE"
+
+    def test_non_explicit_stale_model_re_resolves_before_parity_gate(self, tmp_path: Path):
+        """A stale non-explicit model pin must be ignored when the routed provider changes."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+        assert task.id is not None
+        task.model = "claude-sonnet-4-6"
+        task.model_is_explicit = False
+        task.provider = "codex"
+        task.provider_is_explicit = False
+        store.update(task)
+
+        config = self._make_config(tmp_path, db_path)
+        config.get_provider_for_task.return_value = "codex"
+        config.get_model_for_task.return_value = "gpt-4o"
+
+        mock_provider = Mock()
+        mock_provider.name = "codex"
+        mock_provider.check_credentials.return_value = False
+        mock_provider.credential_setup_hint = "set creds"
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider", return_value=mock_provider),
+        ):
+            result = run(config, task_id=task.id)
+
+        assert result == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason == "PROVIDER_UNAVAILABLE"
+        assert refreshed.model == "gpt-4o"
+        assert refreshed.provider == "codex"
+        assert refreshed.model_is_explicit is False
+
+    def test_explicit_cross_family_model_still_fails_parity_gate(self, tmp_path: Path):
+        """A genuine explicit cross-family model pin must still fail pre-flight."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(
+            prompt="Implement feature",
+            task_type="implement",
+            model="claude-sonnet-4-6",
+            model_is_explicit=True,
+            provider="codex",
+            provider_is_explicit=True,
+        )
+
+        config = self._make_config(tmp_path, db_path)
+        config.get_provider_for_task.return_value = "codex"
+        config.get_model_for_task.return_value = "gpt-4o"
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            result = run(config, task_id=task.id)
+
+        assert result == 1
+        mock_get_provider.assert_not_called()
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason == "CONFIG_ERROR"

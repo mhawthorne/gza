@@ -397,6 +397,7 @@ class Task:
     model: str | None = None  # Per-task model override
     provider: str | None = None  # Per-task provider override
     provider_is_explicit: bool = False  # True when provider was explicitly set by user input
+    model_is_explicit: bool = False  # True when model was explicitly set by user input
     urgent: bool = False  # Queue lane flag: urgent tasks are picked before normal pending tasks
     queue_position: int | None = None  # Optional explicit queue order within the selected queue bucket
     merge_status: str | None = None  # None, 'unmerged', or 'merged'
@@ -708,8 +709,11 @@ ALTER TABLE tasks ADD COLUMN review_verify_branch TEXT;
 ALTER TABLE tasks ADD COLUMN review_scope TEXT;
 """
 
+# Migration from v47 to v48: explicit model override provenance
+MIGRATION_V47_TO_V48 = "ALTER TABLE tasks ADD COLUMN model_is_explicit INTEGER DEFAULT 0;"
+
 # Schema version for migrations
-SCHEMA_VERSION = 47
+SCHEMA_VERSION = 48
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -983,6 +987,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 model TEXT,
                 provider TEXT,
                 provider_is_explicit INTEGER DEFAULT 0,
+                model_is_explicit INTEGER DEFAULT 0,
                 urgent INTEGER DEFAULT 0,
                 urgent_bumped_at TEXT,
                 queue_position INTEGER,
@@ -1098,7 +1103,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns", "num_turns_reported", "num_turns_computed",
             "attach_count", "attach_duration_seconds", "cost_usd", "created_at", "started_at", "running_pid", "completed_at",
             "group", "depends_on", "spec", "review_scope", "create_review", "auto_implement", "create_pr", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
-            "pr_state", "pr_last_synced_at", "sync_last_synced_at", "model", "provider", "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
+            "pr_state", "pr_last_synced_at", "sync_last_synced_at", "model", "provider", "provider_is_explicit", "model_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
             "merge_status", "merged_at", "failure_reason", "completion_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
             "changed_diff",
             "review_cleared_at", "review_score",
@@ -1116,6 +1121,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "create_pr": "0",
             "same_branch": "0",
             "provider_is_explicit": "0",
+            "model_is_explicit": "0",
             "urgent": "0",
             "skip_learnings": "0",
             "log_schema_version": "1",
@@ -1144,7 +1150,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 duration_seconds, num_steps_reported, num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
                 attach_count, attach_duration_seconds, cost_usd, created_at, started_at, running_pid, completed_at,
                 "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
-                pr_state, pr_last_synced_at, sync_last_synced_at, model, provider, provider_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
+                pr_state, pr_last_synced_at, sync_last_synced_at, model, provider, provider_is_explicit, model_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
                 merge_status, merged_at, failure_reason, completion_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
                 changed_diff, review_cleared_at, review_score,
                 review_verify_command, review_verify_status, review_verify_exit_status, review_verify_failure,
@@ -1390,6 +1396,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "model",
     "provider",
     "provider_is_explicit",
+    "model_is_explicit",
     "urgent",
     "input_tokens",
     "output_tokens",
@@ -1407,7 +1414,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "base_branch",
 )
 
-_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset({40, 41, 42, 43, 44, 45, 46, 47})
+_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset({40, 41, 42, 43, 44, 45, 46, 47, 48})
 
 
 def _missing_required_columns(conn: sqlite3.Connection, table: str, required_columns: tuple[str, ...]) -> list[str]:
@@ -1496,6 +1503,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         45: ("tasks", "auto_implement"),
         46: ("tasks", "trigger_source"),
         47: ("tasks", "review_scope"),
+        48: ("tasks", "model_is_explicit"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -1581,6 +1589,7 @@ def _ensure_required_auto_migration_artifacts(
         (47, "tasks", "review_verify_base_sha", "ALTER TABLE tasks ADD COLUMN review_verify_base_sha TEXT"),
         (47, "tasks", "review_verify_branch", "ALTER TABLE tasks ADD COLUMN review_verify_branch TEXT"),
         (47, "tasks", "review_scope", "ALTER TABLE tasks ADD COLUMN review_scope TEXT"),
+        (48, "tasks", "model_is_explicit", "ALTER TABLE tasks ADD COLUMN model_is_explicit INTEGER DEFAULT 0"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -1703,6 +1712,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     model TEXT,
     provider TEXT,
     provider_is_explicit INTEGER DEFAULT 0,
+    model_is_explicit INTEGER DEFAULT 0,
     urgent INTEGER DEFAULT 0,
     urgent_bumped_at TEXT,
     queue_position INTEGER,
@@ -2147,6 +2157,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (45, MIGRATION_V44_TO_V45),
     (46, MIGRATION_V45_TO_V46),
     (47, MIGRATION_V46_TO_V47),
+    (48, MIGRATION_V47_TO_V48),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -2841,6 +2852,7 @@ class SqliteTaskStore:
             model=row["model"] if "model" in keys else None,
             provider=row["provider"] if "provider" in keys else None,
             provider_is_explicit=bool(row["provider_is_explicit"]) if "provider_is_explicit" in keys and row["provider_is_explicit"] is not None else False,
+            model_is_explicit=bool(row["model_is_explicit"]) if "model_is_explicit" in keys and row["model_is_explicit"] is not None else False,
             urgent=bool(row["urgent"]) if "urgent" in keys and row["urgent"] is not None else False,
             queue_position=row["queue_position"] if "queue_position" in keys else None,
             merge_status=row["merge_status"] if "merge_status" in keys else None,
@@ -3030,6 +3042,7 @@ class SqliteTaskStore:
         model: str | None = None,
         provider: str | None = None,
         provider_is_explicit: bool | None = None,
+        model_is_explicit: bool | None = None,
         recovery_origin: str | None = None,
         trigger_source: str | None = None,
         urgent: bool = False,
@@ -3044,12 +3057,14 @@ class SqliteTaskStore:
         persisted_group = normalized_tags[0] if len(normalized_tags) == 1 else None
         if provider_is_explicit is None:
             provider_is_explicit = provider is not None
+        if model_is_explicit is None:
+            model_is_explicit = model is not None
         with self._connect() as conn:
             new_id = self._next_id(conn)
             conn.execute(
                 """
-                INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, recovery_origin, trigger_source, urgent, skip_learnings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, model_is_explicit, recovery_origin, trigger_source, urgent, skip_learnings)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._project_id,
@@ -3071,6 +3086,7 @@ class SqliteTaskStore:
                     model,
                     provider,
                     1 if provider_is_explicit else 0,
+                    1 if model_is_explicit else 0,
                     recovery_origin,
                     trigger_source,
                     1 if urgent else 0,
@@ -3205,6 +3221,7 @@ class SqliteTaskStore:
                     model = ?,
                     provider = ?,
                     provider_is_explicit = ?,
+                    model_is_explicit = ?,
                     urgent = ?,
                     queue_position = ?,
                     merge_status = ?,
@@ -3274,6 +3291,7 @@ class SqliteTaskStore:
                     task.model,
                     task.provider,
                     1 if task.provider_is_explicit else 0,
+                    1 if task.model_is_explicit else 0,
                     1 if task.urgent else 0,
                     task.queue_position,
                     task.merge_status,
@@ -6186,7 +6204,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "create_pr",
         "same_branch", "task_type_hint", "output_content", "session_id", "pr_number", "pr_state",
         "pr_last_synced_at", "sync_last_synced_at", "model", "provider",
-        "provider_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
+        "provider_is_explicit", "model_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
         "merge_status", "merged_at", "failure_reason", "completion_reason", "skip_learnings", "diff_files_changed", "diff_lines_added",
         "diff_lines_removed", "changed_diff", "review_cleared_at", "review_score",
         "review_verify_command", "review_verify_status", "review_verify_exit_status", "review_verify_failure",
@@ -6205,6 +6223,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "changed_diff": "NULL",
         "recovery_origin": "NULL",
         "trigger_source": "NULL",
+        "model_is_explicit": "0",
         "review_verify_command": "NULL",
         "review_verify_status": "NULL",
         "review_verify_exit_status": "NULL",
@@ -6783,6 +6802,7 @@ def _task_to_dict(task: "Task") -> dict:
         "model": task.model,
         "provider": task.provider,
         "provider_is_explicit": task.provider_is_explicit,
+        "model_is_explicit": task.model_is_explicit,
         "queue_position": task.queue_position,
         "merge_status": task.merge_status,
         "failure_reason": task.failure_reason,

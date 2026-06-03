@@ -49,7 +49,7 @@ def test_v24_to_v27_chains_via_gza_migrate(tmp_path: Path) -> None:
     status = check_migration_status(db_path)
     assert status["current_version"] == 27
     assert status["pending_manual"] == []
-    assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+    assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48]
 
 
 def test_squash_merge_reconciles_origin_branch_and_keeps_advance_planning_clean(tmp_path: Path) -> None:

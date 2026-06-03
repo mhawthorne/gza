@@ -137,33 +137,67 @@ class TestTaskChaining:
         assert retrieved.create_pr is True
         assert retrieved.same_branch is True
 
+    def test_review_verify_metadata_round_trips(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
 
-def test_review_verify_metadata_round_trips(tmp_path: Path) -> None:
-    db_path = tmp_path / "test.db"
-    store = SqliteTaskStore(db_path)
+        review = store.add("Review feature", task_type="review")
+        assert review.id is not None
+        review.review_verify_command = "uv run pytest tests/ -q"
+        review.review_verify_status = "failed"
+        review.review_verify_exit_status = "7"
+        review.review_verify_failure = "mypy failed"
+        review.review_verify_captured_at = datetime(2026, 6, 1, 19, 0, tzinfo=UTC)
+        review.review_verify_head_sha = "deadbeef"
+        review.review_verify_base_sha = "cafebabe"
+        review.review_verify_branch = "feature/review-verify"
+        store.update(review)
 
-    review = store.add("Review feature", task_type="review")
-    assert review.id is not None
-    review.review_verify_command = "uv run pytest tests/ -q"
-    review.review_verify_status = "failed"
-    review.review_verify_exit_status = "7"
-    review.review_verify_failure = "mypy failed"
-    review.review_verify_captured_at = datetime(2026, 6, 1, 19, 0, tzinfo=UTC)
-    review.review_verify_head_sha = "deadbeef"
-    review.review_verify_base_sha = "cafebabe"
-    review.review_verify_branch = "feature/review-verify"
-    store.update(review)
+        refreshed = store.get(review.id)
+        assert refreshed is not None
+        assert refreshed.review_verify_command == "uv run pytest tests/ -q"
+        assert refreshed.review_verify_status == "failed"
+        assert refreshed.review_verify_exit_status == "7"
+        assert refreshed.review_verify_failure == "mypy failed"
+        assert refreshed.review_verify_captured_at == datetime(2026, 6, 1, 19, 0, tzinfo=UTC)
+        assert refreshed.review_verify_head_sha == "deadbeef"
+        assert refreshed.review_verify_base_sha == "cafebabe"
+        assert refreshed.review_verify_branch == "feature/review-verify"
 
-    refreshed = store.get(review.id)
-    assert refreshed is not None
-    assert refreshed.review_verify_command == "uv run pytest tests/ -q"
-    assert refreshed.review_verify_status == "failed"
-    assert refreshed.review_verify_exit_status == "7"
-    assert refreshed.review_verify_failure == "mypy failed"
-    assert refreshed.review_verify_captured_at == datetime(2026, 6, 1, 19, 0, tzinfo=UTC)
-    assert refreshed.review_verify_head_sha == "deadbeef"
-    assert refreshed.review_verify_base_sha == "cafebabe"
-    assert refreshed.review_verify_branch == "feature/review-verify"
+    def test_model_explicit_metadata_round_trips_and_serializes(self, tmp_path: Path) -> None:
+        from gza.db import _task_to_dict
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        explicit = store.add(
+            "Explicit model task",
+            model="claude-sonnet-4-6",
+            model_is_explicit=True,
+        )
+        implicit = store.add("Implicit model task")
+        assert explicit.id is not None
+        assert implicit.id is not None
+
+        reloaded_explicit = store.get(explicit.id)
+        reloaded_implicit = store.get(implicit.id)
+
+        assert reloaded_explicit is not None
+        assert reloaded_explicit.model == "claude-sonnet-4-6"
+        assert reloaded_explicit.model_is_explicit is True
+        assert _task_to_dict(reloaded_explicit)["model_is_explicit"] is True
+
+        assert reloaded_implicit is not None
+        assert reloaded_implicit.model is None
+        assert reloaded_implicit.model_is_explicit is False
+
+        reloaded_explicit.model_is_explicit = False
+        store.update(reloaded_explicit)
+
+        updated = store.get(explicit.id)
+        assert updated is not None
+        assert updated.model == "claude-sonnet-4-6"
+        assert updated.model_is_explicit is False
 
     def test_depends_on_relationship(self, tmp_path: Path):
         """Test that depends_on creates correct relationships."""
@@ -6515,7 +6549,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48]
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -6527,7 +6561,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48]
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -8297,6 +8331,39 @@ class TestSharedDbIsolationAndImportGating:
         assert [row.id for row in history] == [task.id]
         assert history[0].review_scope is None
         assert any("tasks.review_scope" in warning for warning in query_store.startup_warnings())
+
+    def test_auto_migration_v47_to_v48_adds_model_is_explicit_with_default_zero(
+        self, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before v48 model explicitness", model="claude-sonnet-4-6")
+        assert task.id is not None
+
+        _drop_tasks_column(db_path, "model_is_explicit")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 47")
+            conn.commit()
+
+        migrated_store = SqliteTaskStore(db_path, prefix="gza")
+        reloaded = migrated_store.get(task.id)
+        assert reloaded is not None
+        assert reloaded.model == "claude-sonnet-4-6"
+        assert reloaded.model_is_explicit is False
+
+        with sqlite3.connect(db_path) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            stored_value = conn.execute(
+                "SELECT model_is_explicit FROM tasks WHERE project_id = ? AND id = ?",
+                ("default", task.id),
+            ).fetchone()[0]
+
+        assert "model_is_explicit" in columns
+        assert version == SCHEMA_VERSION
+        assert stored_value == 0
 
     def test_query_only_open_pre_v43_db_missing_changed_diff_reads_with_null(
         self, tmp_path: Path
