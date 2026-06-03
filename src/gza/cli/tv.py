@@ -35,7 +35,12 @@ MAX_SLOTS = 8
 DEFAULT_MIN_SLOTS = 1
 DEFAULT_MAX_SLOTS = 4
 SHRINK_TICKS = 5
-NON_PANEL_LINES = 3
+# Render into this percentage of the terminal so a tmux status bar / shell
+# cursor can never clip the bottom panel. The leftover margin is intentional
+# headroom. Integer percent (not a float) to keep the budget math exact.
+HEIGHT_PERCENT = 95
+# The single global header row above all panels.
+HEADER_LINES = 1
 
 
 def _status_color(status: str) -> str:
@@ -90,27 +95,46 @@ def _scan_log(log_path: Path, n: int, provider: str | None, configured_model: st
 
 
 def _task_elapsed_seconds(task: DbTask) -> float | None:
-    """Live elapsed time: use recorded duration when set, else now - started_at."""
+    """Elapsed runtime shown in a panel's metadata.
+
+    Only a live ``in_progress`` task ticks against the wall clock. Once a task
+    finishes (completed/failed/etc.) the timer freezes: prefer the recorded
+    ``duration_seconds``, else ``completed_at - started_at``. Without this a
+    failed task with no recorded duration would increment forever.
+    """
     if task.duration_seconds is not None:
         return task.duration_seconds
-    if task.started_at is not None:
-        started = task.started_at
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=UTC)
+    if task.started_at is None:
+        return None
+    started = task.started_at
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    if task.status == "in_progress":
         return (datetime.now(UTC) - started).total_seconds()
+    # Finished without a recorded duration: freeze at the completion time.
+    if task.completed_at is not None:
+        completed = task.completed_at
+        if completed.tzinfo is None:
+            completed = completed.replace(tzinfo=UTC)
+        return (completed - started).total_seconds()
     return None
 
 
 def _lines_per_panel(n_tasks: int) -> int:
-    """Compute how many log lines each panel gets based on terminal height."""
+    """Compute how many log lines each panel gets based on terminal height.
+
+    Sizes panels to fit within ``HEIGHT_PERCENT`` of the terminal. The math is
+    exact: total rendered height is ``HEADER_LINES + n*(content + 2)`` which is
+    ``<= budget`` by construction, so with fixed-height, non-wrapping panels the
+    ``Live(screen=True)`` view never overflows and clips the bottom row.
+    """
     try:
         term_height = _get_terminal_size().lines
     except OSError:
         term_height = 40
-    # Each panel has 2 lines of border (top + bottom) + content lines.
-    # Reserve 3 non-panel lines: the status header row, Rich Live's trailing
-    # newline, and the shell cursor. Without this the bottom row can clip.
-    available = term_height - NON_PANEL_LINES
+    budget = term_height * HEIGHT_PERCENT // 100
+    # Reserve the global header row; the rest is split across panels.
+    available = budget - HEADER_LINES
     if n_tasks <= 0:
         return 10
     # panel overhead: top border + bottom border = 2 lines per panel
@@ -124,8 +148,15 @@ def _build_task_panel(
     n_lines: int,
     width: int,
 ) -> Panel:
-    """Build a Rich Panel for one task's TV row."""
+    """Build a Rich Panel for one task's TV row.
+
+    All metadata (id, type, status, elapsed, steps, tokens, cost) lives on the
+    panel's top border alongside the prompt, so every task reads top-down in one
+    glance. The panel is given a fixed height and a non-wrapping body so wide
+    characters in the logs can never grow it past its budgeted size.
+    """
     rc = _colors.RUNNER_COLORS
+    tc = _colors.TASK_COLORS
     sc = _status_color(task.status or "unknown")
 
     # --- log body & live stats ---
@@ -136,29 +167,46 @@ def _build_task_panel(
     else:
         lines, log_stats = ["(no log available)"], RenderStats()
 
-    # --- subtitle with metadata ---
-    parts: list[str] = []
+    # --- metadata: task id + live stats, all on the top border ---
+    task_id = task.id or "?"
+    meta = Text()
+    meta.append(task_id, style=tc.task_id)
     if task.task_type:
-        parts.append(f"[{rc.task_type}]{task.task_type}[/{rc.task_type}]")
-    parts.append(f"[{sc}]{task.status or 'unknown'}[/{sc}]")
+        meta.append("  ")
+        meta.append(task.task_type, style=rc.task_type)
+    meta.append("  ")
+    meta.append(task.status or "unknown", style=sc)
 
     elapsed = _task_elapsed_seconds(task)
     if elapsed is not None:
-        parts.append(f"[{rc.value}]{format_duration(elapsed)}[/{rc.value}]")
+        meta.append("  ")
+        meta.append(format_duration(elapsed), style=rc.value)
 
     steps = task.num_steps_reported or task.num_steps_computed or log_stats.step_count
     if steps:
-        parts.append(f"[{rc.value}]{steps} steps[/{rc.value}]")
+        meta.append("  ")
+        meta.append(f"{steps} steps", style=rc.value)
 
     total_tokens = log_stats.input_tokens + log_stats.output_tokens
     if total_tokens:
-        parts.append(f"[{rc.value}]{format_token_count(total_tokens)}[/{rc.value}]")
+        meta.append("  ")
+        meta.append(format_token_count(total_tokens), style=rc.value)
 
     cost = task.cost_usd if task.cost_usd is not None else log_stats.cost_usd
     if cost:
-        parts.append(f"[{rc.value}]${cost:.2f}[/{rc.value}]")
+        meta.append("  ")
+        meta.append(f"${cost:.2f}", style=rc.value)
 
-    subtitle = "  ".join(parts)
+    # --- prompt fills the title width remaining after the metadata ---
+    # Reserve the border corners plus the dashes/spaces Rich wraps a title in.
+    # If the prompt still overruns, Rich crops the title tail (never the meta).
+    title_overhead = 8
+    available = max(20, width - title_overhead - meta.cell_len)
+    prompt_display = shorten_prompt(task.prompt or "", available=available)
+    title = meta.copy()
+    if prompt_display:
+        title.append("  ")
+        title.append(prompt_display, style=tc.prompt)
 
     # Pad to n_lines so panels are uniform height
     while len(lines) < n_lines:
@@ -173,32 +221,18 @@ def _build_task_panel(
         body_parts.append(Text.from_ansi(cap.get()))
 
     body = Text("\n").join(body_parts)
-
-    # --- title: prompt styled in themed "prompt" color (pink in minimal),
-    # expanded to fill the panel width using the centralized width helper.
-    task_id = task.id or "?"
-    prompt_color = _colors.TASK_COLORS.prompt
-    # Panel borders (2) + padding (2) + 2 spaces between id and prompt.
-    prefix_chars = len(task_id) + 2
-    suffix_chars = 0
-    # Fit the prompt into the panel's width specifically (not the whole
-    # terminal), since each row may be narrower than the full screen.
-    border_and_padding = 4
-    available = max(20, width - border_and_padding - prefix_chars - suffix_chars)
-    prompt_display = shorten_prompt(task.prompt or "", available=available)
-    title = (
-        f"[{_colors.TASK_COLORS.task_id}]{task_id}[/{_colors.TASK_COLORS.task_id}]  "
-        f"[{prompt_color}]{rich_escape(prompt_display)}[/{prompt_color}]"
-    )
+    # Never wrap: a wide char must be cropped, not pushed onto a second visual
+    # row that would grow the panel past its fixed height and clip the screen.
+    body.no_wrap = True
+    body.overflow = "crop"
 
     return Panel(
         body,
         title=title,
         title_align="left",
-        subtitle=subtitle,
-        subtitle_align="right",
-        border_style=_colors.TASK_COLORS.task_id,
+        border_style=tc.task_id,
         width=width,
+        height=n_lines + 2,
         padding=(0, 1),
     )
 

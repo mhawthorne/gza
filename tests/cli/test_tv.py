@@ -521,9 +521,54 @@ def test_tv_parser_path_renders_header_for_fixed_slot_flag(monkeypatch, tmp_path
     assert "slots: 2 (min 2, max 2)" in header
 
 
-def test_lines_per_panel_reserves_header_row(monkeypatch):
+def test_lines_per_panel_fits_within_height_budget(monkeypatch):
+    # 95% of 20 rows = 19; minus the 1 header row = 18 split across 2 panels,
+    # each costing 2 border rows: (18 - 4) // 2 = 7 content lines.
     monkeypatch.setattr(tv_module, "_get_terminal_size", lambda: os.terminal_size((120, 20)))
-    assert tv_module._lines_per_panel(2) == 6
+    n_lines = tv_module._lines_per_panel(2)
+    assert n_lines == 7
+    # The full render must fit within the budget so screen=True never crops.
+    total = tv_module.HEADER_LINES + 2 * (n_lines + 2)
+    assert total <= 20 * tv_module.HEIGHT_PERCENT // 100
+
+
+def test_task_elapsed_in_progress_ticks_against_wall_clock():
+    started = datetime.now(UTC) - timedelta(seconds=30)
+    task = Task(id="gza-1", prompt="live", status="in_progress", started_at=started)
+    elapsed = tv_module._task_elapsed_seconds(task)
+    assert elapsed is not None and elapsed >= 30
+
+
+def test_task_elapsed_failed_freezes_at_completion_not_wall_clock():
+    """A failed task with no recorded duration must not keep incrementing."""
+    base = datetime(2026, 4, 15, 12, 0, tzinfo=UTC)
+    task = Task(
+        id="gza-2",
+        prompt="failed",
+        status="failed",
+        started_at=base,
+        completed_at=base + timedelta(seconds=42),
+        duration_seconds=None,
+    )
+    assert tv_module._task_elapsed_seconds(task) == 42.0
+
+
+def test_task_elapsed_prefers_recorded_duration():
+    base = datetime(2026, 4, 15, 12, 0, tzinfo=UTC)
+    task = Task(
+        id="gza-3",
+        prompt="done",
+        status="completed",
+        started_at=base,
+        completed_at=base + timedelta(seconds=99),
+        duration_seconds=12.5,
+    )
+    assert tv_module._task_elapsed_seconds(task) == 12.5
+
+
+def test_task_elapsed_finished_without_timing_is_none():
+    task = Task(id="gza-4", prompt="failed", status="failed", started_at=None)
+    assert tv_module._task_elapsed_seconds(task) is None
 
 
 def _explicit_id_args(tmp_path: Path, task_id: str) -> argparse.Namespace:
