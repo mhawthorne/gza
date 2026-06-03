@@ -21,7 +21,7 @@ from .. import colors as _colors, lineage
 from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
 from ..config import Config
 from ..console import console, prompt_available_width, shorten_prompt
-from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from ..db import MERGE_SOURCE_WATCH, SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..git import Git, GitError
 from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
 from ..merge_state import resolve_task_merge_state_for_target
@@ -1557,6 +1557,7 @@ def _run_cycle(
                         merge_git=merge_execution_git,
                         merge_current_branch=merge_execution_branch,
                         already_merged_behavior="mark_merged",
+                        merge_source=MERGE_SOURCE_WATCH,
                     ),
                 )
                 rc = merge_result.rc

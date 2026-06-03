@@ -31,6 +31,55 @@ class TestMergeStatusTracking:
         git._run("commit", "-m", "Initial commit")
         return git
 
+    def _setup_merge_candidate(self, tmp_path: Path, *, branch: str = "feature/test"):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+
+        task = store.add("Add feature")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+        assert task.id is not None
+
+        git._run("checkout", "-b", branch)
+        (tmp_path / "feature.txt").write_text(f"feature on {branch}")
+        git._run("add", "feature.txt")
+        git._run("commit", "-m", "Add feature")
+        git._run("checkout", "main")
+        return store, git, task
+
+    def _add_followup_review(self, store, task, *, followups: bool = True):
+        review = store.add("Review task", task_type="review", based_on=task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        if followups:
+            review.output_content = (
+                "## Summary\n\n- Looks good.\n\n"
+                "## Blockers\n\nNone.\n\n"
+                "## Follow-Ups\n\n"
+                "### F1 Harden edge cases\n"
+                "Evidence: edge case remains.\n"
+                "Impact: low risk hardening.\n"
+                "Recommended follow-up: add a small guard.\n"
+                "Recommended tests: add regression coverage.\n\n"
+                "## Questions / Assumptions\n\nNone.\n\n"
+                "## Verdict\n\nVerdict: APPROVED_WITH_FOLLOWUPS\n"
+            )
+        else:
+            review.output_content = (
+                "## Summary\n\n- Looks good.\n\n"
+                "## Blockers\n\nNone.\n\n"
+                "## Follow-Ups\n\nNone.\n\n"
+                "## Questions / Assumptions\n\nNone.\n\n"
+                "## Verdict\n\nVerdict: APPROVED\n"
+            )
+        store.update(review)
+        return review
+
     def test_merge_sets_merge_status_merged(self, tmp_path: Path):
         """Successful merge sets merge_status='merged' on the task."""
         from datetime import datetime
@@ -124,6 +173,56 @@ class TestMergeStatusTracking:
         updated_task = store.get(task.id)
         assert updated_task is not None
         assert updated_task.merge_status == "merged"
+
+    def test_merge_materializes_followups_and_records_manual_source(self, tmp_path: Path):
+        store, _git, task = self._setup_merge_candidate(tmp_path, branch="feature/with-followups")
+        review = self._add_followup_review(store, task)
+
+        first = run_gza("merge", str(task.id), "--project", str(tmp_path))
+        second = run_gza("merge", str(task.id), "--mark-only", "--project", str(tmp_path))
+
+        assert first.returncode == 0
+        assert second.returncode == 0
+        assert f"FOLLOW {review.id}" not in first.stdout
+        followups = [
+            row for row in store.get_all()
+            if row.task_type == "implement"
+            and row.based_on == review.id
+            and row.prompt.startswith(f"Follow-up F1 from review {review.id} for task {task.id}:")
+        ]
+        assert len(followups) == 1
+        assert f"FOLLOW {followups[0].id} created from {task.id}" in first.stdout
+        assert f"FOLLOW {followups[0].id} reused from {task.id}" in second.stdout
+
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.merge_source == "manual"
+
+    def test_merge_no_followups_flag_suppresses_materialization(self, tmp_path: Path):
+        store, _git, task = self._setup_merge_candidate(tmp_path, branch="feature/no-followups-flag")
+        review = self._add_followup_review(store, task)
+
+        result = run_gza("merge", str(task.id), "--no-followups", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        followups = [
+            row for row in store.get_all()
+            if row.task_type == "implement" and row.based_on == review.id
+        ]
+        assert followups == []
+
+    def test_merge_without_followup_findings_creates_none(self, tmp_path: Path):
+        store, _git, task = self._setup_merge_candidate(tmp_path, branch="feature/no-followup-findings")
+        review = self._add_followup_review(store, task, followups=False)
+
+        result = run_gza("merge", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        followups = [
+            row for row in store.get_all()
+            if row.task_type == "implement" and row.based_on == review.id
+        ]
+        assert followups == []
 
     def test_cmd_unmerged_uses_db_query(self, tmp_path: Path):
         """gza unmerged uses merge_status='unmerged' DB query instead of git detection."""

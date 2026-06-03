@@ -77,6 +77,43 @@ class TestAdvanceCommand:
         assert result.returncode == 0
         assert "No eligible tasks" in result.stdout
 
+    def test_advance_merge_records_advance_merge_source(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        git = self._setup_git_repo(tmp_path)
+        task = self._create_implement_task_with_branch(store, git, tmp_path, prompt="Advance merge source")
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(task.id),
+            dry_run=False,
+            auto=True,
+            max=None,
+            no_docker=True,
+            batch=None,
+            force=False,
+            plans=False,
+            unimplemented=False,
+            create=False,
+            no_resume_failed=False,
+            max_resume_attempts=None,
+            advance_type=None,
+            new=False,
+            max_review_cycles=None,
+            squash_threshold=None,
+        )
+
+        with patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={"type": "merge", "description": "Merge"},
+        ):
+            rc = cmd_advance(args)
+
+        assert rc == 0
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.merge_source == "advance"
+
     def test_advance_dry_run_shows_actions(self, tmp_path: Path):
         """advance --dry-run shows planned actions without executing."""
         setup_config(tmp_path)

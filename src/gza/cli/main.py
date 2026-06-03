@@ -12,6 +12,7 @@ from ..config import (
     discover_project_dir,
 )
 from ..db import (
+    MERGE_SOURCE_VALUES,
     InvalidTaskIdError,
     ManualMigrationRequired,
     MergeTargetResolutionError,
@@ -83,6 +84,7 @@ from .query import (
     cmd_incomplete,
     cmd_kill,
     cmd_lineage,
+    cmd_merged,
     cmd_next,
     cmd_ps,
     cmd_search,
@@ -620,6 +622,40 @@ def main() -> int:
         help="Output JSON rows from the unified query API",
     )
 
+    merged_parser = subparsers.add_parser("merged", help="List merged merge units")
+    add_common_args(merged_parser)
+    merged_parser.add_argument(
+        "--source",
+        choices=sorted(MERGE_SOURCE_VALUES),
+        help="Filter merged units by recorded merge source",
+    )
+    merged_parser.add_argument(
+        "--last-days",
+        type=_parse_non_negative_int,
+        metavar="N",
+        help="Only show units merged in the last N days",
+    )
+    merged_parser.add_argument(
+        "--since",
+        metavar="DATE",
+        help="Only show units merged on or after YYYY-MM-DD",
+    )
+    merged_parser.add_argument(
+        "--fields",
+        metavar="CSV",
+        help="Projection fields override (comma-separated; works in text or JSON mode)",
+    )
+    merged_parser.add_argument(
+        "--list-fields",
+        action="store_true",
+        help="List valid --fields values for this command and exit",
+    )
+    merged_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output JSON rows from the unified query API",
+    )
+
     # advance command
     advance_parser = subparsers.add_parser(
         "advance",
@@ -1014,6 +1050,11 @@ def main() -> int:
         "--mark-only",
         action="store_true",
         help="Mark the task as merged in the database without performing an actual git merge (branch is preserved)",
+    )
+    merge_parser.add_argument(
+        "--no-followups",
+        action="store_true",
+        help="Do not materialize review FOLLOWUP tasks after a successful merge or --mark-only",
     )
     merge_parser.add_argument(
         "--resolve",
@@ -2597,6 +2638,8 @@ def main() -> int:
             return cmd_search(args)
         elif args.command == "unmerged":
             return cmd_unmerged(args)
+        elif args.command == "merged":
+            return cmd_merged(args)
         elif args.command == "advance":
             return cmd_advance(args)
         elif args.command == "watch":

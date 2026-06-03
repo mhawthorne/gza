@@ -4183,6 +4183,7 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
     assert args[4]["followup_findings"] == (finding,)
     assert kwargs["target_branch"] == "main"
     assert kwargs["current_branch"] == "main"
+    assert kwargs["merge_source"] == "watch"
     assert log_path.read_text().count(f"MERGE     {task.id} -> main") == 1
     assert any(
         line.split(maxsplit=2)[1] == "FOLLOW" and "gza-999 created from" in line

@@ -10117,6 +10117,60 @@ class TestUnmergedUnifiedQueryOutput:
         value_lines = [line for line in single.out.splitlines() if line and not line.startswith("On branch ")]
         assert value_lines[-1] == task.id
 
+    def test_merged_json_filters_by_source_and_last_days(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        manual = store.add("Manual merged", task_type="implement")
+        store.mark_completed(manual, has_commits=True, branch="feature/manual-merged")
+        assert manual.id is not None
+        manual_unit = store.resolve_merge_unit_for_task(manual.id)
+        assert manual_unit is not None
+        store.set_merge_unit_state(
+            manual_unit.id,
+            "merged",
+            merge_source="manual",
+            merged_at=datetime.now(UTC) - timedelta(days=2),
+        )
+
+        advance = store.add("Advance merged", task_type="implement")
+        store.mark_completed(advance, has_commits=True, branch="feature/advance-merged")
+        assert advance.id is not None
+        advance_unit = store.resolve_merge_unit_for_task(advance.id)
+        assert advance_unit is not None
+        store.set_merge_unit_state(
+            advance_unit.id,
+            "merged",
+            merge_source="advance",
+            merged_at=datetime.now(UTC) - timedelta(days=10),
+        )
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            source="manual",
+            last_days=7,
+            since=None,
+            fields="merge_unit_id,merge_source,branch",
+            list_fields=False,
+            json=True,
+        )
+
+        result = query_cli.cmd_merged(args)
+        captured = capsys.readouterr()
+
+        assert result == 0
+        assert json.loads(captured.out) == [
+            {
+                "merge_unit_id": manual_unit.id,
+                "merge_source": "manual",
+                "branch": "feature/manual-merged",
+            }
+        ]
+
     def test_unmerged_text_fields_unknown_field_errors_clearly(
         self,
         tmp_path: Path,

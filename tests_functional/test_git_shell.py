@@ -11,7 +11,7 @@ from gza import advance_engine as advance_engine_module
 from gza.advance_engine import evaluate_advance_rules, resolve_advance_context
 from gza.cli.git_ops import _merge_single_task, _run_task_backed_rebase
 from gza.config import Config
-from gza.db import SqliteTaskStore, check_migration_status
+from gza.db import SCHEMA_VERSION, SqliteTaskStore, check_migration_status
 from gza.git import Git, GitError, active_worktree_path_for_branch, cleanup_worktree_for_branch
 from gza.review_verdict import ParsedReviewReport
 from gza.runner import WIP_DIR, _restore_wip_changes, _save_wip_changes, _squash_wip_commits
@@ -49,7 +49,7 @@ def test_v24_to_v27_chains_via_gza_migrate(tmp_path: Path) -> None:
     status = check_migration_status(db_path)
     assert status["current_version"] == 27
     assert status["pending_manual"] == []
-    assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48]
+    assert status["pending_auto"] == list(range(28, SCHEMA_VERSION + 1))
 
 
 def test_squash_merge_reconciles_origin_branch_and_keeps_advance_planning_clean(tmp_path: Path) -> None:

@@ -23,7 +23,15 @@ from ..console import (
     prompt_available_width,
     shorten_prompt,
 )
-from ..db import DB_UNSET, MergeTargetResolutionError, SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from ..db import (
+    DB_UNSET,
+    MERGE_SOURCE_ADVANCE,
+    MERGE_SOURCE_MANUAL,
+    MergeTargetResolutionError,
+    SqliteTaskStore,
+    Task as DbTask,
+    task_id_numeric_key,
+)
 from ..dependency_preconditions import task_is_merged
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import (
@@ -47,6 +55,7 @@ from ..pr_ops import build_task_pr_content, ensure_task_pr
 from ..rebase_diff import capture_rebase_diff_baseline, compute_rebase_changed_diff
 from ..rebase_publish import publish_rebased_branch
 from ..recovery_engine import list_failed_tasks_for_recovery, resolve_recovery_planning_task
+from ..review_verdict import get_review_report
 from ..runner import (
     WIP_INTERRUPTED_COMMIT_SUBJECT,
     TaskExecutionLogger,
@@ -116,6 +125,37 @@ class _ResolvedMergeSubject:
     merge_branch: str | None
     merge_source_ref: str | None
     merge_source_warning: str | None
+
+
+def _materialize_merge_followups(
+    store: SqliteTaskStore,
+    config: Config,
+    merge_subject: DbTask,
+) -> tuple[list[DbTask], list[DbTask]]:
+    """Create or reuse FOLLOWUP tasks for the latest completed review on a merged task."""
+    if merge_subject.id is None:
+        return ([], [])
+    review_task = next(
+        (
+            review
+            for review in store.get_reviews_for_task(merge_subject.id)
+            if review.status == "completed" and review.completed_at is not None
+        ),
+        None,
+    )
+    if review_task is None:
+        return ([], [])
+    report = get_review_report(config.project_dir, review_task)
+    findings = tuple(finding for finding in report.findings if finding.severity == "FOLLOWUP")
+    if not findings:
+        return ([], [])
+    return _create_or_reuse_followup_tasks(
+        store,
+        review_task=review_task,
+        impl_task=merge_subject,
+        findings=findings,
+        trigger_source="manual",
+    )
 
 
 def _merge_execution_status_error(
@@ -934,6 +974,7 @@ def _build_auto_merge_args(
         squash=should_squash,
         delete=False,
         mark_only=False,
+        no_followups=True,
         remote=False,
         resolve=False,
     )
@@ -1050,6 +1091,8 @@ def _merge_single_task(
     git: Git,
     args: argparse.Namespace,
     current_branch: str,
+    *,
+    merge_source: str = MERGE_SOURCE_MANUAL,
 ) -> _MergeSingleTaskResult:
     """Merge a single task's branch."""
     target_branch = git.default_branch()
@@ -1089,9 +1132,20 @@ def _merge_single_task(
             return _MergeSingleTaskResult(rc=1)
 
         if merge_unit_id is not None:
-            store.set_merge_unit_state(merge_unit_id, "merged", merged_by_task_id=merge_subject.id)
+            store.set_merge_unit_state(
+                merge_unit_id,
+                "merged",
+                merged_by_task_id=merge_subject.id,
+                merge_source=merge_source,
+            )
         else:
             store.set_merge_status(merge_subject.id, "merged")
+        if not getattr(args, "no_followups", False):
+            created_followups, reused_followups = _materialize_merge_followups(store, config, merge_subject)
+            for followup_task in created_followups:
+                print(f"FOLLOW {followup_task.id} created from {merge_subject.id}")
+            for followup_task in reused_followups:
+                print(f"FOLLOW {followup_task.id} reused from {merge_subject.id}")
         print(f"✓ Marked task {merge_subject.id} as merged (branch '{merge_branch}' preserved)")
         return _MergeSingleTaskResult(rc=0)
 
@@ -1214,9 +1268,20 @@ def _merge_single_task(
 
         if git.repo_dir == config.project_dir:
             if merge_unit_id is not None:
-                store.set_merge_unit_state(merge_unit_id, "merged", merged_by_task_id=merge_subject.id)
+                store.set_merge_unit_state(
+                    merge_unit_id,
+                    "merged",
+                    merged_by_task_id=merge_subject.id,
+                    merge_source=merge_source,
+                )
             else:
                 store.set_merge_status(merge_subject.id, "merged")
+            if not getattr(args, "no_followups", False):
+                created_followups, reused_followups = _materialize_merge_followups(store, config, merge_subject)
+                for followup_task in created_followups:
+                    print(f"FOLLOW {followup_task.id} created from {merge_subject.id}")
+                for followup_task in reused_followups:
+                    print(f"FOLLOW {followup_task.id} reused from {merge_subject.id}")
         return _MergeSingleTaskResult(rc=0, pending_squash_reconcile=pending_squash_reconcile)
 
     except GitError as e:
@@ -1262,9 +1327,20 @@ def _merge_single_task(
 
             if git.repo_dir == config.project_dir:
                 if merge_unit_id is not None:
-                    store.set_merge_unit_state(merge_unit_id, "merged", merged_by_task_id=merge_subject.id)
+                    store.set_merge_unit_state(
+                        merge_unit_id,
+                        "merged",
+                        merged_by_task_id=merge_subject.id,
+                        merge_source=merge_source,
+                    )
                 else:
                     store.set_merge_status(merge_subject.id, "merged")
+                if not getattr(args, "no_followups", False):
+                    created_followups, reused_followups = _materialize_merge_followups(store, config, merge_subject)
+                    for followup_task in created_followups:
+                        print(f"FOLLOW {followup_task.id} created from {merge_subject.id}")
+                    for followup_task in reused_followups:
+                        print(f"FOLLOW {followup_task.id} reused from {merge_subject.id}")
             return _MergeSingleTaskResult(rc=0)
 
         print(f"Error during {operation}: {e}")
@@ -2492,6 +2568,7 @@ def _execute_merge_action(
     merge_git: Git | None = None,
     merge_current_branch: str | None = None,
     already_merged_behavior: str = "error",
+    merge_source: str = MERGE_SOURCE_MANUAL,
 ) -> _MergeActionResult:
     """Execute a merge-style advance action and materialize follow-up tasks if needed."""
     created_followups: list[DbTask] = []
@@ -2555,6 +2632,7 @@ def _execute_merge_action(
                 resolved_subject.merge_unit_id,
                 "merged",
                 merged_by_task_id=merge_subject.id,
+                merge_source=merge_source,
             )
         else:
             store.set_merge_status(merge_subject.id, "merged")
@@ -2591,6 +2669,7 @@ def _execute_merge_action(
             execution_git,
             merge_args,
             execution_branch,
+            merge_source=merge_source,
         )
     )
     rc = merge_result.rc
@@ -2614,6 +2693,7 @@ def _execute_merge_action(
                     resolved_subject.merge_unit_id,
                     "merged",
                     merged_by_task_id=merge_subject.id,
+                    merge_source=merge_source,
                 )
             else:
                 store.set_merge_status(merge_subject.id, "merged")
@@ -3231,6 +3311,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 action,
                 target_branch=target_branch,
                 current_branch=actual_current_branch,
+                merge_source=MERGE_SOURCE_ADVANCE,
             )
             if merge_result.created_followups:
                 created_ids = ", ".join(str(t.id) for t in merge_result.created_followups if t.id is not None)

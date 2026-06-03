@@ -446,6 +446,7 @@ class MergeUnit:
     updated_at: datetime | None = None
     merged_at: datetime | None = None
     merged_by_task_id: str | None = None
+    merge_source: str | None = None
     pr_number: int | None = None
     pr_state: str | None = None
     pr_last_synced_at: datetime | None = None
@@ -648,6 +649,7 @@ CREATE TABLE IF NOT EXISTS merge_units (
     updated_at TEXT NOT NULL,
     merged_at TEXT,
     merged_by_task_id TEXT,
+    merge_source TEXT,
     pr_number INTEGER,
     pr_state TEXT,
     pr_last_synced_at TEXT,
@@ -662,6 +664,8 @@ CREATE INDEX IF NOT EXISTS idx_merge_units_project_target_state
     ON merge_units(project_id, target_branch, state);
 CREATE INDEX IF NOT EXISTS idx_merge_units_project_source_target
     ON merge_units(project_id, source_branch, target_branch);
+CREATE INDEX IF NOT EXISTS idx_merge_units_project_state_source
+    ON merge_units(project_id, state, merge_source);
 CREATE TABLE IF NOT EXISTS merge_unit_tasks (
     project_id TEXT NOT NULL,
     merge_unit_id TEXT NOT NULL,
@@ -709,11 +713,20 @@ ALTER TABLE tasks ADD COLUMN review_verify_branch TEXT;
 ALTER TABLE tasks ADD COLUMN review_scope TEXT;
 """
 
-# Migration from v47 to v48: explicit model override provenance
-MIGRATION_V47_TO_V48 = "ALTER TABLE tasks ADD COLUMN model_is_explicit INTEGER DEFAULT 0;"
+# Migration from v47 to v48: model explicitness
+MIGRATION_V47_TO_V48 = """
+ALTER TABLE tasks ADD COLUMN model_is_explicit INTEGER DEFAULT 0;
+"""
+
+# Migration from v48 to v49: merge-unit merge-source provenance
+MIGRATION_V48_TO_V49 = """
+ALTER TABLE merge_units ADD COLUMN merge_source TEXT;
+CREATE INDEX IF NOT EXISTS idx_merge_units_project_state_source
+    ON merge_units(project_id, state, merge_source);
+"""
 
 # Schema version for migrations
-SCHEMA_VERSION = 48
+SCHEMA_VERSION = 49
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -749,6 +762,15 @@ def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool
         return str(row[1])
 
     return any(_column_name(row) == column for row in rows)
+
+
+def _index_exists(conn: sqlite3.Connection, index_name: str) -> bool:
+    """Check whether an index exists."""
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name = ?",
+        (index_name,),
+    ).fetchone()
+    return row is not None
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -1414,7 +1436,9 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "base_branch",
 )
 
-_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset({40, 41, 42, 43, 44, 45, 46, 47, 48})
+_QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49}
+)
 
 
 def _missing_required_columns(conn: sqlite3.Connection, table: str, required_columns: tuple[str, ...]) -> list[str]:
@@ -1504,6 +1528,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         46: ("tasks", "trigger_source"),
         47: ("tasks", "review_scope"),
         48: ("tasks", "model_is_explicit"),
+        49: ("merge_units", "merge_source"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -1518,6 +1543,11 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
                 raise RuntimeError(
                     f"Auto-migration to v42 incomplete: missing required table {table}"
                 )
+    if target_version >= 49 and not _index_exists(conn, "idx_merge_units_project_state_source"):
+        raise RuntimeError(
+            "Auto-migration to v49 incomplete: missing required index "
+            "idx_merge_units_project_state_source"
+        )
 
 
 def _ensure_required_auto_migration_artifacts(
@@ -1590,6 +1620,7 @@ def _ensure_required_auto_migration_artifacts(
         (47, "tasks", "review_verify_branch", "ALTER TABLE tasks ADD COLUMN review_verify_branch TEXT"),
         (47, "tasks", "review_scope", "ALTER TABLE tasks ADD COLUMN review_scope TEXT"),
         (48, "tasks", "model_is_explicit", "ALTER TABLE tasks ADD COLUMN model_is_explicit INTEGER DEFAULT 0"),
+        (49, "merge_units", "merge_source", "ALTER TABLE merge_units ADD COLUMN merge_source TEXT"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -1645,6 +1676,28 @@ def _ensure_required_auto_migration_artifacts(
                 "Schema integrity check failed while repairing required table merge_units: "
                 "use a writable database."
             ) from exc
+    if target_version >= 49 and _table_exists(conn, "merge_units"):
+        if not _table_has_column(conn, "merge_units", "merge_source"):
+            try:
+                conn.execute("ALTER TABLE merge_units ADD COLUMN merge_source TEXT")
+            except sqlite3.OperationalError as exc:
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required column "
+                    "merge_units.merge_source: use a writable database."
+                ) from exc
+        if not _index_exists(conn, "idx_merge_units_project_state_source"):
+            try:
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_merge_units_project_state_source
+                        ON merge_units(project_id, state, merge_source)
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required index "
+                    "idx_merge_units_project_state_source: use a writable database."
+                ) from exc
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1834,6 +1887,7 @@ CREATE TABLE IF NOT EXISTS merge_units (
     updated_at TEXT NOT NULL,
     merged_at TEXT,
     merged_by_task_id TEXT,
+    merge_source TEXT,
     pr_number INTEGER,
     pr_state TEXT,
     pr_last_synced_at TEXT,
@@ -1848,6 +1902,8 @@ CREATE INDEX IF NOT EXISTS idx_merge_units_project_target_state
     ON merge_units(project_id, target_branch, state);
 CREATE INDEX IF NOT EXISTS idx_merge_units_project_source_target
     ON merge_units(project_id, source_branch, target_branch);
+CREATE INDEX IF NOT EXISTS idx_merge_units_project_state_source
+    ON merge_units(project_id, state, merge_source);
 
 CREATE TABLE IF NOT EXISTS merge_unit_tasks (
     project_id TEXT NOT NULL,
@@ -2158,9 +2214,25 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (46, MIGRATION_V45_TO_V46),
     (47, MIGRATION_V46_TO_V47),
     (48, MIGRATION_V47_TO_V48),
+    (49, MIGRATION_V48_TO_V49),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
+
+MERGE_SOURCE_MANUAL = "manual"
+MERGE_SOURCE_ADVANCE = "advance"
+MERGE_SOURCE_WATCH = "watch"
+MERGE_SOURCE_GITHUB_PR = "github_pr"
+MERGE_SOURCE_EXTERNAL = "external"
+MERGE_SOURCE_VALUES: frozenset[str] = frozenset(
+    {
+        MERGE_SOURCE_MANUAL,
+        MERGE_SOURCE_ADVANCE,
+        MERGE_SOURCE_WATCH,
+        MERGE_SOURCE_GITHUB_PR,
+        MERGE_SOURCE_EXTERNAL,
+    }
+)
 
 
 def _legacy_local_db_path(project_dir: Path) -> Path:
@@ -2611,6 +2683,11 @@ class SqliteTaskStore:
             self._startup_warnings.append(
                 "Query-only DB open detected missing optional merge-unit tables; "
                 "merge-aware commands will fall back to legacy task merge_status state."
+            )
+        elif not self._query_only_has_column("merge_units", "merge_source"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing optional column merge_units.merge_source; "
+                "merge provenance and source-filtered merged listings will be unavailable."
             )
         if not self._query_only_supports_tags():
             self._startup_warnings.append(
@@ -3939,6 +4016,11 @@ class SqliteTaskStore:
             updated_at=_parse_db_timestamp(row["updated_at"]),
             merged_at=_parse_db_timestamp(row["merged_at"]),
             merged_by_task_id=str(row["merged_by_task_id"]) if row["merged_by_task_id"] is not None else None,
+            merge_source=(
+                str(row["merge_source"])
+                if "merge_source" in row.keys() and row["merge_source"] is not None
+                else None
+            ),
             pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
             pr_state=str(row["pr_state"]) if row["pr_state"] is not None else None,
             pr_last_synced_at=_parse_db_timestamp(row["pr_last_synced_at"]),
@@ -4407,6 +4489,7 @@ class SqliteTaskStore:
         state: str,
         *,
         merged_by_task_id: str | None | object = DB_UNSET,
+        merge_source: str | None | object = DB_UNSET,
         merged_at: datetime | None | object = DB_UNSET,
         pr_number: int | None | object = DB_UNSET,
         pr_state: str | None | object = DB_UNSET,
@@ -4426,12 +4509,17 @@ class SqliteTaskStore:
         typed_merged_by_task_id = (
             cast("str | None", merged_by_task_id) if merged_by_task_id is not DB_UNSET else None
         )
+        typed_merge_source = cast("str | None", merge_source) if merge_source is not DB_UNSET else None
         typed_merged_at_arg = cast("datetime | None", merged_at) if merged_at is not DB_UNSET else None
         if state != "merged":
             if typed_merged_by_task_id is not None:
                 raise ValueError(f"state {state!r} cannot retain merged_by_task_id provenance")
+            if typed_merge_source is not None:
+                raise ValueError(f"state {state!r} cannot retain merge_source provenance")
             if typed_merged_at_arg is not None:
                 raise ValueError(f"state {state!r} cannot retain merged_at provenance")
+        if typed_merge_source is not None and typed_merge_source not in MERGE_SOURCE_VALUES:
+            raise ValueError(f"merge_source must be one of {sorted(MERGE_SOURCE_VALUES)!r}; got {typed_merge_source!r}")
         if merged_by_task_id is not DB_UNSET and typed_merged_by_task_id is not None:
             if owner_task_id is None or typed_merged_by_task_id != owner_task_id:
                 raise ValueError(
@@ -4449,16 +4537,22 @@ class SqliteTaskStore:
                     merged_at_value = now
             if merged_by_task_id is DB_UNSET:
                 merged_by_task_id = owner_task_id
+            if merge_source is DB_UNSET:
+                merge_source = current_unit.merge_source
         else:
             if merged_at_value is DB_UNSET:
                 merged_at_value = None
             if merged_by_task_id is DB_UNSET:
                 merged_by_task_id = None
+            if merge_source is DB_UNSET:
+                merge_source = None
         typed_merged_at_value = cast("datetime | None", merged_at_value)
         updates.append("merged_at = ?")
         params.append(_format_db_timestamp(typed_merged_at_value))
         updates.append("merged_by_task_id = ?")
         params.append(cast("str | None", merged_by_task_id))
+        updates.append("merge_source = ?")
+        params.append(cast("str | None", merge_source))
         if pr_number is not DB_UNSET:
             updates.append("pr_number = ?")
             params.append(pr_number)
@@ -4506,7 +4600,11 @@ class SqliteTaskStore:
                 FROM merge_units
                 WHERE project_id = ?
                   AND state != 'merged'
-                  AND (merged_at IS NOT NULL OR merged_by_task_id IS NOT NULL)
+                  AND (
+                      merged_at IS NOT NULL
+                      OR merged_by_task_id IS NOT NULL
+                      OR merge_source IS NOT NULL
+                  )
                 """,
                 (self._project_id,),
             ).fetchall()
@@ -4517,10 +4615,15 @@ class SqliteTaskStore:
                     UPDATE merge_units
                     SET merged_at = NULL,
                         merged_by_task_id = NULL,
+                        merge_source = NULL,
                         updated_at = ?
                     WHERE project_id = ?
                       AND state != 'merged'
-                      AND (merged_at IS NOT NULL OR merged_by_task_id IS NOT NULL)
+                      AND (
+                          merged_at IS NOT NULL
+                          OR merged_by_task_id IS NOT NULL
+                          OR merge_source IS NOT NULL
+                      )
                     """,
                     (now, self._project_id),
                 )
@@ -4562,6 +4665,45 @@ class SqliteTaskStore:
     def get_unmerged_merge_units(self) -> list[MergeUnit]:
         """Return actionable merge units."""
         return self.list_active_merge_units(states=("unmerged", "blocked", "stale"))
+
+    def list_merged_units(
+        self,
+        *,
+        source: str | None = None,
+        after: datetime | None = None,
+        before: datetime | None = None,
+    ) -> list[MergeUnit]:
+        """Return merged active units filtered by source and/or merged_at window."""
+        if not self.supports_merge_units():
+            return []
+        params: list[object] = [self._project_id]
+        where_parts = [
+            "project_id = ?",
+            "state = 'merged'",
+            "superseded_by_unit_id IS NULL",
+        ]
+        if source is not None:
+            if self._open_mode == "query_only" and not self._query_only_has_column("merge_units", "merge_source"):
+                return []
+            where_parts.append("merge_source = ?")
+            params.append(source)
+        if after is not None:
+            where_parts.append("merged_at >= ?")
+            params.append(_format_db_timestamp(after))
+        if before is not None:
+            where_parts.append("merged_at <= ?")
+            params.append(_format_db_timestamp(before))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM merge_units
+                WHERE {' AND '.join(where_parts)}
+                ORDER BY merged_at DESC, id DESC
+                """,
+                tuple(params),
+            ).fetchall()
+        return [unit for row in rows if (unit := self._row_to_merge_unit(row)) is not None]
 
     def _get_unmerged_merge_units_with_legacy_fallback(self) -> list[MergeUnit]:
         """Return actionable merge units, lazily backfilling legacy rows when needed."""

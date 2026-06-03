@@ -160,6 +160,14 @@ _UNMERGED_PROJECTION_FIELDS: tuple[str, ...] = _projection_fields(
     _TaskProjectionSpec(preset=_TaskProjectionPreset.UNMERGED_DEFAULT),
     scope="lineages",
 )
+_MERGED_PROJECTION_FIELDS: tuple[str, ...] = (
+    "merge_unit_id",
+    "owner_task_id",
+    "merge_source",
+    "merged_at",
+    "branch",
+    "target_branch",
+)
 
 _INCOMPLETE_DEPRECATION_LINES: tuple[str, ...] = (
     "Error: `gza incomplete` is deprecated and no longer supported.",
@@ -1487,6 +1495,114 @@ def _print_unmerged_empty(*, use_json: bool) -> None:
     console.print("No unmerged tasks")
 
 
+def _print_merged_empty(*, use_json: bool) -> None:
+    if use_json:
+        console.print("[]")
+        return
+    console.print("No merged units")
+
+
+def _format_merged_timestamp(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(UTC).isoformat()
+
+
+def _merged_row_dict(store: SqliteTaskStore, unit: MergeUnit) -> dict[str, object | None]:
+    owner = store.resolve_merge_unit_owner_task(unit)
+    return {
+        "merge_unit_id": unit.id,
+        "owner_task_id": owner.id if owner is not None else unit.owner_task_id,
+        "merge_source": unit.merge_source,
+        "merged_at": _format_merged_timestamp(unit.merged_at),
+        "branch": unit.source_branch,
+        "target_branch": unit.target_branch,
+    }
+
+
+def _render_merged_rows(
+    rows: list[dict[str, object | None]],
+    *,
+    fields: tuple[str, ...] | None,
+    use_json: bool,
+) -> None:
+    selected_fields = fields or _MERGED_PROJECTION_FIELDS
+    payload = [{field: row.get(field) for field in selected_fields} for row in rows]
+    if use_json:
+        import json
+
+        print(json.dumps(payload, indent=2))
+        return
+    if fields is not None:
+        if len(selected_fields) == 1:
+            field = selected_fields[0]
+            for row in payload:
+                print("" if row.get(field) is None else str(row.get(field)))
+            return
+        for index, row in enumerate(payload):
+            for field in selected_fields:
+                print(f"{field}: {row.get(field)}")
+            if index != len(payload) - 1:
+                print()
+        return
+
+    owner_width = max(len("owner task"), *(len(str(row["owner_task_id"] or "-")) for row in payload))
+    source_width = max(len("source"), *(len(str(row["merge_source"] or "-")) for row in payload))
+    merged_width = max(len("merged_at"), *(len(str(row["merged_at"] or "-")) for row in payload))
+    print(
+        f"{'unit id':<16} {'owner task':<{owner_width}} {'source':<{source_width}} "
+        f"{'merged_at':<{merged_width}} branch"
+    )
+    for row in payload:
+        print(
+            f"{str(row['merge_unit_id']):<16} "
+            f"{str(row['owner_task_id'] or '-'): <{owner_width}} "
+            f"{str(row['merge_source'] or '-'): <{source_width}} "
+            f"{str(row['merged_at'] or '-'): <{merged_width}} "
+            f"{row['branch']}"
+        )
+
+
+def cmd_merged(args: argparse.Namespace) -> int:
+    """List merged merge units with optional provenance and time filters."""
+    if getattr(args, "list_fields", False):
+        return _print_projection_fields("merged")
+
+    config = Config.load(args.project_dir)
+    store = get_store(config, open_mode="query_only")
+    projection_fields = _validate_projection_fields(
+        _parse_csv(getattr(args, "fields", None)),
+        command_name="merged",
+    )
+    if getattr(args, "fields", None) is not None and projection_fields is None:
+        return 2
+    use_json = bool(getattr(args, "json", False))
+
+    after: datetime | None = None
+    since_value = getattr(args, "since", None)
+    if since_value:
+        parsed_since = _parse_iso(since_value)
+        if parsed_since is None:
+            print("Error: --since must be an ISO date/time or YYYY-MM-DD")
+            return 1
+        after = parsed_since if parsed_since.tzinfo is not None else parsed_since.replace(tzinfo=UTC)
+    last_days = getattr(args, "last_days", None)
+    if last_days is not None:
+        last_days_after = datetime.now(UTC) - _dt.timedelta(days=last_days)
+        after = max(after, last_days_after) if after is not None else last_days_after
+
+    units = store.list_merged_units(
+        source=getattr(args, "source", None),
+        after=after,
+    )
+    if not units:
+        _print_merged_empty(use_json=use_json)
+        return 0
+    rows = [_merged_row_dict(store, unit) for unit in units]
+    _render_merged_rows(rows, fields=projection_fields, use_json=use_json)
+    return 0
+
+
 def _unmerged_effective_fields(query: _TaskQuery) -> set[str]:
     return set(_projection_fields(query.projection, scope="lineages"))
 
@@ -1600,6 +1716,8 @@ def _projection_field_choices(command_name: str, *, blocked_by_dropped: bool = F
         )
     if command_name == "unmerged":
         return _UNMERGED_PROJECTION_FIELDS
+    if command_name == "merged":
+        return _MERGED_PROJECTION_FIELDS
     raise ValueError(f"unknown projection command surface: {command_name}")
 
 

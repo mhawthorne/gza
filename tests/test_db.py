@@ -2816,6 +2816,9 @@ class TestMergeStatus:
         with pytest.raises(ValueError, match="cannot retain merged_at provenance"):
             store.set_merge_unit_state(impl_unit.id, "blocked", merged_at=datetime.now(UTC))
 
+        with pytest.raises(ValueError, match="cannot retain merge_source provenance"):
+            store.set_merge_unit_state(impl_unit.id, "unmerged", merge_source="manual")
+
     def test_set_merge_unit_state_sets_merged_state_and_provenance_together(self, tmp_path: Path) -> None:
         """Merged writes should stamp owner provenance and merged_at in one state change."""
         db_path = tmp_path / "test.db"
@@ -2827,18 +2830,56 @@ class TestMergeStatus:
         impl_unit = store.resolve_merge_unit_for_task(impl.id)
         assert impl_unit is not None
 
-        store.set_merge_unit_state(impl_unit.id, "merged")
+        store.set_merge_unit_state(impl_unit.id, "merged", merge_source="manual")
 
         merged_unit = store.get_merge_unit(impl_unit.id)
         assert merged_unit is not None
         assert merged_unit.state == "merged"
         assert merged_unit.merged_at is not None
         assert merged_unit.merged_by_task_id == impl.id
+        assert merged_unit.merge_source == "manual"
 
         merged_impl = store.get(impl.id)
         assert merged_impl is not None
         assert merged_impl.merge_status == "merged"
         assert merged_impl.merged_at == merged_unit.merged_at
+
+    def test_list_merged_units_filters_by_source_and_window(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        manual = store.add(prompt="Manual merge", task_type="implement")
+        store.mark_completed(manual, has_commits=True, branch="feature/manual")
+        assert manual.id is not None
+        manual_unit = store.resolve_merge_unit_for_task(manual.id)
+        assert manual_unit is not None
+        manual_time = datetime(2026, 6, 2, 12, 0, tzinfo=UTC)
+        store.set_merge_unit_state(
+            manual_unit.id,
+            "merged",
+            merge_source="manual",
+            merged_at=manual_time,
+        )
+
+        advance = store.add(prompt="Advance merge", task_type="implement")
+        store.mark_completed(advance, has_commits=True, branch="feature/advance")
+        assert advance.id is not None
+        advance_unit = store.resolve_merge_unit_for_task(advance.id)
+        assert advance_unit is not None
+        advance_time = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
+        store.set_merge_unit_state(
+            advance_unit.id,
+            "merged",
+            merge_source="advance",
+            merged_at=advance_time,
+        )
+
+        units = store.list_merged_units(
+            source="manual",
+            after=datetime(2026, 6, 1, tzinfo=UTC),
+            before=datetime(2026, 6, 3, tzinfo=UTC),
+        )
+        assert [unit.id for unit in units] == [manual_unit.id]
 
     def test_set_merge_unit_state_preserves_unrelated_task_fields(self, tmp_path: Path) -> None:
         """Dual-write merge projection should not rewrite unrelated task columns."""
@@ -6508,6 +6549,41 @@ def _drop_task_comments_column(db_path: Path, column_name: str) -> None:
     conn.close()
 
 
+def _drop_merge_units_column(db_path: Path, column_name: str) -> None:
+    """Rebuild merge_units without a specific column."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE merge_units RENAME TO merge_units_old")
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(merge_units_old)")]
+    kept_cols = [c for c in cols if c != column_name]
+    cols_str = ", ".join(kept_cols)
+    col_defs = []
+    pragma_rows = list(conn.execute("PRAGMA table_info(merge_units_old)"))
+    pk_cols = [(row[5], row[1]) for row in pragma_rows if row[1] != column_name and row[5]]
+    has_composite_pk = len(pk_cols) > 1
+    for row in pragma_rows:
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        parts = [name, typ]
+        if pk and not has_composite_pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    if has_composite_pk:
+        ordered_pk = ", ".join(name for _, name in sorted(pk_cols, key=lambda item: item[0]))
+        col_defs.append(f"PRIMARY KEY({ordered_pk})")
+    conn.execute(f"CREATE TABLE merge_units ({', '.join(col_defs)})")
+    conn.execute(f"INSERT INTO merge_units ({cols_str}) SELECT {cols_str} FROM merge_units_old")
+    conn.execute("DROP TABLE merge_units_old")
+    conn.commit()
+    conn.close()
+
+
 def _drop_run_steps_column(db_path: Path, column_name: str) -> None:
     """Rebuild run_steps without a specific column."""
     import sqlite3
@@ -6549,7 +6625,7 @@ class TestMigrationUtilityFunctions:
 
         assert status["current_version"] == 24
         assert status["target_version"] == SCHEMA_VERSION
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48]
+        assert status["pending_auto"] == list(range(28, SCHEMA_VERSION + 1))
         assert status["pending_manual"] == [25, 26, 27]
 
     def test_check_migration_status_after_v25_migration(self, tmp_path: Path) -> None:
@@ -6561,7 +6637,7 @@ class TestMigrationUtilityFunctions:
         status = check_migration_status(db_path)
 
         assert status["current_version"] == 27
-        assert status["pending_auto"] == [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48]
+        assert status["pending_auto"] == list(range(28, SCHEMA_VERSION + 1))
         assert status["pending_manual"] == []
 
         # Constructing SqliteTaskStore triggers remaining auto-migrations.
@@ -8332,38 +8408,122 @@ class TestSharedDbIsolationAndImportGating:
         assert history[0].review_scope is None
         assert any("tasks.review_scope" in warning for warning in query_store.startup_warnings())
 
-    def test_auto_migration_v47_to_v48_adds_model_is_explicit_with_default_zero(
+    def test_auto_migration_v47_to_v49_adds_merge_source_and_preserves_existing_rows(
         self, tmp_path: Path
     ) -> None:
         import sqlite3
 
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path, prefix="gza")
-        task = store.add("Task before v48 model explicitness", model="claude-sonnet-4-6")
+        task = store.add("Task before v48 merge source", model="claude-sonnet-4-6")
+        store.mark_completed(task, has_commits=True, branch="feature/pre-v48")
         assert task.id is not None
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
 
         _drop_tasks_column(db_path, "model_is_explicit")
+        _drop_merge_units_column(db_path, "merge_source")
         with sqlite3.connect(db_path) as conn:
             conn.execute("UPDATE schema_version SET version = 47")
             conn.commit()
 
         migrated_store = SqliteTaskStore(db_path, prefix="gza")
         reloaded = migrated_store.get(task.id)
+        reloaded_unit = migrated_store.resolve_merge_unit_for_task(task.id)
         assert reloaded is not None
+        assert reloaded_unit is not None
         assert reloaded.model == "claude-sonnet-4-6"
         assert reloaded.model_is_explicit is False
+        assert reloaded_unit.merge_source is None
 
         with sqlite3.connect(db_path) as conn:
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            task_columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            unit_columns = {row[1] for row in conn.execute("PRAGMA table_info(merge_units)").fetchall()}
             version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-            stored_value = conn.execute(
+            stored_model_explicit = conn.execute(
                 "SELECT model_is_explicit FROM tasks WHERE project_id = ? AND id = ?",
                 ("default", task.id),
             ).fetchone()[0]
+            stored_merge_source = conn.execute(
+                "SELECT merge_source FROM merge_units WHERE project_id = ? AND id = ?",
+                ("default", unit.id),
+            ).fetchone()[0]
 
-        assert "model_is_explicit" in columns
+        assert "model_is_explicit" in task_columns
+        assert "merge_source" in unit_columns
         assert version == SCHEMA_VERSION
-        assert stored_value == 0
+        assert stored_model_explicit == 0
+        assert stored_merge_source is None
+
+    def test_current_v48_db_missing_merge_source_repairs_and_supports_provenance_io(
+        self, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task on current v48 store", model="claude-sonnet-4-6")
+        store.mark_completed(task, has_commits=True, branch="feature/current-v48")
+        assert task.id is not None
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+
+        _drop_merge_units_column(db_path, "merge_source")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 48")
+            conn.commit()
+
+        repaired_store = SqliteTaskStore(db_path, prefix="gza")
+        repaired_store.set_merge_unit_state(unit.id, "merged", merge_source="manual")
+        merged_units = repaired_store.list_merged_units(source="manual")
+
+        with sqlite3.connect(db_path) as conn:
+            unit_columns = {row[1] for row in conn.execute("PRAGMA table_info(merge_units)").fetchall()}
+            index_names = {row[1] for row in conn.execute("PRAGMA index_list(merge_units)").fetchall()}
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            stored_merge_source = conn.execute(
+                "SELECT merge_source FROM merge_units WHERE project_id = ? AND id = ?",
+                ("default", unit.id),
+            ).fetchone()[0]
+
+        assert "merge_source" in unit_columns
+        assert "idx_merge_units_project_state_source" in index_names
+        assert version == SCHEMA_VERSION
+        assert stored_merge_source == "manual"
+        assert [merged.id for merged in merged_units] == [unit.id]
+        assert merged_units[0].merge_source == "manual"
+
+    def test_query_only_open_pre_v49_db_missing_merge_source_warns_and_degrades_source_filter(
+        self, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before v49 merge source", model="claude-sonnet-4-6")
+        store.mark_completed(task, has_commits=True, branch="feature/pre-v49-query-only")
+        assert task.id is not None
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged")
+
+        _drop_merge_units_column(db_path, "merge_source")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 48")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            merged_units = query_store.list_merged_units()
+            filtered_units = query_store.list_merged_units(source="manual")
+        finally:
+            db_path.chmod(0o644)
+
+        assert [merged.id for merged in merged_units] == [unit.id]
+        assert merged_units[0].merge_source is None
+        assert filtered_units == []
+        assert any("merge_units.merge_source" in warning for warning in query_store.startup_warnings())
 
     def test_query_only_open_pre_v43_db_missing_changed_diff_reads_with_null(
         self, tmp_path: Path

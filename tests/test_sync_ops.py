@@ -11,6 +11,7 @@ from gza.github import GitHub, GitHubError, PullRequestDetails
 from gza.sync_ops import (
     BranchCohort,
     build_branch_cohorts_for_task_ids,
+    build_branch_cohorts_for_tasks,
     build_default_branch_cohorts,
     build_task_branch_cohort,
     build_unmerged_branch_cohorts,
@@ -221,8 +222,49 @@ def test_reconcile_task_branch_merge_truth_marks_merged_and_preserves_unit_proje
     assert unit is not None
     assert unit.state == "merged"
     assert unit.merged_at == refreshed.merged_at
+    assert unit.merge_source == "external"
     assert unit.head_sha == "head-sync-merged"
     assert unit.base_sha == "base-sync-merged"
+
+
+def test_sync_branch_cohorts_records_github_pr_merge_source(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/pr-merged")
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.is_merged.side_effect = [False]
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+    git.ref_exists.return_value = False
+
+    gh = Mock(spec=GitHub)
+    gh.cached_pr_support.return_value = True
+    gh.is_available.return_value = True
+    gh.get_pr_details.return_value = None
+    gh.discover_pr_by_branch.return_value = PullRequestDetails(
+        url="https://example.invalid/pr/17",
+        number=17,
+        state="merged",
+        base_ref_name="main",
+    )
+
+    with patch("gza.sync_ops.GitHub", return_value=gh):
+        results, partial = sync_branch_cohorts(
+            store,
+            git,
+            build_branch_cohorts_for_tasks(store, [task]),
+            include_git=True,
+            include_pr=True,
+            dry_run=False,
+            fetch_remote=False,
+        )
+
+    assert partial is False
+    assert results[0].merge_source == "github_pr"
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    assert unit.merge_source == "github_pr"
 
 
 def test_reconcile_task_branch_merge_truth_persists_empty_for_zero_commit_merged_branch(tmp_path):

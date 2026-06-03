@@ -7,7 +7,15 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
-from .db import DB_UNSET, MergeUnit, SqliteTaskStore, Task, task_owns_merge_status
+from .db import (
+    DB_UNSET,
+    MERGE_SOURCE_EXTERNAL,
+    MERGE_SOURCE_GITHUB_PR,
+    MergeUnit,
+    SqliteTaskStore,
+    Task,
+    task_owns_merge_status,
+)
 from .git import Git, GitError, parse_diff_numstat, resolve_ref_if_possible
 from .github import GitHub, GitHubError, PullRequestDetails, is_github_repo_unsupported_error
 from .merge_state import classify_branch_merge_state_for_target, classify_proven_merged_state
@@ -72,6 +80,7 @@ class BranchSyncResult:
     task_ids: tuple[str, ...]
     skipped_reason: str | None = None
     merge_status: str | None = None
+    merge_source: str | None = None
     diff_files_changed: int | None = None
     diff_lines_added: int | None = None
     diff_lines_removed: int | None = None
@@ -399,6 +408,7 @@ def reconcile_branch_merge_truth(
             )
             if desired_merge_status == "merged":
                 _mark_merged(result)
+                result.merge_source = MERGE_SOURCE_EXTERNAL
         elif reconcile_ref is None:
             # No surviving ref: cannot inspect the branch to prove merge truth.
             # Fail-closed: preserve a previously-proven "empty" state rather than
@@ -456,6 +466,7 @@ def reconcile_branch_merge_truth(
 @dataclass
 class _BranchPersistenceUpdate:
     merge_status: str | None | object = _UNSET
+    merge_source: str | None | object = _UNSET
     diff_stats: tuple[int | None, int | None, int | None] | object = _UNSET
     pr_number: int | None | object = _UNSET
     pr_state: str | None | object = _UNSET
@@ -486,6 +497,8 @@ def _git_reconcile_update(result: BranchSyncResult) -> _BranchPersistenceUpdate:
     )
     if result.merge_status is not None:
         update.merge_status = result.merge_status
+    if result.merge_source is not None:
+        update.merge_source = result.merge_source
     if "refreshed diff stats" in result.actions:
         update.diff_stats = (
             result.diff_files_changed,
@@ -502,6 +515,8 @@ def _merge_persistence_update(
     """Overlay non-UNSET branch-state persistence fields."""
     if overlay.merge_status is not _UNSET:
         base.merge_status = overlay.merge_status
+    if overlay.merge_source is not _UNSET:
+        base.merge_source = overlay.merge_source
     if overlay.diff_stats is not _UNSET:
         base.diff_stats = overlay.diff_stats
     if overlay.pr_number is not _UNSET:
@@ -573,6 +588,7 @@ def _enrich_branch_pr_state(
         if details.state == "merged" and details.base_ref_name == default_branch:
             desired_merge_status = "merged"
             _mark_merged(result)
+            result.merge_source = MERGE_SOURCE_GITHUB_PR
         if (
             details.state == "open"
             and fetched_this_run
@@ -583,6 +599,7 @@ def _enrich_branch_pr_state(
         ):
             desired_merge_status = "merged"
             _mark_merged(result)
+            result.merge_source = MERGE_SOURCE_GITHUB_PR
             comment_body = (
                 f"Closing automatically via `gza sync`: the changes from task {representative.id} "
                 f"on branch `{branch}` are already present on `origin/{default_branch}`, "
@@ -614,6 +631,7 @@ def _enrich_branch_pr_state(
             if desired_merge_status != baseline_merge_status or cohort.has_non_owner_merge_status_rows
             else _UNSET
         ),
+        merge_source=result.merge_source if result.merge_source is not None else _UNSET,
         pr_number=(
             resolved_pr.details.number
             if resolved_pr.details is not None
@@ -647,6 +665,7 @@ def _persist_branch_updates(
             target_branch,
             merge_unit_id=cohort.merge_unit_id,
             merge_status=update.merge_status,
+            merge_source=update.merge_source,
             diff_stats=update.diff_stats,
             pr_number=update.pr_number,
             pr_state=update.pr_state,
@@ -1016,6 +1035,7 @@ def _persist_branch_state(
     *,
     merge_unit_id: str | None = None,
     merge_status: str | None | object = _UNSET,
+    merge_source: str | None | object = _UNSET,
     diff_stats: tuple[int | None, int | None, int | None] | object = _UNSET,
     pr_number: int | None | object = _UNSET,
     pr_state: str | None | object = _UNSET,
@@ -1053,6 +1073,7 @@ def _persist_branch_state(
             store.set_merge_unit_state(
                 unit.id,
                 unit.state if merge_status is _UNSET else cast("str | None", merge_status) or "stale",
+                merge_source=cast(Any, cast("str | None", merge_source) if merge_source is not _UNSET else DB_UNSET),
                 pr_number=cast(Any, cast("int | None", pr_number) if pr_number is not _UNSET else DB_UNSET),
                 pr_state=cast(Any, cast("str | None", pr_state) if pr_state is not _UNSET else DB_UNSET),
                 pr_last_synced_at=cast(
