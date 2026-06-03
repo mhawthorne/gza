@@ -1,10 +1,12 @@
 """Tests for branch-scoped sync operations."""
 
+import subprocess
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from gza.db import SqliteTaskStore
-from gza.git import GitError
+from gza.git import Git, GitError
 from gza.github import GitHub, GitHubError, PullRequestDetails
 from gza.sync_ops import (
     BranchCohort,
@@ -1716,3 +1718,168 @@ def test_sync_branch_cohorts_preserves_existing_merged_by_task_id_on_routine_per
     refreshed_unit = store.get_merge_unit(unit.id)
     assert refreshed_unit is not None
     assert refreshed_unit.merged_by_task_id == task.id
+
+
+# ---------------------------------------------------------------------------
+# F-A3: reconcile_branch_merge_truth empty emission and fail-closed paths
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_branch_merge_truth_emits_empty_for_zero_commit_unmerged_branch(tmp_path):
+    """Classifier detects zero unique commits on an inspectable branch and emits 'empty'."""
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/zero-commit")
+    cohort = BranchCohort(branch=task.branch, tasks=(task,))
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    # Disable origin/ ref preference so classifier uses the local branch ref.
+    git.ref_exists.return_value = False
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/zero-commit": "sha-abc123",
+        "main": "sha-def456",
+    }.get(ref)
+    git.count_commits_ahead.return_value = 0
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=False,
+    )
+
+    assert results[0].merge_status == "empty"
+    assert "marked merged" not in results[0].actions
+
+
+def test_reconcile_branch_merge_truth_preserves_empty_state_when_ref_becomes_unavailable(tmp_path):
+    """Previously-proven empty merge unit stays 'empty' even after the branch ref disappears."""
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/was-empty")
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "empty")
+
+    # Branch and remote ref are both gone.
+    git = Mock()
+    git.branch_exists.return_value = False
+    git.ref_exists.return_value = False
+
+    cohort = BranchCohort(
+        branch=task.branch,
+        tasks=(task,),
+        merge_unit_id=unit.id,
+        merge_unit_state="empty",
+    )
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=False,
+    )
+
+    assert results[0].merge_status == "empty"
+    assert results[0].warnings  # warning about unavailable ref should be present
+    assert "empty" in results[0].warnings[0]
+    git.is_merged.assert_not_called()
+
+
+def test_reconcile_task_branch_merge_truth_persists_preserved_empty_when_ref_unavailable(tmp_path):
+    """Preserved 'empty' state is written through persistence so the merge unit stays 'empty'."""
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/persisted-empty")
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "empty")
+
+    git = Mock()
+    git.branch_exists.return_value = False
+    git.ref_exists.return_value = False
+    git.rev_parse_if_exists.return_value = None
+
+    result = reconcile_task_branch_merge_truth(
+        store,
+        git,
+        task.id,
+        target_branch="main",
+        include_diff_stats=False,
+        persist=True,
+    )
+
+    assert result.merge_status == "empty"
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "empty"
+    assert refreshed_unit.merged_at is None
+
+
+def test_reconcile_branch_merge_truth_warns_and_fails_closed_when_commit_count_unavailable(tmp_path):
+    """When refs cannot be resolved to SHAs, emit a warning and preserve the existing state."""
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/no-sha")
+    cohort = BranchCohort(branch=task.branch, tasks=(task,))
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    # No origin/ ref and rev_parse always returns None → source_sha = None → "unknown".
+    git.ref_exists.return_value = False
+    git.rev_parse_if_exists.return_value = None
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=False,
+    )
+
+    # Fail-closed: preserves "unmerged" (from task.merge_status) rather than guessing "empty".
+    assert results[0].merge_status == "unmerged"
+    assert any("could not determine unique commit count" in w for w in results[0].warnings)
+
+
+def _init_git_repo(repo_dir: Path) -> None:
+    """Set up a minimal real git repo for functional tests."""
+    for cmd in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.name", "Test"],
+        ["git", "config", "user.email", "test@example.com"],
+    ):
+        subprocess.run(cmd, cwd=repo_dir, check=True, capture_output=True)
+    (repo_dir / "readme.txt").write_text("initial\n")
+    subprocess.run(["git", "add", "readme.txt"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo_dir, check=True, capture_output=True)
+
+
+def test_reconcile_branch_merge_truth_functional_never_diverged_branch_classifies_as_empty(tmp_path):
+    """Functional test: a branch created at main HEAD with no commits reconciles to 'empty'."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    _init_git_repo(repo_dir)
+
+    # Create a branch at the same commit as main — no commits ever added to it.
+    subprocess.run(
+        ["git", "checkout", "-b", "feature/never-diverged"],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+    )
+    # Switch back to main so HEAD is on main during reconciliation.
+    subprocess.run(["git", "checkout", "main"], cwd=repo_dir, check=True, capture_output=True)
+
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/never-diverged")
+    cohort = BranchCohort(branch=task.branch, tasks=(task,))
+
+    git = Git(repo_dir)
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=False,
+    )
+
+    # A branch that carries no unique work should classify as 'empty', not 'merged'.
+    assert results[0].merge_status == "empty"
+    assert "marked merged" not in results[0].actions

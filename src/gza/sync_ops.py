@@ -10,7 +10,7 @@ from typing import Any, Literal, cast
 from .db import DB_UNSET, MergeUnit, SqliteTaskStore, Task, task_owns_merge_status
 from .git import Git, GitError, parse_diff_numstat, resolve_ref_if_possible
 from .github import GitHub, GitHubError, PullRequestDetails, is_github_repo_unsupported_error
-from .merge_state import classify_proven_merged_state
+from .merge_state import classify_branch_merge_state_for_target, classify_proven_merged_state
 
 _UNSET = object()
 DEFAULT_SYNC_CACHE_SECONDS = 300
@@ -35,6 +35,7 @@ class BranchCohort:
     branch: str
     tasks: tuple[Task, ...]
     merge_unit_id: str | None = None
+    merge_unit_state: str | None = None
 
     @property
     def code_tasks(self) -> tuple[Task, ...]:
@@ -215,6 +216,7 @@ def build_branch_cohorts_for_task_ids(
                     branch=unit.source_branch,
                     tasks=tuple(store.list_tasks_for_merge_unit(unit.id)),
                     merge_unit_id=unit.id,
+                    merge_unit_state=unit.state,
                 )
             )
             continue
@@ -252,6 +254,7 @@ def build_branch_cohorts_for_tasks(
                     branch=unit.source_branch,
                     tasks=tuple(store.list_tasks_for_merge_unit(unit.id)),
                     merge_unit_id=unit.id,
+                    merge_unit_state=unit.state,
                 )
             )
             continue
@@ -397,11 +400,45 @@ def reconcile_branch_merge_truth(
             if desired_merge_status == "merged":
                 _mark_merged(result)
         elif reconcile_ref is None:
-            desired_merge_status = "unmerged"
-        else:
-            if not preserve_recorded_merged or desired_merge_status != "merged":
+            # No surviving ref: cannot inspect the branch to prove merge truth.
+            # Fail-closed: preserve a previously-proven "empty" state rather than
+            # overwriting it with "unmerged". Emit a warning so operators know
+            # reconciliation was incomplete.
+            if cohort.merge_unit_state == "empty":
+                desired_merge_status = "empty"
+                result.warnings.append(
+                    f"branch '{cohort.branch}': ref unavailable; preserved prior 'empty' state "
+                    "(branch previously confirmed to have no unique commits)"
+                )
+            else:
                 desired_merge_status = "unmerged"
-            if include_diff_stats:
+        else:
+            # Branch is inspectable but not proven merged against the target.
+            # Use the F-A1 classifier to detect zero-commit empty branches.
+            # Fail-closed to the existing state when commit count is unavailable.
+            try:
+                classification = classify_branch_merge_state_for_target(
+                    git=git,
+                    source_branch=reconcile_ref,
+                    target_branch=proof_target_ref,
+                    persisted_state=cohort.merge_unit_state,
+                    merged_proof=False,
+                )
+                classify_state = classification.state
+            except Exception:
+                classify_state = "unknown"
+            if classify_state == "empty":
+                desired_merge_status = "empty"
+            elif classify_state == "unknown":
+                result.warnings.append(
+                    f"branch '{cohort.branch}': could not determine unique commit count "
+                    f"against '{proof_target_ref}'; preserving existing merge state"
+                )
+                # desired_merge_status remains as initialized (from task.merge_status) — fail-closed
+            else:
+                if not preserve_recorded_merged or desired_merge_status != "merged":
+                    desired_merge_status = "unmerged"
+            if include_diff_stats and desired_merge_status != "empty":
                 try:
                     diff_output = git.get_diff_numstat(f"{target_branch}...{reconcile_ref}")
                 except GitError as exc:
