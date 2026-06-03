@@ -93,6 +93,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ),
     ConfigKeySpec("max_review_cycles", "int", 3, "Cap for review/improve loops in lifecycle automation."),
     ConfigKeySpec("max_noop_improve_cycles", "int", 2, "Cap for consecutive no-op improves before lifecycle automation stops for discussion."),
+    ConfigKeySpec("max_failed_closing_review_retries", "int", 3, "Max consecutive failed closing-review attempts before the lineage is parked as needs_attention; 0 escalates on first failure."),
     ConfigKeySpec("max_steps", "int", 50, "Global default step budget."),
     ConfigKeySpec("max_turns", "int", 50, "Deprecated global alias for `max_steps`."),
     ConfigKeySpec("main_checkout_isolate", "bool", False, "Stage watch-time merges in a detached integration checkout before advancing the real default branch on success."),

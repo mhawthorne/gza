@@ -1524,13 +1524,15 @@ def resolve_closing_review_action(
     reviews: list[DbTask],
     latest_completed_review: DbTask | None,
     latest_completed_code_change: DbTask | None,
+    max_failed_closing_review_retries: int = 3,
 ) -> dict[str, Any] | None:
     """Return the invariant-enforcing closing review action for a lineage, if any.
 
     The lifecycle invariant is satisfied once the newest completed code-change task
     is followed by at least one review task in any state. Pending reviews should be
-    run, in-progress reviews should be waited on, and completed/failed reviews
-    already satisfy the invariant for automatic lifecycle loops.
+    run, in-progress reviews should be waited on, and completed reviews already
+    satisfy the invariant. Failed closing reviews block merge: they are retried up
+    to max_failed_closing_review_retries times, then escalate to needs_attention.
     """
     if (
         task.task_type != "implement"
@@ -1575,6 +1577,32 @@ def resolve_closing_review_action(
                 ),
                 "review_task": active_follow_on_review,
             }
+        # A completed follow-on review satisfies the invariant (verdict acted on elsewhere).
+        # A failed closing review must NOT silently allow merge when code changed after an
+        # established review baseline (latest_completed_review is not None). Only apply
+        # bounded retry in that case: when latest_completed_review is None there may be
+        # a completed resume that is invisible via get_reviews_for_task (its based_on
+        # points to the original review, not the impl), so preserve the old behaviour
+        # to avoid false retries.
+        if latest_completed_review is not None:
+            failed_count = sum(1 for r in follow_on_reviews if r.status == "failed")
+            if failed_count > 0 and not any(r.status == "completed" for r in follow_on_reviews):
+                assert task.id is not None
+                if failed_count >= max_failed_closing_review_retries:
+                    return with_needs_attention(
+                        {
+                            "type": "needs_discussion",
+                            "description": (
+                                f"SKIP: closing review failed {failed_count} time(s), needs manual intervention"
+                            ),
+                        },
+                        reason="closing-review-failed-max-retries",
+                        subject_task_id=task.id,
+                    )
+                return {
+                    "type": "create_review",
+                    "description": "Create closing review (previous attempt failed)",
+                }
         return None
 
     if latest_completed_code_change.id == task.id:
@@ -1740,11 +1768,15 @@ def _resolve_review_state(
                 break
         recent_verify_timeout_only_reviews = tuple(verify_timeout_only_reviews)
 
+    max_failed_closing_review_retries = int(
+        getattr(config, "max_failed_closing_review_retries", 3)
+    )
     closing_review_action = resolve_closing_review_action(
         task=task,
         reviews=reviews,
         latest_completed_review=latest_completed_review,
         latest_completed_code_change=latest_completed_code_change,
+        max_failed_closing_review_retries=max_failed_closing_review_retries,
     )
 
     return (

@@ -72,6 +72,7 @@ DEFAULT_ADVANCE_MODE = "default"
 DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
 DEFAULT_MAX_NOOP_IMPROVE_CYCLES = 2
+DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES = 3
 DEFAULT_WATCH_BATCH = 5
 DEFAULT_WATCH_POLL = 300
 DEFAULT_WATCH_NO_ACTIVITY_TIMEOUT = 60
@@ -107,7 +108,8 @@ VALID_CONFIG_FIELDS = {
     "reasoning_effort", "defaults", "task_types", "providers", "branch_strategy", "chat_text_display_length",
     "verify_command", "inner_verify_command",
     "advance_create_reviews", "require_review_before_merge", "pr_integration", "advance_mode", "max_resume_attempts",
-    "max_review_cycles", "max_noop_improve_cycles", "iterate_max_iterations", "watch", "interactive_worktree_dir",
+    "max_review_cycles", "max_noop_improve_cycles", "max_failed_closing_review_retries",
+    "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
     "review_diff_medium_threshold", "review_context_file_limit", "review_verify_timeout_seconds",
     "code_task_diff_timeout_medium_threshold", "code_task_diff_timeout_large_threshold",
@@ -184,6 +186,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "max_resume_attempts": None,
     "max_review_cycles": None,
     "max_noop_improve_cycles": None,
+    "max_failed_closing_review_retries": None,
     "watch": {
         "batch": None,
         "poll": None,
@@ -296,6 +299,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "max_resume_attempts": None,
     "max_review_cycles": None,
     "max_noop_improve_cycles": None,
+    "max_failed_closing_review_retries": None,
     "interactive_worktree_dir": None,
     "merge_squash_threshold": None,
     "main_checkout_isolate": None,
@@ -890,6 +894,7 @@ class Config:
     max_resume_attempts: int = DEFAULT_MAX_RESUME_ATTEMPTS
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
     max_noop_improve_cycles: int = DEFAULT_MAX_NOOP_IMPROVE_CYCLES
+    max_failed_closing_review_retries: int = DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
     interactive_worktree_dir: str = DEFAULT_INTERACTIVE_WORKTREE_DIR
     merge_squash_threshold: int = DEFAULT_MERGE_SQUASH_THRESHOLD
     main_checkout_isolate: bool = DEFAULT_MAIN_CHECKOUT_ISOLATE
@@ -1781,6 +1786,11 @@ class Config:
         )
         if max_noop_improve_cycles <= 0:
             raise ConfigError("'max_noop_improve_cycles' must be positive")
+        max_failed_closing_review_retries = _load_strict_int_field(
+            data, "max_failed_closing_review_retries", DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
+        )
+        if max_failed_closing_review_retries < 0:
+            raise ConfigError("'max_failed_closing_review_retries' must be non-negative")
 
         iterate_max_iterations = _load_strict_int_field(
             data, "iterate_max_iterations", DEFAULT_ITERATE_MAX_ITERATIONS
@@ -2095,6 +2105,7 @@ class Config:
             max_resume_attempts=max_resume_attempts,
             max_review_cycles=max_review_cycles,
             max_noop_improve_cycles=max_noop_improve_cycles,
+            max_failed_closing_review_retries=max_failed_closing_review_retries,
             watch=watch_config,
             iterate_max_iterations=iterate_max_iterations,
             interactive_worktree_dir=interactive_worktree_dir,
@@ -2522,6 +2533,11 @@ class Config:
                 errors.append("'max_noop_improve_cycles' must be an integer")
             elif data["max_noop_improve_cycles"] <= 0:
                 errors.append("'max_noop_improve_cycles' must be positive")
+        if "max_failed_closing_review_retries" in data:
+            if not _is_strict_int(data["max_failed_closing_review_retries"]):
+                errors.append("'max_failed_closing_review_retries' must be an integer")
+            elif data["max_failed_closing_review_retries"] < 0:
+                errors.append("'max_failed_closing_review_retries' must be non-negative")
         if "iterate_max_iterations" in data:
             if not _is_strict_int(data["iterate_max_iterations"]):
                 errors.append("'iterate_max_iterations' must be an integer")

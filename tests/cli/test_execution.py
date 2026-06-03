@@ -13481,6 +13481,98 @@ class TestIterateCommand:
 
         assert action["type"] == "needs_rebase"
 
+    def test_advance_engine_config_adapter_carries_max_failed_closing_review_retries(
+        self, tmp_path: Path
+    ) -> None:
+        """_AdvanceEngineConfigAdapter must expose max_failed_closing_review_retries alongside other lifecycle knobs."""
+        from gza.cli.execution import _AdvanceEngineConfigAdapter
+        from gza.config import DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
+
+        adapter = _AdvanceEngineConfigAdapter(
+            project_dir=tmp_path,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+        )
+        assert hasattr(adapter, "max_failed_closing_review_retries")
+        assert adapter.max_failed_closing_review_retries == DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
+
+        tuned = _AdvanceEngineConfigAdapter(
+            project_dir=tmp_path,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            max_failed_closing_review_retries=0,
+        )
+        assert tuned.max_failed_closing_review_retries == 0
+
+    def test_iterate_engine_honors_tuned_max_failed_closing_review_retries(
+        self, tmp_path: Path
+    ) -> None:
+        """max_failed_closing_review_retries=0 on the iterate adapter must escalate to needs_attention on the first failed closing review."""
+        from gza.cli.advance_engine import determine_next_action
+        from gza.cli.execution import _AdvanceEngineConfigAdapter
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        impl.merge_status = "unmerged"
+        impl.has_commits = True
+        store.update(impl)
+
+        stale_review = store.add("Old review", task_type="review", depends_on=impl.id)
+        stale_review.status = "completed"
+        stale_review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+        store.update(stale_review)
+
+        improve = store.add(
+            "Improve",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=stale_review.id,
+            same_branch=True,
+        )
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
+        store.update(improve)
+
+        impl.review_cleared_at = datetime(2026, 1, 3, tzinfo=UTC)
+        store.update(impl)
+
+        failed_closing = store.add("Closing review", task_type="review", depends_on=impl.id)
+        failed_closing.status = "failed"
+        failed_closing.failure_reason = "UNKNOWN"
+        failed_closing.created_at = datetime(2026, 1, 4, tzinfo=UTC)
+        failed_closing.completed_at = datetime(2026, 1, 4, 1, tzinfo=UTC)
+        store.update(failed_closing)
+
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        engine_config = _AdvanceEngineConfigAdapter(
+            project_dir=tmp_path,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            max_failed_closing_review_retries=0,
+        )
+
+        action = determine_next_action(
+            engine_config,
+            store,
+            mock_git,
+            impl,
+            "main",
+            max_resume_attempts=1,
+        )
+
+        assert action["type"] == "needs_discussion"
+        assert action.get("needs_attention_reason") == "closing-review-failed-max-retries"
+
     def test_iterate_errors_when_git_init_fails(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch

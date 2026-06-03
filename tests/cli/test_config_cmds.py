@@ -1198,6 +1198,37 @@ class TestLocalConfigOverrides:
         with pytest.raises(ConfigError, match=re.escape(f"'{key}' must be a boolean (true/false)")):
             Config.load(tmp_path)
 
+    def test_user_config_allows_max_failed_closing_review_retries(self, tmp_path: Path) -> None:
+        """max_failed_closing_review_retries must be accepted in user-level config like its sibling lifecycle knobs."""
+        from gza.config import Config
+
+        home_dir = Path(os.environ["HOME"])
+        write_user_config(home_dir, "max_failed_closing_review_retries: 5\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+
+        cfg = Config.load(tmp_path)
+
+        assert cfg.max_failed_closing_review_retries == 5
+        assert cfg.source_map["max_failed_closing_review_retries"] == "user"
+
+    def test_user_config_lifecycle_bound_knobs_schema_parity(self, tmp_path: Path) -> None:
+        """All lifecycle iteration-bound knobs must appear in both USER_CONFIG_ALLOWED_SCHEMA and LOCAL_OVERRIDE_ALLOWED_SCHEMA."""
+        from gza.config import LOCAL_OVERRIDE_ALLOWED_SCHEMA, USER_CONFIG_ALLOWED_SCHEMA
+
+        lifecycle_knobs = [
+            "max_resume_attempts",
+            "max_review_cycles",
+            "max_noop_improve_cycles",
+            "max_failed_closing_review_retries",
+        ]
+        for knob in lifecycle_knobs:
+            assert knob in USER_CONFIG_ALLOWED_SCHEMA, (
+                f"'{knob}' missing from USER_CONFIG_ALLOWED_SCHEMA — operators cannot set it in ~/.gza/config.yaml"
+            )
+            assert knob in LOCAL_OVERRIDE_ALLOWED_SCHEMA, (
+                f"'{knob}' missing from LOCAL_OVERRIDE_ALLOWED_SCHEMA"
+            )
+
     def test_user_config_removed_review_key_has_rename_hint(self, tmp_path: Path) -> None:
         """User config should surface the rename hint for the removed review gate key."""
         from gza.config import Config, ConfigError

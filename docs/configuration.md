@@ -60,6 +60,7 @@ Gza reads configuration from three YAML layers:
 | `pr_integration` | Boolean | `true` | Enable GitHub PR discovery/comment/create flows; set `false` to skip all `gh`-backed PR operations for the project |
 | `recommend_rebase_behind_commits` | Integer | `1` | Deprecated compatibility key; accepted but ignored by current lifecycle planning |
 | `max_noop_improve_cycles` | Integer | `2` | Cap for consecutive no-op improves before lifecycle automation stops for discussion |
+| `max_failed_closing_review_retries` | Integer | `3` | Max consecutive failed closing-review attempts before a lineage is parked as `needs_attention`; set `0` to escalate immediately on first failure |
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
 | `main_checkout_isolate` | Boolean | `false` | When true, `gza watch` stages merges in a dedicated detached checkout, then fast-forwards the real default branch only after the isolated merge lands cleanly |
 | `watch` | Dict | `{batch: 5, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, restart_failed_batch: 1}` | Defaults for `gza watch` loop behavior |
@@ -887,6 +888,7 @@ log_dir
 max_resume_attempts
 max_review_cycles
 max_noop_improve_cycles
+max_failed_closing_review_retries
 max_steps
 max_turns
 main_checkout_isolate

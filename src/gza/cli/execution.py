@@ -18,7 +18,7 @@ from ..advance_engine import (
     _resolve_current_merge_source,
     count_completed_review_cycles,
 )
-from ..config import DEFAULT_MAX_RESUME_ATTEMPTS, Config
+from ..config import DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES, DEFAULT_MAX_RESUME_ATTEMPTS, Config
 from ..console import format_duration
 from ..db import (
     InvalidTaskIdError,
@@ -2497,6 +2497,7 @@ class _AdvanceEngineConfigAdapter:
     max_review_cycles: int
     max_resume_attempts: int
     max_noop_improve_cycles: int = 2
+    max_failed_closing_review_retries: int = DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
 
 
 def _iterate_action_description(action: dict[str, Any]) -> str:
@@ -2717,6 +2718,10 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
         max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 2),
         max_resume_attempts=effective_max_resume_attempts,
+        max_failed_closing_review_retries=_int_config(
+            getattr(config, "max_failed_closing_review_retries", None),
+            DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES,
+        ),
     )
 
     def _prepare_iterate_background_preflight_context(
@@ -3561,6 +3566,10 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
         max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 2),
         max_resume_attempts=max_resume_attempts,
+        max_failed_closing_review_retries=_int_config(
+            getattr(config, "max_failed_closing_review_retries", None),
+            DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES,
+        ),
     )
     if prepared_iteration_start is not None:
         initial_action = {"type": prepared_iteration_start.action_type or "iteration"}
@@ -3732,6 +3741,10 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
         max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 2),
         max_resume_attempts=max_resume_attempts,
+        max_failed_closing_review_retries=_int_config(
+            getattr(config, "max_failed_closing_review_retries", None),
+            DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES,
+        ),
     )
 
     def _current_impl_task() -> DbTask:

@@ -4940,7 +4940,9 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         ("pending", "run_review"),
         ("in_progress", "wait_review"),
         ("completed", None),
-        ("failed", None),
+        # A failed closing review must NOT satisfy the invariant — it blocks merge
+        # and routes to recovery (create_review retry) rather than returning None.
+        ("failed", "create_review"),
     ],
 )
 def test_closing_review_invariant_does_not_create_duplicate_review(
@@ -5000,7 +5002,235 @@ def test_closing_review_invariant_does_not_create_duplicate_review(
     else:
         assert action is not None
         assert action["type"] == expected_action_type
-        assert action.get("review_task").id == closing_review.id
+        # run_review / wait_review carry a review_task reference; create_review does not
+        if expected_action_type in {"run_review", "wait_review"}:
+            assert action.get("review_task").id == closing_review.id
+
+
+def test_failed_closing_review_blocks_merge_and_routes_to_retry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Regression: review_cleared=True + failed closing review must NOT produce a merge action.
+
+    Reproduces the gza-4073 shape: stale CHANGES_REQUESTED verdict + review_cleared_at
+    set by a completed improve + a FAILED follow-on closing review.  Before the fix,
+    closing_review_action returned None (invariant 'satisfied') and has_valid_review_for_merge
+    returned True via the review_cleared branch, causing auto-merge.
+    """
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/failed-closing-review-no-merge",
+        when=datetime(2026, 5, 1, 9, 0, tzinfo=UTC),
+    )
+
+    # Stale CHANGES_REQUESTED review (before the improve)
+    stale_review = _add_completed_review(store, impl, when=datetime(2026, 5, 1, 10, 0, tzinfo=UTC))
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    # Improve clears the review state
+    improve = _add_completed_improve_for_review(
+        store, impl, stale_review, when=datetime(2026, 5, 1, 11, 0, tzinfo=UTC)
+    )
+    impl.review_cleared_at = improve.completed_at
+    store.update(impl)
+
+    # Closing review fails (e.g., 429 Too Many Requests)
+    closing_review = store.add("Closing review", task_type="review", depends_on=impl.id)
+    assert closing_review.id is not None
+    closing_review.status = "failed"
+    closing_review.failure_reason = "429 Too Many Requests"
+    closing_review.created_at = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    closing_review.completed_at = datetime(2026, 5, 1, 12, 30, tzinfo=UTC)
+    store.update(closing_review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    # Must NOT merge — must retry the closing review
+    assert action["type"] != "merge", f"Expected retry action but got merge: {action}"
+    assert action["type"] == "create_review", action
+    assert "failed" in action["description"].lower()
+
+
+def test_repeated_failed_closing_reviews_escalate_to_needs_attention(
+    tmp_path: Path,
+) -> None:
+    """After max_failed_closing_review_retries consecutive failures, escalate to needs_attention."""
+    store = _make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    impl.branch = "feat/retry-exhausted"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    stale_review = store.add("Old review", task_type="review", depends_on=impl.id)
+    assert stale_review.id is not None
+    stale_review.status = "completed"
+    stale_review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    store.update(stale_review)
+
+    improve = store.add(
+        "Improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=stale_review.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(improve)
+
+    impl.review_cleared_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(impl)
+
+    max_retries = 2
+    for i in range(max_retries):
+        failed = store.add(f"Closing review attempt {i + 1}", task_type="review", depends_on=impl.id)
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "UNKNOWN"
+        failed.created_at = datetime(2026, 1, 4 + i, tzinfo=UTC)
+        failed.completed_at = datetime(2026, 1, 4 + i, 1, tzinfo=UTC)
+        store.update(failed)
+
+    action = resolve_closing_review_action(
+        task=impl,
+        reviews=store.get_reviews_for_task(impl.id),
+        latest_completed_review=stale_review,
+        latest_completed_code_change=improve,
+        max_failed_closing_review_retries=max_retries,
+    )
+
+    assert action is not None
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "closing-review-failed-max-retries"
+    assert action["subject_task_id"] == impl.id
+    assert str(max_retries) in action["description"]
+
+
+def test_single_failed_closing_review_below_retry_bound_retries(
+    tmp_path: Path,
+) -> None:
+    """A single failed closing review below the retry bound produces a create_review retry."""
+    store = _make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    impl.branch = "feat/single-failure-retry"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    stale_review = store.add("Old review", task_type="review", depends_on=impl.id)
+    assert stale_review.id is not None
+    stale_review.status = "completed"
+    stale_review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    store.update(stale_review)
+
+    improve = store.add(
+        "Improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=stale_review.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(improve)
+
+    impl.review_cleared_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(impl)
+
+    failed_closing = store.add("Closing review", task_type="review", depends_on=impl.id)
+    assert failed_closing.id is not None
+    failed_closing.status = "failed"
+    failed_closing.failure_reason = "429"
+    failed_closing.created_at = datetime(2026, 1, 4, tzinfo=UTC)
+    failed_closing.completed_at = datetime(2026, 1, 4, 1, tzinfo=UTC)
+    store.update(failed_closing)
+
+    action = resolve_closing_review_action(
+        task=impl,
+        reviews=store.get_reviews_for_task(impl.id),
+        latest_completed_review=stale_review,
+        latest_completed_code_change=improve,
+        max_failed_closing_review_retries=3,
+    )
+
+    assert action is not None
+    assert action["type"] == "create_review"
+    assert "failed" in action["description"].lower()
+    assert "needs_attention_reason" not in action
+
+
+def test_completed_closing_review_still_satisfies_invariant_unchanged(
+    tmp_path: Path,
+) -> None:
+    """A completed (non-failed) closing review must still satisfy the invariant (returns None)."""
+    store = _make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    impl.branch = "feat/completed-closing-review"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    stale_review = store.add("Old review", task_type="review", depends_on=impl.id)
+    assert stale_review.id is not None
+    stale_review.status = "completed"
+    stale_review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    store.update(stale_review)
+
+    improve = store.add(
+        "Improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=stale_review.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(improve)
+
+    completed_closing = store.add("Closing review", task_type="review", depends_on=impl.id)
+    assert completed_closing.id is not None
+    completed_closing.status = "completed"
+    completed_closing.completed_at = datetime(2026, 1, 4, tzinfo=UTC)
+    store.update(completed_closing)
+
+    action = resolve_closing_review_action(
+        task=impl,
+        reviews=store.get_reviews_for_task(impl.id),
+        latest_completed_review=stale_review,
+        latest_completed_code_change=improve,
+    )
+
+    assert action is None
 
 
 def test_completed_improve_with_review_requirement_disabled_merges_without_closing_review(
