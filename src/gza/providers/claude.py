@@ -40,6 +40,8 @@ from .log_rendering import (
     model_parity_lines,
     normalize_model_name,
     pretty_json_lines,
+    reasoning_line,
+    reasoning_preview,
     summarize_tool_detail,
     tool_one_liner,
     truncated_json_lines,
@@ -76,6 +78,11 @@ CLAUDE_LIVE_EVENT_HANDLERS: dict[str, str] = {
 CLAUDE_LIVE_KNOWN_EVENT_TYPES = frozenset(CLAUDE_LIVE_EVENT_HANDLERS)
 CLAUDE_ASSISTANT_BLOCK_REGISTRY: dict[str, dict[str, object]] = {
     "text": {"render": "_render_assistant_text_block", "live": "_handle_live_assistant_text_block"},
+    "thinking": {"render": "_render_assistant_thinking_block", "live": "_handle_live_assistant_thinking_block"},
+    "redacted_thinking": {
+        "render": "_render_assistant_redacted_thinking_block",
+        "live": "_handle_live_assistant_redacted_thinking_block",
+    },
     "tool_use": {"render": "_render_assistant_tool_use_block", "live": "_handle_live_assistant_tool_use_block"},
     "tool_result": {"render": False, "live": "_handle_live_assistant_tool_result_block"},
     "tool_retry": {"render": False, "live": "_handle_live_assistant_tool_retry_block"},
@@ -429,6 +436,26 @@ class ClaudeLogRenderer:
         if tv:
             return [], [line for line in text.splitlines() if line.strip()][-6:], True, False
         return [rich_escape(text.strip())], [], True, False
+
+    def _render_assistant_thinking_block(self, item: dict[str, Any], *, tv: bool) -> tuple[list[str], list[str], bool, bool]:
+        line = reasoning_line(item.get("thinking"), tv=tv)
+        if line is None:
+            return [], [], False, False
+        return ([line], [], True, False) if not tv else ([], [line], True, False)
+
+    def _render_assistant_redacted_thinking_block(
+        self,
+        item: dict[str, Any],
+        *,
+        tv: bool,
+    ) -> tuple[list[str], list[str], bool, bool]:
+        if item.get("data") in (None, "", {}, []):
+            self.suppressed_count += 1
+            return [], [], False, False
+        line = "thinking: [redacted]"
+        if tv:
+            return [], [line], True, False
+        return [f"[dim]{rich_escape(line)}[/dim]"], [], True, False
 
     def _render_assistant_tool_use_block(self, item: dict[str, Any], *, tv: bool) -> tuple[list[str], list[str], bool, bool]:
         name = str(item.get("name", "unknown"))
@@ -1862,6 +1889,57 @@ class ClaudeProvider(Provider):
         else:
             first_line = text.split("\n")[0]
             formatter.print_agent_message(truncate_text(first_line, chat_text_display_length))
+        return current_step
+
+    def _handle_live_assistant_thinking_block(
+        self,
+        *,
+        content: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        current_step: dict[str, Any],
+        chat_text_display_length: int,
+    ) -> dict[str, Any]:
+        _ = chat_text_display_length
+        preview = reasoning_preview(content.get("thinking"))
+        if preview is None:
+            return current_step
+        legacy_turn_id = current_step.get("legacy_turn_id")
+        current_step["substeps"].append(
+            {
+                "type": "reasoning",
+                "source": "provider",
+                "payload": {"text": preview},
+                "legacy_turn_id": legacy_turn_id,
+                "legacy_event_id": _allocate_claude_legacy_event_id(data, legacy_turn_id),
+            }
+        )
+        formatter.print_reasoning(f"thinking: {preview}")
+        return current_step
+
+    def _handle_live_assistant_redacted_thinking_block(
+        self,
+        *,
+        content: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        current_step: dict[str, Any],
+        chat_text_display_length: int,
+    ) -> dict[str, Any]:
+        _ = chat_text_display_length
+        if content.get("data") in (None, "", {}, []):
+            return current_step
+        legacy_turn_id = current_step.get("legacy_turn_id")
+        current_step["substeps"].append(
+            {
+                "type": "reasoning",
+                "source": "provider",
+                "payload": {"redacted": True},
+                "legacy_turn_id": legacy_turn_id,
+                "legacy_event_id": _allocate_claude_legacy_event_id(data, legacy_turn_id),
+            }
+        )
+        formatter.print_reasoning("thinking: [redacted]")
         return current_step
 
     def _handle_live_user_block(

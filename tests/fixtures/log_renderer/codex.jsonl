@@ -8,6 +8,7 @@
 {"type":"item.completed","item":{"id":"item_1d","type":"todo_list","items":[{"text":"Inspect logs","completed":false},{"text":"Add regression tests","completed":true}]}}
 {"type":"item.completed","item":{"id":"item_1e","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"thread_123","receiver_thread_ids":["thread_worker_1","thread_worker_2"],"prompt":"Investigate Codex log item handling and summarize the gaps for the main thread without leaking the entire worker prompt body."}}
 {"type":"item.completed","item":{"id":"item_1f","type":"mcp_tool_call","server":"filesystem","tool":"read_file","arguments":{"path":"src/gza/providers/codex.py","offset":0,"limit":50},"result":{"ok":true,"bytes":1024},"error":null,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_reasoning_visible","type":"reasoning","text":"**Preparing task ...** reviewing provider output handling before the next command."}}
 {"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"I found the root cause."}}
 {"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":8,"cached_input_tokens":4}}
 {"type":"item.completed","item":{"id":"item_3","type":"reasoning"}}

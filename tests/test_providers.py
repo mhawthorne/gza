@@ -1943,6 +1943,66 @@ class TestClaudeStepMapping:
         assert result.num_steps_computed == 1
         assert result.num_steps_reported == 1
 
+    def test_claude_thinking_blocks_render_and_persist_without_signature(self, tmp_path):
+        """Claude thinking blocks should become reasoning substeps and never expose signatures."""
+        import json
+
+        from gza.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+        mock_formatter = MagicMock()
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_1",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "Checking the next failure mode before I run the command.",
+                            "signature": "secret-signature-blob",
+                        },
+                        {
+                            "type": "redacted_thinking",
+                            "data": "encrypted-thinking-payload",
+                        },
+                        {"type": "text", "text": "done"},
+                    ],
+                },
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.claude.StreamOutputFormatter", return_value=mock_formatter):
+            with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+                mock_process = MagicMock()
+                mock_process.stdout = iter(json_lines)
+                mock_process.wait.return_value = None
+                mock_process.returncode = 0
+                mock_popen.return_value = mock_process
+
+                result = provider._run_with_output_parsing(
+                    cmd=["claude", "-p", "test"],
+                    log_file=log_file,
+                    timeout_minutes=30,
+                )
+
+        steps = result._accumulated_data["run_step_events"]
+        assert len(steps) == 1
+        assert steps[0]["message_text"] == "done"
+        assert [substep["type"] for substep in steps[0]["substeps"]] == ["reasoning", "reasoning"]
+        assert steps[0]["substeps"][0]["payload"] == {
+            "text": "Checking the next failure mode before I run the command."
+        }
+        assert steps[0]["substeps"][1]["payload"] == {"redacted": True}
+        mock_formatter.print_reasoning.assert_any_call(
+            "thinking: Checking the next failure mode before I run the command."
+        )
+        mock_formatter.print_reasoning.assert_any_call("thinking: [redacted]")
+        printed = " ".join(str(call) for call in mock_formatter.mock_calls)
+        assert "secret-signature-blob" not in printed
+
     def test_shows_claude_rate_limit_events_only_when_constrained(self, tmp_path, capsys):
         """Routine Claude rate-limit telemetry should stay silent, constrained states should surface."""
         import json
@@ -4561,6 +4621,55 @@ class TestCodexOutputParsing:
         mock_formatter.print_tool_event.assert_called()
         mock_formatter.print_agent_message.assert_called()
         mock_formatter.print_error.assert_called()
+
+    def test_codex_reasoning_item_renders_and_persists_as_substep(self, tmp_path):
+        """Codex reasoning items should become reasoning substeps instead of unknowns."""
+        import json
+
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+        mock_formatter = MagicMock()
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "item.completed",
+                "item": {
+                    "id": "reasoning_1",
+                    "type": "reasoning",
+                    "text": "**Preparing task ...** inspect the provider output before running the command.",
+                },
+            }) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}) + "\n",
+        ]
+
+        with patch("gza.providers.codex.StreamOutputFormatter", return_value=mock_formatter):
+            with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+                mock_process = MagicMock()
+                mock_process.stdout = iter(json_lines)
+                mock_process.wait.return_value = None
+                mock_process.returncode = 0
+                mock_popen.return_value = mock_process
+
+                result = provider._run_with_output_parsing(
+                    cmd=["codex", "exec", "--json", "-"],
+                    log_file=log_file,
+                    timeout_minutes=30,
+                )
+
+        steps = result._accumulated_data["run_step_events"]
+        assert len(steps) == 2
+        assert steps[0]["summary"] == "Pre-message tool activity"
+        assert [substep["type"] for substep in steps[0]["substeps"]] == ["reasoning"]
+        assert steps[0]["substeps"][0]["payload"] == {
+            "text": "**Preparing task ...** inspect the provider output before running the command."
+        }
+        assert steps[1]["message_text"] == "done"
+        mock_formatter.print_reasoning.assert_called_once_with(
+            "thinking: **Preparing task ...** inspect the provider output before running the command."
+        )
 
     def test_reports_unknown_completed_event_with_usage(self, tmp_path, capsys):
         """Unknown completion events with usage should be surfaced loudly."""

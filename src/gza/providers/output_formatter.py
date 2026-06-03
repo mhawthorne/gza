@@ -95,6 +95,10 @@ class StreamOutputFormatter:
         """Print a colorized assistant message line."""
         self.console.print(f"{prefix}{rich_escape(text)}", style=self.styles.assistant_text)
 
+    def print_reasoning(self, text: str, *, prefix: str = "") -> None:
+        """Print a dim reasoning/thinking line."""
+        self.console.print(f"{prefix}{rich_escape(text)}", style="dim")
+
     def print_error(self, message: str, *, prefix: str = "") -> None:
         """Print a colorized error line."""
         self.console.print(f"{prefix}{rich_escape(message)}", style=self.styles.error)

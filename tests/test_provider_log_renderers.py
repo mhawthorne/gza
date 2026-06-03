@@ -29,13 +29,16 @@ def test_claude_renderer_renders_known_events_and_counts_suppression() -> None:
         starts += int(rendered.starts_step)
 
     joined = "\n".join(lines)
-    assert starts == 1
-    assert renderer.stats.step_count == 1
+    assert starts == 2
+    assert renderer.stats.step_count == 2
     assert renderer.stats.input_tokens == 15
     assert renderer.stats.output_tokens == 5
     assert renderer.suppressed_count == 3
     assert "Session initialized" in joined
     assert "Investigating failure." in joined
+    assert "thinking: Checking the failing assertion before running the test." in joined
+    assert "thinking: \\[redacted]" in joined
+    assert "signature" not in joined
     assert "FAILED tests/test_cli.py::test_case - AssertionError" in joined
     assert "Rate limit (five_hour); resets at 2026-06-03 11:00:00 UTC" in joined
 
@@ -56,6 +59,7 @@ def test_codex_renderer_accumulates_tv_tokens_from_usage_fixture() -> None:
     assert "● Add regression tests" in joined
     assert "-> spawn_agent thread_worker_1 +1 prompt=Investigate Codex log item handling" in joined
     assert "-> mcp:filesystem/read_file {\"limit\": 50, \"offset\": 0, \"path\": \"src/gza/providers/codex.py\"}" in joined
+    assert "thinking: **Preparing task ...** reviewing provider output handling before the next command." in joined
     assert "I found the root cause." in joined
     assert "Selected model is at capacity. Try again shortly." in joined
     assert '"receiver_thread_ids"' not in joined
@@ -517,6 +521,59 @@ def test_claude_renderer_counts_usage_for_suppressed_empty_assistant_on_log_and_
     assert tv_renderer.stats.input_tokens == 15
     assert tv_renderer.stats.output_tokens == 5
     assert tv_renderer.suppressed_count == 1
+
+
+def test_claude_renderer_handles_thinking_blocks_without_unknown_fallback() -> None:
+    renderer = get_log_renderer("claude")
+    entry = {
+        "type": "assistant",
+        "message": {
+            "id": "msg_thinking",
+            "content": [
+                {"type": "thinking", "thinking": "Planning the next check.", "signature": "hidden"},
+                {"type": "redacted_thinking", "data": "ciphertext"},
+            ],
+        },
+    }
+
+    log_rendered = renderer.handle_log(entry, live=False)
+    tv_rendered = renderer.handle_tv(entry)
+
+    assert log_rendered.starts_step is True
+    assert log_rendered.log_lines == [
+        "[dim]thinking: Planning the next check.[/dim]",
+        "[dim]thinking: \\[redacted][/dim]",
+    ]
+    assert tv_rendered.tv_lines == [
+        "thinking: Planning the next check.",
+        "thinking: [redacted]",
+    ]
+    assert all("event:assistant" not in line for line in tv_rendered.tv_lines)
+    assert all("signature" not in line for line in log_rendered.log_lines)
+
+
+def test_codex_renderer_handles_reasoning_without_unknown_fallback() -> None:
+    renderer = get_log_renderer("codex")
+    entry = {
+        "type": "item.completed",
+        "item": {
+            "id": "reasoning_1",
+            "type": "reasoning",
+            "text": "**Preparing task ...** inspect the provider logs before the next command.",
+        },
+    }
+
+    log_rendered = renderer.handle_log(entry, live=False)
+    tv_rendered = renderer.handle_tv(entry)
+
+    assert log_rendered.log_lines == [
+        "[dim]thinking: **Preparing task ...** inspect the provider logs before the next command.[/dim]"
+    ]
+    assert tv_rendered.tv_lines == [
+        "thinking: **Preparing task ...** inspect the provider logs before the next command."
+    ]
+    assert all("[event:item.completed]" not in line for line in log_rendered.log_lines)
+    assert all(line != "{" for line in tv_rendered.tv_lines)
 
 
 def test_gza_log_prints_suppressed_footer_and_verbose_unknown_payload(tmp_path: Path) -> None:

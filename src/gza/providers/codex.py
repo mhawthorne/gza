@@ -35,6 +35,8 @@ from .log_rendering import (
     model_parity_lines,
     normalize_model_name,
     pretty_json_lines,
+    reasoning_line,
+    reasoning_preview,
     strip_shell_wrapper,
     text_to_lines,
     truncated_json_lines,
@@ -575,12 +577,12 @@ class CodexLogRenderer:
         return RenderedLines(tv_lines=[line] if tv else [], log_lines=[line] if not tv else [])
 
     def _render_item_reasoning(self, entry: dict[str, Any], *, item: dict[str, Any], tv: bool) -> RenderedLines:
-        _ = entry, tv
-        has_signal = any(item.get(key) for key in ("summary", "text", "error"))
-        if not has_signal:
+        _ = entry
+        line = reasoning_line(item.get("text"), item.get("summary"), tv=tv)
+        if line is None:
             self.suppressed_count += 1
             return RenderedLines()
-        return self._render_unknown(entry, tv=tv)
+        return RenderedLines(tv_lines=[line] if tv else [], log_lines=[line] if not tv else [])
 
     def _render_unknown(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         logger.debug("Unhandled Codex log payload: %s", entry.get("type"))
@@ -1798,4 +1800,21 @@ class CodexProvider(Provider):
         on_step_count: Callable[[int], None] | None,
         ops_log_file: Path | None,
     ) -> None:
-        _ = item, formatter, data, model, max_steps, chat_text_display_length, log_handle, on_step_count, ops_log_file
+        _ = model, chat_text_display_length, log_handle, ops_log_file
+        preview = reasoning_preview(item.get("text"), item.get("summary"))
+        if preview is None:
+            return
+        current_step, legacy_turn_id = self._ensure_live_step_for_tool_activity(
+            data=data,
+            max_steps=max_steps,
+            on_step_count=on_step_count,
+        )
+        data["approx_output_chars"] = data.get("approx_output_chars", 0) + len(preview)
+        self._append_live_substep(
+            current_step=current_step,
+            legacy_turn_id=legacy_turn_id,
+            data=data,
+            substep_type="reasoning",
+            payload={"text": preview},
+        )
+        formatter.print_reasoning(f"thinking: {preview}")

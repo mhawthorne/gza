@@ -158,6 +158,36 @@ def text_to_lines(text: str, *, max_lines: int = 6, max_chars: int = 200) -> lis
     return [truncate(line, max_chars) for line in lines]
 
 
+def reasoning_preview(
+    *values: object,
+    max_chars: int = 140,
+) -> str | None:
+    """Extract a compact single-line reasoning/thinking preview."""
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        normalized = " ".join(part for part in value.strip().splitlines() if part.strip())
+        if normalized:
+            return truncate(normalized, max_chars)
+    return None
+
+
+def reasoning_line(
+    *values: object,
+    tv: bool,
+    label: str = "thinking:",
+    max_chars: int = 140,
+) -> str | None:
+    """Render a dim reasoning/thinking line for log or TV surfaces."""
+    preview = reasoning_preview(*values, max_chars=max_chars)
+    if preview is None:
+        return None
+    rendered = f"{label} {preview}"
+    if tv:
+        return rendered
+    return f"[dim]{rich_escape(rendered)}[/dim]"
+
+
 def summarize_tool_detail(tool_name: str, tool_input: dict[str, Any]) -> str:
     """Build a compact one-line tool summary for timeline and TV rendering."""
     detail = str(tool_input.get("detail", "")).strip()
