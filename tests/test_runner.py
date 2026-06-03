@@ -14602,3 +14602,136 @@ class TestProviderPromptSanitization:
         assert "create a new retry attempt with a fresh conversation" in output
         assert "implement retries may fork fresh" in output
         assert "same-branch follow-ups stay on the shared branch" in output
+
+
+class TestProviderModelParityGate:
+    """Runtime parity gate: cross-family provider/model pairs fail pre-flight."""
+
+    def _make_config(self, tmp_path: Path, db_path: Path) -> Mock:
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.db_path = db_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.workers_path = tmp_path / ".gza" / "workers"
+        config.workers_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.max_turns = 50
+        config.timeout_minutes = 60
+        config.branch_mode = "multi"
+        config.project_name = "test"
+        config.branch_strategy = Mock()
+        config.branch_strategy.pattern = "{project}/{task_id}"
+        config.branch_strategy.default_type = "feature"
+        config.get_provider_for_task.return_value = "claude"
+        config.get_model_for_task.return_value = None
+        config.get_max_steps_for_task.return_value = 50
+        return config
+
+    @pytest.mark.parametrize(
+        ("provider", "model"),
+        [
+            ("claude", "gpt-5.4"),
+            ("codex", "claude-sonnet-4-6"),
+            ("gemini", "gpt-4o"),
+            ("claude", "o4-mini"),
+        ],
+    )
+    def test_cross_family_pair_fails_preflight_before_provider_launch(
+        self, tmp_path: Path, provider: str, model: str
+    ):
+        """Cross-family provider/model pairs must fail with CONFIG_ERROR before get_provider."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = self._make_config(tmp_path, db_path)
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_effective_config_for_task", return_value=(model, provider, 50)),
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            result = run(config, task_id=task.id)
+
+        assert result == 1
+        mock_get_provider.assert_not_called()
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "CONFIG_ERROR"
+
+        assert refreshed.log_file is not None
+        ops_log = (tmp_path / refreshed.log_file).with_name(
+            f"{Path(refreshed.log_file).stem}.ops.jsonl"
+        )
+        ops_content = ops_log.read_text()
+        assert "CONFIG_ERROR" in ops_content
+        assert model in ops_content
+        assert provider in ops_content
+
+    @pytest.mark.parametrize(
+        ("provider", "model"),
+        [
+            ("claude", "claude-sonnet-4-6"),
+            ("codex", "gpt-4o"),
+            ("gemini", "gemini-2.5-pro"),
+        ],
+    )
+    def test_same_family_pair_passes_parity_gate(
+        self, tmp_path: Path, provider: str, model: str
+    ):
+        """Matching provider/model family pairs must not be blocked by the parity gate."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = self._make_config(tmp_path, db_path)
+        mock_provider = Mock()
+        mock_provider.name = provider
+        mock_provider.check_credentials.return_value = False
+        mock_provider.credential_setup_hint = "set creds"
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_effective_config_for_task", return_value=(model, provider, 50)),
+            patch("gza.runner.get_provider", return_value=mock_provider),
+        ):
+            result = run(config, task_id=task.id)
+
+        # Should proceed past the parity gate (fails later at credential check, not CONFIG_ERROR)
+        assert result == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason == "PROVIDER_UNAVAILABLE"
+
+    def test_unknown_model_name_passes_parity_gate(self, tmp_path: Path):
+        """Unrecognized model names must pass the parity gate (fail-open for custom models)."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = self._make_config(tmp_path, db_path)
+        mock_provider = Mock()
+        mock_provider.name = "claude"
+        mock_provider.check_credentials.return_value = False
+        mock_provider.credential_setup_hint = "set creds"
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_effective_config_for_task", return_value=("my-custom-model-v2", "claude", 50)),
+            patch("gza.runner.get_provider", return_value=mock_provider),
+        ):
+            result = run(config, task_id=task.id)
+
+        # Unknown model passes parity gate; fails at credential check (not CONFIG_ERROR)
+        assert result == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason == "PROVIDER_UNAVAILABLE"

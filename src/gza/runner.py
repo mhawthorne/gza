@@ -31,6 +31,8 @@ from .config import (
     DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS,
     BranchStrategy,
     Config,
+    is_model_compatible_with_provider,
+    provider_model_mismatch_error,
 )
 from .console import (
     console,
@@ -1364,6 +1366,43 @@ def _mark_preflight_failure(
         store=store,
         log_file=log_file,
         explicit_reason=failure_reason,
+        error_type=None,
+        exit_code=None,
+    )
+
+
+def _mark_preflight_model_mismatch(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    provider_name: str,
+    model: str,
+    invocation: "RunInvocationContext",
+    resume: bool,
+    message: str,
+) -> None:
+    """Persist provider/model parity pre-flight failures before provider instantiation."""
+    log_file = ensure_task_log_path(config, store, task)
+    write_worker_start_event(log_file, resumed=resume)
+    write_log_entry(
+        log_file,
+        {"type": "gza", "subtype": "info", "message": f"Task: {task.id} {task.slug or ''}".strip()},
+    )
+    write_log_entry(
+        log_file,
+        {"type": "gza", "subtype": "info", "message": f"Provider: {provider_name}, Model: {model}"},
+    )
+    write_log_entry(
+        log_file,
+        {"type": "gza", "subtype": "outcome", "message": message, "failure_reason": "CONFIG_ERROR"},
+    )
+    _mark_task_failed(
+        task=task,
+        config=config,
+        store=store,
+        log_file=log_file,
+        explicit_reason="CONFIG_ERROR",
         error_type=None,
         exit_code=None,
     )
@@ -4797,6 +4836,23 @@ def run(
     task.model = effective_model
     task.provider = effective_provider
     store.update(task)
+
+    # Parity gate: reject cross-family pairs before provider instantiation.
+    # This surfaces a clear actionable error instead of an opaque HTTP 404.
+    if effective_model and not is_model_compatible_with_provider(effective_provider, effective_model):
+        mismatch_msg = provider_model_mismatch_error("model", effective_provider, effective_model)
+        error_message(f"Error: {mismatch_msg}")
+        _mark_preflight_model_mismatch(
+            task=task,
+            config=config,
+            store=store,
+            provider_name=effective_provider,
+            model=effective_model,
+            invocation=invocation_context,
+            resume=resume,
+            message=f"Preflight failed: {mismatch_msg}",
+        )
+        return 1
 
     # Create a modified config with task-specific settings
     from copy import copy

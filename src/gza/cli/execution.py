@@ -18,7 +18,13 @@ from ..advance_engine import (
     _resolve_current_merge_source,
     count_completed_review_cycles,
 )
-from ..config import DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES, DEFAULT_MAX_RESUME_ATTEMPTS, Config
+from ..config import (
+    DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES,
+    DEFAULT_MAX_RESUME_ATTEMPTS,
+    Config,
+    is_model_compatible_with_provider,
+    provider_model_mismatch_error,
+)
 from ..console import format_duration
 from ..db import (
     InvalidTaskIdError,
@@ -1209,6 +1215,11 @@ def cmd_add(args: argparse.Namespace) -> int:
     skip_learnings = args.skip_learnings if hasattr(args, 'skip_learnings') and args.skip_learnings else False
     mark_next = bool(getattr(args, "next", False))
     recovery_origin = "manual" if based_on else None
+
+    # Validation: reject incompatible provider/model pairs at creation time
+    if provider and model and not is_model_compatible_with_provider(provider, model):
+        print(f"Error: {provider_model_mismatch_error('--model', provider, model)}")
+        return 1
 
     # Validation: --spec must reference an existing file
     if spec:

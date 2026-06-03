@@ -34,6 +34,8 @@ __all__ = [
     "TaskTypeConfig",
     "BranchStrategy",
     "discover_project_dir",
+    "is_model_compatible_with_provider",
+    "provider_model_mismatch_error",
 ]
 
 
@@ -403,6 +405,16 @@ def _provider_model_mismatch_error(path: str, provider: str, model: str) -> str:
         f"'{path}' model '{model}' appears incompatible with provider '{provider}'. "
         f"Use a model for '{provider}' or change provider."
     )
+
+
+def is_model_compatible_with_provider(provider: str, model: str | None) -> bool:
+    """Return True if model appears compatible with provider (public API)."""
+    return _is_model_compatible_with_provider(provider, model)
+
+
+def provider_model_mismatch_error(path: str, provider: str, model: str) -> str:
+    """Return a clear error message for a provider/model family mismatch (public API)."""
+    return _provider_model_mismatch_error(path, provider, model)
 
 
 def _is_strict_int(value: object) -> bool:

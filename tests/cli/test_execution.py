@@ -16118,6 +16118,70 @@ class TestAddCommandWithModelAndProvider:
         assert task.provider == "claude"
         assert task.provider_is_explicit is True
 
+    @pytest.mark.parametrize(
+        ("provider", "model"),
+        [
+            ("claude", "gpt-5.4"),
+            ("codex", "claude-sonnet-4-6"),
+            ("gemini", "gpt-4o"),
+        ],
+    )
+    def test_add_rejects_cross_family_provider_model_at_creation(
+        self, tmp_path: Path, provider: str, model: str
+    ):
+        """gza add must reject an incompatible provider/model pair before persisting."""
+        setup_config(tmp_path)
+        result = run_gza(
+            "add",
+            "--provider", provider,
+            "--model", model,
+            "Cross-family task",
+            "--project", str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "Error:" in result.stdout
+        assert model in result.stdout
+        assert provider in result.stdout
+
+        # Task must NOT have been persisted
+        store = make_store(tmp_path)
+        tasks = store.get_pending()
+        assert not any(t.prompt == "Cross-family task" for t in tasks)
+
+    def test_add_allows_unknown_model_name_with_any_provider(self, tmp_path: Path):
+        """gza add must accept an unrecognized model name (fail-open for custom models)."""
+        setup_config(tmp_path)
+        result = run_gza(
+            "add",
+            "--provider", "claude",
+            "--model", "my-custom-model-v2",
+            "Custom model task",
+            "--project", str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        store = make_store(tmp_path)
+        tasks = store.get_pending()
+        task = next((t for t in tasks if t.prompt == "Custom model task"), None)
+        assert task is not None
+        assert task.model == "my-custom-model-v2"
+
+    def test_add_allows_provider_without_model(self, tmp_path: Path):
+        """gza add with only --provider (no --model) must not trigger the parity gate."""
+        setup_config(tmp_path)
+        result = run_gza(
+            "add",
+            "--provider", "claude",
+            "Provider only task",
+            "--project", str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        store = make_store(tmp_path)
+        tasks = store.get_pending()
+        assert any(t.prompt == "Provider only task" for t in tasks)
+
 
 class TestRecoveryTaskScopeCloning:
     def test_resume_task_preserves_review_scope(self, tmp_path: Path):
