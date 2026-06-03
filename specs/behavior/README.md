@@ -68,6 +68,7 @@ Additional rules for authors:
 | [00-overview.md](00-overview.md) | The lifecycle state machine: states, transition diagram, and the consolidated human-escalation table. | Draft — invariants + 5 decisions ratified 2026-06-01 |
 | [lifecycle-engine.md](lifecycle-engine.md) | The prescriptive transition rules the engine evaluates each pass (plan → implement → review → improve → rebase → merge). | Draft — 5 decisions ratified 2026-06-01 |
 | [watch-supervisor.md](watch-supervisor.md) | The prescriptive runtime/supervisor contract for `gza watch`: cycle order, slot accounting, detached-worker adoption, drift re-exec, scope, and stop/backoff rules. | Draft — north-star runtime contract pending conformance pass |
+| [worktree-reclaim.md](worktree-reclaim.md) | The prescriptive contract for how a code work unit acquires its isolated worktree at task start, and when an existing worktree may be reclaimed vs. must be left for a human. | Draft — under discussion (open questions on claim mechanism + staleness) |
 
 ### Planned (not yet written)
 

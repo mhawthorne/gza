@@ -10,7 +10,9 @@
 > evaluator behind `gza advance`, and is reused by `gza iterate` and `gza watch`. The
 > rules below are the intended behavior; the code is the thing measured against them.*
 > Cycle cadence, slot accounting, detached-worker adoption, and watch-process restart are
-> intentionally out of scope here; see [watch-supervisor.md](watch-supervisor.md).
+> intentionally out of scope here; see [watch-supervisor.md](watch-supervisor.md). How a
+> selected action's task acquires its isolated worktree at start (and when an existing
+> worktree may be reclaimed) is specified in [worktree-reclaim.md](worktree-reclaim.md).
 
 ## How the engine decides
 

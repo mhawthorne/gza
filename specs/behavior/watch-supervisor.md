@@ -19,6 +19,10 @@ gza has two distinct layers that MUST NOT be conflated:
   at once, what order cycle phases execute in, and how a long-running watch process
   survives interruption, restart, and installed-code drift.
 
+Worktree acquisition and reclaim is **not** owned here: it is a step of task start performed
+by the task runner for every caller (watch, manual, inline, recovery), specified in
+[worktree-reclaim.md](worktree-reclaim.md).
+
 This document answers questions the engine spec intentionally does not:
 
 - What is one watch cycle?
