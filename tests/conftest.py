@@ -47,11 +47,21 @@ def _isolate_rich_console(monkeypatch):
     Why: Rich auto-detects color and wraps to terminal width. Both vary across
     local terminals and CI, causing assertions on rendered output to flake when
     ANSI escape codes get inserted or messages wrap mid-token.
+
+    Pinning ``no_color``/``_color_system`` on the console objects is necessary
+    but not sufficient: code under test (e.g. ``Config.load`` ->
+    ``set_config_no_color``) *restores* each console's ``_color_system`` from the
+    value captured at import time in ``_REGISTERED_COLOR_SYSTEMS``. When the test
+    process is attached to a TTY (e.g. ``bin/tests`` run interactively), that
+    captured value is a real color system, so the restore re-enables ANSI
+    mid-test and plaintext assertions on stderr fail. We therefore also pin the
+    captured systems to ``None`` so any restore keeps output plain.
     """
     for name in ("FORCE_COLOR", "TTY_COMPATIBLE", "CLICOLOR_FORCE", "NO_COLOR"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("COLUMNS", "200")
 
+    import gza.console as console_module
     from gza.cli import query as query_cli
     from gza.console import console
 
@@ -59,3 +69,4 @@ def _isolate_rich_console(monkeypatch):
         monkeypatch.setattr(rich_console, "no_color", True)
         monkeypatch.setattr(rich_console, "_color_system", None, raising=False)
         monkeypatch.setattr(rich_console, "_width", 200, raising=False)
+        monkeypatch.setitem(console_module._REGISTERED_COLOR_SYSTEMS, rich_console, None)
