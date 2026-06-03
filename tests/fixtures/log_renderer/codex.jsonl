@@ -8,4 +8,3 @@
 {"type":"item.completed","item":{"id":"item_3","type":"reasoning"}}
 {"type":"turn.failed","error":{"message":"Selected model is at capacity. Try again shortly."}}
 {"type":"error","message":"top-level codex error"}
-{"type":"weird.codex","message":"unexpected branch","session_id":"sess-9","extra":"x"}

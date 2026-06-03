@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from rich.markup import escape as rich_escape
 
@@ -51,6 +51,77 @@ if TYPE_CHECKING:
     from ..config import Config
 
 logger = logging.getLogger(__name__)
+
+CLAUDE_EVENT_REGISTRY: dict[str, dict[str, object]] = {
+    "gza": {"render": ("_render_gza", False), "live": False},
+    "raw": {"render": ("_render_raw", False), "live": False},
+    "error": {"render": ("_render_error", False), "live": "_handle_live_error_event"},
+    "system": {"render": ("_render_system", False), "live": "_handle_live_system_event"},
+    "assistant": {"render": ("_render_assistant", True), "live": "_handle_live_assistant_event"},
+    "user": {"render": ("_render_user", False), "live": "_handle_live_user_event"},
+    "rate_limit_event": {"render": ("_render_rate_limit_event", False), "live": "_handle_live_rate_limit_event"},
+    "result": {"render": ("_render_result", False), "live": "_handle_live_result_event"},
+}
+CLAUDE_RENDER_EVENT_HANDLERS: dict[str, tuple[str, bool]] = {
+    event_type: cast(tuple[str, bool], dispatch)
+    for event_type, metadata in CLAUDE_EVENT_REGISTRY.items()
+    if isinstance(dispatch := metadata.get("render"), tuple)
+}
+CLAUDE_RENDER_KNOWN_EVENT_TYPES = frozenset(CLAUDE_RENDER_EVENT_HANDLERS)
+CLAUDE_LIVE_EVENT_HANDLERS: dict[str, str] = {
+    event_type: str(handler_name)
+    for event_type, metadata in CLAUDE_EVENT_REGISTRY.items()
+    if isinstance(handler_name := metadata.get("live"), str)
+}
+CLAUDE_LIVE_KNOWN_EVENT_TYPES = frozenset(CLAUDE_LIVE_EVENT_HANDLERS)
+CLAUDE_ASSISTANT_BLOCK_REGISTRY: dict[str, dict[str, object]] = {
+    "text": {"render": "_render_assistant_text_block", "live": "_handle_live_assistant_text_block"},
+    "tool_use": {"render": "_render_assistant_tool_use_block", "live": "_handle_live_assistant_tool_use_block"},
+    "tool_result": {"render": False, "live": "_handle_live_assistant_tool_result_block"},
+    "tool_retry": {"render": False, "live": "_handle_live_assistant_tool_retry_block"},
+}
+CLAUDE_RENDER_ASSISTANT_BLOCK_HANDLERS: dict[str, str] = {
+    block_type: str(handler_name)
+    for block_type, metadata in CLAUDE_ASSISTANT_BLOCK_REGISTRY.items()
+    if isinstance(handler_name := metadata.get("render"), str)
+}
+CLAUDE_LIVE_ASSISTANT_BLOCK_HANDLERS: dict[str, str] = {
+    block_type: str(handler_name)
+    for block_type, metadata in CLAUDE_ASSISTANT_BLOCK_REGISTRY.items()
+    if isinstance(handler_name := metadata.get("live"), str)
+}
+CLAUDE_RENDER_KNOWN_ASSISTANT_BLOCK_TYPES = frozenset(
+    CLAUDE_RENDER_ASSISTANT_BLOCK_HANDLERS
+)
+CLAUDE_LIVE_KNOWN_ASSISTANT_BLOCK_TYPES = frozenset(
+    CLAUDE_LIVE_ASSISTANT_BLOCK_HANDLERS
+)
+CLAUDE_USER_BLOCK_REGISTRY: dict[str, dict[str, object]] = {
+    "text": {"render": "_render_user_text_block", "live": "_handle_live_user_text_block"},
+    "tool_result": {"render": "_render_user_tool_result_block", "live": "_handle_live_user_tool_result_block"},
+}
+CLAUDE_RENDER_USER_BLOCK_HANDLERS: dict[str, str] = {
+    block_type: str(handler_name)
+    for block_type, metadata in CLAUDE_USER_BLOCK_REGISTRY.items()
+    if isinstance(handler_name := metadata.get("render"), str)
+}
+CLAUDE_LIVE_USER_BLOCK_HANDLERS: dict[str, str] = {
+    block_type: str(handler_name)
+    for block_type, metadata in CLAUDE_USER_BLOCK_REGISTRY.items()
+    if isinstance(handler_name := metadata.get("live"), str)
+}
+CLAUDE_RENDER_KNOWN_USER_BLOCK_TYPES = frozenset(
+    CLAUDE_RENDER_USER_BLOCK_HANDLERS
+)
+CLAUDE_LIVE_KNOWN_USER_BLOCK_TYPES = frozenset(
+    CLAUDE_LIVE_USER_BLOCK_HANDLERS
+)
+
+
+def _unknown_live_type_message(provider: str, surface: str, type_name: object) -> str:
+    """Build a stable operator-facing message for unhandled live provider output."""
+    rendered_type = str(type_name).strip() if type_name not in (None, "") else "<missing>"
+    return f"Unhandled {provider} {surface}: {rendered_type}"
 
 
 def _parse_iso_datetime(value: object) -> datetime | None:
@@ -100,6 +171,80 @@ def _format_tool_param(value: object) -> str:
         return "{...}"
     else:
         return str(value)
+
+
+def _ensure_claude_step_store(data: dict[str, Any]) -> None:
+    if "run_step_events" not in data:
+        data["run_step_events"] = []
+        data["_step_by_msg_id"] = {}
+        data["_current_step_event"] = None
+        data["_legacy_event_count_by_turn"] = {}
+
+
+def _allocate_claude_legacy_event_id(data: dict[str, Any], legacy_turn_id: str | None) -> str | None:
+    if not legacy_turn_id:
+        return None
+    counters = data.get("_legacy_event_count_by_turn")
+    if not isinstance(counters, dict):
+        counters = {}
+        data["_legacy_event_count_by_turn"] = counters
+    next_idx = int(counters.get(legacy_turn_id, 0)) + 1
+    counters[legacy_turn_id] = next_idx
+    return f"{legacy_turn_id}.{next_idx}"
+
+
+def _start_claude_step(
+    data: dict[str, Any],
+    msg_id: str | None,
+    legacy_turn_id: str | None,
+    on_step_count: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
+    _ensure_claude_step_store(data)
+    event: dict[str, Any] = {
+        "message_role": "assistant",
+        "message_text": None,
+        "legacy_turn_id": legacy_turn_id,
+        "legacy_event_id": _allocate_claude_legacy_event_id(data, legacy_turn_id),
+        "substeps": [],
+        "_seen_tool_use_ids": set(),
+        "outcome": "completed",
+        "summary": None,
+    }
+    data["run_step_events"].append(event)
+    data["_current_step_event"] = event
+    if msg_id:
+        data["_step_by_msg_id"][msg_id] = event
+    if on_step_count:
+        on_step_count(len(data["run_step_events"]))
+    return event
+
+
+def _append_claude_tool_result_substep(
+    data: dict[str, Any],
+    current_step: dict[str, Any] | None,
+    content: dict[str, Any],
+) -> dict[str, Any]:
+    if current_step is None:
+        seen_msg_ids = data.get("seen_msg_ids", set())
+        turn_count = len(seen_msg_ids) if isinstance(seen_msg_ids, set) else 0
+        legacy_turn_id = f"T{turn_count}" if turn_count > 0 else None
+        current_step = _start_claude_step(data, None, legacy_turn_id)
+    legacy_turn_id = current_step.get("legacy_turn_id")
+    is_error = bool(content.get("is_error"))
+    current_step["substeps"].append(
+        {
+            "type": "tool_error" if is_error else "tool_output",
+            "source": "provider",
+            "call_id": content.get("tool_use_id") or content.get("id"),
+            "payload": {
+                "content": content.get("content"),
+                "is_error": is_error,
+            },
+            "legacy_turn_id": legacy_turn_id,
+            "legacy_event_id": _allocate_claude_legacy_event_id(data, legacy_turn_id),
+        }
+    )
+    return current_step
 
 
 # Claude pricing per million tokens (input, output)
@@ -162,30 +307,29 @@ class ClaudeLogRenderer:
 
     def _handle(self, entry: dict[str, Any], *, live: bool, tv: bool) -> RenderedLines:
         event_type = entry.get("type")
-        if event_type == "gza":
-            return self._render_gza(entry, tv=tv)
-        if event_type == "raw":
-            message = entry.get("message", "")
-            if isinstance(message, str) and message:
-                lines = [rich_escape(message)] if not tv else [message]
-                return RenderedLines(log_lines=lines if not tv else [], tv_lines=lines if tv else [])
-            return RenderedLines()
-        if event_type == "error":
-            lines = error_lines(entry.get("message", ""))
-            if tv:
-                return RenderedLines(tv_lines=tv_error_lines(entry.get("message", "")))
-            return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in lines])
-        if event_type == "system":
-            return self._render_system(entry, tv=tv)
-        if event_type == "assistant":
-            return self._render_assistant(entry, live=live, tv=tv)
-        if event_type == "user":
-            return self._render_user(entry, tv=tv)
-        if event_type == "rate_limit_event":
-            return self._render_rate_limit_event(entry, tv=tv)
-        if event_type == "result":
-            return self._render_result(entry, tv=tv)
-        return self._render_unknown(entry, tv=tv)
+        if not isinstance(event_type, str):
+            return self._render_unknown(entry, tv=tv)
+        dispatch = CLAUDE_RENDER_EVENT_HANDLERS.get(event_type)
+        if dispatch is None:
+            return self._render_unknown(entry, tv=tv)
+        method_name, pass_live = dispatch
+        method = getattr(self, method_name)
+        if pass_live:
+            return method(entry, live=live, tv=tv)
+        return method(entry, tv=tv)
+
+    def _render_raw(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        message = entry.get("message", "")
+        if isinstance(message, str) and message:
+            lines = [rich_escape(message)] if not tv else [message]
+            return RenderedLines(log_lines=lines if not tv else [], tv_lines=lines if tv else [])
+        return RenderedLines()
+
+    def _render_error(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        lines = error_lines(entry.get("message", ""))
+        if tv:
+            return RenderedLines(tv_lines=tv_error_lines(entry.get("message", "")))
+        return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in lines])
 
     def _render_gza(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         subtype = entry.get("subtype", "")
@@ -249,29 +393,20 @@ class ClaudeLogRenderer:
         unknown_block_types: list[str] = []
         for item in content_items:
             item_type = item.get("type")
-            if item_type == "text":
-                text = item.get("text", "")
-                if isinstance(text, str) and text.strip():
-                    text_found = True
-                    if tv:
-                        tv_lines.extend([line for line in text.splitlines() if line.strip()][-6:])
-                    else:
-                        log_lines.append(rich_escape(text.strip()))
-            elif item_type == "tool_use":
-                tool_found = True
-                name = str(item.get("name", "unknown"))
-                tool_input = item.get("input", {})
-                if not isinstance(tool_input, dict):
-                    tool_input = {}
-                if tv:
-                    tv_lines.append(f"-> {tool_one_liner(name, tool_input)}")
-                else:
-                    log_lines.append(f"[green]\\[tool: {rich_escape(name)}][/green] {rich_escape(summarize_tool_detail(name, tool_input))}")
-            elif item:
-                unknown_block_found = True
-                if item_type not in (None, ""):
-                    unknown_block_types.append(str(item_type))
-
+            method_name = CLAUDE_RENDER_ASSISTANT_BLOCK_HANDLERS.get(str(item_type))
+            if method_name is None:
+                if item:
+                    unknown_block_found = True
+                    if item_type not in (None, ""):
+                        unknown_block_types.append(str(item_type))
+                continue
+            rendered_log_lines, rendered_tv_lines, rendered_text_found, rendered_tool_found = getattr(
+                self, method_name
+            )(item, tv=tv)
+            log_lines.extend(rendered_log_lines)
+            tv_lines.extend(rendered_tv_lines)
+            text_found = text_found or rendered_text_found
+            tool_found = tool_found or rendered_tool_found
         if not text_found and not tool_found:
             if unknown_block_found:
                 starts_step = self._mark_step_start(message_id)
@@ -286,6 +421,101 @@ class ClaudeLogRenderer:
             log_lines.extend(fallback.log_lines)
             tv_lines.extend(fallback.tv_lines)
         return RenderedLines(log_lines=log_lines, tv_lines=tv_lines, starts_step=starts_step)
+
+    def _render_assistant_text_block(self, item: dict[str, Any], *, tv: bool) -> tuple[list[str], list[str], bool, bool]:
+        text = item.get("text", "")
+        if not isinstance(text, str) or not text.strip():
+            return [], [], False, False
+        if tv:
+            return [], [line for line in text.splitlines() if line.strip()][-6:], True, False
+        return [rich_escape(text.strip())], [], True, False
+
+    def _render_assistant_tool_use_block(self, item: dict[str, Any], *, tv: bool) -> tuple[list[str], list[str], bool, bool]:
+        name = str(item.get("name", "unknown"))
+        tool_input = item.get("input", {})
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        if tv:
+            return [], [f"-> {tool_one_liner(name, tool_input)}"], False, True
+        return [
+            f"[green]\\[tool: {rich_escape(name)}][/green] {rich_escape(summarize_tool_detail(name, tool_input))}"
+        ], [], False, True
+
+    def _render_user(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        log_lines: list[str] = []
+        tv_lines: list[str] = []
+        unknown_block_found = False
+        for item in message_content_items(entry):
+            item_type = item.get("type")
+            method_name = CLAUDE_RENDER_USER_BLOCK_HANDLERS.get(str(item_type))
+            if method_name is None:
+                if item:
+                    unknown_block_found = True
+                continue
+            rendered_log_lines, rendered_tv_lines = getattr(self, method_name)(item, tv=tv)
+            log_lines.extend(rendered_log_lines)
+            tv_lines.extend(rendered_tv_lines)
+
+        if log_lines or tv_lines:
+            if unknown_block_found:
+                fallback = self._render_unknown(entry, tv=tv)
+                log_lines.extend(fallback.log_lines)
+                tv_lines.extend(fallback.tv_lines)
+            return RenderedLines(log_lines=log_lines, tv_lines=tv_lines)
+
+        if unknown_block_found:
+            return self._render_unknown(entry, tv=tv)
+
+        self.suppressed_count += 1
+        return RenderedLines(log_lines=log_lines, tv_lines=tv_lines)
+
+    def _render_user_tool_result_block(self, item: dict[str, Any], *, tv: bool) -> tuple[list[str], list[str]]:
+        result = item.get("content", "")
+        if isinstance(result, str):
+            result = result.replace("\\n", "\n").replace("\\t", "\t")
+        is_error = bool(item.get("is_error", False))
+        rendered = str(result).strip()
+        if not rendered:
+            return [], []
+        if tv:
+            prefix = "tool_error" if is_error else "tool_output"
+            return [], [f"{prefix} {rendered}"]
+        if is_error:
+            return [f"[red]{rich_escape(rendered)}[/red]"], []
+        return [rich_escape(rendered)], []
+
+    def _render_user_text_block(self, item: dict[str, Any], *, tv: bool) -> tuple[list[str], list[str]]:
+        text = item.get("text", "")
+        if not isinstance(text, str) or not text.strip():
+            return [], []
+        rendered_text = text.strip()
+        prefix = "user: "
+        if tv:
+            return [], [f"{prefix}{rendered_text}"]
+        return [rich_escape(f"{prefix}{rendered_text}")], []
+
+    def _render_result(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        cost = entry.get("total_cost_usd") or entry.get("cost_usd")
+        if isinstance(cost, (int, float)):
+            self.stats.cost_usd = float(cost)
+        result_text = str(entry.get("result", "") or "").strip()
+        subtype = str(entry.get("subtype") or "")
+        is_error = bool(entry.get("is_error", False))
+        if tv:
+            if result_text:
+                return RenderedLines(tv_lines=[f"result {result_text}"])
+            if subtype:
+                return RenderedLines(tv_lines=[f"result {subtype}"])
+            return RenderedLines()
+        if is_error:
+            return RenderedLines(log_lines=[f"[red]\\[result] ERROR:[/red] {rich_escape(result_text)}"])
+        if subtype and subtype != "success":
+            if result_text:
+                return RenderedLines(log_lines=[f"[yellow]\\[result] {rich_escape(subtype)}:[/yellow] {rich_escape(result_text)}"])
+            return RenderedLines(log_lines=[f"[yellow]\\[result] {rich_escape(subtype)}[/yellow]"])
+        if result_text:
+            return RenderedLines(log_lines=[f"[green]\\[result][/green] {rich_escape(result_text)}"])
+        return RenderedLines()
 
     def _mark_step_start(self, message: object) -> bool:
         if isinstance(message, str) and message:
@@ -334,80 +564,6 @@ class ClaudeLogRenderer:
             return True
         return False
 
-    def _render_user(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
-        log_lines: list[str] = []
-        tv_lines: list[str] = []
-        unknown_block_found = False
-        for item in message_content_items(entry):
-            item_type = item.get("type")
-            if item_type == "tool_result":
-                result = item.get("content", "")
-                if isinstance(result, str):
-                    result = result.replace("\\n", "\n").replace("\\t", "\t")
-                is_error = bool(item.get("is_error", False))
-                rendered = str(result).strip()
-                if not rendered:
-                    continue
-                if tv:
-                    prefix = "tool_error" if is_error else "tool_output"
-                    tv_lines.append(f"{prefix} {rendered}")
-                else:
-                    if is_error:
-                        log_lines.append(f"[red]{rich_escape(rendered)}[/red]")
-                    else:
-                        log_lines.append(rich_escape(rendered))
-                continue
-
-            if item_type == "text":
-                text = item.get("text", "")
-                if isinstance(text, str) and text.strip():
-                    rendered_text = text.strip()
-                    prefix = "user: "
-                    if tv:
-                        tv_lines.append(f"{prefix}{rendered_text}")
-                    else:
-                        log_lines.append(rich_escape(f"{prefix}{rendered_text}"))
-                    continue
-
-            if item:
-                unknown_block_found = True
-
-        if log_lines or tv_lines:
-            if unknown_block_found:
-                fallback = self._render_unknown(entry, tv=tv)
-                log_lines.extend(fallback.log_lines)
-                tv_lines.extend(fallback.tv_lines)
-            return RenderedLines(log_lines=log_lines, tv_lines=tv_lines)
-
-        if unknown_block_found:
-            return self._render_unknown(entry, tv=tv)
-
-        self.suppressed_count += 1
-        return RenderedLines(log_lines=log_lines, tv_lines=tv_lines)
-
-    def _render_result(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
-        cost = entry.get("total_cost_usd") or entry.get("cost_usd")
-        if isinstance(cost, (int, float)):
-            self.stats.cost_usd = float(cost)
-        result_text = str(entry.get("result", "") or "").strip()
-        subtype = str(entry.get("subtype") or "")
-        is_error = bool(entry.get("is_error", False))
-        if tv:
-            if result_text:
-                return RenderedLines(tv_lines=[f"result {result_text}"])
-            if subtype:
-                return RenderedLines(tv_lines=[f"result {subtype}"])
-            return RenderedLines()
-        if is_error:
-            return RenderedLines(log_lines=[f"[red]\\[result] ERROR:[/red] {rich_escape(result_text)}"])
-        if subtype and subtype != "success":
-            if result_text:
-                return RenderedLines(log_lines=[f"[yellow]\\[result] {rich_escape(subtype)}:[/yellow] {rich_escape(result_text)}"])
-            return RenderedLines(log_lines=[f"[yellow]\\[result] {rich_escape(subtype)}[/yellow]"])
-        if result_text:
-            return RenderedLines(log_lines=[f"[green]\\[result][/green] {rich_escape(result_text)}"])
-        return RenderedLines()
-
     def _render_rate_limit_event(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         message = _claude_rate_limit_message(entry)
         if not message:
@@ -418,6 +574,7 @@ class ClaudeLogRenderer:
         return RenderedLines(log_lines=[f"[red]{rich_escape(message)}[/red]"])
 
     def _render_unknown(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        logger.debug("Unhandled Claude log payload: %s", entry.get("type"))
         if tv:
             return RenderedLines(tv_lines=truncated_json_lines(entry))
         lines = [generic_log_summary(entry)]
@@ -1263,302 +1420,40 @@ class ClaudeProvider(Provider):
         formatter = StreamOutputFormatter()
 
         def _ensure_step_store(data: dict) -> None:
-            if "run_step_events" not in data:
-                data["run_step_events"] = []
-                data["_step_by_msg_id"] = {}
-                data["_current_step_event"] = None
-                data["_legacy_event_count_by_turn"] = {}
+            _ensure_claude_step_store(data)
 
         def _allocate_legacy_event_id(data: dict, legacy_turn_id: str | None) -> str | None:
-            if not legacy_turn_id:
-                return None
-            counters = data.get("_legacy_event_count_by_turn")
-            if not isinstance(counters, dict):
-                counters = {}
-                data["_legacy_event_count_by_turn"] = counters
-            next_idx = int(counters.get(legacy_turn_id, 0)) + 1
-            counters[legacy_turn_id] = next_idx
-            return f"{legacy_turn_id}.{next_idx}"
+            return _allocate_claude_legacy_event_id(data, legacy_turn_id)
 
         def _start_step(data: dict, msg_id: str | None, legacy_turn_id: str | None) -> dict:
-            _ensure_step_store(data)
-            event: dict[str, Any] = {
-                "message_role": "assistant",
-                "message_text": None,
-                "legacy_turn_id": legacy_turn_id,
-                "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
-                "substeps": [],
-                "_seen_tool_use_ids": set(),
-                "outcome": "completed",
-                "summary": None,
-            }
-            data["run_step_events"].append(event)
-            data["_current_step_event"] = event
-            if msg_id:
-                data["_step_by_msg_id"][msg_id] = event
-            if on_step_count:
-                on_step_count(len(data["run_step_events"]))
-            return event
+            return _start_claude_step(data, msg_id, legacy_turn_id, on_step_count)
 
         def _append_tool_result_substep(data: dict, current_step: dict | None, content: dict[str, Any]) -> dict:
-            if current_step is None:
-                seen_msg_ids = data.get("seen_msg_ids", set())
-                turn_count = len(seen_msg_ids) if isinstance(seen_msg_ids, set) else 0
-                legacy_turn_id = f"T{turn_count}" if turn_count > 0 else None
-                current_step = _start_step(data, None, legacy_turn_id)
-            legacy_turn_id = current_step.get("legacy_turn_id")
-            is_error = bool(content.get("is_error"))
-            current_step["substeps"].append(
-                {
-                    "type": "tool_error" if is_error else "tool_output",
-                    "source": "provider",
-                    "call_id": content.get("tool_use_id") or content.get("id"),
-                    "payload": {
-                        "content": content.get("content"),
-                        "is_error": is_error,
-                    },
-                    "legacy_turn_id": legacy_turn_id,
-                    "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
-                }
-            )
-            return current_step
+            return _append_claude_tool_result_substep(data, current_step, content)
 
         def parse_claude_output(line: str, data: dict, log_handle=None) -> None:
             try:
                 event: dict[str, Any] = json.loads(line)
                 event_type = event.get("type")
-
-                if event_type == "assistant":
-                    message = event.get("message", {})
-                    msg_id = message.get("id")
-                    _ensure_step_store(data)
-
-                    # Track unique message IDs as turn proxy
-                    if "seen_msg_ids" not in data:
-                        data["seen_msg_ids"] = set()
-                        data["start_time"] = time.time()
-                    turn_count = len(data["seen_msg_ids"])
-                    if msg_id and msg_id not in data["seen_msg_ids"]:
-                        data["seen_msg_ids"].add(msg_id)
-                        turn_count = len(data["seen_msg_ids"])
-                        _start_step(data, msg_id, f"T{turn_count}")
-
-                        # Accumulate token usage for cost estimation
-                        usage = message.get("usage", {})
-                        if "total_input_tokens" not in data:
-                            data["total_input_tokens"] = 0
-                            data["total_output_tokens"] = 0
-                        data["total_input_tokens"] += usage.get("input_tokens", 0)
-                        data["total_input_tokens"] += usage.get("cache_creation_input_tokens", 0)
-                        data["total_input_tokens"] += usage.get("cache_read_input_tokens", 0)
-                        data["total_output_tokens"] += usage.get("output_tokens", 0)
-
-                        # Calculate runtime
-                        elapsed_seconds = int(time.time() - data["start_time"])
-                        total_tokens = data["total_input_tokens"] + data["total_output_tokens"]
-
-                        # Calculate estimated cost
-                        cost = calculate_cost(
-                            data["total_input_tokens"],
-                            data["total_output_tokens"],
-                            model,
-                        )
-
-                        # Log timestamp to log file at start of each step
-                        if log_handle:
-                            timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-                            write_ops_event(
-                                ops_log_file,
-                                subtype="step_marker",
-                                source="provider",
-                                message=f"Step {turn_count}",
-                                step=turn_count,
-                                step_timestamp=timestamp_str,
-                            )
-
-                        # Add blank line before step (except first step)
-                        formatter.print_step_header(
-                            turn_count,
-                            total_tokens,
-                            cost,
-                            elapsed_seconds,
-                            blank_line_before=turn_count > 1,
-                        )
-                    current_step = data["_step_by_msg_id"].get(msg_id) if msg_id else data.get("_current_step_event")
-                    if current_step is None:
-                        legacy_turn_id = f"T{turn_count}" if turn_count > 0 else None
-                        current_step = _start_step(data, msg_id, legacy_turn_id)
-
-                    for content in message.get("content", []):
-                        if content.get("type") == "tool_use":
-                            tool_name = content.get("name", "unknown")
-                            tool_input = content.get("input", {})
-                            call_id = content.get("id")
-                            seen_tool_use_ids = current_step.setdefault("_seen_tool_use_ids", set())
-                            dedupe_key = call_id or f"{tool_name}:{json.dumps(tool_input, sort_keys=True, default=str)}"
-                            if dedupe_key in seen_tool_use_ids:
-                                continue
-                            seen_tool_use_ids.add(dedupe_key)
-                            current_step["substeps"].append(
-                                {
-                                    "type": "tool_call",
-                                    "source": "provider",
-                                    "call_id": call_id,
-                                    "payload": {
-                                        "tool_name": tool_name,
-                                        "tool_input": tool_input,
-                                    },
-                                    "legacy_turn_id": current_step.get("legacy_turn_id"),
-                                    "legacy_event_id": _allocate_legacy_event_id(data, current_step.get("legacy_turn_id")),
-                                }
-                            )
-
-                            # Extract file path for file-related tools
-                            file_path = tool_input.get("file_path") or tool_input.get("path")
-
-                            # Enhanced logging for specific tools
-                            if tool_name == "Bash":
-                                command = tool_input.get("command", "")
-                                # Truncate to 80 chars
-                                command = truncate_text(command, 80)
-                                formatter.print_tool_event(tool_name, command)
-                            elif tool_name == "Glob":
-                                pattern = tool_input.get("pattern", "")
-                                formatter.print_tool_event(tool_name, pattern)
-                            elif tool_name == "TodoWrite":
-                                todos = tool_input.get("todos", [])
-                                todos_summary = f"{len(todos)} todos"
-                                # Show status breakdown if available (todos may be dicts or strings)
-                                dict_todos = [t for t in todos if isinstance(t, dict)]
-                                if dict_todos:
-                                    pending = sum(1 for t in dict_todos if t.get("status") == "pending")
-                                    in_progress = sum(1 for t in dict_todos if t.get("status") == "in_progress")
-                                    completed = sum(1 for t in dict_todos if t.get("status") == "completed")
-                                    todos_summary += f" (pending: {pending}, in_progress: {in_progress}, completed: {completed})"
-                                formatter.print_tool_event(tool_name, todos_summary)
-                                # Print each todo with status icon and truncated content.
-                                for todo in todos:
-                                    if isinstance(todo, dict):
-                                        status = todo.get("status", "pending")
-                                        content = todo.get("content", "")
-                                    else:
-                                        status = "pending"
-                                        content = str(todo)
-                                    formatter.print_todo(status, truncate_text(content, 60))
-                            elif tool_name == "Edit":
-                                # Enhanced logging for Edit tool
-                                parts = [tool_name]
-                                if file_path:
-                                    parts.append(file_path)
-
-                                # Calculate line count changes
-                                old_string = tool_input.get("old_string", "")
-                                new_string = tool_input.get("new_string", "")
-                                old_lines = old_string.count("\n") + (1 if old_string else 0)
-                                new_lines = new_string.count("\n") + (1 if new_string else 0)
-
-                                # Show line count delta
-                                if old_lines > 0 or new_lines > 0:
-                                    added = max(0, new_lines - old_lines)
-                                    removed = max(0, old_lines - new_lines)
-                                    if added > 0 and removed > 0:
-                                        parts.append(f"(+{added}/-{removed} lines)")
-                                    elif added > 0:
-                                        parts.append(f"(+{added} lines)")
-                                    elif removed > 0:
-                                        parts.append(f"(-{removed} lines)")
-
-                                # Show replace_all indicator
-                                if tool_input.get("replace_all"):
-                                    parts.append("[replace_all]")
-
-                                # Show truncated preview of old_string
-                                if old_string:
-                                    # Get first line of old_string, truncate if needed
-                                    first_line = old_string.split("\n")[0]
-                                    preview = truncate_text(first_line, 40)
-                                    # Escape newlines and quotes for display
-                                    preview = preview.replace("\r", "\\r").replace("\t", "\\t")
-                                    parts.append(f'"{preview}"')
-
-                                formatter.print_tool_event(" ".join(parts))
-                            elif file_path:
-                                formatter.print_tool_event(tool_name, file_path)
-                            else:
-                                parts = [tool_name]
-                                for k, v in tool_input.items():
-                                    parts.append(f"{k}={_format_tool_param(v)}")
-                                formatter.print_tool_event(" ".join(parts))
-                        elif content.get("type") == "tool_result":
-                            current_step = _append_tool_result_substep(data, current_step, content)
-                        elif content.get("type") == "tool_retry":
-                            legacy_turn_id = current_step.get("legacy_turn_id")
-                            current_step["substeps"].append(
-                                {
-                                    "type": "tool_retry",
-                                    "source": "provider",
-                                    "call_id": content.get("id"),
-                                    "payload": {
-                                        "retry_of_call_id": content.get("retry_of_call_id"),
-                                    },
-                                    "legacy_turn_id": legacy_turn_id,
-                                    "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
-                                }
-                            )
-                        elif content.get("type") == "text":
-                            text = content.get("text", "").strip()
-                            if text:
-                                previous = current_step.get("message_text")
-                                current_step["message_text"] = (
-                                    text if not previous else f"{previous}\n{text}"
-                                )
-                                # Display text to console (configurable length, 0 = unlimited)
-                                if chat_text_display_length == 0:
-                                    # Show full text
-                                    formatter.print_agent_message(text)
-                                else:
-                                    # Truncate to first line and max length
-                                    first_line = text.split("\n")[0]
-                                    formatter.print_agent_message(truncate_text(first_line, chat_text_display_length))
-
-                elif event_type == "user":
-                    current_step = data.get("_current_step_event")
-                    for content in message_content_items(event):
-                        item_type = content.get("type")
-                        if item_type == "tool_result":
-                            current_step = _append_tool_result_substep(data, current_step, content)
-                            result_text = str(content.get("content", "") or "").strip()
-                            if result_text:
-                                if bool(content.get("is_error")):
-                                    formatter.print_error(result_text)
-                                else:
-                                    formatter.print_agent_message(result_text)
-                        elif item_type == "text":
-                            text = str(content.get("text", "") or "").strip()
-                            if text:
-                                formatter.print_agent_message(f"user: {text}")
-
-                elif event_type == "system":
-                    subtype = event.get("subtype")
-                    if subtype == "init":
-                        session_id = event.get("session_id")
-                        if session_id and "session_id" not in data:
-                            data["session_id"] = session_id
-                            if on_session_id:
-                                on_session_id(session_id)
-
-                elif event_type == "result":
-                    data["result"] = event
-                    # Also capture session_id from result event if not already seen
-                    session_id = event.get("session_id")
-                    if session_id and "session_id" not in data:
-                            data["session_id"] = session_id
-                            if on_session_id:
-                                on_session_id(session_id)
-                elif event_type == "rate_limit_event":
-                    message = _claude_rate_limit_message(event)
-                    if message:
-                        formatter.print_error(message)
+                method_name = CLAUDE_LIVE_EVENT_HANDLERS.get(str(event_type))
+                if method_name is None:
+                    formatter.print_error(
+                        _unknown_live_type_message("Claude", "event type", event_type)
+                    )
+                    return
+                getattr(self, method_name)(
+                    event=event,
+                    formatter=formatter,
+                    data=data,
+                    model=model,
+                    log_handle=log_handle,
+                    on_session_id=on_session_id,
+                    on_step_count=on_step_count,
+                    chat_text_display_length=chat_text_display_length,
+                    ops_log_file=ops_log_file,
+                    ensure_step_store=_ensure_step_store,
+                    start_step=_start_step,
+                )
 
             except json.JSONDecodeError:
                 # Non-JSON output, just display it
@@ -1609,3 +1504,413 @@ class ClaudeProvider(Provider):
             result.output_tokens = accumulated_data["total_output_tokens"]
 
         return result
+
+    def _handle_live_assistant_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        chat_text_display_length: int,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        start_step: Callable[[dict[str, Any], str | None, str | None], dict[str, Any]],
+    ) -> None:
+        _ = on_session_id, on_step_count
+        message = event.get("message", {})
+        msg_id = message.get("id")
+        ensure_step_store(data)
+
+        if "seen_msg_ids" not in data:
+            data["seen_msg_ids"] = set()
+            data["start_time"] = time.time()
+        turn_count = len(data["seen_msg_ids"])
+        if msg_id and msg_id not in data["seen_msg_ids"]:
+            data["seen_msg_ids"].add(msg_id)
+            turn_count = len(data["seen_msg_ids"])
+            start_step(data, msg_id, f"T{turn_count}")
+
+            usage = message.get("usage", {})
+            if "total_input_tokens" not in data:
+                data["total_input_tokens"] = 0
+                data["total_output_tokens"] = 0
+            data["total_input_tokens"] += usage.get("input_tokens", 0)
+            data["total_input_tokens"] += usage.get("cache_creation_input_tokens", 0)
+            data["total_input_tokens"] += usage.get("cache_read_input_tokens", 0)
+            data["total_output_tokens"] += usage.get("output_tokens", 0)
+
+            elapsed_seconds = int(time.time() - data["start_time"])
+            total_tokens = data["total_input_tokens"] + data["total_output_tokens"]
+            cost = calculate_cost(
+                data["total_input_tokens"],
+                data["total_output_tokens"],
+                model,
+            )
+
+            if log_handle:
+                timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+                write_ops_event(
+                    ops_log_file,
+                    subtype="step_marker",
+                    source="provider",
+                    message=f"Step {turn_count}",
+                    step=turn_count,
+                    step_timestamp=timestamp_str,
+                )
+
+            formatter.print_step_header(
+                turn_count,
+                total_tokens,
+                cost,
+                elapsed_seconds,
+                blank_line_before=turn_count > 1,
+            )
+        current_step = data["_step_by_msg_id"].get(msg_id) if msg_id else data.get("_current_step_event")
+        if current_step is None:
+            legacy_turn_id = f"T{turn_count}" if turn_count > 0 else None
+            current_step = start_step(data, msg_id, legacy_turn_id)
+
+        for content in message.get("content", []):
+            current_step = self._handle_live_assistant_block(
+                content=content,
+                formatter=formatter,
+                data=data,
+                current_step=current_step,
+                chat_text_display_length=chat_text_display_length,
+            )
+
+    def _handle_live_user_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        chat_text_display_length: int,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        start_step: Callable[[dict[str, Any], str | None, str | None], dict[str, Any]],
+    ) -> None:
+        _ = model, log_handle, on_session_id, on_step_count, chat_text_display_length, ops_log_file, ensure_step_store, start_step
+        current_step = data.get("_current_step_event")
+        for content in message_content_items(event):
+            current_step = self._handle_live_user_block(
+                content=content,
+                formatter=formatter,
+                data=data,
+                current_step=current_step,
+            )
+
+    def _handle_live_system_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        chat_text_display_length: int,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        start_step: Callable[[dict[str, Any], str | None, str | None], dict[str, Any]],
+    ) -> None:
+        _ = formatter, model, log_handle, on_step_count, chat_text_display_length, ops_log_file, ensure_step_store, start_step
+        subtype = event.get("subtype")
+        if subtype == "init":
+            session_id = event.get("session_id")
+            if session_id and "session_id" not in data:
+                data["session_id"] = session_id
+                if on_session_id:
+                    on_session_id(session_id)
+
+    def _handle_live_result_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        chat_text_display_length: int,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        start_step: Callable[[dict[str, Any], str | None, str | None], dict[str, Any]],
+    ) -> None:
+        _ = formatter, model, log_handle, on_step_count, chat_text_display_length, ops_log_file, ensure_step_store, start_step
+        data["result"] = event
+        session_id = event.get("session_id")
+        if session_id and "session_id" not in data:
+            data["session_id"] = session_id
+            if on_session_id:
+                on_session_id(session_id)
+
+    def _handle_live_error_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        chat_text_display_length: int,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        start_step: Callable[[dict[str, Any], str | None, str | None], dict[str, Any]],
+    ) -> None:
+        _ = data, model, log_handle, on_session_id, on_step_count, chat_text_display_length, ops_log_file, ensure_step_store, start_step
+        for line in error_lines(event.get("message", "")):
+            formatter.print_error(line.removeprefix("[error] ").removeprefix("[error]").strip() or "error", prefix="Error: ")
+
+    def _handle_live_rate_limit_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        chat_text_display_length: int,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        start_step: Callable[[dict[str, Any], str | None, str | None], dict[str, Any]],
+    ) -> None:
+        _ = data, model, log_handle, on_session_id, on_step_count, chat_text_display_length, ops_log_file, ensure_step_store, start_step
+        message = _claude_rate_limit_message(event)
+        if message:
+            formatter.print_error(message)
+
+    def _handle_live_assistant_block(
+        self,
+        *,
+        content: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        current_step: dict[str, Any],
+        chat_text_display_length: int,
+    ) -> dict[str, Any]:
+        content_type = content.get("type")
+        method_name = CLAUDE_LIVE_ASSISTANT_BLOCK_HANDLERS.get(str(content_type))
+        if method_name is None:
+            formatter.print_error(_unknown_live_type_message("Claude", "assistant block type", content_type))
+            return current_step
+        return getattr(self, method_name)(
+            content=content,
+            formatter=formatter,
+            data=data,
+            current_step=current_step,
+            chat_text_display_length=chat_text_display_length,
+        )
+
+    def _handle_live_assistant_tool_use_block(
+        self,
+        *,
+        content: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        current_step: dict[str, Any],
+        chat_text_display_length: int,
+    ) -> dict[str, Any]:
+        _ = chat_text_display_length
+        tool_name = content.get("name", "unknown")
+        tool_input = content.get("input", {})
+        call_id = content.get("id")
+        seen_tool_use_ids = current_step.setdefault("_seen_tool_use_ids", set())
+        dedupe_key = call_id or f"{tool_name}:{json.dumps(tool_input, sort_keys=True, default=str)}"
+        if dedupe_key in seen_tool_use_ids:
+            return current_step
+        seen_tool_use_ids.add(dedupe_key)
+        current_step["substeps"].append(
+            {
+                "type": "tool_call",
+                "source": "provider",
+                "call_id": call_id,
+                "payload": {
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                },
+                "legacy_turn_id": current_step.get("legacy_turn_id"),
+                "legacy_event_id": _allocate_claude_legacy_event_id(data, current_step.get("legacy_turn_id")),
+            }
+        )
+
+        file_path = tool_input.get("file_path") or tool_input.get("path")
+        if tool_name == "Bash":
+            command = truncate_text(tool_input.get("command", ""), 80)
+            formatter.print_tool_event(tool_name, command)
+        elif tool_name == "Glob":
+            formatter.print_tool_event(tool_name, tool_input.get("pattern", ""))
+        elif tool_name == "TodoWrite":
+            todos = tool_input.get("todos", [])
+            todos_summary = f"{len(todos)} todos"
+            dict_todos = [t for t in todos if isinstance(t, dict)]
+            if dict_todos:
+                pending = sum(1 for t in dict_todos if t.get("status") == "pending")
+                in_progress = sum(1 for t in dict_todos if t.get("status") == "in_progress")
+                completed = sum(1 for t in dict_todos if t.get("status") == "completed")
+                todos_summary += f" (pending: {pending}, in_progress: {in_progress}, completed: {completed})"
+            formatter.print_tool_event(tool_name, todos_summary)
+            for todo in todos:
+                if isinstance(todo, dict):
+                    status = todo.get("status", "pending")
+                    todo_content = todo.get("content", "")
+                else:
+                    status = "pending"
+                    todo_content = str(todo)
+                formatter.print_todo(status, truncate_text(todo_content, 60))
+        elif tool_name == "Edit":
+            parts = [tool_name]
+            if file_path:
+                parts.append(file_path)
+            old_string = tool_input.get("old_string", "")
+            new_string = tool_input.get("new_string", "")
+            old_lines = old_string.count("\n") + (1 if old_string else 0)
+            new_lines = new_string.count("\n") + (1 if new_string else 0)
+            if old_lines > 0 or new_lines > 0:
+                added = max(0, new_lines - old_lines)
+                removed = max(0, old_lines - new_lines)
+                if added > 0 and removed > 0:
+                    parts.append(f"(+{added}/-{removed} lines)")
+                elif added > 0:
+                    parts.append(f"(+{added} lines)")
+                elif removed > 0:
+                    parts.append(f"(-{removed} lines)")
+            if tool_input.get("replace_all"):
+                parts.append("[replace_all]")
+            if old_string:
+                first_line = old_string.split("\n")[0]
+                preview = truncate_text(first_line, 40).replace("\r", "\\r").replace("\t", "\\t")
+                parts.append(f'"{preview}"')
+            formatter.print_tool_event(" ".join(parts))
+        elif file_path:
+            formatter.print_tool_event(tool_name, file_path)
+        else:
+            parts = [tool_name]
+            for key, value in tool_input.items():
+                parts.append(f"{key}={_format_tool_param(value)}")
+            formatter.print_tool_event(" ".join(parts))
+        return current_step
+
+    def _handle_live_assistant_tool_result_block(
+        self,
+        *,
+        content: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        current_step: dict[str, Any],
+        chat_text_display_length: int,
+    ) -> dict[str, Any]:
+        _ = formatter, data, chat_text_display_length
+        return _append_claude_tool_result_substep(data, current_step, content)
+
+    def _handle_live_assistant_tool_retry_block(
+        self,
+        *,
+        content: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        current_step: dict[str, Any],
+        chat_text_display_length: int,
+    ) -> dict[str, Any]:
+        _ = formatter, chat_text_display_length
+        legacy_turn_id = current_step.get("legacy_turn_id")
+        current_step["substeps"].append(
+            {
+                "type": "tool_retry",
+                "source": "provider",
+                "call_id": content.get("id"),
+                "payload": {
+                    "retry_of_call_id": content.get("retry_of_call_id"),
+                },
+                "legacy_turn_id": legacy_turn_id,
+                "legacy_event_id": _allocate_claude_legacy_event_id(data, legacy_turn_id),
+            }
+        )
+        return current_step
+
+    def _handle_live_assistant_text_block(
+        self,
+        *,
+        content: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        current_step: dict[str, Any],
+        chat_text_display_length: int,
+    ) -> dict[str, Any]:
+        _ = data
+        text = content.get("text", "").strip()
+        if not text:
+            return current_step
+        previous = current_step.get("message_text")
+        current_step["message_text"] = text if not previous else f"{previous}\n{text}"
+        if chat_text_display_length == 0:
+            formatter.print_agent_message(text)
+        else:
+            first_line = text.split("\n")[0]
+            formatter.print_agent_message(truncate_text(first_line, chat_text_display_length))
+        return current_step
+
+    def _handle_live_user_block(
+        self,
+        *,
+        content: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        current_step: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        item_type = content.get("type")
+        method_name = CLAUDE_LIVE_USER_BLOCK_HANDLERS.get(str(item_type))
+        if method_name is None:
+            formatter.print_error(_unknown_live_type_message("Claude", "user block type", item_type))
+            return current_step
+        return getattr(self, method_name)(
+            content=content,
+            formatter=formatter,
+            data=data,
+            current_step=current_step,
+        )
+
+    def _handle_live_user_tool_result_block(
+        self,
+        *,
+        content: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        current_step: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        current_step = _append_claude_tool_result_substep(data, current_step, content)
+        result_text = str(content.get("content", "") or "").strip()
+        if result_text:
+            if bool(content.get("is_error")):
+                formatter.print_error(result_text)
+            else:
+                formatter.print_agent_message(result_text)
+        return current_step
+
+    def _handle_live_user_text_block(
+        self,
+        *,
+        content: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        current_step: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        _ = data
+        text = str(content.get("text", "") or "").strip()
+        if text:
+            formatter.print_agent_message(f"user: {text}")
+        return current_step

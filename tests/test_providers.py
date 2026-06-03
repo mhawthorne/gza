@@ -34,8 +34,16 @@ from gza.providers.base import (
     is_docker_running,
     verify_docker_credentials,
 )
-from gza.providers.claude import _claude_rate_limit_message
-from gza.providers.codex import build_headless_exec_args
+from gza.providers.claude import (
+    CLAUDE_EVENT_REGISTRY,
+    CLAUDE_LIVE_EVENT_HANDLERS,
+    _claude_rate_limit_message,
+)
+from gza.providers.codex import (
+    CODEX_EVENT_REGISTRY,
+    CODEX_LIVE_EVENT_HANDLERS,
+    build_headless_exec_args,
+)
 from gza.providers.gemini import calculate_cost
 from gza.providers.output_formatter import (
     StreamOutputFormatter,
@@ -1787,6 +1795,79 @@ class TestClaudeErrorTypeExtraction:
 
 class TestClaudeStepMapping:
     """Tests for Claude message-step/substep mapping."""
+
+    def test_live_event_registry_entries_all_resolve_to_dispatch_handlers(self) -> None:
+        """Every Claude live event registry entry should map to a provider handler."""
+        provider = ClaudeProvider()
+        registered_live_events = {
+            event_type
+            for event_type, metadata in CLAUDE_EVENT_REGISTRY.items()
+            if isinstance(metadata.get("live"), str)
+        }
+
+        assert set(CLAUDE_LIVE_EVENT_HANDLERS) == registered_live_events
+        for handler_name in CLAUDE_LIVE_EVENT_HANDLERS.values():
+            assert hasattr(provider, handler_name)
+
+    def test_routes_system_events_through_registry_dispatch_handler(self, tmp_path) -> None:
+        """Claude top-level live event dispatch should call the registry-derived handler."""
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+        seen_subtypes: list[str] = []
+
+        json_lines = [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "ses_registry"}) + "\n",
+            json.dumps({"type": "result", "subtype": "success"}) + "\n",
+        ]
+
+        def fake_system_handler(**kwargs):
+            seen_subtypes.append(str(kwargs["event"].get("subtype")))
+            kwargs["data"]["session_id"] = "ses_registry"
+
+        with (
+            patch.object(provider, "_handle_live_system_event", side_effect=fake_system_handler),
+            patch("gza.providers.base.subprocess.Popen") as mock_popen,
+        ):
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert seen_subtypes == ["init"]
+        assert result.session_id == "ses_registry"
+
+    def test_reports_top_level_live_error_message(self, tmp_path, capsys) -> None:
+        """Known Claude live error events should keep provider error text."""
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "error", "message": "provider exploded"}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        out = capsys.readouterr().out
+        assert "Error: provider exploded" in out
+        assert "Unhandled Claude event type: error" not in out
 
     def test_maps_assistant_tool_use_and_user_tool_result_to_lifecycle_substeps(self, tmp_path):
         """Claude tool results from real user events should map onto the active assistant step."""
@@ -4481,8 +4562,8 @@ class TestCodexOutputParsing:
         mock_formatter.print_agent_message.assert_called()
         mock_formatter.print_error.assert_called()
 
-    def test_parses_usage_from_non_turn_completed_event(self, tmp_path):
-        """Should capture usage from completion events beyond turn.completed."""
+    def test_reports_unknown_completed_event_with_usage(self, tmp_path, capsys):
+        """Unknown completion events with usage should be surfaced loudly."""
         import json
 
         from gza.providers.codex import CodexProvider
@@ -4511,9 +4592,77 @@ class TestCodexOutputParsing:
                 timeout_minutes=30,
             )
 
-        assert result.input_tokens == 321
-        assert result.output_tokens == 123
-        assert result.cost_usd is not None
+        out = capsys.readouterr().out
+        assert "Unhandled Codex event type: response.completed" in out
+        assert result.input_tokens is None
+        assert result.output_tokens is None
+
+    def test_reports_unknown_error_shaped_event_type(self, tmp_path, capsys):
+        """Unknown error-shaped events should not bypass the unhandled-event path."""
+        import json
+
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({
+                "type": "response.error_details",
+                "error": {"message": "provider changed shape"},
+            }) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        out = capsys.readouterr().out
+        assert "Unhandled Codex event type: response.error_details" in out
+        assert "provider changed shape" not in out
+
+    def test_reports_missing_and_non_string_live_event_types(self, tmp_path, capsys):
+        """Malformed top-level live events should surface loudly and not stop parsing."""
+        import json
+
+        from gza.providers.codex import CodexProvider
+
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"id": "missing-type"}) + "\n",
+            json.dumps({"type": 123}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        out = capsys.readouterr().out
+        assert "Unhandled Codex event type: <missing>" in out
+        assert "Unhandled Codex event type: 123" in out
+        assert "done" in out
 
     def test_estimates_tokens_when_usage_missing(self, tmp_path):
         """Should estimate tokens/cost when no usage event is emitted."""
@@ -5664,9 +5813,87 @@ class TestClaudeFullConversationSimulation:
         log_content = log_file.with_name(f"{log_file.stem}.ops.jsonl").read_text()
         assert log_content.count('"subtype": "step_marker"') == 3
 
+    def test_reports_unknown_live_assistant_block_types(self, tmp_path, capsys):
+        """Unknown Claude live assistant blocks should be surfaced, not silently dropped."""
+        provider = ClaudeProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_unknown",
+                    "usage": {"input_tokens": 10, "output_tokens": 2},
+                    "content": [
+                        {"type": "new_block", "payload": "visible"},
+                        {"type": "text", "text": "known text"},
+                    ],
+                },
+            }) + "\n",
+            json.dumps({"type": "result", "subtype": "success", "session_id": "ses_unknown"}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["claude", "-p", "test"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        out = capsys.readouterr().out
+        assert "Unhandled Claude assistant block type: new_block" in out
+        assert "known text" in out
+
 
 class TestCodexFullConversationSimulation:
     """Simulate a realistic multi-step Codex conversation end-to-end."""
+
+    def test_live_event_registry_entries_all_resolve_to_dispatch_handlers(self) -> None:
+        """Every Codex live event registry entry should map to a provider handler."""
+        provider = CodexProvider()
+        registered_live_events = {
+            event_type
+            for event_type, metadata in CODEX_EVENT_REGISTRY.items()
+            if isinstance(metadata.get("live"), str)
+        }
+
+        assert set(CODEX_LIVE_EVENT_HANDLERS) == registered_live_events
+        for handler_name in CODEX_LIVE_EVENT_HANDLERS.values():
+            assert hasattr(provider, handler_name)
+
+    def test_routes_turn_started_events_through_registry_dispatch_handler(self, tmp_path) -> None:
+        """Codex top-level live event dispatch should call the registry-derived handler."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [json.dumps({"type": "turn.started"}) + "\n"]
+
+        def fake_turn_started_handler(**kwargs):
+            kwargs["data"]["patched_turn_started"] = True
+
+        with (
+            patch.object(provider, "_handle_live_turn_started_event", side_effect=fake_turn_started_handler),
+            patch("gza.providers.base.subprocess.Popen") as mock_popen,
+        ):
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result._accumulated_data["patched_turn_started"] is True
 
     def _build_json_lines(self):
         """3-step conversation across 2 API turns."""
@@ -5876,6 +6103,61 @@ class TestCodexFullConversationSimulation:
             )
 
         assert result.session_id == "thread_abc"
+
+    def test_reports_unknown_live_item_types(self, tmp_path, capsys):
+        """Unknown Codex live items should be surfaced, not silently dropped."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "thread.started", "thread_id": "thread_unknown"}) + "\n",
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "todo_list", "items": []}}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        out = capsys.readouterr().out
+        assert "Unhandled Codex item type: todo_list" in out
+        assert "done" in out
+
+    def test_reports_top_level_live_error_message(self, tmp_path, capsys):
+        """Known Codex live error events should keep provider error text."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "error", "message": "top-level codex error"}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        out = capsys.readouterr().out
+        assert "Error: top-level codex error" in out
+        assert "Unhandled Codex event type: error" not in out
 
 
 class TestGeminiFullConversationSimulation:

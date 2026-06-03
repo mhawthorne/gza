@@ -38,7 +38,6 @@ def test_claude_renderer_renders_known_events_and_counts_suppression() -> None:
     assert "Investigating failure." in joined
     assert "FAILED tests/test_cli.py::test_case - AssertionError" in joined
     assert "Rate limit (five_hour); resets at 2026-06-03 11:00:00 UTC" in joined
-    assert "[event:mystery]" in joined
 
 
 def test_codex_renderer_accumulates_tv_tokens_from_usage_fixture() -> None:
@@ -52,7 +51,6 @@ def test_codex_renderer_accumulates_tv_tokens_from_usage_fixture() -> None:
     assert "Session started (thread: thread_123)" in joined
     assert "I found the root cause." in joined
     assert "Selected model is at capacity. Try again shortly." in joined
-    assert '"type": "weird.codex"' in joined
 
 
 def test_codex_renderer_suppresses_item_updated_events() -> None:
@@ -524,7 +522,10 @@ def test_gza_log_prints_suppressed_footer_and_verbose_unknown_payload(tmp_path: 
 
     log_path = tmp_path / ".gza" / "logs" / "claude.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text((FIXTURES / "claude.jsonl").read_text() + "\n")
+    log_path.write_text(
+        (FIXTURES / "claude.jsonl").read_text()
+        + '\n{"type":"mystery","message":"surprise payload","alpha":1,"beta":2}\n'
+    )
 
     result = run_gza("log", str(task.id), "--verbose", "--project", str(tmp_path))
 

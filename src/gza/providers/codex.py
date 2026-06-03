@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import logging
 import os
 import subprocess
 import time
@@ -43,6 +45,64 @@ if TYPE_CHECKING:
     from ..config import Config
 
 
+logger = logging.getLogger(__name__)
+
+CODEX_EVENT_REGISTRY: dict[str, dict[str, object]] = {
+    "gza": {"render": "_render_gza", "live": False},
+    "raw": {"render": "_render_raw", "live": False},
+    "error": {"render": "_render_error", "live": "_handle_live_error_event"},
+    "thread.started": {"render": "_render_thread_started", "live": "_handle_live_thread_started_event"},
+    "turn.started": {"render": "_render_turn_started", "live": "_handle_live_turn_started_event"},
+    "turn.failed": {"render": "_render_turn_failed", "live": "_handle_live_turn_failed_event"},
+    "turn.completed": {"render": "_render_turn_completed", "live": "_handle_live_turn_completed_event"},
+    "item.started": {"render": "_render_item_started", "live": "_handle_live_item_started_event"},
+    "item.updated": {"render": "_render_item_updated", "live": "_handle_live_item_updated_event"},
+    "item.completed": {"render": "_render_item_completed", "live": "_handle_live_item_completed_event"},
+}
+CODEX_RENDER_EVENT_HANDLERS: dict[str, str] = {
+    event_type: str(method_name)
+    for event_type, metadata in CODEX_EVENT_REGISTRY.items()
+    if (method_name := metadata.get("render")) is not None
+}
+CODEX_RENDER_KNOWN_EVENT_TYPES = frozenset(CODEX_RENDER_EVENT_HANDLERS)
+CODEX_LIVE_EVENT_HANDLERS: dict[str, str] = {
+    event_type: str(handler_name)
+    for event_type, metadata in CODEX_EVENT_REGISTRY.items()
+    if isinstance(handler_name := metadata.get("live"), str)
+}
+CODEX_LIVE_KNOWN_EVENT_TYPES = frozenset(CODEX_LIVE_EVENT_HANDLERS)
+CODEX_ITEM_REGISTRY: dict[str, dict[str, object]] = {
+    "agent_message": {"render": "_render_item_agent_message", "live": "_handle_live_item_agent_message"},
+    "command_execution": {
+        "render": "_render_item_command_execution",
+        "live": "_handle_live_item_command_execution",
+    },
+    "reasoning": {"render": "_render_item_reasoning", "live": "_handle_live_item_reasoning"},
+}
+CODEX_RENDER_ITEM_HANDLERS: dict[str, str] = {
+    item_type: str(handler_name)
+    for item_type, metadata in CODEX_ITEM_REGISTRY.items()
+    if isinstance(handler_name := metadata.get("render"), str)
+}
+CODEX_LIVE_ITEM_HANDLERS: dict[str, str] = {
+    item_type: str(handler_name)
+    for item_type, metadata in CODEX_ITEM_REGISTRY.items()
+    if isinstance(handler_name := metadata.get("live"), str)
+}
+CODEX_RENDER_KNOWN_ITEM_TYPES = frozenset(
+    CODEX_RENDER_ITEM_HANDLERS
+)
+CODEX_LIVE_KNOWN_ITEM_TYPES = frozenset(
+    CODEX_LIVE_ITEM_HANDLERS
+)
+
+
+def _unknown_live_type_message(provider: str, surface: str, type_name: object) -> str:
+    """Build a stable operator-facing message for unhandled live provider output."""
+    rendered_type = str(type_name).strip() if type_name not in (None, "") else "<missing>"
+    return f"Unhandled {provider} {surface}: {rendered_type}"
+
+
 # OpenAI Codex pricing per million tokens (input, output)
 # https://openai.com/api/pricing/
 CODEX_PRICING = {
@@ -74,6 +134,90 @@ def _as_nonnegative_int(value: object) -> int:
     if isinstance(value, (int, float)):
         return max(0, int(value))
     return 0
+
+
+def _ensure_codex_step_store(data: dict[str, Any]) -> None:
+    if "run_step_events" not in data:
+        data["run_step_events"] = []
+        data["_current_step_event"] = None
+        data["_legacy_event_count_by_turn"] = {}
+
+
+def _codex_step_count(data: dict[str, Any]) -> int:
+    return len(data.get("run_step_events", []))
+
+
+def _current_codex_turn_id(data: dict[str, Any]) -> str | None:
+    turn_count = _as_nonnegative_int(data.get("turn_count"))
+    return f"T{turn_count}" if turn_count > 0 else None
+
+
+def _allocate_codex_legacy_event_id(data: dict[str, Any], legacy_turn_id: str | None) -> str | None:
+    if not legacy_turn_id:
+        return None
+    counters = data.get("_legacy_event_count_by_turn")
+    if not isinstance(counters, dict):
+        counters = {}
+        data["_legacy_event_count_by_turn"] = counters
+    current = int(counters.get(legacy_turn_id, 0)) + 1
+    counters[legacy_turn_id] = current
+    return f"{legacy_turn_id}.{current}"
+
+
+def _maybe_mark_codex_max_steps_exceeded(data: dict[str, Any], max_steps: int) -> None:
+    if _codex_step_count(data) > max_steps:
+        data["exceeded_max_steps"] = True
+        data["__terminate_process__"] = True
+
+
+def _codex_step_header_usage(data: dict[str, Any]) -> tuple[int, int]:
+    turn_count = _as_nonnegative_int(data.get("turn_count"))
+    turns_with_usage = data.get("turns_with_usage")
+    has_real_usage_for_turn = isinstance(turns_with_usage, set) and turn_count in turns_with_usage
+
+    if has_real_usage_for_turn:
+        return (
+            _as_nonnegative_int(data.get("input_tokens")),
+            _as_nonnegative_int(data.get("output_tokens")),
+        )
+
+    base_input = _as_nonnegative_int(data.get("input_tokens"))
+    base_output = _as_nonnegative_int(data.get("output_tokens"))
+    approx_input_chars = _as_nonnegative_int(data.get("approx_input_chars"))
+    approx_output_chars = _as_nonnegative_int(data.get("approx_output_chars"))
+    baseline_input_chars = _as_nonnegative_int(data.get("estimate_input_chars_baseline"))
+    baseline_output_chars = _as_nonnegative_int(data.get("estimate_output_chars_baseline"))
+    delta_input_chars = max(0, approx_input_chars - baseline_input_chars)
+    delta_output_chars = max(0, approx_output_chars - baseline_output_chars)
+    est_input = base_input + _estimate_tokens_from_chars(delta_input_chars)
+    est_output = base_output + _estimate_tokens_from_chars(delta_output_chars)
+    return est_input, est_output
+
+
+def _start_codex_step(
+    data: dict[str, Any],
+    message_text: str | None,
+    legacy_turn_id: str | None,
+    *,
+    legacy_event_id: str | None = None,
+    summary: str | None = None,
+    on_step_count: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
+    _ensure_codex_step_store(data)
+    event: dict[str, Any] = {
+        "message_role": "assistant",
+        "message_text": message_text,
+        "legacy_turn_id": legacy_turn_id,
+        "legacy_event_id": legacy_event_id,
+        "substeps": [],
+        "outcome": "completed",
+        "summary": summary,
+    }
+    data["run_step_events"].append(event)
+    data["_current_step_event"] = event
+    if on_step_count:
+        on_step_count(len(data["run_step_events"]))
+    return event
 
 
 def get_pricing_for_model(model: str) -> tuple[float, float]:
@@ -135,48 +279,58 @@ class CodexLogRenderer:
     def _handle(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         self._maybe_accumulate_usage(entry)
         event_type = entry.get("type")
-        if event_type == "gza":
-            return self._render_gza(entry, tv=tv)
-        if event_type == "raw":
-            message = entry.get("message", "")
-            if isinstance(message, str) and message:
-                lines = [rich_escape(message)] if not tv else [message]
-                return RenderedLines(log_lines=lines if not tv else [], tv_lines=lines if tv else [])
-            return RenderedLines()
-        if event_type == "error":
-            if tv:
-                return RenderedLines(tv_lines=tv_error_lines(entry.get("message", "")))
-            return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in error_lines(entry.get("message", ""))])
-        if event_type == "thread.started":
-            thread_id = entry.get("thread_id")
-            if thread_id:
-                self._parity_ready = True
-                line = f"Session started (thread: {thread_id})"
-                log_lines = [line] if not tv else []
-                if not tv:
-                    log_lines.extend(self._model_parity_lines())
-                return RenderedLines(log_lines=log_lines, tv_lines=[line] if tv else [])
+        if not isinstance(event_type, str):
             return self._render_unknown(entry, tv=tv)
-        if event_type == "turn.started":
-            self.suppressed_count += 1
-            return RenderedLines()
-        if event_type == "turn.failed":
-            message = _codex_error_message(entry)
-            if tv:
-                return RenderedLines(tv_lines=tv_error_lines(message))
-            return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in error_lines(message)])
-        if event_type == "turn.completed":
-            self.suppressed_count += 1
-            return RenderedLines()
-        if event_type == "item.started":
-            self.suppressed_count += 1
-            return RenderedLines()
-        if event_type == "item.updated":
-            self.suppressed_count += 1
-            return RenderedLines()
-        if event_type == "item.completed":
-            return self._render_item_completed(entry, tv=tv)
+        method_name = CODEX_RENDER_EVENT_HANDLERS.get(event_type)
+        if method_name is None:
+            return self._render_unknown(entry, tv=tv)
+        method = getattr(self, method_name)
+        return method(entry, tv=tv)
+
+    def _render_raw(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        message = entry.get("message", "")
+        if isinstance(message, str) and message:
+            lines = [rich_escape(message)] if not tv else [message]
+            return RenderedLines(log_lines=lines if not tv else [], tv_lines=lines if tv else [])
+        return RenderedLines()
+
+    def _render_error(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        if tv:
+            return RenderedLines(tv_lines=tv_error_lines(entry.get("message", "")))
+        return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in error_lines(entry.get("message", ""))])
+
+    def _render_thread_started(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        thread_id = entry.get("thread_id")
+        if thread_id:
+            self._parity_ready = True
+            line = f"Session started (thread: {thread_id})"
+            log_lines = [line] if not tv else []
+            if not tv:
+                log_lines.extend(self._model_parity_lines())
+            return RenderedLines(log_lines=log_lines, tv_lines=[line] if tv else [])
         return self._render_unknown(entry, tv=tv)
+
+    def _render_turn_started(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        self.suppressed_count += 1
+        return RenderedLines()
+
+    def _render_turn_failed(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        message = _codex_error_message(entry)
+        if tv:
+            return RenderedLines(tv_lines=tv_error_lines(message))
+        return RenderedLines(log_lines=[f"[red]{rich_escape(line)}[/red]" for line in error_lines(message)])
+
+    def _render_turn_completed(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        self.suppressed_count += 1
+        return RenderedLines()
+
+    def _render_item_started(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        self.suppressed_count += 1
+        return RenderedLines()
+
+    def _render_item_updated(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        self.suppressed_count += 1
+        return RenderedLines()
 
     def _render_gza(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
         subtype = entry.get("subtype", "")
@@ -227,45 +381,54 @@ class CodexLogRenderer:
         if not isinstance(item, dict):
             return self._render_unknown(entry, tv=tv)
         item_type = item.get("type")
-        if item_type == "agent_message":
-            text = item.get("text")
-            if isinstance(text, str) and text.strip():
-                self.stats.step_count += 1
-                if tv:
-                    return RenderedLines(tv_lines=text_to_lines(text), starts_step=True)
-                return RenderedLines(log_lines=[rich_escape(text.strip())], starts_step=True)
-            return self._render_unknown(entry, tv=tv)
-        if item_type == "command_execution":
-            command = item.get("command")
-            if not isinstance(command, str):
-                command = ""
-            output = item.get("aggregated_output")
-            if not isinstance(output, str):
-                output = ""
-            output = output.strip()
-            exit_code = item.get("exit_code")
-            if not command and not output:
-                return self._render_unknown(entry, tv=tv)
+        method_name = CODEX_RENDER_ITEM_HANDLERS.get(str(item_type))
+        if method_name is not None:
+            return getattr(self, method_name)(entry, item=item, tv=tv)
+        return self._render_unknown(entry, tv=tv)
+
+    def _render_item_agent_message(self, entry: dict[str, Any], *, item: dict[str, Any], tv: bool) -> RenderedLines:
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            self.stats.step_count += 1
             if tv:
-                lines = [f"-> $ {truncate_text(strip_shell_wrapper(command), 120)}"] if command else []
-                lines.extend(f"  {line}" for line in text_to_lines(output, max_lines=3, max_chars=120))
-                return RenderedLines(tv_lines=lines)
-            lines = [f"[green]\\[tool: Bash][/green] {rich_escape(strip_shell_wrapper(command))}"] if command else []
-            if output:
-                rendered_output = rich_escape(output if len(output) <= 200 else output[:200] + "...")
-                if isinstance(exit_code, int) and exit_code != 0:
-                    lines.append(f"[red]{rendered_output}[/red]")
-                else:
-                    lines.append(rendered_output)
-            return RenderedLines(log_lines=lines)
-        if item_type == "reasoning":
-            has_signal = any(item.get(key) for key in ("summary", "text", "error"))
-            if not has_signal:
-                self.suppressed_count += 1
-                return RenderedLines()
+                return RenderedLines(tv_lines=text_to_lines(text), starts_step=True)
+            return RenderedLines(log_lines=[rich_escape(text.strip())], starts_step=True)
+        return self._render_unknown(entry, tv=tv)
+
+    def _render_item_command_execution(self, entry: dict[str, Any], *, item: dict[str, Any], tv: bool) -> RenderedLines:
+        command = item.get("command")
+        if not isinstance(command, str):
+            command = ""
+        output = item.get("aggregated_output")
+        if not isinstance(output, str):
+            output = ""
+        output = output.strip()
+        exit_code = item.get("exit_code")
+        if not command and not output:
+            return self._render_unknown(entry, tv=tv)
+        if tv:
+            lines = [f"-> $ {truncate_text(strip_shell_wrapper(command), 120)}"] if command else []
+            lines.extend(f"  {line}" for line in text_to_lines(output, max_lines=3, max_chars=120))
+            return RenderedLines(tv_lines=lines)
+        lines = [f"[green]\\[tool: Bash][/green] {rich_escape(strip_shell_wrapper(command))}"] if command else []
+        if output:
+            rendered_output = rich_escape(output if len(output) <= 200 else output[:200] + "...")
+            if isinstance(exit_code, int) and exit_code != 0:
+                lines.append(f"[red]{rendered_output}[/red]")
+            else:
+                lines.append(rendered_output)
+        return RenderedLines(log_lines=lines)
+
+    def _render_item_reasoning(self, entry: dict[str, Any], *, item: dict[str, Any], tv: bool) -> RenderedLines:
+        _ = entry, tv
+        has_signal = any(item.get(key) for key in ("summary", "text", "error"))
+        if not has_signal:
+            self.suppressed_count += 1
+            return RenderedLines()
         return self._render_unknown(entry, tv=tv)
 
     def _render_unknown(self, entry: dict[str, Any], *, tv: bool) -> RenderedLines:
+        logger.debug("Unhandled Codex log payload: %s", entry.get("type"))
         if tv:
             return RenderedLines(tv_lines=truncated_json_lines(entry))
         lines = [generic_log_summary(entry)]
@@ -762,214 +925,30 @@ class CodexProvider(Provider):
 
                 event: dict[str, Any] = json.loads(line)
                 event_type = event.get("type")
-
-                if event_type == "thread.started":
-                    thread_id = event.get("thread_id")
-                    if thread_id and "thread_id" not in data:
-                        data["thread_id"] = thread_id
-                        if on_session_id:
-                            on_session_id(thread_id)
-                    elif thread_id:
-                        data["thread_id"] = thread_id
-
-                elif event_type == "turn.started":
-                    if "turn_count" not in data:
-                        data["turn_count"] = 0
-                        data["start_time"] = time.time()
-                        data["item_count"] = 0
-                        data["item_count_in_turn"] = 0
-                        data["computed_turn_count"] = 0
-                        data["computed_step_count"] = 0
-                    data["turn_count"] += 1
-                    data["item_count_in_turn"] = 0
-                    data["_current_step_event"] = None
-                    _ensure_step_store(data)
-                    legacy_turn_id = _current_turn_id(data)
-                    if legacy_turn_id:
-                        counters = data.get("_legacy_event_count_by_turn")
-                        if isinstance(counters, dict):
-                            counters.setdefault(legacy_turn_id, 0)
-
-                    # Step headers are now printed when agent_message items
-                    # arrive, so each model response is a logical step (like claude).
-
-                elif event_type == "item.completed":
-                    item = event.get("item", {})
-                    item_type = item.get("type")
-                    data["item_count"] = data.get("item_count", 0) + 1
-                    data["item_count_in_turn"] = data.get("item_count_in_turn", 0) + 1
-
-                    if item_type == "command_execution":
-                        command = item.get("command", "")
-                        aggregated_output = item.get("aggregated_output", "")
-                        data["approx_input_chars"] = data.get("approx_input_chars", 0) + len(command) + len(aggregated_output)
-                        current_step = data.get("_current_step_event")
-                        legacy_turn_id = _current_turn_id(data)
-                        if current_step is None:
-                            current_step = _start_step(
-                                data,
-                                None,
-                                legacy_turn_id,
-                                legacy_event_id=_allocate_legacy_event_id(data, legacy_turn_id),
-                                summary="Pre-message tool activity",
-                            )
-                            _maybe_mark_max_steps_exceeded(data)
-                        call_id = item.get("id")
-                        retry_of_call_id = item.get("retry_of_call_id") or item.get("retry_of")
-
-                        if retry_of_call_id:
-                            current_step["substeps"].append(
-                                {
-                                    "type": "tool_retry",
-                                    "source": "provider",
-                                    "call_id": call_id,
-                                    "payload": {"retry_of_call_id": retry_of_call_id},
-                                    "legacy_turn_id": legacy_turn_id,
-                                    "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
-                                }
-                            )
-
-                        current_step["substeps"].append(
-                            {
-                                "type": "tool_call",
-                                "source": "provider",
-                                "call_id": call_id,
-                                "payload": {
-                                    "tool_name": "Bash",
-                                    "command": command,
-                                    "tool_input": {"command": command},
-                                    "retry_of_call_id": retry_of_call_id,
-                                },
-                                "legacy_turn_id": legacy_turn_id,
-                                "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
-                            }
-                        )
-                        exit_code = item.get("exit_code")
-                        if not isinstance(exit_code, int):
-                            maybe_exit = item.get("status_code")
-                            exit_code = maybe_exit if isinstance(maybe_exit, int) else None
-                        if isinstance(exit_code, int):
-                            substep_type = "tool_output" if exit_code == 0 else "tool_error"
-                            current_step["substeps"].append(
-                                {
-                                    "type": substep_type,
-                                    "source": "provider",
-                                    "call_id": call_id,
-                                    "payload": {
-                                        "exit_code": exit_code,
-                                        "output": aggregated_output,
-                                    },
-                                    "legacy_turn_id": legacy_turn_id,
-                                    "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
-                                }
-                            )
-                        elif aggregated_output:
-                            current_step["substeps"].append(
-                                {
-                                    "type": "tool_output",
-                                    "source": "provider",
-                                    "call_id": call_id,
-                                    "payload": {"output": aggregated_output},
-                                    "legacy_turn_id": legacy_turn_id,
-                                    "legacy_event_id": _allocate_legacy_event_id(data, legacy_turn_id),
-                                }
-                            )
-                        # Truncate to 80 chars
-                        command = truncate_text(command, 80)
-                        formatter.print_tool_event("Bash", command)
-
-                    elif item_type == "agent_message":
-                        data["computed_turn_count"] = data.get("computed_turn_count", 0) + 1
-                        raw_text = item.get("text", "")
-                        data["approx_output_chars"] = data.get("approx_output_chars", 0) + len(raw_text)
-
-                        # Treat each agent_message as a new logical step
-                        # (like claude does with each unique msg_id)
-                        data["computed_step_count"] = data.get("computed_step_count", 0) + 1
-                        step_num = data["computed_step_count"]
-
-                        elapsed_seconds = int(time.time() - data.get("start_time", time.time()))
-                        display_input_tokens, display_output_tokens = _step_header_usage(data)
-                        total_tokens = display_input_tokens + display_output_tokens
-                        cost = calculate_cost(display_input_tokens, display_output_tokens, model)
-
-                        if log_handle:
-                            from datetime import datetime
-                            timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-                            write_ops_event(
-                                ops_log_file,
-                                subtype="step_marker",
-                                source="provider",
-                                message=f"Step {step_num}",
-                                step=step_num,
-                                step_timestamp=timestamp_str,
-                            )
-
-                        formatter.print_step_header(
-                            step_num,
-                            total_tokens,
-                            cost,
-                            elapsed_seconds,
-                            blank_line_before=step_num > 1,
-                        )
-
-                        legacy_turn_id = _current_turn_id(data)
-                        _start_step(
-                            data,
-                            raw_text.strip() or None,
-                            legacy_turn_id,
-                            legacy_event_id=_allocate_legacy_event_id(data, legacy_turn_id),
-                        )
-                        _maybe_mark_max_steps_exceeded(data)
-
-                        text = raw_text.strip()
-                        if text:
-                            if chat_text_display_length == 0:
-                                formatter.print_agent_message(text)
-                            else:
-                                first_line = text.split("\n")[0]
-                                formatter.print_agent_message(
-                                    truncate_text(first_line, chat_text_display_length)
-                                )
-
-                    elif item_type == "reasoning":
-                        # Optional: show reasoning (currently skipped)
-                        pass
-
-                # Codex usage may appear in different completion/error events depending on
-                # execution mode. Capture usage from all completion/error events.
-                if (
-                    isinstance(event_type, str)
-                    and (event_type.endswith(".completed") or event_type.endswith(".error"))
-                    and isinstance(event.get("usage"), dict)
-                ):
-                    usage = event["usage"]
-                    input_tokens = _as_nonnegative_int(usage.get("input_tokens"))
-                    output_tokens = _as_nonnegative_int(usage.get("output_tokens"))
-                    cached_tokens = _as_nonnegative_int(usage.get("cached_input_tokens"))
-                    usage_key = (data.get("turn_count"), input_tokens, output_tokens, cached_tokens)
-                    usage_events_seen = data.get("usage_events_seen")
-                    if isinstance(usage_events_seen, set) and usage_key not in usage_events_seen:
-                        usage_events_seen.add(usage_key)
-                        if "input_tokens" not in data:
-                            data["input_tokens"] = 0
-                            data["output_tokens"] = 0
-                            data["cached_tokens"] = 0
-                        data["input_tokens"] += input_tokens
-                        data["output_tokens"] += output_tokens
-                        data["cached_tokens"] += cached_tokens
-                        turns_with_usage = data.get("turns_with_usage")
-                        if isinstance(turns_with_usage, set):
-                            turns_with_usage.add(_as_nonnegative_int(data.get("turn_count")))
-                        # Rebase estimate deltas so already-priced turns are not
-                        # counted again in later step headers.
-                        data["estimate_input_chars_baseline"] = _as_nonnegative_int(data.get("approx_input_chars"))
-                        data["estimate_output_chars_baseline"] = _as_nonnegative_int(data.get("approx_output_chars"))
-
-                elif event_type == "turn.failed":
-                    formatter.print_error(f"Error: {_codex_error_message(event)}")
-                elif isinstance(event_type, str) and "error" in event_type:
-                    formatter.print_error(f"Error: {_codex_error_message(event)}")
+                method_name = (
+                    CODEX_LIVE_EVENT_HANDLERS.get(event_type)
+                    if isinstance(event_type, str)
+                    else None
+                )
+                if method_name is None:
+                    formatter.print_error(
+                        _unknown_live_type_message("Codex", "event type", event_type)
+                    )
+                    return
+                getattr(self, method_name)(
+                    event=event,
+                    formatter=formatter,
+                    data=data,
+                    model=model,
+                    max_steps=max_steps,
+                    chat_text_display_length=chat_text_display_length,
+                    log_handle=log_handle,
+                    on_session_id=on_session_id,
+                    on_step_count=on_step_count,
+                    ops_log_file=ops_log_file,
+                    ensure_step_store=_ensure_step_store,
+                    current_turn_id=_current_turn_id,
+                )
 
             except json.JSONDecodeError:
                 # Non-JSON output, just display it
@@ -1033,3 +1012,406 @@ class CodexProvider(Provider):
                 result.session_id = accumulated["thread_id"]
 
         return result
+
+    def _handle_live_thread_started_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        current_turn_id: Callable[[dict[str, Any]], str | None],
+    ) -> None:
+        _ = formatter, model, max_steps, chat_text_display_length, log_handle, on_step_count, ops_log_file, ensure_step_store, current_turn_id
+        thread_id = event.get("thread_id")
+        if thread_id and "thread_id" not in data:
+            data["thread_id"] = thread_id
+            if on_session_id:
+                on_session_id(thread_id)
+        elif thread_id:
+            data["thread_id"] = thread_id
+
+    def _handle_live_turn_started_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        current_turn_id: Callable[[dict[str, Any]], str | None],
+    ) -> None:
+        _ = event, formatter, model, max_steps, chat_text_display_length, log_handle, on_session_id, on_step_count, ops_log_file
+        if "turn_count" not in data:
+            data["turn_count"] = 0
+            data["start_time"] = time.time()
+            data["item_count"] = 0
+            data["item_count_in_turn"] = 0
+            data["computed_turn_count"] = 0
+            data["computed_step_count"] = 0
+        data["turn_count"] += 1
+        data["item_count_in_turn"] = 0
+        data["_current_step_event"] = None
+        ensure_step_store(data)
+        legacy_turn_id = current_turn_id(data)
+        if legacy_turn_id:
+            counters = data.get("_legacy_event_count_by_turn")
+            if isinstance(counters, dict):
+                counters.setdefault(legacy_turn_id, 0)
+
+    def _handle_live_turn_failed_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        current_turn_id: Callable[[dict[str, Any]], str | None],
+    ) -> None:
+        _ = data, model, max_steps, chat_text_display_length, log_handle, on_session_id, on_step_count, ops_log_file, ensure_step_store, current_turn_id
+        formatter.print_error(f"Error: {_codex_error_message(event)}")
+
+    def _handle_live_error_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        current_turn_id: Callable[[dict[str, Any]], str | None],
+    ) -> None:
+        _ = data, model, max_steps, chat_text_display_length, log_handle, on_session_id, on_step_count, ops_log_file, ensure_step_store, current_turn_id
+        formatter.print_error(f"Error: {_codex_error_message(event)}")
+
+    def _handle_live_turn_completed_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        current_turn_id: Callable[[dict[str, Any]], str | None],
+    ) -> None:
+        _ = formatter, model, max_steps, chat_text_display_length, log_handle, on_session_id, on_step_count, ops_log_file, ensure_step_store, current_turn_id
+        if not isinstance(event.get("usage"), dict):
+            return
+        usage = event["usage"]
+        input_tokens = _as_nonnegative_int(usage.get("input_tokens"))
+        output_tokens = _as_nonnegative_int(usage.get("output_tokens"))
+        cached_tokens = _as_nonnegative_int(usage.get("cached_input_tokens"))
+        usage_key = (data.get("turn_count"), input_tokens, output_tokens, cached_tokens)
+        usage_events_seen = data.get("usage_events_seen")
+        if isinstance(usage_events_seen, set) and usage_key not in usage_events_seen:
+            usage_events_seen.add(usage_key)
+            if "input_tokens" not in data:
+                data["input_tokens"] = 0
+                data["output_tokens"] = 0
+                data["cached_tokens"] = 0
+            data["input_tokens"] += input_tokens
+            data["output_tokens"] += output_tokens
+            data["cached_tokens"] += cached_tokens
+            turns_with_usage = data.get("turns_with_usage")
+            if isinstance(turns_with_usage, set):
+                turns_with_usage.add(_as_nonnegative_int(data.get("turn_count")))
+            data["estimate_input_chars_baseline"] = _as_nonnegative_int(data.get("approx_input_chars"))
+            data["estimate_output_chars_baseline"] = _as_nonnegative_int(data.get("approx_output_chars"))
+
+    def _handle_live_item_started_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        current_turn_id: Callable[[dict[str, Any]], str | None],
+    ) -> None:
+        _ = event, formatter, data, model, max_steps, chat_text_display_length, log_handle, on_session_id, on_step_count, ops_log_file, ensure_step_store, current_turn_id
+
+    def _handle_live_item_updated_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        current_turn_id: Callable[[dict[str, Any]], str | None],
+    ) -> None:
+        _ = event, formatter, data, model, max_steps, chat_text_display_length, log_handle, on_session_id, on_step_count, ops_log_file, ensure_step_store, current_turn_id
+
+    def _handle_live_item_completed_event(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_session_id: Callable[[str], None] | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+        ensure_step_store: Callable[[dict[str, Any]], None],
+        current_turn_id: Callable[[dict[str, Any]], str | None],
+    ) -> None:
+        _ = on_session_id, ensure_step_store, current_turn_id
+        self._handle_live_item_completed(
+            event=event,
+            formatter=formatter,
+            data=data,
+            model=model,
+            max_steps=max_steps,
+            chat_text_display_length=chat_text_display_length,
+            log_handle=log_handle,
+            on_step_count=on_step_count,
+            ops_log_file=ops_log_file,
+        )
+
+    def _handle_live_item_completed(
+        self,
+        *,
+        event: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+    ) -> None:
+        item = event.get("item", {})
+        item_type = item.get("type") if isinstance(item, dict) else None
+        method_name = CODEX_LIVE_ITEM_HANDLERS.get(str(item_type))
+        if method_name is None:
+            formatter.print_error(_unknown_live_type_message("Codex", "item type", item_type))
+            return
+        data["item_count"] = data.get("item_count", 0) + 1
+        data["item_count_in_turn"] = data.get("item_count_in_turn", 0) + 1
+        getattr(self, method_name)(
+            item=item,
+            formatter=formatter,
+            data=data,
+            model=model,
+            max_steps=max_steps,
+            chat_text_display_length=chat_text_display_length,
+            log_handle=log_handle,
+            on_step_count=on_step_count,
+            ops_log_file=ops_log_file,
+        )
+
+    def _handle_live_item_command_execution(
+        self,
+        *,
+        item: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+    ) -> None:
+        _ = model, chat_text_display_length, log_handle, on_step_count, ops_log_file
+        command = item.get("command", "")
+        aggregated_output = item.get("aggregated_output", "")
+        data["approx_input_chars"] = data.get("approx_input_chars", 0) + len(command) + len(aggregated_output)
+        current_step = data.get("_current_step_event")
+        legacy_turn_id = _current_codex_turn_id(data)
+        if current_step is None:
+            current_step = _start_codex_step(
+                data,
+                None,
+                legacy_turn_id,
+                legacy_event_id=_allocate_codex_legacy_event_id(data, legacy_turn_id),
+                summary="Pre-message tool activity",
+                on_step_count=on_step_count,
+            )
+            _maybe_mark_codex_max_steps_exceeded(data, max_steps)
+        call_id = item.get("id")
+        retry_of_call_id = item.get("retry_of_call_id") or item.get("retry_of")
+
+        if retry_of_call_id:
+            current_step["substeps"].append(
+                {
+                    "type": "tool_retry",
+                    "source": "provider",
+                    "call_id": call_id,
+                    "payload": {"retry_of_call_id": retry_of_call_id},
+                    "legacy_turn_id": legacy_turn_id,
+                    "legacy_event_id": _allocate_codex_legacy_event_id(data, legacy_turn_id),
+                }
+            )
+
+        current_step["substeps"].append(
+            {
+                "type": "tool_call",
+                "source": "provider",
+                "call_id": call_id,
+                "payload": {
+                    "tool_name": "Bash",
+                    "command": command,
+                    "tool_input": {"command": command},
+                    "retry_of_call_id": retry_of_call_id,
+                },
+                "legacy_turn_id": legacy_turn_id,
+                "legacy_event_id": _allocate_codex_legacy_event_id(data, legacy_turn_id),
+            }
+        )
+        exit_code = item.get("exit_code")
+        if not isinstance(exit_code, int):
+            maybe_exit = item.get("status_code")
+            exit_code = maybe_exit if isinstance(maybe_exit, int) else None
+        if isinstance(exit_code, int):
+            substep_type = "tool_output" if exit_code == 0 else "tool_error"
+            current_step["substeps"].append(
+                {
+                    "type": substep_type,
+                    "source": "provider",
+                    "call_id": call_id,
+                    "payload": {
+                        "exit_code": exit_code,
+                        "output": aggregated_output,
+                    },
+                    "legacy_turn_id": legacy_turn_id,
+                    "legacy_event_id": _allocate_codex_legacy_event_id(data, legacy_turn_id),
+                }
+            )
+        elif aggregated_output:
+            current_step["substeps"].append(
+                {
+                    "type": "tool_output",
+                    "source": "provider",
+                    "call_id": call_id,
+                    "payload": {"output": aggregated_output},
+                    "legacy_turn_id": legacy_turn_id,
+                    "legacy_event_id": _allocate_codex_legacy_event_id(data, legacy_turn_id),
+                }
+            )
+        formatter.print_tool_event("Bash", truncate_text(command, 80))
+
+    def _handle_live_item_agent_message(
+        self,
+        *,
+        item: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+    ) -> None:
+        data["computed_turn_count"] = data.get("computed_turn_count", 0) + 1
+        raw_text = item.get("text", "")
+        data["approx_output_chars"] = data.get("approx_output_chars", 0) + len(raw_text)
+        data["computed_step_count"] = data.get("computed_step_count", 0) + 1
+        step_num = data["computed_step_count"]
+
+        elapsed_seconds = int(time.time() - data.get("start_time", time.time()))
+        display_input_tokens, display_output_tokens = _codex_step_header_usage(data)
+        total_tokens = display_input_tokens + display_output_tokens
+        cost = calculate_cost(display_input_tokens, display_output_tokens, model)
+
+        if log_handle:
+            from datetime import datetime
+            timestamp_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            write_ops_event(
+                ops_log_file,
+                subtype="step_marker",
+                source="provider",
+                message=f"Step {step_num}",
+                step=step_num,
+                step_timestamp=timestamp_str,
+            )
+
+        formatter.print_step_header(
+            step_num,
+            total_tokens,
+            cost,
+            elapsed_seconds,
+            blank_line_before=step_num > 1,
+        )
+
+        legacy_turn_id = _current_codex_turn_id(data)
+        _start_codex_step(
+            data,
+            raw_text.strip() or None,
+            legacy_turn_id,
+            legacy_event_id=_allocate_codex_legacy_event_id(data, legacy_turn_id),
+            on_step_count=on_step_count,
+        )
+        _maybe_mark_codex_max_steps_exceeded(data, max_steps)
+
+        text = raw_text.strip()
+        if text:
+            if chat_text_display_length == 0:
+                formatter.print_agent_message(text)
+            else:
+                first_line = text.split("\n")[0]
+                formatter.print_agent_message(truncate_text(first_line, chat_text_display_length))
+
+    def _handle_live_item_reasoning(
+        self,
+        *,
+        item: dict[str, Any],
+        formatter: StreamOutputFormatter,
+        data: dict[str, Any],
+        model: str,
+        max_steps: int,
+        chat_text_display_length: int,
+        log_handle: io.TextIOBase | None,
+        on_step_count: Callable[[int], None] | None,
+        ops_log_file: Path | None,
+    ) -> None:
+        _ = item, formatter, data, model, max_steps, chat_text_display_length, log_handle, on_step_count, ops_log_file

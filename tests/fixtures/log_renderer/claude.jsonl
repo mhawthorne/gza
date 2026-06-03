@@ -6,5 +6,4 @@
 {"type":"rate_limit_event","rate_limit_info":{"status":"denied","rateLimitType":"five_hour","resetsAt":"2026-06-03T11:00:00Z"}}
 {"type":"assistant","message":{"id":"msg_2","content":[]}}
 {"type":"error","message":"provider exploded"}
-{"type":"mystery","message":"surprise payload","role":"assistant","alpha":1,"beta":2}
 {"type":"result","subtype":"success","result":"Finished cleanly.","total_cost_usd":0.1234}
