@@ -9462,6 +9462,87 @@ class TestIterateCommand:
         run_foreground.assert_not_called()
         assert f"No remaining iterate action: implementation {impl.id} has no remaining commits to land." in output
 
+    def test_iterate_suppresses_historical_prerequisite_unmerged_failure_once_reconciled_empty(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+        from gza.recovery_engine import _MergeContext
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dependency = store.add("Merged dependency", task_type="implement")
+        assert dependency.id is not None
+        dependency.status = "completed"
+        dependency.branch = "feature/dependency"
+        dependency.has_commits = True
+        dependency.completed_at = datetime.now(UTC)
+        store.update(dependency)
+        store.set_merge_status(dependency.id, "merged")
+
+        failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id)
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "PREREQUISITE_UNMERGED"
+        failed.branch = "feature/prereq-empty"
+        failed.has_commits = False
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        class _EmptyBranchGit:
+            def resolve_fresh_merge_source(self, branch: str):
+                from gza.git import ResolvedMergeSourceRef
+
+                return ResolvedMergeSourceRef(branch)
+
+            def rev_parse_if_exists(self, ref: str) -> str | None:
+                if ref in {"main", "feature/prereq-empty"}:
+                    return "abc123"
+                return None
+
+            def branch_exists(self, branch: str) -> bool:
+                return bool(branch)
+
+            def is_merged(self, branch: str, into: str) -> bool:
+                return False
+
+        args = argparse.Namespace(
+            impl_task_id=failed.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.recovery_engine._load_merge_context",
+                lambda _project_dir=None: _MergeContext(git=_EmptyBranchGit(), default_branch="main"),
+            ),
+            patch(
+                "gza.cli.execution._run_foreground",
+                side_effect=AssertionError("iterate should not start foreground work for reconciled empty failures"),
+            ) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 0
+        run_foreground.assert_not_called()
+        assert f"No remaining iterate action: implementation {failed.id} has no remaining commits to land." in output
+
     def test_latest_review_needs_discussion_blocks(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch

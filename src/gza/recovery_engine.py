@@ -15,6 +15,7 @@ from .failed_task_ordering import sort_failed_tasks
 from .failure_policy import is_resumable_failure_reason
 from .git import Git, GitError
 from .lifecycle_completion import task_is_complete_for_lifecycle
+from .merge_state import resolve_task_merge_state_for_target
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ _DIRECT_CHILD_SUPERSEDED_REASONS: tuple[tuple[str, str, str], ...] = (
 RecoveryAction = Literal["resume", "retry", "skip"]
 RecoveryRole = Literal["original", "resume", "retry"]
 FailureCategory = Literal["timeout", "retryable", "manual"]
+PrerequisiteUnmergedReconciliation = Literal["dependency_not_ready", "moot_empty", "ordinary_failed"]
 
 
 @dataclass(frozen=True)
@@ -629,6 +631,7 @@ def resolve_recovery_planning_task(store: SqliteTaskStore, task: DbTask) -> DbTa
     """Return the task that should own normal lifecycle planning for this lineage."""
     if task.status != "failed":
         return task
+    _reconcile_historical_prerequisite_unmerged_failure(store, task)
     snapshot = _build_recovery_chain_snapshot(store, task)
     return snapshot.latest_completed_terminal_descendant or task
 
@@ -720,6 +723,61 @@ def _expected_recovery_action(
     return None
 
 
+def _task_has_provider_output(task: DbTask) -> bool:
+    return bool(task.output_content or task.report_file)
+
+
+def _reconcile_historical_prerequisite_unmerged_failure(
+    store: SqliteTaskStore,
+    task: DbTask,
+) -> PrerequisiteUnmergedReconciliation:
+    """Reconcile historical pre-provider dependency failures into moot empty work when proven.
+
+    This is the one explicit mutation point for legacy ``PREREQUISITE_UNMERGED``
+    rows created before the runner started parking never-ran dependency-blocked
+    tasks back in ``pending``.
+    """
+    if task.status != "failed" or (task.failure_reason or "UNKNOWN") != "PREREQUISITE_UNMERGED":
+        return "ordinary_failed"
+
+    if task.depends_on and store.resolve_dependency_completion(task) is None:
+        return "dependency_not_ready"
+    if get_unmerged_dependency_precondition(store, task) is not None:
+        return "dependency_not_ready"
+    if task.has_commits or _task_has_provider_output(task):
+        return "ordinary_failed"
+
+    if task.id is None:
+        return "moot_empty"
+
+    unit = store.resolve_merge_unit_for_task(task.id)
+    if unit is not None and unit.state == "empty":
+        return "moot_empty"
+
+    if task.branch:
+        try:
+            merge_context = _load_merge_context(_project_dir_for_store(store))
+            target_branch = _resolve_merge_context_target_branch(store, merge_context)
+            if merge_context.git is None:
+                return "ordinary_failed"
+            resolved_state = resolve_task_merge_state_for_target(
+                store=store,
+                task=task,
+                git=merge_context.git,
+                target_branch=target_branch,
+            )
+            if resolved_state != "empty":
+                return "ordinary_failed"
+        except MergeTargetResolutionError:
+            return "ordinary_failed"
+
+        unit = unit or store.get_or_create_merge_unit_for_task(task)
+        if unit is not None:
+            store.set_merge_unit_state(unit.id, "empty")
+
+    return "moot_empty"
+
+
 def _skip_decision(
     *,
     task_id: str,
@@ -784,18 +842,10 @@ def decide_failed_task_recovery(
             attempt_limit=attempt_limit,
         )
 
-    if max_recovery_attempts <= 0:
-        return _skip_decision(
-            task_id=task_id,
-            reason_code="automatic_recovery_disabled",
-            reason_text="automatic recovery is disabled",
-            attempt_index=attempt_index,
-            attempt_limit=attempt_limit,
-        )
-
     reason = task.failure_reason or "UNKNOWN"
     if reason == "PREREQUISITE_UNMERGED":
-        if task.depends_on and store.resolve_dependency_completion(task) is None:
+        reconciliation = _reconcile_historical_prerequisite_unmerged_failure(store, task)
+        if reconciliation == "dependency_not_ready":
             return _skip_decision(
                 task_id=task_id,
                 reason_code="dependency_not_ready",
@@ -803,11 +853,11 @@ def decide_failed_task_recovery(
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,
             )
-        if get_unmerged_dependency_precondition(store, task) is not None:
+        if reconciliation == "moot_empty":
             return _skip_decision(
                 task_id=task_id,
-                reason_code="dependency_not_ready",
-                reason_text="dependency precondition not satisfied",
+                reason_code="merge_unit_empty",
+                reason_text="moot/no work (empty branch)",
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,
             )
@@ -816,6 +866,15 @@ def decide_failed_task_recovery(
             task_id=task_id,
             reason_code="manual_failure_reason",
             reason_text=f"{reason} requires manual intervention",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
+
+    if max_recovery_attempts <= 0:
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="automatic_recovery_disabled",
+            reason_text="automatic recovery is disabled",
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,
         )

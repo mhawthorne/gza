@@ -7564,6 +7564,87 @@ def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None
     )
 
 
+def test_watch_restart_failed_skips_historical_prerequisite_unmerged_row_after_empty_reconciliation(
+    tmp_path: Path,
+) -> None:
+    from gza.recovery_engine import _MergeContext
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Merged dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.branch = "feature/dependency"
+    dependency.has_commits = True
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+    store.set_merge_status(dependency.id, "merged")
+
+    failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/prereq-empty"
+    failed.has_commits = False
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    class _EmptyBranchGit:
+        def resolve_fresh_merge_source(self, branch: str):
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref in {"main", "feature/prereq-empty"}:
+                return "abc123"
+            return None
+
+        def branch_exists(self, branch: str) -> bool:
+            return bool(branch)
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            return False
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch(
+            "gza.recovery_engine._load_merge_context",
+            lambda _project_dir=None: _MergeContext(git=_EmptyBranchGit(), default_branch="main"),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=AssertionError("watch should not retry reconciled empty prerequisite failures"),
+        ) as spawn_worker,
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("watch should not iterate reconciled empty prerequisite failures"),
+        ) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            restart_failed_batch=1,
+            max_recovery_attempts=1,
+        )
+
+    assert result.work_done is False
+    spawn_worker.assert_not_called()
+    spawn_iterate.assert_not_called()
+    assert store.get_based_on_children(failed.id) == []
+
+
 def test_cmd_watch_reexecs_on_next_pass_even_when_work_is_still_running(tmp_path: Path) -> None:
     """Detached workers should not block watch from restarting to pick up drifted code."""
     setup_config(tmp_path)

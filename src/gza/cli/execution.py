@@ -2567,13 +2567,20 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             f"Task {impl_task.id} is {impl_task.status}. Can only iterate completed, pending, or failed tasks.",
         )
 
-    if impl_task.status == "failed" and not use_resume and not use_retry:
+    resolved_unit = store.resolve_merge_unit_for_task(impl_task.id) if impl_task.id is not None else None
+    failed_task_is_lifecycle_moot = bool(
+        impl_task.status == "failed"
+        and resolved_unit is not None
+        and merge_state_is_terminal_for_lifecycle(resolved_unit.state)
+    )
+
+    if impl_task.status == "failed" and not use_resume and not use_retry and not failed_task_is_lifecycle_moot:
         return phase1_error(
             args,
             f"Task {impl_task.id} is failed. Use --resume or --retry to specify how to restart it.",
         )
 
-    if (use_resume or use_retry) and impl_task.status != "failed":
+    if (use_resume or use_retry) and (impl_task.status != "failed" or failed_task_is_lifecycle_moot):
         if resolved_from_failed_ancestor and requested_impl_task.status == "failed":
             use_resume = False
             use_retry = False
