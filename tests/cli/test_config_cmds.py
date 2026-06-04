@@ -3662,6 +3662,7 @@ class TestWatchConfigValidation:
             ("failure_backoff_initial", "bad"),
             ("failure_backoff_max", "bad"),
             ("failure_halt_after", "bad"),
+            ("no_progress_cycles", "bad"),
             ("no_activity_timeout", "bad"),
             ("poll", "bad"),
             ("max_idle", "bad"),
@@ -3683,6 +3684,7 @@ class TestWatchConfigValidation:
             "failure_backoff_initial",
             "failure_backoff_max",
             "failure_halt_after",
+            "no_progress_cycles",
             "no_activity_timeout",
             "poll",
             "max_idle",
@@ -3708,6 +3710,7 @@ class TestWatchConfigValidation:
             "  failure_backoff_initial: 30\n"
             "  failure_backoff_max: 900\n"
             "  failure_halt_after: 6\n"
+            "  no_progress_cycles: 4\n"
             "  no_activity_timeout: 75\n"
             "  poll: 45\n"
             "  max_idle: 180\n"
@@ -3718,6 +3721,7 @@ class TestWatchConfigValidation:
         assert config.watch.failure_backoff_initial == 30
         assert config.watch.failure_backoff_max == 900
         assert config.watch.failure_halt_after == 6
+        assert config.watch.no_progress_cycles == 4
         assert config.watch.no_activity_timeout == 75
         assert config.watch.poll == 45
         assert config.watch.max_idle == 180

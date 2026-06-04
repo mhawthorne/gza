@@ -83,6 +83,7 @@ DEFAULT_WATCH_MAX_ITERATIONS = 10
 DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL = 60
 DEFAULT_WATCH_FAILURE_BACKOFF_MAX = 3600
 DEFAULT_WATCH_FAILURE_HALT_AFTER: int | None = 10
+DEFAULT_WATCH_NO_PROGRESS_CYCLES = 3
 DEFAULT_WATCH_RESTART_FAILED_BATCH = 1
 DEFAULT_ITERATE_MAX_ITERATIONS = 3
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
@@ -199,6 +200,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
         "failure_backoff_initial": None,
         "failure_backoff_max": None,
         "failure_halt_after": None,
+        "no_progress_cycles": None,
     },
     "iterate_max_iterations": None,
     "interactive_worktree_dir": None,
@@ -833,6 +835,7 @@ class WatchConfig:
     failure_backoff_initial: int = DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL
     failure_backoff_max: int = DEFAULT_WATCH_FAILURE_BACKOFF_MAX
     failure_halt_after: int | None = DEFAULT_WATCH_FAILURE_HALT_AFTER
+    no_progress_cycles: int = DEFAULT_WATCH_NO_PROGRESS_CYCLES
 
 
 @dataclass
@@ -1886,6 +1889,14 @@ class Config:
                 raise ConfigError("watch.failure_halt_after must be null or a positive integer")
             if watch_failure_halt_after < 1:
                 raise ConfigError("watch.failure_halt_after must be null or a positive integer")
+        try:
+            watch_no_progress_cycles = int(
+                watch_data.get("no_progress_cycles", DEFAULT_WATCH_NO_PROGRESS_CYCLES)
+            )
+        except (TypeError, ValueError):
+            raise ConfigError("watch.no_progress_cycles must be a positive integer")
+        if watch_no_progress_cycles < 1:
+            raise ConfigError("watch.no_progress_cycles must be a positive integer")
 
         watch_config = WatchConfig(
             batch=watch_batch,
@@ -1897,6 +1908,7 @@ class Config:
             failure_backoff_initial=watch_failure_backoff_initial,
             failure_backoff_max=watch_failure_backoff_max,
             failure_halt_after=watch_failure_halt_after,
+            no_progress_cycles=watch_no_progress_cycles,
         )
         interactive_worktree_dir = data.get("interactive_worktree_dir", DEFAULT_INTERACTIVE_WORKTREE_DIR)
 
@@ -2408,6 +2420,12 @@ class Config:
                         or watch_data["failure_halt_after"] < 1
                     ):
                         errors.append("watch.failure_halt_after must be null or a positive integer")
+                if "no_progress_cycles" in watch_data:
+                    if (
+                        not isinstance(watch_data["no_progress_cycles"], int)
+                        or watch_data["no_progress_cycles"] < 1
+                    ):
+                        errors.append("watch.no_progress_cycles must be a positive integer")
 
         if "claude_args" in data:
             warnings.append("'claude_args' is deprecated. Migrate to 'claude.args'.")

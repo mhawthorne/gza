@@ -970,6 +970,7 @@ watch.failure_backoff_max
 watch.failure_halt_after
 watch.max_idle
 watch.no_activity_timeout
+watch.no_progress_cycles
 watch.max_iterations
 watch.poll
 watch.restart_failed_batch
@@ -1673,6 +1674,8 @@ watch:
 ```
 
 `watch.no_activity_timeout` controls when watch reconciliation marks a still-running worker `NO_ACTIVITY` because its task log has stopped receiving writes. `watch.max_idle` keeps its existing meaning: it exits the `gza watch` loop itself after consecutive idle cycles. These settings are independent.
+
+`watch.no_progress_cycles` sets the restart-safe no-progress backstop threshold for `gza watch`. When watch selects the same unchanged worker-launch or recovery action for the same merge unit or lineage across that many cycles without durable progress, it parks the subject with `watch-no-progress-backstop` instead of respawning the no-op forever.
 
 When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
 `INFO      scope: tags=<comma-separated-tags> mode=all|any`.

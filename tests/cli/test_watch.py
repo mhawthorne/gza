@@ -49,9 +49,15 @@ from gza.cli.watch import (
 from gza.cli.advance_executor import AdvanceActionExecutionResult
 import gza.colors as colors
 from gza.config import Config
+from gza.db import WatchProgressObservation
 from gza.git import GitError
 from gza.lineage_query import LineageOwnerRow
 from gza.recovery_engine import decide_failed_task_recovery
+from gza.watch_progress import (
+    WATCH_NO_PROGRESS_BACKSTOP_REASON,
+    build_watch_progress_candidate,
+    clear_watch_progress_subject,
+)
 from gza.workers import WorkerMetadata, WorkerRegistry
 
 from .conftest import make_store, run_gza, setup_config
@@ -76,6 +82,11 @@ def _make_watch_git() -> MagicMock:
     git.get_diff_stat_parsed.return_value = (1, 1, 0)
     git.get_diff_numstat.return_value = "1\t0\tfeature.txt\n"
     return git
+
+
+def _append_watch_config(tmp_path: Path, extra: str) -> None:
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + extra)
 
 
 def _run_cycle_and_emit_transition_events(
@@ -7049,6 +7060,370 @@ def test_watch_cycle_improve_routes_impl_chain_through_iterate_without_creating_
         line.split(maxsplit=2)[1] == "START" and f"{impl.id} iterate" in line
         for line in log_path.read_text().splitlines()
     )
+
+
+def test_watch_cycle_parks_repeated_identical_iterate_no_progress_across_restart(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/no-progress-park"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+    store.get_or_create_merge_unit_for_task(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    git = _make_watch_git()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=1) as spawn_iterate,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+        restarted_store = make_store(tmp_path)
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=restarted_store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    assert spawn_iterate.call_count == 1
+    text = log_path.read_text()
+    assert text.count("ATTENTION") == 1
+    assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
+    assert text.count(f"{impl.id} iterate") == 1
+
+
+def test_clear_watch_progress_subject_clears_persisted_observation_for_subject(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/no-progress-clear"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action={"type": "improve", "review_task": review},
+        action_task=impl,
+        failed_task=None,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            streak=1,
+            parked_reason=None,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    clear_watch_progress_subject(store, subject_task=impl)
+
+    assert store.list_watch_progress_observations(
+        subject_kind="merge_unit",
+        subject_id=unit.id,
+    ) == []
+
+
+def test_watch_cycle_successful_iterate_start_resets_no_progress_streak(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/no-progress-iterate-reset"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    git = _make_watch_git()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=[0, 1]) as spawn_iterate,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+        assert store.list_watch_progress_observations(
+            subject_kind="merge_unit",
+            subject_id=unit.id,
+        ) == []
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    assert spawn_iterate.call_count == 2
+    text = log_path.read_text()
+    assert text.count("ATTENTION") == 1
+    assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
+    assert any("START_FAILED" in line and str(impl.id) in line for line in text.splitlines())
+    assert any("START" in line and f"{impl.id} iterate" in line for line in text.splitlines())
+
+
+def test_watch_cycle_successful_recovery_launch_resets_no_progress_streak(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-123"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=[0, 1]) as spawn_iterate,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        assert store.list_watch_progress_observations(
+            subject_kind="lineage",
+            subject_id=str(failed.id),
+        ) == []
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert spawn_iterate.call_count == 2
+    assert len(store.get_based_on_children(failed.id)) == 1
+    text = log_path.read_text()
+    assert text.count("ATTENTION") == 1
+    assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
+    assert any("START_FAILED" in line and str(failed.id) in line for line in text.splitlines())
+    assert any("RECOVR" in line and f"{failed.id} resume via iterate" in line for line in text.splitlines())
+
+
+def test_watch_cycle_resets_no_progress_streak_after_merge_unit_progress(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/no-progress-reset"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+        store.refresh_merge_unit_head(unit.id, "new-head-sha", "new-base-sha")
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+
+    assert spawn_iterate.call_count == 2
+    text = log_path.read_text()
+    assert "ATTENTION" not in text
+
+
+def test_query_owner_rows_surfaces_persisted_watch_no_progress_backstop(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/no-progress-surface"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+    store.get_or_create_merge_unit_for_task(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    action = {"type": "improve", "review_task": review}
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            streak=2,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    with patch("gza.cli.advance_engine.determine_next_action", return_value=action):
+        rows = _query_owner_rows(
+            store=store,
+            config=Config.load(tmp_path),
+            git=_make_watch_git(),
+            target_branch="main",
+            max_recovery_attempts=1,
+            include_skipped=True,
+        )
+
+    row = next(row for row in rows if row.owner_task.id == impl.id)
+    assert row.lineage_status == "needs_attention"
+    assert row.next_action is not None
+    assert row.next_action["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
 
 
 def test_watch_cycle_dedupes_merge_not_default_skip_across_cycles(tmp_path: Path) -> None:

@@ -20,6 +20,10 @@ from .source_followup import (
     resolve_source_followup_state,
     source_task_needs_implementation_followup,
 )
+from .watch_progress import (
+    build_watch_progress_candidate,
+    get_active_watch_no_progress_attention,
+)
 
 if TYPE_CHECKING:
     from .config import Config
@@ -884,6 +888,7 @@ def query_lineage_owner_rows(
         recovery_leaf_task: DbTask | None = None
         max_recovery_attempts = query.max_recovery_attempts if query.max_recovery_attempts is not None else 1
         failed_action_candidate: DbTask | None = None
+        failed_action_candidate_decision = None
         for failed_task in sorted(
             failed_leaves,
             key=lambda task: (
@@ -909,6 +914,7 @@ def query_lineage_owner_rows(
                 continue
             if decision.action != "skip" or attention_action is not None:
                 failed_action_candidate = failed_task
+                failed_action_candidate_decision = decision
                 break
         if failed_action_candidate is not None:
             recovery_action_task = failed_action_candidate
@@ -922,6 +928,25 @@ def query_lineage_owner_rows(
         if planning_task is None:
             planning_task = recovery_action_task
         action: dict[str, Any] | None = None
+        if (
+            failed_action_candidate is not None
+            and failed_action_candidate_decision is not None
+            and failed_action_candidate.id is not None
+            and failed_action_candidate_decision.action in {"resume", "retry"}
+        ):
+            recovery_action = {
+                "type": failed_action_candidate_decision.action,
+                "description": failed_action_candidate_decision.reason_text,
+                "recovery_task_id": failed_action_candidate_decision.recovery_task_id,
+            }
+            candidate = build_watch_progress_candidate(
+                store,
+                subject_task=failed_action_candidate,
+                action=recovery_action,
+                action_task=failed_action_candidate,
+                failed_task=failed_action_candidate,
+            )
+            action = get_active_watch_no_progress_attention(store, candidate=candidate)
         if planning_task is None:
             blocked_pending = next(
                 (task for task in unresolved_tasks if blocked_by_empty_prereq_label(store, task) is not None),
@@ -964,6 +989,17 @@ def query_lineage_owner_rows(
                 impl_based_on_ids=indexes.non_dropped_impl_source_ids,
                 max_resume_attempts=query.max_recovery_attempts,
             )
+            if lifecycle_action_task is not None and lifecycle_action_task.id is not None:
+                candidate = build_watch_progress_candidate(
+                    store,
+                    subject_task=owner,
+                    action=action,
+                    action_task=lifecycle_action_task,
+                    failed_task=None,
+                )
+                parked_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
+                if parked_attention is not None:
+                    action = parked_attention
         lineage_status = _classify_lineage_status(action) if action is not None else "actionable"
         if not query.include_skipped and lineage_status == "skipped":
             continue

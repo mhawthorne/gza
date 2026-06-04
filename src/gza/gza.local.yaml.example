@@ -280,6 +280,9 @@
 #   Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`.
 #   Default: 60
 #   no_activity_timeout: 60
+#   Repeated unchanged watch-action cycles before the subject is parked for manual attention.
+#   Default: 3
+#   no_progress_cycles: 3
 #   Polling interval seconds for `gza watch`.
 #   Default: 300
 #   poll: 300

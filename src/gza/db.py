@@ -36,6 +36,7 @@ __all__ = [
     "SchemaIntegrityError",
     "Task",
     "MergeUnit",
+    "WatchProgressObservation",
     "TaskComment",
     "TaskStats",
     "SqliteTaskStore",
@@ -515,6 +516,28 @@ class DependencyMergeUnitResolution:
     merge_unit: MergeUnit | None
 
 
+@dataclass(frozen=True)
+class WatchProgressObservation:
+    """Persisted watch-pass observation for restart-safe no-progress detection."""
+
+    subject_kind: str
+    subject_id: str
+    action_type: str
+    action_reason: str
+    subject_task_id: str | None = None
+    action_task_id: str | None = None
+    action_task_status: str | None = None
+    failed_task_id: str | None = None
+    recovery_task_id: str | None = None
+    merge_unit_id: str | None = None
+    merge_unit_state: str | None = None
+    merge_unit_head_sha: str | None = None
+    evidence_fingerprint: str = ""
+    streak: int = 1
+    parked_reason: str | None = None
+    observed_at: datetime | None = None
+
+
 _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "projects": ("created_at", "last_seen_at"),
     "tasks": (
@@ -538,6 +561,7 @@ _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
         "sync_last_synced_at",
     ),
     "merge_unit_tasks": ("attached_at",),
+    "watch_progress_observations": ("observed_at",),
 }
 _DB_TIMESTAMP_COLUMN_NAMES: frozenset[str] = frozenset(
     column for columns in _DB_TIMESTAMP_COLUMNS.values() for column in columns
@@ -701,6 +725,29 @@ CREATE INDEX IF NOT EXISTS idx_merge_unit_tasks_project_task
     ON merge_unit_tasks(project_id, task_id);
 CREATE INDEX IF NOT EXISTS idx_merge_unit_tasks_project_unit_role
     ON merge_unit_tasks(project_id, merge_unit_id, role);
+
+CREATE TABLE IF NOT EXISTS watch_progress_observations (
+    project_id TEXT NOT NULL,
+    subject_kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    action_reason TEXT NOT NULL,
+    subject_task_id TEXT,
+    action_task_id TEXT,
+    action_task_status TEXT,
+    failed_task_id TEXT,
+    recovery_task_id TEXT,
+    merge_unit_id TEXT,
+    merge_unit_state TEXT,
+    merge_unit_head_sha TEXT,
+    evidence_fingerprint TEXT NOT NULL,
+    streak INTEGER NOT NULL DEFAULT 1,
+    parked_reason TEXT,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, subject_kind, subject_id, action_type, action_reason)
+);
+CREATE INDEX IF NOT EXISTS idx_watch_progress_subject
+    ON watch_progress_observations(project_id, subject_kind, subject_id);
 """
 
 # Migration from v42 to v43: persisted rebase diff change signal
@@ -746,8 +793,34 @@ CREATE INDEX IF NOT EXISTS idx_merge_units_project_state_source
     ON merge_units(project_id, state, merge_source);
 """
 
+# Migration from v49 to v50: restart-safe watch no-progress observations
+MIGRATION_V49_TO_V50 = """
+CREATE TABLE IF NOT EXISTS watch_progress_observations (
+    project_id TEXT NOT NULL,
+    subject_kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    action_reason TEXT NOT NULL,
+    subject_task_id TEXT,
+    action_task_id TEXT,
+    action_task_status TEXT,
+    failed_task_id TEXT,
+    recovery_task_id TEXT,
+    merge_unit_id TEXT,
+    merge_unit_state TEXT,
+    merge_unit_head_sha TEXT,
+    evidence_fingerprint TEXT NOT NULL,
+    streak INTEGER NOT NULL DEFAULT 1,
+    parked_reason TEXT,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, subject_kind, subject_id, action_type, action_reason)
+);
+CREATE INDEX IF NOT EXISTS idx_watch_progress_subject
+    ON watch_progress_observations(project_id, subject_kind, subject_id);
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 49
+SCHEMA_VERSION = 50
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -1458,7 +1531,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50}
 )
 
 
@@ -1550,6 +1623,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         47: ("tasks", "review_scope"),
         48: ("tasks", "model_is_explicit"),
         49: ("merge_units", "merge_source"),
+        50: ("watch_progress_observations", "observed_at"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -1569,6 +1643,17 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
             "Auto-migration to v49 incomplete: missing required index "
             "idx_merge_units_project_state_source"
         )
+    if target_version >= 50:
+        for table in ("watch_progress_observations",):
+            if not _table_exists(conn, table):
+                raise RuntimeError(
+                    f"Auto-migration to v50 incomplete: missing required table {table}"
+                )
+        if not _index_exists(conn, "idx_watch_progress_subject"):
+            raise RuntimeError(
+                "Auto-migration to v50 incomplete: missing required index "
+                "idx_watch_progress_subject"
+            )
 
 
 def _ensure_required_auto_migration_artifacts(
@@ -1718,6 +1803,61 @@ def _ensure_required_auto_migration_artifacts(
                 raise SchemaIntegrityError(
                     "Schema integrity check failed while repairing required index "
                     "idx_merge_units_project_state_source: use a writable database."
+                ) from exc
+    if target_version >= 50:
+        if not _table_exists(conn, "watch_progress_observations"):
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS watch_progress_observations (
+                        project_id TEXT NOT NULL,
+                        subject_kind TEXT NOT NULL,
+                        subject_id TEXT NOT NULL,
+                        action_type TEXT NOT NULL,
+                        action_reason TEXT NOT NULL,
+                        subject_task_id TEXT,
+                        action_task_id TEXT,
+                        action_task_status TEXT,
+                        failed_task_id TEXT,
+                        recovery_task_id TEXT,
+                        merge_unit_id TEXT,
+                        merge_unit_state TEXT,
+                        merge_unit_head_sha TEXT,
+                        evidence_fingerprint TEXT NOT NULL,
+                        streak INTEGER NOT NULL DEFAULT 1,
+                        parked_reason TEXT,
+                        observed_at TEXT NOT NULL,
+                        PRIMARY KEY(project_id, subject_kind, subject_id, action_type, action_reason)
+                    )
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required table watch_progress_observations; "
+                        "use a writable database to complete migration to v50, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required table "
+                    "watch_progress_observations: use a writable database."
+                ) from exc
+        if not _index_exists(conn, "idx_watch_progress_subject"):
+            try:
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_watch_progress_subject
+                        ON watch_progress_observations(project_id, subject_kind, subject_id)
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required index idx_watch_progress_subject; "
+                        "use a writable database to complete migration to v50, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required index "
+                    "idx_watch_progress_subject: use a writable database."
                 ) from exc
 
 SCHEMA = """
@@ -2236,6 +2376,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (47, MIGRATION_V46_TO_V47),
     (48, MIGRATION_V47_TO_V48),
     (49, MIGRATION_V48_TO_V49),
+    (50, MIGRATION_V49_TO_V50),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -2461,6 +2602,13 @@ class SqliteTaskStore:
         self._supports_merge_units_cache = result
         return result
 
+    def supports_watch_progress_observations(self) -> bool:
+        """Return whether restart-safe watch observation storage is available."""
+        if self._open_mode == "query_only":
+            return self._query_only_table_exists.get("watch_progress_observations", False)
+        with self._connect() as conn:
+            return _table_exists(conn, "watch_progress_observations")
+
     def default_merge_target(self, *, strict: bool = False) -> str:
         """Resolve the default merge target branch for stored merge units.
 
@@ -2641,6 +2789,7 @@ class SqliteTaskStore:
             "projects",
             "merge_units",
             "merge_unit_tasks",
+            "watch_progress_observations",
         )
         self._query_only_table_exists = {table: _table_exists(conn, table) for table in tables}
         self._query_only_columns = {
@@ -4069,6 +4218,161 @@ class SqliteTaskStore:
             diff_lines_removed=int(row["diff_lines_removed"]) if row["diff_lines_removed"] is not None else None,
             superseded_by_unit_id=str(row["superseded_by_unit_id"]) if row["superseded_by_unit_id"] is not None else None,
         )
+
+    def _row_to_watch_progress_observation(self, row: sqlite3.Row | None) -> WatchProgressObservation | None:
+        if row is None:
+            return None
+        return WatchProgressObservation(
+            subject_kind=str(row["subject_kind"]),
+            subject_id=str(row["subject_id"]),
+            action_type=str(row["action_type"]),
+            action_reason=str(row["action_reason"]),
+            subject_task_id=str(row["subject_task_id"]) if row["subject_task_id"] is not None else None,
+            action_task_id=str(row["action_task_id"]) if row["action_task_id"] is not None else None,
+            action_task_status=str(row["action_task_status"]) if row["action_task_status"] is not None else None,
+            failed_task_id=str(row["failed_task_id"]) if row["failed_task_id"] is not None else None,
+            recovery_task_id=str(row["recovery_task_id"]) if row["recovery_task_id"] is not None else None,
+            merge_unit_id=str(row["merge_unit_id"]) if row["merge_unit_id"] is not None else None,
+            merge_unit_state=str(row["merge_unit_state"]) if row["merge_unit_state"] is not None else None,
+            merge_unit_head_sha=str(row["merge_unit_head_sha"]) if row["merge_unit_head_sha"] is not None else None,
+            evidence_fingerprint=str(row["evidence_fingerprint"]),
+            streak=int(row["streak"]) if row["streak"] is not None else 1,
+            parked_reason=str(row["parked_reason"]) if row["parked_reason"] is not None else None,
+            observed_at=_parse_db_timestamp(row["observed_at"]),
+        )
+
+    def list_watch_progress_observations(
+        self,
+        *,
+        subject_kind: str,
+        subject_id: str,
+    ) -> list[WatchProgressObservation]:
+        """Return persisted watch observations for one subject."""
+        if not self.supports_watch_progress_observations():
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM watch_progress_observations
+                WHERE project_id = ?
+                  AND subject_kind = ?
+                  AND subject_id = ?
+                ORDER BY observed_at DESC, action_type ASC, action_reason ASC
+                """,
+                (self._project_id, subject_kind, subject_id),
+            ).fetchall()
+        return [
+            observation
+            for row in rows
+            if (observation := self._row_to_watch_progress_observation(row)) is not None
+        ]
+
+    def get_watch_progress_observation(
+        self,
+        *,
+        subject_kind: str,
+        subject_id: str,
+        action_type: str,
+        action_reason: str,
+    ) -> WatchProgressObservation | None:
+        """Fetch one persisted watch observation for a subject/action pair."""
+        if not self.supports_watch_progress_observations():
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM watch_progress_observations
+                WHERE project_id = ?
+                  AND subject_kind = ?
+                  AND subject_id = ?
+                  AND action_type = ?
+                  AND action_reason = ?
+                """,
+                (self._project_id, subject_kind, subject_id, action_type, action_reason),
+            ).fetchone()
+        return self._row_to_watch_progress_observation(row)
+
+    def delete_watch_progress_subject(self, *, subject_kind: str, subject_id: str) -> None:
+        """Clear persisted watch observations for one subject."""
+        if not self.supports_watch_progress_observations():
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM watch_progress_observations
+                WHERE project_id = ?
+                  AND subject_kind = ?
+                  AND subject_id = ?
+                """,
+                (self._project_id, subject_kind, subject_id),
+            )
+
+    def upsert_watch_progress_observation(self, observation: WatchProgressObservation) -> None:
+        """Insert or replace one persisted watch observation row."""
+        if not self.supports_watch_progress_observations():
+            return
+        observed_at = _format_db_timestamp(observation.observed_at or datetime.now(UTC))
+        assert observed_at is not None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO watch_progress_observations(
+                    project_id,
+                    subject_kind,
+                    subject_id,
+                    action_type,
+                    action_reason,
+                    subject_task_id,
+                    action_task_id,
+                    action_task_status,
+                    failed_task_id,
+                    recovery_task_id,
+                    merge_unit_id,
+                    merge_unit_state,
+                    merge_unit_head_sha,
+                    evidence_fingerprint,
+                    streak,
+                    parked_reason,
+                    observed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, subject_kind, subject_id, action_type, action_reason)
+                DO UPDATE SET
+                    subject_task_id = excluded.subject_task_id,
+                    action_task_id = excluded.action_task_id,
+                    action_task_status = excluded.action_task_status,
+                    failed_task_id = excluded.failed_task_id,
+                    recovery_task_id = excluded.recovery_task_id,
+                    merge_unit_id = excluded.merge_unit_id,
+                    merge_unit_state = excluded.merge_unit_state,
+                    merge_unit_head_sha = excluded.merge_unit_head_sha,
+                    evidence_fingerprint = excluded.evidence_fingerprint,
+                    streak = excluded.streak,
+                    parked_reason = excluded.parked_reason,
+                    observed_at = excluded.observed_at
+                """,
+                (
+                    self._project_id,
+                    observation.subject_kind,
+                    observation.subject_id,
+                    observation.action_type,
+                    observation.action_reason,
+                    observation.subject_task_id,
+                    observation.action_task_id,
+                    observation.action_task_status,
+                    observation.failed_task_id,
+                    observation.recovery_task_id,
+                    observation.merge_unit_id,
+                    observation.merge_unit_state,
+                    observation.merge_unit_head_sha,
+                    observation.evidence_fingerprint,
+                    observation.streak,
+                    observation.parked_reason,
+                    observed_at,
+                ),
+            )
 
     def create_merge_unit(
         self,

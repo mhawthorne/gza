@@ -148,7 +148,25 @@ When the installed `gza` package fingerprint changes while watch is running:
 - Watch MUST reuse the shared bounded recovery policy; it MUST NOT invent a different
   resume/retry/manual boundary from `advance` or `iterate`.
 
-### 8. Tag scope is a hard boundary
+### 8. Restart-safe no-progress loops must park instead of respawn forever
+
+- Watch MUST persist a no-progress observation for each repeated worker-launch or
+  recovery-launch candidate, keyed by the subject merge unit when one exists or otherwise
+  by the subject lineage, plus the selected action type and reason.
+- The persisted observation MUST include enough evidence to distinguish durable progress
+  from a true no-op repeat: merge-unit identity/state/head, selected action type/reason,
+  action task ID, relevant failed/recovery task ID, and current task status.
+- Watch MUST increment the no-progress streak only when the next cycle selects the same
+  subject/action with unchanged evidence. Restarting watch MUST NOT reset that streak.
+- Watch MUST reset the streak whenever durable progress occurs, including a new task,
+  worker start, task status transition, recovery edge creation, review/improve/rebase
+  completion, branch-head change, merge-unit state change, or a different selected
+  action/reason.
+- When the streak reaches `watch.no_progress_cycles`, watch MUST park the subject with a
+  shared needs-attention reason of `watch-no-progress-backstop` and MUST stop respawning
+  that unchanged no-op automatically.
+
+### 9. Tag scope is a hard boundary
 
 - `watch --tag ...` MUST only act on work that matches the requested scope.
 - Out-of-scope work MUST NOT consume watch slots, be merged, be resumed/retried, or be
@@ -156,7 +174,7 @@ When the installed `gza` package fingerprint changes while watch is running:
 - Scope banners, wake summaries, and attention output SHOULD make the active scope
   explicit so operators can tell when watch is intentionally ignoring other work.
 
-### 9. Stop signals stop the supervisor, not the detached workers
+### 10. Stop signals stop the supervisor, not the detached workers
 
 - On `SIGINT` or `SIGTERM`, watch MUST stop the supervisor loop cleanly at the next safe
   boundary and return a signal-derived exit status.
@@ -192,6 +210,7 @@ The existence of these knobs is contract; their values are operator policy.
 | `watch.max_iterations` | Iterate-worker loop cap for implementation chains launched by watch |
 | `watch.failure_backoff_initial` / `watch.failure_backoff_max` | Exponential cooldown after non-auto-resumable failures |
 | `watch.failure_halt_after` | Failure streak threshold that stops watch for human intervention |
+| `watch.no_progress_cycles` | Repeated unchanged watch-action cycles before the supervisor parks the subject with `watch-no-progress-backstop` |
 | `watch.no_activity_timeout` | Reconciliation threshold for deciding a live in-progress worker has gone silent and must be failed/reconciled |
 | `--tag` / `--any-tag` | Supervisor execution scope |
 | `--[no-]auto-restart-on-drift` | Whether installed-code drift triggers automatic re-exec at the next cycle boundary |
