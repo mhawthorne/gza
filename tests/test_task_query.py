@@ -1035,16 +1035,14 @@ def test_dependency_state_blocked_by_dropped_dep_filters_pending_only(tmp_path: 
     blocked_pending_dropped.completed_at = datetime.now(UTC)
     store.update(blocked_pending_dropped)
 
-    resolved_dep = store.add("Dropped with retry", task_type="implement")
+    resolved_dep = store.add("Dropped with retry", task_type="plan")
     resolved_dep.status = "dropped"
     resolved_dep.completed_at = datetime.now(UTC) - timedelta(hours=2)
     store.update(resolved_dep)
     assert resolved_dep.id is not None
-    retry = store.add("Resolved retry", task_type="implement", based_on=resolved_dep.id)
+    retry = store.add("Resolved retry", task_type="plan", based_on=resolved_dep.id)
     retry.status = "completed"
     retry.completed_at = datetime.now(UTC) - timedelta(hours=1)
-    retry.has_commits = True
-    retry.merge_status = "unmerged"
     store.update(retry)
     blocked_resolved = store.add("Blocked but resolved", task_type="implement", depends_on=resolved_dep.id)
 

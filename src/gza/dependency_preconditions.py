@@ -52,11 +52,11 @@ def resolved_dependency_satisfies_task_readiness(
     dependent: DbTask,
 ) -> bool:
     """Return whether a resolved completed dependency makes ``dependent`` runnable."""
+    if dependent.task_type not in MERGE_REQUIRED_DEPENDENCY_TASK_TYPES:
+        return True
     if prereq.task_type not in MERGE_REQUIRED_DEPENDENCY_TASK_TYPES:
         return True
-    if _resolved_merge_state(store, prereq) != "empty":
-        return True
-    return empty_prereq_satisfies_dependency(store, prereq, dependent)
+    return task_satisfies_merge_dependency(store, prereq, dependent)
 
 
 def dependency_is_ready(
