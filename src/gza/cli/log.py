@@ -659,9 +659,9 @@ def _print_log_header(
     console.print()
 
 
-def _print_failure_focus(task: DbTask, log_path: Path, config: Config) -> None:
+def _print_failure_focus(task: DbTask, log_path: Path, config: Config, store: SqliteTaskStore) -> None:
     """Print failure-first diagnostics for a failed task."""
-    diagnostics = _build_failure_diagnostics(task, log_path, config.verify_command)
+    diagnostics = _build_failure_diagnostics(task, log_path, config.verify_command, store=store)
     _render_failure_diagnostics(
         diagnostics,
         label_color=_lc(),
@@ -858,7 +858,7 @@ def cmd_log(args: argparse.Namespace) -> int:
             if task.status != "failed":
                 print(f"Error: Task {task.id} is not failed")
                 return 1
-            _print_failure_focus(task, log_path, config)
+            _print_failure_focus(task, log_path, config, store)
             return 0
 
         _sep = f"[{_lc()}]" + "━" * 70 + f"[/{_lc()}]"

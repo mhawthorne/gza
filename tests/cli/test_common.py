@@ -413,8 +413,9 @@ class TestExtractLastAgentMessageForFailure:
         assert _extract_last_agent_message_for_failure(log_path) == "Usable explanation"
 
 
-def test_failure_summary_describes_agent_forfeit() -> None:
-    assert _failure_summary("AGENT_FORFEIT") == "Agent forfeited: could not complete the task."
+def test_failure_summary_describes_agent_forfeit(tmp_path: Path) -> None:
+    task = SqliteTaskStore(tmp_path / "test.db").add("Failed task")
+    assert _failure_summary(task, "AGENT_FORFEIT") == "Agent forfeited: could not complete the task."
 
 
 def test_failure_next_steps_for_agent_forfeit_skip_resume(tmp_path: Path) -> None:

@@ -1,8 +1,10 @@
 """Tests for log display CLI commands."""
 
 
+import argparse
 import json
 import os
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -471,6 +473,58 @@ class TestLogCommand:
         for fragment in expected_fragments:
             assert fragment in show_result.stdout
             assert fragment in log_result.stdout
+
+    def test_log_failure_surfaces_empty_lookup_unavailable_without_retry_guidance(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from gza.cli.log import cmd_log
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Lookup failure task", task_type="implement")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "PREREQUISITE_UNMERGED"
+        task.log_file = ".gza/logs/lookup-failure.log"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "lookup-failure.log").write_text('{"type":"result","subtype":"error_max_turns","result":"stopped"}\n')
+
+        wrapped_store = MagicMock(wraps=store)
+        wrapped_store.resolve_merge_unit_for_task.side_effect = sqlite3.OperationalError(
+            "simulated merge-unit lookup failure"
+        )
+        monkeypatch.setattr("gza.cli.log.get_store", lambda _config: wrapped_store)
+
+        args = argparse.Namespace(
+            identifier=str(task.id),
+            slug=False,
+            worker=False,
+            follow=False,
+            raw=False,
+            failure=True,
+            timeline_mode=None,
+            tail=None,
+            project_dir=tmp_path,
+        )
+
+        rc = cmd_log(args)
+        output = capsys.readouterr().out
+
+        assert rc == 0
+        assert "Failure Reason: PREREQUISITE_UNMERGED" in output
+        assert "Dependency-ordering failure guidance unavailable;" in output
+        assert "empty/moot merge-unit lookup unavailable: simulated merge-unit lookup failure" in output
+        assert "gza retry" not in output
+        assert "gza merge" not in output
 
     def test_failure_marker_stripping_is_identical_for_show_and_log_failure(self, tmp_path: Path):
         """Marker lines should be stripped from explanation text in both show and log --failure."""

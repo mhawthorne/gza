@@ -779,18 +779,18 @@ def _target_already_merged_description(ctx: AdvanceContext) -> str:
     state = ctx.post_merge_rebase_state
     reason = state.reason if state is not None else None
     if reason == "merge-unit-empty":
-        return "SKIP: no remaining commits to merge into target branch"
+        return "SKIP: moot (no task commits)"
     return f"SKIP: target implementation already merged ({reason or 'post-merge proof'})"
 
 
 def _merge_terminal_description(ctx: AdvanceContext) -> str:
     if getattr(ctx, "merge_state", None) == "empty":
-        return "SKIP: no remaining commits to merge into target branch"
+        return "SKIP: moot (no task commits)"
     return "SKIP: already merged into target branch"
 
 
 def _empty_merge_state_description(_ctx: AdvanceContext) -> str:
-    return "SKIP: moot/no work (empty branch)"
+    return "SKIP: moot (no task commits)"
 
 
 def _rebase_target_missing_merge_unit_description(ctx: AdvanceContext) -> str:

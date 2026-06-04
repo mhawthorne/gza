@@ -1126,6 +1126,43 @@ def test_dependency_state_completed_empty_prereq_unblocks_when_policy_enabled(
     assert downstream.id in unblocked_ids
 
 
+def test_incomplete_preset_empty_prereq_does_not_set_awaiting_human_when_policy_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+
+    dep = store.add("Empty prerequisite", task_type="implement")
+    store.mark_completed(dep, has_commits=True, branch="feature/incomplete-empty-toggle")
+    assert dep.id is not None
+    unit = store.resolve_merge_unit_for_task(dep.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "empty")
+
+    downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
+    assert downstream.id is not None
+
+    monkeypatch.setattr(
+        dependency_preconditions_module,
+        "empty_prereq_satisfies_dependency",
+        lambda _store, _prereq, _dependent: True,
+    )
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQueryPresets.incomplete(limit=None),
+        config=SimpleNamespace(
+            max_resume_attempts=1,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+        ),
+        git=SimpleNamespace(),
+        target_branch="main",
+    )
+
+    assert len(result.rows) == 0
+
+
 def test_search_negative_scalar_filters_apply_after_positive_filters(tmp_path: Path) -> None:
     store = _store(tmp_path)
 

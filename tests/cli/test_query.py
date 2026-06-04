@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.text import Text
 
 import gza.colors as colors
+from gza import dependency_preconditions as dependency_preconditions_module
 from gza.cli import _queue_render as queue_render_cli, query as query_cli, watch as watch_cli
 from gza.config import Config
 from gza.console import truncate
@@ -1016,6 +1017,27 @@ class TestHistoryCommand:
         normalized = " ".join(result.stdout.split())
         assert "Unit merged row [implement] [merged]" in normalized
         assert "unmerged" not in result.stdout
+
+    def test_history_renders_empty_merge_unit_as_moot(self, tmp_path: Path):
+        """History should visibly surface empty merge units as moot/empty rows."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = query_cli.get_store(config, open_mode="readwrite")
+
+        task = store.add("Historical empty row", task_type="implement")
+        store.mark_completed(task, has_commits=True, branch="feature/history-empty")
+        assert task.id is not None
+
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "empty")
+
+        result = run_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Historical empty row [implement] [empty]" in normalized
+        assert "lifecycle: moot (no task commits)" in result.stdout
 
     def test_history_shows_orphaned_tasks_at_top(self, tmp_path: Path):
         """History command includes orphaned in-progress tasks at the top."""
@@ -3214,6 +3236,69 @@ class TestQueueCommand:
         blocked_line = next(i for i, line in enumerate(lines) if "Blocked pending" in line)
         assert lines[blocked_line].split()[0] == "-"
         assert lines[blocked_line + 1].strip() == f"blocked by {blocker.id}"
+
+    def test_queue_empty_prerequisite_block_points_to_manual_release_valve(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dep = store.add("Empty dependency")
+        assert dep.id is not None
+        dep.status = "completed"
+        dep.completed_at = datetime.now(UTC)
+        dep.branch = "feature/queue-empty-prereq"
+        dep.has_commits = True
+        store.update(dep)
+        unit = store.create_merge_unit(
+            source_branch=dep.branch,
+            target_branch="main",
+            owner_task_id=dep.id,
+            state="empty",
+        )
+        store.attach_task_to_merge_unit(dep.id, unit.id, "owner")
+
+        blocked = store.add("Held downstream", depends_on=dep.id)
+        assert blocked.id is not None
+
+        result = run_gza("queue", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        lines = result.stdout.splitlines()
+        blocked_line = next(i for i, line in enumerate(lines) if "Held downstream" in line)
+        assert "empty prerequisite" in lines[blocked_line + 1]
+        assert "gza-4072" in lines[blocked_line + 1]
+        assert "gza edit --clear-depends-on" in lines[blocked_line + 1]
+
+    def test_queue_failed_empty_prerequisite_block_points_to_manual_release_valve(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dep = store.add("Failed empty dependency", task_type="implement")
+        assert dep.id is not None
+        dep.status = "failed"
+        dep.completed_at = datetime.now(UTC)
+        dep.failure_reason = "PREREQUISITE_UNMERGED"
+        dep.branch = "feature/queue-failed-empty-prereq"
+        dep.has_commits = False
+        store.update(dep)
+        unit = store.create_merge_unit(
+            source_branch=dep.branch,
+            target_branch="main",
+            owner_task_id=dep.id,
+            state="empty",
+        )
+        store.attach_task_to_merge_unit(dep.id, unit.id, "owner")
+
+        blocked = store.add("Held downstream", task_type="implement", depends_on=dep.id)
+        assert blocked.id is not None
+
+        result = run_gza("queue", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        lines = result.stdout.splitlines()
+        blocked_line = next(i for i, line in enumerate(lines) if "Held downstream" in line)
+        assert "empty prerequisite" in lines[blocked_line + 1]
+        assert "gza-4072" in lines[blocked_line + 1]
+        assert "gza edit --clear-depends-on" in lines[blocked_line + 1]
 
     def test_queue_layout_keeps_first_line_columns_stable_and_second_line_aligned(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -5456,6 +5541,38 @@ class TestShowCommand:
         assert "Failure Summary: Dependency is not yet merged to main." in result.stdout
         assert f"gza merge {dep.id}" in result.stdout
         assert f"gza retry {task.id}" in result.stdout
+
+    def test_show_failed_task_prerequisite_unmerged_empty_row_is_moot_without_retry_guidance(self, tmp_path: Path):
+        setup_config(tmp_path)
+
+        store = make_store(tmp_path)
+        dep = store.add("Merged dependency")
+        task = store.add("Historical blocked downstream", depends_on=dep.id)
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "PREREQUISITE_UNMERGED"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feature/empty-show"
+        task.has_commits = False
+        store.update(task)
+
+        unit = store.create_merge_unit(
+            source_branch=task.branch,
+            target_branch="main",
+            owner_task_id=task.id,
+            state="empty",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Failure Reason: PREREQUISITE_UNMERGED" in result.stdout
+        assert "Failure Summary: Historical dependency-ordering failure produced no work; task is moot." in result.stdout
+        assert "Merge Status: empty" in result.stdout
+        assert f"gza merge {dep.id}" not in result.stdout
+        assert f"gza retry {task.id}" not in result.stdout
+        assert "gza-4072 (`gza edit --clear-depends-on`)" in result.stdout
 
     def test_show_prerequisite_unmerged_prefers_resolved_dependency_from_log(self, tmp_path: Path):
         """PREREQUISITE_UNMERGED next steps should use resolved dependency_task_id from outcome log."""
@@ -12539,6 +12656,70 @@ class TestIncompleteCommand:
         tree_output = captured.out
         assert self._tree_root_id(tree_output) == impl.id
         assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
+
+    def test_incomplete_pending_downstream_blocked_by_empty_prereq_points_to_release_valve(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dep = store.add("Empty prerequisite", task_type="implement")
+        store.mark_completed(dep, has_commits=True, branch="feature/incomplete-empty-prereq")
+        assert dep.id is not None
+        unit = store.resolve_merge_unit_for_task(dep.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "empty")
+
+        downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
+        assert downstream.id is not None
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None))
+        captured = capsys.readouterr()
+
+        assert result == 0
+        one_line_output = captured.out
+        assert self._one_line_row_id(one_line_output) == downstream.id
+        assert "empty prerequisite" in one_line_output
+        assert "gza-4072" in one_line_output
+        assert "gza edit --clear-depends-on" in one_line_output
+
+    def test_incomplete_empty_prereq_policy_toggle_hides_release_valve_guidance(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dep = store.add("Empty prerequisite", task_type="implement")
+        store.mark_completed(dep, has_commits=True, branch="feature/incomplete-empty-toggle")
+        assert dep.id is not None
+        unit = store.resolve_merge_unit_for_task(dep.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "empty")
+
+        downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
+        assert downstream.id is not None
+
+        monkeypatch.setattr(
+            dependency_preconditions_module,
+            "empty_prereq_satisfies_dependency",
+            lambda _store, _prereq, _dependent: True,
+        )
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None))
+        captured = capsys.readouterr()
+
+        assert result == 0
+        one_line_output = captured.out
+        assert "empty prerequisite" not in one_line_output
+        assert "gza-4072" not in one_line_output
+        assert "gza edit --clear-depends-on" not in one_line_output
 
     def test_incomplete_surfaces_strict_scope_unverified_needs_attention(
         self,

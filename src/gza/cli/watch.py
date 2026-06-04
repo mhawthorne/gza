@@ -25,6 +25,7 @@ from ..db import MERGE_SOURCE_WATCH, SqliteTaskStore, Task as DbTask, task_id_nu
 from ..git import Git, GitError
 from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
 from ..merge_state import resolve_task_merge_state_for_target
+from ..operator_state import blocked_by_empty_prereq_label
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..recovery_engine import (
     FailedRecoveryDecision,
@@ -2587,16 +2588,20 @@ def cmd_queue(args: argparse.Namespace) -> int:
         QueueRenderRow(task=task, position_text=str(index))
         for index, task in enumerate(visible_runnable, 1)
     ]
+
+    def _blocked_by_text(task: DbTask) -> str:
+        empty_label = blocked_by_empty_prereq_label(store, task)
+        if empty_label is not None:
+            return empty_label
+        blocking = _precondition_blocking_dependency_id(task, config) or task.depends_on
+        return f"blocked by {blocking}" if blocking else "blocked by dependency"
+
     rendered_rows.extend(
         QueueRenderRow(
             task=task,
             position_text="-",
             blocked=True,
-            blocked_by_text=(
-                f"blocked by {blocking}"
-                if (blocking := (_precondition_blocking_dependency_id(task, config) or task.depends_on))
-                else "blocked by dependency"
-            ),
+            blocked_by_text=_blocked_by_text(task),
         )
         for task in blocked_pending
     )

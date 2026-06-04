@@ -857,7 +857,7 @@ def decide_failed_task_recovery(
             return _skip_decision(
                 task_id=task_id,
                 reason_code="merge_unit_empty",
-                reason_text="moot/no work (empty branch)",
+                reason_text="moot (no task commits)",
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,
             )

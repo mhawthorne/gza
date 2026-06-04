@@ -13,6 +13,7 @@ from .lifecycle_completion import (
     merge_state_is_terminal_for_lifecycle,
     task_is_complete_for_lifecycle,
 )
+from .operator_state import blocked_by_empty_prereq_label
 from .source_followup import (
     SourceFollowupState,
     collect_non_dropped_implement_source_ids,
@@ -736,7 +737,8 @@ def query_lineage_owner_rows(
         for task in sorted(owner_members, key=lambda item: (_task_event_time(item), task_id_numeric_key(item.id))):
             if task.id is None:
                 continue
-            if task.status not in {"failed", "completed", "unmerged", "dropped"}:
+            empty_prereq_block = blocked_by_empty_prereq_label(store, task)
+            if task.status not in {"failed", "completed", "unmerged", "dropped"} and empty_prereq_block is None:
                 continue
             if query.exclude_dropped_from_planning and task.status == "dropped":
                 continue
@@ -755,6 +757,10 @@ def query_lineage_owner_rows(
                     non_dropped_implement_source_ids=indexes.non_dropped_impl_source_ids,
                 ):
                     continue
+                if matches:
+                    unresolved_tasks.append(task)
+                continue
+            if empty_prereq_block is not None:
                 if matches:
                     unresolved_tasks.append(task)
                 continue
@@ -818,7 +824,14 @@ def query_lineage_owner_rows(
             recovery_completed_by_failed_id=recovery_completed_by_failed_id,
         )
         owner_merge_unit = _resolve_owner_merge_unit(owner, merge_units_by_member=merge_units_by_member)
-        if owner_merge_unit is not None and merge_state_is_terminal_for_lifecycle(owner_merge_unit.state):
+        has_empty_prereq_blocked_pending = any(
+            blocked_by_empty_prereq_label(store, task) is not None for task in unresolved_tasks
+        )
+        if (
+            owner_merge_unit is not None
+            and merge_state_is_terminal_for_lifecycle(owner_merge_unit.state)
+            and not has_empty_prereq_blocked_pending
+        ):
             continue
         if target_branch and owner_merge_unit is not None and owner_merge_unit.target_branch != target_branch:
             continue
@@ -907,6 +920,18 @@ def query_lineage_owner_rows(
         if planning_task is None:
             planning_task = recovery_action_task
         action: dict[str, Any] | None = None
+        if planning_task is None:
+            blocked_pending = next(
+                (task for task in unresolved_tasks if blocked_by_empty_prereq_label(store, task) is not None),
+                None,
+            )
+            if blocked_pending is not None:
+                action = {
+                    "type": "awaiting_human",
+                    "description": blocked_by_empty_prereq_label(store, blocked_pending),
+                    "needs_attention_reason": "awaiting-human-review",
+                    "subject_task_id": blocked_pending.id,
+                }
         if planning_task is None and _requires_impl_branch_manual_resolution(
             owner,
             unresolved_tasks,

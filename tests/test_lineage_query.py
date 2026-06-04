@@ -4,6 +4,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
+from gza import dependency_preconditions as dependency_preconditions_module
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
@@ -518,6 +521,135 @@ def test_query_lineage_owner_rows_surfaces_held_completed_plan_as_awaiting_human
     assert row.next_action["needs_attention_reason"] == "awaiting-human-review"
     assert row.next_action["subject_task_id"] == plan.id
     assert f"uv run gza implement {plan.id}" in row.next_action["description"]
+
+
+def test_query_lineage_owner_rows_empty_prereq_policy_toggle_suppresses_release_valve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    dep = store.add("Empty prerequisite", task_type="implement")
+    store.mark_completed(dep, has_commits=True, branch="feature/lineage-empty-toggle")
+    assert dep.id is not None
+    unit = store.resolve_merge_unit_for_task(dep.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "empty")
+
+    downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
+    assert downstream.id is not None
+
+    monkeypatch.setattr(
+        dependency_preconditions_module,
+        "empty_prereq_satisfies_dependency",
+        lambda _store, _prereq, _dependent: True,
+    )
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert not rows
+
+
+def test_query_lineage_owner_rows_failed_empty_prereq_surfaces_awaiting_human(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    dep = store.add("Failed empty prerequisite", task_type="implement")
+    dep.status = "failed"
+    dep.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    dep.failure_reason = "PREREQUISITE_UNMERGED"
+    dep.branch = "feature/lineage-failed-empty-prereq"
+    dep.has_commits = False
+    store.update(dep)
+    assert dep.id is not None
+
+    unit = store.create_merge_unit(
+        source_branch=dep.branch,
+        target_branch="main",
+        owner_task_id=dep.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(dep.id, unit.id, "owner")
+
+    downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
+    assert downstream.id is not None
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == downstream.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "awaiting_human"
+    assert "empty prerequisite" in row.next_action["description"]
+    assert "gza-4072" in row.next_action["description"]
+
+
+def test_query_lineage_owner_rows_failed_empty_prereq_policy_toggle_suppresses_release_valve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    dep = store.add("Failed empty prerequisite", task_type="implement")
+    dep.status = "failed"
+    dep.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    dep.failure_reason = "PREREQUISITE_UNMERGED"
+    dep.branch = "feature/lineage-failed-empty-toggle"
+    dep.has_commits = False
+    store.update(dep)
+    assert dep.id is not None
+
+    unit = store.create_merge_unit(
+        source_branch=dep.branch,
+        target_branch="main",
+        owner_task_id=dep.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(dep.id, unit.id, "owner")
+
+    downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
+    assert downstream.id is not None
+
+    monkeypatch.setattr(
+        dependency_preconditions_module,
+        "empty_prereq_satisfies_dependency",
+        lambda _store, _prereq, _dependent: True,
+    )
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert not rows
 
 
 def test_query_lineage_owner_rows_surfaces_manual_review_creation_attention(tmp_path: Path) -> None:

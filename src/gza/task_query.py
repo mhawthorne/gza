@@ -9,6 +9,7 @@ from typing import Any, Literal, TypeVar
 
 from gza.db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
+from gza.operator_state import blocked_by_empty_prereq_label
 
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
@@ -816,6 +817,11 @@ class TaskQueryService:
         next_action_owner_id: str | None = None
 
         if query.projection.preset == TaskProjectionPreset.INCOMPLETE_SUMMARY:
+            empty_prereq_reason = blocked_by_empty_prereq_label(self._store, owner)
+            if empty_prereq_reason is not None:
+                next_action_type = "awaiting_human"
+                next_action_reason = empty_prereq_reason
+                next_action_owner_id = owner.id
             action = (
                 dict(row.next_action_data)
                 if row.next_action_data is not None
@@ -828,18 +834,19 @@ class TaskQueryService:
             )
             action_type_value = action.get("type") if action else None
             action_reason_value = action.get("description") if action else None
-            next_action_type = str(action_type_value) if action_type_value is not None else None
-            next_action_reason = str(action_reason_value) if action_reason_value is not None else None
-            next_action_owner_id = owner.id
-            if action and _action_is_needs_attention(action):
-                from gza.advance_engine import resolve_subject_task
+            if next_action_reason is None:
+                next_action_type = str(action_type_value) if action_type_value is not None else None
+                next_action_reason = str(action_reason_value) if action_reason_value is not None else None
+                next_action_owner_id = owner.id
+                if action and _action_is_needs_attention(action):
+                    from gza.advance_engine import resolve_subject_task
 
-                next_action_owner_id = resolve_subject_task(
-                    self._store,
-                    action,
-                    row,
-                    fallback_task=owner,
-                ).id
+                    next_action_owner_id = resolve_subject_task(
+                        self._store,
+                        action,
+                        row,
+                        fallback_task=owner,
+                    ).id
 
         values: dict[str, object] = {
             "id": owner.id,

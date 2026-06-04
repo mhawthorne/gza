@@ -45,6 +45,7 @@ from ..failure_policy import is_resumable_failure_reason
 from ..failure_reasons import mark_task_failed_from_cause
 from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
+from ..operator_state import inspect_empty_merge_unit
 from ..prompts import PromptBuilder
 from ..recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from ..review_scope import extract_review_scope_from_prompt
@@ -2507,8 +2508,25 @@ def _extract_failure_log_context(log_path: Path, verify_command: str | None) -> 
     return last_verify_failure, last_result_context
 
 
-def _failure_summary(reason: str) -> str:
+def _failure_summary(
+    task: DbTask,
+    reason: str,
+    *,
+    store: SqliteTaskStore | None = None,
+) -> str:
     """Build short human-readable failure summary."""
+    if reason == "PREREQUISITE_UNMERGED":
+        empty_lookup = inspect_empty_merge_unit(store, task)
+        if empty_lookup.warning is not None:
+            return (
+                "Dependency-ordering failure guidance unavailable; "
+                f"{empty_lookup.warning}. Inspect merge-unit state before retrying."
+            )
+        if empty_lookup.is_empty:
+            return (
+                "Historical dependency-ordering failure produced no work; task is moot. "
+                "Manual downstream release is tracked by gza-4072 (`gza edit --clear-depends-on`)."
+            )
     summaries = {
         "AGENT_FORFEIT": "Agent forfeited: could not complete the task.",
         "MAX_STEPS": "Stopped due to max steps limit.",
@@ -2606,7 +2624,13 @@ def _extract_interrupt_source(log_path: Path) -> str | None:
     return None
 
 
-def _build_failure_diagnostics(task: DbTask, log_path: Path | None, verify_command: str | None) -> FailureDiagnostics:
+def _build_failure_diagnostics(
+    task: DbTask,
+    log_path: Path | None,
+    verify_command: str | None,
+    *,
+    store: SqliteTaskStore | None = None,
+) -> FailureDiagnostics:
     """Build canonical failure diagnostics for CLI rendering."""
     reason = task.failure_reason or "UNKNOWN"
     marker_reason: str | None = None
@@ -2624,7 +2648,7 @@ def _build_failure_diagnostics(task: DbTask, log_path: Path | None, verify_comma
     return FailureDiagnostics(
         reason=reason,
         marker_reason=marker_reason,
-        summary=_failure_summary(reason),
+        summary=_failure_summary(task, reason, store=store),
         interrupt_source=interrupt_source,
         explanation=explanation,
         verify_context=verify_context,
@@ -2719,7 +2743,13 @@ def _precondition_blocking_dependency_id(task: DbTask, config: Config | None) ->
     return None
 
 
-def _failure_next_steps(task: DbTask, reason: str, *, config: Config | None = None) -> list[str]:
+def _failure_next_steps(
+    task: DbTask,
+    reason: str,
+    *,
+    config: Config | None = None,
+    store: SqliteTaskStore | None = None,
+) -> list[str]:
     """Return concrete next-step commands for a failed task."""
     if task.id is None:
         return []
@@ -2729,6 +2759,9 @@ def _failure_next_steps(task: DbTask, reason: str, *, config: Config | None = No
         steps.append(f"gza retry {task.id}")
         return steps
     if reason == "PREREQUISITE_UNMERGED":
+        empty_lookup = inspect_empty_merge_unit(store, task)
+        if empty_lookup.warning is not None or empty_lookup.is_empty:
+            return steps
         blocking_dep_id = _precondition_blocking_dependency_id(task, config) or task.depends_on
         if blocking_dep_id:
             steps.append(f"gza merge {blocking_dep_id}")

@@ -46,6 +46,7 @@ from ..github import GitHub
 from ..lifecycle_completion import TERMINAL_MERGE_STATES
 from ..lineage import walk_based_on_descendants
 from ..lineage_query import filter_display_unresolved_tasks_for_incomplete
+from ..operator_state import blocked_by_empty_prereq_label, moot_empty_lifecycle_detail
 from ..pr_ops import lookup_task_pr
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
@@ -528,6 +529,17 @@ def _format_blocked_dependency_label(
     return "(blocked by dependency)"
 
 
+def _task_show_merge_status(store: SqliteTaskStore, task: DbTask) -> str | None:
+    """Return the operator-facing merge status for `gza show`."""
+    if task.id is not None:
+        unit = store.resolve_merge_unit_for_task(task.id)
+        if unit is not None and unit.owner_task_id == task.id:
+            return unit.state
+    if task_owns_merge_status(task):
+        return task.merge_status
+    return None
+
+
 def _reconcile_unmerged_tasks(store: SqliteTaskStore, git: Git, default_branch: str) -> tuple[int, int]:
     """Refresh merge truth and diff stats for tasks currently marked unmerged."""
     merged_count = 0
@@ -643,10 +655,13 @@ def cmd_next(args: argparse.Namespace) -> int:
                 task=row.task,
                 position_text="-",
                 blocked=True,
-                blocked_by_text=_format_blocked_dependency_label(
-                    cast(str | None, row.values.get("blocking_id")),
-                    cast(str | None, row.values.get("blocking_status")),
-                )[1:-1],
+                blocked_by_text=(
+                    blocked_by_empty_prereq_label(store, row.task)
+                    or _format_blocked_dependency_label(
+                        cast(str | None, row.values.get("blocking_id")),
+                        cast(str | None, row.values.get("blocking_status")),
+                    )[1:-1]
+                ),
             )
             for row in blocked_rows
         )
@@ -861,6 +876,7 @@ def cmd_history(args: argparse.Namespace) -> int:
         """Render a single task entry."""
         shares_parent_branch = _task_shares_parent_branch(task, parent_task)
         merge_state = _task_merge_unit_state(task)
+        lifecycle_detail = moot_empty_lifecycle_detail(merge_state)
         use_merge_status = merge_state == "unmerged" and task_owns_merge_status(task)
         if use_merge_status:
             status_label = "unmerged"
@@ -913,7 +929,9 @@ def cmd_history(args: argparse.Namespace) -> int:
             )
 
         type_label = f"\\[{task.task_type}]"
-        merge_label = " \\[merged]" if merge_state == "merged" and task_owns_merge_status(task) else ""
+        merge_label = ""
+        if merge_state in {"merged", "empty"} and task_owns_merge_status(task):
+            merge_label = f" \\[{merge_state}]"
         tid = c['task_id']
         if task.based_on and task.depends_on:
             parent_label = f" ← [{tid}]{task.based_on}[/{tid}] (dep [{tid}]{task.depends_on}[/{tid}])"
@@ -940,6 +958,10 @@ def cmd_history(args: argparse.Namespace) -> int:
             return
 
         console.print(f"{detail_prefix}    {type_label}{merge_label}{parent_label}")
+        if lifecycle_detail is not None:
+            console.print(
+                f"{detail_prefix}    [{c['success']}]lifecycle: {lifecycle_detail}[/{c['success']}]"
+            )
         show_branch = bool(task.branch) and not shares_parent_branch
         if show_branch:
             console.print(f"{detail_prefix}    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
@@ -1454,6 +1476,9 @@ def _resolve_incomplete_owner_task(store: SqliteTaskStore, row: _LineageRow) -> 
         return ordered
 
     candidates = _iter_candidates()
+    for candidate in candidates:
+        if blocked_by_empty_prereq_label(store, candidate) is not None:
+            return candidate
     for candidate in candidates:
         owner_task = _resolve_lineage_owner_task(store, candidate)
         if owner_task.task_type == "implement" and owner_task.branch:
@@ -3292,8 +3317,9 @@ def _cmd_show_output(
             f"[{c['label']}]Changed Diff:[/{c['label']}] "
             f"[{c['value']}]{_format_changed_diff_label(task.changed_diff)}[/{c['value']}]"
         )
-    if task.merge_status and task_owns_merge_status(task):
-        console.print(f"[{c['label']}]Merge Status:[/{c['label']}] [{c['value']}]{task.merge_status}[/{c['value']}]")
+    merge_status = _task_show_merge_status(store, task)
+    if merge_status:
+        console.print(f"[{c['label']}]Merge Status:[/{c['label']}] [{c['value']}]{merge_status}[/{c['value']}]")
     console.print(f"[{c['label']}]Type:[/{c['label']}] [{c['value']}]{task.task_type}[/{c['value']}]")
     if task.task_type == "plan":
         auto_implement_detail = "yes"
@@ -3435,7 +3461,7 @@ def _cmd_show_output(
 
     if task.status == "failed":
         log_path = _resolve_task_log_path(config, task)
-        diagnostics = _build_failure_diagnostics(task, log_path, config.verify_command)
+        diagnostics = _build_failure_diagnostics(task, log_path, config.verify_command, store=store)
         guidance_reason = diagnostics.marker_reason or diagnostics.reason
         _render_failure_diagnostics(
             diagnostics,
@@ -3460,7 +3486,7 @@ def _cmd_show_output(
                     f"[{c['value']}]{turns_used}[/{c['value']}]"
                 )
 
-        next_step_commands = _failure_next_steps(task, guidance_reason, config=config)
+        next_step_commands = _failure_next_steps(task, guidance_reason, config=config, store=store)
         if next_step_commands:
             console.print(f"[{c['label']}]Next Steps:[/{c['label']}]")
             for command in next_step_commands:
