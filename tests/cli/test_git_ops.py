@@ -10,6 +10,7 @@ import pytest
 
 from gza.cli.git_ops import (
     _execute_merge_action,
+    _MergeSingleTaskResult,
     _reconcile_diverged_branch_with_origin,
     SquashBranchReconcileResult,
     _build_auto_merge_args,
@@ -117,6 +118,47 @@ def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -
     assert f"uv run gza rebase {task.id} --resolve" in output
 
 
+def test_merge_single_task_returns_blocked_dirty_checkout_status(tmp_path: Path, capsys) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement dirty checkout guard", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/dirty-checkout-guard"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=True),
+        can_merge=MagicMock(),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    assert result.status == "blocked_dirty_checkout"
+    assert result.block_reason == "main checkout has uncommitted changes"
+    git.can_merge.assert_not_called()
+    git.merge.assert_not_called()
+    output = capsys.readouterr().out
+    assert "You have uncommitted changes. Please commit or stash them first." in output
+
+
 def test_run_task_backed_rebase_refreshes_merge_unit_provenance(tmp_path) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
@@ -216,6 +258,46 @@ def test_execute_merge_action_mark_merged_rejects_failed_owner_without_marking_u
     refreshed = store.resolve_merge_unit_for_task(failed.id)
     assert refreshed is not None
     assert refreshed.state == "unmerged"
+
+
+def test_execute_merge_action_propagates_blocked_dirty_checkout_status(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/dirty-checkout-execute"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git = SimpleNamespace(repo_dir=tmp_path)
+
+    with patch(
+        "gza.cli.git_ops._merge_single_task",
+        return_value=_MergeSingleTaskResult(
+            rc=1,
+            status="blocked_dirty_checkout",
+            block_reason="main checkout has uncommitted changes",
+            pending_squash_reconcile=None,
+        ),
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            git,
+            task,
+            {"type": "merge", "description": "Merge"},
+            target_branch="main",
+            current_branch="main",
+        )
+
+    assert result.rc == 1
+    assert result.status == "blocked_dirty_checkout"
+    assert result.block_reason == "main checkout has uncommitted changes"
 
 
 def test_run_task_backed_rebase_surfaces_resolution_warnings_and_preserves_existing_merge_unit_provenance(
