@@ -104,6 +104,7 @@ from .advance_engine import (
     classify_advance_action,
     determine_next_action,
     format_needs_attention_entry_for_display,
+    needs_attention_recommends_fix,
     resolve_subject_task,
 )
 from .advance_executor import (
@@ -3090,6 +3091,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
         for atask, aaction in items:
             _color = _advance_action_color(aaction["type"])
             console.print(f"  [{_color}]{_format_needs_attention_line(atask, aaction)}[/{_color}]")
+            if needs_attention_recommends_fix(aaction):
+                console.print(f"  [{_color}]Recommended next step: uv run gza fix {atask.id}[/{_color}]")
 
     preview_context = _build_action_context(dry_run_mode=True)
     preview_attention_plan = list(attention_plan)
@@ -3424,13 +3427,5 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     if attention_tasks:
         _print_needs_attention_section(attention_tasks)
-        for atask, aaction in attention_tasks:
-            if aaction.get("needs_attention_reason") in {
-                "review-max-cycles-reached",
-                "automatic-recovery-disabled",
-                "retry-limit-reached",
-            }:
-                _color = _advance_action_color(str(aaction.get("type", "skip")))
-                console.print(f"  [{_color}]Recommended next step: uv run gza fix {atask.id}[/{_color}]")
 
     return 0 if error_count == 0 else 1

@@ -1223,6 +1223,7 @@ class TestRetryCommand:
         assert retry_task.base_branch is None
         assert retry_task.branch == "feature/old"
         assert retry_task.recovery_origin == "retry"
+        assert retry_task.session_id is None
 
     def test_create_retry_task_manual_rebase_retry_keeps_same_branch(self, tmp_path: Path):
         """Manual rebase retry should stay attached to the implementation branch."""
@@ -10544,7 +10545,7 @@ class TestIterateCommand:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         import argparse
-        from unittest.mock import patch
+        from unittest.mock import MagicMock, patch
 
         from gza.cli.execution import cmd_iterate
         from gza.config import Config
@@ -11211,6 +11212,85 @@ class TestIterateCommand:
         assert "reason=retry-limit-reached" in output
         assert output.count("Needs attention:") == 1
         assert f"Implementation {failed_resume.id} failed (exit code 1)" not in output
+        assert f"Recommended next step: uv run gza fix {impl.id}" in output
+
+    def test_iterate_pending_retryable_provider_error_exhaustion_uses_shared_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli import cmd_iterate
+        from gza.recovery_engine import decide_failed_task_recovery
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Pending implementation", task_type="implement")
+        assert impl.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            workers_path=tmp_path / ".gza" / "workers",
+        )
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "failed"
+            task.failure_reason = "RETRYABLE_PROVIDER_ERROR"
+            task.session_id = f"thread-{task_id}"
+            store.update(task)
+            return 1
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.advance_engine.prompt_available_width", return_value=40),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        recovery_children = store.get_based_on_children(impl.id)
+        assert len(recovery_children) == 1
+        failed_retry = recovery_children[0]
+        terminal_decision = decide_failed_task_recovery(
+            store,
+            failed_retry,
+            max_recovery_attempts=1,
+        )
+        with patch("gza.advance_engine.prompt_available_width", return_value=40):
+            expected_line = self._expected_failed_recovery_attention_line(
+                store=store,
+                failed_task=failed_retry,
+                decision=terminal_decision,
+                max_resume_attempts=1,
+            )
+
+        assert result == 3
+        assert run_foreground.call_count == 2
+        assert [call.kwargs.get("resume", False) for call in run_foreground.call_args_list] == [False, False]
+        assert terminal_decision.reason_code == "retryable_provider_error"
+        assert expected_line in output
+        assert "reason=retryable-provider-error" in output
+        assert output.count("Needs attention:") == 1
         assert f"Recommended next step: uv run gza fix {impl.id}" in output
 
     def test_iterate_resume_start_recovery_exhaustion_auto_iterate_uses_shared_attention(

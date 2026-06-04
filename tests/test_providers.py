@@ -43,6 +43,7 @@ from gza.providers.claude import (
 from gza.providers.codex import (
     CODEX_EVENT_REGISTRY,
     CODEX_LIVE_EVENT_HANDLERS,
+    _codex_provider_error_type,
     build_headless_exec_args,
 )
 from gza.providers.gemini import calculate_cost
@@ -126,6 +127,28 @@ def test_classify_provider_api_error(
             message=message,
         ) == expected
     )
+
+
+def test_codex_provider_error_type_classifies_forked_agent_diagnostic_as_retryable() -> None:
+    event = {
+        "type": "error",
+        "message": json.dumps(
+            {
+                "type": "error",
+                "status": 400,
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": (
+                        "Full-history forked agents inherit the parent agent type, model, "
+                        "and reasoning effort. The child agent should either use those "
+                        "settings, or explicitly opt out of full-history."
+                    ),
+                },
+            }
+        ),
+    }
+
+    assert _codex_provider_error_type(event) == "retryable_provider_error"
 
 
 class TestDockerConfig:

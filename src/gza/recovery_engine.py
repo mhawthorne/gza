@@ -34,6 +34,7 @@ _RETRY_REASONS = {
     "INFRASTRUCTURE_ERROR",
     "PROVIDER_UNAVAILABLE",
     "PROVIDER_EMPTY_TURN",
+    "RETRYABLE_PROVIDER_ERROR",
     "WORKER_DIED",
     "NO_ACTIVITY",
 }
@@ -996,6 +997,14 @@ def decide_failed_task_recovery(
         )
 
     if expected_action is None:
+        if reason == "RETRYABLE_PROVIDER_ERROR":
+            return _skip_decision(
+                task_id=task_id,
+                reason_code="retryable_provider_error",
+                reason_text="fresh retry already consumed; retryable provider error now requires manual review",
+                attempt_index=attempt_index,
+                attempt_limit=attempt_limit,
+            )
         return _skip_decision(
             task_id=task_id,
             reason_code="retry_limit_reached",
@@ -1173,6 +1182,8 @@ def _get_failed_recovery_needs_attention_reason(
         return "automatic-recovery-disabled"
     if decision.reason_code == "manual_failure_reason":
         return "manual-failure-reason"
+    if decision.reason_code == "retryable_provider_error":
+        return "retryable-provider-error"
     if decision.reason_code in {"retry_limit_reached", "manual_review_required"}:
         return "retry-limit-reached"
     if decision.reason_code == "recovery_ambiguous":

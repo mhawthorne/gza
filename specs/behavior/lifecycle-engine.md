@@ -281,6 +281,7 @@ is a spec change. The accompanying human message is free text.
 | `review-needs-manual-creation` | needs_discussion | §8 implementation-owned lineage requires review, no review exists, `advance_create_reviews` off |
 | `automatic-recovery-disabled` | HumanParked | §7 recovery attempt budget = 0 |
 | `retry-limit-reached` | HumanParked | §7 recovery attempts exhausted or terminal manual-review recovery stop |
+| `retryable-provider-error` | HumanParked | §7 fresh retry consumed for a retryable provider failure; hand off to `gza fix` |
 | `recovery-ambiguous` | HumanParked | §7 recovery situation ambiguous |
 | `manual-failure-reason` † | HumanParked | §7 failure flagged for manual handling |
 | `newer-recovery-descendant-needs-attention` † | HumanParked | §7 newer unresolved recovery descendant |
@@ -294,8 +295,9 @@ Primary lifecycle code MUST attach `needs_attention_reason` explicitly via
 `needs-discussion` and `max-improve-attempts-reached` remain accepted legacy compatibility
 fallback slugs, but new rules MUST NOT rely on bare action-type fallback to produce them.
 `manual-review-required` is not a recovery parked reason code; recovery paths use
-`retry-limit-reached`, while any operator-facing manual-review distinction is carried by
-the parked state, action type, or human message.
+`retry-limit-reached` and `retryable-provider-error`, while any operator-facing
+manual-review distinction is carried by the parked state, action type, human message, and
+the shared `gza fix` handoff wording on CLI attention surfaces.
 
 *Status: reconciled to the strings the engine actually emits as of the 2026-06-02
 behavior-check (`reviews/20260602003648-behavior-check.md`), spec-follows-code. Remaining

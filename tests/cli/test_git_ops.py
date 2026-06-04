@@ -1776,6 +1776,58 @@ def test_advance_dry_run_surfaces_diverged_merge_source_for_reconcile(
     assert "Needs attention" not in output
 
 
+def test_advance_retryable_provider_attention_recommends_fix_even_without_actionable_work(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Investigate flaky provider run", task_type="implement")
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "RETRYABLE_PROVIDER_ERROR"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="needs_attention",
+        next_action={
+            "type": "needs_discussion",
+            "description": "Fresh retry already consumed; retryable provider error now requires manual review",
+            "needs_attention_reason": "retryable-provider-error",
+            "subject_task_id": task.id,
+        },
+        next_action_reason="retryable-provider-error",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+    )
+
+    args = _advance_args(tmp_path, task.id)
+    args.task_id = None
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+    ):
+        rc = cmd_advance(args)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "No eligible tasks to advance" in output
+    assert "reason=retryable-provider-error" in output
+    assert f"Recommended next step: uv run gza fix {task.id}" in output
+
+
 def test_rebase_background_creator_phase_failure_cleans_up_created_task_and_artifacts(tmp_path: Path) -> None:
     """Background rebase must roll back the created child when startup preparation fails."""
 

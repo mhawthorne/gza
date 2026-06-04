@@ -106,6 +106,9 @@ CODEX_LIVE_KNOWN_ITEM_TYPES = frozenset(
 )
 _CODEX_FILE_CHANGE_LIMIT = 5
 _CODEX_TODO_LIMIT = 5
+_CODEX_FORKED_AGENT_RETRYABLE_ERROR_SNIPPETS = (
+    "full-history forked agents inherit the parent agent type, model, and reasoning effort",
+)
 
 
 def _codex_tool_log_line(label: str, detail: str = "") -> str:
@@ -407,6 +410,12 @@ def _codex_provider_error_type(event: dict[str, Any]) -> str | None:
     if error_message is None and isinstance(message_value, str):
         error_message = message_value
 
+    normalized_message = error_message.strip().lower() if isinstance(error_message, str) else None
+    if normalized_message and any(
+        snippet in normalized_message
+        for snippet in _CODEX_FORKED_AGENT_RETRYABLE_ERROR_SNIPPETS
+    ):
+        return "retryable_provider_error"
     return classify_provider_api_error(
         status=status,
         error_type=error_type,

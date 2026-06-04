@@ -111,6 +111,7 @@ from .advance_engine import (
     classify_advance_action,
     determine_next_action,
     format_needs_attention_entry_for_display,
+    needs_attention_recommends_fix,
     resolve_closing_review_action,
     resolve_subject_task,
 )
@@ -2926,11 +2927,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     f"{NEEDS_ATTENTION_LABEL}: "
                     f"{format_needs_attention_entry_for_display(attention.task, action=attention.action, prefix=len(attention.task.id or '') + 4)}"
                 )
-                if attention.action.get("needs_attention_reason") in {
-                    "review-max-cycles-reached",
-                    "automatic-recovery-disabled",
-                    "retry-limit-reached",
-                }:
+                if needs_attention_recommends_fix(attention.action):
                     print(f"Recommended next step: uv run gza fix {iterate_task.id}")
             else:
                 print(f"Iterate blocked: {attention_result.message.removeprefix('SKIP: ')}")
@@ -2973,11 +2970,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 f"{NEEDS_ATTENTION_LABEL}: "
                 f"{format_needs_attention_entry_for_display(subject_task, action=initial_action, prefix=len(subject_task.id or '') + 4)}"
             )
-            if initial_action.get("needs_attention_reason") in {
-                "review-max-cycles-reached",
-                "automatic-recovery-disabled",
-                "retry-limit-reached",
-            }:
+            if needs_attention_recommends_fix(initial_action):
                 print(f"Recommended next step: uv run gza fix {iterate_task.id}")
             return 3
         print(f"Iterate blocked: {_iterate_action_description(initial_action)}")
@@ -3004,11 +2997,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             f"{NEEDS_ATTENTION_LABEL}: "
             f"{format_needs_attention_entry_for_display(attention.task, action=attention.action, prefix=len(attention.task.id or '') + 4)}"
         )
-        if attention.action.get("needs_attention_reason") in {
-            "review-max-cycles-reached",
-            "automatic-recovery-disabled",
-            "retry-limit-reached",
-        }:
+        if needs_attention_recommends_fix(attention.action):
             print(f"Recommended next step: uv run gza fix {fix_task_id}")
         return 3
 
@@ -4589,11 +4578,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             f"{NEEDS_ATTENTION_LABEL}: "
             f"{format_needs_attention_entry_for_display(final_attention_task, action=final_attention_action, prefix=len(final_attention_task.id or '') + 4)}"
         )
-        if final_attention_action.get("needs_attention_reason") in {
-            "review-max-cycles-reached",
-            "automatic-recovery-disabled",
-            "retry-limit-reached",
-        }:
+        if needs_attention_recommends_fix(final_attention_action):
             print(f"Recommended next step: uv run gza fix {impl_task_key}")
         return 3
     if final_non_attention_stop_message is not None:

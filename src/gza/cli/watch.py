@@ -110,7 +110,9 @@ from .query import _resolve_incomplete_owner_task
 _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
 _WATCH_PARKED_LINEAGE_POLICY: Literal["skip"] = "skip"
-_WATCH_PARKED_NEEDS_ATTENTION_REASONS = frozenset({"retry-limit-reached", WATCH_NO_PROGRESS_BACKSTOP_REASON})
+_WATCH_PARKED_NEEDS_ATTENTION_REASONS = frozenset(
+    {"retry-limit-reached", "retryable-provider-error", WATCH_NO_PROGRESS_BACKSTOP_REASON}
+)
 _WATCH_TASK_ID_TOKEN_RE = re.compile(
     rf"(?<![a-z0-9]){_TASK_ID_RE.pattern.removeprefix('^').removesuffix('$')}(?![a-z0-9])"
 )

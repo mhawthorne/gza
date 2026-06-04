@@ -117,6 +117,13 @@ def test_resolve_failure_reason_maps_provider_error_types() -> None:
             log_file=None,
         ) == "PROVIDER_UNAVAILABLE"
     )
+    assert (
+        resolve_failure_reason(
+            error_type="retryable_provider_error",
+            exit_code=1,
+            log_file=None,
+        ) == "RETRYABLE_PROVIDER_ERROR"
+    )
 
 
 def test_resolve_failure_reason_log_fallback_preserves_config_error(tmp_path: Path) -> None:

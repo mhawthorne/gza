@@ -663,6 +663,55 @@ def test_recovery_engine_provider_empty_turn_is_retryable(tmp_path: Path) -> Non
     assert decision.reason_code == "PROVIDER_EMPTY_TURN"
 
 
+def test_recovery_engine_retryable_provider_error_chooses_fresh_retry_even_with_session(tmp_path: Path) -> None:
+    store, task = _failed_task(
+        tmp_path,
+        task_type="plan",
+        reason="RETRYABLE_PROVIDER_ERROR",
+        session_id="thread_codex_123",
+    )
+
+    assert classify_failure_reason("RETRYABLE_PROVIDER_ERROR") == "retryable"
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "retry"
+    assert decision.launch_mode == "worker"
+    assert decision.reason_code == "RETRYABLE_PROVIDER_ERROR"
+
+
+def test_recovery_engine_retryable_provider_error_parks_after_one_retry(tmp_path: Path) -> None:
+    store, root = _failed_task(
+        tmp_path,
+        task_type="plan",
+        reason="RETRYABLE_PROVIDER_ERROR",
+        session_id="thread_codex_root",
+    )
+    retry_child = store.add(
+        root.prompt,
+        task_type=root.task_type,
+        based_on=root.id,
+        depends_on=root.depends_on,
+        recovery_origin="retry",
+    )
+    assert retry_child.id is not None
+    retry_child.status = "failed"
+    retry_child.failure_reason = "RETRYABLE_PROVIDER_ERROR"
+    retry_child.session_id = "thread_codex_retry"
+    retry_child.completed_at = datetime.now(UTC)
+    store.update(retry_child)
+
+    decision = decide_failed_task_recovery(store, retry_child, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "retryable_provider_error"
+    assert decision.reason_text == "fresh retry already consumed; retryable provider error now requires manual review"
+    assert get_failed_recovery_needs_attention_reason(
+        store,
+        retry_child,
+        decision=decision,
+        max_recovery_attempts=1,
+    ) == "retryable-provider-error"
+
+
 def test_recovery_engine_timeout_without_session_requires_manual_review(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="MAX_STEPS", session_id=None)
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)

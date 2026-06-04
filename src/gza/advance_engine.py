@@ -56,6 +56,14 @@ from gza.source_followup import (
 )
 
 NEEDS_ATTENTION_LABEL = "Needs attention"
+FIX_HANDOFF_NEEDS_ATTENTION_REASONS = frozenset(
+    {
+        "review-max-cycles-reached",
+        "automatic-recovery-disabled",
+        "retry-limit-reached",
+        "retryable-provider-error",
+    }
+)
 ALLOW_NOOP_IMPROVE_TAG = "allow-noop-improve"
 DUPLICATE_BLOCKER_REVIEW_CYCLES = 3
 REBASE_FAILURE_CIRCUIT_BREAKER_ATTEMPTS = 3
@@ -1354,6 +1362,12 @@ def get_needs_attention_reason(action: Mapping[str, Any]) -> str | None:
 
 def is_needs_attention_action(action: Mapping[str, Any]) -> bool:
     return get_needs_attention_reason(action) is not None
+
+
+def needs_attention_recommends_fix(action: Mapping[str, Any]) -> bool:
+    """Return True when the operator handoff for this attention state is `gza fix`."""
+    reason = get_needs_attention_reason(action)
+    return reason in FIX_HANDOFF_NEEDS_ATTENTION_REASONS
 
 
 def is_diverged_merge_source_warning(warning: str | None) -> bool:
