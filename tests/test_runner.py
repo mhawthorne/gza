@@ -28,6 +28,7 @@ from gza.cli import _create_improve_task, _create_rebase_task
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
+    DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
     SUMMARY_DIR,
     WIP_DIR,
@@ -13402,19 +13403,16 @@ class TestDependencyMergePrecondition:
             tmp_path,
         )
 
-        assert result == 1
+        assert result == DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
         assert mock_provider.run.call_count == 0
         refreshed = store.get(downstream.id)
         assert refreshed is not None
-        assert refreshed.status == "failed"
-        assert refreshed.failure_reason == "PREREQUISITE_UNMERGED"
-
-        log_file = tmp_path / "logs" / f"{downstream.slug}.log"
-        assert log_file.exists()
-        log_text = ops_log_path_for(log_file).read_text()
-        assert '"subtype": "outcome"' in log_text
-        assert '"failure_reason": "PREREQUISITE_UNMERGED"' in log_text
-        assert "test/dep-branch" in log_text
+        assert refreshed.status == "pending"
+        assert refreshed.failure_reason is None
+        assert refreshed.completed_at is None
+        assert refreshed.started_at is None
+        assert store.is_task_blocked(refreshed) == (True, refreshed.depends_on, "completed")
+        assert all(task.status != "failed" for task in store.get_all())
 
     def test_retry_chain_dependency_uses_completed_retry_for_precondition(self, tmp_path: Path):
         result, mock_provider, store, downstream = self._run_with_dependency_state(
@@ -13422,6 +13420,35 @@ class TestDependencyMergePrecondition:
             setup_retry_chain=True,
         )
 
+        assert result == DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+        assert mock_provider.run.call_count == 0
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.status == "pending"
+        assert refreshed.failure_reason is None
+
+    def test_unmerged_dependency_with_prior_output_still_fails_closed(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        _dep_task, downstream = self._setup_dep_and_downstream(store)
+        downstream.output_content = "prior output"
+        store.update(downstream)
+        config = self._make_config(tmp_path, db_path)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+
+        mock_main_git = Mock()
+        mock_main_git.default_branch.return_value = "main"
+
+        mock_worktree_git = Mock()
+
+        with (
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner.Git", return_value=mock_worktree_git),
+        ):
+            result = _run_inner(downstream, config, config, store, mock_provider, mock_main_git)
+
         assert result == 1
         assert mock_provider.run.call_count == 0
         refreshed = store.get(downstream.id)
@@ -13429,11 +13456,69 @@ class TestDependencyMergePrecondition:
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "PREREQUISITE_UNMERGED"
 
+    def test_run_inner_logs_blocked_dependency_and_parks_pending(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        _dep_task, downstream = self._setup_dep_and_downstream(store)
+        config = self._make_config(tmp_path, db_path)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+
+        mock_main_git = Mock()
+        mock_main_git.default_branch.return_value = "main"
+
+        mock_worktree_git = Mock()
+
+        with (
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner.Git", return_value=mock_worktree_git),
+        ):
+            result = _run_inner(downstream, config, config, store, mock_provider, mock_main_git)
+
+        assert result == DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+        assert mock_provider.run.call_count == 0
+
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.status == "pending"
+        assert refreshed.failure_reason is None
+
         log_file = tmp_path / "logs" / f"{downstream.slug}.log"
         assert log_file.exists()
         log_text = ops_log_path_for(log_file).read_text()
-        retry_task = next(t for t in store.get_all() if t.prompt == "Retry upstream task")
+        assert '"subtype": "blocked"' in log_text
+        assert '"reason": "dependency_merge_precondition"' in log_text
+        assert '"task_status": "pending"' in log_text
+        assert '"failure_reason": "PREREQUISITE_UNMERGED"' not in log_text
+        assert "test/dep-branch" in log_text
+
+    def test_run_inner_logs_resolved_retry_dependency_for_precondition(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        _dep_task, retry_task, downstream = self._setup_failed_dep_with_completed_retry(store)
+        config = self._make_config(tmp_path, db_path)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+
+        mock_main_git = Mock()
+        mock_main_git.default_branch.return_value = "main"
+
+        mock_worktree_git = Mock()
+
+        with (
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner.Git", return_value=mock_worktree_git),
+        ):
+            result = _run_inner(downstream, config, config, store, mock_provider, mock_main_git)
+
+        assert result == DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
         assert retry_task.id is not None
+
+        log_file = tmp_path / "logs" / f"{downstream.slug}.log"
+        assert log_file.exists()
+        log_text = ops_log_path_for(log_file).read_text()
         assert "test/retry-upstream-branch" in log_text
         assert f'"dependency_task_id": "{retry_task.id}"' in log_text
 

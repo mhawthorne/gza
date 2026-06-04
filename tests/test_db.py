@@ -582,7 +582,7 @@ class TestTaskChaining:
         store = SqliteTaskStore(db_path)
 
         # Create dependent tasks
-        task1 = store.add("First task")
+        task1 = store.add("First task", task_type="plan")
         task2 = store.add("Second task", depends_on=task1.id)
         task3 = store.add("Independent task")
 
@@ -613,7 +613,7 @@ class TestTaskChaining:
         store = SqliteTaskStore(db_path)
 
         # Create some blocked and unblocked tasks
-        task1 = store.add("First task")
+        task1 = store.add("First task", task_type="plan")
         store.add("Second task", depends_on=task1.id)
         store.add("Third task", depends_on=task1.id)
         store.add("Independent task")
@@ -4916,11 +4916,39 @@ class TestRetryChainDependencyResolution:
     def test_completed_dependency_not_blocked(self, tmp_path: Path):
         """Regression: task with a completed dependency is not blocked."""
         store = self._make_store(tmp_path)
-        dep = store.add("Dependency")
+        dep = store.add("Dependency", task_type="plan")
         self._complete(store, dep)
         downstream = store.add("Downstream", depends_on=dep.id)
         is_blocked, _, _ = store.is_task_blocked(downstream)
         assert is_blocked is False
+
+    def test_completed_unmerged_implement_dependency_stays_blocked(self, tmp_path: Path):
+        """Completed code prerequisites remain blocked until merge dependency is satisfied."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dependency", task_type="implement")
+        self._complete_implement_with_branch(store, dep, branch="feature/dep-unmerged", merge_state="unmerged")
+        downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
+
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(downstream)
+        assert is_blocked is True
+        assert blocking_id == dep.id
+        assert blocking_status == "completed"
+        assert store.get_next_pending() is None
+        assert store.get_pending_pickup() == []
+
+    def test_completed_unmerged_implement_dependency_does_not_block_review(self, tmp_path: Path):
+        """Non-code downstream tasks only require completed prerequisites, not merged code."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dependency", task_type="implement")
+        self._complete_implement_with_branch(store, dep, branch="feature/dep-unmerged-review", merge_state="unmerged")
+        review = store.add("Review dependency output", task_type="review", depends_on=dep.id)
+
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(review)
+        assert is_blocked is False
+        assert blocking_id is None
+        assert blocking_status is None
+        assert store.get_next_pending() is not None
+        assert store.get_next_pending().id == review.id
 
     def test_failed_dep_no_retry_still_blocked(self, tmp_path: Path):
         """Task blocked by a failed dep with no retry stays blocked."""
@@ -4936,9 +4964,9 @@ class TestRetryChainDependencyResolution:
     def test_failed_dep_with_successful_retry_unblocks(self, tmp_path: Path):
         """Task blocked by failed dep is unblocked when a direct retry succeeds."""
         store = self._make_store(tmp_path)
-        dep = store.add("Dependency")
+        dep = store.add("Dependency", task_type="plan")
         self._fail(store, dep)
-        retry = store.add("Retry of dep", based_on=dep.id)
+        retry = store.add("Retry of dep", task_type="plan", based_on=dep.id)
         self._complete(store, retry)
 
         downstream = store.add("Downstream", depends_on=dep.id)
@@ -4961,11 +4989,11 @@ class TestRetryChainDependencyResolution:
     def test_retry_chain_failed_failed_completed_unblocks(self, tmp_path: Path):
         """dep(failed) → retry1(failed) → retry2(completed): downstream unblocked."""
         store = self._make_store(tmp_path)
-        dep = store.add("Original dep")
+        dep = store.add("Original dep", task_type="plan")
         self._fail(store, dep)
-        retry1 = store.add("First retry", based_on=dep.id)
+        retry1 = store.add("First retry", task_type="plan", based_on=dep.id)
         self._fail(store, retry1)
-        retry2 = store.add("Second retry", based_on=retry1.id)
+        retry2 = store.add("Second retry", task_type="plan", based_on=retry1.id)
         self._complete(store, retry2)
 
         downstream = store.add("Downstream", depends_on=dep.id)
@@ -4975,9 +5003,9 @@ class TestRetryChainDependencyResolution:
     def test_resolve_dependency_completion_returns_completed_retry(self, tmp_path: Path):
         """resolve_dependency_completion should resolve to completed retry descendant."""
         store = self._make_store(tmp_path)
-        dep = store.add("Original dep")
+        dep = store.add("Original dep", task_type="plan")
         self._fail(store, dep)
-        retry = store.add("Retry dep", based_on=dep.id)
+        retry = store.add("Retry dep", task_type="plan", based_on=dep.id)
         self._complete(store, retry)
         downstream = store.add("Downstream", depends_on=dep.id)
 
@@ -4988,11 +5016,11 @@ class TestRetryChainDependencyResolution:
     def test_dropped_dep_with_successful_retry_unblocks(self, tmp_path: Path):
         """Dropped dependency remains blocking unless a retry descendant completes."""
         store = self._make_store(tmp_path)
-        dep = store.add("Dependency")
+        dep = store.add("Dependency", task_type="plan")
         dep.status = "dropped"
         dep.completed_at = datetime.now(UTC)
         store.update(dep)
-        retry = store.add("Retry of dropped dep", based_on=dep.id)
+        retry = store.add("Retry of dropped dep", task_type="plan", based_on=dep.id)
         self._complete(store, retry)
 
         downstream = store.add("Downstream", depends_on=dep.id)
@@ -5015,9 +5043,9 @@ class TestRetryChainDependencyResolution:
     def test_get_next_pending_returns_task_unblocked_by_successful_retry(self, tmp_path: Path):
         """get_next_pending returns downstream once its dep's retry succeeds."""
         store = self._make_store(tmp_path)
-        dep = store.add("Dependency")
+        dep = store.add("Dependency", task_type="plan")
         self._fail(store, dep)
-        retry = store.add("Retry", based_on=dep.id)
+        retry = store.add("Retry", task_type="plan", based_on=dep.id)
         self._complete(store, retry)
         downstream = store.add("Downstream", depends_on=dep.id)
 
@@ -5028,11 +5056,11 @@ class TestRetryChainDependencyResolution:
     def test_get_next_pending_handles_retry_chain(self, tmp_path: Path):
         """get_next_pending unblocks downstream after multi-hop retry chain succeeds."""
         store = self._make_store(tmp_path)
-        dep = store.add("Original dep")
+        dep = store.add("Original dep", task_type="plan")
         self._fail(store, dep)
-        retry1 = store.add("Retry 1", based_on=dep.id)
+        retry1 = store.add("Retry 1", task_type="plan", based_on=dep.id)
         self._fail(store, retry1)
-        retry2 = store.add("Retry 2", based_on=retry1.id)
+        retry2 = store.add("Retry 2", task_type="plan", based_on=retry1.id)
         self._complete(store, retry2)
         downstream = store.add("Downstream", depends_on=dep.id)
 
@@ -5052,7 +5080,7 @@ class TestRetryChainDependencyResolution:
     def test_get_next_pending_completed_dep_unblocks(self, tmp_path: Path):
         """Regression: get_next_pending returns downstream when dep is completed."""
         store = self._make_store(tmp_path)
-        dep = store.add("Dep")
+        dep = store.add("Dep", task_type="plan")
         self._complete(store, dep)
         downstream = store.add("Downstream", depends_on=dep.id)
 
@@ -5110,9 +5138,9 @@ class TestRetryChainDependencyResolution:
     def test_count_blocked_excludes_unblocked_by_retry(self, tmp_path: Path):
         """count_blocked_tasks does not count tasks unblocked by a successful retry."""
         store = self._make_store(tmp_path)
-        dep = store.add("Dep")
+        dep = store.add("Dep", task_type="plan")
         self._fail(store, dep)
-        retry = store.add("Retry", based_on=dep.id)
+        retry = store.add("Retry", task_type="plan", based_on=dep.id)
         self._complete(store, retry)
         _downstream = store.add("Downstream", depends_on=dep.id)
 
