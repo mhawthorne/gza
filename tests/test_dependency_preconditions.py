@@ -26,7 +26,7 @@ def test_dependency_precondition_reads_merge_unit_state(tmp_path: Path) -> None:
     assert get_unmerged_dependency_precondition(store, downstream) is None
 
 
-def test_dependency_precondition_blocks_when_unit_is_empty_by_default(tmp_path: Path) -> None:
+def test_dependency_precondition_empty_unit_is_runnable_by_default(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
 
     dependency = store.add("Dependency", task_type="implement")
@@ -39,10 +39,10 @@ def test_dependency_precondition_blocks_when_unit_is_empty_by_default(tmp_path: 
     downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
 
     assert callable(empty_prereq_satisfies_dependency)
-    assert get_unmerged_dependency_precondition(store, downstream).id == dependency.id
+    assert get_unmerged_dependency_precondition(store, downstream) is None
 
 
-def test_dependency_precondition_empty_policy_can_satisfy_dependency(
+def test_dependency_precondition_empty_policy_can_block_dependency(
     tmp_path: Path, monkeypatch
 ) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
@@ -56,15 +56,15 @@ def test_dependency_precondition_empty_policy_can_satisfy_dependency(
 
     downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
 
-    assert get_unmerged_dependency_precondition(store, downstream).id == dependency.id
+    assert get_unmerged_dependency_precondition(store, downstream) is None
 
     monkeypatch.setattr(
         dependency_preconditions_module,
         "empty_prereq_satisfies_dependency",
-        lambda _store, _prereq, _dependent: True,
+        lambda _store, _prereq, _dependent: False,
     )
 
-    assert get_unmerged_dependency_precondition(store, downstream) is None
+    assert get_unmerged_dependency_precondition(store, downstream).id == dependency.id
 
 
 def test_dependency_precondition_blocks_when_unit_is_unmerged_but_legacy_row_says_merged(tmp_path: Path) -> None:
@@ -102,3 +102,35 @@ def test_dependency_precondition_blocks_when_unit_is_blocked_even_if_legacy_row_
     downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
 
     assert get_unmerged_dependency_precondition(store, downstream).id == dependency.id
+
+
+def test_dependency_precondition_uses_canonical_dependency_lineage_merge_unit(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    dependency = store.add("Dependency", task_type="implement")
+    store.mark_completed(dependency, has_commits=True, branch="feature/dependency-lineage")
+    assert dependency.id is not None
+    unit = store.resolve_merge_unit_for_task(dependency.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "unmerged")
+
+    dependency = store.get(dependency.id)
+    assert dependency is not None
+    store.mark_failed(dependency, failure_reason="UNKNOWN")
+
+    recovered = store.add("Recovered dependency", task_type="implement", based_on=dependency.id)
+    store.mark_completed(recovered, has_commits=True, branch="feature/dependency-lineage-recovered")
+
+    downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
+
+    blocking_dep = get_unmerged_dependency_precondition(store, downstream)
+    assert blocking_dep is not None
+    assert blocking_dep.id == recovered.id
+
+    readiness = store.get_dependency_readiness(downstream)
+    assert readiness.blocking_merge_unit_id == unit.id
+    assert readiness.blocking_merge_unit_owner_task_id == dependency.id
+    assert readiness.blocking_source_branch == "feature/dependency-lineage"
+
+    store.set_merge_unit_state(unit.id, "merged")
+    assert get_unmerged_dependency_precondition(store, downstream) is None

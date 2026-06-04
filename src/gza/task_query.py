@@ -170,6 +170,14 @@ _TASK_DEFAULT_FIELDS: tuple[str, ...] = (
     "next_action",
     "next_action_reason",
     "next_action_owner_id",
+    "blocked",
+    "blocking_id",
+    "blocking_status",
+    "blocking_merge_unit_id",
+    "blocking_merge_state",
+    "blocking_merge_owner_id",
+    "blocking_source_branch",
+    "blocking_target_branch",
 )
 
 _LINEAGE_DEFAULT_FIELDS: tuple[str, ...] = (
@@ -197,6 +205,11 @@ _PROJECTION_PRESET_FIELDS: dict[str, tuple[str, ...]] = {
         "blocked",
         "blocking_id",
         "blocking_status",
+        "blocking_merge_unit_id",
+        "blocking_merge_state",
+        "blocking_merge_owner_id",
+        "blocking_source_branch",
+        "blocking_target_branch",
     ),
     TaskProjectionPreset.UNMERGED_DEFAULT: (
         "id",
@@ -762,7 +775,10 @@ class TaskQueryService:
     def _project_task_row(self, task: DbTask, query: TaskQuery, *, target_branch: str | None) -> TaskRow:
         root = _resolve_lineage_root(self._store, task)
         branch_owner = _resolve_lineage_owner_task(self._store, task)
-        blocked, blocking_id, blocking_status = self._store.is_task_blocked(task)
+        readiness = self._store.get_dependency_readiness(task)
+        blocked = not readiness.ready
+        blocking_id = readiness.blocking_task_id
+        blocking_status = readiness.blocking_task_status
         review_verdict = None
         comments_count = 0
         if task.id is not None:
@@ -794,6 +810,11 @@ class TaskQueryService:
             "blocked": blocked,
             "blocking_id": blocking_id,
             "blocking_status": blocking_status,
+            "blocking_merge_unit_id": readiness.blocking_merge_unit_id,
+            "blocking_merge_state": readiness.blocking_merge_state,
+            "blocking_merge_owner_id": readiness.blocking_merge_unit_owner_task_id,
+            "blocking_source_branch": readiness.blocking_source_branch,
+            "blocking_target_branch": readiness.blocking_target_branch,
         }
         return TaskRow(
             task=task,
@@ -811,6 +832,7 @@ class TaskQueryService:
     ) -> LineageRow:
         owner = row.owner_task
         root = _resolve_lineage_root(self._store, owner)
+        owner_readiness = self._store.get_dependency_readiness(owner)
 
         next_action_type: str | None = None
         next_action_reason: str | None = None
@@ -869,8 +891,14 @@ class TaskQueryService:
             "next_action_reason": next_action_reason,
             "next_action_owner_id": next_action_owner_id,
             "trigger_source": owner.trigger_source,
-            "blocked": self._store.is_task_blocked(owner)[0],
-            "blocking_id": self._store.is_task_blocked(owner)[1],
+            "blocked": not owner_readiness.ready,
+            "blocking_id": owner_readiness.blocking_task_id,
+            "blocking_status": owner_readiness.blocking_task_status,
+            "blocking_merge_unit_id": owner_readiness.blocking_merge_unit_id,
+            "blocking_merge_state": owner_readiness.blocking_merge_state,
+            "blocking_merge_owner_id": owner_readiness.blocking_merge_unit_owner_task_id,
+            "blocking_source_branch": owner_readiness.blocking_source_branch,
+            "blocking_target_branch": owner_readiness.blocking_target_branch,
             "member_ids": [member.id for member in row.members if member.id is not None],
             "unresolved_ids": [task.id for task in row.unresolved_tasks if task.id is not None],
         }

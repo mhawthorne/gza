@@ -1387,7 +1387,7 @@ def test_recovery_engine_prerequisite_unmerged_reconciles_no_output_row_to_empty
     assert unit.state == "empty"
 
 
-def test_recovery_engine_prerequisite_unmerged_with_commits_still_retries_after_dependency_merge(
+def test_recovery_engine_prerequisite_unmerged_with_commits_stays_parked_after_dependency_merge(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -1412,8 +1412,8 @@ def test_recovery_engine_prerequisite_unmerged_with_commits_still_retries_after_
     store.set_merge_status(dependency.id, "merged")
 
     ready_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
-    assert ready_decision.action == "retry"
-    assert ready_decision.reason_code == "PREREQUISITE_UNMERGED"
+    assert ready_decision.action == "skip"
+    assert ready_decision.reason_code == "legacy_prerequisite_unmerged_parked"
 
 
 def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:

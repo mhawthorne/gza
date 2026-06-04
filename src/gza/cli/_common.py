@@ -2718,7 +2718,7 @@ def _render_failure_diagnostics(
 
 
 def _precondition_blocking_dependency_id(task: DbTask, config: Config | None) -> str | None:
-    """Extract dependency_task_id from PREREQUISITE_UNMERGED outcome log entry."""
+    """Extract dependency_task_id from dependency-merge precondition log entries."""
     if config is None or not task.log_file:
         return None
     from .log import _load_log_file_entries
@@ -2733,9 +2733,9 @@ def _precondition_blocking_dependency_id(task: DbTask, config: Config | None) ->
         return None
 
     for entry in reversed(entries):
-        if entry.get("type") != "gza" or entry.get("subtype") != "outcome":
+        if entry.get("type") != "gza" or entry.get("subtype") not in {"outcome", "blocked"}:
             continue
-        if entry.get("failure_reason") != "PREREQUISITE_UNMERGED":
+        if entry.get("failure_reason") != "PREREQUISITE_UNMERGED" and entry.get("reason") != "dependency_merge_precondition":
             continue
         dep_id = entry.get("dependency_task_id")
         if isinstance(dep_id, str) and dep_id:
@@ -2765,7 +2765,6 @@ def _failure_next_steps(
         blocking_dep_id = _precondition_blocking_dependency_id(task, config) or task.depends_on
         if blocking_dep_id:
             steps.append(f"gza merge {blocking_dep_id}")
-        steps.append(f"gza retry {task.id}")
         return steps
     if is_resumable_failure_reason(reason):
         if task.session_id:

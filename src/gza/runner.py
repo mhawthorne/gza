@@ -4843,10 +4843,17 @@ def run(
                 return 1
             if task.status == "pending":
                 assert task.id is not None
-                claimed = store.try_mark_in_progress(task.id, os.getpid())
+                claim = store.try_mark_in_progress(task.id, os.getpid())
+                claimed = claim.task if claim is not None else None
                 if claimed is None:
                     refreshed = store.get(task.id)
                     status = refreshed.status if refreshed else "unknown"
+                    if claim is not None and claim.refusal_reason == "blocked":
+                        error_message(
+                            f"Error: Task {task_id} is blocked by task "
+                            f"{claim.blocking_task_id} ({claim.blocking_task_status})"
+                        )
+                        return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
                     error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
                     return 1
                 task = claimed
@@ -4897,13 +4904,30 @@ def run(
                 return 1
             else:
                 assert task.id is not None
-                claimed = store.try_mark_in_progress(task.id, os.getpid())
-                if claimed is None:
-                    refreshed = store.get(task.id)
-                    status = refreshed.status if refreshed else "unknown"
-                    error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
-                    return 1
-                task = claimed
+                if skip_precondition_check and merge_precondition_blocked:
+                    task.status = "in_progress"
+                    task.started_at = datetime.now(UTC)
+                    task.completed_at = None
+                    task.failure_reason = None
+                    task.completion_reason = None
+                    task.running_pid = os.getpid()
+                    task.execution_mode = task_execution_mode
+                    store.update(task)
+                else:
+                    claim = store.try_mark_in_progress(task.id, os.getpid())
+                    claimed = claim.task if claim is not None else None
+                    if claimed is None:
+                        refreshed = store.get(task.id)
+                        status = refreshed.status if refreshed else "unknown"
+                        if claim is not None and claim.refusal_reason == "blocked":
+                            error_message(
+                                f"Error: Task {task_id} is blocked by task "
+                                f"{claim.blocking_task_id} ({claim.blocking_task_status})"
+                            )
+                            return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+                        error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
+                        return 1
+                    task = claimed
                 task.execution_mode = task_execution_mode
                 assert task.id is not None
                 store.set_execution_mode(task.id, task_execution_mode)
@@ -4917,7 +4941,8 @@ def run(
             if candidate is None:
                 break
             assert candidate.id is not None
-            claimed = store.try_mark_in_progress(candidate.id, os.getpid())
+            claim = store.try_mark_in_progress(candidate.id, os.getpid())
+            claimed = claim.task if claim is not None else None
             if claimed is None:
                 continue
             task = claimed
@@ -5101,16 +5126,6 @@ def _check_dependency_merge_precondition(
     if dep is None:
         return (None, None, None)
     return (dep, default_branch, None)
-
-
-def _task_has_prior_execution_evidence(task: Task, *, resume: bool) -> bool:
-    """Return whether a blocked dependency gate should fail closed for ``task``."""
-    return bool(
-        resume
-        or task.has_commits
-        or task.output_content
-        or task.session_id
-    )
 
 
 def _park_task_pending_after_blocked_precondition(task: Task, store: SqliteTaskStore) -> None:
@@ -6218,56 +6233,26 @@ def _run_inner(
         if blocking_dep is not None:
             assert blocking_dep.id is not None
             dep_branch = blocking_dep.branch or "<none>"
-            if not _task_has_prior_execution_evidence(task, resume=resume):
-                blocked_message = (
-                    f"Dependency {blocking_dep.id} on branch '{dep_branch}' is not merged into "
-                    f"'{target_branch}'. Leaving task pending without provider run."
-                )
-                error_message(f"Error: {blocked_message}")
-                write_log_entry(
-                    log_file,
-                    {
-                        "type": "gza",
-                        "subtype": "blocked",
-                        "message": blocked_message,
-                        "reason": "dependency_merge_precondition",
-                        "dependency_task_id": blocking_dep.id,
-                        "dependency_branch": dep_branch,
-                        "target_branch": target_branch,
-                        "task_status": "pending",
-                    },
-                )
-                _park_task_pending_after_blocked_precondition(task, store)
-                return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
-
             failure_message = (
                 f"Dependency {blocking_dep.id} on branch '{dep_branch}' is not merged into "
-                f"'{target_branch}'. Failing without provider run."
+                f"'{target_branch}'. Leaving task pending without provider run."
             )
             error_message(f"Error: {failure_message}")
             write_log_entry(
                 log_file,
                 {
                     "type": "gza",
-                    "subtype": "outcome",
+                    "subtype": "blocked",
                     "message": failure_message,
-                    "failure_reason": "PREREQUISITE_UNMERGED",
+                    "reason": "dependency_merge_precondition",
                     "dependency_task_id": blocking_dep.id,
                     "dependency_branch": dep_branch,
                     "target_branch": target_branch,
+                    "task_status": "pending",
                 },
             )
-            _mark_task_failed(
-                task=task,
-                config=config,
-                store=store,
-                log_file=log_file,
-                branch=branch_name,
-                explicit_reason="PREREQUISITE_UNMERGED",
-                error_type=None,
-                exit_code=1,
-            )
-            return 1
+            _park_task_pending_after_blocked_precondition(task, store)
+            return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
 
     # Setup summary directory and path for task/implement types
     _, summary_path = get_task_output_paths(task, config.project_dir)

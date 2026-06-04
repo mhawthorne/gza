@@ -496,6 +496,25 @@ class TaskComment:
     resolved_at: datetime | None
 
 
+@dataclass(frozen=True)
+class TaskClaimResult:
+    """Outcome of attempting to claim a pending task for execution."""
+
+    task: Task | None
+    refusal_reason: str | None = None
+    readiness_reason: str | None = None
+    blocking_task_id: str | None = None
+    blocking_task_status: str | None = None
+
+
+@dataclass(frozen=True)
+class DependencyMergeUnitResolution:
+    """Canonical active merge-unit lookup for a dependency lineage."""
+
+    attached_task: Task | None
+    merge_unit: MergeUnit | None
+
+
 _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "projects": ("created_at", "last_seen_at"),
     "tasks": (
@@ -3487,15 +3506,33 @@ class SqliteTaskStore:
                     break
         return runnable
 
-    def try_mark_in_progress(self, task_id: str, pid: int) -> Task | None:
+    def try_mark_in_progress(self, task_id: str, pid: int) -> TaskClaimResult:
         """Compare-and-swap pending -> in_progress for a specific task.
 
-        Returns the updated Task on success, or None if the task was already
-        claimed (CAS loss) or the database was busy.
+        Returns a structured result so callers can distinguish CAS loss from a
+        dependency-held pending task.
         """
         started_at = datetime.now(UTC)
         try:
             with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                    (self._project_id, task_id),
+                ).fetchone()
+                task = self._row_to_task(row) if row is not None else None
+                if task is None:
+                    return TaskClaimResult(task=None, refusal_reason="missing")
+                if task.status != "pending":
+                    return TaskClaimResult(task=None, refusal_reason="not_pending")
+                readiness = self.get_dependency_readiness(task)
+                if not readiness.ready:
+                    return TaskClaimResult(
+                        task=None,
+                        refusal_reason="blocked",
+                        readiness_reason=readiness.reason,
+                        blocking_task_id=readiness.blocking_task_id,
+                        blocking_task_status=readiness.blocking_task_status,
+                    )
                 cur = conn.execute(
                     """
                     UPDATE tasks
@@ -3510,14 +3547,14 @@ class SqliteTaskStore:
                     (_format_db_timestamp(started_at), pid, self._project_id, task_id),
                 )
                 if cur.rowcount == 0:
-                    return None
-                task = self.get(task_id)
-                if task is None:
-                    return None
-                return task
+                    return TaskClaimResult(task=None, refusal_reason="cas_lost")
+                claimed = self.get(task_id)
+                if claimed is None:
+                    return TaskClaimResult(task=None, refusal_reason="missing")
+                return TaskClaimResult(task=claimed)
         except sqlite3.OperationalError:
             # Database busy after timeout — treat as CAS loss.
-            return None
+            return TaskClaimResult(task=None, refusal_reason="busy")
 
     def get_pending(
         self,
@@ -5789,6 +5826,53 @@ class SqliteTaskStore:
 
         return None
 
+    def resolve_dependency_merge_unit(self, task: Task) -> DependencyMergeUnitResolution:
+        """Resolve the active merge unit, if any, for ``task.depends_on``'s lineage.
+
+        Prefer the direct dependency's attached active merge unit when present.
+        If the resolved completed recovery row is attached directly, use that.
+        Otherwise walk the direct dependency's retry lineage and return the
+        first attached active merge unit found there. Callers should fall back
+        to legacy task-row merge state only when this returns no unit anywhere
+        in the dependency lineage.
+        """
+        if task.depends_on is None:
+            return DependencyMergeUnitResolution(attached_task=None, merge_unit=None)
+
+        direct_dep = self.get(task.depends_on)
+        if direct_dep is None or direct_dep.id is None:
+            return DependencyMergeUnitResolution(attached_task=None, merge_unit=None)
+
+        resolved_dep = self.resolve_dependency_completion(task)
+        candidate_ids: list[str] = [direct_dep.id]
+        if resolved_dep is not None and resolved_dep.id is not None and resolved_dep.id != direct_dep.id:
+            candidate_ids.append(resolved_dep.id)
+
+        visited: set[str] = set()
+        queue: list[str] = list(candidate_ids)
+        while queue:
+            current_id = queue.pop(0)
+            if current_id in visited:
+                continue
+            visited.add(current_id)
+            current_task = direct_dep if current_id == direct_dep.id else self.get(current_id)
+            if current_task is None or current_task.id is None:
+                continue
+            merge_unit = self.resolve_merge_unit_for_task(current_task.id)
+            if merge_unit is not None:
+                return DependencyMergeUnitResolution(attached_task=current_task, merge_unit=merge_unit)
+            for child in self.get_based_on_children(current_task.id):
+                if child.id is not None and child.id not in visited:
+                    queue.append(child.id)
+
+        return DependencyMergeUnitResolution(attached_task=None, merge_unit=None)
+
+    def get_dependency_readiness(self, task: Task) -> Any:
+        """Return the shared dependency-readiness result for ``task``."""
+        from .dependency_preconditions import dependency_readiness
+
+        return dependency_readiness(self, task)
+
     def is_task_blocked(self, task: Task) -> tuple[bool, str | None, str | None]:
         """Check if a task is blocked by an incomplete dependency.
 
@@ -5799,19 +5883,10 @@ class SqliteTaskStore:
         Returns:
             Tuple of (is_blocked, blocking_task_id, blocking_task_status)
         """
-        if task.depends_on is None:
+        readiness = self.get_dependency_readiness(task)
+        if readiness.ready:
             return (False, None, None)
-
-        dep = self.get(task.depends_on)
-        if dep is None:
-            return (False, None, None)
-
-        from .dependency_preconditions import dependency_is_ready
-
-        if dependency_is_ready(self, task):
-            return (False, None, None)
-
-        return (True, dep.id, dep.status)
+        return (True, readiness.blocking_task_id, readiness.blocking_task_status)
 
     def count_blocked_tasks(self) -> int:
         """Count pending tasks that are blocked by dependencies.
@@ -5827,6 +5902,12 @@ class SqliteTaskStore:
 
     def mark_in_progress(self, task: Task) -> None:
         """Mark a task as in progress."""
+        if task.status == "pending":
+            readiness = self.get_dependency_readiness(task)
+            if not readiness.ready:
+                raise RuntimeError(
+                    f"Could not mark task {task.id} in progress: blocked by {readiness.blocking_task_id}"
+                )
         task.status = "in_progress"
         task.started_at = datetime.now(UTC)
         task.running_pid = os.getpid()

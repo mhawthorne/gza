@@ -2529,22 +2529,23 @@ def test_watch_cycle_starts_pending_work_when_terminal_task_worker_is_still_aliv
 
 def test_format_wake_message_includes_running_task_ids() -> None:
     """WAKE line should append task IDs when tasks are actively running."""
-    assert _format_wake_message(running=1, pending=3, slots=0, running_task_ids=["gza-42"]) == (
-        "checking... (1 running, 3 pending, 0 slots)\n"
+    assert _format_wake_message(running=1, runnable_pending=3, blocked_pending=0, slots=0, running_task_ids=["gza-42"]) == (
+        "checking... (1 running, pending=3 runnable, blocked=0, 0 slots)\n"
         "live workers:\n"
         "- gza-42"
     )
-    assert _format_wake_message(running=0, pending=2, slots=2, running_task_ids=[]) == (
-        "checking... (0 running, 2 pending, 2 slots)"
+    assert _format_wake_message(running=0, runnable_pending=2, blocked_pending=0, slots=2, running_task_ids=[]) == (
+        "checking... (0 running, pending=2 runnable, blocked=0, 2 slots)"
     )
     assert _format_wake_message(
         running=2,
-        pending=3,
+        runnable_pending=3,
+        blocked_pending=0,
         slots=0,
         running_task_ids=["gza-42"],
         anonymous_worker_count=1,
     ) == (
-        "checking... (2 running, 3 pending, 0 slots)\n"
+        "checking... (2 running, pending=3 runnable, blocked=0, 0 slots)\n"
         "live workers:\n"
         "- gza-42\n"
         "- 1 worker without an active task id"
@@ -2626,7 +2627,7 @@ def test_watch_cycle_logs_tag_scoped_pending_count_in_wake_line(tmp_path: Path) 
             tags=("release-1",),
         )
 
-    assert "WAKE      checking... (0 running, 2 pending, 1 slots)" in log_path.read_text()
+    assert "WAKE      checking... (0 running, pending=2 runnable, blocked=1, 1 slots)" in log_path.read_text()
 
 
 def test_watch_cycle_logs_tag_scope_with_all_mode(tmp_path: Path) -> None:
@@ -4106,6 +4107,63 @@ def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(
     stdout = capsys.readouterr().out
     assert "Merging 'feature/watch-quiet-merge' into 'main'..." not in stdout
     assert log_path.read_text().count(f"MERGE     {task.id} -> main") == 1
+
+
+def test_watch_cycle_dirty_checkout_blocks_merge_pass_and_stops_later_merges(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    first = store.add("First completed task", task_type="implement")
+    second = store.add("Second completed task", task_type="implement")
+    for task, branch in ((first, "feature/watch-dirty-1"), (second, "feature/watch-dirty-2")):
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        store.update(task)
+        store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    calls: list[str] = []
+
+    def fake_execute_merge_action(*args, **kwargs):
+        task = args[3]
+        calls.append(task.id)
+        return SimpleNamespace(
+            rc=1,
+            status="blocked_dirty_checkout",
+            block_reason="main checkout has uncommitted changes",
+            created_followups=[],
+            reused_followups=[],
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+    ):
+        result = _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is False
+    assert len(calls) == 1
+    assert calls[0] in {first.id, second.id}
+    assert "ATTENTION merges blocked: main checkout has uncommitted changes - commit or stash them first" in (
+        log_path.read_text()
+    )
 
 
 def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_tasks(tmp_path: Path) -> None:

@@ -434,6 +434,8 @@ class _PendingSquashBranchReconcile:
 @dataclass(frozen=True)
 class _MergeSingleTaskResult:
     rc: int
+    status: str = "merged"
+    block_reason: str | None = None
     pending_squash_reconcile: _PendingSquashBranchReconcile | None = None
 
 
@@ -1164,7 +1166,11 @@ def _merge_single_task(
     # Check for uncommitted changes (untracked files are OK, they won't conflict with merge)
     if git.has_changes(include_untracked=False):
         print("Error: You have uncommitted changes. Please commit or stash them first.")
-        return _MergeSingleTaskResult(rc=1)
+        return _MergeSingleTaskResult(
+            rc=1,
+            status="blocked_dirty_checkout",
+            block_reason="main checkout has uncommitted changes",
+        )
 
     # Check for conflicting flags
     if args.rebase and args.squash:
@@ -2517,6 +2523,7 @@ class _MergeActionResult:
     created_followups: list[DbTask]
     reused_followups: list[DbTask]
     status: str = "merged"
+    block_reason: str | None = None
 
 
 @dataclass
@@ -2704,6 +2711,8 @@ def _execute_merge_action(
         rc=rc,
         created_followups=created_followups,
         reused_followups=reused_followups,
+        status=merge_result.status,
+        block_reason=merge_result.block_reason,
     )
 
 

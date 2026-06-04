@@ -523,9 +523,7 @@ def test_query_lineage_owner_rows_surfaces_held_completed_plan_as_awaiting_human
     assert f"uv run gza implement {plan.id}" in row.next_action["description"]
 
 
-def test_query_lineage_owner_rows_empty_prereq_policy_toggle_suppresses_release_valve(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_query_lineage_owner_rows_empty_prereq_is_suppressed_by_default(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -539,12 +537,6 @@ def test_query_lineage_owner_rows_empty_prereq_policy_toggle_suppresses_release_
 
     downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
     assert downstream.id is not None
-
-    monkeypatch.setattr(
-        dependency_preconditions_module,
-        "empty_prereq_satisfies_dependency",
-        lambda _store, _prereq, _dependent: True,
-    )
 
     git = MagicMock()
     git.can_merge.return_value = True
@@ -560,7 +552,7 @@ def test_query_lineage_owner_rows_empty_prereq_policy_toggle_suppresses_release_
     assert not rows
 
 
-def test_query_lineage_owner_rows_failed_empty_prereq_surfaces_awaiting_human(tmp_path: Path) -> None:
+def test_query_lineage_owner_rows_failed_empty_prereq_is_suppressed_by_default(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -596,16 +588,10 @@ def test_query_lineage_owner_rows_failed_empty_prereq_surfaces_awaiting_human(tm
         target_branch="main",
     )
 
-    assert len(rows) == 1
-    row = rows[0]
-    assert row.owner_task.id == downstream.id
-    assert row.next_action is not None
-    assert row.next_action["type"] == "awaiting_human"
-    assert "empty prerequisite" in row.next_action["description"]
-    assert "gza-4072" in row.next_action["description"]
+    assert not rows
 
 
-def test_query_lineage_owner_rows_failed_empty_prereq_policy_toggle_suppresses_release_valve(
+def test_query_lineage_owner_rows_failed_empty_prereq_policy_toggle_surfaces_release_valve(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     setup_config(tmp_path)
@@ -635,7 +621,7 @@ def test_query_lineage_owner_rows_failed_empty_prereq_policy_toggle_suppresses_r
     monkeypatch.setattr(
         dependency_preconditions_module,
         "empty_prereq_satisfies_dependency",
-        lambda _store, _prereq, _dependent: True,
+        lambda _store, _prereq, _dependent: False,
     )
 
     git = MagicMock()
@@ -649,7 +635,13 @@ def test_query_lineage_owner_rows_failed_empty_prereq_policy_toggle_suppresses_r
         target_branch="main",
     )
 
-    assert not rows
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == downstream.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "awaiting_human"
+    assert "empty prerequisite" in row.next_action["description"]
+    assert "gza-4072" in row.next_action["description"]
 
 
 def test_query_lineage_owner_rows_surfaces_manual_review_creation_attention(tmp_path: Path) -> None:

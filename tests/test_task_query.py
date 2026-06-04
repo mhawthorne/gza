@@ -1062,7 +1062,7 @@ def test_dependency_state_blocked_by_dropped_dep_filters_pending_only(tmp_path: 
     assert blocked_resolved.id not in ids
 
 
-def test_dependency_state_completed_empty_prereq_is_blocked_by_default(tmp_path: Path) -> None:
+def test_dependency_state_completed_empty_prereq_is_unblocked_by_default(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
     dep = store.add("Empty dependency", task_type="implement")
@@ -1086,12 +1086,12 @@ def test_dependency_state_completed_empty_prereq_is_blocked_by_default(tmp_path:
     blocked_ids = [row.task.id for row in blocked_result.rows if hasattr(row, "task")]
     unblocked_ids = [row.task.id for row in unblocked_result.rows if hasattr(row, "task")]
 
-    assert blocked.id in blocked_ids
-    assert blocked.id not in unblocked_ids
+    assert blocked.id not in blocked_ids
+    assert blocked.id in unblocked_ids
     assert ready.id in unblocked_ids
 
 
-def test_dependency_state_completed_empty_prereq_unblocks_when_policy_enabled(
+def test_dependency_state_completed_empty_prereq_blocks_when_policy_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
@@ -1108,7 +1108,7 @@ def test_dependency_state_completed_empty_prereq_unblocks_when_policy_enabled(
     monkeypatch.setattr(
         dependency_preconditions_module,
         "empty_prereq_satisfies_dependency",
-        lambda _store, _prereq, _dependent: True,
+        lambda _store, _prereq, _dependent: False,
     )
 
     service = TaskQueryService(store)
@@ -1122,13 +1122,11 @@ def test_dependency_state_completed_empty_prereq_unblocks_when_policy_enabled(
     blocked_ids = [row.task.id for row in blocked_result.rows if hasattr(row, "task")]
     unblocked_ids = [row.task.id for row in unblocked_result.rows if hasattr(row, "task")]
 
-    assert downstream.id not in blocked_ids
-    assert downstream.id in unblocked_ids
+    assert downstream.id in blocked_ids
+    assert downstream.id not in unblocked_ids
 
 
-def test_incomplete_preset_empty_prereq_does_not_set_awaiting_human_when_policy_enabled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_incomplete_preset_empty_prereq_does_not_set_awaiting_human_by_default(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
     dep = store.add("Empty prerequisite", task_type="implement")
@@ -1140,12 +1138,6 @@ def test_incomplete_preset_empty_prereq_does_not_set_awaiting_human_when_policy_
 
     downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
     assert downstream.id is not None
-
-    monkeypatch.setattr(
-        dependency_preconditions_module,
-        "empty_prereq_satisfies_dependency",
-        lambda _store, _prereq, _dependent: True,
-    )
 
     service = TaskQueryService(store)
     result = service.run(

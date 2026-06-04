@@ -904,12 +904,16 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
 def _format_wake_message(
     *,
     running: int,
-    pending: int,
+    runnable_pending: int,
+    blocked_pending: int,
     slots: int,
     running_task_ids: list[str],
     anonymous_worker_count: int = 0,
 ) -> str:
-    message = f"checking... ({running} running, {pending} pending, {slots} slots)"
+    message = (
+        f"checking... ({running} running, pending={runnable_pending} runnable, "
+        f"blocked={blocked_pending}, {slots} slots)"
+    )
     if running_task_ids or anonymous_worker_count > 0:
         worker_lines = ["live workers:"]
         worker_lines.extend(f"- {task_id}" for task_id in running_task_ids)
@@ -1210,6 +1214,13 @@ def _run_cycle(
     live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
     running_task_id_set = set(running_task_ids)
     pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
+    blocked_pending_count = sum(
+        1
+        for pending_task in store.get_pending(limit=None)
+        if pending_task.task_type != "internal"
+        and task_matches_tag_filters(task_tags=pending_task.tags, tag_filters=tags, any_tag=any_tag)
+        and store.is_task_blocked(pending_task)[0]
+    )
     running = len(live_pids)
     slots = max(0, batch - running)
     work_done = False
@@ -1220,7 +1231,8 @@ def _run_cycle(
         "WAKE",
         _format_wake_message(
             running=running,
-            pending=pending_count,
+            runnable_pending=pending_count,
+            blocked_pending=blocked_pending_count,
             slots=slots,
             running_task_ids=running_task_ids,
             anonymous_worker_count=anonymous_worker_count,
@@ -1566,6 +1578,12 @@ def _run_cycle(
                     log.emit("FOLLOW", f"{followup_task.id} created from {display_task.id}")
                 for followup_task in merge_result.reused_followups:
                     log.emit("FOLLOW", f"{followup_task.id} reused from {display_task.id}")
+                if getattr(merge_result, "status", None) == "blocked_dirty_checkout":
+                    log.emit_attention(
+                        attention_key="merge-blocked-dirty-checkout",
+                        message="merges blocked: main checkout has uncommitted changes - commit or stash them first",
+                    )
+                    break
                 if rc == 0:
                     work_done = True
                 else:
@@ -2572,7 +2590,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
         if isinstance(row, TaskRow)
     ]
     runnable_pending = [row.task for row in queue_rows if not bool(row.values.get("blocked"))]
-    blocked_pending = [row.task for row in queue_rows if bool(row.values.get("blocked"))]
+    blocked_pending = [row for row in queue_rows if bool(row.values.get("blocked"))]
     if not runnable_pending and not blocked_pending and not recovery_entries:
         if tag_filters:
             print(f"No pending tasks matching tags: {', '.join(tag_filters)}")
@@ -2589,21 +2607,38 @@ def cmd_queue(args: argparse.Namespace) -> int:
         for index, task in enumerate(visible_runnable, 1)
     ]
 
-    def _blocked_by_text(task: DbTask) -> str:
+    def _blocked_by_text(row: TaskRow) -> str:
+        task = row.task
         empty_label = blocked_by_empty_prereq_label(store, task)
         if empty_label is not None:
             return empty_label
-        blocking = _precondition_blocking_dependency_id(task, config) or task.depends_on
+        blocking_id = row.values.get("blocking_id")
+        merge_state = row.values.get("blocking_merge_state")
+        merge_owner = row.values.get("blocking_merge_owner_id")
+        source_branch = row.values.get("blocking_source_branch")
+        target_branch = row.values.get("blocking_target_branch")
+        if isinstance(merge_state, str) and merge_state:
+            detail = f"blocked by dependency {blocking_id or task.depends_on or 'unknown'} merge unit {merge_state}"
+            if isinstance(merge_owner, str) and merge_owner and merge_owner != blocking_id:
+                detail += f" owned by {merge_owner}"
+            if isinstance(source_branch, str) and source_branch:
+                detail += f" on {source_branch}"
+            if isinstance(target_branch, str) and target_branch:
+                detail += f" -> {target_branch}"
+            return detail
+        blocking = str(blocking_id) if isinstance(blocking_id, str) and blocking_id else (
+            _precondition_blocking_dependency_id(task, config) or task.depends_on
+        )
         return f"blocked by {blocking}" if blocking else "blocked by dependency"
 
     rendered_rows.extend(
         QueueRenderRow(
-            task=task,
+            task=row.task,
             position_text="-",
             blocked=True,
-            blocked_by_text=_blocked_by_text(task),
+            blocked_by_text=_blocked_by_text(row),
         )
-        for task in blocked_pending
+        for row in blocked_pending
     )
     widths = queue_render_widths(rendered_rows)
 

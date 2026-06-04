@@ -3237,7 +3237,7 @@ class TestQueueCommand:
         assert lines[blocked_line].split()[0] == "-"
         assert lines[blocked_line + 1].strip() == f"blocked by {blocker.id}"
 
-    def test_queue_empty_prerequisite_block_points_to_manual_release_valve(self, tmp_path: Path):
+    def test_queue_empty_prerequisite_is_runnable(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -3256,19 +3256,17 @@ class TestQueueCommand:
         )
         store.attach_task_to_merge_unit(dep.id, unit.id, "owner")
 
-        blocked = store.add("Held downstream", depends_on=dep.id)
-        assert blocked.id is not None
+        downstream = store.add("Held downstream", depends_on=dep.id)
+        assert downstream.id is not None
 
         result = run_gza("queue", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        lines = result.stdout.splitlines()
-        blocked_line = next(i for i, line in enumerate(lines) if "Held downstream" in line)
-        assert "empty prerequisite" in lines[blocked_line + 1]
-        assert "gza-4072" in lines[blocked_line + 1]
-        assert "gza edit --clear-depends-on" in lines[blocked_line + 1]
+        normalized = " ".join(result.stdout.split())
+        assert "Held downstream" in normalized
+        assert "empty prerequisite" not in normalized
 
-    def test_queue_failed_empty_prerequisite_block_points_to_manual_release_valve(self, tmp_path: Path):
+    def test_queue_failed_empty_prerequisite_is_runnable(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -3288,17 +3286,15 @@ class TestQueueCommand:
         )
         store.attach_task_to_merge_unit(dep.id, unit.id, "owner")
 
-        blocked = store.add("Held downstream", task_type="implement", depends_on=dep.id)
-        assert blocked.id is not None
+        downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
+        assert downstream.id is not None
 
         result = run_gza("queue", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        lines = result.stdout.splitlines()
-        blocked_line = next(i for i, line in enumerate(lines) if "Held downstream" in line)
-        assert "empty prerequisite" in lines[blocked_line + 1]
-        assert "gza-4072" in lines[blocked_line + 1]
-        assert "gza edit --clear-depends-on" in lines[blocked_line + 1]
+        normalized = " ".join(result.stdout.split())
+        assert "Held downstream" in normalized
+        assert "empty prerequisite" not in normalized
 
     def test_queue_layout_keeps_first_line_columns_stable_and_second_line_aligned(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -5523,7 +5519,7 @@ class TestShowCommand:
         assert f"gza resume {task.id}" not in result.stdout
 
     def test_show_failed_task_prerequisite_unmerged_next_steps(self, tmp_path: Path):
-        """PREREQUISITE_UNMERGED should show merge+retry guidance."""
+        """PREREQUISITE_UNMERGED should show merge-only guidance for legacy parked rows."""
         setup_config(tmp_path)
 
         store = make_store(tmp_path)
@@ -5540,7 +5536,7 @@ class TestShowCommand:
         assert "Failure Reason: PREREQUISITE_UNMERGED" in result.stdout
         assert "Failure Summary: Dependency is not yet merged to main." in result.stdout
         assert f"gza merge {dep.id}" in result.stdout
-        assert f"gza retry {task.id}" in result.stdout
+        assert f"gza retry {task.id}" not in result.stdout
 
     def test_show_failed_task_prerequisite_unmerged_empty_row_is_moot_without_retry_guidance(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -12657,7 +12653,7 @@ class TestIncompleteCommand:
         assert self._tree_root_id(tree_output) == impl.id
         assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
 
-    def test_incomplete_pending_downstream_blocked_by_empty_prereq_points_to_release_valve(
+    def test_incomplete_empty_prereq_is_not_unresolved_by_default(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -12680,13 +12676,41 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
 
         assert result == 0
-        one_line_output = captured.out
-        assert self._one_line_row_id(one_line_output) == downstream.id
-        assert "empty prerequisite" in one_line_output
-        assert "gza-4072" in one_line_output
-        assert "gza edit --clear-depends-on" in one_line_output
+        assert "No unresolved task lineages" in captured.out
 
-    def test_incomplete_empty_prereq_policy_toggle_hides_release_valve_guidance(
+    def test_incomplete_warns_when_mergeable_rows_are_blocked_by_dirty_default_checkout(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement dirty-checkout warning", task_type="implement")
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=True, branch="feature/incomplete-dirty-warning")
+        unit = store.resolve_merge_unit_for_task(impl.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "unmerged")
+        review = store.add("Review dirty-checkout warning", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        review.output_content = "**Verdict: APPROVED**"
+        store.update(review)
+        assert review.id is not None
+        store.attach_task_to_merge_unit(review.id, unit.id, "review")
+
+        git = _mock_unmerged_git()
+        git.has_changes.return_value = True
+
+        with patch("gza.cli.query.Git", return_value=git):
+            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None))
+        captured = capsys.readouterr()
+
+        assert result == 0
+        assert "merges blocked: main checkout has uncommitted changes - commit or stash them first" in captured.out
+
+    def test_incomplete_empty_prereq_policy_toggle_surfaces_release_valve_guidance(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -12708,7 +12732,7 @@ class TestIncompleteCommand:
         monkeypatch.setattr(
             dependency_preconditions_module,
             "empty_prereq_satisfies_dependency",
-            lambda _store, _prereq, _dependent: True,
+            lambda _store, _prereq, _dependent: False,
         )
 
         with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
@@ -12717,9 +12741,10 @@ class TestIncompleteCommand:
 
         assert result == 0
         one_line_output = captured.out
-        assert "empty prerequisite" not in one_line_output
-        assert "gza-4072" not in one_line_output
-        assert "gza edit --clear-depends-on" not in one_line_output
+        assert self._one_line_row_id(one_line_output) == downstream.id
+        assert "empty prerequisite" in one_line_output
+        assert "gza-4072" in one_line_output
+        assert "gza edit --clear-depends-on" in one_line_output
 
     def test_incomplete_surfaces_strict_scope_unverified_needs_attention(
         self,

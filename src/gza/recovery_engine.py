@@ -172,8 +172,6 @@ def _is_retry_recovery_edge(parent: DbTask, child: DbTask) -> bool:
 def classify_failure_reason(reason: str | None) -> FailureCategory:
     if reason in _MANUAL_ONLY_REASONS or reason == "UNKNOWN" or reason is None:
         return "manual"
-    if reason == "PREREQUISITE_UNMERGED":
-        return "retryable"
     if reason in _RETRY_REASONS:
         return "retryable"
     if reason in _TIMEOUT_STYLE_REASONS or is_resumable_failure_reason(reason):
@@ -701,7 +699,7 @@ def _expected_recovery_action(
     category = classify_failure_reason(reason)
 
     if reason == "PREREQUISITE_UNMERGED":
-        return "retry" if chain.role == "original" else None
+        return None
 
     if category == "manual":
         return None
@@ -861,6 +859,13 @@ def decide_failed_task_recovery(
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,
             )
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="legacy_prerequisite_unmerged_parked",
+            reason_text="legacy dependency-merge failure is parked; wait for dependency merge state to reconcile",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
     elif classify_failure_reason(reason) == "manual":
         return _skip_decision(
             task_id=task_id,
@@ -910,6 +915,14 @@ def decide_failed_task_recovery(
     deeper_descendants = list(snapshot.deeper_descendants)
     pending_children = [child for child in matching_children if child.status == "pending" and child.id is not None]
     all_pending_children = [child for child in recovery_children if child.status == "pending" and child.id is not None]
+    if any(store.is_task_blocked(child)[0] for child in all_pending_children):
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="dependency_not_ready",
+            reason_text="dependency precondition not satisfied",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
 
     for status, reason_code, reason_text in _DIRECT_CHILD_SUPERSEDED_REASONS:
         if any(child.status == status for child in recovery_children):

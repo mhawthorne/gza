@@ -40,6 +40,7 @@ from ..db import (
     task_id_numeric_key as _task_id_numeric_key,
     task_owns_merge_status,
 )
+from ..dependency_preconditions import DependencyReadiness
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git, GitError, active_worktree_path_for_branch
 from ..github import GitHub
@@ -518,8 +519,23 @@ def _normalize_task_timestamp(value: datetime | None) -> datetime:
 def _format_blocked_dependency_label(
     blocking_id: str | None,
     blocking_status: str | None,
+    *,
+    blocking_merge_state: str | None = None,
+    blocking_merge_owner_id: str | None = None,
+    blocking_source_branch: str | None = None,
+    blocking_target_branch: str | None = None,
 ) -> str:
     """Render a truthful blocked-dependency label for `gza next --all` rows."""
+    if blocking_merge_state:
+        bits = [f"blocked: dependency {blocking_id or 'unknown'}"]
+        bits.append(f"merge unit {blocking_merge_state}")
+        if blocking_merge_owner_id and blocking_merge_owner_id != blocking_id:
+            bits.append(f"owned by {blocking_merge_owner_id}")
+        if blocking_source_branch:
+            bits.append(f"on {blocking_source_branch}")
+        if blocking_target_branch:
+            bits.append(f"-> {blocking_target_branch}")
+        return f"({' '.join(bits)})"
     if blocking_status and blocking_id:
         return f"(blocked-by-{blocking_status} {blocking_id})"
     if blocking_status:
@@ -660,6 +676,10 @@ def cmd_next(args: argparse.Namespace) -> int:
                     or _format_blocked_dependency_label(
                         cast(str | None, row.values.get("blocking_id")),
                         cast(str | None, row.values.get("blocking_status")),
+                        blocking_merge_state=cast(str | None, row.values.get("blocking_merge_state")),
+                        blocking_merge_owner_id=cast(str | None, row.values.get("blocking_merge_owner_id")),
+                        blocking_source_branch=cast(str | None, row.values.get("blocking_source_branch")),
+                        blocking_target_branch=cast(str | None, row.values.get("blocking_target_branch")),
                     )[1:-1]
                 ),
             )
@@ -1361,6 +1381,39 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     if rendered:
         console.print(rendered)
 
+    dirty_merge_warning = _incomplete_dirty_checkout_warning(
+        result,
+        config=config,
+        git=git,
+    )
+    if dirty_merge_warning is not None:
+        console.print(dirty_merge_warning)
+
+    blocked_dependents = _collect_incomplete_blocked_dependents(
+        store,
+        result,
+        task_type_filter=task_type_filter,
+    )
+    if blocked_dependents:
+        console.print()
+        console.print("Blocked dependents:")
+        for task, readiness in blocked_dependents:
+            assert task.id is not None
+            detail = (
+                f"  {task.id} pending {task.task_type} blocked by "
+                f"{readiness.blocking_merge_state or 'unmerged'} dependency "
+                f"{readiness.blocking_task_id or task.depends_on or 'unknown'}"
+            )
+            owner_id = readiness.blocking_merge_unit_owner_task_id
+            if owner_id and owner_id != readiness.blocking_task_id:
+                detail += f" (merge unit owned by {owner_id}"
+                if readiness.blocking_source_branch:
+                    detail += f", branch {readiness.blocking_source_branch}"
+                detail += ")"
+            elif readiness.blocking_source_branch:
+                detail += f" (branch {readiness.blocking_source_branch})"
+            console.print(detail)
+
     if getattr(args, "verbose", False) and mode != "tree":
         c = TASK_COLORS
         for row in result.rows:
@@ -1376,6 +1429,64 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             )
 
     return 0
+
+
+def _collect_incomplete_blocked_dependents(
+    store: SqliteTaskStore,
+    result: _TaskQueryResult,
+    *,
+    task_type_filter: str | None,
+) -> list[tuple[DbTask, DependencyReadiness]]:
+    owner_ids = {
+        row.owner_task.id
+        for row in result.rows
+        if isinstance(row, _LineageRow) and row.owner_task.id is not None
+    }
+    owner_unit_ids = {
+        cast(str, row.values.get("merge_unit_id"))
+        for row in result.rows
+        if isinstance(row, _LineageRow) and isinstance(row.values.get("merge_unit_id"), str)
+    }
+
+    blocked: list[tuple[DbTask, DependencyReadiness]] = []
+    for task in store.get_pending(limit=None):
+        if task.task_type == "internal":
+            continue
+        if task_type_filter is not None and task.task_type != task_type_filter:
+            continue
+        readiness = store.get_dependency_readiness(task)
+        if readiness.ready:
+            continue
+        if (
+            readiness.blocking_merge_unit_owner_task_id not in owner_ids
+            and readiness.blocking_merge_unit_id not in owner_unit_ids
+        ):
+            continue
+        blocked.append((task, readiness))
+    blocked.sort(key=lambda item: _normalize_task_timestamp(item[0].created_at))
+    return blocked
+
+
+def _incomplete_dirty_checkout_warning(
+    result: _TaskQueryResult,
+    *,
+    config: Config,
+    git: Git | None,
+) -> str | None:
+    if config.main_checkout_isolate or git is None:
+        return None
+    has_mergeable_rows = any(
+        isinstance(row, _LineageRow) and row.values.get("next_action") in {"merge", "merge_with_followups"}
+        for row in result.rows
+    )
+    if not has_mergeable_rows:
+        return None
+    try:
+        if not git.has_changes(include_untracked=False):
+            return None
+    except GitError:
+        return None
+    return "merges blocked: main checkout has uncommitted changes - commit or stash them first"
 
 
 def _normalize_incomplete_result_rows(

@@ -13414,6 +13414,44 @@ class TestDependencyMergePrecondition:
         assert store.is_task_blocked(refreshed) == (True, refreshed.depends_on, "completed")
         assert all(task.status != "failed" for task in store.get_all())
 
+    def test_missing_dependency_holds_task_before_provider_run(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        downstream = store.add(
+            prompt="Implement with stale dependency",
+            task_type="implement",
+            depends_on="gza-999999",
+        )
+        downstream.slug = "20260412-implement-with-stale-dependency"
+        store.update(downstream)
+        config = self._make_config(tmp_path, db_path)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.check_credentials.return_value = True
+        mock_provider.verify_credentials.return_value = True
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=3.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        with (
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.load_dotenv"),
+        ):
+            result = run(config, task_id=downstream.id)
+
+        assert result == DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+        assert mock_provider.run.call_count == 0
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.status == "pending"
+        assert refreshed.failure_reason is None
+        assert store.is_task_blocked(refreshed) == (True, "gza-999999", "missing")
+
     def test_retry_chain_dependency_uses_completed_retry_for_precondition(self, tmp_path: Path):
         result, mock_provider, store, downstream = self._run_with_dependency_state(
             tmp_path,
@@ -13427,7 +13465,7 @@ class TestDependencyMergePrecondition:
         assert refreshed.status == "pending"
         assert refreshed.failure_reason is None
 
-    def test_unmerged_dependency_with_prior_output_still_fails_closed(self, tmp_path: Path):
+    def test_unmerged_dependency_with_prior_output_still_parks_pending(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         _dep_task, downstream = self._setup_dep_and_downstream(store)
@@ -13449,12 +13487,13 @@ class TestDependencyMergePrecondition:
         ):
             result = _run_inner(downstream, config, config, store, mock_provider, mock_main_git)
 
-        assert result == 1
+        assert result == DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
         assert mock_provider.run.call_count == 0
         refreshed = store.get(downstream.id)
         assert refreshed is not None
-        assert refreshed.status == "failed"
-        assert refreshed.failure_reason == "PREREQUISITE_UNMERGED"
+        assert refreshed.status == "pending"
+        assert refreshed.failure_reason is None
+        assert refreshed.output_content == "prior output"
 
     def test_run_inner_logs_blocked_dependency_and_parks_pending(self, tmp_path: Path):
         db_path = tmp_path / "test.db"

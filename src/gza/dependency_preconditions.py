@@ -2,10 +2,29 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from .db import SqliteTaskStore, Task as DbTask
 from .lifecycle_completion import merge_state_is_terminal_for_lifecycle
 
 MERGE_REQUIRED_DEPENDENCY_TASK_TYPES = frozenset({"task", "implement", "improve", "fix", "rebase"})
+
+
+@dataclass(frozen=True)
+class DependencyReadiness:
+    """Structured dependency-readiness result shared across lifecycle callers."""
+
+    ready: bool
+    reason: str | None = None
+    direct_dependency: DbTask | None = None
+    resolved_dependency: DbTask | None = None
+    blocking_task_id: str | None = None
+    blocking_task_status: str | None = None
+    blocking_merge_unit_id: str | None = None
+    blocking_merge_state: str | None = None
+    blocking_merge_unit_owner_task_id: str | None = None
+    blocking_source_branch: str | None = None
+    blocking_target_branch: str | None = None
 
 
 def empty_prereq_satisfies_dependency(
@@ -15,7 +34,7 @@ def empty_prereq_satisfies_dependency(
 ) -> bool:
     """Policy hook for whether an empty prerequisite satisfies a dependency."""
     del store, prereq, dependent
-    return False
+    return True
 
 
 def task_is_merged(store: SqliteTaskStore, task: DbTask) -> bool:
@@ -64,13 +83,7 @@ def dependency_is_ready(
     task: DbTask,
 ) -> bool:
     """Return whether ``task`` has a dependency state that allows execution/pickup."""
-    if task.same_branch or not task.depends_on:
-        return True
-
-    dep = store.resolve_dependency_completion(task)
-    if dep is None:
-        return False
-    return resolved_dependency_satisfies_task_readiness(store, dep, task)
+    return dependency_readiness(store, task).ready
 
 
 def _resolved_merge_state(store: SqliteTaskStore, prereq: DbTask) -> str | None:
@@ -87,14 +100,108 @@ def get_unmerged_dependency_precondition(
     task: DbTask,
 ) -> DbTask | None:
     """Return the resolved dependency still requiring a merge before task execution."""
-    if task.same_branch or not task.depends_on:
+    readiness = dependency_readiness(store, task)
+    if readiness.reason != "unmerged":
         return None
+    return readiness.resolved_dependency
 
-    dep = store.resolve_dependency_completion(task)
-    if dep is None:
-        return None
-    if dep.task_type not in MERGE_REQUIRED_DEPENDENCY_TASK_TYPES:
-        return None
-    if task_satisfies_merge_dependency(store, dep, task):
-        return None
-    return dep
+
+def dependency_readiness(
+    store: SqliteTaskStore,
+    task: DbTask,
+) -> DependencyReadiness:
+    """Return structured dependency readiness for ``task``."""
+    if task.same_branch or not task.depends_on:
+        return DependencyReadiness(ready=True)
+
+    direct_dep = store.get(task.depends_on)
+    if direct_dep is None:
+        return DependencyReadiness(
+            ready=False,
+            reason="missing",
+            blocking_task_id=task.depends_on,
+            blocking_task_status="missing",
+        )
+
+    resolved_dep = store.resolve_dependency_completion(task)
+    if resolved_dep is None:
+        if _resolved_merge_state(store, direct_dep) == "empty" and resolved_dependency_satisfies_task_readiness(
+            store,
+            direct_dep,
+            task,
+        ):
+            return DependencyReadiness(
+                ready=True,
+                reason="ready",
+                direct_dependency=direct_dep,
+                resolved_dependency=direct_dep,
+            )
+        return DependencyReadiness(
+            ready=False,
+            reason=direct_dep.status,
+            direct_dependency=direct_dep,
+            blocking_task_id=direct_dep.id,
+            blocking_task_status=direct_dep.status,
+        )
+
+    if _resolved_dependency_lineage_satisfies_task_readiness(
+        store,
+        direct_dep=direct_dep,
+        resolved_dep=resolved_dep,
+        dependent=task,
+    ):
+        return DependencyReadiness(
+            ready=True,
+            reason="ready",
+            direct_dependency=direct_dep,
+            resolved_dependency=resolved_dep,
+        )
+
+    merge_resolution = store.resolve_dependency_merge_unit(task)
+    merge_unit = merge_resolution.merge_unit
+    merge_unit_owner = (
+        store.resolve_merge_unit_owner_task(merge_unit)
+        if merge_unit is not None
+        else None
+    )
+    blocking_merge_state = merge_unit.state if merge_unit is not None else resolved_dep.merge_status
+    blocking_target_branch = merge_unit.target_branch if merge_unit is not None else store.default_merge_target()
+    return DependencyReadiness(
+        ready=False,
+        reason="unmerged",
+        direct_dependency=direct_dep,
+        resolved_dependency=resolved_dep,
+        blocking_task_id=resolved_dep.id,
+        blocking_task_status=resolved_dep.status,
+        blocking_merge_unit_id=merge_unit.id if merge_unit is not None else None,
+        blocking_merge_state=blocking_merge_state,
+        blocking_merge_unit_owner_task_id=(
+            merge_unit_owner.id if merge_unit_owner is not None else merge_unit.owner_task_id if merge_unit is not None else None
+        ),
+        blocking_source_branch=merge_unit.source_branch if merge_unit is not None else resolved_dep.branch,
+        blocking_target_branch=blocking_target_branch,
+    )
+
+
+def _resolved_dependency_lineage_satisfies_task_readiness(
+    store: SqliteTaskStore,
+    *,
+    direct_dep: DbTask,
+    resolved_dep: DbTask,
+    dependent: DbTask,
+) -> bool:
+    """Return readiness using canonical merge-unit state for the dependency lineage."""
+    if dependent.task_type not in MERGE_REQUIRED_DEPENDENCY_TASK_TYPES:
+        return True
+    if resolved_dep.task_type not in MERGE_REQUIRED_DEPENDENCY_TASK_TYPES:
+        return True
+    merge_resolution = store.resolve_dependency_merge_unit(dependent)
+    merge_unit = merge_resolution.merge_unit
+    if merge_unit is None:
+        return task_satisfies_merge_dependency(store, resolved_dep, dependent)
+    if merge_unit.state == "merged":
+        return True
+    if merge_unit.state == "empty":
+        prereq = merge_resolution.attached_task or direct_dep
+        return empty_prereq_satisfies_dependency(store, prereq, dependent)
+    return False

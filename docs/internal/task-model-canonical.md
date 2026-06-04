@@ -32,7 +32,11 @@ The expected squash-merge shape is therefore: `merge_unit.state == "merged"`, br
 
 An `empty` merge-unit state is the other terminal lifecycle outcome for code-bearing branches. It is neither DB lifecycle `merged` nor active `unmerged`: the branch has no remaining net commits to land against its target, so lifecycle queries should treat it as moot/complete and exclude it from `needs_merge`, while merge provenance fields such as `merged_at` stay unset.
 
-An `empty` prerequisite also has a distinct dependency-policy answer. By default, an `empty` prerequisite does **not** satisfy a downstream merge-required `depends_on` edge, so pending pickup and blocked-state surfaces keep the dependent held for operator attention. That decision must stay routed through the single shared `empty_prereq_satisfies_dependency()` policy hook in `src/gza/dependency_preconditions.py`; its default return is `False`, and flipping the future policy should only require changing that one hook instead of reworking multiple lifecycle call sites.
+An `empty` prerequisite also has a distinct dependency-policy answer. It **does** satisfy a downstream merge-required `depends_on` edge, because the upstream merge unit is terminal and moot. That decision must stay routed through the single shared `empty_prereq_satisfies_dependency()` policy hook in `src/gza/dependency_preconditions.py`; its default return is `True`, and any future policy flip should only require changing that one hook instead of reworking multiple lifecycle call sites.
+
+Missing dependency rows are the opposite policy case: they remain a hard blocked pending state. Pickup, claim, runner preflight, and query projections must all treat a `depends_on` edge with no backing row as not runnable rather than as an unowned compatibility fallback.
+
+When a dependency points at a failed original task whose work was later recovered, readiness still follows the dependency lineage's canonical active merge unit, not merely the completed descendant row that satisfied the retry chain. Resolve the active merge unit from the direct dependency lineage first; only fall back to legacy task-row `merge_status` when no merge unit exists anywhere in that lineage.
 
 Guidance for future callers:
 
