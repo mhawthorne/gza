@@ -201,6 +201,9 @@ belongs to" MUST walk the chain to the nearest non-improve ancestor.
 
 ### §7 — Failure recovery
 
+The shared recovery policy referenced in this section is specified in
+[recovery.md](recovery.md).
+
 Failed tasks are evaluated by the same ordered engine, through one shared recovery policy
 (so `advance`, `iterate`, and `watch` agree on one resume/retry/manual boundary).
 
@@ -210,6 +213,11 @@ Failed tasks are evaluated by the same ordered engine, through one shared recove
   off.
 - Recovery limit reached, ambiguous, or a terminal manual situation (e.g. failed resume
   descendants, dropped recovery terminal) → `needs_discussion` / manual review (P2, P5).
+- Before treating merge-unit state `empty` as a terminal "nothing left to do" outcome,
+  the engine MUST apply the shared empty-recovery predicate from
+  [recovery.md](recovery.md). A failed task with an `empty` merge unit but recoverable
+  session-backed execution evidence MUST continue through recovery instead of being
+  suppressed as moot.
 - A failed task whose work has *already landed* by another path (merged sibling in the
   same lineage, branch reachable from target) MUST be omitted silently — there is nothing
   to recover.

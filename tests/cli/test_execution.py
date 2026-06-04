@@ -9543,6 +9543,163 @@ class TestIterateCommand:
         run_foreground.assert_not_called()
         assert f"No remaining iterate action: implementation {failed.id} has no remaining commits to land." in output
 
+    def test_iterate_resume_on_empty_failed_branch_with_recorded_session_work(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "MAX_TURNS"
+        failed.session_id = "sess-empty"
+        failed.branch = "test-project/20260101-empty-resume"
+        failed.num_steps_computed = 3
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        unit = store.create_merge_unit(
+            source_branch=failed.branch,
+            target_branch="main",
+            owner_task_id=failed.id,
+            state="empty",
+        )
+        store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+
+        args = argparse.Namespace(
+            impl_task_id=failed.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=True,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            workers_path=tmp_path / ".gza" / "workers",
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 3
+        assert "has no remaining commits to land" not in output
+        assert "Resuming failed implementation" in output
+        assert run_foreground.call_count >= 1
+        assert run_foreground.call_args_list[0].kwargs.get("resume") is True
+
+    def test_iterate_resume_on_empty_failed_branch_resolved_by_landed_sibling_noops(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Implementation root", task_type="implement")
+        assert root.id is not None
+        root.status = "completed"
+        root.branch = "feature/root"
+        root.has_commits = True
+        root.completed_at = datetime.now(UTC)
+        store.update(root)
+
+        failed = store.add("Failed manual follow-up", task_type="implement", based_on=root.id, recovery_origin="manual")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "MAX_TURNS"
+        failed.session_id = "sess-empty-landed"
+        failed.branch = "feature/independent-landed"
+        failed.num_steps_computed = 3
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        unit = store.create_merge_unit(
+            source_branch=failed.branch,
+            target_branch="main",
+            owner_task_id=failed.id,
+            state="empty",
+        )
+        store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+
+        landed = store.add("Merged sibling representative", task_type="implement", based_on=root.id, recovery_origin="manual")
+        assert landed.id is not None
+        landed.status = "completed"
+        landed.branch = failed.branch
+        landed.has_commits = True
+        landed.merge_status = "merged"
+        landed.completed_at = datetime.now(UTC)
+        store.update(landed)
+
+        args = argparse.Namespace(
+            impl_task_id=failed.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=True,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution._run_foreground",
+                side_effect=AssertionError("iterate should not resume already landed empty failures"),
+            ) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 0
+        run_foreground.assert_not_called()
+        assert (
+            f"No remaining iterate action: failed implementation {failed.id} was already resolved by landed lineage "
+            "or completed recovery work."
+        ) in output
+        assert "Resuming failed implementation" not in output
+
     def test_latest_review_needs_discussion_blocks(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch

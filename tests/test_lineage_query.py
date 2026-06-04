@@ -7,9 +7,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from gza import dependency_preconditions as dependency_preconditions_module
+from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
+from gza.recovery_engine import list_failed_tasks_for_recovery
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -1383,3 +1385,131 @@ def test_query_lineage_owner_rows_hides_empty_owner_with_failed_same_branch_desc
     )
 
     assert rows == ()
+
+
+def test_query_lineage_owner_rows_keeps_empty_failed_owner_visible_for_recovery_lane(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    failed = store.add("Failed implement owner", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-empty-owner"
+    failed.branch = "feature/empty-failed-owner"
+    failed.num_steps_computed = 3
+    failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == failed.id
+    assert row.recovery_action_task is not None
+    assert row.recovery_action_task.id == failed.id
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == failed.id
+
+    entries = collect_recovery_lane_entries(
+        store,
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=1,
+    )
+
+    assert len(entries) == 1
+    assert entries[0].owner_task.id == failed.id
+    assert entries[0].task.id == failed.id
+    assert entries[0].decision.action == "resume"
+
+
+def test_query_lineage_owner_rows_hides_empty_failed_owner_resolved_by_landed_sibling(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    root = store.add("Implementation root", task_type="implement")
+    assert root.id is not None
+    _set_completed(
+        root,
+        when=datetime(2026, 5, 16, 8, 0, tzinfo=UTC),
+        branch="feature/root",
+        has_commits=True,
+    )
+    store.update(root)
+
+    failed = store.add("Failed manual follow-up", task_type="implement", based_on=root.id, recovery_origin="manual")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-empty-landed"
+    failed.branch = "feature/independent-landed"
+    failed.num_steps_computed = 3
+    failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+
+    landed = store.add("Merged sibling representative", task_type="implement", based_on=root.id, recovery_origin="manual")
+    assert landed.id is not None
+    _set_completed(
+        landed,
+        when=datetime(2026, 5, 16, 10, 0, tzinfo=UTC),
+        branch=failed.branch,
+        has_commits=True,
+    )
+    landed.merge_status = "merged"
+    store.update(landed)
+
+    assert list_failed_tasks_for_recovery(store) == []
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    failed_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert failed.id not in failed_leaf_ids
+
+    entries = collect_recovery_lane_entries(
+        store,
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=1,
+    )
+    assert [entry.decision.task_id for entry in entries] == []

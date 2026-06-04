@@ -56,6 +56,7 @@ RecoveryAction = Literal["resume", "retry", "skip"]
 RecoveryRole = Literal["original", "resume", "retry"]
 FailureCategory = Literal["timeout", "retryable", "manual"]
 PrerequisiteUnmergedReconciliation = Literal["dependency_not_ready", "moot_empty", "ordinary_failed"]
+EmptyTaskRecoveryState = Literal["requires_recovery", "moot", "resolved"]
 
 
 @dataclass(frozen=True)
@@ -73,7 +74,11 @@ class FailedRecoveryDecision:
 
 def should_hide_failed_recovery_decision(decision: FailedRecoveryDecision) -> bool:
     """Return whether the decision should stay off operator recovery surfaces."""
-    return decision.action == "skip" and decision.reason_code == "resolved_by_merged_target"
+    return decision.action == "skip" and decision.reason_code in {
+        "resolved_by_merged_target",
+        "merge_unit_empty",
+        "empty_recovery_already_resolved",
+    }
 
 
 @dataclass(frozen=True)
@@ -253,6 +258,66 @@ def _task_merge_state_for_recovery(store: SqliteTaskStore, task: DbTask) -> str 
         return task.merge_status
     unit = store.resolve_merge_unit_for_task(task.id)
     return unit.state if unit is not None else task.merge_status
+
+
+def _task_has_executed_resumable_session(task: DbTask) -> bool:
+    """Return whether a failed task recorded provider execution for empty-branch recovery.
+
+    This check is intentionally fail-closed: once a resumable ``session_id`` exists,
+    missing step/token evidence keeps the task recoverable rather than silently moot.
+    Only an explicit all-zero record proves "never actually ran".
+    """
+    if task.session_id is None:
+        return False
+
+    evidence = (task.num_steps_computed, task.num_steps_reported, task.output_tokens)
+    if any(value is not None and value > 0 for value in evidence):
+        return True
+    return not all(value is not None for value in evidence)
+
+
+def _classify_empty_task_recovery_state(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    merge_state: str | None = None,
+    merge_context: _MergeContext | None = None,
+) -> EmptyTaskRecoveryState:
+    """Classify whether an empty failed task is moot, resolved, or still recoverable."""
+    if task.status != "failed":
+        return "moot"
+    resolved_merge_state = merge_state if merge_state is not None else _task_merge_state_for_recovery(store, task)
+    if resolved_merge_state != "empty":
+        return "moot"
+    if not _task_has_executed_resumable_session(task):
+        return "moot"
+    if get_completed_recovery_descendant(store, task) is not None:
+        return "resolved"
+    if get_completed_sibling_recovery(store, task) is not None:
+        return "resolved"
+    resolved_merge_context = merge_context or _load_merge_context(_project_dir_for_store(store))
+    if _is_resolved_by_landed_lineage(store, task, merge_context=resolved_merge_context):
+        return "resolved"
+    return "requires_recovery"
+
+
+def empty_task_requires_recovery(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    merge_state: str | None = None,
+    merge_context: _MergeContext | None = None,
+) -> bool:
+    """Return whether an empty merge unit still represents recoverable failed work."""
+    return (
+        _classify_empty_task_recovery_state(
+            store,
+            task,
+            merge_state=merge_state,
+            merge_context=merge_context,
+        )
+        == "requires_recovery"
+    )
 
 
 def _task_is_complete_recovery_outcome(store: SqliteTaskStore, task: DbTask) -> bool:
@@ -662,6 +727,12 @@ def list_failed_tasks_for_recovery(
     failed = [task for task in failed if not is_chain_resolved_by_recovery(store, task)]
     failed = [task for task in failed if not is_resolved_by_merged_target(store, task)]
     failed = [task for task in failed if not _is_resolved_by_landed_lineage(store, task, merge_context=merge_context)]
+    failed = [
+        task
+        for task in failed
+        if _task_merge_state_for_recovery(store, task) != "empty"
+        or empty_task_requires_recovery(store, task, merge_context=merge_context)
+    ]
     if warnings is not None:
         warnings.extend(merge_context.repository_inspection_warnings)
     return sort_failed_tasks(failed)
@@ -852,6 +923,17 @@ def decide_failed_task_recovery(
                 attempt_limit=attempt_limit,
             )
         if reconciliation == "moot_empty":
+            if empty_task_requires_recovery(store, task, merge_state="empty"):
+                return _skip_decision(
+                    task_id=task_id,
+                    reason_code="legacy_prerequisite_unmerged_parked",
+                    reason_text=(
+                        "empty merge unit is recoverable because provider execution was recorded; "
+                        "legacy dependency-merge failure is parked for manual review"
+                    ),
+                    attempt_index=attempt_index,
+                    attempt_limit=attempt_limit,
+                )
             return _skip_decision(
                 task_id=task_id,
                 reason_code="merge_unit_empty",
@@ -866,7 +948,26 @@ def decide_failed_task_recovery(
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,
         )
-    elif classify_failure_reason(reason) == "manual":
+    merge_state = _task_merge_state_for_recovery(store, task)
+    if merge_state == "empty":
+        empty_recovery_state = _classify_empty_task_recovery_state(store, task, merge_state=merge_state)
+        if empty_recovery_state == "resolved":
+            return _skip_decision(
+                task_id=task_id,
+                reason_code="empty_recovery_already_resolved",
+                reason_text="empty failed task already resolved by landed lineage or completed recovery work",
+                attempt_index=attempt_index,
+                attempt_limit=attempt_limit,
+            )
+        if empty_recovery_state == "moot":
+            return _skip_decision(
+                task_id=task_id,
+                reason_code="merge_unit_empty",
+                reason_text="moot (empty branch with no recorded provider execution)",
+                attempt_index=attempt_index,
+                attempt_limit=attempt_limit,
+            )
+    if classify_failure_reason(reason) == "manual":
         return _skip_decision(
             task_id=task_id,
             reason_code="manual_failure_reason",

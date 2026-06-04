@@ -15,6 +15,7 @@ from gza.recovery_engine import (
     FailedRecoveryDecision,
     classify_failure_reason,
     decide_failed_task_recovery,
+    empty_task_requires_recovery,
     get_completed_recovery_descendant,
     get_completed_sibling_recovery,
     get_failed_recovery_needs_attention_reason,
@@ -50,6 +51,17 @@ def _completed_impl(store, *, merge_status: str):
     task.completed_at = datetime.now(UTC)
     store.update(task)
     return task
+
+
+def _attach_empty_merge_unit(store, task) -> None:
+    assert task.id is not None
+    unit = store.create_merge_unit(
+        source_branch=task.branch or f"feature/{task.id}",
+        target_branch="main",
+        owner_task_id=task.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(task.id, unit.id, "owner")
 
 
 class _StubMergeGit:
@@ -235,6 +247,113 @@ def test_list_failed_tasks_for_recovery_keeps_failed_task_without_landed_lineage
 
     assert is_chain_resolved_by_recovery(store, failed) is False
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id, failed_retry.id]
+
+
+def test_empty_task_requires_recovery_for_session_backed_failed_empty_branch(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-empty"
+    failed.branch = "feature/resume-empty"
+    failed.num_steps_computed = 2
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_empty_merge_unit(store, failed)
+
+    assert empty_task_requires_recovery(store, failed) is True
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "resume"
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+
+def test_empty_task_requires_recovery_fail_closed_when_session_metrics_are_missing(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-missing"
+    failed.branch = "feature/resume-empty-missing"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_empty_merge_unit(store, failed)
+
+    assert empty_task_requires_recovery(store, failed) is True
+    assert decide_failed_task_recovery(store, failed, max_recovery_attempts=1).action == "resume"
+
+
+def test_empty_task_requires_recovery_false_when_landed_representative_exists(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Implementation root", task_type="implement")
+    assert root.id is not None
+    root.status = "completed"
+    root.branch = "feature/root"
+    root.has_commits = True
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed = store.add("Failed manual follow-up", task_type="implement", based_on=root.id, recovery_origin="manual")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-empty-landed"
+    failed.branch = "feature/independent-landed"
+    failed.num_steps_computed = 2
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_empty_merge_unit(store, failed)
+
+    landed = store.add("Merged sibling representative", task_type="implement", based_on=root.id, recovery_origin="manual")
+    assert landed.id is not None
+    landed.status = "completed"
+    landed.branch = failed.branch
+    landed.has_commits = True
+    landed.merge_status = "merged"
+    landed.completed_at = datetime.now(UTC)
+    store.update(landed)
+
+    assert empty_task_requires_recovery(store, failed) is False
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "empty_recovery_already_resolved"
+    assert decision.reason_text == "empty failed task already resolved by landed lineage or completed recovery work"
+    assert list_failed_tasks_for_recovery(store) == []
+
+
+def test_list_failed_tasks_for_recovery_filters_moot_failed_empty_branch_without_execution(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Never-ran implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-empty-zero"
+    failed.branch = "feature/moot-empty"
+    failed.num_steps_computed = 0
+    failed.num_steps_reported = 0
+    failed.output_tokens = 0
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_empty_merge_unit(store, failed)
+
+    assert empty_task_requires_recovery(store, failed) is False
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_empty"
+    assert decision.reason_text == "moot (empty branch with no recorded provider execution)"
+    assert list_failed_tasks_for_recovery(store) == []
 
 
 def test_list_failed_tasks_for_recovery_emits_one_warning_when_branch_reachability_probe_fails(
@@ -1381,6 +1500,50 @@ def test_recovery_engine_prerequisite_unmerged_reconciles_no_output_row_to_empty
     ready_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert ready_decision.action == "skip"
     assert ready_decision.reason_code == "merge_unit_empty"
+
+    unit = store.resolve_merge_unit_for_task(failed.id)
+    assert unit is not None
+    assert unit.state == "empty"
+
+
+def test_recovery_engine_prerequisite_unmerged_empty_session_backed_failure_stays_visible_after_dependency_merge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.session_id = "sess-prereq-empty"
+    failed.branch = "feature/prereq-empty"
+    failed.has_commits = False
+    failed.num_steps_computed = 2
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=_StubEmptyBranchGit(), default_branch="main"),
+    )
+
+    assert empty_task_requires_recovery(store, failed, merge_state="empty") is True
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "legacy_prerequisite_unmerged_parked"
+    assert decision.reason_code != "merge_unit_empty"
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
     unit = store.resolve_merge_unit_for_task(failed.id)
     assert unit is not None

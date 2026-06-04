@@ -1,5 +1,8 @@
 # Task Resume
 
+> **Status: Superseded.** Resume and failed-task recovery behavior is now specified by
+> the behavior-spec contract in [../behavior/recovery.md](../behavior/recovery.md).
+
 ## Overview
 
 This spec describes the ability to resume a task that failed due to `max_turns` being exceeded, preserving the full conversation context from the previous attempt.

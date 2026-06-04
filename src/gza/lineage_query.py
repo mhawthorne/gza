@@ -724,6 +724,7 @@ def query_lineage_owner_rows(
             if task.id is not None and task.id in indexes.merge_units_by_task_id
         }
         failed_leaves: list[DbTask] = []
+        matching_failed_leaves: list[DbTask] = []
         recovery_completed_by_failed_id: dict[str, DbTask] = {}
         unresolved_tasks: list[DbTask] = []
         orphaned_same_branch_tasks: list[DbTask] = []
@@ -783,6 +784,7 @@ def query_lineage_owner_rows(
                     continue
                 failed_leaves.append(task)
                 if matches:
+                    matching_failed_leaves.append(task)
                     unresolved_tasks.append(task)
                 continue
             if merged_owner_branch:
@@ -830,6 +832,7 @@ def query_lineage_owner_rows(
         if (
             owner_merge_unit is not None
             and merge_state_is_terminal_for_lifecycle(owner_merge_unit.state)
+            and not matching_failed_leaves
             and not has_empty_prereq_blocked_pending
         ):
             continue
@@ -843,9 +846,8 @@ def query_lineage_owner_rows(
             )
         )
 
-        if not unresolved_tasks:
-            if not orphaned_same_branch_tasks:
-                continue
+        if not unresolved_tasks and not matching_failed_leaves and not orphaned_same_branch_tasks:
+            continue
         resolution = is_lineage_resolved(snapshot)
         has_unimplemented_source = (
             owner.id is not None

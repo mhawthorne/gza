@@ -60,7 +60,9 @@ from ..query import (
 )
 from ..recovery_engine import (
     FailedRecoveryDecision,
+    _classify_empty_task_recovery_state,
     decide_failed_task_recovery,
+    empty_task_requires_recovery,
     get_failed_recovery_needs_attention_reason,
     get_manual_resume_override_descendant,
     resolve_recovery_planning_task,
@@ -189,6 +191,7 @@ def _resolve_iterate_merge_state_for_current_target(
 
 def _format_iterate_terminal_merge_state_message(
     *,
+    store: SqliteTaskStore,
     requested_impl_task: DbTask,
     iterate_task: DbTask,
     resolved_from_failed_ancestor: bool,
@@ -199,6 +202,15 @@ def _format_iterate_terminal_merge_state_message(
         return None
 
     if merge_state == "empty":
+        empty_recovery_state = _classify_empty_task_recovery_state(store, iterate_task, merge_state=merge_state)
+        if empty_recovery_state == "requires_recovery":
+            return None
+        if empty_recovery_state == "resolved" and iterate_task.status == "failed":
+            return (
+                "No remaining iterate action: "
+                f"failed implementation {iterate_task.id} was already resolved by landed lineage or completed "
+                "recovery work."
+            )
         if resolved_from_failed_ancestor:
             return (
                 "No remaining iterate action: "
@@ -2572,6 +2584,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         impl_task.status == "failed"
         and resolved_unit is not None
         and merge_state_is_terminal_for_lifecycle(resolved_unit.state)
+        and not empty_task_requires_recovery(store, impl_task, merge_state=resolved_unit.state)
     )
 
     if impl_task.status == "failed" and not use_resume and not use_retry and not failed_task_is_lifecycle_moot:
@@ -2581,7 +2594,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         )
 
     if (use_resume or use_retry) and (impl_task.status != "failed" or failed_task_is_lifecycle_moot):
-        if resolved_from_failed_ancestor and requested_impl_task.status == "failed":
+        if (resolved_from_failed_ancestor and requested_impl_task.status == "failed") or (
+            impl_task.status == "failed" and failed_task_is_lifecycle_moot
+        ):
             use_resume = False
             use_retry = False
         else:
@@ -2854,6 +2869,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     )
                     return 1
             terminal_message = _format_iterate_terminal_merge_state_message(
+                store=store,
                 requested_impl_task=requested_impl_task,
                 iterate_task=iterate_task,
                 resolved_from_failed_ancestor=resolved_from_failed_ancestor,
@@ -3403,6 +3419,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             print(f"Error: failed to reconcile already-merged implementation {task_label}: {exc}")
             return 1
     terminal_message = _format_iterate_terminal_merge_state_message(
+        store=store,
         requested_impl_task=requested_impl_task,
         iterate_task=impl_task,
         resolved_from_failed_ancestor=resolved_from_failed_ancestor,
